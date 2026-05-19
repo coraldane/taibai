@@ -1,7 +1,7 @@
 use std::time::Instant;
 use uuid::Uuid;
 
-use crate::sql::prepared::PreparedStatementCache;
+use crate::sql::execution::prepared::PreparedStatementCache;
 
 pub struct Session {
     pub id: Uuid,

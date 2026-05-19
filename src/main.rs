@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use common::config::{RunMode, ServerConfig};
 use net::server::Server;
-use sql::executor::Engine;
+use sql::execution::Engine;
 
 #[tokio::main]
 async fn main() {

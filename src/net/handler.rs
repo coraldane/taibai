@@ -6,7 +6,7 @@ use crate::common::error::Result;
 use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::protocol::bulk;
-use crate::sql::executor::{Engine, ExecResult};
+use crate::sql::execution::{Engine, ExecResult};
 use crate::types::scalar::ScalarValue;
 
 pub struct Handler {

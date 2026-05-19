@@ -1,0 +1,149 @@
+use crate::common::error::{MonaxError, Result};
+use crate::sql::parser::ast::Expr;
+use crate::types::scalar::ScalarValue;
+
+use super::BindContext;
+
+#[derive(Debug, Clone)]
+pub struct BoundExpr {
+    pub kind: BoundExprKind,
+    pub data_type: DataType,
+}
+
+#[derive(Debug, Clone)]
+pub enum BoundExprKind {
+    ColumnRef {
+        index: usize,
+        name: String,
+    },
+    Literal(ScalarValue),
+    BinaryOp {
+        left: Box<BoundExpr>,
+        op: crate::sql::parser::ast::BinOp,
+        right: Box<BoundExpr>,
+    },
+    UnaryNot(Box<BoundExpr>),
+    IsNull(Box<BoundExpr>),
+    IsNotNull(Box<BoundExpr>),
+    Aggregate {
+        func: crate::sql::planner::AggFunc,
+        arg: Box<BoundExpr>,
+        distinct: bool,
+    },
+    Wildcard,
+}
+
+use crate::protocol::types::DataType;
+
+pub struct ExpressionBinder<'a> {
+    ctx: &'a BindContext,
+}
+
+impl<'a> ExpressionBinder<'a> {
+    pub fn new(ctx: &'a BindContext) -> Self {
+        Self { ctx }
+    }
+
+    pub fn bind(&self, expr: &Expr) -> Result<BoundExpr> {
+        match expr {
+            Expr::Literal(v) => {
+                let dt = v.data_type();
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Literal(v.clone()),
+                    data_type: dt,
+                })
+            }
+            Expr::Column(name) => {
+                let idx = self.ctx.resolve_column(name)
+                    .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", name)))?;
+                let dt = self.ctx.column_type(idx)
+                    .unwrap_or(DataType::Int64);
+                Ok(BoundExpr {
+                    kind: BoundExprKind::ColumnRef {
+                        index: idx,
+                        name: name.clone(),
+                    },
+                    data_type: dt,
+                })
+            }
+            Expr::QualifiedColumn { table, column } => {
+                let idx = self.ctx.resolve_qualified_column(table, column)
+                    .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found in table '{}'", column, table)))?;
+                let dt = self.ctx.column_type(idx)
+                    .unwrap_or(DataType::Int64);
+                Ok(BoundExpr {
+                    kind: BoundExprKind::ColumnRef {
+                        index: idx,
+                        name: column.clone(),
+                    },
+                    data_type: dt,
+                })
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let l = self.bind(left)?;
+                let r = self.bind(right)?;
+                let dt = crate::sql::binder::type_resolver::resolve_binary_type(&l.data_type, op, &r.data_type);
+                Ok(BoundExpr {
+                    kind: BoundExprKind::BinaryOp {
+                        left: Box::new(l),
+                        op: *op,
+                        right: Box::new(r),
+                    },
+                    data_type: dt,
+                })
+            }
+            Expr::UnaryNot(inner) => {
+                let e = self.bind(inner)?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::UnaryNot(Box::new(e)),
+                    data_type: DataType::Bool,
+                })
+            }
+            Expr::IsNull(inner) => {
+                let e = self.bind(inner)?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::IsNull(Box::new(e)),
+                    data_type: DataType::Bool,
+                })
+            }
+            Expr::IsNotNull(inner) => {
+                let e = self.bind(inner)?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::IsNotNull(Box::new(e)),
+                    data_type: DataType::Bool,
+                })
+            }
+            Expr::Function { name, args, distinct } => {
+                let func_name = name.to_uppercase();
+                let func = match func_name.as_str() {
+                    "COUNT" => crate::sql::planner::AggFunc::Count,
+                    "SUM" => crate::sql::planner::AggFunc::Sum,
+                    "AVG" => crate::sql::planner::AggFunc::Avg,
+                    "MIN" => crate::sql::planner::AggFunc::Min,
+                    "MAX" => crate::sql::planner::AggFunc::Max,
+                    other => return Err(MonaxError::Sql(format!("unknown function '{}'", other))),
+                };
+                let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*")) {
+                    BoundExpr {
+                        kind: BoundExprKind::Wildcard,
+                        data_type: DataType::Int64,
+                    }
+                } else {
+                    self.bind(&args[0])?
+                };
+                let dt = match func {
+                    crate::sql::planner::AggFunc::Count => DataType::Int64,
+                    _ => DataType::Float64,
+                };
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Aggregate {
+                        func,
+                        arg: Box::new(arg),
+                        distinct: *distinct,
+                    },
+                    data_type: dt,
+                })
+            }
+        }
+    }
+}
