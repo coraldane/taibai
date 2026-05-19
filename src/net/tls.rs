@@ -1,0 +1,114 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::common::error::{MonaxError, Result};
+
+/// TLS configuration for the server.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// Path to the PEM-encoded certificate file.
+    pub cert_path: PathBuf,
+    /// Path to the PEM-encoded private key file.
+    pub key_path: PathBuf,
+}
+
+impl TlsConfig {
+    pub fn new(cert_path: impl Into<PathBuf>, key_path: impl Into<PathBuf>) -> Self {
+        Self {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+        }
+    }
+
+    /// Validate that the cert and key files exist.
+    pub fn validate(&self) -> Result<()> {
+        if !self.cert_path.exists() {
+            return Err(MonaxError::Config(format!(
+                "TLS certificate file not found: {:?}", self.cert_path
+            )));
+        }
+        if !self.key_path.exists() {
+            return Err(MonaxError::Config(format!(
+                "TLS private key file not found: {:?}", self.key_path
+            )));
+        }
+        Ok(())
+    }
+
+    /// Load the TLS configuration and create a rustls server config.
+    pub fn load_server_config(&self) -> Result<Arc<rustls::ServerConfig>> {
+        use rustls_pemfile::{certs, private_key};
+        use std::io::BufReader;
+
+        // Load certificate chain
+        let cert_file = std::fs::File::open(&self.cert_path)
+            .map_err(|e| MonaxError::Config(format!("Failed to open cert file: {}", e)))?;
+        let mut cert_reader = BufReader::new(cert_file);
+        let cert_chain: Vec<rustls::pki_types::CertificateDer> = certs(&mut cert_reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| MonaxError::Config(format!("Failed to read certificates: {}", e)))?;
+
+        if cert_chain.is_empty() {
+            return Err(MonaxError::Config("No certificates found in cert file".into()));
+        }
+
+        // Load private key
+        let key_file = std::fs::File::open(&self.key_path)
+            .map_err(|e| MonaxError::Config(format!("Failed to open key file: {}", e)))?;
+        let mut key_reader = BufReader::new(key_file);
+        let key = private_key(&mut key_reader)
+            .map_err(|e| MonaxError::Config(format!("Failed to read private key: {}", e)))?
+            .ok_or_else(|| MonaxError::Config("No private key found in key file".into()))?;
+
+        // Create server config
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| MonaxError::Config(format!("Failed to create TLS config: {}", e)))?;
+
+        Ok(Arc::new(server_config))
+    }
+}
+
+/// Whether to use TLS for incoming connections.
+#[derive(Debug, Clone, Default)]
+pub enum TlsMode {
+    /// No TLS.
+    #[default]
+    Disable,
+    /// TLS enabled with the given configuration.
+    Enable(TlsConfig),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_tls_config_validate_missing_cert() {
+        let config = TlsConfig::new("/nonexistent/cert.pem", "/nonexistent/key.pem");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tls_config_validate_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+
+        let mut f = std::fs::File::create(&cert_path).unwrap();
+        f.write_all(b"fake cert").unwrap();
+        let mut f = std::fs::File::create(&key_path).unwrap();
+        f.write_all(b"fake key").unwrap();
+
+        let config = TlsConfig::new(&cert_path, &key_path);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tls_mode_default() {
+        let mode = TlsMode::default();
+        assert!(matches!(mode, TlsMode::Disable));
+    }
+}

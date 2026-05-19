@@ -1,0 +1,418 @@
+use crate::common::error::{MonaxError, Result};
+use crate::protocol::types::DataType;
+use crate::types::bitmap::NullBitmap;
+use crate::types::scalar::ScalarValue;
+
+/// A typed column array with null bitmap.
+/// Data is stored in typed vectors for cache efficiency; null values are
+/// marked in the bitmap but still occupy space in the data vector (simpler
+/// than taibai's "skip nulls" approach for in-memory representation).
+#[derive(Debug, Clone)]
+pub enum ColumnArray {
+    Bool { data: Vec<u8>, bitmap: NullBitmap },
+    Int8 { data: Vec<i8>, bitmap: NullBitmap },
+    Int16 { data: Vec<i16>, bitmap: NullBitmap },
+    Int32 { data: Vec<i32>, bitmap: NullBitmap },
+    Int64 { data: Vec<i64>, bitmap: NullBitmap },
+    UInt8 { data: Vec<u8>, bitmap: NullBitmap },
+    UInt16 { data: Vec<u16>, bitmap: NullBitmap },
+    UInt32 { data: Vec<u32>, bitmap: NullBitmap },
+    UInt64 { data: Vec<u64>, bitmap: NullBitmap },
+    Float32 { data: Vec<f32>, bitmap: NullBitmap },
+    Float64 { data: Vec<f64>, bitmap: NullBitmap },
+    Decimal { data: Vec<i64>, bitmap: NullBitmap },
+    Date { data: Vec<i32>, bitmap: NullBitmap },
+    Time { data: Vec<i64>, bitmap: NullBitmap },
+    Timestamp { data: Vec<i64>, bitmap: NullBitmap },
+    Interval { data: Vec<i64>, bitmap: NullBitmap },
+    VarChar { data: Vec<String>, bitmap: NullBitmap },
+    Blob { data: Vec<Vec<u8>>, bitmap: NullBitmap },
+    Vector { data: Vec<Vec<f32>>, bitmap: NullBitmap },
+}
+
+impl ColumnArray {
+    /// Create an empty ColumnArray for the given DataType.
+    pub fn empty(dt: DataType) -> Self {
+        match dt {
+            DataType::Bool => ColumnArray::Bool { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Int8 => ColumnArray::Int8 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Int16 => ColumnArray::Int16 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Int32 => ColumnArray::Int32 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Int64 => ColumnArray::Int64 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::UInt8 => ColumnArray::UInt8 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::UInt16 => ColumnArray::UInt16 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::UInt32 => ColumnArray::UInt32 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::UInt64 => ColumnArray::UInt64 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Float32 => ColumnArray::Float32 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Float64 => ColumnArray::Float64 { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Decimal => ColumnArray::Decimal { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Date => ColumnArray::Date { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Time => ColumnArray::Time { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Timestamp => ColumnArray::Timestamp { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Interval => ColumnArray::Interval { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::VarChar => ColumnArray::VarChar { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Blob => ColumnArray::Blob { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+            DataType::Vector => ColumnArray::Vector { data: Vec::new(), bitmap: NullBitmap::new_valid(0) },
+        }
+    }
+
+    /// Returns the DataType of this column.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            ColumnArray::Bool { .. } => DataType::Bool,
+            ColumnArray::Int8 { .. } => DataType::Int8,
+            ColumnArray::Int16 { .. } => DataType::Int16,
+            ColumnArray::Int32 { .. } => DataType::Int32,
+            ColumnArray::Int64 { .. } => DataType::Int64,
+            ColumnArray::UInt8 { .. } => DataType::UInt8,
+            ColumnArray::UInt16 { .. } => DataType::UInt16,
+            ColumnArray::UInt32 { .. } => DataType::UInt32,
+            ColumnArray::UInt64 { .. } => DataType::UInt64,
+            ColumnArray::Float32 { .. } => DataType::Float32,
+            ColumnArray::Float64 { .. } => DataType::Float64,
+            ColumnArray::Decimal { .. } => DataType::Decimal,
+            ColumnArray::Date { .. } => DataType::Date,
+            ColumnArray::Time { .. } => DataType::Time,
+            ColumnArray::Timestamp { .. } => DataType::Timestamp,
+            ColumnArray::Interval { .. } => DataType::Interval,
+            ColumnArray::VarChar { .. } => DataType::VarChar,
+            ColumnArray::Blob { .. } => DataType::Blob,
+            ColumnArray::Vector { .. } => DataType::Vector,
+        }
+    }
+
+    /// Returns the number of rows in this column.
+    pub fn len(&self) -> usize {
+        match self {
+            ColumnArray::Bool { data, .. } => data.len(),
+            ColumnArray::Int8 { data, .. } => data.len(),
+            ColumnArray::Int16 { data, .. } => data.len(),
+            ColumnArray::Int32 { data, .. } => data.len(),
+            ColumnArray::Int64 { data, .. } => data.len(),
+            ColumnArray::UInt8 { data, .. } => data.len(),
+            ColumnArray::UInt16 { data, .. } => data.len(),
+            ColumnArray::UInt32 { data, .. } => data.len(),
+            ColumnArray::UInt64 { data, .. } => data.len(),
+            ColumnArray::Float32 { data, .. } => data.len(),
+            ColumnArray::Float64 { data, .. } => data.len(),
+            ColumnArray::Decimal { data, .. } => data.len(),
+            ColumnArray::Date { data, .. } => data.len(),
+            ColumnArray::Time { data, .. } => data.len(),
+            ColumnArray::Timestamp { data, .. } => data.len(),
+            ColumnArray::Interval { data, .. } => data.len(),
+            ColumnArray::VarChar { data, .. } => data.len(),
+            ColumnArray::Blob { data, .. } => data.len(),
+            ColumnArray::Vector { data, .. } => data.len(),
+        }
+    }
+
+    /// Returns true if the column has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns a reference to the null bitmap.
+    pub fn bitmap(&self) -> &NullBitmap {
+        match self {
+            ColumnArray::Bool { bitmap, .. } => bitmap,
+            ColumnArray::Int8 { bitmap, .. } => bitmap,
+            ColumnArray::Int16 { bitmap, .. } => bitmap,
+            ColumnArray::Int32 { bitmap, .. } => bitmap,
+            ColumnArray::Int64 { bitmap, .. } => bitmap,
+            ColumnArray::UInt8 { bitmap, .. } => bitmap,
+            ColumnArray::UInt16 { bitmap, .. } => bitmap,
+            ColumnArray::UInt32 { bitmap, .. } => bitmap,
+            ColumnArray::UInt64 { bitmap, .. } => bitmap,
+            ColumnArray::Float32 { bitmap, .. } => bitmap,
+            ColumnArray::Float64 { bitmap, .. } => bitmap,
+            ColumnArray::Decimal { bitmap, .. } => bitmap,
+            ColumnArray::Date { bitmap, .. } => bitmap,
+            ColumnArray::Time { bitmap, .. } => bitmap,
+            ColumnArray::Timestamp { bitmap, .. } => bitmap,
+            ColumnArray::Interval { bitmap, .. } => bitmap,
+            ColumnArray::VarChar { bitmap, .. } => bitmap,
+            ColumnArray::Blob { bitmap, .. } => bitmap,
+            ColumnArray::Vector { bitmap, .. } => bitmap,
+        }
+    }
+
+    /// Returns a mutable reference to the null bitmap.
+    pub fn bitmap_mut(&mut self) -> &mut NullBitmap {
+        match self {
+            ColumnArray::Bool { bitmap, .. } => bitmap,
+            ColumnArray::Int8 { bitmap, .. } => bitmap,
+            ColumnArray::Int16 { bitmap, .. } => bitmap,
+            ColumnArray::Int32 { bitmap, .. } => bitmap,
+            ColumnArray::Int64 { bitmap, .. } => bitmap,
+            ColumnArray::UInt8 { bitmap, .. } => bitmap,
+            ColumnArray::UInt16 { bitmap, .. } => bitmap,
+            ColumnArray::UInt32 { bitmap, .. } => bitmap,
+            ColumnArray::UInt64 { bitmap, .. } => bitmap,
+            ColumnArray::Float32 { bitmap, .. } => bitmap,
+            ColumnArray::Float64 { bitmap, .. } => bitmap,
+            ColumnArray::Decimal { bitmap, .. } => bitmap,
+            ColumnArray::Date { bitmap, .. } => bitmap,
+            ColumnArray::Time { bitmap, .. } => bitmap,
+            ColumnArray::Timestamp { bitmap, .. } => bitmap,
+            ColumnArray::Interval { bitmap, .. } => bitmap,
+            ColumnArray::VarChar { bitmap, .. } => bitmap,
+            ColumnArray::Blob { bitmap, .. } => bitmap,
+            ColumnArray::Vector { bitmap, .. } => bitmap,
+        }
+    }
+
+    /// Get the scalar value at the given index.
+    pub fn scalar(&self, idx: usize) -> ScalarValue {
+        match self {
+            ColumnArray::Bool { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Bool(None) }
+                else { ScalarValue::Bool(Some(data[idx] != 0)) }
+            }
+            ColumnArray::Int8 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Int8(None) }
+                else { ScalarValue::Int8(Some(data[idx])) }
+            }
+            ColumnArray::Int16 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Int16(None) }
+                else { ScalarValue::Int16(Some(data[idx])) }
+            }
+            ColumnArray::Int32 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Int32(None) }
+                else { ScalarValue::Int32(Some(data[idx])) }
+            }
+            ColumnArray::Int64 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Int64(None) }
+                else { ScalarValue::Int64(Some(data[idx])) }
+            }
+            ColumnArray::UInt8 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::UInt8(None) }
+                else { ScalarValue::UInt8(Some(data[idx])) }
+            }
+            ColumnArray::UInt16 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::UInt16(None) }
+                else { ScalarValue::UInt16(Some(data[idx])) }
+            }
+            ColumnArray::UInt32 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::UInt32(None) }
+                else { ScalarValue::UInt32(Some(data[idx])) }
+            }
+            ColumnArray::UInt64 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::UInt64(None) }
+                else { ScalarValue::UInt64(Some(data[idx])) }
+            }
+            ColumnArray::Float32 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Float32(None) }
+                else { ScalarValue::Float32(Some(data[idx])) }
+            }
+            ColumnArray::Float64 { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Float64(None) }
+                else { ScalarValue::Float64(Some(data[idx])) }
+            }
+            ColumnArray::Decimal { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Decimal(None) }
+                else { ScalarValue::Decimal(Some(data[idx])) }
+            }
+            ColumnArray::Date { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Date(None) }
+                else { ScalarValue::Date(Some(data[idx])) }
+            }
+            ColumnArray::Time { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Time(None) }
+                else { ScalarValue::Time(Some(data[idx])) }
+            }
+            ColumnArray::Timestamp { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Timestamp(None) }
+                else { ScalarValue::Timestamp(Some(data[idx])) }
+            }
+            ColumnArray::Interval { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Interval(None) }
+                else { ScalarValue::Interval(Some(data[idx])) }
+            }
+            ColumnArray::VarChar { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::VarChar(None) }
+                else { ScalarValue::VarChar(Some(data[idx].clone())) }
+            }
+            ColumnArray::Blob { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Blob(None) }
+                else { ScalarValue::Blob(Some(data[idx].clone())) }
+            }
+            ColumnArray::Vector { data, bitmap } => {
+                if bitmap.is_null(idx) { ScalarValue::Vector(None) }
+                else { ScalarValue::Vector(Some(data[idx].clone())) }
+            }
+        }
+    }
+
+    /// Push a scalar value into this column array.
+    pub fn push(&mut self, value: &ScalarValue) -> Result<()> {
+        let is_null = value.is_null();
+        match (self, value) {
+            (ColumnArray::Bool { data, bitmap }, ScalarValue::Bool(v)) => {
+                data.push(if v.unwrap_or(false) { 1 } else { 0 });
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Int8 { data, bitmap }, ScalarValue::Int8(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Int16 { data, bitmap }, ScalarValue::Int16(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Int32 { data, bitmap }, ScalarValue::Int32(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Int64 { data, bitmap }, ScalarValue::Int64(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::UInt8 { data, bitmap }, ScalarValue::UInt8(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::UInt16 { data, bitmap }, ScalarValue::UInt16(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::UInt32 { data, bitmap }, ScalarValue::UInt32(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::UInt64 { data, bitmap }, ScalarValue::UInt64(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Float32 { data, bitmap }, ScalarValue::Float32(v)) => {
+                data.push(v.unwrap_or(0.0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Float64 { data, bitmap }, ScalarValue::Float64(v)) => {
+                data.push(v.unwrap_or(0.0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Decimal { data, bitmap }, ScalarValue::Decimal(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Date { data, bitmap }, ScalarValue::Date(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Time { data, bitmap }, ScalarValue::Time(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Timestamp { data, bitmap }, ScalarValue::Timestamp(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Interval { data, bitmap }, ScalarValue::Interval(v)) => {
+                data.push(v.unwrap_or(0));
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::VarChar { data, bitmap }, ScalarValue::VarChar(v)) => {
+                data.push(v.clone().unwrap_or_default());
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Blob { data, bitmap }, ScalarValue::Blob(v)) => {
+                data.push(v.clone().unwrap_or_default());
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (ColumnArray::Vector { data, bitmap }, ScalarValue::Vector(v)) => {
+                data.push(v.clone().unwrap_or_default());
+                if is_null { bitmap.push_null(); } else { bitmap.push_valid(); }
+            }
+            (arr, val) => {
+                return Err(MonaxError::Internal(format!(
+                    "type mismatch: column is {} but value is {}",
+                    arr.data_type().display_name(),
+                    val.data_type().display_name(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a ColumnArray from a slice of ScalarValues.
+    /// All values must match the requested DataType.
+    pub fn from_scalar_values(dt: DataType, values: &[ScalarValue]) -> Result<Self> {
+        let mut arr = Self::empty(dt);
+        for v in values {
+            arr.push(v)?;
+        }
+        Ok(arr)
+    }
+
+    /// Append another ColumnArray of the same type.
+    pub fn extend(&mut self, other: &ColumnArray) -> Result<()> {
+        if self.data_type() != other.data_type() {
+            return Err(MonaxError::Internal(format!(
+                "cannot extend {} with {}",
+                self.data_type().display_name(),
+                other.data_type().display_name(),
+            )));
+        }
+        for i in 0..other.len() {
+            self.push(&other.scalar(i))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_column() {
+        let col = ColumnArray::empty(DataType::Int64);
+        assert_eq!(col.len(), 0);
+        assert!(col.is_empty());
+        assert_eq!(col.data_type(), DataType::Int64);
+    }
+
+    #[test]
+    fn test_push_and_scalar() {
+        let mut col = ColumnArray::empty(DataType::Int32);
+        col.push(&ScalarValue::Int32(Some(42))).unwrap();
+        col.push(&ScalarValue::Int32(None)).unwrap();
+        col.push(&ScalarValue::Int32(Some(7))).unwrap();
+
+        assert_eq!(col.len(), 3);
+        assert_eq!(col.scalar(0), ScalarValue::Int32(Some(42)));
+        assert_eq!(col.scalar(1), ScalarValue::Int32(None));
+        assert_eq!(col.scalar(2), ScalarValue::Int32(Some(7)));
+    }
+
+    #[test]
+    fn test_varchar_column() {
+        let mut col = ColumnArray::empty(DataType::VarChar);
+        col.push(&ScalarValue::VarChar(Some("hello".into()))).unwrap();
+        col.push(&ScalarValue::VarChar(None)).unwrap();
+
+        assert_eq!(col.scalar(0), ScalarValue::VarChar(Some("hello".into())));
+        assert!(col.scalar(1).is_null());
+    }
+
+    #[test]
+    fn test_type_mismatch() {
+        let mut col = ColumnArray::empty(DataType::Int64);
+        let result = col.push(&ScalarValue::VarChar(Some("oops".into())));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extend() {
+        let mut col1 = ColumnArray::empty(DataType::Int64);
+        col1.push(&ScalarValue::Int64(Some(1))).unwrap();
+        col1.push(&ScalarValue::Int64(Some(2))).unwrap();
+
+        let mut col2 = ColumnArray::empty(DataType::Int64);
+        col2.push(&ScalarValue::Int64(Some(3))).unwrap();
+
+        col1.extend(&col2).unwrap();
+        assert_eq!(col1.len(), 3);
+        assert_eq!(col1.scalar(2), ScalarValue::Int64(Some(3)));
+    }
+}

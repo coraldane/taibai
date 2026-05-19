@@ -1,0 +1,30 @@
+# Monax Database Server Configuration
+# Copy this file to config.yaml and modify as needed
+
+# Server listen address (host:port)
+listen_addr: "0.0.0.0:5151"
+
+# Data directory for storing database files
+data_dir: "E:/data/monax/"
+
+# Default database name
+default_database: "main"
+
+# Maximum message size in bytes (64MB)
+max_message_size: 67108864
+
+# Row threshold for flushing to disk
+flush_threshold_rows: 65536
+
+# Batch size for query processing
+batch_size: 4096
+
+# TLS configuration (optional)
+# Set enabled: true and provide cert/key paths to enable TLS
+tls:
+  enabled: false
+  cert_path: ""
+  key_path: ""
+
+# Enable protocol compression
+enable_compression: true

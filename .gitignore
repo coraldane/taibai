@@ -1,0 +1,50 @@
+# Rust build artifacts
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (for applications, not libraries)
+Cargo.lock
+
+# IDE and editor directories
+/.idea/
+/.vscode/
+/.motuo/
+/.emacs*
+/.vim/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Monax data directory (database files)
+/data/
+*.col
+
+# Log files
+*.log
+/logs/
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Test coverage
+/coverage/
+
+# Documentation build
+/doc/target/
+
+# Backup files
+*.bak
+*.backup

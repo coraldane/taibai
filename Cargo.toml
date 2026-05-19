@@ -1,0 +1,51 @@
+[package]
+name = "monax"
+version = "0.1.0"
+edition = "2021"
+description = "A columnar database server wire-compatible with taibai-go"
+
+[lib]
+name = "monax"
+path = "src/lib.rs"
+
+[[bin]]
+name = "monax"
+path = "src/main.rs"
+
+[[bin]]
+name = "segment"
+path = "src/bin/segment_checker.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+futures = "0.3"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+crc32fast = "1.4"
+memmap2 = "0.9"
+zstd = "0.13"
+bumpalo = "3"
+flate2 = "1"
+rustls-pemfile = "2"
+crossbeam-queue = "0.3"
+lazy_static = "1.4"
+rayon = "1.10"
+parking_lot = "0.12"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "scan_bench"
+harness = false
+path = "benches/scan_bench.rs"
