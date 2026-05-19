@@ -150,7 +150,7 @@ fn bench_bulk_insert_decode(c: &mut Criterion) {
     }
     group.bench_function("decode_1k_rows_3_cols", |b| {
         b.iter(|| {
-            let _ = monax::protocol::bulk::decode_columnar_bulk_insert(&payload);
+            let _ = monax::protocol::bulk::decode_bulk_insert(&payload);
         })
     });
     group.finish();

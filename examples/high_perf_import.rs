@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use monax::protocol::fast_bulk::{BulkEncoderV2, decode_bulk_fast};
+use monax::protocol::bulk::{BulkEncoder, decode_bulk_insert};
 use monax::storage::async_segment::{HighThroughputIngestor, DEFAULT_ROW_GROUP_SIZE};
 use monax::types::batch::{ColumnDef, RecordBatch, Schema};
 use monax::types::scalar::ScalarValue;
@@ -33,7 +33,7 @@ fn main() {
         .with_row_group_size(DEFAULT_ROW_GROUP_SIZE)
         .with_compression_level(3);
 
-    let mut encoder = BulkEncoderV2::new();
+    let mut encoder = BulkEncoder::new();
 
     let start = Instant::now();
     let mut rows_written = 0usize;

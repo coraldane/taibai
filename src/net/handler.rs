@@ -6,7 +6,6 @@ use crate::common::error::Result;
 use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::protocol::bulk;
-use crate::protocol::fast_bulk;
 use crate::sql::executor::{Engine, ExecResult};
 use crate::types::scalar::ScalarValue;
 
@@ -183,29 +182,14 @@ impl Handler {
 
         let db = session.database.clone();
         let disable_wal = session.disable_wal;
-        
+
         match self.engine.exec_bulk_insert_payload_with_wal_control(&db, payload, disable_wal) {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
             Err(e) => {
-                tracing::warn!(error = %e, "bulk insert direct path failed, falling back to RecordBatch decoder");
-                self.handle_bulk_insert_decoded(&db, payload, disable_wal)
-            }
-        }
-    }
-
-    fn handle_bulk_insert_decoded(&self, db: &str, payload: &[u8], disable_wal: bool) -> Result<Vec<Message>> {
-        match fast_bulk::decode_bulk_fast(payload) {
-            Ok(req) => {
-                match self.engine.exec_bulk_insert_with_wal_control(db, &req.table_name, req.batch, disable_wal) {
-                    Ok(row_count) => Ok(vec![build_ok(row_count)]),
-                    Err(e) => Ok(vec![build_error(&e.to_string())]),
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "bulk insert fast decode error, falling back to standard decoder");
-                match bulk::decode_columnar_bulk_insert(payload) {
+                tracing::warn!(error = %e, "bulk insert direct path failed, falling back to decoder");
+                match bulk::decode_bulk_insert(payload) {
                     Ok(req) => {
-                        match self.engine.exec_bulk_insert_with_wal_control(db, &req.table_name, req.batch, disable_wal) {
+                        match self.engine.exec_bulk_insert_with_wal_control(&db, &req.table_name, req.batch, disable_wal) {
                             Ok(row_count) => Ok(vec![build_ok(row_count)]),
                             Err(e) => Ok(vec![build_error(&e.to_string())]),
                         }
