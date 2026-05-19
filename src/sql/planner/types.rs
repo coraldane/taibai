@@ -13,6 +13,12 @@ pub enum LogicalPlan {
     Sort(SortPlan),
     Limit(LimitPlan),
     Join(JoinPlan),
+    /// TopN plan: combines ORDER BY + LIMIT into an optimized heap-sort operation.
+    TopN(TopNPlan),
+    /// Distinct plan: removes duplicate rows.
+    Distinct(DistinctPlan),
+    /// Window plan: computes window functions.
+    Window(WindowPlan),
     Empty,
 }
 
@@ -63,6 +69,10 @@ pub struct AggregatePlan {
     pub group_by: Vec<LogicalExpr>,
     pub aggregates: Vec<AggregateExpr>,
     pub input: Box<LogicalPlan>,
+    /// Optional HAVING filter applied after aggregation
+    pub having: Option<LogicalExpr>,
+    /// Whether DISTINCT should be applied to output
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +99,36 @@ pub struct JoinPlan {
     pub output_schema: Schema,
 }
 
+/// TopN plan: optimized ORDER BY + LIMIT using heap sort.
+#[derive(Debug, Clone)]
+pub struct TopNPlan {
+    pub sort_keys: Vec<SortKey>,
+    pub limit: usize,
+    pub offset: usize,
+    pub input: Box<LogicalPlan>,
+}
+
+/// Distinct plan.
+#[derive(Debug, Clone)]
+pub struct DistinctPlan {
+    pub input: Box<LogicalPlan>,
+}
+
+/// Window function plan.
+#[derive(Debug, Clone)]
+pub struct WindowPlan {
+    pub window_funcs: Vec<WindowFuncPlan>,
+    pub partition_by: Vec<LogicalExpr>,
+    pub order_by: Vec<SortKey>,
+    pub input: Box<LogicalPlan>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowFuncPlan {
+    pub func: WindowFunc,
+    pub output_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SortKey {
     pub expr: LogicalExpr,
@@ -108,6 +148,36 @@ pub enum LogicalExpr {
     IsNull(Box<LogicalExpr>),
     IsNotNull(Box<LogicalExpr>),
     Aggregate(AggregateExpr),
+    /// IN expression
+    In {
+        expr: Box<LogicalExpr>,
+        values: Vec<ScalarValue>,
+        negated: bool,
+    },
+    /// BETWEEN expression
+    Between {
+        expr: Box<LogicalExpr>,
+        low: Box<LogicalExpr>,
+        high: Box<LogicalExpr>,
+        negated: bool,
+    },
+    /// CASE WHEN expression
+    Case {
+        operand: Option<Box<LogicalExpr>>,
+        when_clauses: Vec<(LogicalExpr, LogicalExpr)>,
+        else_clause: Option<Box<LogicalExpr>>,
+    },
+    /// LIKE pattern matching
+    Like {
+        expr: Box<LogicalExpr>,
+        pattern: String,
+        negated: bool,
+    },
+    /// Scalar function call
+    Function {
+        name: String,
+        args: Vec<LogicalExpr>,
+    },
     Wildcard,
 }
 

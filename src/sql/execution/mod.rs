@@ -11,5 +11,8 @@ pub mod morsel;
 pub mod operators;
 pub mod expressions;
 pub mod pipeline;
+pub mod join_hashtable;
+pub mod strategy;
+pub mod functions;
 
 pub use engine::{Engine, ExecResult};

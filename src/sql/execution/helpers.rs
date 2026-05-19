@@ -53,6 +53,14 @@ pub fn eval_where_clause(
         Expr::Column(_) => Ok(true),
         Expr::QualifiedColumn { .. } => Ok(true),
         Expr::Function { .. } => Ok(true),
+        Expr::UnaryMinus(_) => Ok(true),
+        Expr::In { .. } => Ok(true),
+        Expr::Between { .. } => Ok(true),
+        Expr::Case { .. } => Ok(true),
+        Expr::Like { .. } => Ok(true),
+        Expr::Exists(_) => Ok(true),
+        Expr::Subquery(_) => Ok(true),
+        Expr::WindowFunction { .. } => Ok(true),
     }
 }
 
@@ -99,6 +107,14 @@ pub fn eval_expr_for_row(
                 .unwrap_or(ScalarValue::null_for_type(schema.columns[col_idx].data_type)))
         }
         Expr::Function { .. } => Ok(ScalarValue::Int64(None)),
+        Expr::UnaryMinus(_) => Ok(ScalarValue::Int64(None)),
+        Expr::In { .. } => Ok(ScalarValue::Bool(None)),
+        Expr::Between { .. } => Ok(ScalarValue::Bool(None)),
+        Expr::Case { .. } => Ok(ScalarValue::Int64(None)),
+        Expr::Like { .. } => Ok(ScalarValue::Bool(None)),
+        Expr::Exists(_) => Ok(ScalarValue::Bool(None)),
+        Expr::Subquery(_) => Ok(ScalarValue::Int64(None)),
+        Expr::WindowFunction { .. } => Ok(ScalarValue::Int64(None)),
     }
 }
 

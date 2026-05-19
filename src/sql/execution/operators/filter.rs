@@ -177,6 +177,7 @@ fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Sc
                 BinOp::Sub => ScalarValue::Int64(Some(l - r)),
                 BinOp::Mul => ScalarValue::Int64(Some(l * r)),
                 BinOp::Div => ScalarValue::Int64(Some(l / r)),
+                BinOp::Mod => ScalarValue::Int64(Some(l % r)),
                 BinOp::Eq => ScalarValue::Bool(Some(l == r)),
                 BinOp::Neq => ScalarValue::Bool(Some(l != r)),
                 BinOp::Lt => ScalarValue::Bool(Some(l < r)),
@@ -184,6 +185,7 @@ fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Sc
                 BinOp::Lte => ScalarValue::Bool(Some(l <= r)),
                 BinOp::Gte => ScalarValue::Bool(Some(l >= r)),
                 BinOp::And | BinOp::Or => ScalarValue::Bool(None),
+                _ => ScalarValue::Bool(None),
             }
         }
         (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
@@ -192,6 +194,7 @@ fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Sc
                 BinOp::Sub => ScalarValue::Float64(Some(l - r)),
                 BinOp::Mul => ScalarValue::Float64(Some(l * r)),
                 BinOp::Div => ScalarValue::Float64(Some(l / r)),
+                BinOp::Mod => ScalarValue::Float64(Some(l % r)),
                 _ => ScalarValue::Bool(None),
             }
         }

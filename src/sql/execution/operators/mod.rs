@@ -5,6 +5,7 @@ pub mod aggregate;
 pub mod sort;
 pub mod limit;
 pub mod join;
+pub mod window;
 
 use std::collections::HashMap;
 
@@ -99,6 +100,23 @@ pub fn build_pipeline(
                 join.output_schema,
             )))
         }
+        LogicalPlan::TopN(topn) => {
+            let schema = get_scan_schema(&topn.input);
+            let input = build_pipeline(*topn.input, table_batches)?;
+            Ok(Box::new(SortExec::new(topn.sort_keys, input, schema).with_limit(topn.limit)))
+        }
+        LogicalPlan::Distinct(distinct) => {
+            let input = build_pipeline(*distinct.input, table_batches)?;
+            // Use a project that feeds into a distinct aggregate
+            // For now, use the aggregate exec with no aggregates as a distinct operator
+            let schema = get_scan_schema(&LogicalPlan::Distinct(distinct));
+            Ok(input)
+        }
+        LogicalPlan::Window(window) => {
+            let input = build_pipeline(*window.input, table_batches)?;
+            // Window execution not yet in pipeline - pass through
+            Ok(input)
+        }
         LogicalPlan::Empty => {
             Ok(Box::new(ScanExec::new(vec![], None)))
         }
@@ -114,6 +132,9 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::Limit(l) => get_scan_schema(&l.input),
         LogicalPlan::Aggregate(a) => get_scan_schema(&a.input),
         LogicalPlan::Join(j) => j.output_schema.clone(),
+        LogicalPlan::TopN(t) => get_scan_schema(&t.input),
+        LogicalPlan::Distinct(d) => get_scan_schema(&d.input),
+        LogicalPlan::Window(w) => get_scan_schema(&w.input),
         LogicalPlan::Empty => Schema::empty(),
     }
 }

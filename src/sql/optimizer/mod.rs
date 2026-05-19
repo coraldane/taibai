@@ -7,6 +7,10 @@ pub mod partition_pruning;
 pub mod join_reorder;
 pub mod bloom_filter;
 pub mod cost;
+pub mod topn;
+pub mod expr_rules;
+pub mod filter_reorder;
+pub mod subquery;
 
 use crate::sql::planner::LogicalPlan;
 
@@ -23,14 +27,30 @@ impl Optimizer {
     pub fn new() -> Self {
         Self {
             rules: vec![
+                // Expression simplification first (cheapest)
+                Box::new(expr_rules::ExpressionSimplificationRule),
+                // Predicate pushdown before scan optimization
                 Box::new(predicate_pushdown::PredicatePushdownRule),
+                // Column pruning
                 Box::new(column_pruning::ColumnPruningRule),
+                // Zone map pruning
                 Box::new(zone_map_pruning::ZoneMapPruningRule),
-                Box::new(limit_pushdown::LimitPushdownRule),
-                Box::new(index_selection::IndexSelectionRule),
-                Box::new(partition_pruning::PartitionPruningRule),
-                Box::new(join_reorder::JoinReorderRule),
+                // Bloom filter optimization
                 Box::new(bloom_filter::BloomFilterRule),
+                // Limit pushdown
+                Box::new(limit_pushdown::LimitPushdownRule),
+                // TopN: combine ORDER BY + LIMIT
+                Box::new(topn::TopNRule),
+                // Filter reordering: put most selective first
+                Box::new(filter_reorder::FilterReorderRule),
+                // Index selection
+                Box::new(index_selection::IndexSelectionRule),
+                // Partition pruning
+                Box::new(partition_pruning::PartitionPruningRule),
+                // Join reorder
+                Box::new(join_reorder::JoinReorderRule),
+                // Subquery optimization (last, as it may need to execute subqueries)
+                Box::new(subquery::SubqueryRule),
             ],
         }
     }

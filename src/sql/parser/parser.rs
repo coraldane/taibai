@@ -387,6 +387,7 @@ impl Parser {
             from,
             where_clause,
             group_by,
+            having: None,
             order_by,
             limit,
             offset,

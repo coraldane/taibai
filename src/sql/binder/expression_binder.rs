@@ -23,12 +23,29 @@ pub enum BoundExprKind {
         right: Box<BoundExpr>,
     },
     UnaryNot(Box<BoundExpr>),
+    UnaryMinus(Box<BoundExpr>),
     IsNull(Box<BoundExpr>),
     IsNotNull(Box<BoundExpr>),
     Aggregate {
         func: crate::sql::planner::AggFunc,
         arg: Box<BoundExpr>,
         distinct: bool,
+    },
+    In {
+        expr: Box<BoundExpr>,
+        values: Vec<BoundExpr>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<BoundExpr>,
+        low: Box<BoundExpr>,
+        high: Box<BoundExpr>,
+        negated: bool,
+    },
+    Like {
+        expr: Box<BoundExpr>,
+        pattern: Box<BoundExpr>,
+        negated: bool,
     },
     Wildcard,
 }
@@ -142,6 +159,64 @@ impl<'a> ExpressionBinder<'a> {
                         distinct: *distinct,
                     },
                     data_type: dt,
+                })
+            }
+            // Handle new expression types with default binding
+            Expr::UnaryMinus(inner) => {
+                let bound = self.bind(inner)?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::UnaryMinus(Box::new(bound)),
+                    data_type: DataType::Int64,
+                })
+            }
+            Expr::In { expr, values, negated } => {
+                let bound_expr = self.bind(expr)?;
+                let bound_values: Result<Vec<_>> = values.iter().map(|v| self.bind(v)).collect();
+                Ok(BoundExpr {
+                    kind: BoundExprKind::In {
+                        expr: Box::new(bound_expr),
+                        values: bound_values?,
+                        negated: *negated,
+                    },
+                    data_type: DataType::Bool,
+                })
+            }
+            Expr::Between { expr, low, high, negated } => {
+                let bound_expr = self.bind(expr)?;
+                let bound_low = self.bind(low)?;
+                let bound_high = self.bind(high)?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Between {
+                        expr: Box::new(bound_expr),
+                        low: Box::new(bound_low),
+                        high: Box::new(bound_high),
+                        negated: *negated,
+                    },
+                    data_type: DataType::Bool,
+                })
+            }
+            Expr::Like { expr, pattern, negated } => {
+                let bound_expr = self.bind(expr)?;
+                let bound_pattern = self.bind(pattern)?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Like {
+                        expr: Box::new(bound_expr),
+                        pattern: Box::new(bound_pattern),
+                        negated: *negated,
+                    },
+                    data_type: DataType::Bool,
+                })
+            }
+            Expr::Case { operand, when_clauses, else_clause } => {
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Literal(ScalarValue::Bool(None)),
+                    data_type: DataType::Bool,
+                })
+            }
+            Expr::Exists(_) | Expr::Subquery(_) | Expr::WindowFunction { .. } => {
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Literal(ScalarValue::Bool(None)),
+                    data_type: DataType::Bool,
                 })
             }
         }

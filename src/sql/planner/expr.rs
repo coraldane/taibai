@@ -32,6 +32,14 @@ pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> 
             let e = ast_expr_to_logical(inner, schema)?;
             Ok(LogicalExpr::Not(Box::new(e)))
         }
+        Expr::UnaryMinus(inner) => {
+            let e = ast_expr_to_logical(inner, schema)?;
+            Ok(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(0)))),
+                op: BinOp::Sub,
+                right: Box::new(e),
+            })
+        }
         Expr::IsNull(inner) => {
             let e = ast_expr_to_logical(inner, schema)?;
             Ok(LogicalExpr::IsNull(Box::new(e)))
@@ -39,6 +47,24 @@ pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> 
         Expr::IsNotNull(inner) => {
             let e = ast_expr_to_logical(inner, schema)?;
             Ok(LogicalExpr::IsNotNull(Box::new(e)))
+        }
+        Expr::In { expr, values, negated } => {
+            let e = ast_expr_to_logical(expr, schema)?;
+            let vals: Vec<ScalarValue> = values.iter()
+                .filter_map(|v| match v { Expr::Literal(s) => Some(s.clone()), _ => None })
+                .collect();
+            Ok(LogicalExpr::In { expr: Box::new(e), values: vals, negated: *negated })
+        }
+        Expr::Between { expr, low, high, negated } => {
+            let e = ast_expr_to_logical(expr, schema)?;
+            let lo = ast_expr_to_logical(low, schema)?;
+            let hi = ast_expr_to_logical(high, schema)?;
+            Ok(LogicalExpr::Between { expr: Box::new(e), low: Box::new(lo), high: Box::new(hi), negated: *negated })
+        }
+        Expr::Like { expr, pattern, negated } => {
+            let e = ast_expr_to_logical(expr, schema)?;
+            let pat = match &**pattern { Expr::Literal(ScalarValue::VarChar(Some(s))) => s.clone(), _ => "%".to_string() };
+            Ok(LogicalExpr::Like { expr: Box::new(e), pattern: pat, negated: *negated })
         }
         Expr::Function { name, args, distinct } => {
             let func = match name.to_uppercase().as_str() {
@@ -60,6 +86,8 @@ pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> 
                 distinct: *distinct,
             }))
         }
+        // Unsupported expressions fall through
+        _ => Err(MonaxError::Sql(format!("unsupported expression type"))),
     }
 }
 
@@ -103,6 +131,14 @@ pub fn ast_expr_to_logical_join(
             let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema)?;
             Ok(LogicalExpr::Not(Box::new(e)))
         }
+        Expr::UnaryMinus(inner) => {
+            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema)?;
+            Ok(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(0)))),
+                op: BinOp::Sub,
+                right: Box::new(e),
+            })
+        }
         Expr::IsNull(inner) => {
             let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema)?;
             Ok(LogicalExpr::IsNull(Box::new(e)))
@@ -131,6 +167,8 @@ pub fn ast_expr_to_logical_join(
                 distinct: *distinct,
             }))
         }
+        // Unsupported expressions for join context
+        _ => Err(MonaxError::Sql(format!("unsupported expression type in join context"))),
     }
 }
 

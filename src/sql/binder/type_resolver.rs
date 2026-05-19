@@ -5,6 +5,15 @@ pub fn resolve_binary_type(left: &DataType, op: &BinOp, right: &DataType) -> Dat
     match op {
         BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => DataType::Bool,
         BinOp::And | BinOp::Or => DataType::Bool,
+        BinOp::Like | BinOp::NotLike => DataType::Bool,
+        BinOp::In | BinOp::NotIn => DataType::Bool,
+        BinOp::Mod => {
+            match (left, right) {
+                (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
+                (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float32,
+                _ => DataType::Int64,
+            }
+        }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
             match (left, right) {
                 (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,

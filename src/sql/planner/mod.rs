@@ -15,9 +15,9 @@ pub fn plan_select(
     stmt: &Statement,
     table_schemas: &HashMap<String, Schema>,
 ) -> Result<LogicalPlan> {
-    let (select_list, from, where_clause, group_by, order_by, limit, offset, _distinct) = match stmt {
-        Statement::Select { select_list, from, where_clause, group_by, order_by, limit, offset, distinct } => {
-            (select_list, from, where_clause, group_by, order_by, limit, offset, distinct)
+    let (select_list, from, where_clause, group_by, _having, order_by, limit, offset, _distinct) = match stmt {
+        Statement::Select { select_list, from, where_clause, group_by, having, order_by, limit, offset, distinct } => {
+            (select_list, from, where_clause, group_by, having, order_by, limit, offset, distinct)
         }
         _ => return Err(MonaxError::Internal("plan_select called with non-SELECT".into())),
     };
@@ -56,6 +56,8 @@ pub fn plan_select(
             group_by: group_exprs,
             aggregates: agg_exprs,
             input: Box::new(plan),
+            having: None,
+            distinct: false,
         });
     }
 
