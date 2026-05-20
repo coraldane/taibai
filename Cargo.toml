@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    ".",
+    "examples/batch_import",
+    "examples/multi_insert",
+]
+
 [package]
 name = "monax"
 version = "0.1.0"
