@@ -1,8 +1,6 @@
-use std::collections::BinaryHeap;
 
 use crate::common::error::Result;
 use crate::sql::planner::{LogicalExpr, SortKey};
-use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 

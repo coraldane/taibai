@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
 use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
-use crate::sql::execution::operators::filter::eval_expr_column;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;

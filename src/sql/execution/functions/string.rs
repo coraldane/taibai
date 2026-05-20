@@ -2,7 +2,7 @@
 use crate::common::error::Result;
 use crate::types::scalar::ScalarValue;
 
-use super::registry::{args_to_f64, args_to_i64, args_to_string};
+use super::registry::{args_to_i64, args_to_string};
 
 pub fn length(args: &[ScalarValue]) -> Result<ScalarValue> {
     match args_to_string(args, 0) {

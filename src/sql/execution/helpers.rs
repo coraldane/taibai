@@ -5,7 +5,7 @@ use crate::protocol::types::DataType;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use crate::sql::parser::ast::{BinOp, Expr, Statement};
+use crate::sql::parser::ast::{BinOp, Expr};
 
 pub fn eval_where_clause(
     expr: &Expr,
@@ -124,11 +124,20 @@ pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> Option<std::cmp::Ord
         (ScalarValue::Int32(Some(a)), ScalarValue::Int32(Some(b))) => Some(a.cmp(b)),
         (ScalarValue::Float64(Some(a)), ScalarValue::Float64(Some(b))) => a.partial_cmp(b),
         (ScalarValue::VarChar(Some(a)), ScalarValue::VarChar(Some(b))) => Some(a.cmp(b)),
+        (ScalarValue::Timestamp(Some(a)), ScalarValue::Timestamp(Some(b))) => Some(a.cmp(b)),
         _ => None,
     }
 }
 
 pub fn eval_expr_to_scalar(expr: &Expr, dt: &DataType) -> Result<ScalarValue> {
+    eval_expr_to_scalar_with_scale_timezone(expr, dt, 0, 0)
+}
+
+pub fn eval_expr_to_scalar_with_timezone(expr: &Expr, dt: &DataType, timezone_offset_hours: i32) -> Result<ScalarValue> {
+    eval_expr_to_scalar_with_scale_timezone(expr, dt, 0, timezone_offset_hours)
+}
+
+pub fn eval_expr_to_scalar_with_scale_timezone(expr: &Expr, dt: &DataType, scale: i32, timezone_offset_hours: i32) -> Result<ScalarValue> {
     match expr {
         Expr::Literal(v) => {
             match (dt, v) {
@@ -136,6 +145,24 @@ pub fn eval_expr_to_scalar(expr: &Expr, dt: &DataType) -> Result<ScalarValue> {
                 (DataType::Int16, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int16(Some(*v as i16))),
                 (DataType::Int8, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int8(Some(*v as i8))),
                 (DataType::Float32, ScalarValue::Float64(Some(v))) => Ok(ScalarValue::Float32(Some(*v as f32))),
+                (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
+                    let multiplier = 10_i64.pow(scale as u32) as f64;
+                    Ok(ScalarValue::Decimal(Some((*v * multiplier).round() as i64)))
+                }
+                (DataType::Decimal, ScalarValue::Int64(Some(v))) => {
+                    Ok(ScalarValue::Decimal(Some(*v)))
+                }
+                (DataType::Timestamp, ScalarValue::VarChar(Some(s))) => {
+                    use crate::sql::execution::functions::date::parse_timestamp_smart;
+                    match parse_timestamp_smart(s, timezone_offset_hours) {
+                        Some(ts) => Ok(ScalarValue::Timestamp(Some(ts))),
+                        None => Ok(ScalarValue::Timestamp(None)),
+                    }
+                }
+                (DataType::Timestamp, ScalarValue::Int64(Some(n))) => {
+                    use crate::sql::execution::functions::date::parse_timestamp_from_int;
+                    Ok(ScalarValue::Timestamp(Some(parse_timestamp_from_int(*n))))
+                }
                 _ => Ok(v.clone()),
             }
         }

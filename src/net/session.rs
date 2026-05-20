@@ -15,6 +15,7 @@ pub struct Session {
     pub compression_enabled: bool,
     pub bulk_import_mode: bool,
     pub disable_wal: bool,
+    pub timezone_offset_hours: i32,
 }
 
 impl Session {
@@ -32,6 +33,7 @@ impl Session {
             compression_enabled: false,
             bulk_import_mode: false,
             disable_wal: false,
+            timezone_offset_hours: 0,
         }
     }
 
@@ -41,5 +43,13 @@ impl Session {
 
     pub fn touch(&mut self) {
         self.last_activity = Instant::now();
+    }
+
+    pub fn set_timezone(&mut self, offset_hours: i32) {
+        self.timezone_offset_hours = offset_hours;
+    }
+
+    pub fn timezone_offset(&self) -> i32 {
+        self.timezone_offset_hours
     }
 }

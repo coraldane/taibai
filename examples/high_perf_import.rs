@@ -49,7 +49,7 @@ fn main() {
         rows_written += to_write;
     }
 
-    if ingestor.pending_rows > 0 {
+    if ingestor.pending_rows() > 0 {
         ingestor.compress_and_buffer().unwrap();
     }
 

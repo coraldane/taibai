@@ -3,6 +3,7 @@ use crate::protocol::types::DataType;
 use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
+use crate::sql::execution::functions::date::parse_timestamp_smart;
 
 use super::ColumnExpression;
 
@@ -24,7 +25,7 @@ impl ColumnExpression for CastExpression {
         let mut result = ColumnArray::empty(self.target_type);
         for i in 0..num_rows {
             let v = col.scalar(i);
-            let casted = cast_scalar(&v, &self.target_type);
+            let casted = cast_scalar(&v, &self.target_type, 0);
             result.push(&casted)?;
         }
         Ok(result)
@@ -35,7 +36,7 @@ impl ColumnExpression for CastExpression {
     }
 }
 
-fn cast_scalar(v: &ScalarValue, target: &DataType) -> ScalarValue {
+pub fn cast_scalar_with_timezone(v: &ScalarValue, target: &DataType, timezone_offset_hours: i32) -> ScalarValue {
     if v.is_null() {
         return ScalarValue::null_for_type(*target);
     }
@@ -56,6 +57,20 @@ fn cast_scalar(v: &ScalarValue, target: &DataType) -> ScalarValue {
                 Err(_) => ScalarValue::Float64(None),
             }
         }
+        (ScalarValue::VarChar(Some(s)), DataType::Timestamp) => {
+            match parse_timestamp_smart(s, timezone_offset_hours) {
+                Some(ts) => ScalarValue::Timestamp(Some(ts)),
+                None => ScalarValue::Timestamp(None),
+            }
+        }
+        (ScalarValue::Int64(Some(n)), DataType::Timestamp) => {
+            use crate::sql::execution::functions::date::parse_timestamp_from_int;
+            ScalarValue::Timestamp(Some(parse_timestamp_from_int(*n)))
+        }
         _ => v.clone(),
     }
+}
+
+fn cast_scalar(v: &ScalarValue, target: &DataType, timezone_offset_hours: i32) -> ScalarValue {
+    cast_scalar_with_timezone(v, target, timezone_offset_hours)
 }

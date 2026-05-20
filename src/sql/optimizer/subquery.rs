@@ -2,7 +2,6 @@
 /// replacing with literal values where possible.
 /// Inspired by taibai's SubqueryOptimizer and DuckDB's InClauseRewriter.
 use crate::sql::planner::{LogicalPlan, LogicalExpr};
-use crate::types::scalar::ScalarValue;
 
 use super::Rule;
 

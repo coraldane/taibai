@@ -31,12 +31,8 @@ pub trait Accumulator: Send + Sync {
 
 /// The global function registry.
 pub struct FunctionRegistry {
-    /// Scalar functions: name -> handler
     functions: HashMap<String, FunctionHandler>,
-    /// Function aliases (e.g., CEILING -> CEIL)
     aliases: HashMap<String, String>,
-    /// Aggregate functions
-    aggregate_functions: HashMap<String, Box<dyn AggregateFunction>>,
 }
 
 impl FunctionRegistry {
@@ -44,7 +40,6 @@ impl FunctionRegistry {
         let mut registry = Self {
             functions: HashMap::new(),
             aliases: HashMap::new(),
-            aggregate_functions: HashMap::new(),
         };
         registry.register_defaults();
         registry

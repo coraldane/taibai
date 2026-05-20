@@ -207,9 +207,7 @@ pub fn build_multi_insert_sql(table: &str, batch: &[TickElement]) -> String {
         sb.push_str(&e.bid_vol5.to_string());
         sb.push(',');
         if e.local_time != 0 {
-            sb.push('\'');
-            sb.push_str(&format_timestamp(e.local_time));
-            sb.push('\'');
+            sb.push_str(&e.local_time.to_string());
         } else {
             sb.push_str("NULL");
         }

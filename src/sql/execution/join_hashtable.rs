@@ -3,7 +3,6 @@
 /// Stores data in columnar format using RecordBatch for cache efficiency.
 use std::collections::HashMap;
 
-use crate::common::error::Result;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
 

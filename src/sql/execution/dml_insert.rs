@@ -1,11 +1,9 @@
 use crate::common::error::{MonaxError, Result};
-use crate::storage::segment::SegmentWriter;
 use crate::storage::sort_key::SortKeyInserter;
 use crate::types::batch::{RecordBatch, Schema};
-use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{discover_segments, sort_batch_by_key, eval_expr_to_scalar};
+use super::helpers::{sort_batch_by_key, eval_expr_to_scalar_with_scale_timezone};
 use crate::sql::parser::ast::Expr;
 
 pub fn exec_insert(
@@ -14,6 +12,7 @@ pub fn exec_insert(
     table: &str,
     columns: &[String],
     values: &[Vec<Expr>],
+    timezone_offset_hours: i32,
 ) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs.get(db)
@@ -41,7 +40,7 @@ pub fn exec_insert(
     let mut batch = RecordBatch::new(schema.clone());
     for row in values {
         for (val_idx, &col_idx) in col_indices.iter().enumerate() {
-            let scalar = eval_expr_to_scalar(&row[val_idx], &schema.columns[col_idx].data_type)?;
+            let scalar = eval_expr_to_scalar_with_scale_timezone(&row[val_idx], &schema.columns[col_idx].data_type, schema.columns[col_idx].scale, timezone_offset_hours)?;
             batch.column_mut(col_idx).unwrap().push(&scalar)?;
         }
     }
@@ -49,7 +48,7 @@ pub fn exec_insert(
     drop(catalogs);
 
     let table_dir = engine.data_dir().join(db).join(table);
-    let (write_dir, partition_key) = super::wal_helper::determine_write_dir(
+    let (write_dir, _partition_key) = super::wal_helper::determine_write_dir(
         engine, &table_meta, &batch, &table_dir,
     )?;
     std::fs::create_dir_all(&write_dir)?;
@@ -69,32 +68,17 @@ pub fn exec_insert(
         }
     }
 
-    let seg_path = if partition_key.is_empty() {
-        engine.next_segment_path(&write_dir, "")?
-    } else {
-        engine.next_partition_segment_path(&write_dir, &partition_key)?
-    };
-    let mut writer = SegmentWriter::create(&seg_path, schema, 8192)?;
-    writer.write_batch(&batch)?;
-    writer.seal()?;
-
-    {
-        let mut wal_writers = engine.wal_writers().lock().unwrap();
-        let key = table_dir.to_string_lossy().to_string();
-        if let Some(wal_writer) = wal_writers.get_mut(&key) {
-            wal_writer.clear()?;
-        }
-    }
+    let row_count = batch.num_rows() as u64;
+    engine.exec_bulk_insert_with_wal_control(db, table, batch, false)?;
 
     let mut catalogs = engine.catalogs().write().unwrap();
     if let Some(catalog) = catalogs.get_mut(db) {
         if let Some(meta) = catalog.get_table_mut(table) {
             meta.row_count += values.len() as i64;
-            meta.segment_count += 1;
         }
         let meta_dir = engine.data_dir().join("meta");
         catalog.save(&meta_dir)?;
     }
 
-    Ok(ExecResult::Ok { rows_affected: values.len() as u64 })
+    Ok(ExecResult::Ok { rows_affected: row_count })
 }

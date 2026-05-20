@@ -2,7 +2,6 @@
 use crate::common::error::Result;
 use crate::types::scalar::ScalarValue;
 
-use super::registry::args_to_string;
 
 pub fn to_int(args: &[ScalarValue]) -> Result<ScalarValue> {
     match args.first() {

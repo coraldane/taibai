@@ -1,7 +1,7 @@
 /// Hash Join Execution Operator - DuckDB-inspired Sink/Probe two-phase design.
 /// Supports: Inner, Left, Right, Full, Cross, Semi, Anti, and Asof joins.
 /// Uses columnar data processing through RecordBatch for cache efficiency.
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::Result;
 use crate::sql::execution::join_hashtable::{AsofJoinIndex, JoinHashTable, RowPointer};
 use crate::sql::parser::ast::JoinType;
 use crate::sql::planner::LogicalExpr;
@@ -9,8 +9,6 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use super::filter::eval_expr_column;
-use super::limit::trim_batch;
 use super::ExecutionOp;
 
 /// Columnar Hash Join Executor
@@ -140,7 +138,6 @@ impl ExecutionOp for HashJoinExec {
             JoinType::Semi => self.probe_semi(),
             JoinType::Anti => self.probe_anti(),
             JoinType::Asof => self.probe_asof(),
-            _ => Ok(None),
         }
     }
 }
@@ -396,7 +393,7 @@ impl HashJoinExec {
                     let key: Vec<ScalarValue> = self.right_key_cols.iter()
                         .map(|&idx| right_row[idx].clone())
                         .collect();
-                    let matches = {
+                    let _matches = {
                         let ht = self.hash_table.as_mut().unwrap();
                         let m = ht.probe(&key);
                         for ptr in &m {

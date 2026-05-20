@@ -1,5 +1,4 @@
 use crate::common::error::Result;
-use crate::protocol::types::DataType;
 use crate::sql::planner::LogicalExpr;
 use crate::sql::execution::operators::filter::eval_expr_column;
 use crate::sql::execution::operators::project::infer_type;

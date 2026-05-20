@@ -1,6 +1,6 @@
 /// Query Analyzer - analyzes query properties for strategy selection.
 /// Inspired by taibai's QueryAnalyzer with selectivity estimation.
-use super::strategy::{QueryProperties, QuerySignature};
+use super::strategy::QueryProperties;
 
 pub struct QueryAnalyzer;
 

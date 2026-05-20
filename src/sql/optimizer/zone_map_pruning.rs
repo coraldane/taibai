@@ -1,6 +1,5 @@
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::*;
-use crate::types::scalar::ScalarValue;
 
 use super::Rule;
 

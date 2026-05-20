@@ -74,11 +74,18 @@ impl Handler {
         };
 
         let binary_results = rest.first().map(|&b| b != 0).unwrap_or(false);
+        
+        let timezone_offset_hours = if rest.len() >= 5 {
+            i32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]])
+        } else {
+            0
+        };
 
         let mut session = Session::new(username.to_string(), database);
         session.binary_results = binary_results;
+        session.timezone_offset_hours = timezone_offset_hours;
         let session_id = session.session_id_string();
-        tracing::info!(username, session_id = %session_id, "login success");
+        tracing::info!(username, session_id = %session_id, timezone_offset_hours, "login success");
         self.session = Some(session);
 
         Ok(vec![build_auth_ok(&session_id)])
@@ -98,7 +105,10 @@ impl Handler {
             Err(_) => std::str::from_utf8(payload).unwrap_or("").trim()
         };
 
-        tracing::info!(sql, "query received");
+        let is_insert = sql.to_uppercase().starts_with("INSERT");
+        if !is_insert {
+            tracing::info!(sql, "query received");
+        }
 
         let session = match &mut self.session {
             Some(s) => s,
@@ -128,7 +138,9 @@ impl Handler {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, sql, "query error");
+                if !is_insert {
+                    tracing::warn!(error = %e, sql, "query error");
+                }
                 Ok(vec![build_error(&e.to_string())])
             }
         }

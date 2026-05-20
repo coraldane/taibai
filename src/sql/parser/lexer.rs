@@ -73,6 +73,8 @@ pub enum Token {
     Gt,
     Lte,
     Gte,
+    Minus,
+    Plus,
     // Special
     Eof,
 }
@@ -145,6 +147,8 @@ impl std::fmt::Display for Token {
             Token::Gt => write!(f, ">"),
             Token::Lte => write!(f, "<="),
             Token::Gte => write!(f, ">="),
+            Token::Minus => write!(f, "-"),
+            Token::Plus => write!(f, "+"),
             Token::Eof => write!(f, "EOF"),
         }
     }
@@ -182,6 +186,7 @@ impl Lexer {
                 ';' => { self.pos += 1; Token::Semicolon }
                 '.' => { self.pos += 1; Token::Dot }
                 '*' => { self.pos += 1; Token::Star }
+                '+' => { self.pos += 1; Token::Plus }
                 '=' => { self.pos += 1; Token::Eq }
                 '<' => {
                     self.pos += 1;
@@ -197,6 +202,14 @@ impl Lexer {
                     self.pos += 1;
                     if self.peek_char() == Some('=') { self.pos += 1; Token::Neq }
                     else { return Err(MonaxError::Sql("unexpected character '!'".into())); }
+                }
+                '-' => {
+                    self.pos += 1;
+                    if self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        self.read_negative_number()?
+                    } else {
+                        Token::Minus
+                    }
                 }
                 '\'' => self.read_string()?,
                 c if c.is_ascii_digit() => self.read_number()?,
@@ -256,6 +269,26 @@ impl Lexer {
             let s: String = self.input[start..self.pos].iter().collect();
             let v = s.parse::<i64>().map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
             Ok(Token::Integer(v))
+        }
+    }
+
+    fn read_negative_number(&mut self) -> Result<Token> {
+        let start = self.pos;
+        while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+        if self.pos < self.input.len() && self.input[self.pos] == '.' {
+            self.pos += 1;
+            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+            let s: String = self.input[start..self.pos].iter().collect();
+            let v = s.parse::<f64>().map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
+            Ok(Token::Float(-v))
+        } else {
+            let s: String = self.input[start..self.pos].iter().collect();
+            let v = s.parse::<i64>().map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
+            Ok(Token::Integer(-v))
         }
     }
 
@@ -377,8 +410,6 @@ mod tests {
     fn test_operators() {
         let mut lexer = Lexer::new("a <= b AND c != d OR e > f");
         let tokens = lexer.tokenize().unwrap();
-        // 0:Ident("a") 1:Lte 2:Ident("b") 3:And 4:Ident("c")
-        // 5:Neq 6:Ident("d") 7:Or 8:Ident("e") 9:Gt 10:Ident("f")
         assert_eq!(tokens[1], Token::Lte);
         assert_eq!(tokens[5], Token::Neq);
         assert_eq!(tokens[9], Token::Gt);
@@ -400,5 +431,37 @@ mod tests {
         assert_eq!(tokens[2], Token::If);
         assert_eq!(tokens[3], Token::Not);
         assert_eq!(tokens[4], Token::Exists);
+    }
+
+    #[test]
+    fn test_negative_integer() {
+        let mut lexer = Lexer::new("-42");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Integer(-42));
+    }
+
+    #[test]
+    fn test_negative_float() {
+        let mut lexer = Lexer::new("-3.14");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Float(-3.14));
+    }
+
+    #[test]
+    fn test_minus_operator() {
+        let mut lexer = Lexer::new("a - b");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Ident("a".into()));
+        assert_eq!(tokens[1], Token::Minus);
+        assert_eq!(tokens[2], Token::Ident("b".into()));
+    }
+
+    #[test]
+    fn test_negative_in_values() {
+        let mut lexer = Lexer::new("VALUES (-1, -2.5, 'test')");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[2], Token::Integer(-1));
+        assert_eq!(tokens[4], Token::Float(-2.5));
+        assert_eq!(tokens[6], Token::StringLit("test".into()));
     }
 }

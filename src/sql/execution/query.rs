@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;

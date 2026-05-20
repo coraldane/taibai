@@ -207,7 +207,7 @@ impl<'a> ExpressionBinder<'a> {
                     data_type: DataType::Bool,
                 })
             }
-            Expr::Case { operand, when_clauses, else_clause } => {
+            Expr::Case { operand: _, when_clauses: _, else_clause: _ } => {
                 Ok(BoundExpr {
                     kind: BoundExprKind::Literal(ScalarValue::Bool(None)),
                     data_type: DataType::Bool,

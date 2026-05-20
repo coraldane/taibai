@@ -33,7 +33,7 @@ pub fn write_wal(engine: &Engine, table_dir: &Path, batch: &RecordBatch) -> Resu
 }
 
 pub fn determine_write_dir(
-    engine: &Engine,
+    _engine: &Engine,
     table_meta: &TableMeta,
     batch: &RecordBatch,
     default_dir: &Path,

@@ -79,11 +79,22 @@ impl Client {
         password: &str,
         database: &str,
     ) -> Result<()> {
+        self.login_with_timezone(username, password, database, 0).await
+    }
+
+    pub async fn login_with_timezone(
+        &mut self,
+        username: &str,
+        password: &str,
+        database: &str,
+        timezone_offset_hours: i32,
+    ) -> Result<()> {
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, username);
         write_len_prefixed_string(&mut payload, password);
         write_len_prefixed_string(&mut payload, database);
         payload.push(0);
+        payload.extend_from_slice(&timezone_offset_hours.to_le_bytes());
 
         self.send(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
             .await?;

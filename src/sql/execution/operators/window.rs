@@ -111,7 +111,7 @@ impl ExecutionOp for WindowExec {
 
         // Build output: original columns + window function columns
         let mut output_col_defs = self.input_schema.columns.clone();
-        for (func_idx, func) in self.window_funcs.iter().enumerate() {
+        for (func_idx, _func) in self.window_funcs.iter().enumerate() {
             let name = format!("window_{}", func_idx);
             output_col_defs.push(ColumnDef::new(&name, ScalarValue::Int64(None).data_type()));
         }
@@ -193,7 +193,7 @@ fn compute_window_func(
                     result[i] = rows[row_indices[i + offset]][0].clone(); // simplified
                 } else {
                     result[i] = default.as_ref()
-                        .and_then(|d| Some(ScalarValue::Int64(None)))
+                        .and_then(|_d| Some(ScalarValue::Int64(None)))
                         .unwrap_or(ScalarValue::Int64(None));
                 }
             }
@@ -204,12 +204,12 @@ fn compute_window_func(
                     result[i] = rows[row_indices[i - offset]][0].clone(); // simplified
                 } else {
                     result[i] = default.as_ref()
-                        .and_then(|d| Some(ScalarValue::Int64(None)))
+                        .and_then(|_d| Some(ScalarValue::Int64(None)))
                         .unwrap_or(ScalarValue::Int64(None));
                 }
             }
         }
-        WindowFunc::Aggregate { func: agg_name, args, .. } => {
+        WindowFunc::Aggregate { func: agg_name, args: _, .. } => {
             // Simplified: compute aggregate over the entire partition
             let values: Vec<ScalarValue> = row_indices.iter()
                 .map(|&idx| rows[idx].get(0).cloned().unwrap_or(ScalarValue::Int64(None)))

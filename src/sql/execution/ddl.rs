@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::schema::{DatabaseCatalog, PartitionType, TableMeta};
+use crate::storage::schema::{DatabaseCatalog, PartitionType};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 
 use super::engine::{Engine, ExecResult};

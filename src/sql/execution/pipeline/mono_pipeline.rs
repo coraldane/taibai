@@ -1,5 +1,5 @@
 use crate::common::error::Result;
-use crate::sql::planner::{LogicalPlan, LogicalExpr, AggregateExpr, SortKey};
+use crate::sql::planner::{LogicalPlan, LogicalExpr};
 use crate::types::batch::RecordBatch;
 
 use super::push_filter::PushFilter;
@@ -139,9 +139,9 @@ fn schema_of(plan: &LogicalPlan) -> crate::types::batch::Schema {
         LogicalPlan::Scan(s) => s.schema.clone(),
         LogicalPlan::Filter(f) => schema_of(&f.input),
         LogicalPlan::Project(p) => {
-            let input_schema = schema_of(&p.input);
+            let _input_schema = schema_of(&p.input);
             let mut cols = Vec::new();
-            for (i, expr) in p.expressions.iter().enumerate() {
+            for (i, _expr) in p.expressions.iter().enumerate() {
                 let name = p.aliases[i].as_deref().unwrap_or("expr");
                 let dt = crate::protocol::types::DataType::Int64;
                 cols.push(crate::types::batch::ColumnDef::new(name, dt));

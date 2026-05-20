@@ -15,6 +15,7 @@ use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
 
 const MAX_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const MIN_SEGMENT_SIZE: u64 = 1 * 1024 * 1024 * 1024;
 
 pub enum ExecResult {
     Ok { rows_affected: u64 },
@@ -132,7 +133,7 @@ impl Engine {
                 super::ddl::exec_drop_table(self, &session.database, name, *if_exists)
             }
             Statement::Insert { table, columns, values } => {
-                super::dml_insert::exec_insert(self, &session.database, table, columns, values)
+                super::dml_insert::exec_insert(self, &session.database, table, columns, values, session.timezone_offset_hours)
             }
             Statement::Update { table, assignments, where_clause } => {
                 super::dml_update::exec_update(self, &session.database, table, assignments, where_clause)
@@ -153,7 +154,6 @@ impl Engine {
             Statement::ShowDatabases => {
                 super::ddl::exec_show_databases(self)
             }
-            _ => Err(MonaxError::Sql(format!("unsupported statement type"))),
         }
     }
 
@@ -166,7 +166,7 @@ impl Engine {
         let mut seqs = self.segment_seqs.lock().unwrap();
         let seq = seqs.entry(key).or_insert(0);
         *seq += 1;
-        Ok(table_dir.join(format!("seg-{:06}.monax", seq)))
+        Ok(table_dir.join(format!("seg_{:05}.dat", seq)))
     }
 
     pub fn next_partition_segment_path(&self, table_dir: &Path, partition_key: &str) -> Result<PathBuf> {
@@ -174,7 +174,7 @@ impl Engine {
         let mut seqs = self.segment_seqs.lock().unwrap();
         let seq = seqs.entry(key).or_insert(0);
         *seq += 1;
-        Ok(table_dir.join(format!("p{}_seg-{:06}.monax", partition_key, seq)))
+        Ok(table_dir.join(format!("p{}_{:04}.dat", partition_key, seq)))
     }
 
     pub fn get_table_meta(&self, db: &str, table: &str) -> Option<crate::storage::schema::TableMeta> {
@@ -190,8 +190,11 @@ impl Engine {
     pub fn flush_all_buffers(&self) -> Result<u64> {
         let mut active = self.active_segments.lock().unwrap();
         let mut total = 0u64;
-        for (_, segment) in active.drain() {
-            total += segment.total_rows;
+        for (_, mut segment) in active.drain() {
+            if segment.total_rows > 0 {
+                self.seal_segment(&mut segment)?;
+                total += segment.total_rows;
+            }
         }
         Ok(total)
     }
@@ -200,20 +203,12 @@ impl Engine {
         &self.catalogs
     }
 
-    pub(crate) fn segment_seqs(&self) -> &Mutex<HashMap<String, u32>> {
-        &self.segment_seqs
-    }
-
     pub(crate) fn wal_writers(&self) -> &Mutex<HashMap<String, WalWriter>> {
         &self.wal_writers
     }
 
     pub(crate) fn next_txn_id(&self) -> &Mutex<u64> {
         &self.next_txn_id
-    }
-
-    pub(crate) fn bulk_mode_flag(&self) -> &Mutex<bool> {
-        &self.bulk_mode
     }
 
     pub fn exec_bulk_insert_with_wal_control(
