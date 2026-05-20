@@ -1,8 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
-use monax::protocol::bulk::{BulkEncoder, decode_bulk_insert};
 use monax::storage::async_segment::{HighThroughputIngestor, DEFAULT_ROW_GROUP_SIZE};
 use monax::types::batch::{ColumnDef, RecordBatch, Schema};
 use monax::types::scalar::ScalarValue;
@@ -32,8 +30,6 @@ fn main() {
     let mut ingestor = HighThroughputIngestor::new(schema.clone())
         .with_row_group_size(DEFAULT_ROW_GROUP_SIZE)
         .with_compression_level(3);
-
-    let mut encoder = BulkEncoder::new();
 
     let start = Instant::now();
     let mut rows_written = 0usize;

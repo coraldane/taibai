@@ -5,7 +5,6 @@ use crate::common::config::ServerConfig;
 use crate::common::error::Result;
 use crate::net::session::Session;
 use crate::protocol::message::*;
-use crate::protocol::bulk;
 use crate::sql::execution::{Engine, ExecResult};
 use crate::types::scalar::ScalarValue;
 
@@ -33,10 +32,7 @@ impl Handler {
                 Ok(vec![])
             }
             MSG_TYPE_QUERY => self.handle_query(&msg.payload),
-            MSG_TYPE_INSERT => self.handle_insert(&msg.payload),
-            MSG_TYPE_BULK_INSERT | MSG_TYPE_BULK_INSERT_COLUMNAR => {
-                self.handle_bulk_insert(&msg.payload)
-            }
+            MSG_TYPE_BULK_INSERT_COLUMNAR => self.handle_bulk_insert(&msg.payload),
             MSG_TYPE_FLUSH => self.handle_flush(),
 
             MSG_TYPE_PREPARE => self.handle_prepare(&msg.payload),
@@ -46,11 +42,6 @@ impl Handler {
             MSG_TYPE_BEGIN_TXN => self.handle_begin_txn(),
             MSG_TYPE_COMMIT_TXN => self.handle_commit_txn(),
             MSG_TYPE_ROLLBACK_TXN => self.handle_rollback_txn(),
-
-            MSG_TYPE_BULK_INSERT_ASYNC => self.handle_bulk_insert_async(&msg.payload),
-            MSG_TYPE_BULK_INSERT_ACK => {
-                Ok(vec![build_ok(0)])
-            }
 
             MSG_TYPE_AUTH_FAIL => {
                 Ok(vec![build_error("authentication failed")])
@@ -145,14 +136,14 @@ impl Handler {
 
     fn handle_start_bulk_import(&mut self, sql: &str) -> Result<Vec<Message>> {
         let disable_wal = sql.contains("\"disable_wal\":true") || sql.contains("\"disable_wal\": true");
-        
+
         self.engine.set_bulk_mode(disable_wal);
-        
+
         if let Some(session) = &mut self.session {
             session.bulk_import_mode = true;
             session.disable_wal = disable_wal;
         }
-        
+
         tracing::info!(disable_wal, "bulk import mode started");
         Ok(vec![build_ok(0)])
     }
@@ -160,18 +151,14 @@ impl Handler {
     fn handle_stop_bulk_import(&mut self) -> Result<Vec<Message>> {
         self.engine.set_bulk_mode(false);
         let flushed = self.engine.flush_all_buffers()?;
-        
+
         if let Some(session) = &mut self.session {
             session.bulk_import_mode = false;
             session.disable_wal = false;
         }
-        
+
         tracing::info!(rows_flushed = flushed, "bulk import mode stopped");
         Ok(vec![build_ok(flushed)])
-    }
-
-    fn handle_insert(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
-        self.handle_query(payload)
     }
 
     fn handle_bulk_insert(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -186,19 +173,8 @@ impl Handler {
         match self.engine.exec_bulk_insert_payload_with_wal_control(&db, payload, disable_wal) {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
             Err(e) => {
-                tracing::warn!(error = %e, "bulk insert direct path failed, falling back to decoder");
-                match bulk::decode_bulk_insert(payload) {
-                    Ok(req) => {
-                        match self.engine.exec_bulk_insert_with_wal_control(&db, &req.table_name, req.batch, disable_wal) {
-                            Ok(row_count) => Ok(vec![build_ok(row_count)]),
-                            Err(e) => Ok(vec![build_error(&e.to_string())]),
-                        }
-                    }
-                    Err(e2) => {
-                        tracing::warn!(error = %e2, "bulk insert decode error");
-                        Ok(vec![build_error(&format!("bulk insert error: {}", e2))])
-                    }
-                }
+                tracing::warn!(error = %e, "bulk insert error");
+                Ok(vec![build_error(&e.to_string())])
             }
         }
     }
@@ -299,15 +275,6 @@ impl Handler {
         };
         session.active_txn_id = 0;
         Ok(vec![build_ok(0)])
-    }
-
-    fn handle_bulk_insert_async(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
-        let result = self.handle_bulk_insert(payload)?;
-        if !result.is_empty() && result[0].msg_type == MSG_TYPE_OK {
-            let ack_payload = result[0].payload.clone();
-            return Ok(vec![Message::new(MSG_TYPE_BULK_INSERT_ACK, ack_payload)]);
-        }
-        Ok(result)
     }
 
     fn handle_cursor_open(&mut self, payload: &[u8]) -> Result<Vec<Message>> {

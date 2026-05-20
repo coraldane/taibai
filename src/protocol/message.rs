@@ -1,30 +1,21 @@
 use bytes::Bytes;
 use crate::common::error::{MonaxError, Result};
 
-// ---- Wire constants ----
-
-/// Protocol magic bytes: 0xDB01 LE
-pub const MAGIC: [u8; 2] = [0x01, 0xDB]; // LE: low byte first
+pub const MAGIC: [u8; 2] = [0x01, 0xDB];
 pub const HEADER_SIZE: usize = 7;
-pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64MB
-
-// ---- Message type constants (u8) ----
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 pub const MSG_TYPE_QUERY: u8 = 0x01;
 pub const MSG_TYPE_RESULT: u8 = 0x02;
 pub const MSG_TYPE_ERROR: u8 = 0x03;
 pub const MSG_TYPE_PING: u8 = 0x04;
 pub const MSG_TYPE_PONG: u8 = 0x05;
-pub const MSG_TYPE_INSERT: u8 = 0x06;
 pub const MSG_TYPE_OK: u8 = 0x07;
 pub const MSG_TYPE_LOGIN: u8 = 0x08;
 pub const MSG_TYPE_LOGOUT: u8 = 0x09;
 pub const MSG_TYPE_AUTH_OK: u8 = 0x0A;
 pub const MSG_TYPE_AUTH_FAIL: u8 = 0x0B;
 
-pub const MSG_TYPE_BULK_INSERT: u8 = 0x20;
-pub const MSG_TYPE_BULK_INSERT_ASYNC: u8 = 0x21;
-pub const MSG_TYPE_BULK_INSERT_ACK: u8 = 0x22;
 pub const MSG_TYPE_BULK_INSERT_COLUMNAR: u8 = 0x23;
 pub const MSG_TYPE_BINARY_QUERY_RESULT: u8 = 0x24;
 pub const MSG_TYPE_FLUSH: u8 = 0x25;
@@ -41,9 +32,6 @@ pub const MSG_TYPE_PREPARE: u8 = 0x50;
 pub const MSG_TYPE_EXECUTE: u8 = 0x51;
 pub const MSG_TYPE_CLOSE_STMT: u8 = 0x52;
 
-// ---- Header ----
-
-/// 7-byte wire header: [magic:2 LE][msg_type:1][payload_len:4 LE]
 #[derive(Debug, Clone)]
 pub struct MessageHeader {
     pub msg_type: u8,
@@ -73,9 +61,6 @@ impl MessageHeader {
     }
 }
 
-// ---- Message ----
-
-/// A decoded message with type and payload.
 #[derive(Debug, Clone)]
 pub struct Message {
     pub msg_type: u8,
@@ -92,10 +77,6 @@ impl Message {
     }
 }
 
-// ---- Wire helper functions ----
-
-/// Read a u32-LE length-prefixed string from a byte slice.
-/// Returns (value_bytes, remaining_bytes).
 pub fn read_len_prefixed_string(data: &[u8]) -> Result<(&str, &[u8])> {
     if data.len() < 4 {
         return Err(MonaxError::Protocol("insufficient data for length prefix".into()));
@@ -112,14 +93,12 @@ pub fn read_len_prefixed_string(data: &[u8]) -> Result<(&str, &[u8])> {
     Ok((s, &data[4 + len..]))
 }
 
-/// Write a u32-LE length-prefixed string into a byte buffer.
 pub fn write_len_prefixed_string(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);
 }
 
-/// Write a u32-LE length-prefixed bytes into a byte buffer.
 pub fn write_len_prefixed_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
     buf.extend_from_slice(data);

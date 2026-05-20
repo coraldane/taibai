@@ -18,9 +18,6 @@ use crate::types::array::ColumnArray;
 use crate::types::scalar::ScalarValue;
 
 #[allow(dead_code)]
-pub const MSG_TYPE_BULK_INSERT_COLUMNAR: u8 = 0x23;
-
-#[allow(dead_code)]
 pub struct BulkImportConfig {
     pub disable_wal: bool,
 }
@@ -248,9 +245,7 @@ impl Client {
         }
 
         self.pending_count.fetch_add(1, Ordering::Relaxed);
-        
         self.send(Message::new(MSG_TYPE_BULK_INSERT_COLUMNAR, payload)).await?;
-        
         Ok(())
     }
 
@@ -269,10 +264,8 @@ impl Client {
         }
 
         self.pipeline_mode.store(false, Ordering::Release);
-        
         self.send(Message::empty(MSG_TYPE_PING)).await?;
         self.recv().await?;
-        
         Ok(())
     }
 
@@ -299,7 +292,7 @@ impl Client {
         let resp = self.recv().await?;
         self.response_handled.fetch_add(1, Ordering::Relaxed);
         match resp.msg_type {
-            MSG_TYPE_OK | MSG_TYPE_BULK_INSERT_ACK => Ok(()),
+            MSG_TYPE_OK => Ok(()),
             MSG_TYPE_ERROR => Err(MonaxError::Storage(
                 String::from_utf8_lossy(&resp.payload).to_string(),
             )),
