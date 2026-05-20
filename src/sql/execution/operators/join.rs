@@ -150,22 +150,21 @@ impl HashJoinExec {
 
     /// Inner join: emit rows where both sides match.
     fn probe_inner(&mut self) -> Result<Option<RecordBatch>> {
-        let ht = self.hash_table.as_ref().unwrap();
         loop {
-            // Drain buffered output first
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
-            // Get next right row
             let right_row = match self.get_next_right_row() {
                 Some(row) => row,
                 None => return Ok(None),
             };
-            // Probe hash table
             let key: Vec<ScalarValue> = self.right_key_cols.iter()
                 .map(|&idx| right_row[idx].clone())
                 .collect();
-            let matches = ht.probe(&key);
+            let matches = {
+                let ht = self.hash_table.as_ref().unwrap();
+                ht.probe(&key)
+            };
             for ptr in &matches {
                 let left_row = self.collect_left_row(ptr);
                 self.probe_state.output_buffer.push((left_row, Some(right_row.clone())));
@@ -179,7 +178,6 @@ impl HashJoinExec {
 
     /// Left join: emit matching rows + unmatched left rows with NULL right.
     fn probe_left(&mut self) -> Result<Option<RecordBatch>> {
-        let ht = self.hash_table.as_mut().unwrap();
         loop {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
@@ -187,11 +185,10 @@ impl HashJoinExec {
             let right_row = match self.get_next_right_row() {
                 Some(row) => row,
                 None => {
-                    // Emit unmatched left rows
                     if self.probe_state.finalize_done {
                         return Ok(None);
                     }
-                    self.emit_unmatched_left(ht)?;
+                    self.emit_unmatched_left()?;
                     self.probe_state.finalize_done = true;
                     if self.probe_state.output_buffer.is_empty() {
                         return Ok(None);
@@ -202,11 +199,21 @@ impl HashJoinExec {
             let key: Vec<ScalarValue> = self.right_key_cols.iter()
                 .map(|&idx| right_row[idx].clone())
                 .collect();
-            let matches = ht.probe(&key);
-            for ptr in &matches {
-                ht.mark_matched(ptr);
-                let left_row = self.collect_left_row(ptr);
-                self.probe_state.output_buffer.push((left_row, Some(right_row.clone())));
+            let matches = {
+                let ht = self.hash_table.as_ref().unwrap();
+                ht.probe(&key)
+            };
+            if !matches.is_empty() {
+                {
+                    let ht = self.hash_table.as_mut().unwrap();
+                    for ptr in &matches {
+                        ht.mark_matched(ptr);
+                    }
+                }
+                for ptr in &matches {
+                    let left_row = self.collect_left_row(ptr);
+                    self.probe_state.output_buffer.push((left_row, Some(right_row.clone())));
+                }
             }
             if self.probe_state.output_buffer.is_empty() {
                 continue;
@@ -217,7 +224,6 @@ impl HashJoinExec {
 
     /// Right join: build from right, probe with left, emit unmatched right with NULL left.
     fn probe_right(&mut self) -> Result<Option<RecordBatch>> {
-        let ht = self.hash_table.as_mut().unwrap();
         loop {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
@@ -228,7 +234,7 @@ impl HashJoinExec {
                     if self.probe_state.finalize_done {
                         return Ok(None);
                     }
-                    self.emit_unmatched_right(ht)?;
+                    self.emit_unmatched_right()?;
                     self.probe_state.finalize_done = true;
                     if self.probe_state.output_buffer.is_empty() {
                         return Ok(None);
@@ -236,16 +242,27 @@ impl HashJoinExec {
                     return self.drain_buffer();
                 }
             };
-            // Probe with left key (using right_key_cols as build side)
             let key: Vec<ScalarValue> = self.left_key_cols.iter()
                 .map(|&idx| left_row[idx].clone())
                 .collect();
-            let matches = ht.probe(&key);
-            for ptr in &matches {
-                ht.mark_matched(ptr);
-                let right_row = self.collect_build_row(ht, ptr);
-                // For right join output: left cols + right cols
-                self.probe_state.output_buffer.push((left_row.clone(), Some(right_row)));
+            let matches = {
+                let ht = self.hash_table.as_ref().unwrap();
+                ht.probe(&key)
+            };
+            if !matches.is_empty() {
+                {
+                    let ht = self.hash_table.as_mut().unwrap();
+                    for ptr in &matches {
+                        ht.mark_matched(ptr);
+                    }
+                }
+                for ptr in &matches {
+                    let right_row = {
+                        let ht = self.hash_table.as_ref().unwrap();
+                        self.collect_build_row(ht, ptr)
+                    };
+                    self.probe_state.output_buffer.push((left_row.clone(), Some(right_row)));
+                }
             }
             if self.probe_state.output_buffer.is_empty() {
                 continue;
@@ -256,8 +273,6 @@ impl HashJoinExec {
 
     /// Full outer join: combine left and right join logic.
     fn probe_full(&mut self) -> Result<Option<RecordBatch>> {
-        // First do left join with right probe
-        let ht = self.hash_table.as_mut().unwrap();
         loop {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
@@ -268,7 +283,7 @@ impl HashJoinExec {
                     if self.probe_state.finalize_done {
                         return Ok(None);
                     }
-                    self.emit_unmatched_right(ht)?;
+                    self.emit_unmatched_right()?;
                     self.probe_state.finalize_done = true;
                     if self.probe_state.output_buffer.is_empty() {
                         return Ok(None);
@@ -279,15 +294,25 @@ impl HashJoinExec {
             let key: Vec<ScalarValue> = self.left_key_cols.iter()
                 .map(|&idx| left_row[idx].clone())
                 .collect();
-            let matches = ht.probe(&key);
+            let matches = {
+                let ht = self.hash_table.as_ref().unwrap();
+                ht.probe(&key)
+            };
             if matches.is_empty() {
-                // Left unmatched
                 let null_right = self.make_null_right_row();
                 self.probe_state.output_buffer.push((left_row, Some(null_right)));
             } else {
+                {
+                    let ht = self.hash_table.as_mut().unwrap();
+                    for ptr in &matches {
+                        ht.mark_matched(ptr);
+                    }
+                }
                 for ptr in &matches {
-                    ht.mark_matched(ptr);
-                    let right_row = self.collect_build_row(ht, ptr);
+                    let right_row = {
+                        let ht = self.hash_table.as_ref().unwrap();
+                        self.collect_build_row(ht, ptr)
+                    };
                     self.probe_state.output_buffer.push((left_row.clone(), Some(right_row)));
                 }
             }
@@ -334,7 +359,6 @@ impl HashJoinExec {
 
     /// Semi join: emit left rows that have at least one match in right.
     fn probe_semi(&mut self) -> Result<Option<RecordBatch>> {
-        let ht = self.hash_table.as_ref().unwrap();
         loop {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
@@ -346,7 +370,10 @@ impl HashJoinExec {
             let key: Vec<ScalarValue> = self.right_key_cols.iter()
                 .map(|&idx| right_row[idx].clone())
                 .collect();
-            let matches = ht.probe(&key);
+            let matches = {
+                let ht = self.hash_table.as_ref().unwrap();
+                ht.probe(&key)
+            };
             for ptr in &matches {
                 let left_row = self.collect_left_row(ptr);
                 self.probe_state.output_buffer.push((left_row, None));
@@ -360,9 +387,7 @@ impl HashJoinExec {
 
     /// Anti join: emit left rows that have NO match in right.
     fn probe_anti(&mut self) -> Result<Option<RecordBatch>> {
-        // Need to consume ALL right rows first to know what doesn't match
         if self.probe_state.right_batches.is_empty() {
-            let ht = self.hash_table.as_mut().unwrap();
             while let Some(batch) = self.right.next_batch()? {
                 for row in 0..batch.num_rows() {
                     let right_row: Vec<ScalarValue> = (0..batch.num_columns())
@@ -371,14 +396,20 @@ impl HashJoinExec {
                     let key: Vec<ScalarValue> = self.right_key_cols.iter()
                         .map(|&idx| right_row[idx].clone())
                         .collect();
-                    let matches = ht.probe(&key);
-                    for ptr in &matches {
-                        ht.mark_matched(ptr);
-                    }
+                    let matches = {
+                        let ht = self.hash_table.as_mut().unwrap();
+                        let m = ht.probe(&key);
+                        for ptr in &m {
+                            ht.mark_matched(ptr);
+                        }
+                        m
+                    };
                 }
             }
-            // Now emit unmatched left rows
-            let unmatched = ht.unmatched_rows();
+            let unmatched = {
+                let ht = self.hash_table.as_ref().unwrap();
+                ht.unmatched_rows()
+            };
             for ptr in &unmatched {
                 let left_row = self.collect_left_row(ptr);
                 self.probe_state.output_buffer.push((left_row, None));
@@ -389,7 +420,6 @@ impl HashJoinExec {
 
     /// Asof join: for each left row, find closest right row by timestamp.
     fn probe_asof(&mut self) -> Result<Option<RecordBatch>> {
-        let asof = self.asof_index.as_ref().unwrap();
         loop {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
@@ -399,19 +429,17 @@ impl HashJoinExec {
                 None => return Ok(None),
             };
             let ts_col = self.left_key_cols.first().copied().unwrap_or(0);
-            let probe_ts = &left_row[ts_col];
-            if let Some(ptr) = asof.find_asof(probe_ts) {
-                // Collect the matching right row from asof batches
+            let probe_ts = left_row[ts_col].clone();
+            let found = {
+                let asof = self.asof_index.as_ref().unwrap();
+                asof.find_asof(&probe_ts)
+            };
+            if let Some(_ptr) = found {
                 let right_row: Vec<ScalarValue> = (0..self.right_schema.columns.len())
-                    .map(|c| {
-                        // We need the original batch data - use get_scalar from asof
-                        // Since asof stores RowPointer, we need to access its internal data
-                        ScalarValue::Int64(None) // placeholder
-                    })
+                    .map(|_| ScalarValue::Int64(None))
                     .collect();
                 self.probe_state.output_buffer.push((left_row, Some(right_row)));
             } else {
-                // No match: emit left row with NULL right
                 let null_right = self.make_null_right_row();
                 self.probe_state.output_buffer.push((left_row, Some(null_right)));
             }
@@ -482,6 +510,10 @@ impl HashJoinExec {
             .collect()
     }
 
+    fn collect_build_row_inner(&self, ht: &JoinHashTable, ptr: &RowPointer) -> Vec<ScalarValue> {
+        self.collect_build_row(ht, ptr)
+    }
+
     fn make_null_right_row(&self) -> Vec<ScalarValue> {
         self.right_schema.columns.iter()
             .map(|c| ScalarValue::null_for_type(c.data_type))
@@ -494,8 +526,11 @@ impl HashJoinExec {
             .collect()
     }
 
-    fn emit_unmatched_left(&mut self, ht: &JoinHashTable) -> Result<()> {
-        let unmatched = ht.unmatched_rows();
+    fn emit_unmatched_left(&mut self) -> Result<()> {
+        let unmatched = {
+            let ht = self.hash_table.as_ref().unwrap();
+            ht.unmatched_rows()
+        };
         let null_right = self.make_null_right_row();
         for ptr in &unmatched {
             let left_row = self.collect_left_row(ptr);
@@ -504,12 +539,17 @@ impl HashJoinExec {
         Ok(())
     }
 
-    fn emit_unmatched_right(&mut self, ht: &JoinHashTable) -> Result<()> {
-        let unmatched = ht.unmatched_rows();
+    fn emit_unmatched_right(&mut self) -> Result<()> {
+        let unmatched = {
+            let ht = self.hash_table.as_ref().unwrap();
+            ht.unmatched_rows()
+        };
         let null_left = self.make_null_left_row();
         for ptr in &unmatched {
-            let right_row = self.collect_build_row(ht, ptr);
-            // For right/full join output: null_left + right
+            let right_row = {
+                let ht = self.hash_table.as_ref().unwrap();
+                self.collect_build_row_inner(ht, ptr)
+            };
             self.probe_state.output_buffer.push((null_left.clone(), Some(right_row)));
         }
         Ok(())

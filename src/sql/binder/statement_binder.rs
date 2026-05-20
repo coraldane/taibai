@@ -15,7 +15,7 @@ impl StatementBinder {
         table_schemas: &HashMap<String, Schema>,
     ) -> Result<BindContext> {
         let (select_list, from, where_clause, group_by, _order_by, _limit, _offset, _distinct) = match stmt {
-            Statement::Select { select_list, from, where_clause, group_by, order_by, limit, offset, distinct } => {
+            Statement::Select { select_list, from, where_clause, group_by, order_by, limit, offset, distinct, having: _ } => {
                 (select_list, from, where_clause, group_by, order_by, limit, offset, distinct)
             }
             _ => return Err(MonaxError::Internal("bind_select called with non-SELECT".into())),

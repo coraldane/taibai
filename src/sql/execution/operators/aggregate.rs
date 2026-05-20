@@ -205,18 +205,20 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], _schema
             else { ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64)) }
         }
         AggFunc::Min => {
-            values.iter()
+            match values.iter()
                 .filter(|v| !v.is_null())
-                .min_by(|a, b| compare_scalars(a, b))
-                .cloned()
-                .unwrap_or(ScalarValue::Int64(None))
+                .min_by(|a, b| compare_scalars(a, b)) {
+                Some(v) => (*v).clone(),
+                None => ScalarValue::Int64(None),
+            }
         }
         AggFunc::Max => {
-            values.iter()
+            match values.iter()
                 .filter(|v| !v.is_null())
-                .max_by(|a, b| compare_scalars(a, b))
-                .cloned()
-                .unwrap_or(ScalarValue::Int64(None))
+                .max_by(|a, b| compare_scalars(a, b)) {
+                Some(v) => (*v).clone(),
+                None => ScalarValue::Int64(None),
+            }
         }
     }
 }

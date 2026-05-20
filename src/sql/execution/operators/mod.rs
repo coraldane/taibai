@@ -107,9 +107,6 @@ pub fn build_pipeline(
         }
         LogicalPlan::Distinct(distinct) => {
             let input = build_pipeline(*distinct.input, table_batches)?;
-            // Use a project that feeds into a distinct aggregate
-            // For now, use the aggregate exec with no aggregates as a distinct operator
-            let schema = get_scan_schema(&LogicalPlan::Distinct(distinct));
             Ok(input)
         }
         LogicalPlan::Window(window) => {

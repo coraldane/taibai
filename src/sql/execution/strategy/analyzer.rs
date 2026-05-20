@@ -17,8 +17,8 @@ impl QueryAnalyzer {
         }
 
         // Base selectivity per predicate (heuristic)
-        let base_selectivity = 0.33; // range predicate default
-        let eq_selectivity = 0.1;    // equality predicate
+        let base_selectivity: f64 = 0.33;
+        let eq_selectivity: f64 = 0.1;
 
         // Simplified: assume mix of predicates
         let estimated = if props.predicate_count == 0 {

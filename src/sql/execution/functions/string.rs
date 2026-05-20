@@ -73,8 +73,7 @@ pub fn concat(args: &[ScalarValue]) -> Result<ScalarValue> {
             ScalarValue::Float64(Some(v)) => result.push_str(&v.to_string()),
             ScalarValue::Float32(Some(v)) => result.push_str(&v.to_string()),
             ScalarValue::Bool(Some(v)) => result.push_str(if *v { "true" } else { "false" }),
-            ScalarValue::Null => {} // skip NULLs in CONCAT
-            _ => {} // skip other NULLs
+            _ => {} // skip NULLs in CONCAT
         }
     }
     Ok(ScalarValue::VarChar(Some(result)))

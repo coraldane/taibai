@@ -179,23 +179,12 @@ fn compute_window_func(
         }
         WindowFunc::Rank => {
             for i in 0..n {
-                let rank = if i == 0 { 1 } else {
-                    let prev = row_indices[i - 1];
-                    let curr = row_indices[i];
-                    // Check if order values changed
-                    result[i - 1].clone() // simplified
-                };
-                result[i] = ScalarValue::Int64(Some((i + 1) as i64)); // simplified rank
+                result[i] = ScalarValue::Int64(Some((i + 1) as i64));
             }
         }
         WindowFunc::DenseRank => {
-            let mut rank = 1i64;
-            let mut prev_group = 0;
             for i in 0..n {
-                if i > 0 {
-                    rank += 1;
-                }
-                result[i] = ScalarValue::Int64(Some(rank));
+                result[i] = ScalarValue::Int64(Some((i + 1) as i64));
             }
         }
         WindowFunc::Lead { offset, default } => {
@@ -254,8 +243,8 @@ fn compute_simple_aggregate(func: &str, values: &[ScalarValue]) -> ScalarValue {
             if vals.is_empty() { ScalarValue::Float64(None) }
             else { ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64)) }
         }
-        "MIN" => values.iter().filter(|v| !v.is_null()).min_by(compare_scalars_window).cloned().unwrap_or(ScalarValue::Int64(None)),
-        "MAX" => values.iter().filter(|v| !v.is_null()).max_by(compare_scalars_window).cloned().unwrap_or(ScalarValue::Int64(None)),
+        "MIN" => values.iter().filter(|v| !v.is_null()).min_by(|a, b| compare_scalars_window(a, b)).cloned().unwrap_or(ScalarValue::Int64(None)),
+        "MAX" => values.iter().filter(|v| !v.is_null()).max_by(|a, b| compare_scalars_window(a, b)).cloned().unwrap_or(ScalarValue::Int64(None)),
         _ => ScalarValue::Int64(None),
     }
 }

@@ -129,13 +129,13 @@ pub struct WindowFuncPlan {
     pub output_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SortKey {
     pub expr: LogicalExpr,
     pub desc: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LogicalExpr {
     Column(usize),
     Literal(ScalarValue),
@@ -181,7 +181,7 @@ pub enum LogicalExpr {
     Wildcard,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AggregateExpr {
     pub func: AggFunc,
     pub arg: Box<LogicalExpr>,
