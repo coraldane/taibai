@@ -53,7 +53,9 @@ pub fn exec_insert(
     )?;
     std::fs::create_dir_all(&write_dir)?;
 
-    super::wal_helper::write_wal(engine, &table_dir, &batch)?;
+    if !engine.is_bulk_mode() {
+        super::wal_helper::write_wal(engine, &table_dir, &batch)?;
+    }
 
     let has_sort_key = !table_meta.cluster_key.is_empty();
     if has_sort_key {

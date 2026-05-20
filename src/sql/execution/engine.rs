@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use crate::common::error::{MonaxError, Result};
@@ -16,6 +17,7 @@ use crate::sql::parser::parser::Parser;
 
 const MAX_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const MIN_SEGMENT_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
 
 pub enum ExecResult {
     Ok { rows_affected: u64 },
@@ -46,8 +48,8 @@ pub struct Engine {
     catalogs: RwLock<HashMap<String, DatabaseCatalog>>,
     segment_seqs: Mutex<HashMap<String, u32>>,
     wal_writers: Mutex<HashMap<String, WalWriter>>,
-    next_txn_id: Mutex<u64>,
-    bulk_mode: Mutex<bool>,
+    next_txn_id: AtomicU64,
+    bulk_mode: AtomicBool,
     active_segments: Mutex<HashMap<String, ActiveSegment>>,
 }
 
@@ -106,8 +108,8 @@ impl Engine {
             catalogs: RwLock::new(catalogs),
             segment_seqs: Mutex::new(segment_seqs_init),
             wal_writers: Mutex::new(HashMap::new()),
-            next_txn_id: Mutex::new(0),
-            bulk_mode: Mutex::new(false),
+            next_txn_id: AtomicU64::new(0),
+            bulk_mode: AtomicBool::new(false),
             active_segments: Mutex::new(HashMap::new()),
         })
     }
@@ -183,12 +185,15 @@ impl Engine {
     }
 
     pub fn set_bulk_mode(&self, enabled: bool) {
-        let mut mode = self.bulk_mode.lock().unwrap();
-        *mode = enabled;
+        self.bulk_mode.store(enabled, Ordering::Release);
     }
 
     pub fn is_bulk_mode(&self) -> bool {
-        *self.bulk_mode.lock().unwrap()
+        self.bulk_mode.load(Ordering::Acquire)
+    }
+
+    pub fn alloc_txn_id(&self) -> u64 {
+        self.next_txn_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn flush_all_buffers(&self) -> Result<u64> {
@@ -199,12 +204,21 @@ impl Engine {
             }
         }
 
-        let mut active = self.active_segments.lock().unwrap();
         let mut total = 0u64;
-        for (_, mut segment) in active.drain() {
-            if segment.total_rows > 0 {
-                self.seal_segment(&mut segment)?;
-                total += segment.total_rows;
+        {
+            let mut active = self.active_segments.lock().unwrap();
+            for (_, mut segment) in active.drain() {
+                if segment.total_rows > 0 {
+                    self.seal_segment(&mut segment)?;
+                    total += segment.total_rows;
+                }
+            }
+        }
+
+        {
+            let mut wal_writers = self.wal_writers().lock().unwrap();
+            for (_, writer) in wal_writers.iter_mut() {
+                let _ = writer.clear();
             }
         }
 
@@ -227,16 +241,12 @@ impl Engine {
         &self.wal_writers
     }
 
-    pub(crate) fn next_txn_id(&self) -> &Mutex<u64> {
-        &self.next_txn_id
-    }
-
     pub fn exec_bulk_insert_with_wal_control(
         &self,
         db: &str,
         table: &str,
         batch: RecordBatch,
-        disable_wal: bool,
+        _disable_wal: bool,
     ) -> Result<u64> {
         use rayon::prelude::*;
 
@@ -275,7 +285,7 @@ impl Engine {
             active_segments.insert(
                 key.clone(),
                 ActiveSegment {
-                    file: std::io::BufWriter::new(file),
+                    file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
                     path: seg_path,
                     schema,
                     row_groups: Vec::new(),
@@ -310,10 +320,22 @@ impl Engine {
         });
         segment.current_size += total_length;
         segment.total_rows += row_count;
+        let mut sealed = false;
         if segment.current_size >= MAX_SEGMENT_SIZE {
             self.seal_segment(segment)?;
             active_segments.remove(&key);
+            sealed = true;
         }
+        drop(active_segments);
+
+        if sealed {
+            let wal_key = table_dir.to_string_lossy().to_string();
+            let mut wal_writers = self.wal_writers.lock().unwrap();
+            if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
+                let _ = wal_writer.clear();
+            }
+        }
+
         Ok(row_count)
     }
 
@@ -409,7 +431,7 @@ impl Engine {
             active_segments.insert(
                 key.clone(),
                 ActiveSegment {
-                    file: std::io::BufWriter::new(file),
+                    file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
                     path: seg_path,
                     schema,
                     row_groups: Vec::new(),
@@ -448,13 +470,24 @@ impl Engine {
         segment.current_size += total_length;
         segment.total_rows += req.row_count as u64;
 
+        let mut sealed = false;
         if segment.current_size >= MAX_SEGMENT_SIZE {
             self.seal_segment(segment)?;
             active_segments.remove(&key);
+            sealed = true;
+        }
+        drop(active_segments);
+
+        if sealed {
+            let wal_key = table_dir.to_string_lossy().to_string();
+            let mut wal_writers = self.wal_writers.lock().unwrap();
+            if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
+                let _ = wal_writer.clear();
+            }
         }
 
         if !disable_wal {
-            let bulk_mode = *self.bulk_mode.lock().unwrap();
+            let bulk_mode = self.bulk_mode.load(Ordering::Acquire);
             if !bulk_mode {
                 let mut catalogs = self.catalogs.write().unwrap();
                 if let Some(catalog) = catalogs.get_mut(db) {
@@ -563,7 +596,7 @@ fn bulk_compression_level() -> i32 {
         std::env::var("MONAX_BULK_ZSTD_LEVEL")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(3)
+            .unwrap_or(1)
     })
 }
 

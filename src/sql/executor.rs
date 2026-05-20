@@ -654,7 +654,7 @@ impl Engine {
             wal_writers.insert(key.clone(), writer);
         }
         let wal_writer = wal_writers.get_mut(&key).unwrap();
-        wal_writer.write_batch(txn_id, &[(RecordType::Insert, wal_data.as_slice())])?;
+        wal_writer.write_compact(txn_id, &wal_data, true)?;
 
         Ok(())
     }

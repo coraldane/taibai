@@ -1,19 +1,18 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher;
 
 use crate::common::error::{MonaxError, Result};
 
-/// WAL file prefix and suffix.
 pub const FILE_PREFIX: &str = "wal_";
 pub const FILE_SUFFIX: &str = ".log";
 
-/// WAL record header size: seq(8) + type(1) + txn_id(8) + data_len(4) + crc(4) = 25.
 pub const HEADER_SIZE: usize = 25;
 
-/// WAL record types, aligned with taibai.
+const WAL_BUF_CAPACITY: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RecordType {
@@ -24,6 +23,7 @@ pub enum RecordType {
     Delete = 5,
     Checkpoint = 6,
     CompactSwap = 7,
+    BatchInsert = 8,
 }
 
 impl RecordType {
@@ -36,12 +36,12 @@ impl RecordType {
             5 => Ok(RecordType::Delete),
             6 => Ok(RecordType::Checkpoint),
             7 => Ok(RecordType::CompactSwap),
+            8 => Ok(RecordType::BatchInsert),
             _ => Err(MonaxError::Storage(format!("unknown WAL record type: {}", v))),
         }
     }
 }
 
-/// A single WAL record.
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     pub sequence: u64,
@@ -51,26 +51,12 @@ pub struct WalRecord {
 }
 
 impl WalRecord {
-    /// Encode this record into bytes: header (25 bytes) + data.
-    /// Header: seq(8 LE) + type(1) + txn_id(8 LE) + data_len(4 LE) + crc32(4 LE).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(HEADER_SIZE + self.data.len());
-        buf.extend_from_slice(&self.sequence.to_le_bytes());
-        buf.push(self.record_type as u8);
-        buf.extend_from_slice(&self.txn_id.to_le_bytes());
-        buf.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
-        // CRC placeholder
-        buf.extend_from_slice(&[0u8; 4]);
-        buf.extend_from_slice(&self.data);
-
-        // Compute CRC32 over header[0..21] + data
-        let crc = compute_crc(&buf[..21], &self.data);
-        buf[21..25].copy_from_slice(&crc.to_le_bytes());
-
+        encode_record_to(&mut buf, self.sequence, self.record_type, self.txn_id, &self.data);
         buf
     }
 
-    /// Decode a record from bytes. Returns the record and the number of bytes consumed.
     pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
         if buf.len() < HEADER_SIZE {
             return Err(MonaxError::Storage("WAL record too short".into()));
@@ -88,7 +74,6 @@ impl WalRecord {
 
         let data = buf[HEADER_SIZE..HEADER_SIZE + data_len].to_vec();
 
-        // Verify CRC
         let computed_crc = compute_crc(&buf[..21], &data);
         if stored_crc != computed_crc {
             return Err(MonaxError::Storage(format!(
@@ -102,7 +87,19 @@ impl WalRecord {
     }
 }
 
-/// Compute CRC32 over header prefix + data.
+fn encode_record_to(buf: &mut Vec<u8>, seq: u64, rt: RecordType, txn_id: u64, data: &[u8]) {
+    let start = buf.len();
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.push(rt as u8);
+    buf.extend_from_slice(&txn_id.to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(data);
+
+    let crc = compute_crc(&buf[start..start + 21], data);
+    buf[start + 21..start + 25].copy_from_slice(&crc.to_le_bytes());
+}
+
 fn compute_crc(header_prefix: &[u8], data: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(header_prefix);
@@ -110,19 +107,17 @@ fn compute_crc(header_prefix: &[u8], data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-/// WAL writer: appends records to the current WAL file.
 pub struct WalWriter {
     dir: PathBuf,
     file_index: u32,
-    file: Option<fs::File>,
+    file: Option<BufWriter<fs::File>>,
     sequence: u64,
     current_size: u64,
     max_file_size: u64,
+    batch_buf: Vec<u8>,
 }
 
 impl WalWriter {
-    /// Create or open a WAL writer in the given directory.
-    /// If the directory exists and has WAL files, continues from the latest.
     pub fn open(dir: &Path, max_file_size: u64) -> Result<Self> {
         fs::create_dir_all(dir)?;
 
@@ -135,18 +130,18 @@ impl WalWriter {
             sequence,
             current_size: 0,
             max_file_size,
+            batch_buf: Vec::with_capacity(64 * 1024),
         };
 
         if file_index > 0 || !dir_has_wal_files(dir) {
             writer.rotate_file()?;
         } else {
-            // Found existing files, open the latest for append
             let path = wal_path(dir, file_index);
             if path.exists() {
                 let file = fs::OpenOptions::new().append(true).open(&path)?;
                 let meta = file.metadata()?;
                 writer.current_size = meta.len();
-                writer.file = Some(file);
+                writer.file = Some(BufWriter::with_capacity(WAL_BUF_CAPACITY, file));
             } else {
                 writer.rotate_file()?;
             }
@@ -155,115 +150,88 @@ impl WalWriter {
         Ok(writer)
     }
 
-    /// Write a single record and optionally sync.
     pub fn write(&mut self, record_type: RecordType, txn_id: u64, data: &[u8]) -> Result<u64> {
         self.sequence += 1;
-        let record = WalRecord {
-            sequence: self.sequence,
-            record_type,
-            txn_id,
-            data: data.to_vec(),
-        };
-
-        let encoded = record.encode();
-        self.write_raw(&encoded)?;
+        self.batch_buf.clear();
+        encode_record_to(&mut self.batch_buf, self.sequence, record_type, txn_id, data);
+        let buf = self.batch_buf.clone();
+        self.write_raw(&buf)?;
         Ok(self.sequence)
     }
 
-    /// Write a batch of records under a single transaction.
-    /// Wraps with Begin + Commit, returns the commit sequence.
     pub fn write_batch(&mut self, txn_id: u64, records: &[(RecordType, &[u8])]) -> Result<u64> {
+        self.batch_buf.clear();
+
         self.sequence += 1;
-        let begin = WalRecord {
-            sequence: self.sequence,
-            record_type: RecordType::Begin,
-            txn_id,
-            data: Vec::new(),
-        };
-        self.write_raw(&begin.encode())?;
+        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::Begin, txn_id, &[]);
 
         for &(rt, data) in records {
             self.sequence += 1;
-            let rec = WalRecord {
-                sequence: self.sequence,
-                record_type: rt,
-                txn_id,
-                data: data.to_vec(),
-            };
-            self.write_raw(&rec.encode())?;
+            encode_record_to(&mut self.batch_buf, self.sequence, rt, txn_id, data);
         }
 
         self.sequence += 1;
-        let commit = WalRecord {
-            sequence: self.sequence,
-            record_type: RecordType::Commit,
-            txn_id,
-            data: Vec::new(),
-        };
-        self.write_raw(&commit.encode())?;
+        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::Commit, txn_id, &[]);
 
+        let buf = self.batch_buf.clone();
+        self.write_raw(&buf)?;
         self.sync()?;
         Ok(self.sequence)
     }
 
-    /// Get the current sequence number.
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
 
-    /// Sync the current file to disk.
     pub fn sync(&mut self) -> Result<()> {
-        if let Some(ref file) = self.file {
-            file.sync_all()?;
+        if let Some(ref mut file) = self.file {
+            file.flush()?;
+            file.get_ref().sync_all()?;
         }
         Ok(())
     }
 
     pub fn write_batch_no_sync(&mut self, txn_id: u64, records: &[(RecordType, &[u8])]) -> Result<u64> {
+        self.batch_buf.clear();
+
         self.sequence += 1;
-        let begin = WalRecord {
-            sequence: self.sequence,
-            record_type: RecordType::Begin,
-            txn_id,
-            data: Vec::new(),
-        };
-        self.write_raw(&begin.encode())?;
+        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::Begin, txn_id, &[]);
 
         for &(rt, data) in records {
             self.sequence += 1;
-            let rec = WalRecord {
-                sequence: self.sequence,
-                record_type: rt,
-                txn_id,
-                data: data.to_vec(),
-            };
-            self.write_raw(&rec.encode())?;
+            encode_record_to(&mut self.batch_buf, self.sequence, rt, txn_id, data);
         }
 
         self.sequence += 1;
-        let commit = WalRecord {
-            sequence: self.sequence,
-            record_type: RecordType::Commit,
-            txn_id,
-            data: Vec::new(),
-        };
-        self.write_raw(&commit.encode())?;
+        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::Commit, txn_id, &[]);
 
+        let buf = self.batch_buf.clone();
+        self.write_raw(&buf)?;
         Ok(self.sequence)
     }
 
-    /// Clear the WAL file after data has been safely persisted to segments.
-    /// This prevents duplicate data on recovery.
+    pub fn write_compact(&mut self, txn_id: u64, data: &[u8], sync: bool) -> Result<u64> {
+        self.sequence += 1;
+        self.batch_buf.clear();
+        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::BatchInsert, txn_id, data);
+        let buf = self.batch_buf.clone();
+        self.write_raw(&buf)?;
+
+        if sync {
+            self.sync()?;
+        }
+        Ok(self.sequence)
+    }
+
     pub fn clear(&mut self) -> Result<()> {
-        // Sync and close current file
-        if let Some(ref file) = self.file {
-            file.sync_all()?;
+        if let Some(ref mut file) = self.file {
+            let _ = file.flush();
+            let _ = file.get_ref().sync_all();
         }
         self.file = None;
         self.current_size = 0;
         self.sequence = 0;
 
-        // Delete all WAL files in the directory
         let indices = list_wal_files(&self.dir)?;
         for idx in indices {
             let path = wal_path(&self.dir, idx);
@@ -272,7 +240,6 @@ impl WalWriter {
             }
         }
 
-        // Start a fresh WAL file
         self.file_index = 0;
         self.rotate_file()?;
 
@@ -281,7 +248,6 @@ impl WalWriter {
     }
 
     fn write_raw(&mut self, data: &[u8]) -> Result<()> {
-        // Rotate if needed
         if self.current_size + data.len() as u64 > self.max_file_size && self.current_size > 0 {
             self.rotate_file()?;
         }
@@ -294,14 +260,13 @@ impl WalWriter {
     }
 
     fn rotate_file(&mut self) -> Result<()> {
-        // Sync and close current file
-        if let Some(ref file) = self.file {
-            file.sync_all()?;
+        if let Some(ref mut file) = self.file {
+            let _ = file.flush();
+            let _ = file.get_ref().sync_all();
         }
         self.file = None;
         self.current_size = 0;
 
-        // Increment file index
         self.file_index += 1;
         let path = wal_path(&self.dir, self.file_index);
 
@@ -309,14 +274,13 @@ impl WalWriter {
             .create(true)
             .write(true)
             .open(&path)?;
-        self.file = Some(file);
+        self.file = Some(BufWriter::with_capacity(WAL_BUF_CAPACITY, file));
 
         tracing::debug!(path = %path.display(), "rotated WAL file");
         Ok(())
     }
 }
 
-/// WAL reader: reads all records from WAL files for recovery.
 pub struct WalReader {
     dir: PathBuf,
 }
@@ -326,7 +290,6 @@ impl WalReader {
         Self { dir: dir.to_path_buf() }
     }
 
-    /// Read all valid records from all WAL files in order.
     pub fn read_all(&self) -> Result<Vec<WalRecord>> {
         let mut all_records = Vec::new();
         let indices = list_wal_files(&self.dir)?;
@@ -340,7 +303,6 @@ impl WalReader {
         Ok(all_records)
     }
 
-    /// Read all records from a single WAL file.
     fn read_file(&self, path: &Path) -> Result<Vec<WalRecord>> {
         let data = fs::read(path)?;
         let mut records = Vec::new();
@@ -353,7 +315,6 @@ impl WalReader {
                     records.push(record);
                 }
                 Err(MonaxError::Storage(msg)) if msg.contains("truncated") => {
-                    // Truncated record at end of file — ignore
                     break;
                 }
                 Err(e) => {
@@ -367,17 +328,13 @@ impl WalReader {
     }
 }
 
-/// WAL recovery: replay committed transactions.
 pub struct WalRecovery;
 
 impl WalRecovery {
-    /// Recover committed records from the WAL directory.
-    /// Returns only the data records from committed transactions.
     pub fn replay(dir: &Path) -> Result<Vec<WalRecord>> {
         let reader = WalReader::new(dir);
         let all = reader.read_all()?;
 
-        // Classify transactions
         let mut committed: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut aborted: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
@@ -393,7 +350,6 @@ impl WalRecovery {
             }
         }
 
-        // Collect data records from committed transactions
         let mut result = Vec::new();
         let mut in_committed = false;
 
@@ -404,6 +360,9 @@ impl WalRecovery {
                 }
                 RecordType::Commit | RecordType::Abort => {
                     in_committed = false;
+                }
+                RecordType::BatchInsert => {
+                    result.push(rec);
                 }
                 RecordType::Insert | RecordType::Delete | RecordType::Checkpoint => {
                     if in_committed {
@@ -512,7 +471,6 @@ mod tests {
             data: vec![],
         };
         let mut encoded = rec.encode();
-        // Corrupt the CRC
         encoded[22] ^= 0xFF;
         let result = WalRecord::decode(&encoded);
         assert!(result.is_err());
@@ -520,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_truncated_record() {
-        let buf = vec![0u8; 10]; // Less than HEADER_SIZE
+        let buf = vec![0u8; 10];
         let result = WalRecord::decode(&buf);
         assert!(result.is_err());
     }
@@ -532,21 +490,16 @@ mod tests {
 
         let mut writer = WalWriter::open(&wal_dir, 1024 * 1024).unwrap();
 
-        // Write a batch
         let insert_data = vec![1, 2, 3];
         writer.write_batch(1, &[(RecordType::Insert, insert_data.as_slice())]).unwrap();
         assert!(writer.sequence() > 0);
 
-        // Write another record
         writer.write(RecordType::Insert, 2, &[4, 5, 6]).unwrap();
 
-        // Drop the writer to flush
         drop(writer);
 
-        // Read back
         let reader = WalReader::new(&wal_dir);
         let records = reader.read_all().unwrap();
-        // Begin + Insert + Commit + Insert = 4 records
         assert_eq!(records.len(), 4);
         assert_eq!(records[0].record_type, RecordType::Begin);
         assert_eq!(records[1].record_type, RecordType::Insert);
@@ -561,14 +514,11 @@ mod tests {
 
         let mut writer = WalWriter::open(&wal_dir, 1024 * 1024).unwrap();
 
-        // Committed transaction
         writer.write_batch(1, &[(RecordType::Insert, &[1, 2, 3])]).unwrap();
 
-        // Uncommitted transaction (write begin + insert, but no commit)
         writer.write(RecordType::Begin, 2, &[]).unwrap();
         writer.write(RecordType::Insert, 2, &[4, 5, 6]).unwrap();
 
-        // Aborted transaction
         writer.write(RecordType::Begin, 3, &[]).unwrap();
         writer.write(RecordType::Insert, 3, &[7, 8, 9]).unwrap();
         writer.write(RecordType::Abort, 3, &[]).unwrap();
@@ -576,9 +526,27 @@ mod tests {
         drop(writer);
 
         let committed = WalRecovery::replay(&wal_dir).unwrap();
-        // Only the Insert from txn 1 should be recovered
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].txn_id, 1);
         assert_eq!(committed[0].data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_batch_insert_recovery() {
+        let dir = TempDir::new().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let mut writer = WalWriter::open(&wal_dir, 1024 * 1024).unwrap();
+
+        writer.write_compact(1, &[10, 20, 30], false).unwrap();
+        writer.write_compact(2, &[40, 50, 60], true).unwrap();
+
+        drop(writer);
+
+        let committed = WalRecovery::replay(&wal_dir).unwrap();
+        assert_eq!(committed.len(), 2);
+        assert_eq!(committed[0].record_type, RecordType::BatchInsert);
+        assert_eq!(committed[0].data, vec![10, 20, 30]);
+        assert_eq!(committed[1].data, vec![40, 50, 60]);
     }
 }
