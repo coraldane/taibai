@@ -27,7 +27,12 @@ pub fn write_wal(engine: &Engine, table_dir: &Path, batch: &RecordBatch) -> Resu
         wal_writers.insert(key.clone(), writer);
     }
     let wal_writer = wal_writers.get_mut(&key).unwrap();
-    wal_writer.write_batch(txn_id, &[(RecordType::Insert, wal_data.as_slice())])?;
+
+    if engine.is_bulk_mode() {
+        wal_writer.write_batch_no_sync(txn_id, &[(RecordType::Insert, wal_data.as_slice())])?;
+    } else {
+        wal_writer.write_batch(txn_id, &[(RecordType::Insert, wal_data.as_slice())])?;
+    }
 
     Ok(())
 }

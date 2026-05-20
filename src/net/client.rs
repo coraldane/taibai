@@ -168,6 +168,31 @@ impl Client {
         }
     }
 
+    pub async fn send_execute(&mut self, sql: &str) -> Result<()> {
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, "");
+        write_len_prefixed_string(&mut payload, sql);
+        self.send(Message::new(MSG_TYPE_QUERY, Bytes::from(payload))).await
+    }
+
+    pub async fn recv_execute_result(&mut self) -> Result<u64> {
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_OK => {
+                if resp.payload.len() < 8 {
+                    return Err(MonaxError::Protocol("OK payload too short".into()));
+                }
+                Ok(u64::from_le_bytes(resp.payload[..8].try_into().unwrap()))
+            }
+            MSG_TYPE_ERROR => {
+                Err(MonaxError::Sql(String::from_utf8_lossy(&resp.payload).to_string()))
+            }
+            other => Err(MonaxError::Protocol(format!(
+                "unexpected execute response type: {other:#04X}"
+            ))),
+        }
+    }
+
     pub async fn logout(&mut self) -> Result<()> {
         self.send(Message::empty(MSG_TYPE_LOGOUT)).await?;
         Ok(())

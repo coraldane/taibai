@@ -219,6 +219,39 @@ impl WalWriter {
         Ok(())
     }
 
+    pub fn write_batch_no_sync(&mut self, txn_id: u64, records: &[(RecordType, &[u8])]) -> Result<u64> {
+        self.sequence += 1;
+        let begin = WalRecord {
+            sequence: self.sequence,
+            record_type: RecordType::Begin,
+            txn_id,
+            data: Vec::new(),
+        };
+        self.write_raw(&begin.encode())?;
+
+        for &(rt, data) in records {
+            self.sequence += 1;
+            let rec = WalRecord {
+                sequence: self.sequence,
+                record_type: rt,
+                txn_id,
+                data: data.to_vec(),
+            };
+            self.write_raw(&rec.encode())?;
+        }
+
+        self.sequence += 1;
+        let commit = WalRecord {
+            sequence: self.sequence,
+            record_type: RecordType::Commit,
+            txn_id,
+            data: Vec::new(),
+        };
+        self.write_raw(&commit.encode())?;
+
+        Ok(self.sequence)
+    }
+
     /// Clear the WAL file after data has been safely persisted to segments.
     /// This prevents duplicate data on recovery.
     pub fn clear(&mut self) -> Result<()> {

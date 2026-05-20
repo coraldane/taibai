@@ -149,7 +149,7 @@ impl Handler {
     fn handle_start_bulk_import(&mut self, sql: &str) -> Result<Vec<Message>> {
         let disable_wal = sql.contains("\"disable_wal\":true") || sql.contains("\"disable_wal\": true");
 
-        self.engine.set_bulk_mode(disable_wal);
+        self.engine.set_bulk_mode(true);
 
         if let Some(session) = &mut self.session {
             session.bulk_import_mode = true;

@@ -71,13 +71,17 @@ pub fn exec_insert(
     let row_count = batch.num_rows() as u64;
     engine.exec_bulk_insert_with_wal_control(db, table, batch, false)?;
 
-    let mut catalogs = engine.catalogs().write().unwrap();
-    if let Some(catalog) = catalogs.get_mut(db) {
-        if let Some(meta) = catalog.get_table_mut(table) {
-            meta.row_count += values.len() as i64;
+    {
+        let mut catalogs = engine.catalogs().write().unwrap();
+        if let Some(catalog) = catalogs.get_mut(db) {
+            if let Some(meta) = catalog.get_table_mut(table) {
+                meta.row_count += values.len() as i64;
+            }
+            if !engine.is_bulk_mode() {
+                let meta_dir = engine.data_dir().join("meta");
+                catalog.save(&meta_dir)?;
+            }
         }
-        let meta_dir = engine.data_dir().join("meta");
-        catalog.save(&meta_dir)?;
     }
 
     Ok(ExecResult::Ok { rows_affected: row_count })

@@ -187,7 +187,18 @@ impl Engine {
         *mode = enabled;
     }
 
+    pub fn is_bulk_mode(&self) -> bool {
+        *self.bulk_mode.lock().unwrap()
+    }
+
     pub fn flush_all_buffers(&self) -> Result<u64> {
+        {
+            let mut wal_writers = self.wal_writers().lock().unwrap();
+            for (_, writer) in wal_writers.iter_mut() {
+                let _ = writer.sync();
+            }
+        }
+
         let mut active = self.active_segments.lock().unwrap();
         let mut total = 0u64;
         for (_, mut segment) in active.drain() {
@@ -196,6 +207,15 @@ impl Engine {
                 total += segment.total_rows;
             }
         }
+
+        {
+            let mut catalogs = self.catalogs.write().unwrap();
+            let meta_dir = self.data_dir.join("meta");
+            for (_, catalog) in catalogs.iter_mut() {
+                let _ = catalog.save(&meta_dir);
+            }
+        }
+
         Ok(total)
     }
 
@@ -293,17 +313,6 @@ impl Engine {
         if segment.current_size >= MAX_SEGMENT_SIZE {
             self.seal_segment(segment)?;
             active_segments.remove(&key);
-        }
-        if !disable_wal {
-            let bulk_mode = *self.bulk_mode.lock().unwrap();
-            if !bulk_mode {
-                let mut catalogs = self.catalogs.write().unwrap();
-                if let Some(catalog) = catalogs.get_mut(db) {
-                    if let Some(meta) = catalog.get_table_mut(table) {
-                        meta.row_count += row_count as i64;
-                    }
-                }
-            }
         }
         Ok(row_count)
     }
