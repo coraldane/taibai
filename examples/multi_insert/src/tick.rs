@@ -128,10 +128,13 @@ pub fn parse_tick_csv_line(line: &str) -> Option<TickElement> {
 }
 
 pub fn build_multi_insert_sql(table: &str, batch: &[TickElement]) -> String {
-    let mut sb = String::with_capacity(batch.len() * 350);
+    let mut sb = String::with_capacity(batch.len() * 300);
     sb.push_str("INSERT INTO ");
     sb.push_str(table);
     sb.push_str(" (security_id, deal_date, deal_time, pre_close, open_px, high_px, low_px, close_px, high_limit, low_limit, total_num_trade, trans_volume, trans_value, ask_px1, ask_px2, ask_px3, ask_px4, ask_px5, ask_vol1, ask_vol2, ask_vol3, ask_vol4, ask_vol5, bid_px1, bid_px2, bid_px3, bid_px4, bid_px5, bid_vol1, bid_vol2, bid_vol3, bid_vol4, bid_vol5, local_time) VALUES ");
+
+    let mut dec_buf = DecBuf::new();
+    let mut int_buf = IntBuf::new();
 
     for (i, e) in batch.iter().enumerate() {
         if i > 0 {
@@ -142,72 +145,72 @@ pub fn build_multi_insert_sql(table: &str, batch: &[TickElement]) -> String {
         escape_string_into(&e.security_id, &mut sb);
         sb.push('\'');
         sb.push(',');
-        sb.push_str(&e.deal_date.to_string());
+        write_i32(&mut int_buf, &mut sb, e.deal_date);
         sb.push(',');
-        sb.push_str(&e.deal_time.to_string());
+        write_i32(&mut int_buf, &mut sb, e.deal_time);
         sb.push(',');
-        sb.push_str(&format_decimal(e.pre_close));
+        write_decimal(&mut dec_buf, &mut sb, e.pre_close);
         sb.push(',');
-        sb.push_str(&format_decimal(e.open_px));
+        write_decimal(&mut dec_buf, &mut sb, e.open_px);
         sb.push(',');
-        sb.push_str(&format_decimal(e.high_px));
+        write_decimal(&mut dec_buf, &mut sb, e.high_px);
         sb.push(',');
-        sb.push_str(&format_decimal(e.low_px));
+        write_decimal(&mut dec_buf, &mut sb, e.low_px);
         sb.push(',');
-        sb.push_str(&format_decimal(e.close_px));
+        write_decimal(&mut dec_buf, &mut sb, e.close_px);
         sb.push(',');
-        sb.push_str(&format_decimal(e.high_limit));
+        write_decimal(&mut dec_buf, &mut sb, e.high_limit);
         sb.push(',');
-        sb.push_str(&format_decimal(e.low_limit));
+        write_decimal(&mut dec_buf, &mut sb, e.low_limit);
         sb.push(',');
-        sb.push_str(&e.total_num_trade.to_string());
+        write_i32(&mut int_buf, &mut sb, e.total_num_trade);
         sb.push(',');
-        sb.push_str(&e.trans_volume.to_string());
+        write_i64(&mut int_buf, &mut sb, e.trans_volume);
         sb.push(',');
-        sb.push_str(&format_decimal(e.trans_value));
+        write_decimal(&mut dec_buf, &mut sb, e.trans_value);
         sb.push(',');
-        sb.push_str(&format_decimal(e.ask_px1));
+        write_decimal(&mut dec_buf, &mut sb, e.ask_px1);
         sb.push(',');
-        sb.push_str(&format_decimal(e.ask_px2));
+        write_decimal(&mut dec_buf, &mut sb, e.ask_px2);
         sb.push(',');
-        sb.push_str(&format_decimal(e.ask_px3));
+        write_decimal(&mut dec_buf, &mut sb, e.ask_px3);
         sb.push(',');
-        sb.push_str(&format_decimal(e.ask_px4));
+        write_decimal(&mut dec_buf, &mut sb, e.ask_px4);
         sb.push(',');
-        sb.push_str(&format_decimal(e.ask_px5));
+        write_decimal(&mut dec_buf, &mut sb, e.ask_px5);
         sb.push(',');
-        sb.push_str(&e.ask_vol1.to_string());
+        write_i32(&mut int_buf, &mut sb, e.ask_vol1);
         sb.push(',');
-        sb.push_str(&e.ask_vol2.to_string());
+        write_i32(&mut int_buf, &mut sb, e.ask_vol2);
         sb.push(',');
-        sb.push_str(&e.ask_vol3.to_string());
+        write_i32(&mut int_buf, &mut sb, e.ask_vol3);
         sb.push(',');
-        sb.push_str(&e.ask_vol4.to_string());
+        write_i32(&mut int_buf, &mut sb, e.ask_vol4);
         sb.push(',');
-        sb.push_str(&e.ask_vol5.to_string());
+        write_i32(&mut int_buf, &mut sb, e.ask_vol5);
         sb.push(',');
-        sb.push_str(&format_decimal(e.bid_px1));
+        write_decimal(&mut dec_buf, &mut sb, e.bid_px1);
         sb.push(',');
-        sb.push_str(&format_decimal(e.bid_px2));
+        write_decimal(&mut dec_buf, &mut sb, e.bid_px2);
         sb.push(',');
-        sb.push_str(&format_decimal(e.bid_px3));
+        write_decimal(&mut dec_buf, &mut sb, e.bid_px3);
         sb.push(',');
-        sb.push_str(&format_decimal(e.bid_px4));
+        write_decimal(&mut dec_buf, &mut sb, e.bid_px4);
         sb.push(',');
-        sb.push_str(&format_decimal(e.bid_px5));
+        write_decimal(&mut dec_buf, &mut sb, e.bid_px5);
         sb.push(',');
-        sb.push_str(&e.bid_vol1.to_string());
+        write_i32(&mut int_buf, &mut sb, e.bid_vol1);
         sb.push(',');
-        sb.push_str(&e.bid_vol2.to_string());
+        write_i32(&mut int_buf, &mut sb, e.bid_vol2);
         sb.push(',');
-        sb.push_str(&e.bid_vol3.to_string());
+        write_i32(&mut int_buf, &mut sb, e.bid_vol3);
         sb.push(',');
-        sb.push_str(&e.bid_vol4.to_string());
+        write_i32(&mut int_buf, &mut sb, e.bid_vol4);
         sb.push(',');
-        sb.push_str(&e.bid_vol5.to_string());
+        write_i32(&mut int_buf, &mut sb, e.bid_vol5);
         sb.push(',');
         if e.local_time != 0 {
-            sb.push_str(&e.local_time.to_string());
+            write_i64(&mut int_buf, &mut sb, e.local_time);
         } else {
             sb.push_str("NULL");
         }
@@ -215,6 +218,137 @@ pub fn build_multi_insert_sql(table: &str, batch: &[TickElement]) -> String {
     }
 
     sb
+}
+
+struct DecBuf {
+    buf: [u8; 32],
+    len: usize,
+}
+
+impl DecBuf {
+    fn new() -> Self { DecBuf { buf: [0u8; 32], len: 0 } }
+}
+
+struct IntBuf {
+    buf: [u8; 20],
+    len: usize,
+}
+
+impl IntBuf {
+    fn new() -> Self { IntBuf { buf: [0u8; 20], len: 0 } }
+}
+
+fn write_decimal(buf: &mut DecBuf, sb: &mut String, raw: i64) {
+    let neg = raw < 0;
+    let abs = if neg { -raw } else { raw };
+    let int_part = abs / 100;
+    let frac_part = abs % 100;
+
+    buf.len = 0;
+    if neg {
+        buf.buf[buf.len] = b'-';
+        buf.len += 1;
+    }
+
+    if int_part == 0 {
+        buf.buf[buf.len] = b'0';
+        buf.len += 1;
+    } else {
+        let mut tmp = [0u8; 20];
+        let mut tmp_len = 0;
+        let mut n = int_part;
+        while n > 0 {
+            tmp[tmp_len] = b'0' + (n % 10) as u8;
+            tmp_len += 1;
+            n /= 10;
+        }
+        for i in (0..tmp_len).rev() {
+            buf.buf[buf.len] = tmp[i];
+            buf.len += 1;
+        }
+    }
+
+    buf.buf[buf.len] = b'.';
+    buf.len += 1;
+
+    if frac_part < 10 {
+        buf.buf[buf.len] = b'0';
+        buf.len += 1;
+    }
+
+    if frac_part == 0 {
+        buf.buf[buf.len] = b'0';
+        buf.len += 1;
+    } else {
+        let mut tmp = [0u8; 2];
+        let mut tmp_len = 0;
+        let mut n = frac_part;
+        while n > 0 {
+            tmp[tmp_len] = b'0' + (n % 10) as u8;
+            tmp_len += 1;
+            n /= 10;
+        }
+        for i in (0..tmp_len).rev() {
+            buf.buf[buf.len] = tmp[i];
+            buf.len += 1;
+        }
+    }
+
+    sb.push_str(unsafe { std::str::from_utf8_unchecked(&buf.buf[..buf.len]) });
+}
+
+fn write_i32(buf: &mut IntBuf, sb: &mut String, val: i32) {
+    buf.len = 0;
+    let mut n = val;
+    if n < 0 {
+        buf.buf[buf.len] = b'-';
+        buf.len += 1;
+        n = -n;
+    }
+    if n == 0 {
+        buf.buf[buf.len] = b'0';
+        buf.len += 1;
+    } else {
+        let mut tmp = [0u8; 10];
+        let mut tmp_len = 0;
+        while n > 0 {
+            tmp[tmp_len] = b'0' + (n % 10) as u8;
+            tmp_len += 1;
+            n /= 10;
+        }
+        for i in (0..tmp_len).rev() {
+            buf.buf[buf.len] = tmp[i];
+            buf.len += 1;
+        }
+    }
+    sb.push_str(unsafe { std::str::from_utf8_unchecked(&buf.buf[..buf.len]) });
+}
+
+fn write_i64(buf: &mut IntBuf, sb: &mut String, val: i64) {
+    buf.len = 0;
+    let mut n = val;
+    if n < 0 {
+        buf.buf[buf.len] = b'-';
+        buf.len += 1;
+        n = -n;
+    }
+    if n == 0 {
+        buf.buf[buf.len] = b'0';
+        buf.len += 1;
+    } else {
+        let mut tmp = [0u8; 20];
+        let mut tmp_len = 0;
+        while n > 0 {
+            tmp[tmp_len] = b'0' + (n % 10) as u8;
+            tmp_len += 1;
+            n /= 10;
+        }
+        for i in (0..tmp_len).rev() {
+            buf.buf[buf.len] = tmp[i];
+            buf.len += 1;
+        }
+    }
+    sb.push_str(unsafe { std::str::from_utf8_unchecked(&buf.buf[..buf.len]) });
 }
 
 fn escape_string_into(s: &str, sb: &mut String) {
@@ -227,20 +361,6 @@ fn escape_string_into(s: &str, sb: &mut String) {
     }
 }
 
-fn format_decimal(raw: i64) -> String {
-    let neg = raw < 0;
-    let abs = if neg { -raw } else { raw };
-    let int_part = abs / 100;
-    let frac_part = abs % 100;
-    let mut s = if neg { String::from("-") } else { String::new() };
-    s.push_str(&int_part.to_string());
-    s.push('.');
-    if frac_part < 10 {
-        s.push('0');
-    }
-    s.push_str(&frac_part.to_string());
-    s
-}
 
 fn format_timestamp(micros: i64) -> String {
     let secs = micros / 1_000_000;

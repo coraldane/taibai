@@ -178,11 +178,16 @@ impl Engine {
 
     /// Execute a SQL string in the context of a session.
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
+        if sql.as_bytes().get(0).map(|b| b.to_ascii_uppercase()) == Some(b'I') {
+            if let Some(result) = super::parser::fast_insert::try_fast_parse_insert(sql) {
+                let stmt = result?;
+                return self.execute_stmt(session, &stmt);
+            }
+        }
         let stmts = Parser::parse(sql)?;
         if stmts.is_empty() {
             return Err(MonaxError::Sql("empty query".into()));
         }
-        // Execute only the first statement for now
         self.execute_stmt(session, &stmts[0])
     }
 
@@ -350,60 +355,116 @@ impl Engine {
             }
         }
 
-        drop(catalogs); // release read lock
-
-        // Determine partition key and write directory
         let table_dir = self.data_dir.join(db).join(table);
         let (write_dir, partition_key) = self.determine_write_dir(&table_meta, &batch, &table_dir)?;
         std::fs::create_dir_all(&write_dir)?;
 
-        // Write to WAL (write-ahead log)
-        self.write_wal(&table_dir, &batch)?;
+        drop(catalogs);
 
-        // Apply sort key insertion if the table has cluster keys
+        let row_count = batch.num_rows() as u64;
+        let num_cols = batch.num_columns();
+
         let has_sort_key = !table_meta.cluster_key.is_empty();
         if has_sort_key {
-            // For sort-keyed tables, sort the batch before writing
             let key_indices: Vec<usize> = table_meta.cluster_key.iter()
                 .filter_map(|k| schema.index_of(k))
                 .collect();
             if !key_indices.is_empty() {
                 let inserter = crate::storage::sort_key::SortKeyInserter::new(key_indices, vec![false]);
                 if !inserter.is_sorted(&batch) {
-                    // Sort the batch by sort key columns
                     batch = sort_batch_by_key(&batch, &inserter)?;
                 }
             }
         }
 
-        // Write to segment (use partition filename if partitioned)
-        let seg_path = if partition_key.is_empty() {
-            self.next_segment_path(&write_dir, "")?
-        } else {
-            self.next_partition_segment_path(&write_dir, &partition_key)?
-        };
-        let mut writer = SegmentWriter::create(&seg_path, schema, 8192)?;
-        writer.write_batch(&batch)?;
-        writer.seal()?;
+        let compression_level = bulk_compression_level();
+        let compressed_columns: Vec<(Vec<u8>, u64)> = (0..num_cols)
+            .map(|col_idx| {
+                let col = batch.column(col_idx).unwrap();
+                let encoded = encode_column_direct(col);
+                let orig_len = encoded.len() as u64;
+                let compressed = zstd::bulk::compress(&encoded, compression_level)
+                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
+                Ok((compressed, orig_len))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        // Clear WAL after successful segment write to prevent duplicate data on recovery
-        {
-            let mut wal_writers = self.wal_writers.lock().unwrap();
-            let key = table_dir.to_string_lossy().to_string();
-            if let Some(wal_writer) = wal_writers.get_mut(&key) {
-                wal_writer.clear()?;
-            }
+        let active_key = if partition_key.is_empty() {
+            format!("{}:{}", db, table)
+        } else {
+            format!("{}:{}:part:{}", db, table, partition_key)
+        };
+
+        let mut active_segments = self.active_segments.lock().unwrap();
+
+        if !active_segments.contains_key(&active_key) {
+            let seg_path = if partition_key.is_empty() {
+                self.next_segment_path(&write_dir, "")?
+            } else {
+                self.next_partition_segment_path(&write_dir, &partition_key)?
+            };
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&seg_path)?;
+            active_segments.insert(active_key.clone(), ActiveSegment {
+                file: BufWriter::new(file),
+                path: seg_path,
+                schema: schema.clone(),
+                row_groups: Vec::new(),
+                current_size: 0,
+                total_rows: 0,
+            });
         }
 
-        // Update row count in catalog
-        let mut catalogs = self.catalogs.write().unwrap();
-        if let Some(catalog) = catalogs.get_mut(db) {
-            if let Some(meta) = catalog.get_table_mut(table) {
-                meta.row_count += values.len() as i64;
-                meta.segment_count += 1;
+        let segment = active_segments.get_mut(&active_key).unwrap();
+        let offset = segment.current_size;
+        let mut column_sizes = Vec::with_capacity(num_cols);
+        let mut compressed_sizes = Vec::with_capacity(num_cols);
+        let mut uncompressed_sizes = Vec::with_capacity(num_cols);
+        let mut total_length = 0u64;
+        let mut write_buf = Vec::new();
+
+        for (compressed, uncompressed_size) in &compressed_columns {
+            let n = compressed.len() as u64;
+            column_sizes.push(n);
+            compressed_sizes.push(n);
+            uncompressed_sizes.push(*uncompressed_size);
+            total_length += n;
+            write_buf.extend_from_slice(compressed);
+        }
+        segment.file.write_all(&write_buf)?;
+
+        segment.row_groups.push(RowGroupMeta {
+            offset,
+            length: total_length,
+            row_count,
+            column_sizes,
+            compressed_sizes,
+            uncompressed_sizes,
+        });
+        segment.current_size += total_length;
+        segment.total_rows += row_count;
+
+        if segment.current_size >= MAX_SEGMENT_SIZE {
+            self.seal_segment(segment)?;
+            active_segments.remove(&active_key);
+        }
+
+        drop(active_segments);
+
+        {
+            let mut catalogs = self.catalogs.write().unwrap();
+            if let Some(catalog) = catalogs.get_mut(db) {
+                if let Some(meta) = catalog.get_table_mut(table) {
+                    meta.row_count += values.len() as i64;
+                }
+                if !self.is_bulk_mode() {
+                    let meta_dir = self.data_dir.join("meta");
+                    catalog.save(&meta_dir)?;
+                }
             }
-            let meta_dir = self.data_dir.join("meta");
-            catalog.save(&meta_dir)?;
         }
 
         Ok(ExecResult::Ok { rows_affected: values.len() as u64 })
@@ -1344,6 +1405,11 @@ impl Engine {
         let mut mode = self.bulk_mode.lock().unwrap();
         *mode = enabled;
     }
+
+    pub fn is_bulk_mode(&self) -> bool {
+        *self.bulk_mode.lock().unwrap()
+    }
+
     pub fn flush_all_buffers(&self) -> Result<u64> {
         let mut total_rows = 0u64;
         let mut active_segments = self.active_segments.lock().unwrap();

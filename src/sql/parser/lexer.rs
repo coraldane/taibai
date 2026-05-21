@@ -154,16 +154,17 @@ impl std::fmt::Display for Token {
     }
 }
 
-/// SQL lexer: tokenizes SQL input.
-pub struct Lexer {
-    input: Vec<char>,
+pub struct Lexer<'a> {
+    input: &'a str,
     pos: usize,
+    bytes: &'a [u8],
 }
 
-impl Lexer {
-    pub fn new(input: &str) -> Self {
+impl<'a> Lexer<'a> {
+    pub fn new(input: &'a str) -> Self {
         Self {
-            input: input.chars().collect(),
+            input,
+            bytes: input.as_bytes(),
             pos: 0,
         }
     }
@@ -173,48 +174,54 @@ impl Lexer {
         let mut tokens = Vec::new();
         loop {
             self.skip_whitespace();
-            if self.pos >= self.input.len() {
+            if self.pos >= self.bytes.len() {
                 tokens.push(Token::Eof);
                 break;
             }
 
-            let ch = self.input[self.pos];
+            let ch = self.bytes[self.pos];
             let token = match ch {
-                '(' => { self.pos += 1; Token::LeftParen }
-                ')' => { self.pos += 1; Token::RightParen }
-                ',' => { self.pos += 1; Token::Comma }
-                ';' => { self.pos += 1; Token::Semicolon }
-                '.' => { self.pos += 1; Token::Dot }
-                '*' => { self.pos += 1; Token::Star }
-                '+' => { self.pos += 1; Token::Plus }
-                '=' => { self.pos += 1; Token::Eq }
-                '<' => {
+                b'(' => { self.pos += 1; Token::LeftParen }
+                b')' => { self.pos += 1; Token::RightParen }
+                b',' => { self.pos += 1; Token::Comma }
+                b';' => { self.pos += 1; Token::Semicolon }
+                b'.' => { self.pos += 1; Token::Dot }
+                b'*' => { self.pos += 1; Token::Star }
+                b'+' => { self.pos += 1; Token::Plus }
+                b'=' => { self.pos += 1; Token::Eq }
+                b'<' => {
                     self.pos += 1;
-                    if self.peek_char() == Some('=') { self.pos += 1; Token::Lte }
+                    if self.peek_byte() == Some(b'=') { self.pos += 1; Token::Lte }
                     else { Token::Lt }
                 }
-                '>' => {
+                b'>' => {
                     self.pos += 1;
-                    if self.peek_char() == Some('=') { self.pos += 1; Token::Gte }
+                    if self.peek_byte() == Some(b'=') { self.pos += 1; Token::Gte }
                     else { Token::Gt }
                 }
-                '!' => {
+                b'!' => {
                     self.pos += 1;
-                    if self.peek_char() == Some('=') { self.pos += 1; Token::Neq }
+                    if self.peek_byte() == Some(b'=') { self.pos += 1; Token::Neq }
                     else { return Err(MonaxError::Sql("unexpected character '!'".into())); }
                 }
-                '-' => {
+                b'-' => {
                     self.pos += 1;
-                    if self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    if self.peek_byte().map(|c| c.is_ascii_digit()).unwrap_or(false) {
                         self.read_negative_number()?
                     } else {
                         Token::Minus
                     }
                 }
-                '\'' => self.read_string()?,
+                b'\'' => self.read_string()?,
                 c if c.is_ascii_digit() => self.read_number()?,
-                c if c.is_ascii_alphabetic() || c == '_' => self.read_ident_or_keyword()?,
-                c => return Err(MonaxError::Sql(format!("unexpected character '{}'", c))),
+                c if c.is_ascii_alphabetic() || c == b'_' => self.read_ident_or_keyword()?,
+                c => {
+                    let ch = c as char;
+                    if ch.is_whitespace() {
+                        continue;
+                    }
+                    return Err(MonaxError::Sql(format!("unexpected character '{}'", ch)));
+                }
             };
             tokens.push(token);
         }
@@ -222,51 +229,80 @@ impl Lexer {
     }
 
     fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len() && self.input[self.pos].is_whitespace() {
+        while self.pos < self.bytes.len() && {
+            let b = self.bytes[self.pos];
+            b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
+        } {
             self.pos += 1;
         }
     }
 
-    fn peek_char(&self) -> Option<char> {
-        self.input.get(self.pos).copied()
+    fn peek_byte(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
     }
 
     fn read_string(&mut self) -> Result<Token> {
-        self.pos += 1; // skip opening quote
-        let mut s = String::new();
-        while self.pos < self.input.len() {
-            let ch = self.input[self.pos];
-            if ch == '\'' {
-                self.pos += 1;
-                // Check for escaped quote ''
-                if self.pos < self.input.len() && self.input[self.pos] == '\'' {
-                    s.push('\'');
-                    self.pos += 1;
-                    continue;
+        let start = self.pos + 1;
+        let mut end = start;
+        let mut has_escape = false;
+        while end < self.bytes.len() {
+            if self.bytes[end] == b'\'' {
+                if end + 1 < self.bytes.len() && self.bytes[end + 1] == b'\'' {
+                    has_escape = true;
+                    end += 2;
+                } else {
+                    break;
                 }
-                return Ok(Token::StringLit(s));
+            } else {
+                end += 1;
             }
-            s.push(ch);
-            self.pos += 1;
         }
-        Err(MonaxError::Sql("unterminated string literal".into()))
+        if end >= self.bytes.len() {
+            self.pos = end;
+            return Err(MonaxError::Sql("unterminated string literal".into()));
+        }
+        let s = if has_escape {
+            let mut result = String::with_capacity(end - start);
+            let mut i = start;
+            while i < end {
+                if self.bytes[i] == b'\'' && i + 1 < end && self.bytes[i + 1] == b'\'' {
+                    result.push('\'');
+                    i += 2;
+                } else {
+                    let c = unsafe { self.input.as_bytes().get_unchecked(i) };
+                    if *c < 128 {
+                        result.push(*c as char);
+                        i += 1;
+                    } else {
+                        let ch = self.input[i..].chars().next().unwrap();
+                        result.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+            result
+        } else {
+            self.input[start..end].to_string()
+        };
+        self.pos = end + 1;
+        Ok(Token::StringLit(s))
     }
 
     fn read_number(&mut self) -> Result<Token> {
         let start = self.pos;
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
             self.pos += 1;
         }
-        if self.pos < self.input.len() && self.input[self.pos] == '.' {
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == b'.' {
             self.pos += 1;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
-            let s: String = self.input[start..self.pos].iter().collect();
+            let s = &self.input[start..self.pos];
             let v = s.parse::<f64>().map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
             Ok(Token::Float(v))
         } else {
-            let s: String = self.input[start..self.pos].iter().collect();
+            let s = &self.input[start..self.pos];
             let v = s.parse::<i64>().map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
             Ok(Token::Integer(v))
         }
@@ -274,19 +310,19 @@ impl Lexer {
 
     fn read_negative_number(&mut self) -> Result<Token> {
         let start = self.pos;
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
             self.pos += 1;
         }
-        if self.pos < self.input.len() && self.input[self.pos] == '.' {
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == b'.' {
             self.pos += 1;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
-            let s: String = self.input[start..self.pos].iter().collect();
+            let s = &self.input[start..self.pos];
             let v = s.parse::<f64>().map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
             Ok(Token::Float(-v))
         } else {
-            let s: String = self.input[start..self.pos].iter().collect();
+            let s = &self.input[start..self.pos];
             let v = s.parse::<i64>().map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
             Ok(Token::Integer(-v))
         }
@@ -294,15 +330,15 @@ impl Lexer {
 
     fn read_ident_or_keyword(&mut self) -> Result<Token> {
         let start = self.pos;
-        while self.pos < self.input.len() {
-            let ch = self.input[self.pos];
-            if ch.is_ascii_alphanumeric() || ch == '_' {
+        while self.pos < self.bytes.len() {
+            let ch = self.bytes[self.pos];
+            if ch.is_ascii_alphanumeric() || ch == b'_' {
                 self.pos += 1;
             } else {
                 break;
             }
         }
-        let word: String = self.input[start..self.pos].iter().collect();
+        let word = &self.input[start..self.pos];
         Ok(match word.to_uppercase().as_str() {
             "SELECT" => Token::Select,
             "FROM" => Token::From,
@@ -375,7 +411,7 @@ impl Lexer {
             "VECTOR" => Token::Ident("VECTOR".into()),
             "DAY" => Token::Ident("DAY".into()),
             "YEAR" => Token::Ident("YEAR".into()),
-            _ => Token::Ident(word),
+            _ => Token::Ident(word.to_string()),
         })
     }
 }
