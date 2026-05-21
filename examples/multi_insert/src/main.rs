@@ -37,9 +37,10 @@ fn print_usage() {
     eprintln!("  --no-drop         Do not drop table before import");
     eprintln!("  --max=<n>         Max rows to import (default: 0 = unlimited)");
     eprintln!("  --pipeline=<n>    Pipeline depth (default: {})", PIPELINE_DEPTH);
-    eprintln!("  --no-bulk         Do not use START/STOP BULK IMPORT");
+    eprintln!("  --bulk            Use START/STOP BULK IMPORT mode");
     eprintln!();
     eprintln!("This tool tests regular SQL INSERT performance (INSERT ... VALUES (...), (...), ...).");
+    eprintln!("Use --bulk to enable bulk import mode for better performance.");
     eprintln!("For bulk binary import, use batch_import instead.");
 }
 
@@ -82,7 +83,7 @@ async fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(PIPELINE_DEPTH);
 
-    let use_bulk = !args.iter().any(|a| a == "--no-bulk");
+    let use_bulk = args.iter().any(|a| a == "--bulk");
 
     log_msg!("Connecting to {} ...", host);
     let mut client = Client::connect(host).await.expect("connect failed");

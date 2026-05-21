@@ -18,6 +18,7 @@ use crate::sql::parser::parser::Parser;
 const MAX_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const MIN_SEGMENT_SIZE: u64 = 1 * 1024 * 1024 * 1024;
 const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
+const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 200_000;
 
 pub enum ExecResult {
     Ok { rows_affected: u64 },
@@ -31,6 +32,8 @@ struct ActiveSegment {
     row_groups: Vec<RowGroupMeta>,
     current_size: u64,
     total_rows: u64,
+    buffered_batch: Option<RecordBatch>,
+    buffered_rows: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +118,12 @@ impl Engine {
     }
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
+        if sql.as_bytes().get(0).map(|b| b.to_ascii_uppercase()) == Some(b'I') {
+            if let Some(result) = crate::sql::parser::fast_insert::try_fast_parse_insert(sql) {
+                let stmt = result?;
+                return self.execute_stmt(session, &stmt);
+            }
+        }
         let stmts = Parser::parse(sql)?;
         if stmts.is_empty() {
             return Err(MonaxError::Sql("empty query".into()));
@@ -208,6 +217,7 @@ impl Engine {
         {
             let mut active = self.active_segments.lock().unwrap();
             for (_, mut segment) in active.drain() {
+                self.flush_segment_buffer(&mut segment)?;
                 if segment.total_rows > 0 {
                     self.seal_segment(&mut segment)?;
                     total += segment.total_rows;
@@ -248,8 +258,6 @@ impl Engine {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
-        use rayon::prelude::*;
-
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
             return Ok(0);
@@ -257,21 +265,6 @@ impl Engine {
         let table_dir = self.data_dir.join(db).join(table);
         std::fs::create_dir_all(&table_dir)?;
         let key = format!("{}:{}", db, table);
-
-        let compression_level = bulk_compression_level();
-
-        let num_cols = batch.num_columns();
-        let compressed_columns: Vec<(Vec<u8>, u64)> = (0..num_cols)
-            .into_par_iter()
-            .map(|col_idx| {
-                let col = batch.column(col_idx).unwrap();
-                let encoded = encode_column_direct(col);
-                let orig_len = encoded.len() as u64;
-                let compressed = zstd::bulk::compress(&encoded, compression_level)
-                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
-                Ok((compressed, orig_len))
-            })
-            .collect::<Result<Vec<_>>>()?;
 
         let mut active_segments = self.active_segments.lock().unwrap();
         if !active_segments.contains_key(&key) {
@@ -291,49 +284,25 @@ impl Engine {
                     row_groups: Vec::new(),
                     current_size: 0,
                     total_rows: 0,
+                    buffered_batch: None,
+                    buffered_rows: 0,
                 },
             );
         }
         let segment = active_segments.get_mut(&key).unwrap();
-        let offset = segment.current_size;
-        let mut column_sizes = Vec::with_capacity(num_cols);
-        let mut compressed_sizes = Vec::with_capacity(num_cols);
-        let mut uncompressed_sizes = Vec::with_capacity(num_cols);
-        let mut total_length = 0u64;
-        let mut write_buf = Vec::new();
-        for (compressed, uncompressed_size) in &compressed_columns {
-            let n = compressed.len() as u64;
-            column_sizes.push(n);
-            compressed_sizes.push(n);
-            uncompressed_sizes.push(*uncompressed_size);
-            total_length += n;
-            write_buf.extend_from_slice(compressed);
-        }
-        segment.file.write_all(&write_buf)?;
-        segment.row_groups.push(RowGroupMeta {
-            offset,
-            length: total_length,
-            row_count,
-            column_sizes,
-            compressed_sizes,
-            uncompressed_sizes,
-        });
-        segment.current_size += total_length;
-        segment.total_rows += row_count;
-        let mut sealed = false;
-        if segment.current_size >= MAX_SEGMENT_SIZE {
+        self.append_to_segment_buffer(segment, &batch, &table_dir)?;
+
+        let sealed = segment.current_size >= MAX_SEGMENT_SIZE;
+        if sealed {
             self.seal_segment(segment)?;
             active_segments.remove(&key);
-            sealed = true;
         }
         drop(active_segments);
 
-        if sealed {
-            let wal_key = table_dir.to_string_lossy().to_string();
-            let mut wal_writers = self.wal_writers.lock().unwrap();
-            if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
-                let _ = wal_writer.clear();
-            }
+        let wal_key = table_dir.to_string_lossy().to_string();
+        let mut wal_writers = self.wal_writers.lock().unwrap();
+        if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
+            let _ = wal_writer.clear();
         }
 
         Ok(row_count)
@@ -437,6 +406,8 @@ impl Engine {
                     row_groups: Vec::new(),
                     current_size: 0,
                     total_rows: 0,
+                    buffered_batch: None,
+                    buffered_rows: 0,
                 },
             );
         }
@@ -470,20 +441,17 @@ impl Engine {
         segment.current_size += total_length;
         segment.total_rows += req.row_count as u64;
 
-        let mut sealed = false;
-        if segment.current_size >= MAX_SEGMENT_SIZE {
+        let sealed = segment.current_size >= MAX_SEGMENT_SIZE;
+        if sealed {
             self.seal_segment(segment)?;
             active_segments.remove(&key);
-            sealed = true;
         }
         drop(active_segments);
 
-        if sealed {
-            let wal_key = table_dir.to_string_lossy().to_string();
-            let mut wal_writers = self.wal_writers.lock().unwrap();
-            if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
-                let _ = wal_writer.clear();
-            }
+        let wal_key = table_dir.to_string_lossy().to_string();
+        let mut wal_writers = self.wal_writers.lock().unwrap();
+        if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
+            let _ = wal_writer.clear();
         }
 
         if !disable_wal {
@@ -574,6 +542,101 @@ impl Engine {
         }
 
         Ok(buf)
+    }
+
+    fn append_to_segment_buffer(
+        &self,
+        segment: &mut ActiveSegment,
+        batch: &RecordBatch,
+        _table_dir: &Path,
+    ) -> Result<()> {
+        if let Some(ref mut buffered) = segment.buffered_batch {
+            for col_idx in 0..batch.num_columns() {
+                let src = batch.column(col_idx).unwrap();
+                let dst = buffered.column_mut(col_idx).unwrap();
+                dst.extend(src)?;
+            }
+            segment.buffered_rows += batch.num_rows();
+        } else {
+            segment.buffered_batch = Some(batch.clone());
+            segment.buffered_rows = batch.num_rows();
+        }
+
+        while segment.buffered_rows >= SQL_INSERT_ROW_GROUP_TARGET_ROWS {
+            self.flush_segment_buffer(segment)?;
+        }
+        Ok(())
+    }
+
+    fn flush_segment_buffer(&self, segment: &mut ActiveSegment) -> Result<()> {
+        use rayon::prelude::*;
+
+        let buffered = match segment.buffered_batch.take() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let total_buffered = segment.buffered_rows;
+        segment.buffered_rows = 0;
+
+        let compression_level = bulk_compression_level();
+        let num_cols = buffered.num_columns();
+
+        let rows_to_flush = SQL_INSERT_ROW_GROUP_TARGET_ROWS.min(total_buffered);
+
+        let compressed_columns: Vec<(Vec<u8>, u64)> = (0..num_cols)
+            .into_par_iter()
+            .map(|col_idx| {
+                let col = buffered.column(col_idx).unwrap();
+                let encoded = encode_column_direct_range(col, 0, rows_to_flush);
+                let orig_len = encoded.len() as u64;
+                let compressed = zstd::bulk::compress(&encoded, compression_level)
+                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
+                Ok((compressed, orig_len))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let offset = segment.current_size;
+        let mut column_sizes = Vec::with_capacity(num_cols);
+        let mut compressed_sizes = Vec::with_capacity(num_cols);
+        let mut uncompressed_sizes = Vec::with_capacity(num_cols);
+        let mut total_length = 0u64;
+        let mut write_buf = Vec::new();
+        for (compressed, uncompressed_size) in &compressed_columns {
+            let n = compressed.len() as u64;
+            column_sizes.push(n);
+            compressed_sizes.push(n);
+            uncompressed_sizes.push(*uncompressed_size);
+            total_length += n;
+            write_buf.extend_from_slice(compressed);
+        }
+        segment.file.write_all(&write_buf)?;
+        segment.row_groups.push(RowGroupMeta {
+            offset,
+            length: total_length,
+            row_count: rows_to_flush as u64,
+            column_sizes,
+            compressed_sizes,
+            uncompressed_sizes,
+        });
+        segment.current_size += total_length;
+        segment.total_rows += rows_to_flush as u64;
+
+        let remaining = total_buffered - rows_to_flush;
+        if remaining > 0 {
+            let mut remainder = RecordBatch::new(buffered.schema.clone());
+            for col_idx in 0..num_cols {
+                let col = buffered.column(col_idx).unwrap();
+                let dst = remainder.column_mut(col_idx).unwrap();
+                for row_idx in rows_to_flush..total_buffered {
+                    let val = col.scalar(row_idx);
+                    dst.push(&val)?;
+                }
+            }
+            segment.buffered_batch = Some(remainder);
+            segment.buffered_rows = remaining;
+        }
+
+        Ok(())
     }
 }
 
@@ -725,109 +788,124 @@ fn read_utf8_at<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> Result<&'
     Ok(s)
 }
 
-fn encode_column_direct(col: &crate::types::array::ColumnArray) -> Vec<u8> {
-    let mut data = Vec::with_capacity(4 + col.len() * col.data_type().fixed_size().unwrap_or(8));
+fn encode_column_direct_range(col: &crate::types::array::ColumnArray, start: usize, len: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + len * col.data_type().fixed_size().unwrap_or(8));
     data.extend_from_slice(&0u32.to_le_bytes());
+    let end = start + len;
 
     match col {
         crate::types::array::ColumnArray::Int32 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes =
-                unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 4) };
+                unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4) };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Int64 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes =
-                unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8) };
+                unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8) };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Float64 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes =
-                unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8) };
+                unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8) };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Decimal { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes =
-                unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8) };
+                unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8) };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::VarChar { data: vals, .. } => {
-            for v in vals {
+            for v in &vals[start..end] {
                 data.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 data.extend_from_slice(v.as_bytes());
             }
         }
         crate::types::array::ColumnArray::Timestamp { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes =
-                unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8) };
+                unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8) };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Bool { data: vals, .. } => {
-            data.extend_from_slice(vals);
+            data.extend_from_slice(&vals[start..end]);
         }
         crate::types::array::ColumnArray::Int8 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes =
-                unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len()) };
+                unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Int16 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes = unsafe {
-                std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 2)
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 2)
             };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::UInt8 { data: vals, .. } => {
-            data.extend_from_slice(vals);
+            data.extend_from_slice(&vals[start..end]);
         }
         crate::types::array::ColumnArray::UInt16 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes = unsafe {
-                std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 2)
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 2)
             };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::UInt32 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes = unsafe {
-                std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 4)
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
             };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::UInt64 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes = unsafe {
-                std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8)
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8)
             };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Float32 { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes = unsafe {
-                std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 4)
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
             };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Date { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes = unsafe {
-                std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 4)
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
             };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Time { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes = unsafe {
-                std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8)
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8)
             };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Interval { data: vals, .. } => {
+            let slice = &vals[start..end];
             let bytes = unsafe {
-                std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8)
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8)
             };
             data.extend_from_slice(bytes);
         }
         crate::types::array::ColumnArray::Blob { data: vals, .. } => {
-            for v in vals {
+            for v in &vals[start..end] {
                 data.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 data.extend_from_slice(v);
             }
         }
         crate::types::array::ColumnArray::Vector { data: vals, .. } => {
-            for v in vals {
+            for v in &vals[start..end] {
                 data.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 for f in v {
                     data.extend_from_slice(&f.to_le_bytes());
@@ -838,3 +916,8 @@ fn encode_column_direct(col: &crate::types::array::ColumnArray) -> Vec<u8> {
 
     data
 }
+
+fn encode_column_direct(col: &crate::types::array::ColumnArray) -> Vec<u8> {
+    encode_column_direct_range(col, 0, col.len())
+}
+

@@ -157,6 +157,13 @@ impl Parser {
             nullable = false;
         }
 
+        if data_type == DataType::Decimal && scale < 0 {
+            return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
+        }
+        if data_type == DataType::Decimal && scale > 18 {
+            return Err(MonaxError::Sql(format!("decimal scale {} exceeds supported maximum 18", scale)));
+        }
+
         Ok(ColumnDefAst {
             name,
             data_type,

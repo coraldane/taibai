@@ -141,15 +141,14 @@ pub fn try_fast_parse_insert(sql: &str) -> Option<Result<Statement>> {
                     Expr::Literal(ScalarValue::Int64(None))
                 }
                 b'-' if pos + 1 < len && bytes[pos + 1].is_ascii_digit() => {
-                    pos += 1;
-                    let (val, new_pos) = parse_number(bytes, pos, len, true)?;
+                    let (val, new_pos) = parse_number(sql, bytes, pos, len)?;
                     pos = new_pos;
-                    Expr::Literal(ScalarValue::Int64(Some(val)))
+                    Expr::Literal(val)
                 }
                 c if c.is_ascii_digit() => {
-                    let (val, new_pos) = parse_number(bytes, pos, len, false)?;
+                    let (val, new_pos) = parse_number(sql, bytes, pos, len)?;
                     pos = new_pos;
-                    Expr::Literal(ScalarValue::Int64(Some(val)))
+                    Expr::Literal(val)
                 }
                 _ => {
                     return None;
@@ -193,23 +192,32 @@ pub fn try_fast_parse_insert(sql: &str) -> Option<Result<Statement>> {
 }
 
 #[inline]
-fn parse_number(bytes: &[u8], start: usize, len: usize, neg: bool) -> Option<(i64, usize)> {
+fn parse_number(sql: &str, bytes: &[u8], start: usize, len: usize) -> Option<(ScalarValue, usize)> {
     let mut pos = start;
-    let mut result: i64 = 0;
-    while pos < len && bytes[pos].is_ascii_digit() {
-        result = result * 10 + (bytes[pos] - b'0') as i64;
+    if bytes[pos] == b'-' {
         pos += 1;
     }
-    if pos < len && bytes[pos] == b'.' {
+    while pos < len && bytes[pos].is_ascii_digit() {
         pos += 1;
+    }
+    let mut has_fraction = false;
+    if pos < len && bytes[pos] == b'.' {
+        has_fraction = true;
+        pos += 1;
+        let fraction_start = pos;
         while pos < len && bytes[pos].is_ascii_digit() {
             pos += 1;
         }
+        if pos == fraction_start {
+            return None;
+        }
     }
-    if neg {
-        result = -result;
+    let s = &sql[start..pos];
+    if has_fraction {
+        Some((ScalarValue::Float64(Some(s.parse::<f64>().ok()?)), pos))
+    } else {
+        Some((ScalarValue::Int64(Some(s.parse::<i64>().ok()?)), pos))
     }
-    Some((result, pos))
 }
 
 #[cfg(test)]
@@ -266,6 +274,27 @@ mod tests {
                 match &values[0][0] {
                     Expr::Literal(ScalarValue::VarChar(Some(s))) => assert_eq!(s, "it's"),
                     _ => panic!("expected string"),
+                }
+            }
+            _ => panic!("expected insert"),
+        }
+    }
+
+    #[test]
+    fn test_fast_insert_decimal_literal() {
+        let sql = "INSERT INTO t VALUES (12.34, -0.56)";
+        let result = try_fast_parse_insert(sql).unwrap().unwrap();
+        match result {
+            Statement::Insert { values, .. } => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].len(), 2);
+                match &values[0][0] {
+                    Expr::Literal(ScalarValue::Float64(Some(v))) => assert_eq!(*v, 12.34),
+                    _ => panic!("expected float"),
+                }
+                match &values[0][1] {
+                    Expr::Literal(ScalarValue::Float64(Some(v))) => assert_eq!(*v, -0.56),
+                    _ => panic!("expected float"),
                 }
             }
             _ => panic!("expected insert"),

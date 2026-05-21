@@ -139,6 +139,7 @@ pub fn eval_expr_to_scalar_with_timezone(expr: &Expr, dt: &DataType, timezone_of
 
 pub fn eval_expr_to_scalar_with_scale_timezone(expr: &Expr, dt: &DataType, scale: i32, timezone_offset_hours: i32) -> Result<ScalarValue> {
     match expr {
+        Expr::Literal(v) if v.is_null() => Ok(ScalarValue::null_for_type(*dt)),
         Expr::Literal(v) => {
             match (dt, v) {
                 (DataType::Int32, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int32(Some(*v as i32))),
@@ -146,11 +147,12 @@ pub fn eval_expr_to_scalar_with_scale_timezone(expr: &Expr, dt: &DataType, scale
                 (DataType::Int8, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int8(Some(*v as i8))),
                 (DataType::Float32, ScalarValue::Float64(Some(v))) => Ok(ScalarValue::Float32(Some(*v as f32))),
                 (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
-                    let multiplier = 10_i64.pow(scale as u32) as f64;
-                    Ok(ScalarValue::Decimal(Some((*v * multiplier).round() as i64)))
+                    let multiplier = decimal_multiplier(scale)?;
+                    Ok(ScalarValue::Decimal(Some((*v * multiplier as f64).round() as i64)))
                 }
                 (DataType::Decimal, ScalarValue::Int64(Some(v))) => {
-                    Ok(ScalarValue::Decimal(Some(*v)))
+                    let multiplier = decimal_multiplier(scale)?;
+                    Ok(ScalarValue::Decimal(Some(v.checked_mul(multiplier).ok_or_else(|| MonaxError::Sql(format!("decimal value '{}' overflows scale {}", v, scale)))?)))
                 }
                 (DataType::Timestamp, ScalarValue::VarChar(Some(s))) => {
                     use crate::sql::execution::functions::date::parse_timestamp_smart;
@@ -169,6 +171,14 @@ pub fn eval_expr_to_scalar_with_scale_timezone(expr: &Expr, dt: &DataType, scale
         Expr::Column(_) => Ok(ScalarValue::null_for_type(*dt)),
         _ => Ok(ScalarValue::null_for_type(*dt)),
     }
+}
+
+fn decimal_multiplier(scale: i32) -> Result<i64> {
+    if scale < 0 || scale > 18 {
+        return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
+    }
+    10_i64.checked_pow(scale as u32)
+        .ok_or_else(|| MonaxError::Sql(format!("invalid decimal scale {}", scale)))
 }
 
 pub fn sort_batch_by_key(
