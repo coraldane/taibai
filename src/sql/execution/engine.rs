@@ -34,6 +34,7 @@ struct ActiveSegment {
     total_rows: u64,
     buffered_batch: Option<RecordBatch>,
     buffered_rows: usize,
+    wal_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +218,7 @@ impl Engine {
         {
             let mut active = self.active_segments.lock().unwrap();
             for (_, mut segment) in active.drain() {
-                self.flush_segment_buffer(&mut segment)?;
+                let _ = self.flush_segment_buffer(&mut segment)?;
                 if segment.total_rows > 0 {
                     self.seal_segment(&mut segment)?;
                     total += segment.total_rows;
@@ -275,6 +276,7 @@ impl Engine {
                 .write(true)
                 .truncate(true)
                 .open(&seg_path)?;
+            let wal_key = table_dir.to_string_lossy().to_string();
             active_segments.insert(
                 key.clone(),
                 ActiveSegment {
@@ -286,23 +288,37 @@ impl Engine {
                     total_rows: 0,
                     buffered_batch: None,
                     buffered_rows: 0,
+                    wal_key,
                 },
             );
         }
         let segment = active_segments.get_mut(&key).unwrap();
-        self.append_to_segment_buffer(segment, &batch, &table_dir)?;
+        let wal_keys_to_clear = self.append_to_segment_buffer(segment, &batch, &table_dir)?;
 
-        let sealed = segment.current_size >= MAX_SEGMENT_SIZE;
-        if sealed {
+        let mut sealed = false;
+        let sealed_wal_key = if segment.current_size >= MAX_SEGMENT_SIZE {
             self.seal_segment(segment)?;
+            let wal_key = segment.wal_key.clone();
             active_segments.remove(&key);
-        }
+            sealed = true;
+            Some(wal_key)
+        } else {
+            None
+        };
         drop(active_segments);
 
-        let wal_key = table_dir.to_string_lossy().to_string();
-        let mut wal_writers = self.wal_writers.lock().unwrap();
-        if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
-            let _ = wal_writer.clear();
+        if !wal_keys_to_clear.is_empty() || sealed {
+            let mut wal_writers = self.wal_writers.lock().unwrap();
+            for wal_key in &wal_keys_to_clear {
+                if let Some(wal_writer) = wal_writers.get_mut(wal_key) {
+                    let _ = wal_writer.clear();
+                }
+            }
+            if let Some(wal_key) = sealed_wal_key {
+                if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
+                    let _ = wal_writer.clear();
+                }
+            }
         }
 
         Ok(row_count)
@@ -397,6 +413,7 @@ impl Engine {
                 .write(true)
                 .truncate(true)
                 .open(&seg_path)?;
+            let wal_key = table_dir.to_string_lossy().to_string();
             active_segments.insert(
                 key.clone(),
                 ActiveSegment {
@@ -408,6 +425,7 @@ impl Engine {
                     total_rows: 0,
                     buffered_batch: None,
                     buffered_rows: 0,
+                    wal_key,
                 },
             );
         }
@@ -441,17 +459,23 @@ impl Engine {
         segment.current_size += total_length;
         segment.total_rows += req.row_count as u64;
 
-        let sealed = segment.current_size >= MAX_SEGMENT_SIZE;
-        if sealed {
+        let mut sealed = false;
+        let sealed_wal_key = if segment.current_size >= MAX_SEGMENT_SIZE {
             self.seal_segment(segment)?;
+            let wal_key = segment.wal_key.clone();
             active_segments.remove(&key);
-        }
+            sealed = true;
+            Some(wal_key)
+        } else {
+            None
+        };
         drop(active_segments);
 
-        let wal_key = table_dir.to_string_lossy().to_string();
-        let mut wal_writers = self.wal_writers.lock().unwrap();
-        if let Some(wal_writer) = wal_writers.get_mut(&wal_key) {
-            let _ = wal_writer.clear();
+        if sealed {
+            let mut wal_writers = self.wal_writers.lock().unwrap();
+            if let Some(wal_writer) = wal_writers.get_mut(&sealed_wal_key.unwrap()) {
+                let _ = wal_writer.clear();
+            }
         }
 
         if !disable_wal {
@@ -549,7 +573,8 @@ impl Engine {
         segment: &mut ActiveSegment,
         batch: &RecordBatch,
         _table_dir: &Path,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
+        let mut wal_keys_to_clear = Vec::new();
         if let Some(ref mut buffered) = segment.buffered_batch {
             for col_idx in 0..batch.num_columns() {
                 let src = batch.column(col_idx).unwrap();
@@ -563,17 +588,19 @@ impl Engine {
         }
 
         while segment.buffered_rows >= SQL_INSERT_ROW_GROUP_TARGET_ROWS {
-            self.flush_segment_buffer(segment)?;
+            if let Some(wal_key) = self.flush_segment_buffer(segment)? {
+                wal_keys_to_clear.push(wal_key);
+            }
         }
-        Ok(())
+        Ok(wal_keys_to_clear)
     }
 
-    fn flush_segment_buffer(&self, segment: &mut ActiveSegment) -> Result<()> {
+    fn flush_segment_buffer(&self, segment: &mut ActiveSegment) -> Result<Option<String>> {
         use rayon::prelude::*;
 
         let buffered = match segment.buffered_batch.take() {
             Some(b) => b,
-            None => return Ok(()),
+            None => return Ok(None),
         };
         let total_buffered = segment.buffered_rows;
         segment.buffered_rows = 0;
@@ -636,7 +663,7 @@ impl Engine {
             segment.buffered_rows = remaining;
         }
 
-        Ok(())
+        Ok(Some(segment.wal_key.clone()))
     }
 }
 
