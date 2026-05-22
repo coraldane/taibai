@@ -57,7 +57,6 @@ async fn run_server(config: ServerConfig) {
 
     let config = Arc::new(config);
     let engine = Arc::new(engine);
-    Engine::start_flush_thread(&engine);
     let server = Server::new(config, engine.clone());
 
     let server_handle = tokio::spawn(async move {

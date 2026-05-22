@@ -78,11 +78,7 @@ pub fn exec_drop_table(
     catalog.drop_table(name)?;
 
     let table_dir = engine.data_dir().join(db).join(name);
-    {
-        let key = table_dir.to_string_lossy().to_string();
-        let mut wal_writers = engine.wal_writers().lock().unwrap();
-        wal_writers.remove(&key);
-    }
+    engine.segment_mgr().remove_wal(&table_dir);
 
     if table_dir.exists() {
         let _ = std::fs::remove_dir_all(&table_dir);

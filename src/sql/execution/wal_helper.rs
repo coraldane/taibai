@@ -1,37 +1,17 @@
 use std::path::{Path, PathBuf};
 
-use crate::common::error::{MonaxError, Result};
-use crate::protocol::types::DataType;
+use crate::common::error::Result;
 use crate::storage::schema::TableMeta;
-use crate::storage::wal::WalWriter;
-use crate::types::batch::{RecordBatch, Schema};
-use crate::types::scalar::ScalarValue;
 
 use super::engine::Engine;
 
-const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
-const FLAG_COMPRESSED: u8 = 0x01;
-
-pub fn write_wal(engine: &Engine, table_dir: &Path, batch: &RecordBatch) -> Result<()> {
+pub fn write_wal(engine: &Engine, table_dir: &Path, batch: &crate::types::batch::RecordBatch) -> Result<()> {
     if engine.is_bulk_mode() {
         return Ok(());
     }
 
-    let wal_dir = table_dir.join("wal");
-    let key = table_dir.to_string_lossy().to_string();
-
-    let wal_data = serialize_batch_for_wal(batch);
-
-    let txn_id = engine.alloc_txn_id();
-
-    let mut wal_writers = engine.wal_writers().lock().unwrap();
-    if !wal_writers.contains_key(&key) {
-        let writer = WalWriter::open(&wal_dir, 64 * 1024 * 1024)?;
-        wal_writers.insert(key.clone(), writer);
-    }
-    let wal_writer = wal_writers.get_mut(&key).unwrap();
-
-    wal_writer.write_compact(txn_id, &wal_data, false)?;
+    let mgr = engine.segment_mgr();
+    mgr.write_wal(table_dir, batch)?;
 
     Ok(())
 }
@@ -39,7 +19,7 @@ pub fn write_wal(engine: &Engine, table_dir: &Path, batch: &RecordBatch) -> Resu
 pub fn determine_write_dir(
     _engine: &Engine,
     table_meta: &TableMeta,
-    batch: &RecordBatch,
+    batch: &crate::types::batch::RecordBatch,
     default_dir: &Path,
 ) -> Result<(PathBuf, String)> {
     if table_meta.partition_key.is_empty() {
@@ -62,7 +42,7 @@ pub fn determine_write_dir(
     };
 
     let first_val = batch.scalar(0, col_idx)
-        .unwrap_or(ScalarValue::Int64(None));
+        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
 
     let partition_key = crate::storage::partition::compute_partition_key(&first_val, strategy)
         .unwrap_or_else(|_| "default".to_string());
@@ -70,7 +50,10 @@ pub fn determine_write_dir(
     Ok((default_dir.to_path_buf(), partition_key))
 }
 
-pub fn serialize_batch_for_wal(batch: &RecordBatch) -> Vec<u8> {
+pub fn serialize_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Vec<u8> {
+    const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
+    const FLAG_COMPRESSED: u8 = 0x01;
+
     let num_cols = batch.num_columns();
     let num_rows = batch.num_rows();
 
@@ -232,7 +215,12 @@ fn encode_column_raw(col: &crate::types::array::ColumnArray) -> Vec<u8> {
     }
 }
 
-pub fn deserialize_batch_from_wal(data: &[u8], schema: &Schema) -> Result<RecordBatch> {
+pub fn deserialize_batch_from_wal(data: &[u8], schema: &crate::types::batch::Schema) -> Result<crate::types::batch::RecordBatch> {
+    use crate::common::error::MonaxError;
+
+    const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
+    const FLAG_COMPRESSED: u8 = 0x01;
+
     if data.len() < 13 {
         return Err(MonaxError::Internal("WAL data too short".into()));
     }
@@ -277,7 +265,7 @@ pub fn deserialize_batch_from_wal(data: &[u8], schema: &Schema) -> Result<Record
         ));
     }
 
-    let mut batch = RecordBatch::new(schema.clone());
+    let mut batch = crate::types::batch::RecordBatch::new(schema.clone());
     let mut offset = 13;
 
     for col_idx in 0..num_cols {
@@ -328,13 +316,16 @@ pub fn deserialize_batch_from_wal(data: &[u8], schema: &Schema) -> Result<Record
 }
 
 fn decode_column_raw(
-    batch: &mut RecordBatch,
+    batch: &mut crate::types::batch::RecordBatch,
     col_idx: usize,
-    dt: DataType,
+    dt: crate::protocol::types::DataType,
     data: &[u8],
     num_rows: usize,
     null_bitmap: Option<&crate::types::bitmap::NullBitmap>,
 ) -> Result<()> {
+    use crate::common::error::MonaxError;
+    use crate::types::scalar::ScalarValue;
+
     let col = batch.column_mut(col_idx).unwrap();
     let mut pos = 0;
 
@@ -351,9 +342,12 @@ fn decode_column_raw(
     Ok(())
 }
 
-fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<ScalarValue> {
+fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::DataType) -> Result<crate::types::scalar::ScalarValue> {
+    use crate::common::error::MonaxError;
+    use crate::types::scalar::ScalarValue;
+
     match dt {
-        DataType::Bool => {
+        crate::protocol::types::DataType::Bool => {
             if *pos >= data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Bool".into()));
             }
@@ -361,7 +355,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 1;
             Ok(ScalarValue::Bool(Some(v)))
         }
-        DataType::Int8 => {
+        crate::protocol::types::DataType::Int8 => {
             if *pos >= data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Int8".into()));
             }
@@ -369,7 +363,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 1;
             Ok(ScalarValue::Int8(Some(v)))
         }
-        DataType::Int16 => {
+        crate::protocol::types::DataType::Int16 => {
             if *pos + 2 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Int16".into()));
             }
@@ -377,7 +371,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 2;
             Ok(ScalarValue::Int16(Some(v)))
         }
-        DataType::Int32 => {
+        crate::protocol::types::DataType::Int32 => {
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Int32".into()));
             }
@@ -385,7 +379,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 4;
             Ok(ScalarValue::Int32(Some(v)))
         }
-        DataType::Int64 => {
+        crate::protocol::types::DataType::Int64 => {
             if *pos + 8 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Int64".into()));
             }
@@ -396,7 +390,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 8;
             Ok(ScalarValue::Int64(Some(v)))
         }
-        DataType::UInt8 => {
+        crate::protocol::types::DataType::UInt8 => {
             if *pos >= data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for UInt8".into()));
             }
@@ -404,7 +398,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 1;
             Ok(ScalarValue::UInt8(Some(v)))
         }
-        DataType::UInt16 => {
+        crate::protocol::types::DataType::UInt16 => {
             if *pos + 2 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for UInt16".into()));
             }
@@ -412,7 +406,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 2;
             Ok(ScalarValue::UInt16(Some(v)))
         }
-        DataType::UInt32 => {
+        crate::protocol::types::DataType::UInt32 => {
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for UInt32".into()));
             }
@@ -420,7 +414,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 4;
             Ok(ScalarValue::UInt32(Some(v)))
         }
-        DataType::UInt64 => {
+        crate::protocol::types::DataType::UInt64 => {
             if *pos + 8 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for UInt64".into()));
             }
@@ -431,7 +425,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 8;
             Ok(ScalarValue::UInt64(Some(v)))
         }
-        DataType::Float32 => {
+        crate::protocol::types::DataType::Float32 => {
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Float32".into()));
             }
@@ -439,7 +433,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 4;
             Ok(ScalarValue::Float32(Some(v)))
         }
-        DataType::Float64 => {
+        crate::protocol::types::DataType::Float64 => {
             if *pos + 8 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Float64".into()));
             }
@@ -450,7 +444,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 8;
             Ok(ScalarValue::Float64(Some(v)))
         }
-        DataType::Decimal => {
+        crate::protocol::types::DataType::Decimal => {
             if *pos + 8 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Decimal".into()));
             }
@@ -461,7 +455,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 8;
             Ok(ScalarValue::Decimal(Some(v)))
         }
-        DataType::Date => {
+        crate::protocol::types::DataType::Date => {
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Date".into()));
             }
@@ -469,7 +463,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 4;
             Ok(ScalarValue::Date(Some(v)))
         }
-        DataType::Time => {
+        crate::protocol::types::DataType::Time => {
             if *pos + 8 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Time".into()));
             }
@@ -480,7 +474,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 8;
             Ok(ScalarValue::Time(Some(v)))
         }
-        DataType::Timestamp => {
+        crate::protocol::types::DataType::Timestamp => {
             if *pos + 8 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Timestamp".into()));
             }
@@ -491,7 +485,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 8;
             Ok(ScalarValue::Timestamp(Some(v)))
         }
-        DataType::Interval => {
+        crate::protocol::types::DataType::Interval => {
             if *pos + 8 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Interval".into()));
             }
@@ -502,7 +496,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += 8;
             Ok(ScalarValue::Interval(Some(v)))
         }
-        DataType::VarChar => {
+        crate::protocol::types::DataType::VarChar => {
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for VarChar".into()));
             }
@@ -516,7 +510,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += len;
             Ok(ScalarValue::VarChar(Some(s.to_string())))
         }
-        DataType::Blob => {
+        crate::protocol::types::DataType::Blob => {
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Blob".into()));
             }
@@ -529,7 +523,7 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: DataType) -> Result<Scal
             *pos += len;
             Ok(ScalarValue::Blob(Some(v)))
         }
-        DataType::Vector => {
+        crate::protocol::types::DataType::Vector => {
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Vector".into()));
             }

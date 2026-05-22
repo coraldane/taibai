@@ -1,11 +1,11 @@
 use crate::common::error::{MonaxError, Result};
-use crate::storage::segment::{SegmentReader, SegmentWriter};
+use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::RecordBatch;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{discover_segments, eval_where_clause, eval_expr_to_scalar};
+use super::helpers::{eval_where_clause, eval_expr_to_scalar};
 use crate::sql::parser::ast::{Assignment, Expr};
 
 pub fn exec_update(
@@ -26,11 +26,12 @@ pub fn exec_update(
     };
 
     let table_dir = engine.data_dir().join(db).join(table);
+    let mgr = engine.segment_mgr();
     let mut all_batches = Vec::new();
     if table_dir.exists() {
-        let segment_files = discover_segments(&table_dir)?;
+        let segment_files = SegmentManager::discover_segments(&table_dir)?;
         for seg_path in segment_files {
-            let reader = SegmentReader::open(&seg_path)?;
+            let reader = mgr.open_reader(&seg_path)?;
             let batches = reader.scan(4096)?;
             all_batches.extend(batches);
         }
@@ -79,24 +80,18 @@ pub fn exec_update(
     }
 
     if table_dir.exists() {
-        for seg_file in discover_segments(&table_dir)? {
+        for seg_file in SegmentManager::discover_segments(&table_dir)? {
             std::fs::remove_file(&seg_file)?;
         }
     }
 
     for batch in new_batches {
-        let seg_path = engine.next_segment_path(&table_dir, "")?;
-        let mut writer = SegmentWriter::create(&seg_path, batch.schema.clone(), 8192)?;
-        writer.write_batch(&batch)?;
-        writer.seal()?;
+        let seg_path = mgr.next_segment_path(&table_dir, "")?;
+        mgr.write_new_segment(&seg_path, batch.schema.clone(), 8192, &batch)?;
     }
 
     {
-        let mut wal_writers = engine.wal_writers().lock().unwrap();
-        let key = table_dir.to_string_lossy().to_string();
-        if let Some(wal_writer) = wal_writers.get_mut(&key) {
-            wal_writer.clear()?;
-        }
+        let _ = mgr.clear_wal(&table_dir);
     }
 
     let mut catalogs = engine.catalogs().write().unwrap();

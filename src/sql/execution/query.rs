@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ScanStats, SegmentReader};
+use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ScanStats};
+use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::discover_segments;
 use crate::sql::parser::ast::{BinOp, FromClause, SelectItem, Statement};
 use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan};
 
@@ -92,11 +92,12 @@ fn exec_table_select(
     collect_scan_predicates(&plan, &mut scan_predicates);
 
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mgr = engine.segment_mgr();
     for table_name in &table_names {
         let table_dir = engine.data_dir().join(db).join(table_name);
         let mut batches = Vec::new();
         if table_dir.exists() {
-            let segment_files = discover_segments(&table_dir)?;
+            let segment_files = SegmentManager::discover_segments(&table_dir)?;
             let predicate = scan_predicates.get(table_name);
             let pred_ref = predicate.filter(|p| !p.is_empty());
             if let Some(p) = pred_ref {
@@ -107,7 +108,7 @@ fn exec_table_select(
                 );
             }
             for seg_path in segment_files {
-                let reader = SegmentReader::open(&seg_path)?;
+                let reader = mgr.open_reader(&seg_path)?;
                 let table_stats = stats.as_deref_mut()
                     .map(|s| s.entry(table_name.clone()).or_default());
                 batches.extend(reader.scan_with_predicate_and_stats(4096, pred_ref, table_stats)?);

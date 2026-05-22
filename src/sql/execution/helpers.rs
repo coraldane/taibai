@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 use crate::types::batch::{RecordBatch, Schema};
@@ -224,23 +222,4 @@ pub fn sort_batch_by_key(
     }
 
     Ok(sorted_batch)
-}
-
-pub fn discover_segments(table_dir: &Path) -> Result<Vec<PathBuf>> {
-    if !table_dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(table_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some(name) = path.file_name() {
-            let name = name.to_string_lossy();
-            if (name.starts_with("seg_") || name.starts_with('p')) && name.ends_with(".dat") {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
 }

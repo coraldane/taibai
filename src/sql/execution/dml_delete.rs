@@ -1,9 +1,9 @@
 use crate::common::error::{MonaxError, Result};
-use crate::storage::segment::SegmentReader;
+use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::Schema;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{discover_segments, eval_where_clause};
+use super::helpers::eval_where_clause;
 use crate::sql::parser::ast::Expr;
 
 pub fn exec_delete(
@@ -27,12 +27,13 @@ pub fn exec_delete(
         return Ok(ExecResult::Ok { rows_affected: 0 });
     }
 
-    let segment_files = discover_segments(&table_dir)?;
+    let mgr = engine.segment_mgr();
+    let segment_files = SegmentManager::discover_segments(&table_dir)?;
     let mut total_deleted: u64 = 0;
 
     for seg_path in segment_files {
-        let (new_bitmap, new_deleted_count, total_rows, prev_deleted) = {
-            let reader = SegmentReader::open(&seg_path)?;
+        let (new_bitmap, new_deleted_count, prev_deleted) = {
+            let reader = mgr.open_reader(&seg_path)?;
             let total_rows = reader.row_count();
             if total_rows == 0 {
                 continue;
@@ -71,15 +72,14 @@ pub fn exec_delete(
 
             let new_deleted_count = prev_deleted + newly_deleted;
             total_deleted += newly_deleted;
-            (new_bitmap, new_deleted_count, total_rows, prev_deleted)
+            (new_bitmap, new_deleted_count, prev_deleted)
         };
 
         if new_deleted_count == prev_deleted {
             continue;
         }
-        let _ = total_rows;
 
-        SegmentReader::rewrite_footer_with_deletes(&seg_path, &new_bitmap, new_deleted_count)?;
+        mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count)?;
     }
 
     if total_deleted > 0 {
