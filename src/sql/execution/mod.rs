@@ -14,5 +14,6 @@ pub mod pipeline;
 pub mod join_hashtable;
 pub mod strategy;
 pub mod functions;
+pub mod explain;
 
 pub use engine::{Engine, ExecResult};

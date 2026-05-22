@@ -2,15 +2,36 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::segment::SegmentReader;
+use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ScanStats, SegmentReader};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use super::helpers::discover_segments;
-use crate::sql::parser::ast::{FromClause, SelectItem, Statement};
+use crate::sql::parser::ast::{BinOp, FromClause, SelectItem, Statement};
+use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan};
 
 pub fn exec_select(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecResult> {
+    exec_select_inner(engine, db, stmt, None)
+}
+
+/// Same as [exec_select], but populates per-table [ScanStats] in `stats`.
+/// Used by EXPLAIN ANALYZE.
+pub fn exec_select_with_stats(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    stats: &mut HashMap<String, ScanStats>,
+) -> Result<ExecResult> {
+    exec_select_inner(engine, db, stmt, Some(stats))
+}
+
+fn exec_select_inner(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    mut stats: Option<&mut HashMap<String, ScanStats>>,
+) -> Result<ExecResult> {
     let from = match stmt {
         Statement::Select { from, .. } => from,
         _ => return Err(MonaxError::Internal("exec_select called with non-SELECT".into())),
@@ -18,7 +39,7 @@ pub fn exec_select(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecRe
 
     match from {
         None => exec_literal_select(stmt),
-        Some(from_clause) => exec_table_select(engine, db, stmt, from_clause),
+        Some(from_clause) => exec_table_select(engine, db, stmt, from_clause, stats.as_deref_mut()),
     }
 }
 
@@ -46,6 +67,7 @@ fn exec_table_select(
     db: &str,
     stmt: &Statement,
     from_clause: &FromClause,
+    mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<ExecResult> {
     let table_names = extract_table_names(from_clause);
 
@@ -66,15 +88,29 @@ fn exec_table_select(
     let plan = crate::sql::planner::plan_select(stmt, &table_schemas)?;
     let plan = crate::sql::optimizer::optimize(plan);
 
+    let mut scan_predicates: HashMap<String, RowGroupPredicate> = HashMap::new();
+    collect_scan_predicates(&plan, &mut scan_predicates);
+
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     for table_name in &table_names {
         let table_dir = engine.data_dir().join(db).join(table_name);
         let mut batches = Vec::new();
         if table_dir.exists() {
             let segment_files = discover_segments(&table_dir)?;
+            let predicate = scan_predicates.get(table_name);
+            let pred_ref = predicate.filter(|p| !p.is_empty());
+            if let Some(p) = pred_ref {
+                tracing::debug!(
+                    table = %table_name,
+                    clauses = p.clauses.len(),
+                    "applying zone-map pruning to table scan"
+                );
+            }
             for seg_path in segment_files {
                 let reader = SegmentReader::open(&seg_path)?;
-                batches.extend(reader.scan(4096)?);
+                let table_stats = stats.as_deref_mut()
+                    .map(|s| s.entry(table_name.clone()).or_default());
+                batches.extend(reader.scan_with_predicate_and_stats(4096, pred_ref, table_stats)?);
             }
         }
         table_batches.insert(table_name.clone(), batches);
@@ -113,4 +149,107 @@ fn collect_table_names_from_join(join_expr: &crate::sql::parser::ast::JoinExpr, 
     for jc in &join_expr.joins {
         names.push(jc.right.name.clone());
     }
+}
+
+fn collect_scan_predicates(
+    plan: &LogicalPlan,
+    out: &mut HashMap<String, RowGroupPredicate>,
+) {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            if let Some(filter) = &scan.pushed_filter {
+                let mut clauses = Vec::new();
+                extract_range_clauses(filter, scan, &mut clauses);
+                if !clauses.is_empty() {
+                    out.entry(scan.table_name.clone())
+                        .and_modify(|p| p.clauses.extend(clauses.clone()))
+                        .or_insert_with(|| RowGroupPredicate::new(clauses));
+                }
+            }
+        }
+        LogicalPlan::Filter(f) => collect_scan_predicates(&f.input, out),
+        LogicalPlan::Project(p) => collect_scan_predicates(&p.input, out),
+        LogicalPlan::Aggregate(a) => collect_scan_predicates(&a.input, out),
+        LogicalPlan::Sort(s) => collect_scan_predicates(&s.input, out),
+        LogicalPlan::Limit(l) => collect_scan_predicates(&l.input, out),
+        LogicalPlan::TopN(t) => collect_scan_predicates(&t.input, out),
+        LogicalPlan::Distinct(d) => collect_scan_predicates(&d.input, out),
+        LogicalPlan::Window(w) => collect_scan_predicates(&w.input, out),
+        LogicalPlan::Join(j) => {
+            collect_scan_predicates(&j.left, out);
+            collect_scan_predicates(&j.right, out);
+        }
+        LogicalPlan::Empty => {}
+    }
+}
+
+fn extract_range_clauses(
+    expr: &LogicalExpr,
+    scan: &ScanPlan,
+    out: &mut Vec<RangeClause>,
+) {
+    match expr {
+        LogicalExpr::BinaryOp { left, op, right } => match op {
+            BinOp::And => {
+                extract_range_clauses(left, scan, out);
+                extract_range_clauses(right, scan, out);
+            }
+            BinOp::Eq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => {
+                if let Some(c) = try_build_clause(left, *op, right) {
+                    out.push(c);
+                } else if let Some(c) = try_build_clause_mirrored(left, *op, right) {
+                    out.push(c);
+                }
+            }
+            _ => {}
+        },
+        LogicalExpr::Between { expr, low, high, negated: false } => {
+            if let (LogicalExpr::Column(idx), LogicalExpr::Literal(lo), LogicalExpr::Literal(hi)) =
+                (&**expr, &**low, &**high)
+            {
+                out.push(RangeClause { column_index: *idx, op: RangeOp::Ge, value: lo.clone() });
+                out.push(RangeClause { column_index: *idx, op: RangeOp::Le, value: hi.clone() });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn try_build_clause(
+    left: &LogicalExpr,
+    op: BinOp,
+    right: &LogicalExpr,
+) -> Option<RangeClause> {
+    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) = (left, right) {
+        let rop = match op {
+            BinOp::Eq => RangeOp::Eq,
+            BinOp::Lt => RangeOp::Lt,
+            BinOp::Lte => RangeOp::Le,
+            BinOp::Gt => RangeOp::Gt,
+            BinOp::Gte => RangeOp::Ge,
+            _ => return None,
+        };
+        return Some(RangeClause { column_index: *idx, op: rop, value: val.clone() });
+    }
+    None
+}
+
+fn try_build_clause_mirrored(
+    left: &LogicalExpr,
+    op: BinOp,
+    right: &LogicalExpr,
+) -> Option<RangeClause> {
+    if let (LogicalExpr::Literal(val), LogicalExpr::Column(idx)) = (left, right) {
+        // Literal <op> Column  ===  Column <mirrored_op> Literal
+        let rop = match op {
+            BinOp::Eq => RangeOp::Eq,
+            BinOp::Lt => RangeOp::Gt,
+            BinOp::Lte => RangeOp::Ge,
+            BinOp::Gt => RangeOp::Lt,
+            BinOp::Gte => RangeOp::Le,
+            _ => return None,
+        };
+        return Some(RangeClause { column_index: *idx, op: rop, value: val.clone() });
+    }
+    None
 }

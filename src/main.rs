@@ -13,7 +13,6 @@ use sql::execution::Engine;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -43,13 +42,11 @@ async fn run_server(config: ServerConfig) {
         "starting monax server"
     );
 
-    // Ensure data directory exists
     if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
         tracing::error!(error = %e, "failed to create data directory");
         std::process::exit(1);
     }
 
-    // Initialize storage engine
     let engine = match Engine::new(std::path::Path::new(&config.data_dir)) {
         Ok(e) => e,
         Err(e) => {
@@ -60,11 +57,26 @@ async fn run_server(config: ServerConfig) {
 
     let config = Arc::new(config);
     let engine = Arc::new(engine);
-    let server = Server::new(config, engine);
+    Engine::start_flush_thread(&engine);
+    let server = Server::new(config, engine.clone());
 
-    if let Err(e) = server.run().await {
-        tracing::error!(error = %e, "server error");
-        std::process::exit(1);
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = server.run().await {
+            tracing::error!(error = %e, "server error");
+        }
+    });
+
+    tokio::select! {
+        _ = server_handle => {
+            tracing::info!("server loop exited");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received Ctrl+C, flushing active segments...");
+            match engine.flush_all_buffers() {
+                Ok(n) => tracing::info!(rows_flushed = n, "all active segments sealed"),
+                Err(e) => tracing::error!(error = %e, "failed to flush segments on shutdown"),
+            }
+        }
     }
 }
 
@@ -91,7 +103,6 @@ async fn run_client(
     }
     println!("Connected to {} as {}", host, user);
 
-    // Ping to verify connectivity
     match client.ping().await {
         Ok(rtt) => println!("Ping: {:?}", rtt),
         Err(e) => eprintln!("Ping failed: {}", e),
@@ -103,11 +114,9 @@ async fn run_client(
                 println!("OK, {} row(s) affected", rows_affected);
             }
             Ok(QueryResult::Rows { schema, batches }) => {
-                // Print header
                 let names: Vec<&str> = schema.column_names().collect();
                 println!("{}", names.join("\t"));
 
-                // Print rows
                 for batch in &batches {
                     for row in 0..batch.num_rows() {
                         let cells: Vec<String> = (0..schema.num_columns())
@@ -131,7 +140,6 @@ async fn run_client(
             }
         }
     } else {
-        // Interactive mode: read from stdin
         println!("monax client interactive mode. Type SQL queries or 'quit' to exit.");
         let stdin = std::io::stdin();
         let mut buf = String::new();

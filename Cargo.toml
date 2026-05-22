@@ -58,8 +58,3 @@ twox-hash = "1"
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"
-
-[[bench]]
-name = "scan_bench"
-harness = false
-path = "benches/scan_bench.rs"

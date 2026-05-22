@@ -43,6 +43,9 @@ pub enum Statement {
     ShowTables,
     ShowDatabases,
     UseDatabase(String),
+    /// EXPLAIN [ANALYZE] <stmt>: returns the logical plan of an inner statement
+    /// (and optionally the actual scan statistics from a real execution).
+    Explain { analyze: bool, stmt: Box<Statement> },
 }
 
 /// Assignment for UPDATE statement: column = value.

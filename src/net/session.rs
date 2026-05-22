@@ -16,6 +16,7 @@ pub struct Session {
     pub bulk_import_mode: bool,
     pub disable_wal: bool,
     pub timezone_offset_hours: i32,
+    pub had_writes: bool,
 }
 
 impl Session {
@@ -34,6 +35,7 @@ impl Session {
             bulk_import_mode: false,
             disable_wal: false,
             timezone_offset_hours: 0,
+            had_writes: false,
         }
     }
 

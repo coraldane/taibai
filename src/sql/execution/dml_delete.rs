@@ -1,8 +1,6 @@
 use crate::common::error::{MonaxError, Result};
-use crate::storage::segment::{SegmentReader, SegmentWriter};
-use crate::types::batch::RecordBatch;
+use crate::storage::segment::SegmentReader;
 use crate::types::batch::Schema;
-use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use super::helpers::{discover_segments, eval_where_clause};
@@ -14,88 +12,86 @@ pub fn exec_delete(
     table: &str,
     where_clause: &Option<Expr>,
 ) -> Result<ExecResult> {
-    let (table_schema, _table_meta) = {
+    let table_schema = {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs.get(db)
             .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
         let meta = catalog.get_table(table)
             .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?
             .clone();
-        (Schema::new(meta.columns.clone()), meta)
+        Schema::new(meta.columns.clone())
     };
 
     let table_dir = engine.data_dir().join(db).join(table);
-    let mut all_batches = Vec::new();
-    if table_dir.exists() {
-        let segment_files = discover_segments(&table_dir)?;
-        for seg_path in segment_files {
-            let reader = SegmentReader::open(&seg_path)?;
-            let batches = reader.scan(4096)?;
-            all_batches.extend(batches);
-        }
-    }
-
-    if all_batches.is_empty() {
+    if !table_dir.exists() {
         return Ok(ExecResult::Ok { rows_affected: 0 });
     }
 
-    let original_rows = all_batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    let segment_files = discover_segments(&table_dir)?;
+    let mut total_deleted: u64 = 0;
 
-    let mut new_batches = Vec::new();
-    for batch in all_batches {
-        let mut new_batch = RecordBatch::new(batch.schema.clone());
-        for row_idx in 0..batch.num_rows() {
-            let should_delete = if let Some(ref where_expr) = where_clause {
-                eval_where_clause(where_expr, &batch, row_idx, &table_schema)?
-            } else {
-                true
-            };
+    for seg_path in segment_files {
+        let (new_bitmap, new_deleted_count, total_rows, prev_deleted) = {
+            let reader = SegmentReader::open(&seg_path)?;
+            let total_rows = reader.row_count();
+            if total_rows == 0 {
+                continue;
+            }
+            let prev_bitmap = reader.delete_bitmap().to_vec();
+            let prev_deleted = reader.deleted_row_count();
+            let bitmap_bytes = ((total_rows + 7) / 8) as usize;
+            let mut new_bitmap = vec![0u8; bitmap_bytes];
+            if !prev_bitmap.is_empty() {
+                let copy_len = prev_bitmap.len().min(bitmap_bytes);
+                new_bitmap[..copy_len].copy_from_slice(&prev_bitmap[..copy_len]);
+            }
 
-            if !should_delete {
-                for col_idx in 0..batch.num_columns() {
-                    let val = batch.scalar(row_idx, col_idx)
-                        .unwrap_or(ScalarValue::null_for_type(table_schema.columns[col_idx].data_type));
-                    new_batch.column_mut(col_idx).unwrap().push(&val)?;
+            let mut newly_deleted: u64 = 0;
+            let mut row_id: u64 = 0;
+            for rg_idx in 0..reader.num_row_groups() {
+                let batch = reader.read_row_group(rg_idx)?;
+                for i in 0..batch.num_rows() {
+                    let rid = row_id + i as u64;
+                    let byte = (rid / 8) as usize;
+                    let bit = (rid % 8) as u8;
+                    let already = (new_bitmap[byte] & (1u8 << bit)) != 0;
+                    if already { continue; }
+                    let matches = if let Some(ref where_expr) = where_clause {
+                        eval_where_clause(where_expr, &batch, i, &table_schema)?
+                    } else {
+                        true
+                    };
+                    if matches {
+                        new_bitmap[byte] |= 1u8 << bit;
+                        newly_deleted += 1;
+                    }
                 }
+                row_id += batch.num_rows() as u64;
+            }
+
+            let new_deleted_count = prev_deleted + newly_deleted;
+            total_deleted += newly_deleted;
+            (new_bitmap, new_deleted_count, total_rows, prev_deleted)
+        };
+
+        if new_deleted_count == prev_deleted {
+            continue;
+        }
+        let _ = total_rows;
+
+        SegmentReader::rewrite_footer_with_deletes(&seg_path, &new_bitmap, new_deleted_count)?;
+    }
+
+    if total_deleted > 0 {
+        let mut catalogs = engine.catalogs().write().unwrap();
+        if let Some(catalog) = catalogs.get_mut(db) {
+            if let Some(meta) = catalog.get_table_mut(table) {
+                meta.row_count = (meta.row_count - total_deleted as i64).max(0);
+                let meta_dir = engine.data_dir().join("meta");
+                catalog.save(&meta_dir)?;
             }
         }
-        if new_batch.num_rows() > 0 {
-            new_batches.push(new_batch);
-        }
     }
 
-    let new_rows = new_batches.iter().map(|b| b.num_rows()).sum::<usize>();
-    let deleted_count = (original_rows - new_rows) as u64;
-
-    if table_dir.exists() {
-        for seg_file in discover_segments(&table_dir)? {
-            std::fs::remove_file(&seg_file)?;
-        }
-    }
-
-    for batch in new_batches {
-        let seg_path = engine.next_segment_path(&table_dir, "")?;
-        let mut writer = SegmentWriter::create(&seg_path, batch.schema.clone(), 8192)?;
-        writer.write_batch(&batch)?;
-        writer.seal()?;
-    }
-
-    {
-        let mut wal_writers = engine.wal_writers().lock().unwrap();
-        let key = table_dir.to_string_lossy().to_string();
-        if let Some(wal_writer) = wal_writers.get_mut(&key) {
-            wal_writer.clear()?;
-        }
-    }
-
-    let mut catalogs = engine.catalogs().write().unwrap();
-    if let Some(catalog) = catalogs.get_mut(db) {
-        if let Some(meta) = catalog.get_table_mut(table) {
-            meta.row_count = new_rows as i64;
-            let meta_dir = engine.data_dir().join("meta");
-            catalog.save(&meta_dir)?;
-        }
-    }
-
-    Ok(ExecResult::Ok { rows_affected: deleted_count })
+    Ok(ExecResult::Ok { rows_affected: total_deleted })
 }

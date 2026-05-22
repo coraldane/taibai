@@ -5,11 +5,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
+use crate::storage::segment::{decode_scalar_with_tag, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use crate::types::batch::{ColumnDef, Schema};
+#[allow(unused_imports)]
+use crate::types::scalar::ScalarValue;
 
 #[derive(Debug, Clone)]
 pub struct SegmentInspectInfo {
     pub path: PathBuf,
+    pub header_magic: u32,
+    pub header_version: u32,
+    pub header_created_at: u64,
+    pub header_flags: u64,
     pub version: u32,
     pub generation: u64,
     pub row_count: u64,
@@ -28,6 +35,8 @@ pub struct SegmentInspectInfo {
     pub row_groups: Vec<RowGroupInfo>,
     pub partition_key: String,
     pub sequence: u32,
+    pub deleted_row_count: u64,
+    pub delete_bitmap_len: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +46,7 @@ pub struct RowGroupInfo {
     pub row_count: u64,
     pub compressed_sizes: Vec<u64>,
     pub uncompressed_sizes: Vec<u64>,
+    pub zone_maps: Vec<ZoneMap>,
 }
 
 pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
@@ -52,24 +62,44 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
     let file_created = metadata.created().ok();
     let file_modified = metadata.modified().ok();
 
-    if file_size < 8 {
+    if file_size < (SEGMENT_HEADER_SIZE as u64) + 8 {
         return Err(MonaxError::Storage(format!(
-            "segment file too small: {} bytes",
-            file_size
+            "segment file too small: {} bytes (need >= {})",
+            file_size,
+            SEGMENT_HEADER_SIZE + 8
         )));
     }
 
     let mut tmp_file = file;
+    tmp_file.seek(SeekFrom::Start(0))?;
+    let mut header_buf = [0u8; SEGMENT_HEADER_SIZE];
+    tmp_file.read_exact(&mut header_buf)?;
+    let header_magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+    let header_version = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+    let header_created_at = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+    let header_flags = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
+    if header_magic != SEGMENT_MAGIC {
+        return Err(MonaxError::Storage(format!(
+            "invalid segment header magic: {:08X} (expected {:08X})",
+            header_magic, SEGMENT_MAGIC
+        )));
+    }
+    if header_version != SEGMENT_VERSION {
+        return Err(MonaxError::Storage(format!(
+            "unsupported segment header version: {} (expected {})",
+            header_version, SEGMENT_VERSION
+        )));
+    }
+
     let mut footer_offset_buf = [0u8; 8];
     tmp_file.seek(SeekFrom::End(-8))?;
     tmp_file.read_exact(&mut footer_offset_buf)?;
     let footer_offset = u64::from_le_bytes(footer_offset_buf);
 
-    if footer_offset >= file_size - 8 {
+    if footer_offset < SEGMENT_HEADER_SIZE as u64 || footer_offset >= file_size - 8 {
         return Err(MonaxError::Storage(format!(
-            "invalid footer offset: {} >= file size {}",
-            footer_offset,
-            file_size
+            "invalid footer offset: {} (file size {}, header size {})",
+            footer_offset, file_size, SEGMENT_HEADER_SIZE
         )));
     }
 
@@ -146,14 +176,32 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             uncomp_sizes.push(s);
         }
 
+        let mut zone_maps = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            let min_v = decode_scalar_with_tag(&mut cursor)?;
+            let max_v = decode_scalar_with_tag(&mut cursor)?;
+            let null_count = read_u64_le(&mut cursor)?;
+            let zm_row_count = read_u64_le(&mut cursor)?;
+            zone_maps.push(ZoneMap {
+                min_value: min_v,
+                max_value: max_v,
+                null_count,
+                row_count: zm_row_count,
+            });
+        }
+
         row_groups.push(RowGroupInfo {
             offset: rg_offset,
             length: rg_length,
             row_count: rg_row_count,
             compressed_sizes: comp_sizes,
             uncompressed_sizes: uncomp_sizes,
+            zone_maps,
         });
     }
+
+    let deleted_row_count = read_u64_le(&mut cursor).unwrap_or(0);
+    let delete_bitmap_len = read_u32_le(&mut cursor).unwrap_or(0);
 
     let row_count = if footer_row_count > 0 {
         footer_row_count
@@ -169,6 +217,10 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
 
     Ok(SegmentInspectInfo {
         path: path.to_path_buf(),
+        header_magic,
+        header_version,
+        header_created_at,
+        header_flags,
         version,
         generation,
         row_count,
@@ -187,6 +239,8 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         row_groups,
         partition_key,
         sequence,
+        deleted_row_count,
+        delete_bitmap_len,
     })
 }
 

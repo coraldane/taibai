@@ -133,6 +133,7 @@ where
         }
     }
 
+    handler.flush_on_disconnect();
     tracing::info!("connection closed");
     Ok(())
 }

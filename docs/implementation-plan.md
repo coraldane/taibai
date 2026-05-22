@@ -171,42 +171,55 @@ Segment format: Header(64B) + ColumnChunks(Blocks) + Footer.
 - `SegmentWriter`: create → write_block → seal (write footer, backfill header, fsync)
 - `SegmentReader`: open (prefer mmap) → read_header → read_footer → read_column
 
-### Step 2.5 - `storage/writer.rs`
+### Step 2.5 - Write entry point (now merged into sql/execution/engine.rs)
 
-`TableWriter`: coordinates WAL + memory buffer + segment sealing.
-Write path: WAL entry → memory buffer → flush at 65536 rows → seal at 2GB.
+> Note: the old storage/writer.rs::TableWriter (which combined WAL + memory buffer +
+> segment sealing) has been removed. Its responsibilities now live entirely in Engine:
+> - WAL writes: sql/execution/wal_helper.rs::write_wal
+> - Segment append / seal: Engine::exec_bulk_insert_with_wal_control,
+>   Engine::exec_bulk_insert_payload_with_wal_control, Engine::seal_segment
+> - Thresholds: flush row group at SQL_INSERT_ROW_GROUP_TARGET_ROWS, seal segment when
+>   the file exceeds 2 GB
+>
+> The following modules have been removed as dead code:
+> storage/writer.rs, storage/memtable.rs, storage/async_segment.rs,
+> storage/column_encoder.rs, storage/reader.rs, and the legacy sql/executor.rs.
 
-### Step 2.6 - `storage/reader.rs`
+### Step 2.6 - Read entry point
 
-`TableReader`: discovers .dat files, yields `RecordBatch`es of `batch_size`.
+SegmentReader::open plus sql/execution/helpers.rs::discover_segments are used by
+sql/execution/query.rs (SELECT) and the UPDATE/DELETE rewrite paths in dml_update.rs /
+dml_delete.rs to enumerate and scan .dat files.
 
 ### Step 2.7 - `sql/parser/`
 
-Hand-written recursive descent: `Lexer` → tokens, `Parser` → AST.
-Statements: CREATE TABLE, INSERT INTO, DROP TABLE, SHOW TABLES, SELECT (stub).
+Hand-written recursive descent: `Lexer` -> tokens, `Parser` -> AST.
+Statements: CREATE TABLE, INSERT INTO, DROP TABLE, SHOW TABLES, SELECT.
 
-### Step 2.8 - `sql/executor/mod.rs` (Engine facade)
+### Step 2.8 - `sql/execution/engine.rs` (Engine facade)
 
-`struct Engine`: `schemas: Arc<RwLock<DatabaseSchema>>`, `writers: Arc<Mutex<HashMap<String, TableWriter>>>`.
-`execute(session, sql)` → parse → dispatch → result.
-WAL recovery on startup.
+`struct Engine`:
+- `catalogs: RwLock<HashMap<String, DatabaseCatalog>>`
+- `wal_writers: Mutex<HashMap<String, WalWriter>>`
+- `active_segments: Mutex<HashMap<String, ActiveSegment>>`
+- `segment_seqs: Mutex<HashMap<String, u32>>`
+
+`execute(session, sql)` -> parse -> dispatch to `dml_insert` / `dml_update` /
+`dml_delete` / `query` / `ddl`. On startup it scans each table directory for
+`seg_*.dat` to seed `segment_seqs` and uses `WalRecovery::replay` to recover
+unflushed batches.
 
 ### Step 2.9 - Wire into handler
 
-Update Handler with `engine: Arc<Engine>`. Query → Engine::execute → serialize result.
+`Handler` holds `engine: Arc<Engine>`. `MSG_TYPE_QUERY` -> `Engine::execute`;
+`MSG_TYPE_BULK_INSERT_COLUMNAR` -> `Engine::exec_bulk_insert_payload_with_wal_control`
+(bypasses SQL parsing and writes columnar payloads directly to the active segment).
 
 ### Step 2.10 - `protocol/bulk.rs`
 
-Parse BulkInsert binary payload → ColumnArrays → Engine::insert_rows.
-
-**Phase 2 checkpoint**: CREATE TABLE → INSERT/BulkInsert → WAL recovery → SELECT *.
-
----
-
-## Phase 3: Full SQL + Sort Key + Partitioning
-
-**Goal**: Complete SELECT, WHERE, GROUP BY, ORDER BY, LIMIT. SORT KEY. PARTITION BY.
-
+Parses the BulkInsert binary payload; data is then handed to
+`Engine::exec_bulk_insert_payload_with_wal_control` which uses rayon-parallel zstd
+compression before appending row groups to the current active segment.
 ### Step 3.1 - `sql/planner/`
 
 AST → `LogicalPlan` tree: Scan, Filter, Project, Aggregate, Sort, Limit.

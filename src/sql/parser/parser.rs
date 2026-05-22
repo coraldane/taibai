@@ -42,8 +42,21 @@ impl Parser {
             Token::Select => self.parse_select(),
             Token::Show => self.parse_show(),
             Token::Use => self.parse_use(),
+            Token::Explain => self.parse_explain(),
             other => Err(MonaxError::Sql(format!("unexpected token: {}", other))),
         }
+    }
+
+    fn parse_explain(&mut self) -> Result<Statement> {
+        self.expect(&Token::Explain)?;
+        let analyze = if self.peek() == &Token::Analyze {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let inner = self.parse_statement()?;
+        Ok(Statement::Explain { analyze, stmt: Box::new(inner) })
     }
 
     // ---- CREATE TABLE ----
@@ -929,6 +942,30 @@ mod tests {
     fn test_show_tables() {
         let stmts = Parser::parse("SHOW TABLES").unwrap();
         assert!(matches!(&stmts[0], Statement::ShowTables));
+    }
+
+    #[test]
+    fn test_explain_plain() {
+        let stmts = Parser::parse("EXPLAIN SELECT * FROM t").unwrap();
+        match &stmts[0] {
+            Statement::Explain { analyze, stmt } => {
+                assert!(!*analyze);
+                assert!(matches!(&**stmt, Statement::Select { .. }));
+            }
+            _ => panic!("expected EXPLAIN"),
+        }
+    }
+
+    #[test]
+    fn test_explain_analyze() {
+        let stmts = Parser::parse("EXPLAIN ANALYZE SELECT * FROM t WHERE id > 10").unwrap();
+        match &stmts[0] {
+            Statement::Explain { analyze, stmt } => {
+                assert!(*analyze, "ANALYZE flag should be true");
+                assert!(matches!(&**stmt, Statement::Select { .. }));
+            }
+            _ => panic!("expected EXPLAIN ANALYZE"),
+        }
     }
 
     #[test]

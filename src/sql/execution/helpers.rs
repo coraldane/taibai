@@ -236,7 +236,7 @@ pub fn discover_segments(table_dir: &Path) -> Result<Vec<PathBuf>> {
         let path = entry.path();
         if let Some(name) = path.file_name() {
             let name = name.to_string_lossy();
-            if (name.starts_with("seg-") || name.starts_with('p')) && name.ends_with(".monax") {
+            if (name.starts_with("seg_") || name.starts_with('p')) && name.ends_with(".dat") {
                 files.push(path);
             }
         }

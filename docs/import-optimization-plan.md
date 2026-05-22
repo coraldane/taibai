@@ -132,7 +132,7 @@ catalogs.write()        // 全局 catalog 写入锁
 ```
 
 **方案**:
-- 按 table 分片锁: 使用 `HashMap<String, TableWriter>` 替代全局锁，每个表独立锁
+- 按 table 分片锁: 使用 `HashMap<String, Arc<TableSlot>>` (TableWriter has been removed; this is the proposed target structure) 替代全局锁，每个表独立锁
 - WAL 写入: 每个表独立的 `WalWriter`（当前已部分实现，但 HashMap 的全局 Mutex 仍序列化所有表的 WAL 操作）
 - Segment 写入: 每个表独立的 `ActiveSegment`，移除全局 `active_segments` Mutex
 - Catalog 更新: 使用 `AtomicU64` 存储 `row_count`，避免每次 insert 都获取 catalog 写锁

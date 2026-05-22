@@ -2,13 +2,17 @@ use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Instant;
 
 use crate::common::error::{MonaxError, Result};
 use crate::net::session::Session;
 use crate::protocol::types::DataType;
 use crate::storage::schema::DatabaseCatalog;
-use crate::storage::segment::{FOOTER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use crate::storage::segment::{
+    encode_segment_footer, encode_segment_header, RowGroupMeta, ZoneMap,
+    SEGMENT_HEADER_SIZE,
+};
 use crate::storage::wal::WalWriter;
 use crate::types::batch::{RecordBatch, Schema};
 
@@ -19,6 +23,9 @@ const MAX_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const MIN_SEGMENT_SIZE: u64 = 1 * 1024 * 1024 * 1024;
 const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
 const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 200_000;
+const FLUSH_CHECK_INTERVAL_SECS: u64 = 30;
+const FLUSH_IDLE_THRESHOLD_SECS: u64 = 10;
+const FLUSH_ROW_THRESHOLD: u64 = 500_000;
 
 pub enum ExecResult {
     Ok { rows_affected: u64 },
@@ -35,16 +42,9 @@ struct ActiveSegment {
     buffered_batch: Option<RecordBatch>,
     buffered_rows: usize,
     wal_key: String,
-}
-
-#[derive(Debug, Clone)]
-struct RowGroupMeta {
-    offset: u64,
-    length: u64,
-    row_count: u64,
-    column_sizes: Vec<u64>,
-    compressed_sizes: Vec<u64>,
-    uncompressed_sizes: Vec<u64>,
+    dirty_meta: bool,
+    data_end: u64,
+    last_write_at: Instant,
 }
 
 pub struct Engine {
@@ -55,6 +55,7 @@ pub struct Engine {
     next_txn_id: AtomicU64,
     bulk_mode: AtomicBool,
     active_segments: Mutex<HashMap<String, ActiveSegment>>,
+    flush_stop: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -90,7 +91,7 @@ impl Engine {
                                         for seg in segments {
                                             if let Some(name) = seg.file_stem() {
                                                 let stem = name.to_string_lossy().to_string();
-                                                if let Some(seq_str) = stem.strip_prefix("seg-") {
+                                                if let Some(seq_str) = stem.strip_prefix("seg_") {
                                                     if let Ok(seq) = seq_str.parse::<u32>() {
                                                         let key = format!("{}/{}", db_name, tbl_entry.file_name().to_string_lossy());
                                                         segment_seqs_init.entry(key).and_modify(|v: &mut u32| *v = (*v).max(seq)).or_insert(seq);
@@ -107,6 +108,8 @@ impl Engine {
             }
         }
 
+        let flush_stop = Arc::new(AtomicBool::new(false));
+
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             catalogs: RwLock::new(catalogs),
@@ -115,7 +118,57 @@ impl Engine {
             next_txn_id: AtomicU64::new(0),
             bulk_mode: AtomicBool::new(false),
             active_segments: Mutex::new(HashMap::new()),
+            flush_stop,
         })
+    }
+
+    pub fn start_flush_thread(engine: &Arc<Self>) {
+        let engine_clone = Arc::clone(engine);
+        let stop = engine.flush_stop.clone();
+        std::thread::Builder::new()
+            .name("monax-flush".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_secs(FLUSH_CHECK_INTERVAL_SECS));
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Err(e) = engine_clone.periodic_flush_check() {
+                        tracing::warn!(error = %e, "periodic flush check failed");
+                    }
+                }
+            })
+            .expect("failed to spawn flush thread");
+    }
+
+    fn periodic_flush_check(&self) -> Result<u64> {
+        let now = Instant::now();
+        let mut total = 0u64;
+        let mut active = self.active_segments.lock().unwrap();
+        let keys: Vec<String> = active.keys().cloned().collect();
+        for key in &keys {
+            let segment = active.get_mut(key).unwrap();
+            if !segment.dirty_meta && segment.buffered_rows == 0 {
+                continue;
+            }
+            let idle = now.duration_since(segment.last_write_at).as_secs();
+            if idle < FLUSH_IDLE_THRESHOLD_SECS {
+                continue;
+            }
+            if segment.buffered_rows > 0 {
+                if let Some(_) = self.flush_segment_buffer(segment)? {
+                    let mut wal_writers = self.wal_writers.lock().unwrap();
+                    if let Some(wal_writer) = wal_writers.get_mut(&segment.wal_key) {
+                        let _ = wal_writer.clear();
+                    }
+                }
+            }
+            if segment.dirty_meta {
+                self.flush_meta(segment)?;
+            }
+            total += segment.total_rows;
+        }
+        Ok(total)
     }
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
@@ -166,6 +219,9 @@ impl Engine {
             Statement::ShowDatabases => {
                 super::ddl::exec_show_databases(self)
             }
+            Statement::Explain { analyze, stmt: inner } => {
+                super::explain::exec_explain(self, &session.database, inner, *analyze)
+            }
         }
     }
 
@@ -207,6 +263,8 @@ impl Engine {
     }
 
     pub fn flush_all_buffers(&self) -> Result<u64> {
+        self.flush_stop.store(true, Ordering::Release);
+
         {
             let mut wal_writers = self.wal_writers().lock().unwrap();
             for (_, writer) in wal_writers.iter_mut() {
@@ -215,13 +273,27 @@ impl Engine {
         }
 
         let mut total = 0u64;
+        let mut wal_keys_to_clear = Vec::new();
         {
             let mut active = self.active_segments.lock().unwrap();
-            for (_, mut segment) in active.drain() {
-                let _ = self.flush_segment_buffer(&mut segment)?;
+            let keys: Vec<String> = active.keys().cloned().collect();
+            for key in &keys {
+                let segment = active.get_mut(key).unwrap();
+                if let Some(wal_key) = self.flush_segment_buffer(segment)? {
+                    wal_keys_to_clear.push(wal_key);
+                }
                 if segment.total_rows > 0 {
-                    self.seal_segment(&mut segment)?;
+                    self.flush_meta(segment)?;
                     total += segment.total_rows;
+                }
+            }
+        }
+
+        if !wal_keys_to_clear.is_empty() {
+            let mut wal_writers = self.wal_writers().lock().unwrap();
+            for wal_key in &wal_keys_to_clear {
+                if let Some(wal_writer) = wal_writers.get_mut(wal_key) {
+                    let _ = wal_writer.clear();
                 }
             }
         }
@@ -271,11 +343,12 @@ impl Engine {
         if !active_segments.contains_key(&key) {
             let schema = batch.schema.clone();
             let seg_path = self.next_segment_path(&table_dir, "")?;
-            let file = std::fs::OpenOptions::new()
+            let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&seg_path)?;
+            file.write_all(&encode_segment_header())?;
             let wal_key = table_dir.to_string_lossy().to_string();
             active_segments.insert(
                 key.clone(),
@@ -284,18 +357,23 @@ impl Engine {
                     path: seg_path,
                     schema,
                     row_groups: Vec::new(),
-                    current_size: 0,
+                    current_size: SEGMENT_HEADER_SIZE as u64,
                     total_rows: 0,
                     buffered_batch: None,
                     buffered_rows: 0,
                     wal_key,
+                    dirty_meta: false,
+                    data_end: SEGMENT_HEADER_SIZE as u64,
+                    last_write_at: Instant::now(),
                 },
             );
         }
         let segment = active_segments.get_mut(&key).unwrap();
-        let wal_keys_to_clear = self.append_to_segment_buffer(segment, &batch, &table_dir)?;
+        let mut wal_keys_to_clear = self.append_to_segment_buffer(segment, &batch, &table_dir)?;
 
         let mut sealed = false;
+        let mut need_flush_buffer = false;
+        let mut need_flush_meta = false;
         let sealed_wal_key = if segment.current_size >= MAX_SEGMENT_SIZE {
             self.seal_segment(segment)?;
             let wal_key = segment.wal_key.clone();
@@ -303,8 +381,33 @@ impl Engine {
             sealed = true;
             Some(wal_key)
         } else {
+            if segment.dirty_meta {
+                let idle = Instant::now().duration_since(segment.last_write_at).as_secs();
+                if idle >= FLUSH_IDLE_THRESHOLD_SECS || segment.total_rows >= FLUSH_ROW_THRESHOLD {
+                    need_flush_meta = true;
+                }
+            }
+            if segment.buffered_rows > 0 && !need_flush_meta {
+                let idle = Instant::now().duration_since(segment.last_write_at).as_secs();
+                if idle >= FLUSH_IDLE_THRESHOLD_SECS {
+                    need_flush_buffer = true;
+                    need_flush_meta = true;
+                }
+            }
             None
         };
+
+        if need_flush_buffer && !sealed {
+            let segment = active_segments.get_mut(&key).unwrap();
+            if let Some(_) = self.flush_segment_buffer(segment)? {
+                wal_keys_to_clear.push(segment.wal_key.clone());
+            }
+        }
+        if need_flush_meta && !sealed {
+            let segment = active_segments.get_mut(&key).unwrap();
+            self.flush_meta(segment)?;
+        }
+
         drop(active_segments);
 
         if !wal_keys_to_clear.is_empty() || sealed {
@@ -408,11 +511,12 @@ impl Engine {
         let mut active_segments = self.active_segments.lock().unwrap();
         if !active_segments.contains_key(&key) {
             let seg_path = self.next_segment_path(&table_dir, "")?;
-            let file = std::fs::OpenOptions::new()
+            let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&seg_path)?;
+            file.write_all(&encode_segment_header())?;
             let wal_key = table_dir.to_string_lossy().to_string();
             active_segments.insert(
                 key.clone(),
@@ -421,11 +525,14 @@ impl Engine {
                     path: seg_path,
                     schema,
                     row_groups: Vec::new(),
-                    current_size: 0,
+                    current_size: SEGMENT_HEADER_SIZE as u64,
                     total_rows: 0,
                     buffered_batch: None,
                     buffered_rows: 0,
                     wal_key,
+                    dirty_meta: false,
+                    data_end: SEGMENT_HEADER_SIZE as u64,
+                    last_write_at: Instant::now(),
                 },
             );
         }
@@ -452,14 +559,19 @@ impl Engine {
             offset,
             length: total_length,
             row_count: req.row_count as u64,
+            zone_maps: placeholder_zone_maps(&segment.schema, req.row_count as u64),
             column_sizes,
             compressed_sizes,
             uncompressed_sizes,
         });
         segment.current_size += total_length;
         segment.total_rows += req.row_count as u64;
+        segment.dirty_meta = true;
+        segment.data_end = segment.current_size;
+        segment.last_write_at = Instant::now();
 
         let mut sealed = false;
+        let mut need_flush_meta = false;
         let sealed_wal_key = if segment.current_size >= MAX_SEGMENT_SIZE {
             self.seal_segment(segment)?;
             let wal_key = segment.wal_key.clone();
@@ -467,8 +579,20 @@ impl Engine {
             sealed = true;
             Some(wal_key)
         } else {
+            if segment.dirty_meta {
+                let idle = Instant::now().duration_since(segment.last_write_at).as_secs();
+                if idle >= FLUSH_IDLE_THRESHOLD_SECS || segment.total_rows >= FLUSH_ROW_THRESHOLD {
+                    need_flush_meta = true;
+                }
+            }
             None
         };
+
+        if need_flush_meta && !sealed {
+            let segment = active_segments.get_mut(&key).unwrap();
+            self.flush_meta(segment)?;
+        }
+
         drop(active_segments);
 
         if sealed {
@@ -494,16 +618,13 @@ impl Engine {
     }
 
     fn seal_segment(&self, segment: &mut ActiveSegment) -> Result<()> {
-        segment.file.flush()?;
-        let footer_offset = segment.file.seek(SeekFrom::End(0))?;
-
-        let footer = self.encode_footer(segment)?;
-        segment.file.write_all(&footer)?;
-        segment
-            .file
-            .write_all(&(footer_offset as u64).to_le_bytes())?;
-        segment.file.flush()?;
-        segment.file.get_ref().sync_all()?;
+        if let Some(_) = self.flush_segment_buffer(segment)? {
+            let mut wal_writers = self.wal_writers.lock().unwrap();
+            if let Some(wal_writer) = wal_writers.get_mut(&segment.wal_key) {
+                let _ = wal_writer.clear();
+            }
+        }
+        self.flush_meta(segment)?;
 
         tracing::debug!(
             path = %segment.path.display(),
@@ -515,57 +636,47 @@ impl Engine {
         Ok(())
     }
 
+    fn flush_meta(&self, segment: &mut ActiveSegment) -> Result<()> {
+        if !segment.dirty_meta {
+            return Ok(());
+        }
+
+        segment.file.flush()?;
+        segment.file.seek(SeekFrom::Start(segment.data_end))?;
+
+        let footer = self.encode_footer(segment)?;
+        segment.file.write_all(&footer)?;
+        segment.file.write_all(&(segment.data_end as u64).to_le_bytes())?;
+        segment.file.flush()?;
+        segment.file.get_ref().sync_all()?;
+
+        segment.dirty_meta = false;
+
+        tracing::debug!(
+            path = %segment.path.display(),
+            rows = segment.total_rows,
+            row_groups = segment.row_groups.len(),
+            "segment meta flushed"
+        );
+
+        Ok(())
+    }
+
     fn encode_footer(&self, segment: &ActiveSegment) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-
-        buf.extend_from_slice(&SEGMENT_MAGIC.to_le_bytes());
-        buf.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        buf.extend_from_slice(&segment.total_rows.to_le_bytes());
-        buf.extend_from_slice(&(segment.row_groups.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
-
         let table_name = segment
             .path
             .parent()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        buf.extend_from_slice(&(table_name.len() as u32).to_le_bytes());
-        buf.extend_from_slice(table_name.as_bytes());
-        buf.extend_from_slice(&(segment.schema.columns.len() as u32).to_le_bytes());
-
-        for col in &segment.schema.columns {
-            buf.extend_from_slice(&(col.name.len() as u32).to_le_bytes());
-            buf.extend_from_slice(col.name.as_bytes());
-            buf.push(col.data_type as u8);
-            buf.push(col.nullable as u8);
-            buf.extend_from_slice(&(col.scale as u32).to_le_bytes());
-            buf.extend_from_slice(&(col.precision as u32).to_le_bytes());
-        }
-
-        for rg in &segment.row_groups {
-            buf.extend_from_slice(&rg.offset.to_le_bytes());
-            buf.extend_from_slice(&rg.length.to_le_bytes());
-            buf.extend_from_slice(&rg.row_count.to_le_bytes());
-
-            for &s in &rg.column_sizes {
-                buf.extend_from_slice(&s.to_le_bytes());
-            }
-            for &s in &rg.compressed_sizes {
-                buf.extend_from_slice(&s.to_le_bytes());
-            }
-            for &s in &rg.uncompressed_sizes {
-                buf.extend_from_slice(&s.to_le_bytes());
-            }
-        }
-
-        if buf.len() < FOOTER_SIZE {
-            buf.resize(FOOTER_SIZE, 0);
-        }
-
-        Ok(buf)
+        Ok(encode_segment_footer(
+            &segment.schema,
+            segment.total_rows,
+            &segment.row_groups,
+            &[],
+            0,
+            &table_name,
+        ))
     }
 
     fn append_to_segment_buffer(
@@ -641,12 +752,16 @@ impl Engine {
             offset,
             length: total_length,
             row_count: rows_to_flush as u64,
+            zone_maps: placeholder_zone_maps(&segment.schema, rows_to_flush as u64),
             column_sizes,
             compressed_sizes,
             uncompressed_sizes,
         });
         segment.current_size += total_length;
         segment.total_rows += rows_to_flush as u64;
+        segment.dirty_meta = true;
+        segment.data_end = segment.current_size;
+        segment.last_write_at = Instant::now();
 
         let remaining = total_buffered - rows_to_flush;
         if remaining > 0 {
@@ -678,6 +793,54 @@ struct DirectBulkColumn<'a> {
     data_type: DataType,
     data: &'a [u8],
     nulls: &'a [u8],
+}
+
+/// Build a placeholder zone-map vector for a row group whose actual
+/// per-column min/max were never collected on the streaming bulk-insert
+/// path. All entries report `row_count` total rows with that many nulls,
+/// which is the safe value: row-group pruning treats fully-null groups as
+/// "do not match", but the SegmentReader pruning predicate falls back to
+/// keeping the group whenever the zone-map looks degenerate, so correctness
+/// is preserved. Real min/max collection on this path is a TODO.
+fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
+    schema
+        .columns
+        .iter()
+        .map(|col| {
+            let null = null_scalar_for(col.data_type);
+            ZoneMap {
+                min_value: null.clone(),
+                max_value: null,
+                null_count: 0,
+                row_count,
+            }
+        })
+        .collect()
+}
+
+fn null_scalar_for(dtype: DataType) -> crate::types::scalar::ScalarValue {
+    use crate::types::scalar::ScalarValue;
+    match dtype {
+        DataType::Bool => ScalarValue::Bool(None),
+        DataType::Int8 => ScalarValue::Int8(None),
+        DataType::Int16 => ScalarValue::Int16(None),
+        DataType::Int32 => ScalarValue::Int32(None),
+        DataType::Int64 => ScalarValue::Int64(None),
+        DataType::UInt8 => ScalarValue::UInt8(None),
+        DataType::UInt16 => ScalarValue::UInt16(None),
+        DataType::UInt32 => ScalarValue::UInt32(None),
+        DataType::UInt64 => ScalarValue::UInt64(None),
+        DataType::Float32 => ScalarValue::Float32(None),
+        DataType::Float64 => ScalarValue::Float64(None),
+        DataType::Decimal => ScalarValue::Decimal(None),
+        DataType::Date => ScalarValue::Date(None),
+        DataType::Time => ScalarValue::Time(None),
+        DataType::Timestamp => ScalarValue::Timestamp(None),
+        DataType::Interval => ScalarValue::Interval(None),
+        DataType::VarChar => ScalarValue::VarChar(None),
+        DataType::Blob => ScalarValue::Blob(None),
+        DataType::Vector => ScalarValue::Vector(None),
+    }
 }
 
 fn bulk_compression_level() -> i32 {

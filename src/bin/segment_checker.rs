@@ -28,6 +28,14 @@ struct Args {
 
     #[arg(long)]
     where_value: Option<String>,
+
+    /// Print 32-byte file header (magic, version, created_at, flags).
+    #[arg(long)]
+    show_header: bool,
+
+    /// Print per-column ZoneMap (min/max/null_count) for each row group.
+    #[arg(long)]
+    show_zonemaps: bool,
 }
 
 fn main() {
@@ -131,7 +139,7 @@ fn main() {
                     total_uncompressed += info.uncompressed_size;
                     total_row_groups += info.row_group_count;
 
-                    print_info(i + 1, &info, args.verbose);
+                    print_info(i + 1, &info, args.verbose, args.show_header, args.show_zonemaps);
 
                     if args.verbose {
                         let schema = &info.schema;
@@ -203,7 +211,7 @@ fn main() {
     }
 }
 
-fn print_info(idx: usize, info: &SegmentInspectInfo, verbose: bool) {
+fn print_info(idx: usize, info: &SegmentInspectInfo, verbose: bool, show_header: bool, show_zonemaps: bool) {
     let name = info
         .path
         .file_name()
@@ -216,7 +224,28 @@ fn print_info(idx: usize, info: &SegmentInspectInfo, verbose: bool) {
             info.partition_key, info.sequence
         );
     }
+    if show_header {
+        println!("    file header (32 bytes):");
+        println!(
+            "      magic: 0x{:08X} (\"{}\"), version: {}",
+            info.header_magic,
+            magic_as_ascii(info.header_magic),
+            info.header_version
+        );
+        println!(
+            "      created_at: {} ({}), flags: 0x{:016X}",
+            info.header_created_at,
+            segment::format_timestamp(info.header_created_at),
+            info.header_flags
+        );
+    }
     println!("    version: {}, generation: {}", info.version, info.generation);
+    if info.deleted_row_count > 0 || info.delete_bitmap_len > 0 {
+        println!(
+            "    deleted rows: {} (bitmap bytes: {})",
+            info.deleted_row_count, info.delete_bitmap_len
+        );
+    }
     println!(
         "    row count: {} (header: {}, footer actual: {})",
         info.row_count, info.header_row_count, info.footer_row_count
@@ -288,9 +317,57 @@ fn print_info(idx: usize, info: &SegmentInspectInfo, verbose: bool) {
                 segment::format_size(rg.length),
                 segment::format_size(avg_size)
             );
+            if show_zonemaps {
+                for (c, zm) in rg.zone_maps.iter().enumerate() {
+                    let col_name = info
+                        .schema
+                        .columns
+                        .get(c)
+                        .map(|cd| cd.name.as_str())
+                        .unwrap_or("?");
+                    println!(
+                        "          col[{}] {:<16} min={:<24} max={:<24} nulls={}/{}",
+                        c,
+                        col_name,
+                        format!("{:?}", zm.min_value),
+                        format!("{:?}", zm.max_value),
+                        zm.null_count,
+                        zm.row_count
+                    );
+                }
+            }
+        }
+    } else if show_zonemaps && !info.row_groups.is_empty() {
+        println!("    zone maps:");
+        for (j, rg) in info.row_groups.iter().enumerate() {
+            for (c, zm) in rg.zone_maps.iter().enumerate() {
+                let col_name = info
+                    .schema
+                    .columns
+                    .get(c)
+                    .map(|cd| cd.name.as_str())
+                    .unwrap_or("?");
+                println!(
+                    "      rg[{}] col[{}] {:<16} min={:<24} max={:<24} nulls={}/{}",
+                    j,
+                    c,
+                    col_name,
+                    format!("{:?}", zm.min_value),
+                    format!("{:?}", zm.max_value),
+                    zm.null_count,
+                    zm.row_count
+                );
+            }
         }
     }
     println!();
+}
+
+fn magic_as_ascii(m: u32) -> String {
+    let b = m.to_le_bytes();
+    b.iter()
+        .map(|c| if c.is_ascii_graphic() { *c as char } else { '?' })
+        .collect()
 }
 
 fn inspect_with_filter(

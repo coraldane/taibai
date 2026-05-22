@@ -23,6 +23,17 @@ impl Handler {
         }
     }
 
+    pub fn flush_on_disconnect(&self) {
+        if let Some(ref session) = self.session {
+            if session.had_writes {
+                match self.engine.flush_all_buffers() {
+                    Ok(n) => tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed buffers on disconnect"),
+                    Err(e) => tracing::warn!(error = %e, "failed to flush buffers on disconnect"),
+                }
+            }
+        }
+    }
+
     pub fn handle_message(&mut self, msg: Message) -> Result<Vec<Message>> {
         match msg.msg_type {
             MSG_TYPE_LOGIN => self.handle_login(&msg.payload),
@@ -126,6 +137,9 @@ impl Handler {
 
         match self.engine.execute(session, sql) {
             Ok(ExecResult::Ok { rows_affected }) => {
+                if is_insert && rows_affected > 0 {
+                    self.session.as_mut().map(|s| s.had_writes = true);
+                }
                 Ok(vec![build_ok(rows_affected)])
             }
             Ok(ExecResult::Query { schema, batches }) => {
@@ -174,13 +188,14 @@ impl Handler {
     }
 
     fn handle_bulk_insert(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
-        let session = match &self.session {
-            Some(s) => s,
+        let (db, disable_wal) = match &self.session {
+            Some(s) => (s.database.clone(), s.disable_wal),
             None => return Ok(vec![build_error("not logged in")]),
         };
 
-        let db = session.database.clone();
-        let disable_wal = session.disable_wal;
+        if let Some(session) = &mut self.session {
+            session.had_writes = true;
+        }
 
         match self.engine.exec_bulk_insert_payload_with_wal_control(&db, payload, disable_wal) {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
