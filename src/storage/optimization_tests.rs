@@ -1,20 +1,18 @@
 #[cfg(test)]
 mod tests {
-    use crate::storage::bloomfilter::{BloomFilter, BloomFilterBuilder};
-    use crate::storage::sparse_index::{SparseIndexImpl, SparseBlockData};
+    use crate::storage::bloomfilter::BloomFilter;
+    use crate::storage::sparse_index::{SparseBlock, SparseBlockData, SparseIndexImpl};
     use crate::types::scalar::ScalarValue;
     use crate::storage::segment::{ZoneMap, RangeOp, RangeClause, RowGroupPredicate};
 
     #[test]
     fn test_bloomfilter_basic() {
-        let mut builder = BloomFilterBuilder::new(0.01, 1000);
+        let mut bf = BloomFilter::new(1000, 0.01);
         
-        builder.insert(&ScalarValue::Int32(Some(42)));
-        builder.insert(&ScalarValue::Int32(Some(100)));
-        builder.insert(&ScalarValue::Int64(Some(999)));
-        builder.insert(&ScalarValue::VarChar(Some("hello".to_string())));
-
-        let bf = builder.build();
+        bf.add(&ScalarValue::Int32(Some(42)));
+        bf.add(&ScalarValue::Int32(Some(100)));
+        bf.add(&ScalarValue::Int64(Some(999)));
+        bf.add(&ScalarValue::VarChar(Some("hello".to_string())));
 
         // Should contain inserted values
         assert!(bf.might_contain(&ScalarValue::Int32(Some(42))));
@@ -31,17 +29,15 @@ mod tests {
 
     #[test]
     fn test_bloomfilter_batch_insert() {
-        let mut builder = BloomFilterBuilder::new(0.01, 1000);
+        let mut bf = BloomFilter::new(1000, 0.01);
         
         let values: Vec<ScalarValue> = (0..100)
             .map(|i| ScalarValue::Int32(Some(i)))
             .collect();
         
         for v in &values {
-            builder.insert(v);
+            bf.add(v);
         }
-        
-        let bf = builder.build();
 
         // All inserted values should be found
         for v in &values {
@@ -51,16 +47,15 @@ mod tests {
 
     #[test]
     fn test_bloomfilter_serialization() {
-        let mut builder = BloomFilterBuilder::new(0.01, 1000);
+        let mut bf = BloomFilter::new(1000, 0.01);
         
-        builder.insert(&ScalarValue::Int32(Some(1)));
-        builder.insert(&ScalarValue::Int32(Some(2)));
-        builder.insert(&ScalarValue::VarChar(Some("test".to_string())));
+        bf.add(&ScalarValue::Int32(Some(1)));
+        bf.add(&ScalarValue::Int32(Some(2)));
+        bf.add(&ScalarValue::VarChar(Some("test".to_string())));
 
-        let bf = builder.build();
-        let encoded = bf.encode();
+        let encoded = bf.serialize();
         
-        let decoded = BloomFilter::decode(&encoded).unwrap();
+        let decoded = BloomFilter::deserialize(&encoded).unwrap();
 
         assert!(decoded.might_contain(&ScalarValue::Int32(Some(1))));
         assert!(decoded.might_contain(&ScalarValue::Int32(Some(2))));
@@ -96,18 +91,19 @@ mod tests {
         };
 
         // Overlaps with range
-        assert!(zm.overlaps_range(ScalarValue::Int32(Some(20)), ScalarValue::Int32(Some(50))));
-        assert!(zm.overlaps_range(ScalarValue::Int32(Some(5)), ScalarValue::Int32(Some(15))));
-        assert!(zm.overlaps_range(ScalarValue::Int32(Some(50)), ScalarValue::Int32(Some(150))));
+        assert!(zm.overlaps(&ScalarValue::Int32(Some(20)), &ScalarValue::Int32(Some(50))));
+        assert!(zm.overlaps(&ScalarValue::Int32(Some(5)), &ScalarValue::Int32(Some(15))));
+        assert!(zm.overlaps(&ScalarValue::Int32(Some(50)), &ScalarValue::Int32(Some(150))));
 
         // No overlap
-        assert!(!zm.overlaps_range(ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(5))));
-        assert!(!zm.overlaps_range(ScalarValue::Int32(Some(101)), ScalarValue::Int32(Some(200))));
+        assert!(!zm.overlaps(&ScalarValue::Int32(Some(1)), &ScalarValue::Int32(Some(5))));
+        assert!(!zm.overlaps(&ScalarValue::Int32(Some(101)), &ScalarValue::Int32(Some(200))));
     }
 
     #[test]
     fn test_sparse_index_basic() {
         let index = SparseIndexImpl::new();
+        index.add_block(SparseBlock::new(0, 0, 300));
 
         // Insert some values
         index.insert(&ScalarValue::Int32(Some(1)), 0);
@@ -126,9 +122,10 @@ mod tests {
     #[test]
     fn test_sparse_index_range_search() {
         let index = SparseIndexImpl::new();
+        index.add_block(SparseBlock::new(0, 0, 100));
 
         for i in 0..100 {
-            index.insert(&ScalarValue::Int32(Some(i * 10)), i);
+            index.insert(&ScalarValue::Int32(Some(i * 10)), i as i64);
         }
 
         // Range search [30, 70]
@@ -202,11 +199,10 @@ mod tests {
         // Simulate two-level filtering: BloomFilter -> ZoneMap
 
         // Step 1: BloomFilter rejects quickly
-        let mut builder = BloomFilterBuilder::new(0.01, 1000);
+        let mut bf = BloomFilter::new(1000, 0.01);
         for i in 0..100 {
-            builder.insert(&ScalarValue::Int32(Some(i)));
+            bf.add(&ScalarValue::Int32(Some(i)));
         }
-        let bf = builder.build();
 
         // Value 50 should pass BloomFilter
         assert!(bf.might_contain(&ScalarValue::Int32(Some(50))));
@@ -233,14 +229,12 @@ mod tests {
         let n = 10000;
         let fp_rate = 0.01;
         
-        let mut builder = BloomFilterBuilder::new(fp_rate, n);
+        let mut bf = BloomFilter::new(n, fp_rate);
         
         // Insert n items
         for i in 0..n {
-            builder.insert(&ScalarValue::Int32(Some(i as i32)));
+            bf.add(&ScalarValue::Int32(Some(i as i32)));
         }
-        
-        let bf = builder.build();
 
         // Test for items not in the filter
         let mut false_positives = 0;
@@ -264,19 +258,17 @@ mod tests {
 
     #[test]
     fn test_various_scalar_types() {
-        let mut builder = BloomFilterBuilder::new(0.01, 100);
+        let mut bf = BloomFilter::new(100, 0.01);
 
         // Test various types
-        builder.insert(&ScalarValue::Int8(Some(42)));
-        builder.insert(&ScalarValue::Int16(Some(1000)));
-        builder.insert(&ScalarValue::Int32(Some(100000)));
-        builder.insert(&ScalarValue::Int64(Some(10000000000)));
-        builder.insert(&ScalarValue::Float32(Some(3.14)));
-        builder.insert(&ScalarValue::Float64(Some(3.14159265358979)));
-        builder.insert(&ScalarValue::VarChar(Some("hello world".to_string())));
-        builder.insert(&ScalarValue::Date(Some(18628))); // 2021-01-01
-
-        let bf = builder.build();
+        bf.add(&ScalarValue::Int8(Some(42)));
+        bf.add(&ScalarValue::Int16(Some(1000)));
+        bf.add(&ScalarValue::Int32(Some(100000)));
+        bf.add(&ScalarValue::Int64(Some(10000000000)));
+        bf.add(&ScalarValue::Float32(Some(3.14)));
+        bf.add(&ScalarValue::Float64(Some(3.14159265358979)));
+        bf.add(&ScalarValue::VarChar(Some("hello world".to_string())));
+        bf.add(&ScalarValue::Date(Some(18628))); // 2021-01-01
 
         // All types should be found
         assert!(bf.might_contain(&ScalarValue::Int8(Some(42))));

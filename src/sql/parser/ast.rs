@@ -7,6 +7,8 @@ pub enum AlterOperation {
     DropColumn { name: String },
     RenameColumn { old_name: String, new_name: String },
     RenameTable { new_name: String },
+    DropPartition { partition_key: String },
+    TruncatePartition { partition_key: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,7 +45,7 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDefAst>,
         if_not_exists: bool,
-        sort_key: Option<Vec<String>>,
+        cluster_by: Option<Vec<String>>,
         partition_by: Option<PartitionDef>,
     },
     DropTable {
@@ -180,16 +182,19 @@ impl ColumnDefAst {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PartitionDef {
-    pub column: String,
-    pub strategy: PartitionStrategy,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub enum PartitionStrategy {
     Day,
     Year,
+    Month,
     Value,
+    Hash(i32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionDef {
+    pub column: String,
+    pub strategy: PartitionStrategy,
+    pub param: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

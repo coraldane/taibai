@@ -17,7 +17,7 @@ pub fn exec_create_table(
     name: &str,
     columns: &[ColumnDefAst],
     if_not_exists: bool,
-    sort_key: &Option<Vec<String>>,
+    cluster_by: &Option<Vec<String>>,
     partition_by: &Option<PartitionDef>,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
@@ -40,7 +40,7 @@ pub fn exec_create_table(
     catalog.create_table(name, col_defs)?;
 
     if let Some(meta) = catalog.get_table_mut(name) {
-        if let Some(ref keys) = sort_key {
+        if let Some(ref keys) = cluster_by {
             meta.cluster_key = keys.clone();
         }
         if let Some(ref pdef) = partition_by {
@@ -48,7 +48,12 @@ pub fn exec_create_table(
             meta.partition_type = match pdef.strategy {
                 PartitionStrategy::Day => PartitionType::Function,
                 PartitionStrategy::Year => PartitionType::Function,
+                PartitionStrategy::Month => PartitionType::Function,
                 PartitionStrategy::Value => PartitionType::Value,
+                PartitionStrategy::Hash(buckets) => {
+                    meta.partition_param = buckets;
+                    PartitionType::Hash
+                }
             };
         }
     }
@@ -134,6 +139,41 @@ pub fn exec_alter_table(
                 catalog.rename_table(name, new_name)?;
                 if old_table_dir.exists() && !new_table_dir.exists() {
                     std::fs::rename(&old_table_dir, &new_table_dir)?;
+                }
+            }
+            AlterOperation::DropPartition { partition_key } => {
+                let table_dir = engine.data_dir().join(db).join(name);
+                if table_dir.exists() {
+                    for entry in std::fs::read_dir(&table_dir)? {
+                        if let Ok(e) = entry {
+                            let file_name = e.file_name().to_string_lossy().to_string();
+                            if file_name.starts_with(&format!("p{}", partition_key)) && file_name.ends_with(".seg") {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+                if let Some(meta) = catalog.get_table_mut(name) {
+                    meta.partitions.retain(|p| p.key != *partition_key);
+                }
+            }
+            AlterOperation::TruncatePartition { partition_key } => {
+                let table_dir = engine.data_dir().join(db).join(name);
+                if table_dir.exists() {
+                    for entry in std::fs::read_dir(&table_dir)? {
+                        if let Ok(e) = entry {
+                            let file_name = e.file_name().to_string_lossy().to_string();
+                            if file_name.starts_with(&format!("p{}", partition_key)) && file_name.ends_with(".seg") {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+                if let Some(meta) = catalog.get_table_mut(name) {
+                    if let Some(part) = meta.partitions.iter_mut().find(|p| p.key == *partition_key) {
+                        part.row_count = 0;
+                        part.segment_count = 0;
+                    }
                 }
             }
         }
@@ -460,7 +500,20 @@ pub fn exec_show_create_table(
     create_sql.push_str(")");
 
     if !table_meta.cluster_key.is_empty() {
-        create_sql.push_str(&format!(" SORT KEY ({})", table_meta.cluster_key.join(", ")));
+        create_sql.push_str(&format!(" CLUSTER BY ({})", table_meta.cluster_key.join(", ")));
+    }
+
+    if table_meta.is_partitioned() {
+        let partition_str = match table_meta.partition_type {
+            PartitionType::Function => {
+                let func = if table_meta.partition_key.to_lowercase().contains("day") { "DAY" } else { "YEAR" };
+                format!(" PARTITION BY {}({})", func, table_meta.partition_key)
+            }
+            PartitionType::Value => format!(" PARTITION BY VALUE({})", table_meta.partition_key),
+            PartitionType::Hash => format!(" PARTITION BY HASH({})({})", table_meta.partition_key, table_meta.partition_param),
+            _ => String::new(),
+        };
+        create_sql.push_str(&partition_str);
     }
 
     let schema = Schema::new(vec![
@@ -551,12 +604,51 @@ pub fn exec_show_partitions(
     db: &str,
     table: &Option<String>,
 ) -> Result<ExecResult> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs.get(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+
     let schema = Schema::new(vec![
+        ColumnDef::new("Table", DataType::VarChar),
         ColumnDef::new("Partition", DataType::VarChar),
         ColumnDef::new("Rows", DataType::Int64),
-        ColumnDef::new("Size", DataType::Int64),
+        ColumnDef::new("Segments", DataType::Int64),
     ]);
-    let batch = RecordBatch::new(schema.clone());
+
+    let mut batch = RecordBatch::new(schema.clone());
+
+    if let Some(table_name) = table {
+        let table_name_owned: String = table_name.clone();
+        if let Some(meta) = catalog.get_table(&table_name_owned) {
+            for partition in &meta.partitions {
+                let col0 = batch.column_mut(0).unwrap();
+                col0.push(&ScalarValue::VarChar(Some(table_name_owned.clone())))?;
+                let col1 = batch.column_mut(1).unwrap();
+                col1.push(&ScalarValue::VarChar(Some(partition.key.clone())))?;
+                let col2 = batch.column_mut(2).unwrap();
+                col2.push(&ScalarValue::Int64(Some(partition.row_count)))?;
+                let col3 = batch.column_mut(3).unwrap();
+                col3.push(&ScalarValue::Int64(Some(partition.segment_count as i64)))?;
+            }
+        }
+    } else {
+        for table_name in catalog.table_names() {
+            let table_name_owned: String = table_name.to_string();
+            if let Some(meta) = catalog.get_table(&table_name_owned) {
+                for partition in &meta.partitions {
+                    let col0 = batch.column_mut(0).unwrap();
+                    col0.push(&ScalarValue::VarChar(Some(table_name_owned.clone())))?;
+                    let col1 = batch.column_mut(1).unwrap();
+                    col1.push(&ScalarValue::VarChar(Some(partition.key.clone())))?;
+                    let col2 = batch.column_mut(2).unwrap();
+                    col2.push(&ScalarValue::Int64(Some(partition.row_count)))?;
+                    let col3 = batch.column_mut(3).unwrap();
+                    col3.push(&ScalarValue::Int64(Some(partition.segment_count as i64)))?;
+                }
+            }
+        }
+    }
+
     Ok(ExecResult::Query { schema, batches: vec![batch] })
 }
 
@@ -640,11 +732,20 @@ pub fn exec_optimize_table(
     let catalog = catalogs.get(db)
         .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
     
-    if catalog.get_table(table).is_none() {
-        return Err(MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)));
-    }
+    let table_meta = catalog.get_table(table)
+        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+        .clone();
+    drop(catalogs);
     
     engine.flush_all_buffers()?;
+    
+    let compactor = crate::storage::compactor::Compactor::new(
+        engine.segment_mgr().clone(),
+        engine.data_dir().to_path_buf(),
+    );
+    
+    compactor.optimize_table(db, table, &table_meta)?;
+    
     tracing::info!(db, table, "OPTIMIZE TABLE executed");
     Ok(ExecResult::Ok { rows_affected: 0 })
 }

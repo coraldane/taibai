@@ -508,8 +508,16 @@ fn parse_decimal(s: &str, scale: u32) -> i64 {
         if b < b'0' || b > b'9' {
             break;
         }
-        result = result * 10 + (b - b'0') as i64;
-        if has_decimal {
+        if !has_decimal || decimals < scale {
+            result = result * 10 + (b - b'0') as i64;
+            if has_decimal {
+                decimals += 1;
+            }
+        } else if decimals == scale {
+            let digit = (b - b'0') as i64;
+            if digit >= 5 {
+                result += 1;
+            }
             decimals += 1;
         }
         idx += 1;

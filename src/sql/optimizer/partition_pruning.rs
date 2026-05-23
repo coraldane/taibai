@@ -1,6 +1,7 @@
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::*;
 use crate::types::batch::Schema;
+use crate::types::scalar::ScalarValue;
 
 use super::Rule;
 
@@ -29,6 +30,13 @@ fn apply_partition_pruning(plan: LogicalPlan) -> (LogicalPlan, bool) {
                     scan.time_range = Some(tr);
                     return (LogicalPlan::Filter(filter), changed || is_new);
                 }
+                
+                let partition_filter = extract_partition_filter(&filter.predicate, &scan.schema);
+                if let Some(pf) = partition_filter {
+                    let is_new = scan.partition_filter.is_none();
+                    scan.partition_filter = Some(pf);
+                    return (LogicalPlan::Filter(filter), changed || is_new);
+                }
             }
 
             (LogicalPlan::Filter(filter), changed)
@@ -52,6 +60,20 @@ fn apply_partition_pruning(plan: LogicalPlan) -> (LogicalPlan, bool) {
             let (input, changed) = apply_partition_pruning(*agg.input);
             agg.input = Box::new(input);
             (LogicalPlan::Aggregate(agg), changed)
+        }
+        LogicalPlan::Join(mut join) => {
+            let (left, left_changed) = apply_partition_pruning(*join.left);
+            let (right, right_changed) = apply_partition_pruning(*join.right);
+            join.left = Box::new(left);
+            join.right = Box::new(right);
+            (LogicalPlan::Join(join), left_changed || right_changed)
+        }
+        LogicalPlan::SemiJoin(mut semi) => {
+            let (left, left_changed) = apply_partition_pruning(*semi.left);
+            let (right, right_changed) = apply_partition_pruning(*semi.right);
+            semi.left = Box::new(left);
+            semi.right = Box::new(right);
+            (LogicalPlan::SemiJoin(semi), left_changed || right_changed)
         }
         other => (other, false),
     }
@@ -105,4 +127,70 @@ fn extract_time_range(expr: &LogicalExpr, schema: &Schema) -> Option<TimeRange> 
         _ => {}
     }
     None
+}
+
+fn extract_partition_filter(expr: &LogicalExpr, schema: &Schema) -> Option<PartitionFilter> {
+    match expr {
+        LogicalExpr::BinaryOp { left, op, right } => {
+            match op {
+                BinOp::Eq => {
+                    if let LogicalExpr::Column(idx) = **left {
+                        if let LogicalExpr::Literal(ref val) = **right {
+                            let col_name = schema.columns.get(idx)?.name.clone();
+                            return Some(PartitionFilter {
+                                column: col_name,
+                                values: vec![val.clone()],
+                            });
+                        }
+                    }
+                    if let LogicalExpr::Column(idx) = **right {
+                        if let LogicalExpr::Literal(ref val) = **left {
+                            let col_name = schema.columns.get(idx)?.name.clone();
+                            return Some(PartitionFilter {
+                                column: col_name,
+                                values: vec![val.clone()],
+                            });
+                        }
+                    }
+                }
+                BinOp::And => {
+                    let left_filter = extract_partition_filter(left, schema);
+                    let right_filter = extract_partition_filter(right, schema);
+                    if let (Some(l), Some(r)) = (&left_filter, &right_filter) {
+                        if l.column == r.column {
+                            let merged_values: Vec<ScalarValue> = l.values.iter()
+                                .filter(|v| r.values.contains(v))
+                                .cloned()
+                                .collect();
+                            if !merged_values.is_empty() {
+                                return Some(PartitionFilter {
+                                    column: l.column.clone(),
+                                    values: merged_values,
+                                });
+                            }
+                        }
+                    }
+                    return left_filter.or(right_filter);
+                }
+                _ => {}
+            }
+        }
+        LogicalExpr::In { expr, values, negated: false } => {
+            if let LogicalExpr::Column(idx) = **expr {
+                let col_name = schema.columns.get(idx)?.name.clone();
+                return Some(PartitionFilter {
+                    column: col_name,
+                    values: values.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionFilter {
+    pub column: String,
+    pub values: Vec<ScalarValue>,
 }

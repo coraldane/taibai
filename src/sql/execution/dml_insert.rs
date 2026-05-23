@@ -152,6 +152,12 @@ fn determine_partition_key(
                 &val,
             )
         }
+        PartitionType::Hash => {
+            crate::storage::partition_function::compute_partition_key_from_scalar(
+                &table_meta.partition_strategy(),
+                &val,
+            )
+        }
         PartitionType::Value => val.to_text().unwrap_or_default(),
         PartitionType::None => String::new(),
     }

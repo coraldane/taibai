@@ -122,7 +122,7 @@ async fn run_client(
                         let cells: Vec<String> = (0..schema.num_columns())
                             .map(|col| {
                                 batch.scalar(row, col)
-                                    .map(|v| v.to_text().unwrap_or_else(|| "NULL".to_string()))
+                                    .map(|v| format_cell(&v, schema.columns[col].scale))
                                     .unwrap_or_else(|| "NULL".to_string())
                             })
                             .collect();
@@ -179,7 +179,7 @@ async fn run_client(
                             let cells: Vec<String> = (0..schema.num_columns())
                                 .map(|col| {
                                     batch.scalar(row, col)
-                                        .map(|v| v.to_text().unwrap_or_else(|| "NULL".to_string()))
+                                        .map(|v| format_cell(&v, schema.columns[col].scale))
                                         .unwrap_or_else(|| "NULL".to_string())
                                 })
                                 .collect();
@@ -201,4 +201,22 @@ async fn run_client(
     let _ = client.logout().await;
     let _ = client.close().await;
     println!("Disconnected.");
+}
+
+fn format_cell(value: &types::scalar::ScalarValue, scale: i32) -> String {
+    match value {
+        types::scalar::ScalarValue::Decimal(Some(v)) if scale > 0 => {
+            let divisor = 10_i64.pow(scale as u32);
+            let sign = if *v < 0 { "-" } else { "" };
+            let abs = v.abs();
+            format!(
+                "{}{}.{:0width$}",
+                sign,
+                abs / divisor,
+                abs % divisor,
+                width = scale as usize
+            )
+        }
+        _ => value.to_text().unwrap_or_else(|| "NULL".to_string()),
+    }
 }

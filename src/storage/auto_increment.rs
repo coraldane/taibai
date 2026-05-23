@@ -146,7 +146,7 @@ mod tests {
         sorted.sort();
         
         for i in 0..10 {
-            assert_eq!(sorted[i], i + 1);
+            assert_eq!(sorted[i], (i + 1) as u64);
         }
         assert_eq!(counter.current_value(), 11);
     }

@@ -18,6 +18,7 @@ use crate::sql::parser::parser::Parser;
 
 use crate::types::batch::{RecordBatch, Schema};
 
+#[derive(Debug)]
 pub enum ExecResult {
     Ok { rows_affected: u64 },
     Query { schema: Schema, batches: Vec<RecordBatch> },
@@ -147,8 +148,8 @@ impl Engine {
 
     fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
         match stmt {
-            Statement::CreateTable { name, columns, if_not_exists, sort_key, partition_by } => {
-                super::ddl::exec_create_table(self, &session.database, name, columns, *if_not_exists, sort_key, partition_by)
+            Statement::CreateTable { name, columns, if_not_exists, cluster_by, partition_by } => {
+                super::ddl::exec_create_table(self, &session.database, name, columns, *if_not_exists, cluster_by, partition_by)
             }
             Statement::DropTable { name, if_exists } => {
                 super::ddl::exec_drop_table(self, &session.database, name, *if_exists)

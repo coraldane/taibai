@@ -145,8 +145,7 @@ impl Parser {
             columns.push(self.parse_column_def()?);
             if self.peek() == &Token::Comma {
                 self.advance();
-                // Check for SORT KEY or PARTITION BY after last column
-                if self.peek() == &Token::Sort {
+                if self.peek() == &Token::Cluster {
                     break;
                 }
                 if self.peek() == &Token::RightParen {
@@ -158,10 +157,9 @@ impl Parser {
         }
         self.expect(&Token::RightParen)?;
 
-        // Optional: SORT KEY (col1, col2)
-        let sort_key = if self.peek() == &Token::Sort {
+        let cluster_by = if self.peek() == &Token::Cluster {
             self.advance();
-            self.expect(&Token::Key)?;
+            self.expect(&Token::By)?;
             self.expect(&Token::LeftParen)?;
             let mut keys = Vec::new();
             loop {
@@ -182,16 +180,35 @@ impl Parser {
         let partition_by = if self.peek() == &Token::Partition {
             self.advance();
             self.expect(&Token::By)?;
-            let strategy_name = self.expect_ident()?.to_uppercase();
-            let strategy = match strategy_name.as_str() {
-                "DAY" => PartitionStrategy::Day,
-                "YEAR" => PartitionStrategy::Year,
-                _ => PartitionStrategy::Value,
+            let first_token = self.expect_ident()?.to_uppercase();
+            
+            let (strategy, column, param) = if first_token == "HASH" {
+                self.expect(&Token::LeftParen)?;
+                let col = self.expect_ident()?;
+                let num_buckets = if self.peek() == &Token::Comma {
+                    self.advance();
+                    self.expect_integer()? as i32
+                } else {
+                    10
+                };
+                self.expect(&Token::RightParen)?;
+                (PartitionStrategy::Hash(num_buckets), col, Some(num_buckets))
+            } else if matches!(first_token.as_str(), "DAY" | "YEAR" | "MONTH") {
+                self.expect(&Token::LeftParen)?;
+                let col = self.expect_ident()?;
+                self.expect(&Token::RightParen)?;
+                let strategy = match first_token.as_str() {
+                    "DAY" => PartitionStrategy::Day,
+                    "YEAR" => PartitionStrategy::Year,
+                    "MONTH" => PartitionStrategy::Month,
+                    _ => PartitionStrategy::Value,
+                };
+                (strategy, col, None)
+            } else {
+                (PartitionStrategy::Value, first_token, None)
             };
-            self.expect(&Token::LeftParen)?;
-            let column = self.expect_ident()?;
-            self.expect(&Token::RightParen)?;
-            Some(PartitionDef { column, strategy })
+            
+            Some(PartitionDef { column, strategy, param })
         } else {
             None
         };
@@ -200,7 +217,7 @@ impl Parser {
             name,
             columns,
             if_not_exists,
-            sort_key,
+            cluster_by,
             partition_by,
         })
     }
@@ -436,14 +453,43 @@ impl Parser {
         loop {
             let op = if self.peek() == &Token::Add {
                 self.advance();
-                self.expect(&Token::Column)?;
-                let column = self.parse_column_def()?;
-                AlterOperation::AddColumn { column }
+                if self.peek() == &Token::Column {
+                    self.advance();
+                    let column = self.parse_column_def()?;
+                    AlterOperation::AddColumn { column }
+                } else if self.peek() == &Token::Partition {
+                    self.advance();
+                    let partition_key = self.expect_ident()?;
+                    AlterOperation::DropPartition { partition_key }
+                } else {
+                    self.expect(&Token::Column)?;
+                    let column = self.parse_column_def()?;
+                    AlterOperation::AddColumn { column }
+                }
             } else if self.peek() == &Token::Drop {
                 self.advance();
-                self.expect(&Token::Column)?;
-                let col_name = self.expect_ident()?;
-                AlterOperation::DropColumn { name: col_name }
+                if self.peek() == &Token::Column {
+                    self.advance();
+                    let col_name = self.expect_ident()?;
+                    AlterOperation::DropColumn { name: col_name }
+                } else if self.peek() == &Token::Partition {
+                    self.advance();
+                    let partition_key = self.expect_ident()?;
+                    AlterOperation::DropPartition { partition_key }
+                } else {
+                    self.expect(&Token::Column)?;
+                    let col_name = self.expect_ident()?;
+                    AlterOperation::DropColumn { name: col_name }
+                }
+            } else if self.peek() == &Token::Truncate {
+                self.advance();
+                if self.peek() == &Token::Partition {
+                    self.advance();
+                    let partition_key = self.expect_ident()?;
+                    AlterOperation::TruncatePartition { partition_key }
+                } else {
+                    return Err(MonaxError::Sql("expected PARTITION after TRUNCATE in ALTER TABLE".into()));
+                }
             } else if self.peek() == &Token::Rename {
                 self.advance();
                 if self.peek() == &Token::Column {

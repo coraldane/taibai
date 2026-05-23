@@ -23,6 +23,10 @@ path = "src/main.rs"
 name = "segment"
 path = "src/bin/segment_checker.rs"
 
+[[bin]]
+name = "stock_filter"
+path = "src/bin/stock_filter.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }

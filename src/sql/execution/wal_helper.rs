@@ -38,6 +38,12 @@ pub fn determine_write_dir(
             crate::storage::partition::PartitionStrategy::Day
         }
         crate::storage::schema::PartitionType::Value => crate::storage::partition::PartitionStrategy::Day,
+        crate::storage::schema::PartitionType::Hash => {
+            let first_val = batch.scalar(0, col_idx)
+                .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
+            let hash_val = crate::storage::partition_function::hash_partition_value(&first_val, table_meta.partition_param as i64);
+            return Ok((default_dir.to_path_buf(), format!("hash_{}", hash_val)));
+        }
         crate::storage::schema::PartitionType::None => return Ok((default_dir.to_path_buf(), String::new())),
     };
 

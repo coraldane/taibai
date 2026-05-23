@@ -13,6 +13,7 @@ pub enum PartitionType {
     None = 0,
     Value = 1,
     Function = 2,
+    Hash = 3,
 }
 
 impl Default for PartitionType {
@@ -44,6 +45,7 @@ pub struct TableMeta {
     pub row_group_size: i32,
     pub partition_key: String,
     pub partition_type: PartitionType,
+    pub partition_param: i32,
     pub partitions: Vec<PartitionInfo>,
 }
 
@@ -64,6 +66,7 @@ impl TableMeta {
             row_group_size: 8192,
             partition_key: String::new(),
             partition_type: PartitionType::None,
+            partition_param: 0,
             partitions: Vec::new(),
         }
     }
@@ -74,11 +77,35 @@ impl TableMeta {
 
     pub fn partition_strategy(&self) -> crate::storage::partition_function::PartitionFunction {
         use crate::storage::partition_function::PartitionFunction;
-        match self.partition_key.to_lowercase().as_str() {
-            "day" => PartitionFunction::Day,
-            "year" => PartitionFunction::Year,
-            _ => PartitionFunction::Value,
+        match self.partition_type {
+            PartitionType::None => PartitionFunction::Value,
+            PartitionType::Value => PartitionFunction::Value,
+            PartitionType::Function => {
+                if self.partition_key.to_lowercase().contains("day") {
+                    PartitionFunction::Day
+                } else if self.partition_key.to_lowercase().contains("year") {
+                    PartitionFunction::Year
+                } else if self.partition_key.to_lowercase().contains("month") {
+                    PartitionFunction::Month
+                } else {
+                    PartitionFunction::Value
+                }
+            }
+            PartitionType::Hash => {
+                PartitionFunction::Hash(self.partition_param)
+            }
         }
+    }
+    
+    pub fn is_partitioned(&self) -> bool {
+        self.partition_type != PartitionType::None
+    }
+    
+    pub fn get_partition_column_index(&self) -> Option<usize> {
+        if self.partition_key.is_empty() {
+            return None;
+        }
+        self.columns.iter().position(|c| c.name == self.partition_key)
     }
 }
 
