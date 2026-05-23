@@ -32,8 +32,9 @@ fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
                 }
                 LogicalPlan::Scan(mut scan) => {
                     if scan.pushed_filter.is_none() {
-                        scan.pushed_filter = Some(filter.predicate);
-                        (LogicalPlan::Scan(scan), true)
+                        scan.pushed_filter = Some(filter.predicate.clone());
+                        filter.input = Box::new(LogicalPlan::Scan(scan));
+                        (LogicalPlan::Filter(filter), true)
                     } else {
                         filter.input = Box::new(LogicalPlan::Scan(scan));
                         (LogicalPlan::Filter(filter), input_changed)
@@ -69,5 +70,46 @@ fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
             (LogicalPlan::Limit(limit), changed)
         }
         other => (other, false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::sql::parser::parser::Parser;
+    use crate::sql::planner::plan_select;
+    use crate::types::batch::{ColumnDef, Schema};
+    use std::collections::HashMap;
+
+    #[test]
+    fn predicate_pushdown_keeps_row_filter() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("security_id", DataType::VarChar),
+            ColumnDef::new("deal_date", DataType::Int32),
+        ]);
+        let mut schemas = HashMap::new();
+        schemas.insert("stock_tick_multi".to_string(), schema);
+
+        let stmt = Parser::parse(
+            "SELECT security_id FROM stock_tick_multi \
+             WHERE security_id = '688256.SH' AND deal_date = 20251111",
+        )
+        .unwrap()
+        .remove(0);
+        let plan = plan_select(&stmt, &schemas).unwrap();
+        let (optimized, changed) = PredicatePushdownRule.apply(plan);
+
+        assert!(changed);
+        let LogicalPlan::Project(project) = optimized else {
+            panic!("expected project root");
+        };
+        let LogicalPlan::Filter(filter) = *project.input else {
+            panic!("predicate pushdown must preserve the row-level filter");
+        };
+        let LogicalPlan::Scan(scan) = *filter.input else {
+            panic!("expected filter input to be scan");
+        };
+        assert!(scan.pushed_filter.is_some());
     }
 }

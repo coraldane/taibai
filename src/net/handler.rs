@@ -393,14 +393,15 @@ fn build_query_result(schema: &crate::types::batch::Schema, batches: &[crate::ty
     for batch in batches {
         for row in 0..batch.num_rows() {
             for col_idx in 0..schema.columns.len() {
+                let col_def = &schema.columns[col_idx];
                 let scalar = batch.scalar(row, col_idx)
-                    .unwrap_or(ScalarValue::null_for_type(schema.columns[col_idx].data_type));
+                    .unwrap_or(ScalarValue::null_for_type(col_def.data_type));
 
                 if scalar.is_null() {
                     buf.push(1);
                 } else {
                     buf.push(0);
-                    write_scalar_value(&mut buf, &scalar);
+                    write_scalar_value_with_scale(&mut buf, &scalar, col_def.scale);
                 }
             }
         }
@@ -446,7 +447,7 @@ fn merge_batches(batches: &[crate::types::batch::RecordBatch]) -> crate::types::
     crate::types::batch::RecordBatch::try_new(schema, columns).unwrap()
 }
 
-fn write_scalar_value(buf: &mut Vec<u8>, val: &ScalarValue) {
+fn write_scalar_value_with_scale(buf: &mut Vec<u8>, val: &ScalarValue, scale: i32) {
     match val {
         ScalarValue::Bool(Some(v)) => buf.push(if *v { 1 } else { 0 }),
         ScalarValue::Int8(Some(v)) => buf.push(*v as u8),
@@ -459,7 +460,23 @@ fn write_scalar_value(buf: &mut Vec<u8>, val: &ScalarValue) {
         ScalarValue::UInt64(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         ScalarValue::Float32(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         ScalarValue::Float64(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Decimal(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+        ScalarValue::Decimal(Some(v)) => {
+            if scale > 0 {
+                let divisor = 10_i64.pow(scale as u32);
+                let int_part = v / divisor;
+                let frac_part = (v.abs() % divisor) as u32;
+                let s = if frac_part == 0 {
+                    format!("{}", int_part)
+                } else {
+                    let width = scale as usize;
+                    format!("{}.{:0width$}", int_part, frac_part)
+                };
+                buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            } else {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         ScalarValue::Date(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         ScalarValue::Time(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
         ScalarValue::Timestamp(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),

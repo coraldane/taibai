@@ -402,6 +402,40 @@ pub fn exec_show_columns(
     Ok(ExecResult::Query { schema, batches: vec![batch] })
 }
 
+pub fn exec_show_indexes(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+) -> Result<ExecResult> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs.get(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+
+    let table_meta = catalog.get_table(table)
+        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("Table", DataType::VarChar),
+        ColumnDef::new("Non_unique", DataType::Int64),
+        ColumnDef::new("Key_name", DataType::VarChar),
+        ColumnDef::new("Seq_in_index", DataType::Int64),
+        ColumnDef::new("Column_name", DataType::VarChar),
+        ColumnDef::new("Index_type", DataType::VarChar),
+    ]);
+
+    let mut batch = RecordBatch::new(schema.clone());
+    for (idx, col_name) in table_meta.cluster_key.iter().enumerate() {
+        batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(table.to_string())))?;
+        batch.column_mut(1).unwrap().push(&ScalarValue::Int64(Some(0)))?;
+        batch.column_mut(2).unwrap().push(&ScalarValue::VarChar(Some("cluster_key".to_string())))?;
+        batch.column_mut(3).unwrap().push(&ScalarValue::Int64(Some((idx + 1) as i64)))?;
+        batch.column_mut(4).unwrap().push(&ScalarValue::VarChar(Some(col_name.clone())))?;
+        batch.column_mut(5).unwrap().push(&ScalarValue::VarChar(Some("BTREE".to_string())))?;
+    }
+
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
 pub fn exec_show_create_table(
     engine: &Engine,
     db: &str,

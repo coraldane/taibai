@@ -130,6 +130,7 @@ pub enum Statement {
     ShowTables,
     ShowDatabases,
     ShowColumns { table: String },
+    ShowIndexes { table: String },
     ShowCreateTable { table: String },
     ShowUsers,
     ShowRoles,

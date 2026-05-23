@@ -1,5 +1,5 @@
 use crate::common::error::Result;
-use crate::sql::planner::LogicalExpr;
+use crate::sql::planner::{AggregateExpr, LogicalExpr};
 use crate::sql::parser::ast::BinOp;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -15,13 +15,103 @@ pub struct FilterExec {
 impl ExecutionOp for FilterExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         while let Some(batch) = self.input.next_batch()? {
-            let mask = eval_filter(&self.predicate, &batch)?;
+            let predicate = remap_expr_for_batch(&self.predicate, &self.schema, &batch.schema);
+            let mask = eval_filter(&predicate, &batch)?;
             let filtered = super::apply_filter_mask(&batch, &mask);
             if filtered.num_rows() > 0 {
                 return Ok(Some(filtered));
             }
         }
         Ok(None)
+    }
+}
+
+pub fn remap_expr_for_batch(
+    expr: &LogicalExpr,
+    logical_schema: &Schema,
+    batch_schema: &Schema,
+) -> LogicalExpr {
+    match expr {
+        LogicalExpr::Column(idx) => {
+            logical_schema
+                .columns
+                .get(*idx)
+                .and_then(|col| batch_schema.index_of(&col.name))
+                .map(LogicalExpr::Column)
+                .unwrap_or_else(|| expr.clone())
+        }
+        LogicalExpr::BinaryOp { left, op, right } => LogicalExpr::BinaryOp {
+            left: Box::new(remap_expr_for_batch(left, logical_schema, batch_schema)),
+            op: *op,
+            right: Box::new(remap_expr_for_batch(right, logical_schema, batch_schema)),
+        },
+        LogicalExpr::Not(inner) => {
+            LogicalExpr::Not(Box::new(remap_expr_for_batch(inner, logical_schema, batch_schema)))
+        }
+        LogicalExpr::IsNull(inner) => {
+            LogicalExpr::IsNull(Box::new(remap_expr_for_batch(inner, logical_schema, batch_schema)))
+        }
+        LogicalExpr::IsNotNull(inner) => {
+            LogicalExpr::IsNotNull(Box::new(remap_expr_for_batch(inner, logical_schema, batch_schema)))
+        }
+        LogicalExpr::Aggregate(agg) => LogicalExpr::Aggregate(remap_aggregate_for_batch(
+            agg,
+            logical_schema,
+            batch_schema,
+        )),
+        LogicalExpr::In { expr, values, negated } => LogicalExpr::In {
+            expr: Box::new(remap_expr_for_batch(expr, logical_schema, batch_schema)),
+            values: values.clone(),
+            negated: *negated,
+        },
+        LogicalExpr::Between { expr, low, high, negated } => LogicalExpr::Between {
+            expr: Box::new(remap_expr_for_batch(expr, logical_schema, batch_schema)),
+            low: Box::new(remap_expr_for_batch(low, logical_schema, batch_schema)),
+            high: Box::new(remap_expr_for_batch(high, logical_schema, batch_schema)),
+            negated: *negated,
+        },
+        LogicalExpr::Case { operand, when_clauses, else_clause } => LogicalExpr::Case {
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(remap_expr_for_batch(e, logical_schema, batch_schema))),
+            when_clauses: when_clauses
+                .iter()
+                .map(|(when, then)| {
+                    (
+                        remap_expr_for_batch(when, logical_schema, batch_schema),
+                        remap_expr_for_batch(then, logical_schema, batch_schema),
+                    )
+                })
+                .collect(),
+            else_clause: else_clause
+                .as_ref()
+                .map(|e| Box::new(remap_expr_for_batch(e, logical_schema, batch_schema))),
+        },
+        LogicalExpr::Like { expr, pattern, negated } => LogicalExpr::Like {
+            expr: Box::new(remap_expr_for_batch(expr, logical_schema, batch_schema)),
+            pattern: pattern.clone(),
+            negated: *negated,
+        },
+        LogicalExpr::Function { name, args } => LogicalExpr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| remap_expr_for_batch(arg, logical_schema, batch_schema))
+                .collect(),
+        },
+        _ => expr.clone(),
+    }
+}
+
+pub fn remap_aggregate_for_batch(
+    agg: &AggregateExpr,
+    logical_schema: &Schema,
+    batch_schema: &Schema,
+) -> AggregateExpr {
+    AggregateExpr {
+        func: agg.func,
+        arg: Box::new(remap_expr_for_batch(&agg.arg, logical_schema, batch_schema)),
+        distinct: agg.distinct,
     }
 }
 

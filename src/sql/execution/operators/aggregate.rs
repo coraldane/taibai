@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
+use crate::sql::execution::operators::filter::{remap_aggregate_for_batch, remap_expr_for_batch};
 use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
@@ -46,7 +47,11 @@ impl ExecutionOp for HashAggregateExec {
 
         // Collect all input rows
         let mut all_rows: Vec<Vec<ScalarValue>> = Vec::new();
+        let mut physical_schema = None;
         while let Some(batch) = self.input.next_batch()? {
+            if physical_schema.is_none() {
+                physical_schema = Some(batch.schema.clone());
+            }
             for row in 0..batch.num_rows() {
                 let vals: Vec<ScalarValue> = (0..batch.num_columns())
                     .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
@@ -54,12 +59,19 @@ impl ExecutionOp for HashAggregateExec {
                 all_rows.push(vals);
             }
         }
+        let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
+        let group_by: Vec<LogicalExpr> = self.group_by.iter()
+            .map(|expr| remap_expr_for_batch(expr, &self.input_schema, &physical_schema))
+            .collect();
+        let aggregates: Vec<AggregateExpr> = self.aggregates.iter()
+            .map(|agg| remap_aggregate_for_batch(agg, &self.input_schema, &physical_schema))
+            .collect();
 
         // Group by key
         let mut groups: HashMap<Vec<String>, Vec<Vec<ScalarValue>>> = HashMap::new();
         let mut group_order: Vec<Vec<String>> = Vec::new();
         for row in &all_rows {
-            let key: Vec<String> = self.group_by.iter()
+            let key: Vec<String> = group_by.iter()
                 .map(|expr| eval_group_key(expr, row))
                 .collect();
             if !groups.contains_key(&key) {
@@ -70,9 +82,9 @@ impl ExecutionOp for HashAggregateExec {
 
         // Build output schema
         let mut col_defs = Vec::new();
-        for expr in &self.group_by {
+        for expr in &group_by {
             if let LogicalExpr::Column(idx) = expr {
-                if let Some(cd) = self.input_schema.columns.get(*idx) {
+                if let Some(cd) = physical_schema.columns.get(*idx) {
                     col_defs.push(ColumnDef::new(&cd.name, cd.data_type));
                 }
             }
@@ -89,13 +101,13 @@ impl ExecutionOp for HashAggregateExec {
         for key in &group_order {
             let rows = groups.get(key).unwrap();
             let mut row_vals = Vec::new();
-            for expr in &self.group_by {
+            for expr in &group_by {
                 if let LogicalExpr::Column(idx) = expr {
                     row_vals.push(rows.first().and_then(|r| r.get(*idx)).cloned().unwrap_or(ScalarValue::Int64(None)));
                 }
             }
-            for agg in &self.aggregates {
-                row_vals.push(compute_aggregate(agg, rows, &self.input_schema));
+            for agg in &aggregates {
+                row_vals.push(compute_aggregate(agg, rows, &physical_schema));
             }
             for (col_idx, val) in row_vals.iter().enumerate() {
                 result_batch.column_mut(col_idx).unwrap().push(val)?;

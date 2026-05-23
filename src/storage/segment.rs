@@ -755,6 +755,31 @@ impl SegmentReader {
         candidates
     }
 
+    pub fn filter_row_groups_multi_bloom(&self, predicate: &RowGroupPredicate, bloom_columns: &[(usize, ScalarValue)]) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
+            for (col_idx, value) in bloom_columns {
+                if let Some(bf) = rg.bloom_filters.get(*col_idx).and_then(|b| b.as_ref()) {
+                    if !bf.might_contain(value) {
+                        continue;
+                    }
+                }
+                if let Some(zm) = rg.zone_maps.get(*col_idx) {
+                    if !zm.contains(value) {
+                        continue;
+                    }
+                }
+            }
+
+            if !predicate.matches_row_group(&rg.zone_maps) {
+                continue;
+            }
+
+            candidates.push(rg_idx);
+        }
+        candidates
+    }
+
     /// Number of rows in a given row group.
     pub fn row_group_rows(&self, row_group: usize) -> u64 {
         self.footer.row_groups[row_group].row_count
@@ -1151,6 +1176,54 @@ impl SegmentReader {
             );
         }
         Ok(batches)
+    }
+
+    pub fn count_matching_rows_fast(
+        &self,
+        column_idx: usize,
+        value: &ScalarValue,
+    ) -> Result<u64> {
+        let mut total_count: u64 = 0;
+        let bitmap_active = !self.footer.delete_bitmap.is_empty();
+
+        for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
+            if let Some(bf) = rg.bloom_filters.get(column_idx).and_then(|b| b.as_ref()) {
+                if !bf.might_contain(value) {
+                    continue;
+                }
+            }
+
+            if let Some(zm) = rg.zone_maps.get(column_idx) {
+                if zm.row_count > 0 && zm.null_count == zm.row_count {
+                    continue;
+                }
+                if !zm.min_value.is_null() && !zm.max_value.is_null() {
+                    if !zm.contains(value) {
+                        continue;
+                    }
+                }
+            }
+
+            let col = self.read_column(rg_idx, column_idx)?;
+            let mask = col.eq_vec(value);
+            let mut match_count = mask.iter().filter(|&m| *m).count() as u64;
+
+            if bitmap_active {
+                let rg_start_row = self.footer.row_groups.iter()
+                    .take(rg_idx)
+                    .map(|r| r.row_count)
+                    .sum::<u64>();
+                for (i, &matched) in mask.iter().enumerate() {
+                    if matched && self.is_row_deleted(rg_start_row + i as u64) {
+                        match_count -= 1;
+                    }
+                }
+            }
+
+            total_count += match_count;
+        }
+
+        Ok(total_count)
     }
 
     fn parse_footer(buf: &[u8]) -> Result<SegmentFooter> {

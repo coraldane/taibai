@@ -1,7 +1,7 @@
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
 use crate::sql::planner::LogicalExpr;
-use crate::sql::execution::operators::filter::eval_expr_column;
+use crate::sql::execution::operators::filter::{eval_expr_column, remap_expr_for_batch};
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 
@@ -22,9 +22,10 @@ impl ExecutionOp for ProjectExec {
                 let mut col_defs = Vec::with_capacity(self.expressions.len());
 
                 for (i, expr) in self.expressions.iter().enumerate() {
-                    let vals = eval_expr_column(expr, &batch)?;
+                    let expr = remap_expr_for_batch(expr, &self.input_schema, &batch.schema);
+                    let vals = eval_expr_column(&expr, &batch)?;
                     let alias = self.aliases[i].as_deref().unwrap_or("expr");
-                    let dt = infer_type(expr, &batch.schema);
+                    let dt = infer_type(&expr, &batch.schema);
 
                     let mut col = ColumnArray::empty(dt);
                     for v in &vals {

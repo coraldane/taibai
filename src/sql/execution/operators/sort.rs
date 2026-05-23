@@ -1,5 +1,6 @@
 
 use crate::common::error::Result;
+use crate::sql::execution::operators::filter::remap_expr_for_batch;
 use crate::sql::planner::{LogicalExpr, SortKey};
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -40,10 +41,11 @@ impl ExecutionOp for SortExec {
         if all_batches.is_empty() {
             return Ok(None);
         }
+        let output_schema = all_batches[0].schema.clone();
 
         let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
         if total_rows == 0 {
-            return Ok(Some(RecordBatch::new(self.schema.clone())));
+            return Ok(Some(RecordBatch::new(output_schema)));
         }
 
         // Materialize rows for sorting
@@ -59,7 +61,8 @@ impl ExecutionOp for SortExec {
 
         let sort_key_indices: Vec<(usize, bool)> = self.sort_keys.iter()
             .map(|sk| {
-                match &sk.expr {
+                let expr = remap_expr_for_batch(&sk.expr, &self.schema, &output_schema);
+                match &expr {
                     LogicalExpr::Column(idx) => (*idx, sk.desc),
                     _ => (0, sk.desc),
                 }
@@ -74,7 +77,7 @@ impl ExecutionOp for SortExec {
             rows.sort_by(|a, b| compare_rows(a, b, &sort_key_indices));
         }
 
-        let mut batch = RecordBatch::new(self.schema.clone());
+        let mut batch = RecordBatch::new(output_schema);
         for row in &rows {
             for (col_idx, val) in row.iter().enumerate() {
                 batch.column_mut(col_idx).unwrap().push(val)?;

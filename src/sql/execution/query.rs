@@ -87,6 +87,9 @@ fn exec_table_select(
         if let Some(result) = try_count_star_fast_path(engine, db, stmt, &table_names) {
             return result;
         }
+        if let Some(result) = try_fast_scan_multi_eq(engine, db, stmt, &table_names) {
+            return result;
+        }
         if let Some(result) = try_fast_scan_eq_unified(engine, db, stmt, &table_names) {
             return result;
         }
@@ -470,19 +473,51 @@ fn try_count_star_fast_path(
     };
 
     let mgr = engine.segment_mgr();
-    let predicate = super::helpers::build_row_group_predicate(where_clause, &table_schema);
     let mut total_rows: u64 = 0;
 
-    for seg_path in &segment_files {
-        match mgr.open_reader(seg_path) {
-            Ok(reader) => {
-                if where_clause.is_some() {
-                    let batches = match reader.scan_with_predicate(4096, predicate.as_ref()) {
-                        Ok(b) => b,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    for batch in batches {
-                        if let Some(ref expr) = where_clause {
+    if let Some(ref expr) = where_clause {
+        let eq_info = extract_simple_eq_clause(expr, &table_schema);
+        if let Some((col_idx, value)) = eq_info {
+            for seg_path in &segment_files {
+                match mgr.open_reader(seg_path) {
+                    Ok(reader) => {
+                        match reader.count_matching_rows_fast(col_idx, &value) {
+                            Ok(count) => total_rows += count,
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+
+            let memtables = engine.memtable_manager().get_by_table(db, table_name);
+            for mt in &memtables {
+                if let Some(batch) = mt.read() {
+                    if batch.num_rows() > 0 {
+                        if let Some(col) = batch.column(col_idx) {
+                            let mask = col.eq_vec(&value);
+                            total_rows += mask.iter().filter(|&m| *m).count() as u64;
+                        }
+                    }
+                }
+            }
+        } else {
+            let predicate = super::helpers::build_row_group_predicate(where_clause, &table_schema);
+            let filter_col_indices = extract_filter_column_indices(expr, &table_schema);
+
+            for seg_path in &segment_files {
+                match mgr.open_reader(seg_path) {
+                    Ok(reader) => {
+                        let batches = match reader.scan_with_projection_and_stats(
+                            4096,
+                            predicate.as_ref(),
+                            if filter_col_indices.is_empty() { None } else { Some(&filter_col_indices) },
+                            None,
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        for batch in batches {
                             match super::helpers::eval_where_clause_batch(expr, &batch, &table_schema) {
                                 Ok(mask) => {
                                     total_rows += mask.iter().filter(|&m| *m).count() as u64;
@@ -493,29 +528,39 @@ fn try_count_star_fast_path(
                             }
                         }
                     }
-                } else {
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+
+            let memtables = engine.memtable_manager().get_by_table(db, table_name);
+            for mt in &memtables {
+                if let Some(batch) = mt.read() {
+                    match super::helpers::eval_where_clause_batch(expr, &batch, &table_schema) {
+                        Ok(mask) => {
+                            total_rows += mask.iter().filter(|&m| *m).count() as u64;
+                        }
+                        Err(_) => {
+                            total_rows += batch.num_rows() as u64;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for seg_path in &segment_files {
+            match mgr.open_reader(seg_path) {
+                Ok(reader) => {
                     let count = reader.row_count();
                     let deleted = reader.deleted_row_count();
                     total_rows += count.saturating_sub(deleted);
                 }
+                Err(e) => return Some(Err(e)),
             }
-            Err(e) => return Some(Err(e)),
         }
-    }
 
-    let memtables = engine.memtable_manager().get_by_table(db, table_name);
-    for mt in &memtables {
-        if let Some(batch) = mt.read() {
-            if let Some(ref expr) = where_clause {
-                match super::helpers::eval_where_clause_batch(expr, &batch, &table_schema) {
-                    Ok(mask) => {
-                        total_rows += mask.iter().filter(|&m| *m).count() as u64;
-                    }
-                    Err(_) => {
-                        total_rows += batch.num_rows() as u64;
-                    }
-                }
-            } else {
+        let memtables = engine.memtable_manager().get_by_table(db, table_name);
+        for mt in &memtables {
+            if let Some(batch) = mt.read() {
                 total_rows += batch.num_rows() as u64;
             }
         }
@@ -545,6 +590,179 @@ fn apply_projection_to_batch(batch: &RecordBatch, projection: &[usize]) -> Recor
     RecordBatch::try_new(schema, columns).unwrap_or_else(|_| batch.clone())
 }
 
+fn try_fast_scan_multi_eq(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    table_names: &[String],
+) -> Option<Result<ExecResult>> {
+    if table_names.len() != 1 {
+        return None;
+    }
+
+    let (select_list, where_clause, group_by, order_by) = match stmt {
+        Statement::Select { select_list, where_clause, group_by, order_by, .. } => {
+            (select_list, where_clause, group_by, order_by)
+        }
+        _ => return None,
+    };
+
+    if !group_by.is_empty() || !order_by.is_empty() {
+        return None;
+    }
+
+    let table_name = &table_names[0];
+
+    let table_schema = {
+        let catalogs = engine.catalogs().read().unwrap();
+        let catalog = catalogs.get(db)?;
+        let meta = catalog.get_table(table_name)?;
+        Schema::new(meta.columns.clone())
+    };
+
+    let eq_clauses = extract_multi_eq_clauses(where_clause, &table_schema)?;
+    if eq_clauses.len() < 2 {
+        return None;
+    }
+
+    let projection = extract_projection_indices(select_list, &table_schema)?;
+
+    let mut sorted_clauses: Vec<(usize, ScalarValue)> = eq_clauses.iter()
+        .map(|c| (c.column_index, c.value.clone()))
+        .collect();
+    sorted_clauses.sort_by_key(|(idx, _)| {
+        match table_schema.columns.get(*idx).map(|c| c.data_type) {
+            Some(DataType::Int32) | Some(DataType::Int64) | Some(DataType::Date) => 0,
+            Some(DataType::VarChar) => 1,
+            _ => 2,
+        }
+    });
+
+    let pred = RowGroupPredicate::new(eq_clauses.clone());
+
+    let mut all_rows: Vec<RecordBatch> = Vec::new();
+
+    let table_dir = engine.data_dir().join(db).join(table_name);
+    if table_dir.exists() {
+        let segment_files = match SegmentManager::discover_segments(&table_dir) {
+            Ok(files) => files,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let mgr = engine.segment_mgr();
+
+        for seg_path in segment_files {
+            let reader = match mgr.open_reader(&seg_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let candidate_rgs = reader.filter_row_groups_multi_bloom(&pred, &sorted_clauses);
+
+            for rg_idx in candidate_rgs {
+                let batch = match reader.read_columns_fast(rg_idx, &projection) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                let proj_to_batch_pos: std::collections::HashMap<usize, usize> = projection
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &idx)| (idx, pos))
+                    .collect();
+
+                let mut mask: Vec<bool> = vec![true; batch.num_rows()];
+                for (col_idx, value) in &sorted_clauses {
+                    let batch_pos = proj_to_batch_pos.get(col_idx);
+                    if let Some(&pos) = batch_pos {
+                        if let Some(col) = batch.column(pos) {
+                            let col_mask = col.eq_vec(value);
+                            for i in 0..mask.len() {
+                                mask[i] = mask[i] && col_mask[i];
+                            }
+                        } else {
+                            mask = vec![false; batch.num_rows()];
+                            break;
+                        }
+                    } else {
+                        mask = vec![false; batch.num_rows()];
+                        break;
+                    }
+                    if mask.iter().all(|m| !m) {
+                        break;
+                    }
+                }
+
+                let match_count = mask.iter().filter(|&m| *m).count();
+                if match_count > 0 {
+                    let mut columns = Vec::with_capacity(projection.len());
+                    for (pos, &proj_idx) in projection.iter().enumerate() {
+                        if let Some(col) = batch.column(pos) {
+                            columns.push(col.filter_by_mask_fast(&mask, match_count));
+                        }
+                    }
+                    let proj_schema = Schema::new(projection.iter()
+                        .map(|&idx| table_schema.columns[idx].clone())
+                        .collect());
+                    if let Ok(filtered_batch) = RecordBatch::try_new(proj_schema, columns) {
+                        all_rows.push(filtered_batch);
+                    }
+                }
+            }
+        }
+    }
+
+    let memtables = engine.memtable_manager().get_by_table(db, table_name);
+    for mt in &memtables {
+        if let Some(batch) = mt.read() {
+            if batch.num_rows() > 0 {
+                let mut mask: Vec<bool> = vec![true; batch.num_rows()];
+                for (col_idx, value) in &sorted_clauses {
+                    if let Some(col) = batch.column(*col_idx) {
+                        let col_mask = col.eq_vec(value);
+                        for i in 0..mask.len() {
+                            mask[i] = mask[i] && col_mask[i];
+                        }
+                    } else {
+                        mask = vec![false; batch.num_rows()];
+                        break;
+                    }
+                    if mask.iter().all(|m| !m) {
+                        break;
+                    }
+                }
+
+                let match_count = mask.iter().filter(|&m| *m).count();
+                if match_count > 0 {
+                    let mut columns = Vec::with_capacity(projection.len());
+                    for &proj_idx in &projection {
+                        if let Some(col) = batch.column(proj_idx) {
+                            columns.push(col.filter_by_mask_fast(&mask, match_count));
+                        }
+                    }
+                    let proj_schema = Schema::new(projection.iter()
+                        .map(|&idx| table_schema.columns[idx].clone())
+                        .collect());
+                    if let Ok(filtered_batch) = RecordBatch::try_new(proj_schema, columns) {
+                        all_rows.push(filtered_batch);
+                    }
+                }
+            }
+        }
+    }
+
+    if all_rows.is_empty() {
+        return None;
+    }
+
+    let result_schema = all_rows[0].schema.clone();
+    Some(Ok(ExecResult::Query { schema: result_schema, batches: all_rows }))
+}
+
 fn try_fast_scan_eq_unified(
     engine: &Engine,
     db: &str,
@@ -566,7 +784,6 @@ fn try_fast_scan_eq_unified(
         return None;
     }
 
-    let eq_clause = extract_single_eq_clause(where_clause)?;
     let table_name = &table_names[0];
 
     let table_schema = {
@@ -576,8 +793,8 @@ fn try_fast_scan_eq_unified(
         Schema::new(meta.columns.clone())
     };
 
+    let eq_clause = extract_single_eq_clause(where_clause, &table_schema)?;
     let col_idx = eq_clause.column_index;
-    let col_name = table_schema.columns.get(col_idx)?.name.clone();
     let eq_value = eq_clause.value.clone();
 
     let projection = extract_projection_indices(select_list, &table_schema)?;
@@ -660,9 +877,15 @@ fn try_fast_scan_eq_unified(
                 };
 
                 if batch.num_rows() > 0 {
-                    let filtered = fast_scan.scan_batch_fast(&batch);
-                    if filtered.num_rows() > 0 {
-                        all_rows.push(filtered);
+                    let filter_col_pos = projection.iter().position(|&p| p == col_idx);
+                    if let Some(pos) = filter_col_pos {
+                        if let Some(col) = batch.column(pos) {
+                            let mask = col.eq_vec(&eq_value);
+                            let filtered = crate::storage::fastscan::apply_filter_mask_fast(&batch, &mask);
+                            if filtered.num_rows() > 0 {
+                                all_rows.push(filtered);
+                            }
+                        }
                     }
                 }
             }
@@ -691,7 +914,7 @@ fn try_fast_scan_eq_unified(
     Some(Ok(ExecResult::Query { schema: result_schema, batches: all_rows }))
 }
 
-fn extract_single_eq_clause(where_clause: &Option<Expr>) -> Option<RangeClause> {
+fn extract_single_eq_clause(where_clause: &Option<Expr>, schema: &Schema) -> Option<RangeClause> {
     let expr = where_clause.as_ref()?;
     
     match expr {
@@ -701,18 +924,73 @@ fn extract_single_eq_clause(where_clause: &Option<Expr>) -> Option<RangeClause> 
             }
             
             if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
-                let idx = 0;
+                let idx = schema.index_of(col_name)?;
                 return Some(RangeClause { column_index: idx, op: RangeOp::Eq, value: val.clone() });
             }
             
             if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
-                let idx = 0;
+                let idx = schema.index_of(col_name)?;
+                return Some(RangeClause { column_index: idx, op: RangeOp::Eq, value: val.clone() });
+            }
+
+            if let (Expr::QualifiedColumn { column, .. }, Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                let idx = schema.index_of(column)?;
+                return Some(RangeClause { column_index: idx, op: RangeOp::Eq, value: val.clone() });
+            }
+
+            if let (Expr::Literal(val), Expr::QualifiedColumn { column, .. }) = (left.as_ref(), right.as_ref()) {
+                let idx = schema.index_of(column)?;
                 return Some(RangeClause { column_index: idx, op: RangeOp::Eq, value: val.clone() });
             }
             
             None
         }
         _ => None,
+    }
+}
+
+fn extract_multi_eq_clauses(where_clause: &Option<Expr>, schema: &Schema) -> Option<Vec<RangeClause>> {
+    let expr = where_clause.as_ref()?;
+    let mut clauses = Vec::new();
+    collect_eq_clauses_from_expr(expr, schema, &mut clauses);
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(clauses)
+    }
+}
+
+fn collect_eq_clauses_from_expr(expr: &Expr, schema: &Schema, clauses: &mut Vec<RangeClause>) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinOp::And => {
+                    collect_eq_clauses_from_expr(left, schema, clauses);
+                    collect_eq_clauses_from_expr(right, schema, clauses);
+                }
+                BinOp::Eq => {
+                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(idx) = schema.index_of(col_name) {
+                            clauses.push(RangeClause { column_index: idx, op: RangeOp::Eq, value: val.clone() });
+                        }
+                    } else if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(idx) = schema.index_of(col_name) {
+                            clauses.push(RangeClause { column_index: idx, op: RangeOp::Eq, value: val.clone() });
+                        }
+                    } else if let (Expr::QualifiedColumn { column, .. }, Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(idx) = schema.index_of(column) {
+                            clauses.push(RangeClause { column_index: idx, op: RangeOp::Eq, value: val.clone() });
+                        }
+                    } else if let (Expr::Literal(val), Expr::QualifiedColumn { column, .. }) = (left.as_ref(), right.as_ref()) {
+                        if let Some(idx) = schema.index_of(column) {
+                            clauses.push(RangeClause { column_index: idx, op: RangeOp::Eq, value: val.clone() });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
     }
 }
 
@@ -732,6 +1010,100 @@ fn extract_projection_indices(select_list: &[SelectItem], schema: &Schema) -> Op
         }
     }
     Some(indices)
+}
+
+fn extract_simple_eq_clause(expr: &Expr, schema: &Schema) -> Option<(usize, ScalarValue)> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if *op != BinOp::Eq {
+                return None;
+            }
+            
+            if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                let idx = schema.index_of(col_name)?;
+                return Some((idx, val.clone()));
+            }
+            
+            if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
+                let idx = schema.index_of(col_name)?;
+                return Some((idx, val.clone()));
+            }
+
+            if let (Expr::QualifiedColumn { column, .. }, Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                let idx = schema.index_of(column)?;
+                return Some((idx, val.clone()));
+            }
+
+            if let (Expr::Literal(val), Expr::QualifiedColumn { column, .. }) = (left.as_ref(), right.as_ref()) {
+                let idx = schema.index_of(column)?;
+                return Some((idx, val.clone()));
+            }
+            
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_filter_column_indices(expr: &Expr, schema: &Schema) -> Vec<usize> {
+    let mut indices = Vec::new();
+    collect_filter_columns(expr, schema, &mut indices);
+    indices.sort();
+    indices.dedup();
+    indices
+}
+
+fn collect_filter_columns(expr: &Expr, schema: &Schema, indices: &mut Vec<usize>) {
+    match expr {
+        Expr::Column(col_name) => {
+            if let Some(idx) = schema.index_of(col_name) {
+                indices.push(idx);
+            }
+        }
+        Expr::QualifiedColumn { column, .. } => {
+            if let Some(idx) = schema.index_of(column) {
+                indices.push(idx);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_filter_columns(left, schema, indices);
+            collect_filter_columns(right, schema, indices);
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_filter_columns(inner, schema, indices);
+        }
+        Expr::UnaryNot(inner) => {
+            collect_filter_columns(inner, schema, indices);
+        }
+        Expr::In { expr, values, .. } => {
+            collect_filter_columns(expr, schema, indices);
+            for v in values {
+                collect_filter_columns(v, schema, indices);
+            }
+        }
+        Expr::Between { expr, low, high, .. } => {
+            collect_filter_columns(expr, schema, indices);
+            collect_filter_columns(low, schema, indices);
+            collect_filter_columns(high, schema, indices);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_filter_columns(expr, schema, indices);
+            collect_filter_columns(pattern, schema, indices);
+        }
+        Expr::Case { operand, when_clauses, else_clause } => {
+            if let Some(op) = operand {
+                collect_filter_columns(op, schema, indices);
+            }
+            for (when_cond, then_result) in when_clauses.iter() {
+                collect_filter_columns(when_cond, schema, indices);
+                collect_filter_columns(then_result, schema, indices);
+            }
+            if let Some(else_expr) = else_clause {
+                collect_filter_columns(else_expr, schema, indices);
+            }
+        }
+        _ => {}
+    }
 }
 
 use crate::sql::parser::ast::OrderByItem;

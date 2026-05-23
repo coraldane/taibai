@@ -213,6 +213,9 @@ impl Engine {
             Statement::ShowColumns { table } => {
                 super::ddl::exec_show_columns(self, &session.database, table)
             }
+            Statement::ShowIndexes { table } => {
+                super::ddl::exec_show_indexes(self, &session.database, table)
+            }
             Statement::ShowCreateTable { table } => {
                 super::ddl::exec_show_create_table(self, &session.database, table)
             }

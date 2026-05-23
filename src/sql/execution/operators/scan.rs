@@ -25,6 +25,9 @@ impl ExecutionOp for ScanExec {
 
         match &self.projection {
             Some(indices) => {
+                if is_already_projected(batch, indices) {
+                    return Ok(Some(batch.clone()));
+                }
                 let schema_cols: Vec<&crate::types::batch::ColumnDef> = indices.iter()
                     .map(|&i| &batch.schema.columns[i])
                     .collect();
@@ -38,4 +41,10 @@ impl ExecutionOp for ScanExec {
             None => Ok(Some(batch.clone())),
         }
     }
+}
+
+fn is_already_projected(batch: &RecordBatch, indices: &[usize]) -> bool {
+    batch.schema.columns.len() == indices.len()
+        && (indices.iter().enumerate().all(|(idx, &source_idx)| idx == source_idx)
+            || indices.iter().any(|&source_idx| source_idx >= batch.schema.columns.len()))
 }

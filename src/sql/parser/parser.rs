@@ -935,6 +935,12 @@ impl Parser {
                 let table = self.expect_ident()?;
                 Ok(Statement::ShowColumns { table })
             }
+            Token::Ident(word) if word.eq_ignore_ascii_case("INDEX") || word.eq_ignore_ascii_case("INDEXES") => {
+                self.advance();
+                self.expect(&Token::From)?;
+                let table = self.expect_ident()?;
+                Ok(Statement::ShowIndexes { table })
+            }
             Token::Create => {
                 self.advance();
                 self.expect(&Token::Table)?;
@@ -986,7 +992,7 @@ impl Parser {
                 Ok(Statement::ShowProcesslist { full })
             }
             other => Err(MonaxError::Sql(format!(
-                "expected TABLES, DATABASES, COLUMNS, CREATE, USER, ROLE, GRANTS, PARTITIONS, STATS, ENGINES, or PROCESSLIST after SHOW, got {}", other
+                "expected TABLES, DATABASES, COLUMNS, INDEXES, CREATE, USER, ROLE, GRANTS, PARTITIONS, STATS, ENGINES, or PROCESSLIST after SHOW, got {}", other
             ))),
         }
     }
