@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::memtable::MemTableState;
 use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ScanStats};
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
@@ -563,7 +562,7 @@ fn try_fast_scan_eq_unified(
         _ => return None,
     };
 
-    if !group_by.is_empty() || order_by.is_some() {
+    if !group_by.is_empty() || !order_by.is_empty() {
         return None;
     }
 
@@ -597,8 +596,8 @@ fn try_fast_scan_eq_unified(
 
         let mgr = engine.segment_mgr();
 
-        if let Some(index_mgr) = engine.index_manager() {
-            if !index_mgr.is_index_stale(db, table_name) && index_mgr.index_block_count(db, table_name) > 0 {
+        let index_mgr = engine.index_manager();
+        if !index_mgr.is_index_stale(db, table_name) && index_mgr.index_block_count(db, table_name) > 0 {
                 if let Some(row_ids) = index_mgr.search(db, table_name, &eq_value) {
                     if !row_ids.is_empty() {
                         for seg_path in &segment_files {
@@ -637,7 +636,6 @@ fn try_fast_scan_eq_unified(
                         }
                     }
                 }
-            }
         }
 
         let fast_scan = crate::storage::fastscan::FastScanEQ::new(col_idx, eq_value.clone());
@@ -736,7 +734,7 @@ fn extract_projection_indices(select_list: &[SelectItem], schema: &Schema) -> Op
     Some(indices)
 }
 
-use crate::sql::parser::ast::{OrderByItem, Statement as AstStatement};
+use crate::sql::parser::ast::OrderByItem;
 
 pub fn exec_union(
     engine: &Engine,
@@ -781,9 +779,9 @@ pub fn exec_union(
 
     if let Some(offset_expr) = offset {
         let offset_val = super::helpers::eval_expr_to_int(offset_expr)?;
-        if offset_val > 0 && offset_val < combined_batches.len() {
+        if offset_val > 0 && (offset_val as usize) < combined_batches.len() {
             combined_batches = combined_batches.into_iter().skip(offset_val as usize).collect();
-        } else if offset_val >= combined_batches.len() as i64 {
+        } else if (offset_val as usize) >= combined_batches.len() {
             combined_batches = Vec::new();
         }
     }
@@ -827,9 +825,8 @@ fn deduplicate_batches(batches: &[RecordBatch]) -> Vec<RecordBatch> {
                 for col_idx in 0..batch.num_columns() {
                     if let Some(col) = batch.column(col_idx) {
                         if let Some(dest_col) = current_batch.column_mut(col_idx) {
-                            if let Ok(val) = col.get(row_idx) {
-                                let _ = dest_col.push(&val);
-                            }
+                            let val = col.scalar(row_idx);
+                            let _ = dest_col.push(&val);
                         }
                     }
                 }
@@ -852,11 +849,10 @@ fn build_row_key(batch: &RecordBatch, row_idx: usize) -> Vec<String> {
     let mut key = Vec::with_capacity(batch.num_columns());
     for col_idx in 0..batch.num_columns() {
         if let Some(col) = batch.column(col_idx) {
-            if let Ok(val) = col.get(row_idx) {
-                key.push(format!("{:?}", val));
-            } else {
-                key.push("NULL".to_string());
-            }
+            let val = col.scalar(row_idx);
+            key.push(format!("{:?}", val));
+        } else {
+            key.push("NULL".to_string());
         }
     }
     key
@@ -886,11 +882,11 @@ fn sort_batches(batches: &[RecordBatch], order_by: &[OrderByItem]) -> Vec<Record
             };
             
             let val_a = batches[a.0].column(col_idx)
-                .and_then(|c| c.get(a.1))
-                .unwrap_or(ScalarValue::Null);
+                .map(|c| c.scalar(a.1))
+                .unwrap_or_else(|| ScalarValue::Int64(None));
             let val_b = batches[b.0].column(col_idx)
-                .and_then(|c| c.get(b.1))
-                .unwrap_or(ScalarValue::Null);
+                .map(|c| c.scalar(b.1))
+                .unwrap_or_else(|| ScalarValue::Int64(None));
             
             let cmp = compare_scalar_values(&val_a, &val_b);
             if cmp != std::cmp::Ordering::Equal {
@@ -905,9 +901,8 @@ fn sort_batches(batches: &[RecordBatch], order_by: &[OrderByItem]) -> Vec<Record
         for col_idx in 0..schema.num_columns() {
             if let Some(col) = batches[batch_idx].column(col_idx) {
                 if let Some(dest_col) = result_batch.column_mut(col_idx) {
-                    if let Ok(val) = col.get(row_idx) {
-                        let _ = dest_col.push(&val);
-                    }
+                    let val = col.scalar(row_idx);
+                    let _ = dest_col.push(&val);
                 }
             }
         }
@@ -924,9 +919,9 @@ fn compare_scalar_values(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering
         (ScalarValue::Int64(Some(va)), ScalarValue::Int64(Some(vb))) => va.cmp(&vb),
         (ScalarValue::Float64(Some(va)), ScalarValue::Float64(Some(vb))) => va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal),
         (ScalarValue::VarChar(Some(va)), ScalarValue::VarChar(Some(vb))) => va.cmp(&vb),
-        (ScalarValue::TimestampNanosecond(Some(va), _), ScalarValue::TimestampNanosecond(Some(vb), _)) => va.cmp(&vb),
-        (ScalarValue::Null, _) => std::cmp::Ordering::Less,
-        (_, ScalarValue::Null) => std::cmp::Ordering::Greater,
+        (ScalarValue::Timestamp(Some(va)), ScalarValue::Timestamp(Some(vb))) => va.cmp(&vb),
+        (a_val, b_val) if a_val.is_null() && !b_val.is_null() => std::cmp::Ordering::Less,
+        (a_val, b_val) if !a_val.is_null() && b_val.is_null() => std::cmp::Ordering::Greater,
         _ => std::cmp::Ordering::Equal,
     }
 }

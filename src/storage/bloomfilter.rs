@@ -6,6 +6,7 @@ use crate::types::scalar::ScalarValue;
 const DEFAULT_FALSE_POSITIVE_RATE: f64 = 0.01;
 const DEFAULT_EXPECTED_ITEMS: usize = 8192;
 
+#[derive(Debug, Clone)]
 pub struct BloomFilter {
     bits: Vec<u8>,
     num_bits: usize,

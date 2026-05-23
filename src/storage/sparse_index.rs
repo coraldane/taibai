@@ -152,7 +152,7 @@ impl SparseIndexImpl {
         let mut row_ids = Vec::new();
 
         for block_id in block_ids {
-            if block_id < blocks.len() {
+            if *block_id < blocks.len() {
                 let block = &blocks[*block_id];
                 for i in 0..block.row_count {
                     row_ids.push(block.start_row_id + i);
@@ -181,8 +181,9 @@ impl SparseIndexImpl {
             block
         };
 
+        let row_count = block.row_count;
         blocks.push(block);
-        *self.size.lock().unwrap() += block.row_count;
+        *self.size.lock().unwrap() += row_count;
     }
 
     pub fn rebuild_from_blocks(&self, block_data: Vec<SparseBlockData>) {

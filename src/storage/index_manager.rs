@@ -1,14 +1,14 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::common::error::Result;
 use crate::storage::sparse_index::SparseIndexImpl;
-use crate::storage::segment::SegmentReader;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::scalar::ScalarValue;
 
 pub struct IndexManager {
-    indexes: RwLock<HashMap<String, HashMap<String, Arc<SparseIndexImpl>>>>>,
+    indexes: RwLock<HashMap<String, HashMap<String, Arc<SparseIndexImpl>>>>,
     segment_mgr: Arc<SegmentManager>,
 }
 
@@ -50,7 +50,7 @@ impl IndexManager {
         let mut block_data = Vec::new();
         
         for (seg_idx, seg_path) in segments.iter().enumerate() {
-            let reader = self.segment_mgr.open_reader(seg_path)?;
+            let reader = self.segment_mgr.open_reader(Path::new(seg_path))?;
             
             let num_row_groups = reader.num_row_groups();
             for rg_idx in 0..num_row_groups {
@@ -149,6 +149,8 @@ impl IndexManager {
 
 impl Default for IndexManager {
     fn default() -> Self {
-        Self::new(Arc::new(SegmentManager::new()))
+        let segment_mgr = SegmentManager::new(std::path::Path::new("/tmp/monax_default"))
+            .expect("failed to create default SegmentManager");
+        Self::new(Arc::new(segment_mgr))
     }
 }

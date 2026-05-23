@@ -1,23 +1,26 @@
 # Monax Database Server Configuration
 # Copy this file to config.yaml and modify as needed
 
-# Server listen address (host:port)
-listen_addr: "0.0.0.0:5151"
+# Server settings
+server:
+  host: "0.0.0.0"
+  port: 5151
+  max_message_size: 67108864  # 64MB
 
-# Data directory for storing database files
-data_dir: "/Users/coral/Downloads/data/monax"
+# Storage settings
+storage:
+  data_dir: "/Users/coral/Downloads/data/monax"
+  default_database: "main"
+  flush_threshold_rows: 65536
+  min_segment_seal_size_mb: 500  # Minimum segment size in MB before sealing
 
-# Default database name
-default_database: "main"
+# Buffer settings
+buffer:
+  batch_size: 4096  # Batch size for query processing
 
-# Maximum message size in bytes (64MB)
-max_message_size: 67108864
-
-# Row threshold for flushing to disk
-flush_threshold_rows: 65536
-
-# Batch size for query processing
-batch_size: 4096
+# Compression settings
+compression:
+  enabled: true  # Enable protocol compression
 
 # TLS configuration (optional)
 # Set enabled: true and provide cert/key paths to enable TLS
@@ -26,5 +29,6 @@ tls:
   cert_path: ""
   key_path: ""
 
-# Enable protocol compression
-enable_compression: true
+# Log settings
+log:
+  level: "info"  # trace, debug, info, warn, error

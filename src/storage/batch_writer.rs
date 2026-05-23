@@ -8,9 +8,9 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::storage::wal::RecordType;
 use crate::types::batch::{RecordBatch, Schema};
 
-const DEFAULT_MAX_ROWS_PER_MEMTABLE: u64 = 100_000;
-const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 5;
-const DEFAULT_MAX_TOTAL_MEMORY: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_ROWS_PER_MEMTABLE: u64 = 500_000;
+const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
+const DEFAULT_MAX_TOTAL_MEMORY: u64 = 512 * 1024 * 1024;
 
 enum WriteCommand {
     WriteColumns {
@@ -301,24 +301,21 @@ impl BatchWriter {
             segment_mgr.write_txn_wal(&table_dir, txn_id, &batch)?;
         }
 
-        let row_group_size = 8192;
-        let seg_path = if partition_key.is_empty() {
-            segment_mgr.next_segment_path(&table_dir, "")?
+        if partition_key.is_empty() {
+            segment_mgr.bulk_insert_batch(&db, &table, batch, true)?;
         } else {
-            segment_mgr.next_partition_segment_path(&table_dir, &partition_key)?
-        };
-
-        segment_mgr.write_new_segment(&seg_path, batch.schema.clone(), row_group_size, &batch)?;
+            segment_mgr.bulk_insert_batch_with_partition(&db, &table, &partition_key, batch)?;
+        }
 
         if txn_id > 0 {
             segment_mgr.sync_table_wal(&table_dir)?;
         }
 
         tracing::debug!(
-            path = %seg_path.display(),
+            table = %table,
             rows = mt.row_count(),
             txn_id,
-            "memtable flushed to segment"
+            "memtable flushed to active segment"
         );
         mt.set_state(MemTableState::Flushed);
         Ok(())

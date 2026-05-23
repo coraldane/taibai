@@ -16,7 +16,7 @@ use crate::types::scalar::ScalarValue;
 /// Stored little-endian, so on disk the first 4 bytes are `58 49 41 54`.
 /// Kept in sync with taibai (`pkg/storage/columnar/types.go: SegmentMagic = 0x54414958`).
 pub const SEGMENT_MAGIC: u32 = 0x5441_4958;
-pub const SEGMENT_VERSION: u32 = 4;
+pub const SEGMENT_VERSION: u32 = 5;
 pub const DEFAULT_ROW_GROUP_SIZE: usize = 8192;
 pub const FOOTER_SIZE: usize = 4096;
 pub const SEGMENT_HEADER_SIZE: usize = 32;
@@ -154,8 +154,8 @@ impl ZoneMap {
 
     pub fn deserialize(data: &[u8]) -> Option<(Self, usize)> {
         let mut cursor = std::io::Cursor::new(data);
-        let min_value = decode_scalar_with_tag(&mut cursor)?;
-        let max_value = decode_scalar_with_tag(&mut cursor)?;
+        let min_value = decode_scalar_with_tag(&mut cursor).ok()?;
+        let max_value = decode_scalar_with_tag(&mut cursor).ok()?;
 
         let pos = cursor.position() as usize;
         if data.len() < pos + 16 {
@@ -702,6 +702,21 @@ impl SegmentReader {
         &self.footer.row_groups[row_group].bloom_filters
     }
 
+    pub fn footer_row_groups_info(&self) -> Vec<RowGroupMeta> {
+        self.footer.row_groups.iter().map(|rg| {
+            RowGroupMeta {
+                offset: rg.offset,
+                length: rg.length,
+                row_count: rg.row_count,
+                column_sizes: rg.column_compressed_sizes.clone(),
+                compressed_sizes: rg.column_compressed_sizes.clone(),
+                uncompressed_sizes: rg.column_uncompressed_sizes.clone(),
+                zone_maps: rg.zone_maps.clone(),
+                bloom_filters: rg.bloom_filters.clone(),
+            }
+        }).collect()
+    }
+
     pub fn filter_row_groups_by_bloom_filter(&self, column_index: usize, value: &ScalarValue) -> Vec<usize> {
         let mut candidates = Vec::new();
         for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
@@ -864,6 +879,25 @@ impl SegmentReader {
                 let _ = read_u64_le(&mut cursor)?;
                 let _ = read_u64_le(&mut cursor)?;
             }
+            for _ in 0..col_count {
+                let has_bf = read_u8(&mut cursor)?;
+                if has_bf != 0 {
+                    let bf_len = read_u32_le(&mut cursor)? as usize;
+                    let start = cursor.position() as usize;
+                    let end = start.checked_add(bf_len).ok_or_else(|| {
+                        MonaxError::Storage("invalid bloom filter length".to_string())
+                    })?;
+                    if end > buf.len() {
+                        return Err(MonaxError::Storage(format!(
+                            "invalid bloom filter length: {} at footer offset {} (footer size {})",
+                            bf_len,
+                            start,
+                            buf.len()
+                        )));
+                    }
+                    cursor.set_position(end as u64);
+                }
+            }
         }
         Ok(cursor.position() as usize)
     }
@@ -970,7 +1004,7 @@ impl SegmentReader {
 
         let mut column_indices = Vec::with_capacity(column_names.len());
         for name in column_names {
-            if let Some(idx) = self.footer.schema.column_index(name) {
+            if let Some(idx) = self.footer.schema.index_of(name) {
                 column_indices.push(idx);
             }
         }
@@ -978,7 +1012,7 @@ impl SegmentReader {
         let batch = self.read_columns_fast(target_rg, &column_indices)?;
         
         if batch.num_rows() == 0 {
-            return Ok(crate::types::batch::RecordBatch::empty(batch.schema.clone()));
+            return Ok(crate::types::batch::RecordBatch::new(batch.schema.clone()));
         }
 
         let mut selected_columns = Vec::with_capacity(column_indices.len());
@@ -997,6 +1031,9 @@ impl SegmentReader {
                     name: name.clone(),
                     data_type: self.footer.schema.columns[idx].data_type.clone(),
                     nullable: self.footer.schema.columns[idx].nullable,
+                    scale: self.footer.schema.columns[idx].scale,
+                    precision: self.footer.schema.columns[idx].precision,
+                    auto_increment: self.footer.schema.columns[idx].auto_increment,
                 })
                 .collect()
         );
@@ -1197,9 +1234,20 @@ impl SegmentReader {
                 if has_bf != 0 {
                     let bf_len = read_u32_le(&mut cursor)? as usize;
                     let bf_data_start = cursor.position() as usize;
+                    let bf_data_end = bf_data_start.checked_add(bf_len).ok_or_else(|| {
+                        MonaxError::Storage("invalid bloom filter length".to_string())
+                    })?;
+                    if bf_data_end > buf.len() {
+                        return Err(MonaxError::Storage(format!(
+                            "invalid bloom filter length: {} at footer offset {} (footer size {})",
+                            bf_len,
+                            bf_data_start,
+                            buf.len()
+                        )));
+                    }
                     let bf_data = &buf[bf_data_start..bf_data_start + bf_len];
                     let bf = BloomFilter::deserialize(bf_data);
-                    cursor.set_position((bf_data_start + bf_len) as u64);
+                    cursor.set_position(bf_data_end as u64);
                     bloom_filters.push(bf);
                 } else {
                     bloom_filters.push(None);

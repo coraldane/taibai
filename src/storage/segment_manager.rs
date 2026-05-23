@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
+use crate::storage::bloomfilter::BloomFilter;
 use crate::storage::segment::{
     encode_segment_footer, encode_segment_header, RowGroupMeta, SegmentReader, SegmentWriter,
     ZoneMap, SEGMENT_HEADER_SIZE,
@@ -16,10 +17,28 @@ use crate::types::batch::{RecordBatch, Schema};
 
 const MAX_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
-const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 200_000;
-const FLUSH_CHECK_INTERVAL_SECS: u64 = 30;
-const FLUSH_IDLE_THRESHOLD_SECS: u64 = 10;
-const FLUSH_ROW_THRESHOLD: u64 = 500_000;
+const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 500_000;
+const FLUSH_CHECK_INTERVAL_SECS: u64 = 10;
+const FLUSH_IDLE_THRESHOLD_SECS: u64 = 5;
+const FLUSH_ROW_THRESHOLD: u64 = 100_000;
+const FLUSH_META_AFTER_ROW_GROUP: bool = true;
+
+const DEFAULT_MIN_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
+
+pub struct SegmentConfig {
+    pub min_segment_size: u64,
+    pub max_segment_size: u64,
+}
+
+impl Default for SegmentConfig {
+    fn default() -> Self {
+        Self {
+            min_segment_size: DEFAULT_MIN_SEGMENT_SIZE,
+            max_segment_size: DEFAULT_MAX_SEGMENT_SIZE,
+        }
+    }
+}
 
 struct ActiveSegment {
     file: std::io::BufWriter<std::fs::File>,
@@ -35,9 +54,15 @@ struct ActiveSegment {
     last_write_at: Instant,
 }
 
+impl ActiveSegment {
+    fn is_sealed(&self) -> bool {
+        !self.dirty_meta && self.buffered_rows == 0 && self.row_groups.is_empty()
+    }
+}
+
 struct TableSegmentState {
     seq: AtomicU32,
-    active_segment: Mutex<Option<ActiveSegment>>,
+    active_segments: Mutex<HashMap<String, ActiveSegment>>,
     wal_writer: Mutex<Option<WalWriter>>,
 }
 
@@ -45,7 +70,7 @@ impl TableSegmentState {
     fn new(initial_seq: u32) -> Self {
         Self {
             seq: AtomicU32::new(initial_seq),
-            active_segment: Mutex::new(None),
+            active_segments: Mutex::new(HashMap::new()),
             wal_writer: Mutex::new(None),
         }
     }
@@ -57,10 +82,15 @@ pub struct SegmentManager {
     flush_stop: Arc<AtomicBool>,
     flush_paused: Arc<AtomicBool>,
     next_txn_id: AtomicU64,
+    config: SegmentConfig,
 }
 
 impl SegmentManager {
     pub fn new(data_dir: &Path) -> Result<Self> {
+        Self::with_config(data_dir, SegmentConfig::default())
+    }
+
+    pub fn with_config(data_dir: &Path, config: SegmentConfig) -> Result<Self> {
         let mut tables = HashMap::new();
 
         if data_dir.exists() {
@@ -98,7 +128,20 @@ impl SegmentManager {
             flush_stop,
             flush_paused,
             next_txn_id: AtomicU64::new(0),
+            config,
         })
+    }
+
+    pub fn set_config(&mut self, config: SegmentConfig) {
+        self.config = config;
+    }
+
+    fn min_segment_seal_size(&self) -> u64 {
+        self.config.min_segment_size
+    }
+
+    fn max_segment_size(&self) -> u64 {
+        self.config.max_segment_size
     }
 
     pub fn start_flush_thread(mgr: &Arc<Self>) {
@@ -127,6 +170,9 @@ impl SegmentManager {
 
     pub fn shutdown(&self) {
         self.flush_stop.store(true, Ordering::Release);
+        if let Err(e) = self.flush_all_active() {
+            tracing::warn!(error = %e, "failed to flush all active segments during shutdown");
+        }
     }
 
     pub fn pause_flush(&self) {
@@ -186,6 +232,30 @@ impl SegmentManager {
         }
         files.sort();
         Ok(files)
+    }
+
+    pub fn find_unsealed_segment(table_dir: &Path, min_seal_size: u64) -> Result<Option<(PathBuf, Schema, u64)>> {
+        let segments = Self::discover_segments(table_dir)?;
+        
+        for seg_path in segments.iter().rev() {
+            let file_len = match std::fs::metadata(seg_path) {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+            
+            if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
+                continue;
+            }
+            
+            if let Ok(reader) = SegmentReader::open(seg_path) {
+                let seg_size = file_len;
+                if seg_size < min_seal_size && reader.row_count() > 0 {
+                    return Ok(Some((seg_path.clone(), reader.schema().clone(), reader.row_count())));
+                }
+            }
+        }
+        
+        Ok(None)
     }
 
     pub fn next_segment_path(&self, table_dir: &Path, _partition_key: &str) -> Result<PathBuf> {
@@ -296,6 +366,16 @@ impl SegmentManager {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition(db, table, "", batch)
+    }
+    
+    pub fn bulk_insert_batch_with_partition(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+    ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
             return Ok(0);
@@ -306,71 +386,49 @@ impl SegmentManager {
         let state = self.get_or_create_state(&key);
 
         {
-            let mut active_guard = state.active_segment.lock().unwrap();
-            if active_guard.is_none() {
-                let schema = batch.schema.clone();
-                let seg_path = self.next_segment_path(&table_dir, "")?;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&seg_path)?;
-                file.write_all(&encode_segment_header())?;
-                *active_guard = Some(ActiveSegment {
-                    file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
-                    path: seg_path,
-                    schema,
-                    row_groups: Vec::new(),
-                    current_size: SEGMENT_HEADER_SIZE as u64,
-                    total_rows: 0,
-                    buffered_batch: None,
-                    buffered_rows: 0,
-                    dirty_meta: false,
-                    data_end: SEGMENT_HEADER_SIZE as u64,
-                    last_write_at: Instant::now(),
-                });
-            }
-            let mut wal_keys_to_clear =
-                self.append_to_segment_buffer(active_guard.as_mut().unwrap(), &batch)?;
+            let mut active_guard = state.active_segments.lock().unwrap();
+            self.get_or_create_active_segment_for_partition_locked(
+                &table_dir,
+                &batch.schema,
+                partition_key,
+                &mut active_guard,
+            )?;
+            
+            let seg = active_guard.get_mut(partition_key).unwrap();
+            let mut wal_keys_to_clear = self.append_to_segment_buffer(seg, &batch)?;
 
             let mut sealed = false;
             let mut need_flush_buffer = false;
             let mut need_flush_meta = false;
-            let _sealed_wal_key = {
-                let seg = active_guard.as_mut().unwrap();
-                if seg.current_size >= MAX_SEGMENT_SIZE {
-                    self.seal_segment(seg, &state)?;
-                    let wal_key = table_dir.to_string_lossy().to_string();
-                    active_guard.take();
-                    sealed = true;
-                    Some(wal_key)
-                } else {
-                    if seg.dirty_meta {
-                        let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
-                        if idle >= FLUSH_IDLE_THRESHOLD_SECS || seg.total_rows >= FLUSH_ROW_THRESHOLD
-                        {
-                            need_flush_meta = true;
-                        }
+            
+            if seg.current_size >= self.max_segment_size() {
+                self.seal_segment(seg)?;
+                active_guard.remove(partition_key);
+                sealed = true;
+            } else {
+                if seg.dirty_meta {
+                    let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
+                    if idle >= FLUSH_IDLE_THRESHOLD_SECS || seg.total_rows >= FLUSH_ROW_THRESHOLD {
+                        need_flush_meta = true;
                     }
-                    if seg.buffered_rows > 0 && !need_flush_meta {
-                        let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
-                        if idle >= FLUSH_IDLE_THRESHOLD_SECS {
-                            need_flush_buffer = true;
-                            need_flush_meta = true;
-                        }
-                    }
-                    None
                 }
-            };
+                if seg.buffered_rows > 0 && !need_flush_meta {
+                    let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
+                    if idle >= FLUSH_IDLE_THRESHOLD_SECS {
+                        need_flush_buffer = true;
+                        need_flush_meta = true;
+                    }
+                }
+            }
 
             if need_flush_buffer && !sealed {
-                let seg = active_guard.as_mut().unwrap();
+                let seg = active_guard.get_mut(partition_key).unwrap();
                 if let Some(wk) = self.flush_segment_buffer(seg)? {
                     wal_keys_to_clear.push(wk);
                 }
             }
             if need_flush_meta && !sealed {
-                let seg = active_guard.as_mut().unwrap();
+                let seg = active_guard.get_mut(partition_key).unwrap();
                 self.flush_meta(seg)?;
             }
         }
@@ -378,11 +436,184 @@ impl SegmentManager {
         Ok(row_count)
     }
 
+    fn get_or_create_active_segment_for_partition_locked(
+        &self,
+        table_dir: &Path,
+        schema: &Schema,
+        partition_key: &str,
+        active_guard: &mut std::sync::MutexGuard<HashMap<String, ActiveSegment>>,
+    ) -> Result<()> {
+        if active_guard.contains_key(partition_key) {
+            return Ok(());
+        }
+        
+        let unsealed = if partition_key.is_empty() {
+            Self::find_unsealed_segment(table_dir, self.min_segment_seal_size())?
+        } else {
+            Self::find_unsealed_partition_segment(table_dir, partition_key, self.min_segment_seal_size())?
+        };
+        
+        let active = if let Some((seg_path, existing_schema, existing_rows)) = unsealed {
+            if existing_schema.columns.len() == schema.columns.len() {
+                tracing::info!(
+                    path = %seg_path.display(),
+                    partition_key,
+                    existing_rows,
+                    "resuming unsealed segment for append"
+                );
+                if let Some(recovered) = self.recover_active_segment(&seg_path, &existing_schema)? {
+                    recovered
+                } else {
+                    self.create_new_active_segment(table_dir, schema, partition_key)?
+                }
+            } else {
+                self.create_new_active_segment(table_dir, schema, partition_key)?
+            }
+        } else {
+            self.create_new_active_segment(table_dir, schema, partition_key)?
+        };
+        
+        active_guard.insert(partition_key.to_string(), active);
+        Ok(())
+    }
+    
+    fn create_new_active_segment(
+        &self,
+        table_dir: &Path,
+        schema: &Schema,
+        partition_key: &str,
+    ) -> Result<ActiveSegment> {
+        let seg_path = if partition_key.is_empty() {
+            self.next_segment_path(table_dir, "")?
+        } else {
+            self.next_partition_segment_path(table_dir, partition_key)?
+        };
+        
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&seg_path)?;
+        file.write_all(&encode_segment_header())?;
+        
+        tracing::info!(
+            path = %seg_path.display(),
+            partition_key,
+            "created new active segment"
+        );
+        
+        Ok(ActiveSegment {
+            file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
+            path: seg_path,
+            schema: schema.clone(),
+            row_groups: Vec::new(),
+            current_size: SEGMENT_HEADER_SIZE as u64,
+            total_rows: 0,
+            buffered_batch: None,
+            buffered_rows: 0,
+            dirty_meta: false,
+            data_end: SEGMENT_HEADER_SIZE as u64,
+            last_write_at: Instant::now(),
+        })
+    }
+    
+    pub fn find_unsealed_partition_segment(
+        table_dir: &Path,
+        partition_key: &str,
+        min_seal_size: u64,
+    ) -> Result<Option<(PathBuf, Schema, u64)>> {
+        let pattern = format!("p{}_*", partition_key);
+        let segments: Vec<PathBuf> = if let Ok(entries) = std::fs::read_dir(table_dir) {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let file_name = e.file_name();
+                    let name = file_name.to_string_lossy();
+                    name.starts_with(&format!("p{}", partition_key)) && 
+                        name.ends_with(".dat") &&
+                        name.contains('_')
+                })
+                .map(|e| e.path())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        
+        for seg_path in segments.iter().rev() {
+            let file_len = match std::fs::metadata(seg_path) {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+            
+            if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
+                continue;
+            }
+            
+            if let Ok(reader) = SegmentReader::open(seg_path) {
+                if file_len < min_seal_size && reader.row_count() > 0 {
+                    return Ok(Some((seg_path.clone(), reader.schema().clone(), reader.row_count())));
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    fn recover_active_segment(&self, seg_path: &Path, schema: &Schema) -> Result<Option<ActiveSegment>> {
+        let file_len = std::fs::metadata(seg_path)?.len();
+        
+        if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
+            return Ok(None);
+        }
+        
+        let reader = SegmentReader::open(seg_path)?;
+        let footer_offset = {
+            let mut file = std::fs::File::open(seg_path)?;
+            use std::io::Read;
+            file.seek(SeekFrom::End(-8))?;
+            let mut buf = [0u8; 8];
+            file.read_exact(&mut buf)?;
+            u64::from_le_bytes(buf)
+        };
+        
+        let row_groups = reader.footer_row_groups_info();
+        
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(seg_path)?;
+        
+        file.set_len(footer_offset)?;
+        file.seek(SeekFrom::Start(footer_offset))?;
+        
+        tracing::info!(
+            path = %seg_path.display(),
+            data_end = footer_offset,
+            existing_rows = reader.row_count(),
+            row_groups = row_groups.len(),
+            "recovered active segment from unsealed file"
+        );
+        
+        Ok(Some(ActiveSegment {
+            file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
+            path: seg_path.to_path_buf(),
+            schema: schema.clone(),
+            row_groups: row_groups,
+            current_size: footer_offset,
+            total_rows: reader.row_count(),
+            buffered_batch: None,
+            buffered_rows: 0,
+            dirty_meta: true,
+            data_end: footer_offset,
+            last_write_at: Instant::now(),
+        }))
+    }
+
     pub fn bulk_insert_payload(
         &self,
         db: &str,
         payload: &[u8],
-        disable_wal: bool,
+        _disable_wal: bool,
     ) -> Result<u64> {
         use rayon::prelude::*;
 
@@ -393,7 +624,16 @@ impl SegmentManager {
 
         let table_dir = self.data_dir.join(db).join(req.table_name);
         std::fs::create_dir_all(&table_dir)?;
-
+        
+        let schema = {
+            let col_defs: Vec<crate::types::batch::ColumnDef> = req
+                .columns
+                .iter()
+                .map(|c| crate::types::batch::ColumnDef::new(c.name, c.data_type))
+                .collect();
+            Schema::new(col_defs)
+        };
+        
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
 
@@ -413,41 +653,22 @@ impl SegmentManager {
             .collect::<Result<Vec<_>>>()?;
 
         {
-            let mut active_guard = state.active_segment.lock().unwrap();
-            if active_guard.is_none() {
-                let seg_path = self.next_segment_path(&table_dir, "")?;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&seg_path)?;
-                file.write_all(&encode_segment_header())?;
-                let schema = {
-                    let col_defs: Vec<crate::types::batch::ColumnDef> = req
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            crate::types::batch::ColumnDef::new(c.name, c.data_type)
-                        })
-                        .collect();
-                    Schema::new(col_defs)
-                };
-                *active_guard = Some(ActiveSegment {
-                    file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
-                    path: seg_path,
-                    schema,
-                    row_groups: Vec::new(),
-                    current_size: SEGMENT_HEADER_SIZE as u64,
-                    total_rows: 0,
-                    buffered_batch: None,
-                    buffered_rows: 0,
-                    dirty_meta: false,
-                    data_end: SEGMENT_HEADER_SIZE as u64,
-                    last_write_at: Instant::now(),
-                });
-            }
+            let mut active_guard = state.active_segments.lock().unwrap();
+            self.get_or_create_active_segment_for_partition_locked(
+                &table_dir,
+                &schema,
+                "",
+                &mut active_guard,
+            )?;
 
-            let seg = active_guard.as_mut().unwrap();
+            let seg = active_guard.get_mut("").unwrap();
+            
+            if seg.current_size != seg.data_end {
+                seg.file.get_ref().set_len(seg.data_end)?;
+                seg.file.seek(SeekFrom::Start(seg.data_end))?;
+                seg.current_size = seg.data_end;
+            }
+            
             let offset = seg.current_size;
             let mut column_sizes = Vec::with_capacity(compressed_columns.len());
             let mut compressed_sizes = Vec::with_capacity(compressed_columns.len());
@@ -473,6 +694,7 @@ impl SegmentManager {
                 column_sizes,
                 compressed_sizes,
                 uncompressed_sizes,
+                bloom_filters: vec![None; seg.schema.num_columns()],
             });
             seg.current_size += total_length;
             seg.total_rows += req.row_count as u64;
@@ -482,12 +704,11 @@ impl SegmentManager {
 
             let mut sealed = false;
             let mut need_flush_meta = false;
-            let _sealed_wal_key = if seg.current_size >= MAX_SEGMENT_SIZE {
-                self.seal_segment(seg, &state)?;
-                let wal_key = table_dir.to_string_lossy().to_string();
-                active_guard.take();
+            
+            if seg.current_size >= self.max_segment_size() {
+                self.seal_segment(seg)?;
+                active_guard.remove("");
                 sealed = true;
-                Some(wal_key)
             } else {
                 if seg.dirty_meta {
                     let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
@@ -495,26 +716,12 @@ impl SegmentManager {
                         need_flush_meta = true;
                     }
                 }
-                None
-            };
+            }
 
             if need_flush_meta && !sealed {
-                let seg = active_guard.as_mut().unwrap();
+                let seg = active_guard.get_mut("").unwrap();
                 self.flush_meta(seg)?;
             }
-
-            drop(active_guard);
-
-            if sealed {
-                let mut wal_guard = state.wal_writer.lock().unwrap();
-                if let Some(ref mut w) = *wal_guard {
-                    let _ = w.clear();
-                }
-            }
-        }
-
-        if !disable_wal {
-            tracing::debug!("bulk payload insert completed");
         }
 
         Ok(req.row_count as u64)
@@ -601,31 +808,22 @@ impl SegmentManager {
             .collect::<Result<Vec<_>>>()?;
 
         {
-            let mut active_guard = state.active_segment.lock().unwrap();
-            if active_guard.is_none() {
-                let seg_path = self.next_segment_path(&table_dir, "")?;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&seg_path)?;
-                file.write_all(&encode_segment_header())?;
-                *active_guard = Some(ActiveSegment {
-                    file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
-                    path: seg_path,
-                    schema: schema.clone(),
-                    row_groups: Vec::new(),
-                    current_size: SEGMENT_HEADER_SIZE as u64,
-                    total_rows: 0,
-                    buffered_batch: None,
-                    buffered_rows: 0,
-                    dirty_meta: false,
-                    data_end: SEGMENT_HEADER_SIZE as u64,
-                    last_write_at: Instant::now(),
-                });
-            }
+            let mut active_guard = state.active_segments.lock().unwrap();
+            self.get_or_create_active_segment_for_partition_locked(
+                &table_dir,
+                &schema,
+                "",
+                &mut active_guard,
+            )?;
 
-            let seg = active_guard.as_mut().unwrap();
+            let seg = active_guard.get_mut("").unwrap();
+            
+            if seg.current_size != seg.data_end {
+                seg.file.get_ref().set_len(seg.data_end)?;
+                seg.file.seek(SeekFrom::Start(seg.data_end))?;
+                seg.current_size = seg.data_end;
+            }
+            
             let offset = seg.current_size;
             let mut column_sizes = Vec::with_capacity(compressed_columns.len());
             let mut compressed_sizes = Vec::with_capacity(compressed_columns.len());
@@ -651,6 +849,7 @@ impl SegmentManager {
                 column_sizes,
                 compressed_sizes,
                 uncompressed_sizes,
+                bloom_filters: vec![None; seg.schema.num_columns()],
             });
             seg.current_size += total_length;
             seg.total_rows += req.row_count as u64;
@@ -660,12 +859,11 @@ impl SegmentManager {
 
             let mut sealed = false;
             let mut need_flush_meta = false;
-            let _sealed_wal_key = if seg.current_size >= MAX_SEGMENT_SIZE {
-                self.seal_segment(seg, &state)?;
-                let wal_key = table_dir.to_string_lossy().to_string();
-                active_guard.take();
+            
+            if seg.current_size >= self.max_segment_size() {
+                self.seal_segment(seg)?;
+                active_guard.remove("");
                 sealed = true;
-                Some(wal_key)
             } else {
                 if seg.dirty_meta {
                     let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
@@ -673,26 +871,12 @@ impl SegmentManager {
                         need_flush_meta = true;
                     }
                 }
-                None
-            };
+            }
 
             if need_flush_meta && !sealed {
-                let seg = active_guard.as_mut().unwrap();
+                let seg = active_guard.get_mut("").unwrap();
                 self.flush_meta(seg)?;
             }
-
-            drop(active_guard);
-
-            if sealed {
-                let mut wal_guard = state.wal_writer.lock().unwrap();
-                if let Some(ref mut w) = *wal_guard {
-                    let _ = w.clear();
-                }
-            }
-        }
-
-        if !disable_wal {
-            tracing::debug!("bulk payload insert with catalog completed");
         }
 
         Ok(req.row_count as u64)
@@ -704,18 +888,43 @@ impl SegmentManager {
         let mut total = 0u64;
         let tables = self.tables.read().unwrap();
         for state in tables.values() {
-            let mut active_guard = state.active_segment.lock().unwrap();
-            if let Some(ref mut seg) = *active_guard {
-                if let Some(wk) = self.flush_segment_buffer(seg)? {
-                    let mut wal_guard = state.wal_writer.lock().unwrap();
-                    if let Some(ref mut w) = *wal_guard {
-                        let _ = w.clear();
+            let mut active_guard = state.active_segments.lock().unwrap();
+            let keys_to_seal: Vec<String> = active_guard
+                .iter()
+                .filter(|(_, seg)| seg.total_rows > 0 && seg.current_size >= self.min_segment_seal_size())
+                .map(|(k, _)| k.clone())
+                .collect();
+            
+            for key in keys_to_seal {
+                if let Some(seg) = active_guard.get_mut(&key) {
+                    if let Some(_) = self.flush_segment_buffer(seg)? {
                     }
-                    let _ = wk;
+                    self.flush_meta(seg)?;
+                    tracing::info!(
+                        path = %seg.path.display(),
+                        size_mb = seg.current_size / (1024 * 1024),
+                        rows = seg.total_rows,
+                        partition_key = key,
+                        "sealing segment on flush (meets minimum size threshold)"
+                    );
+                    self.finalize_segment(seg)?;
+                    total += seg.total_rows;
                 }
+                active_guard.remove(&key);
+            }
+            
+            for (_, seg) in active_guard.iter_mut() {
                 if seg.total_rows > 0 {
+                    if let Some(_) = self.flush_segment_buffer(seg)? {
+                    }
                     self.flush_meta(seg)?;
                     total += seg.total_rows;
+                    tracing::info!(
+                        path = %seg.path.display(),
+                        size_mb = seg.current_size / (1024 * 1024),
+                        rows = seg.total_rows,
+                        "active segment flushed but kept open (below minimum seal size)"
+                    );
                 }
             }
         }
@@ -731,8 +940,8 @@ impl SegmentManager {
         let mut total = 0u64;
         let tables = self.tables.read().unwrap();
         for state in tables.values() {
-            let mut active_guard = state.active_segment.lock().unwrap();
-            if let Some(ref mut seg) = *active_guard {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            for (_, seg) in active_guard.iter_mut() {
                 if !seg.dirty_meta && seg.buffered_rows == 0 {
                     continue;
                 }
@@ -742,10 +951,6 @@ impl SegmentManager {
                 }
                 if seg.buffered_rows > 0 {
                     if let Some(_) = self.flush_segment_buffer(seg)? {
-                        let mut wal_guard = state.wal_writer.lock().unwrap();
-                        if let Some(ref mut w) = *wal_guard {
-                            let _ = w.clear();
-                        }
                     }
                 }
                 if seg.dirty_meta {
@@ -757,24 +962,33 @@ impl SegmentManager {
         Ok(total)
     }
 
-    fn seal_segment(
-        &self,
-        segment: &mut ActiveSegment,
-        state: &TableSegmentState,
-    ) -> Result<()> {
+    fn seal_segment(&self, segment: &mut ActiveSegment) -> Result<()> {
         if let Some(_) = self.flush_segment_buffer(segment)? {
-            let mut wal_guard = state.wal_writer.lock().unwrap();
-            if let Some(ref mut w) = *wal_guard {
-                let _ = w.clear();
-            }
         }
         self.flush_meta(segment)?;
+        self.finalize_segment(segment)?;
 
-        tracing::debug!(
+        tracing::info!(
             path = %segment.path.display(),
+            size_mb = segment.current_size / (1024 * 1024),
             rows = segment.total_rows,
             row_groups = segment.row_groups.len(),
             "segment sealed"
+        );
+
+        Ok(())
+    }
+
+    fn finalize_segment(&self, segment: &mut ActiveSegment) -> Result<()> {
+        segment.file.flush()?;
+        segment.file.get_ref().sync_all()?;
+
+        tracing::info!(
+            path = %segment.path.display(),
+            size_mb = segment.current_size / (1024 * 1024),
+            rows = segment.total_rows,
+            row_groups = segment.row_groups.len(),
+            "segment finalized and closed"
         );
 
         Ok(())
@@ -786,6 +1000,7 @@ impl SegmentManager {
         }
 
         segment.file.flush()?;
+        segment.file.get_ref().set_len(segment.data_end)?;
         segment.file.seek(SeekFrom::Start(segment.data_end))?;
 
         let footer = self.encode_footer(segment)?;
@@ -877,6 +1092,12 @@ impl SegmentManager {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        if segment.current_size != segment.data_end {
+            segment.file.get_ref().set_len(segment.data_end)?;
+            segment.file.seek(SeekFrom::Start(segment.data_end))?;
+            segment.current_size = segment.data_end;
+        }
+
         let offset = segment.current_size;
         let mut column_sizes = Vec::with_capacity(num_cols);
         let mut compressed_sizes = Vec::with_capacity(num_cols);
@@ -900,12 +1121,17 @@ impl SegmentManager {
             column_sizes,
             compressed_sizes,
             uncompressed_sizes,
+            bloom_filters: vec![None; segment.schema.num_columns()],
         });
         segment.current_size += total_length;
         segment.total_rows += rows_to_flush as u64;
         segment.dirty_meta = true;
         segment.data_end = segment.current_size;
         segment.last_write_at = Instant::now();
+
+        if FLUSH_META_AFTER_ROW_GROUP {
+            self.flush_meta(segment)?;
+        }
 
         let remaining = total_buffered - rows_to_flush;
         if remaining > 0 {

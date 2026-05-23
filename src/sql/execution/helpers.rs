@@ -5,6 +5,22 @@ use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{BinOp, Expr};
 
+pub fn eval_expr_to_int(expr: &Expr) -> Result<i64> {
+    match expr {
+        Expr::Literal(ScalarValue::Int64(Some(v))) => Ok(*v),
+        Expr::Literal(ScalarValue::Int32(Some(v))) => Ok(*v as i64),
+        Expr::Literal(ScalarValue::UInt64(Some(v))) => Ok(*v as i64),
+        Expr::Literal(ScalarValue::UInt32(Some(v))) => Ok(*v as i64),
+        Expr::Literal(v) => Err(MonaxError::Sql(format!(
+            "expected integer literal for OFFSET/LIMIT, got {:?}",
+            v
+        ))),
+        _ => Err(MonaxError::Sql(
+            "OFFSET/LIMIT requires a constant integer expression".into(),
+        )),
+    }
+}
+
 pub fn eval_where_clause_batch(
     expr: &Expr,
     batch: &RecordBatch,

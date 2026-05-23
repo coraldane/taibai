@@ -79,7 +79,7 @@ impl Handler {
         let (database, rest) = read_len_prefixed_string(rest)?;
 
         let database = if database.is_empty() {
-            self.config.default_database.clone()
+            self.config.storage.default_database.clone()
         } else {
             database.to_string()
         };

@@ -191,6 +191,11 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             });
         }
 
+        // Footer v5 stores one bloom-filter slot per column after ZoneMaps.
+        // The inspector does not print these, but it must advance past them
+        // before reading the next row group or the delete-bitmap section.
+        skip_bloom_filters(&mut cursor, footer_data.as_slice(), col_count)?;
+
         row_groups.push(RowGroupInfo {
             offset: rg_offset,
             length: rg_length,
@@ -412,6 +417,29 @@ fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
         .read_exact(&mut buf)
         .map_err(|e| MonaxError::Storage(format!("read_u64 error: {}", e)))?;
     Ok(u64::from_le_bytes(buf))
+}
+
+fn skip_bloom_filters(cursor: &mut Cursor<&[u8]>, data: &[u8], col_count: usize) -> Result<()> {
+    for _ in 0..col_count {
+        let has_bf = read_u8(cursor)?;
+        if has_bf != 0 {
+            let bf_len = read_u32_le(cursor)? as usize;
+            let start = cursor.position() as usize;
+            let end = start
+                .checked_add(bf_len)
+                .ok_or_else(|| MonaxError::Storage("invalid bloom filter length".to_string()))?;
+            if end > data.len() {
+                return Err(MonaxError::Storage(format!(
+                    "invalid bloom filter length: {} at footer offset {} (footer size {})",
+                    bf_len,
+                    start,
+                    data.len()
+                )));
+            }
+            cursor.set_position(end as u64);
+        }
+    }
+    Ok(())
 }
 
 fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> Result<String> {

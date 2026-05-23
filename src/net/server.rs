@@ -54,8 +54,8 @@ impl Server {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(&self.config.listen_addr).await?;
-        tracing::info!("monax listening on {}", self.config.listen_addr);
+        let listener = TcpListener::bind(&self.config.listen_addr()).await?;
+        tracing::info!("monax listening on {}", self.config.listen_addr());
 
         if self.tls_acceptor.is_some() {
             tracing::info!("TLS handshake will be performed for incoming connections");
@@ -100,10 +100,10 @@ async fn handle_framed<S>(stream: S, config: Arc<ServerConfig>, engine: Arc<Engi
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let compress_threshold = if config.enable_compression { 4096 } else { usize::MAX };
+    let compress_threshold = if config.compression.enabled { 4096 } else { usize::MAX };
     let mut framed = Framed::new(
         stream,
-        MessageCodec::new(config.max_message_size).with_compression(compress_threshold),
+        MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),
     );
     let mut handler = Handler::new(config, engine);
 

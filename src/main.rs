@@ -34,20 +34,20 @@ async fn main() {
 
 async fn run_server(config: ServerConfig) {
     tracing::info!(
-        addr = %config.listen_addr,
-        data_dir = %config.data_dir,
-        database = %config.default_database,
+        addr = %config.listen_addr(),
+        data_dir = %config.storage.data_dir,
+        database = %config.storage.default_database,
         tls_enabled = config.tls.enabled,
-        compression = config.enable_compression,
+        compression = config.compression.enabled,
         "starting monax server"
     );
 
-    if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
+    if let Err(e) = std::fs::create_dir_all(&config.storage.data_dir) {
         tracing::error!(error = %e, "failed to create data directory");
         std::process::exit(1);
     }
 
-    let engine = match Engine::new(std::path::Path::new(&config.data_dir), &config.default_database) {
+    let engine = match Engine::new(std::path::Path::new(&config.storage.data_dir), &config.storage.default_database) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize engine");

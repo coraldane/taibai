@@ -504,7 +504,7 @@ pub fn exec_show_grants(
 ) -> Result<ExecResult> {
     let user_name = user.clone().unwrap_or_else(|| "root".to_string());
     let grants = engine.auth_manager().show_grants(&user_name);
-    let schema = Schema::new(vec![ColumnDef::new(format!("Grants for {}", user_name), DataType::VarChar)]);
+    let schema = Schema::new(vec![ColumnDef::new(&format!("Grants for {}", user_name), DataType::VarChar)]);
     let mut batch = RecordBatch::new(schema.clone());
     for grant in grants {
         batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(grant)))?;
@@ -541,10 +541,10 @@ pub fn exec_show_stats(
     if let Some(catalog) = catalogs.get(db) {
         for table_name in catalog.table_names() {
             if let Some(meta) = catalog.get_table(&table_name) {
-                batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(table_name)))?;
+                batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(table_name.to_string())))?;
                 batch.column_mut(1).unwrap().push(&ScalarValue::Int64(Some(meta.row_count)))?;
                 batch.column_mut(2).unwrap().push(&ScalarValue::Int64(Some(0)))?;
-                batch.column_mut(3).unwrap().push(&ScalarValue::TimestampNanosecond(Some(0), None))?;
+                batch.column_mut(3).unwrap().push(&ScalarValue::Timestamp(Some(0)))?;
             }
         }
     }
