@@ -97,7 +97,15 @@ impl DataType {
             DataType::Vector => None,
         }
     }
+}
 
+impl std::fmt::Display for DataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+impl DataType {
     pub fn display_name(&self) -> &'static str {
         match self {
             DataType::Bool => "BOOL",

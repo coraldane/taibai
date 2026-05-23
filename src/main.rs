@@ -47,7 +47,7 @@ async fn run_server(config: ServerConfig) {
         std::process::exit(1);
     }
 
-    let engine = match Engine::new(std::path::Path::new(&config.data_dir)) {
+    let engine = match Engine::new(std::path::Path::new(&config.data_dir), &config.default_database) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize engine");

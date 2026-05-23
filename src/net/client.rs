@@ -59,7 +59,7 @@ impl Client {
         Ok(Self {
             framed,
             session_id: None,
-            default_timeout: Duration::from_secs(30),
+            default_timeout: Duration::from_secs(300),
             pipeline_mode: Arc::new(AtomicBool::new(false)),
             pipeline_depth: 0,
             pipeline_sem: None,
@@ -400,6 +400,7 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
             nullable: true,
             scale: scale as i32,
             precision: 0,
+            auto_increment: false,
         });
         offset += 4 + name.len() + 5;
     }

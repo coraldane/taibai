@@ -167,6 +167,7 @@ fn schema_of(plan: &LogicalPlan) -> crate::types::batch::Schema {
         LogicalPlan::Sort(s) => schema_of(&s.input),
         LogicalPlan::Limit(l) => schema_of(&l.input),
         LogicalPlan::Join(j) => j.output_schema.clone(),
+        LogicalPlan::SemiJoin(s) => s.left_schema.clone(),
         LogicalPlan::TopN(t) => schema_of(&t.input),
         LogicalPlan::Distinct(d) => schema_of(&d.input),
         LogicalPlan::Window(w) => schema_of(&w.input),

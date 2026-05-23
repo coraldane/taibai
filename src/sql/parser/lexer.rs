@@ -48,6 +48,19 @@ pub enum Token {
     Set,
     Delete,
     Primary,
+    Begin,
+    Commit,
+    Rollback,
+    Transaction,
+    Alter,
+    Truncate,
+    Database,
+    Column,
+    Columns,
+    Add,
+    Rename,
+    Modify,
+    To,
     // Join keywords
     Join,
     Inner,
@@ -56,6 +69,17 @@ pub enum Token {
     Outer,
     Cross,
     On,
+    // User/Role/Permission keywords
+    User,
+    Role,
+    Grant,
+    Revoke,
+    Identified,
+    Password,
+    Privileges,
+    All,
+    // AutoIncrement
+    AutoIncrement,
     // Literals
     Integer(i64),
     Float(f64),
@@ -77,6 +101,8 @@ pub enum Token {
     Gte,
     Minus,
     Plus,
+    // Parameter placeholder
+    Placeholder,
     // Special
     Eof,
 }
@@ -128,6 +154,19 @@ impl std::fmt::Display for Token {
             Token::Set => write!(f, "SET"),
             Token::Delete => write!(f, "DELETE"),
             Token::Primary => write!(f, "PRIMARY"),
+            Token::Begin => write!(f, "BEGIN"),
+            Token::Commit => write!(f, "COMMIT"),
+            Token::Rollback => write!(f, "ROLLBACK"),
+            Token::Transaction => write!(f, "TRANSACTION"),
+            Token::Alter => write!(f, "ALTER"),
+            Token::Truncate => write!(f, "TRUNCATE"),
+            Token::Database => write!(f, "DATABASE"),
+            Token::Column => write!(f, "COLUMN"),
+            Token::Columns => write!(f, "COLUMNS"),
+            Token::Add => write!(f, "ADD"),
+            Token::Rename => write!(f, "RENAME"),
+            Token::Modify => write!(f, "MODIFY"),
+            Token::To => write!(f, "TO"),
             Token::Join => write!(f, "JOIN"),
             Token::Inner => write!(f, "INNER"),
             Token::Left => write!(f, "LEFT"),
@@ -135,11 +174,21 @@ impl std::fmt::Display for Token {
             Token::Outer => write!(f, "OUTER"),
             Token::Cross => write!(f, "CROSS"),
             Token::On => write!(f, "ON"),
+            Token::User => write!(f, "USER"),
+            Token::Role => write!(f, "ROLE"),
+            Token::Grant => write!(f, "GRANT"),
+            Token::Revoke => write!(f, "REVOKE"),
+            Token::Identified => write!(f, "IDENTIFIED"),
+            Token::Password => write!(f, "PASSWORD"),
+            Token::Privileges => write!(f, "PRIVILEGES"),
+            Token::All => write!(f, "ALL"),
+            Token::AutoIncrement => write!(f, "AUTOINCREMENT"),
             Token::Integer(v) => write!(f, "{}", v),
             Token::Float(v) => write!(f, "{}", v),
             Token::StringLit(v) => write!(f, "'{}'", v),
             Token::Ident(v) => write!(f, "{}", v),
             Token::Star => write!(f, "*"),
+            Token::Placeholder => write!(f, "?"),
             Token::Comma => write!(f, ","),
             Token::LeftParen => write!(f, "("),
             Token::RightParen => write!(f, ")"),
@@ -191,6 +240,7 @@ impl<'a> Lexer<'a> {
                 b';' => { self.pos += 1; Token::Semicolon }
                 b'.' => { self.pos += 1; Token::Dot }
                 b'*' => { self.pos += 1; Token::Star }
+                b'?' => { self.pos += 1; Token::Placeholder }
                 b'+' => { self.pos += 1; Token::Plus }
                 b'=' => { self.pos += 1; Token::Eq }
                 b'<' => {
@@ -387,6 +437,19 @@ impl<'a> Lexer<'a> {
             "SET" => Token::Set,
             "DELETE" => Token::Delete,
             "PRIMARY" => Token::Primary,
+            "BEGIN" => Token::Begin,
+            "COMMIT" => Token::Commit,
+            "ROLLBACK" => Token::Rollback,
+            "TRANSACTION" | "TXN" => Token::Transaction,
+            "ALTER" => Token::Alter,
+            "TRUNCATE" => Token::Truncate,
+            "DATABASE" => Token::Database,
+            "COLUMN" => Token::Column,
+            "COLUMNS" => Token::Columns,
+            "ADD" => Token::Add,
+            "RENAME" => Token::Rename,
+            "MODIFY" => Token::Modify,
+            "TO" => Token::To,
             // Join keywords
             "JOIN" => Token::Join,
             "INNER" => Token::Inner,
@@ -395,6 +458,15 @@ impl<'a> Lexer<'a> {
             "OUTER" => Token::Outer,
             "CROSS" => Token::Cross,
             "ON" => Token::On,
+            "USER" => Token::User,
+            "ROLE" => Token::Role,
+            "GRANT" => Token::Grant,
+            "REVOKE" => Token::Revoke,
+            "IDENTIFIED" => Token::Identified,
+            "PASSWORD" => Token::Password,
+            "PRIVILEGES" => Token::Privileges,
+            "ALL" => Token::All,
+            "AUTOINCREMENT" | "AUTO_INCREMENT" => Token::AutoIncrement,
             // Data types as identifiers
             "BOOL" | "BOOLEAN" => Token::Ident("BOOL".into()),
             "INT8" | "TINYINT" => Token::Ident("INT8".into()),
@@ -505,5 +577,23 @@ mod tests {
         assert_eq!(tokens[2], Token::Integer(-1));
         assert_eq!(tokens[4], Token::Float(-2.5));
         assert_eq!(tokens[6], Token::StringLit("test".into()));
+    }
+
+    #[test]
+    fn test_transaction_keywords() {
+        let mut lexer = Lexer::new("BEGIN TRANSACTION COMMIT ROLLBACK");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Begin);
+        assert_eq!(tokens[1], Token::Transaction);
+        assert_eq!(tokens[2], Token::Commit);
+        assert_eq!(tokens[3], Token::Rollback);
+    }
+
+    #[test]
+    fn test_txn_keyword() {
+        let mut lexer = Lexer::new("BEGIN TXN");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Begin);
+        assert_eq!(tokens[1], Token::Transaction);
     }
 }

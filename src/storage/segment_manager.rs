@@ -772,6 +772,7 @@ impl SegmentManager {
         segment.file.flush()?;
         segment.file.get_ref().sync_all()?;
 
+        segment.current_size = segment.data_end + footer.len() as u64 + 8;
         segment.dirty_meta = false;
 
         tracing::debug!(
@@ -900,6 +901,58 @@ impl SegmentManager {
         }
 
         Ok(Some(segment.path.to_string_lossy().to_string()))
+    }
+
+    pub fn begin_txn(&self) -> u64 {
+        self.alloc_txn_id()
+    }
+
+    pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
+        self.sync_all_wals();
+        tracing::debug!(txn_id, "transaction committed in storage layer");
+        Ok(())
+    }
+
+    pub fn rollback_txn(&self, txn_id: u64) -> Result<()> {
+        tracing::debug!(txn_id, "transaction rolled back in storage layer");
+        Ok(())
+    }
+
+    pub fn write_txn_wal(&self, table_dir: &Path, txn_id: u64, batch: &RecordBatch) -> Result<()> {
+        let key = table_dir.to_string_lossy().to_string();
+        let state = self.get_or_create_state(&key);
+
+        let wal_data = crate::sql::execution::wal_helper::serialize_batch_for_wal(batch);
+
+        let mut wal_guard = state.wal_writer.lock().unwrap();
+        if wal_guard.is_none() {
+            let wal_dir = table_dir.join("wal");
+            let writer = WalWriter::open(&wal_dir, 64 * 1024 * 1024)?;
+            *wal_guard = Some(writer);
+        }
+        let wal_writer = wal_guard.as_mut().unwrap();
+        wal_writer.write_compact(txn_id, &wal_data, false)?;
+        Ok(())
+    }
+
+    pub fn clear_txn_wal(&self, table_dir: &Path, txn_id: u64) -> Result<()> {
+        let key = table_dir.to_string_lossy().to_string();
+        let state = self.get_or_create_state(&key);
+        let mut wal_guard = state.wal_writer.lock().unwrap();
+        if let Some(ref mut w) = *wal_guard {
+            w.clear_entries_for_txn(txn_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn sync_table_wal(&self, table_dir: &Path) -> Result<()> {
+        let key = table_dir.to_string_lossy().to_string();
+        let state = self.get_or_create_state(&key);
+        let mut wal_guard = state.wal_writer.lock().unwrap();
+        if let Some(ref mut w) = *wal_guard {
+            w.sync()?;
+        }
+        Ok(())
     }
 }
 

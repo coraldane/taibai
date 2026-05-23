@@ -59,6 +59,7 @@ pub fn eval_where_clause(
         Expr::Exists(_) => Ok(true),
         Expr::Subquery(_) => Ok(true),
         Expr::WindowFunction { .. } => Ok(true),
+        Expr::Placeholder(_) => Ok(true),
     }
 }
 
@@ -113,6 +114,7 @@ pub fn eval_expr_for_row(
         Expr::Exists(_) => Ok(ScalarValue::Bool(None)),
         Expr::Subquery(_) => Ok(ScalarValue::Int64(None)),
         Expr::WindowFunction { .. } => Ok(ScalarValue::Int64(None)),
+        Expr::Placeholder(_) => Ok(ScalarValue::Int64(None)),
     }
 }
 
@@ -222,4 +224,106 @@ pub fn sort_batch_by_key(
     }
 
     Ok(sorted_batch)
+}
+
+pub fn apply_row_group_predicate(batch: &RecordBatch, pred: &crate::storage::segment::RowGroupPredicate) -> Vec<RecordBatch> {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 || pred.is_empty() {
+        return vec![batch.clone()];
+    }
+    let mut matched = RecordBatch::new(batch.schema.clone());
+    for row_idx in 0..num_rows {
+        let mut passes = true;
+        for clause in &pred.clauses {
+            let val = batch.scalar(row_idx, clause.column_index)
+                .unwrap_or(ScalarValue::null_for_type(batch.schema.columns[clause.column_index].data_type));
+            if !eval_range_clause(&val, clause) {
+                passes = false;
+                break;
+            }
+        }
+        if passes {
+            for col_idx in 0..batch.num_columns() {
+                let val = batch.scalar(row_idx, col_idx)
+                    .unwrap_or(ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type));
+                let _ = matched.column_mut(col_idx).unwrap().push(&val);
+            }
+        }
+    }
+    if matched.num_rows() > 0 {
+        vec![matched]
+    } else {
+        vec![]
+    }
+}
+
+fn eval_range_clause(val: &ScalarValue, clause: &crate::storage::segment::RangeClause) -> bool {
+    use crate::storage::segment::RangeOp;
+    match clause.op {
+        RangeOp::Eq => val == &clause.value,
+        RangeOp::Lt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Less),
+        RangeOp::Le => compare_scalars(val, &clause.value).map_or(false, |o| o != std::cmp::Ordering::Greater),
+        RangeOp::Gt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Greater),
+        RangeOp::Ge => compare_scalars(val, &clause.value).map_or(false, |o| o != std::cmp::Ordering::Less),
+    }
+}
+
+pub fn build_row_group_predicate(where_clause: &Option<Expr>, schema: &Schema) -> Option<crate::storage::segment::RowGroupPredicate> {
+    let expr = where_clause.as_ref()?;
+    let mut clauses = Vec::new();
+    extract_range_clauses(expr, schema, &mut clauses);
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(crate::storage::segment::RowGroupPredicate::new(clauses))
+    }
+}
+
+fn extract_range_clauses(expr: &Expr, schema: &Schema, clauses: &mut Vec<crate::storage::segment::RangeClause>) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinOp::Eq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
+                    if let Expr::Column(col_name) = left.as_ref() {
+                        if let Expr::Literal(ref val) = right.as_ref() {
+                            if let Some(idx) = schema.index_of(col_name) {
+                                let op = match op {
+                                    BinOp::Eq => crate::storage::segment::RangeOp::Eq,
+                                    BinOp::Lt => crate::storage::segment::RangeOp::Lt,
+                                    BinOp::Lte => crate::storage::segment::RangeOp::Le,
+                                    BinOp::Gt => crate::storage::segment::RangeOp::Gt,
+                                    BinOp::Gte => crate::storage::segment::RangeOp::Ge,
+                                    _ => unreachable!(),
+                                };
+                                clauses.push(crate::storage::segment::RangeClause {
+                                    column_index: idx,
+                                    op,
+                                    value: val.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                BinOp::And => {
+                    extract_range_clauses(left, schema, clauses);
+                    extract_range_clauses(right, schema, clauses);
+                }
+                _ => {}
+            }
+        }
+        Expr::UnaryNot(inner) => {
+            if let Expr::IsNull(col_expr) = inner.as_ref() {
+                if let Expr::Column(col_name) = col_expr.as_ref() {
+                    if let Some(idx) = schema.index_of(col_name) {
+                        clauses.push(crate::storage::segment::RangeClause {
+                            column_index: idx,
+                            op: crate::storage::segment::RangeOp::Eq,
+                            value: ScalarValue::null_for_type(schema.columns[idx].data_type),
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }

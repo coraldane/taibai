@@ -138,7 +138,10 @@ impl Handler {
         match self.engine.execute(session, sql) {
             Ok(ExecResult::Ok { rows_affected }) => {
                 if is_insert && rows_affected > 0 {
-                    self.session.as_mut().map(|s| s.had_writes = true);
+                    if let Some(s) = self.session.as_mut() {
+                        s.had_writes = true;
+                        s.mark_txn_write();
+                    }
                 }
                 Ok(vec![build_ok(rows_affected)])
             }
@@ -241,14 +244,20 @@ impl Handler {
         }
         let stmt_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
 
-        let stmt = match session.prepared_statements.get(stmt_id) {
-            Some(s) => s.clone(),
+        let use_binary = session.binary_results;
+
+        // Take prepared statement out of cache temporarily to allow mutation
+        let mut stmt = match session.prepared_statements.remove(stmt_id) {
+            Some(s) => s,
             None => return Ok(vec![build_error(&format!("prepared statement {} not found", stmt_id))]),
         };
 
-        let use_binary = session.binary_results;
+        let result = self.engine.execute_prepared(session, &mut stmt);
 
-        match self.engine.execute_prepared(session, &stmt.stmt) {
+        // Put it back into cache
+        session.prepared_statements.insert(stmt);
+
+        match result {
             Ok(ExecResult::Ok { rows_affected }) => {
                 Ok(vec![build_ok(rows_affected)])
             }
@@ -282,8 +291,12 @@ impl Handler {
             Some(s) => s,
             None => return Ok(vec![build_error("not logged in")]),
         };
-        session.active_txn_id += 1;
-        Ok(vec![build_ok(session.active_txn_id)])
+        if session.in_txn() {
+            return Ok(vec![build_error("transaction already in progress")]);
+        }
+        let txn_id = self.engine.alloc_txn_id();
+        session.begin_txn(txn_id);
+        Ok(vec![build_ok(txn_id)])
     }
 
     fn handle_commit_txn(&mut self) -> Result<Vec<Message>> {
@@ -291,7 +304,15 @@ impl Handler {
             Some(s) => s,
             None => return Ok(vec![build_error("not logged in")]),
         };
-        session.active_txn_id = 0;
+        if !session.in_txn() {
+            return Ok(vec![build_error("no active transaction")]);
+        }
+        let txn_id = session.active_txn_id();
+        let had_writes = session.active_txn.as_ref().map(|t| t.had_writes).unwrap_or(false);
+        if had_writes {
+            self.engine.batch_writer().commit_txn(txn_id)?;
+        }
+        session.commit_txn();
         Ok(vec![build_ok(0)])
     }
 
@@ -300,8 +321,13 @@ impl Handler {
             Some(s) => s,
             None => return Ok(vec![build_error("not logged in")]),
         };
-        session.active_txn_id = 0;
-        Ok(vec![build_ok(0)])
+        if !session.in_txn() {
+            return Ok(vec![build_error("no active transaction")]);
+        }
+        let txn_id = session.active_txn_id();
+        let rolled_back = self.engine.batch_writer().rollback_txn(txn_id)?;
+        session.rollback_txn();
+        Ok(vec![build_ok(rolled_back)])
     }
 
     fn handle_cursor_open(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -501,7 +527,7 @@ mod tests {
     #[test]
     fn test_login_dispatch() {
         let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(Engine::new(dir.path()).unwrap());
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
         let config = Arc::new(ServerConfig::default());
         let mut handler = Handler::new(config, engine);
 
@@ -521,7 +547,7 @@ mod tests {
     #[test]
     fn test_ping_dispatch() {
         let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(Engine::new(dir.path()).unwrap());
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
         let config = Arc::new(ServerConfig::default());
         let mut handler = Handler::new(config, engine);
 
@@ -534,7 +560,7 @@ mod tests {
     #[test]
     fn test_logout_dispatch() {
         let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(Engine::new(dir.path()).unwrap());
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
         let config = Arc::new(ServerConfig::default());
         let mut handler = Handler::new(config, engine);
 
@@ -546,18 +572,18 @@ mod tests {
     #[test]
     fn test_prepare_and_execute() {
         let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(Engine::new(dir.path()).unwrap());
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
         let config = Arc::new(ServerConfig::default());
         let mut handler = Handler::new(config, engine);
 
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
         write_len_prefixed_string(&mut payload, "pass");
-        write_len_prefixed_string(&mut payload, "default");
+        write_len_prefixed_string(&mut payload, "main");
         handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
 
         let mut sql_payload = Vec::new();
-        write_len_prefixed_string(&mut sql_payload, "default");
+        write_len_prefixed_string(&mut sql_payload, "main");
         write_len_prefixed_string(&mut sql_payload, "CREATE TABLE t (id INT64)");
         handler.handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload))).unwrap();
 
@@ -578,14 +604,14 @@ mod tests {
     #[test]
     fn test_transaction_messages() {
         let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(Engine::new(dir.path()).unwrap());
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
         let config = Arc::new(ServerConfig::default());
         let mut handler = Handler::new(config, engine);
 
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
         write_len_prefixed_string(&mut payload, "pass");
-        write_len_prefixed_string(&mut payload, "default");
+        write_len_prefixed_string(&mut payload, "main");
         handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
 
         let resp = handler.handle_message(Message::empty(MSG_TYPE_BEGIN_TXN)).unwrap();
@@ -597,5 +623,63 @@ mod tests {
         handler.handle_message(Message::empty(MSG_TYPE_BEGIN_TXN)).unwrap();
         let resp = handler.handle_message(Message::empty(MSG_TYPE_ROLLBACK_TXN)).unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
+    }
+
+    #[test]
+    fn test_txn_error_nested_begin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+        let config = Arc::new(ServerConfig::default());
+        let mut handler = Handler::new(config, engine);
+
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, "root");
+        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "main");
+        handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
+
+        handler.handle_message(Message::empty(MSG_TYPE_BEGIN_TXN)).unwrap();
+        let resp = handler.handle_message(Message::empty(MSG_TYPE_BEGIN_TXN)).unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_ERROR);
+        let msg = String::from_utf8_lossy(&resp[0].payload);
+        assert!(msg.contains("already in progress"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_txn_error_commit_without_active() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+        let config = Arc::new(ServerConfig::default());
+        let mut handler = Handler::new(config, engine);
+
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, "root");
+        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "main");
+        handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
+
+        let resp = handler.handle_message(Message::empty(MSG_TYPE_COMMIT_TXN)).unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_ERROR);
+        let msg = String::from_utf8_lossy(&resp[0].payload);
+        assert!(msg.contains("no active transaction"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_txn_error_rollback_without_active() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+        let config = Arc::new(ServerConfig::default());
+        let mut handler = Handler::new(config, engine);
+
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, "root");
+        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "main");
+        handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
+
+        let resp = handler.handle_message(Message::empty(MSG_TYPE_ROLLBACK_TXN)).unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_ERROR);
+        let msg = String::from_utf8_lossy(&resp[0].payload);
+        assert!(msg.contains("no active transaction"), "got: {msg}");
     }
 }

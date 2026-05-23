@@ -2,11 +2,14 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
+use crate::storage::auth::{AuthManager, Permission, PermissionObjectType, PermissionType};
+use crate::storage::auto_increment::AutoIncrementManager;
 use crate::storage::schema::{DatabaseCatalog, PartitionType};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use crate::sql::parser::ast::{ColumnDefAst, PartitionDef, PartitionStrategy};
+use crate::sql::parser::ast::{AlterOperation, ColumnDefAst, GrantObject, PartitionDef, PartitionStrategy, Privilege};
 
 pub fn exec_create_table(
     engine: &Engine,
@@ -50,6 +53,11 @@ pub fn exec_create_table(
         }
     }
 
+    let auto_inc_col = columns.iter().find(|c| c.auto_increment);
+    if let Some(ai_col) = auto_inc_col {
+        engine.auto_increment_manager().register(db, name, &ai_col.name, 1)?;
+    }
+
     let table_dir = engine.data_dir().join(db).join(name);
     std::fs::create_dir_all(&table_dir)?;
 
@@ -76,6 +84,7 @@ pub fn exec_drop_table(
     }
 
     catalog.drop_table(name)?;
+    engine.auto_increment_manager().unregister(db, name);
 
     let table_dir = engine.data_dir().join(db).join(name);
     engine.segment_mgr().remove_wal(&table_dir);
@@ -90,6 +99,255 @@ pub fn exec_drop_table(
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
+pub fn exec_alter_table(
+    engine: &Engine,
+    db: &str,
+    name: &str,
+    operations: &[AlterOperation],
+) -> Result<ExecResult> {
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let catalog = catalogs.get_mut(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+
+    if catalog.get_table(name).is_none() {
+        return Err(MonaxError::Sql(format!("table '{}.{}' does not exist", db, name)));
+    }
+
+    for op in operations {
+        match op {
+            AlterOperation::AddColumn { column } => {
+                let col_def = ColumnDef::new(&column.name, column.data_type)
+                    .with_nullable(column.nullable)
+                    .with_scale(column.scale)
+                    .with_precision(column.precision);
+                catalog.add_column(name, col_def)?;
+            }
+            AlterOperation::DropColumn { name: col_name } => {
+                catalog.drop_column(name, col_name)?;
+            }
+            AlterOperation::RenameColumn { old_name, new_name } => {
+                catalog.rename_column(name, old_name, new_name)?;
+            }
+            AlterOperation::RenameTable { new_name } => {
+                let old_table_dir = engine.data_dir().join(db).join(name);
+                let new_table_dir = engine.data_dir().join(db).join(new_name);
+                catalog.rename_table(name, new_name)?;
+                if old_table_dir.exists() && !new_table_dir.exists() {
+                    std::fs::rename(&old_table_dir, &new_table_dir)?;
+                }
+            }
+        }
+    }
+
+    let meta_dir = engine.data_dir().join("meta");
+    catalog.save(&meta_dir)?;
+
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_truncate_table(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+) -> Result<ExecResult> {
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let catalog = catalogs.get_mut(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+
+    if catalog.get_table(table).is_none() {
+        return Err(MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)));
+    }
+
+    let table_dir = engine.data_dir().join(db).join(table);
+    engine.segment_mgr().remove_wal(&table_dir);
+
+    if table_dir.exists() {
+        for entry in std::fs::read_dir(&table_dir)? {
+            if let Ok(e) = entry {
+                let path = e.path();
+                if path.extension().map(|ext| ext == "seg").unwrap_or(false) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    engine.auto_increment_manager().reset(db, table, 1)?;
+
+    if let Some(meta) = catalog.get_table_mut(table) {
+        meta.row_count = 0;
+    }
+
+    let meta_dir = engine.data_dir().join("meta");
+    catalog.save(&meta_dir)?;
+
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_create_database(
+    engine: &Engine,
+    name: &str,
+    if_not_exists: bool,
+) -> Result<ExecResult> {
+    let mut catalogs = engine.catalogs().write().unwrap();
+
+    if catalogs.contains_key(name) {
+        if if_not_exists {
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
+        return Err(MonaxError::Sql(format!("database '{}' already exists", name)));
+    }
+
+    let db_dir = engine.data_dir().join(name);
+    std::fs::create_dir_all(&db_dir)?;
+
+    let meta_dir = engine.data_dir().join("meta");
+    let catalog = DatabaseCatalog::load_or_create(&meta_dir, name)?;
+    catalogs.insert(name.to_string(), catalog);
+
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_drop_database(
+    engine: &Engine,
+    name: &str,
+    if_exists: bool,
+) -> Result<ExecResult> {
+    let mut catalogs = engine.catalogs().write().unwrap();
+
+    if !catalogs.contains_key(name) {
+        if if_exists {
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
+        return Err(MonaxError::Sql(format!("database '{}' does not exist", name)));
+    }
+
+    if name == "default" {
+        return Err(MonaxError::Sql("cannot drop default database".into()));
+    }
+
+    catalogs.remove(name);
+
+    let db_dir = engine.data_dir().join(name);
+    if db_dir.exists() {
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    let meta_dir = engine.data_dir().join("meta");
+    let catalog_file = meta_dir.join(format!("{}.json", name));
+    if catalog_file.exists() {
+        let _ = std::fs::remove_file(&catalog_file);
+    }
+
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_create_user(
+    engine: &Engine,
+    name: &str,
+    pwd: &str,
+) -> Result<ExecResult> {
+    engine.auth_manager().create_user(name, pwd)?;
+    tracing::info!(user = name, "CREATE USER executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_create_role(
+    engine: &Engine,
+    name: &str,
+) -> Result<ExecResult> {
+    engine.auth_manager().create_role(name)?;
+    tracing::info!(role = name, "CREATE ROLE executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_drop_user(
+    engine: &Engine,
+    name: &str,
+    if_exists: bool,
+) -> Result<ExecResult> {
+    engine.auth_manager().drop_user(name, if_exists)?;
+    tracing::info!(user = name, if_exists, "DROP USER executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_drop_role(
+    engine: &Engine,
+    name: &str,
+    if_exists: bool,
+) -> Result<ExecResult> {
+    engine.auth_manager().drop_role(name, if_exists)?;
+    tracing::info!(role = name, if_exists, "DROP ROLE executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_grant(
+    engine: &Engine,
+    privileges: &[Privilege],
+    on: &Option<GrantObject>,
+    to: &str,
+) -> Result<ExecResult> {
+    let perms: Vec<Permission> = privileges.iter().map(|p| {
+        let perm_type = match p {
+            Privilege::All => PermissionType::All,
+            Privilege::Select => PermissionType::Select,
+            Privilege::Insert => PermissionType::Insert,
+            Privilege::Update => PermissionType::Update,
+            Privilege::Delete => PermissionType::Delete,
+            Privilege::Create => PermissionType::Create,
+            Privilege::Drop => PermissionType::Drop,
+            Privilege::Alter => PermissionType::Alter,
+            Privilege::Truncate => PermissionType::Truncate,
+        };
+        let (obj_type, obj_name) = match on {
+            Some(GrantObject::Table(t)) => (PermissionObjectType::Table, t.clone()),
+            Some(GrantObject::Database(d)) => (PermissionObjectType::Database, d.clone()),
+            Some(GrantObject::AllTables) => (PermissionObjectType::Table, "*".to_string()),
+            Some(GrantObject::AllDatabases) => (PermissionObjectType::Database, "*".to_string()),
+            None => (PermissionObjectType::Global, "*".to_string()),
+        };
+        Permission {
+            permission_type: perm_type,
+            object_type: obj_type,
+            object_name: obj_name,
+        }
+    }).collect();
+    engine.auth_manager().grant(to, perms)?;
+    tracing::info!(privileges_count = privileges.len(), to, "GRANT executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_revoke(
+    engine: &Engine,
+    privileges: &[Privilege],
+    on: &Option<GrantObject>,
+    from: &str,
+) -> Result<ExecResult> {
+    let perm_types: Vec<PermissionType> = privileges.iter().map(|p| {
+        match p {
+            Privilege::All => PermissionType::All,
+            Privilege::Select => PermissionType::Select,
+            Privilege::Insert => PermissionType::Insert,
+            Privilege::Update => PermissionType::Update,
+            Privilege::Delete => PermissionType::Delete,
+            Privilege::Create => PermissionType::Create,
+            Privilege::Drop => PermissionType::Drop,
+            Privilege::Alter => PermissionType::Alter,
+            Privilege::Truncate => PermissionType::Truncate,
+        }
+    }).collect();
+    let obj_name = match on {
+        Some(GrantObject::Table(t)) => Some(t.as_str()),
+        Some(GrantObject::Database(d)) => Some(d.as_str()),
+        Some(GrantObject::AllTables) => Some("*"),
+        Some(GrantObject::AllDatabases) => Some("*"),
+        None => None,
+    };
+    engine.auth_manager().revoke(from, &perm_types, obj_name)?;
+    tracing::info!(privileges_count = privileges.len(), from, "REVOKE executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
 pub fn exec_show_tables(engine: &Engine, db: &str) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let schema = Schema::new(vec![ColumnDef::new("table_name", DataType::VarChar)]);
@@ -97,7 +355,7 @@ pub fn exec_show_tables(engine: &Engine, db: &str) -> Result<ExecResult> {
     let mut batch = RecordBatch::new(schema.clone());
     if let Some(catalog) = catalogs.get(db) {
         for name in catalog.table_names() {
-            batch.column_mut(0).unwrap().push(&crate::types::scalar::ScalarValue::VarChar(Some(name.to_string())))?;
+            batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(name.to_string())))?;
         }
     }
 
@@ -110,8 +368,75 @@ pub fn exec_show_databases(engine: &Engine) -> Result<ExecResult> {
 
     let mut batch = RecordBatch::new(schema.clone());
     for name in catalogs.keys() {
-        batch.column_mut(0).unwrap().push(&crate::types::scalar::ScalarValue::VarChar(Some(name.clone())))?;
+        batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(name.clone())))?;
     }
+
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_show_columns(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+) -> Result<ExecResult> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs.get(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+
+    let table_meta = catalog.get_table(table)
+        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("column_name", DataType::VarChar),
+        ColumnDef::new("data_type", DataType::VarChar),
+        ColumnDef::new("nullable", DataType::Bool),
+    ]);
+
+    let mut batch = RecordBatch::new(schema.clone());
+    for col in &table_meta.columns {
+        batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(col.name.clone())))?;
+        batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some(col.data_type.to_string())))?;
+        batch.column_mut(2).unwrap().push(&ScalarValue::Bool(Some(col.nullable)))?;
+    }
+
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_show_create_table(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+) -> Result<ExecResult> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs.get(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+
+    let table_meta = catalog.get_table(table)
+        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
+
+    let mut create_sql = format!("CREATE TABLE {} (\n", table);
+    for (i, col) in table_meta.columns.iter().enumerate() {
+        let nullable = if col.nullable { "" } else { " NOT NULL" };
+        if i < table_meta.columns.len() - 1 {
+            create_sql.push_str(&format!("  {} {}{},\n", col.name, col.data_type, nullable));
+        } else {
+            create_sql.push_str(&format!("  {} {}{}\n", col.name, col.data_type, nullable));
+        }
+    }
+    create_sql.push_str(")");
+
+    if !table_meta.cluster_key.is_empty() {
+        create_sql.push_str(&format!(" SORT KEY ({})", table_meta.cluster_key.join(", ")));
+    }
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("Table", DataType::VarChar),
+        ColumnDef::new("Create Table", DataType::VarChar),
+    ]);
+
+    let mut batch = RecordBatch::new(schema.clone());
+    batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(table.to_string())))?;
+    batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some(create_sql)))?;
 
     Ok(ExecResult::Query { schema, batches: vec![batch] })
 }

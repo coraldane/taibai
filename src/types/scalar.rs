@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
@@ -26,6 +27,45 @@ pub enum ScalarValue {
     Blob(Option<Vec<u8>>),
     Vector(Option<Vec<f32>>),
 }
+
+impl Hash for ScalarValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            ScalarValue::Bool(v) => v.hash(state),
+            ScalarValue::Int8(v) => v.hash(state),
+            ScalarValue::Int16(v) => v.hash(state),
+            ScalarValue::Int32(v) => v.hash(state),
+            ScalarValue::Int64(v) => v.hash(state),
+            ScalarValue::UInt8(v) => v.hash(state),
+            ScalarValue::UInt16(v) => v.hash(state),
+            ScalarValue::UInt32(v) => v.hash(state),
+            ScalarValue::UInt64(v) => v.hash(state),
+            ScalarValue::Float32(v) => {
+                v.map(|f| f.to_bits()).hash(state);
+            }
+            ScalarValue::Float64(v) => {
+                v.map(|f| f.to_bits()).hash(state);
+            }
+            ScalarValue::Decimal(v) => v.hash(state),
+            ScalarValue::Date(v) => v.hash(state),
+            ScalarValue::Time(v) => v.hash(state),
+            ScalarValue::Timestamp(v) => v.hash(state),
+            ScalarValue::Interval(v) => v.hash(state),
+            ScalarValue::VarChar(v) => v.hash(state),
+            ScalarValue::Blob(v) => v.hash(state),
+            ScalarValue::Vector(v) => {
+                if let Some(vec) = v {
+                    for f in vec {
+                        f.to_bits().hash(state);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Eq for ScalarValue {}
 
 impl ScalarValue {
     /// Returns true if this value is NULL.

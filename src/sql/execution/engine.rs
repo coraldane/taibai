@@ -6,7 +6,11 @@ use std::sync::{Arc, RwLock};
 use crate::common::error::{MonaxError, Result};
 use crate::net::session::Session;
 use crate::storage::schema::DatabaseCatalog;
+use crate::storage::batch_writer::{BatchWriter, BatchWriterConfig};
+use crate::storage::memtable::MemTableManager;
 use crate::storage::segment_manager::SegmentManager;
+use crate::storage::auth::AuthManager;
+use crate::storage::auto_increment::AutoIncrementManager;
 
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
@@ -22,16 +26,19 @@ pub struct Engine {
     data_dir: PathBuf,
     catalogs: RwLock<HashMap<String, DatabaseCatalog>>,
     segment_mgr: Arc<SegmentManager>,
+    batch_writer: BatchWriter,
     bulk_mode: AtomicBool,
+    auth_manager: Arc<AuthManager>,
+    auto_increment_mgr: Arc<AutoIncrementManager>,
 }
 
 impl Engine {
-    pub fn new(data_dir: &Path) -> Result<Self> {
+    pub fn new(data_dir: &Path, default_database: &str) -> Result<Self> {
         let mut catalogs = HashMap::new();
         let meta_dir = data_dir.join("meta");
         if meta_dir.exists() {
-            if let Ok(catalog) = DatabaseCatalog::load_or_create(&meta_dir, "default") {
-                catalogs.insert("default".to_string(), catalog);
+            if let Ok(catalog) = DatabaseCatalog::load_or_create(&meta_dir, default_database) {
+                catalogs.insert(default_database.to_string(), catalog);
             }
         }
 
@@ -56,11 +63,19 @@ impl Engine {
         let segment_mgr = Arc::new(SegmentManager::new(data_dir)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
+        let batch_writer = BatchWriter::new(BatchWriterConfig::default(), Arc::clone(&segment_mgr));
+
+        let auth_manager = Arc::new(AuthManager::new(data_dir)?);
+        let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
+
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             catalogs: RwLock::new(catalogs),
             segment_mgr,
+            batch_writer,
             bulk_mode: AtomicBool::new(false),
+            auth_manager,
+            auto_increment_mgr,
         })
     }
 
@@ -78,8 +93,52 @@ impl Engine {
         self.execute_stmt(session, &stmts[0])
     }
 
-    pub fn execute_prepared(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
-        self.execute_stmt(session, stmt)
+    pub fn execute_prepared(&self, session: &mut Session, prepared: &mut crate::sql::execution::prepared::PreparedStatement) -> Result<ExecResult> {
+        let has_placeholders = crate::sql::execution::prepared::has_placeholders(&prepared.stmt);
+        let mut stmt = prepared.stmt.clone();
+        if !prepared.params.is_empty() {
+            crate::sql::execution::prepared::bind_params(&mut stmt, &prepared.params)?;
+        }
+        match &stmt {
+            Statement::Select { .. } => {
+                if let Some(ref plan) = prepared.cached_plan {
+                    super::query::exec_select_with_plan(self, &session.database, &stmt, plan.clone())
+                } else {
+                    let result = super::query::exec_select(self, &session.database, &stmt);
+                    if let Ok(ref _r) = result {
+                        // Only cache plan if statement has no placeholders (params won't change structure)
+                        if !has_placeholders {
+                            let table_schemas = self.gather_table_schemas(&session.database, &stmt)?;
+                            if let Ok(plan) = crate::sql::planner::plan_select(&stmt, &table_schemas) {
+                                prepared.cached_plan = Some(crate::sql::optimizer::optimize(plan));
+                            }
+                        }
+                    }
+                    result
+                }
+            }
+            _ => self.execute_stmt(session, &stmt),
+        }
+    }
+
+    fn gather_table_schemas(&self, db: &str, stmt: &Statement) -> Result<std::collections::HashMap<String, crate::types::batch::Schema>> {
+        use crate::types::batch::Schema;
+        let mut table_names = Vec::new();
+        if let Statement::Select { from, .. } = stmt {
+            if let Some(ref from_clause) = from {
+                table_names.extend(super::query::extract_table_names(from_clause));
+            }
+        }
+        let mut table_schemas = std::collections::HashMap::new();
+        let catalogs = self.catalogs().read().unwrap();
+        if let Some(catalog) = catalogs.get(db) {
+            for table_name in &table_names {
+                if let Some(meta) = catalog.get_table(table_name) {
+                    table_schemas.insert(table_name.clone(), Schema::new(meta.columns.clone()));
+                }
+            }
+        }
+        Ok(table_schemas)
     }
 
     fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
@@ -90,8 +149,43 @@ impl Engine {
             Statement::DropTable { name, if_exists } => {
                 super::ddl::exec_drop_table(self, &session.database, name, *if_exists)
             }
+            Statement::AlterTable { name, operations } => {
+                super::ddl::exec_alter_table(self, &session.database, name, operations)
+            }
+            Statement::Truncate { table } => {
+                super::ddl::exec_truncate_table(self, &session.database, table)
+            }
+            Statement::CreateDatabase { name, if_not_exists } => {
+                super::ddl::exec_create_database(self, name, *if_not_exists)
+            }
+            Statement::DropDatabase { name, if_exists } => {
+                super::ddl::exec_drop_database(self, name, *if_exists)
+            }
+            Statement::CreateUser { name, password } => {
+                super::ddl::exec_create_user(self, name, password)
+            }
+            Statement::CreateRole { name } => {
+                super::ddl::exec_create_role(self, name)
+            }
+            Statement::DropUser { name, if_exists } => {
+                super::ddl::exec_drop_user(self, name, *if_exists)
+            }
+            Statement::DropRole { name, if_exists } => {
+                super::ddl::exec_drop_role(self, name, *if_exists)
+            }
+            Statement::Grant { privileges, on, to } => {
+                super::ddl::exec_grant(self, privileges, on, to)
+            }
+            Statement::Revoke { privileges, on, from } => {
+                super::ddl::exec_revoke(self, privileges, on, from)
+            }
             Statement::Insert { table, columns, values } => {
-                super::dml_insert::exec_insert(self, &session.database, table, columns, values, session.timezone_offset_hours)
+                let txn_id = session.active_txn_id();
+                let result = super::dml_insert::exec_insert(self, &session.database, table, columns, values, session.timezone_offset_hours, txn_id);
+                if result.is_ok() && txn_id > 0 {
+                    session.mark_txn_write();
+                }
+                result
             }
             Statement::Update { table, assignments, where_clause } => {
                 super::dml_update::exec_update(self, &session.database, table, assignments, where_clause)
@@ -112,8 +206,44 @@ impl Engine {
             Statement::ShowDatabases => {
                 super::ddl::exec_show_databases(self)
             }
+            Statement::ShowColumns { table } => {
+                super::ddl::exec_show_columns(self, &session.database, table)
+            }
+            Statement::ShowCreateTable { table } => {
+                super::ddl::exec_show_create_table(self, &session.database, table)
+            }
             Statement::Explain { analyze, stmt: inner } => {
                 super::explain::exec_explain(self, &session.database, inner, *analyze)
+            }
+            Statement::Begin => {
+                if session.in_txn() {
+                    return Err(MonaxError::Sql("transaction already in progress".into()));
+                }
+                let txn_id = self.alloc_txn_id();
+                session.begin_txn(txn_id);
+                Ok(ExecResult::Ok { rows_affected: txn_id })
+            }
+            Statement::Commit => {
+                if !session.in_txn() {
+                    return Err(MonaxError::Sql("no active transaction".into()));
+                }
+                let txn_id = session.active_txn_id();
+                let had_writes = session.active_txn.as_ref().map(|t| t.had_writes).unwrap_or(false);
+                if had_writes {
+                    self.batch_writer().commit_txn(txn_id)?;
+                }
+                session.commit_txn();
+                Ok(ExecResult::Ok { rows_affected: 0 })
+            }
+            Statement::Rollback => {
+                if !session.in_txn() {
+                    return Err(MonaxError::Sql("no active transaction".into()));
+                }
+                let txn_id = session.active_txn_id();
+                let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
+                tracing::debug!(txn_id, rows_rolled_back = rolled_back, "transaction rolled back");
+                session.rollback_txn();
+                Ok(ExecResult::Ok { rows_affected: rolled_back })
             }
         }
     }
@@ -124,6 +254,22 @@ impl Engine {
 
     pub fn segment_mgr(&self) -> &Arc<SegmentManager> {
         &self.segment_mgr
+    }
+
+    pub fn batch_writer(&self) -> &BatchWriter {
+        &self.batch_writer
+    }
+
+    pub fn memtable_manager(&self) -> &Arc<MemTableManager> {
+        self.batch_writer.memtable_manager()
+    }
+
+    pub fn auth_manager(&self) -> &Arc<AuthManager> {
+        &self.auth_manager
+    }
+
+    pub fn auto_increment_manager(&self) -> &Arc<AutoIncrementManager> {
+        &self.auto_increment_mgr
     }
 
     pub fn get_table_meta(&self, db: &str, table: &str) -> Option<crate::storage::schema::TableMeta> {
@@ -144,6 +290,10 @@ impl Engine {
     }
 
     pub fn flush_all_buffers(&self) -> Result<u64> {
+        if let Err(e) = self.batch_writer.flush_all() {
+            tracing::warn!(error = %e, "batch writer flush failed");
+        }
+
         self.segment_mgr.flush_all_active()?;
 
         {

@@ -193,6 +193,13 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String) {
             out.push_str(&format!("{}  right:\n", pad));
             render_plan(&j.right, depth + 2, out);
         }
+        LogicalPlan::SemiJoin(s) => {
+            out.push_str(&format!("{}SemiJoin: anti={}\n", pad, s.is_anti));
+            out.push_str(&format!("{}  left:\n", pad));
+            render_plan(&s.left, depth + 2, out);
+            out.push_str(&format!("{}  right:\n", pad));
+            render_plan(&s.right, depth + 2, out);
+        }
         LogicalPlan::Empty => {
             out.push_str(&format!("{}Empty\n", pad));
         }
@@ -211,6 +218,7 @@ fn get_input_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::Distinct(d) => get_input_schema(&d.input),
         LogicalPlan::Window(w) => get_input_schema(&w.input),
         LogicalPlan::Join(j) => j.output_schema.clone(),
+        LogicalPlan::SemiJoin(s) => s.left_schema.clone(),
         LogicalPlan::Empty => Schema::empty(),
     }
 }
@@ -277,5 +285,12 @@ fn render_expr(expr: &LogicalExpr, schema: &Schema) -> String {
         LogicalExpr::Function { name, args } => format!("{}({} args)", name, args.len()),
         LogicalExpr::Aggregate(a) => format!("{:?}({})", a.func, render_expr(&a.arg, schema)),
         LogicalExpr::Wildcard => "*".to_string(),
+        LogicalExpr::ScalarSubquery(_) => "(subquery)".to_string(),
+        LogicalExpr::ExistsSubquery(_) => "EXISTS(subquery)".to_string(),
+        LogicalExpr::InSubquery { expr, negated, .. } => format!(
+            "{} {}IN (subquery)",
+            render_expr(expr, schema),
+            if *negated { "NOT " } else { "" }
+        ),
     }
 }

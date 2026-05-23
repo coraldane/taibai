@@ -6,6 +6,7 @@ pub mod sort;
 pub mod limit;
 pub mod join;
 pub mod window;
+pub mod semi_join;
 
 use std::collections::HashMap;
 
@@ -21,6 +22,7 @@ use aggregate::HashAggregateExec;
 use sort::SortExec;
 use limit::LimitExec;
 use join::HashJoinExec;
+use semi_join::SemiJoinExec;
 
 pub trait ExecutionOp {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
@@ -100,6 +102,18 @@ pub fn build_pipeline(
                 join.output_schema,
             )))
         }
+        LogicalPlan::SemiJoin(semi) => {
+            let left = build_pipeline(*semi.left, table_batches)?;
+            let right = build_pipeline(*semi.right, table_batches)?;
+            Ok(Box::new(SemiJoinExec::new(
+                left,
+                right,
+                semi.condition,
+                semi.left_schema,
+                semi.right_schema,
+                semi.is_anti,
+            )))
+        }
         LogicalPlan::TopN(topn) => {
             let schema = get_scan_schema(&topn.input);
             let input = build_pipeline(*topn.input, table_batches)?;
@@ -111,7 +125,6 @@ pub fn build_pipeline(
         }
         LogicalPlan::Window(window) => {
             let input = build_pipeline(*window.input, table_batches)?;
-            // Window execution not yet in pipeline - pass through
             Ok(input)
         }
         LogicalPlan::Empty => {
@@ -129,6 +142,7 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::Limit(l) => get_scan_schema(&l.input),
         LogicalPlan::Aggregate(a) => get_scan_schema(&a.input),
         LogicalPlan::Join(j) => j.output_schema.clone(),
+        LogicalPlan::SemiJoin(s) => s.left_schema.clone(),
         LogicalPlan::TopN(t) => get_scan_schema(&t.input),
         LogicalPlan::Distinct(d) => get_scan_schema(&d.input),
         LogicalPlan::Window(w) => get_scan_schema(&w.input),

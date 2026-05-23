@@ -21,7 +21,6 @@ pub struct Server {
 
 impl Server {
     pub fn new(config: Arc<ServerConfig>, engine: Arc<Engine>) -> Self {
-        // Load TLS configuration if enabled
         let tls_acceptor = match config.tls_mode() {
             TlsMode::Enable(tls_config) => {
                 match tls_config.validate() {
@@ -84,7 +83,6 @@ async fn handle_connection(
     engine: Arc<Engine>,
     tls_acceptor: Option<TlsAcceptor>,
 ) -> Result<()> {
-    // Perform TLS handshake if configured, otherwise use plain TCP
     if let Some(acceptor) = tls_acceptor {
         tracing::debug!("Performing TLS handshake");
         let tls_stream = acceptor.accept(stream).await

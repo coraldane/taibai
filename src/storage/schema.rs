@@ -68,9 +68,17 @@ impl TableMeta {
         }
     }
 
-    /// Returns the data directory path for this table's segments.
     pub fn data_path(&self, base_dir: &str) -> PathBuf {
         PathBuf::from(base_dir).join(&self.database).join(&self.name)
+    }
+
+    pub fn partition_strategy(&self) -> crate::storage::partition_function::PartitionFunction {
+        use crate::storage::partition_function::PartitionFunction;
+        match self.partition_key.to_lowercase().as_str() {
+            "day" => PartitionFunction::Day,
+            "year" => PartitionFunction::Year,
+            _ => PartitionFunction::Value,
+        }
     }
 }
 
@@ -83,7 +91,6 @@ pub struct DatabaseCatalog {
 }
 
 impl DatabaseCatalog {
-    /// Create a new empty database catalog.
     pub fn new(name: &str) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -96,7 +103,6 @@ impl DatabaseCatalog {
         }
     }
 
-    /// Load or create the catalog for a database from the meta directory.
     pub fn load_or_create(meta_dir: &Path, db_name: &str) -> Result<Self> {
         let schema_path = meta_dir.join("schema.json");
         if schema_path.exists() {
@@ -114,14 +120,12 @@ impl DatabaseCatalog {
         }
     }
 
-    /// Save the catalog to the meta directory.
     pub fn save(&self, meta_dir: &Path) -> Result<()> {
         fs::create_dir_all(meta_dir)
             .map_err(|e| MonaxError::Storage(format!("failed to create meta dir: {}", e)))?;
         let schema_path = meta_dir.join("schema.json");
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| MonaxError::Storage(format!("failed to serialize catalog: {}", e)))?;
-        // Write atomically via temp file
         let tmp_path = schema_path.with_extension("json.tmp");
         fs::write(&tmp_path, &data)
             .map_err(|e| MonaxError::Storage(format!("failed to write schema.json.tmp: {}", e)))?;
@@ -130,7 +134,6 @@ impl DatabaseCatalog {
         Ok(())
     }
 
-    /// Create a new table in the catalog.
     pub fn create_table(&mut self, name: &str, columns: Vec<ColumnDef>) -> Result<()> {
         if self.tables.contains_key(name) {
             return Err(MonaxError::Sql(format!("table '{}' already exists", name)));
@@ -140,7 +143,6 @@ impl DatabaseCatalog {
         Ok(())
     }
 
-    /// Drop a table from the catalog.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         if self.tables.remove(name).is_none() {
             return Err(MonaxError::Sql(format!("table '{}' does not exist", name)));
@@ -148,19 +150,60 @@ impl DatabaseCatalog {
         Ok(())
     }
 
-    /// Get a table's metadata.
     pub fn get_table(&self, name: &str) -> Option<&TableMeta> {
         self.tables.get(name)
     }
 
-    /// Get a mutable reference to a table's metadata.
     pub fn get_table_mut(&mut self, name: &str) -> Option<&mut TableMeta> {
         self.tables.get_mut(name)
     }
 
-    /// List all table names.
     pub fn table_names(&self) -> Vec<&str> {
         self.tables.keys().map(|s| s.as_str()).collect()
+    }
+
+    pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        if !self.tables.contains_key(old_name) {
+            return Err(MonaxError::Sql(format!("table '{}' does not exist", old_name)));
+        }
+        if self.tables.contains_key(new_name) {
+            return Err(MonaxError::Sql(format!("table '{}' already exists", new_name)));
+        }
+        let mut meta = self.tables.remove(old_name).unwrap();
+        meta.name = new_name.to_string();
+        self.tables.insert(new_name.to_string(), meta);
+        Ok(())
+    }
+
+    pub fn add_column(&mut self, table_name: &str, column: ColumnDef) -> Result<()> {
+        let table = self.tables.get_mut(table_name)
+            .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
+        if table.columns.iter().any(|c| c.name == column.name) {
+            return Err(MonaxError::Sql(format!("column '{}' already exists in table '{}'", column.name, table_name)));
+        }
+        table.columns.push(column);
+        Ok(())
+    }
+
+    pub fn drop_column(&mut self, table_name: &str, column_name: &str) -> Result<()> {
+        let table = self.tables.get_mut(table_name)
+            .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
+        let idx = table.columns.iter().position(|c| c.name == column_name)
+            .ok_or_else(|| MonaxError::Sql(format!("column '{}' does not exist in table '{}'", column_name, table_name)))?;
+        table.columns.remove(idx);
+        Ok(())
+    }
+
+    pub fn rename_column(&mut self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let table = self.tables.get_mut(table_name)
+            .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
+        if table.columns.iter().any(|c| c.name == new_name) {
+            return Err(MonaxError::Sql(format!("column '{}' already exists in table '{}'", new_name, table_name)));
+        }
+        let col = table.columns.iter_mut().find(|c| c.name == old_name)
+            .ok_or_else(|| MonaxError::Sql(format!("column '{}' does not exist in table '{}'", old_name, table_name)))?;
+        col.name = new_name.to_string();
+        Ok(())
     }
 }
 
@@ -243,7 +286,6 @@ mod tests {
         assert_eq!(catalog.name, "newdb");
         assert!(catalog.tables.is_empty());
 
-        // Should have created the file
         assert!(meta_dir.join("schema.json").exists());
     }
 
@@ -256,5 +298,15 @@ mod tests {
         let mut names = catalog.table_names();
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_rename_table() {
+        let mut catalog = DatabaseCatalog::new("testdb");
+        catalog.create_table("old", vec![ColumnDef::new("id", DataType::Int64)]).unwrap();
+        
+        catalog.rename_table("old", "new").unwrap();
+        assert!(catalog.get_table("old").is_none());
+        assert!(catalog.get_table("new").is_some());
     }
 }

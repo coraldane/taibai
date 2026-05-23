@@ -247,6 +247,19 @@ impl WalWriter {
         Ok(())
     }
 
+    pub fn clear_entries_for_txn(&mut self, txn_id: u64) -> Result<()> {
+        self.write(RecordType::Abort, txn_id, &[])?;
+        self.sync()?;
+        tracing::debug!(txn_id, "WAL abort marker written");
+        Ok(())
+    }
+
+    pub fn write_txn_marker(&mut self, txn_id: u64, record_type: RecordType) -> Result<()> {
+        self.write(record_type, txn_id, &[])?;
+        self.sync()?;
+        Ok(())
+    }
+
     fn write_raw(&mut self, data: &[u8]) -> Result<()> {
         if self.current_size + data.len() as u64 > self.max_file_size && self.current_size > 0 {
             self.rotate_file()?;

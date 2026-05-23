@@ -5,13 +5,14 @@ use crate::protocol::types::DataType;
 use crate::types::array::ColumnArray;
 
 /// Column definition within a table schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
     pub scale: i32,
     pub precision: i32,
+    pub auto_increment: bool,
 }
 
 impl ColumnDef {
@@ -22,6 +23,7 @@ impl ColumnDef {
             nullable: true,
             scale: 0,
             precision: 0,
+            auto_increment: false,
         }
     }
 
@@ -39,10 +41,15 @@ impl ColumnDef {
         self.precision = precision;
         self
     }
+
+    pub fn with_auto_increment(mut self, auto_increment: bool) -> Self {
+        self.auto_increment = auto_increment;
+        self
+    }
 }
 
 /// Schema for a table: column names + types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
     pub columns: Vec<ColumnDef>,
 }

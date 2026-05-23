@@ -1,8 +1,36 @@
 use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
-/// SQL Abstract Syntax Tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterOperation {
+    AddColumn { column: ColumnDefAst },
+    DropColumn { name: String },
+    RenameColumn { old_name: String, new_name: String },
+    RenameTable { new_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Privilege {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Create,
+    Drop,
+    Alter,
+    Truncate,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GrantObject {
+    Table(String),
+    Database(String),
+    AllTables,
+    AllDatabases,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
         name: String,
@@ -14,6 +42,46 @@ pub enum Statement {
     DropTable {
         name: String,
         if_exists: bool,
+    },
+    AlterTable {
+        name: String,
+        operations: Vec<AlterOperation>,
+    },
+    Truncate {
+        table: String,
+    },
+    CreateDatabase {
+        name: String,
+        if_not_exists: bool,
+    },
+    DropDatabase {
+        name: String,
+        if_exists: bool,
+    },
+    CreateUser {
+        name: String,
+        password: String,
+    },
+    CreateRole {
+        name: String,
+    },
+    DropUser {
+        name: String,
+        if_exists: bool,
+    },
+    DropRole {
+        name: String,
+        if_exists: bool,
+    },
+    Grant {
+        privileges: Vec<Privilege>,
+        on: Option<GrantObject>,
+        to: String,
+    },
+    Revoke {
+        privileges: Vec<Privilege>,
+        on: Option<GrantObject>,
+        from: String,
     },
     Insert {
         table: String,
@@ -42,42 +110,57 @@ pub enum Statement {
     },
     ShowTables,
     ShowDatabases,
+    ShowColumns { table: String },
+    ShowCreateTable { table: String },
     UseDatabase(String),
-    /// EXPLAIN [ANALYZE] <stmt>: returns the logical plan of an inner statement
-    /// (and optionally the actual scan statistics from a real execution).
     Explain { analyze: bool, stmt: Box<Statement> },
+    Begin,
+    Commit,
+    Rollback,
 }
 
-/// Assignment for UPDATE statement: column = value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
     pub column: String,
     pub value: Expr,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDefAst {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
     pub scale: i32,
     pub precision: i32,
+    pub auto_increment: bool,
 }
 
-#[derive(Debug, Clone)]
+impl ColumnDefAst {
+    pub fn new(name: String, data_type: DataType) -> Self {
+        Self {
+            name,
+            data_type,
+            nullable: true,
+            scale: 0,
+            precision: 0,
+            auto_increment: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PartitionDef {
     pub column: String,
     pub strategy: PartitionStrategy,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PartitionStrategy {
     Day,
     Year,
     Value,
 }
 
-/// JOIN type specifier.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JoinType {
     Inner,
@@ -85,58 +168,52 @@ pub enum JoinType {
     Right,
     Full,
     Cross,
-    /// Semi join: returns left rows that have a match in right (no right columns in output)
     Semi,
-    /// Anti join: returns left rows that do NOT have a match in right
     Anti,
-    /// Asof join: matches closest timestamp (used in time-series)
     Asof,
 }
 
-/// A single JOIN clause in a FROM clause.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JoinClause {
     pub join_type: JoinType,
     pub right: TableRef,
-    pub condition: Option<Expr>, // ON clause, None for CROSS JOIN
+    pub condition: Option<Expr>,
 }
 
-/// FROM clause: base table with optional chained JOINs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FromClause {
     Table(TableRef),
     Join(JoinExpr),
 }
 
-/// Join expression with left side and chained JOINs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JoinExpr {
     pub left: Box<FromClause>,
-    pub joins: Vec<JoinClause>, // chained joins
+    pub joins: Vec<JoinClause>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Star,
-    Expr(Expr, Option<String>), // (expr, alias)
+    Expr(Expr, Option<String>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderByItem {
     pub expr: Expr,
     pub desc: bool,
 }
 
-/// SQL Expression AST - enhanced with IN, BETWEEN, CASE, LIKE, Subquery support.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(ScalarValue),
+    Placeholder(usize),
     Column(String),
     QualifiedColumn {
         table: String,
@@ -151,41 +228,34 @@ pub enum Expr {
     UnaryMinus(Box<Expr>),
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),
-    /// IN expression: expr IN (values...) or expr IN (subquery)
     In {
         expr: Box<Expr>,
         values: Vec<Expr>,
         negated: bool,
     },
-    /// BETWEEN expression: expr BETWEEN low AND high
     Between {
         expr: Box<Expr>,
         low: Box<Expr>,
         high: Box<Expr>,
         negated: bool,
     },
-    /// CASE WHEN ... THEN ... ELSE ... END
     Case {
         operand: Option<Box<Expr>>,
-        when_clauses: Vec<(Expr, Expr)>, // (condition, result)
+        when_clauses: Vec<(Expr, Expr)>,
         else_clause: Option<Box<Expr>>,
     },
-    /// LIKE pattern matching: expr LIKE pattern
     Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
     },
-    /// EXISTS subquery
     Exists(Box<Expr>),
-    /// Scalar subquery (returns a single value)
     Subquery(Box<Statement>),
     Function {
         name: String,
         args: Vec<Expr>,
         distinct: bool,
     },
-    /// Window function: func OVER (PARTITION BY ... ORDER BY ...)
     WindowFunction {
         func: WindowFunc,
         partition_by: Vec<Expr>,
@@ -194,8 +264,7 @@ pub enum Expr {
     },
 }
 
-/// Window function types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WindowFunc {
     RowNumber,
     Rank,
@@ -205,8 +274,7 @@ pub enum WindowFunc {
     Aggregate { func: String, args: Vec<Expr>, distinct: bool },
 }
 
-/// Window frame specification
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowFrame {
     pub frame_type: FrameType,
     pub start: FrameBound,
@@ -219,7 +287,7 @@ pub enum FrameType {
     Range,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FrameBound {
     UnboundedPreceding,
     Preceding(usize),

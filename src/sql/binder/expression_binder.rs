@@ -213,7 +213,7 @@ impl<'a> ExpressionBinder<'a> {
                     data_type: DataType::Bool,
                 })
             }
-            Expr::Exists(_) | Expr::Subquery(_) | Expr::WindowFunction { .. } => {
+            Expr::Exists(_) | Expr::Subquery(_) | Expr::WindowFunction { .. } | Expr::Placeholder(_) => {
                 Ok(BoundExpr {
                     kind: BoundExprKind::Literal(ScalarValue::Bool(None)),
                     data_type: DataType::Bool,

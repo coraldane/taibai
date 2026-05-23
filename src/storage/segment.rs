@@ -814,6 +814,7 @@ impl SegmentReader {
                 nullable,
                 scale,
                 precision,
+                auto_increment: false,
             });
         }
         let schema = Schema::new(columns);

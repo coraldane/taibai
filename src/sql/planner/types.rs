@@ -3,7 +3,7 @@ use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     Scan(ScanPlan),
     Filter(FilterPlan),
@@ -12,16 +12,14 @@ pub enum LogicalPlan {
     Sort(SortPlan),
     Limit(LimitPlan),
     Join(JoinPlan),
-    /// TopN plan: combines ORDER BY + LIMIT into an optimized heap-sort operation.
+    SemiJoin(SemiJoinPlan),
     TopN(TopNPlan),
-    /// Distinct plan: removes duplicate rows.
     Distinct(DistinctPlan),
-    /// Window plan: computes window functions.
     Window(WindowPlan),
     Empty,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScanPlan {
     pub table_name: String,
     pub schema: Schema,
@@ -29,6 +27,7 @@ pub struct ScanPlan {
     pub pushed_filter: Option<LogicalExpr>,
     pub zone_map_filters: Vec<ZoneMapFilter>,
     pub pushed_limit: Option<usize>,
+    pub pushed_order: Option<Vec<SortKey>>,
     pub index_columns: Vec<String>,
     pub time_range: Option<TimeRange>,
     pub bloom_filter_columns: Vec<String>,
@@ -43,6 +42,7 @@ impl ScanPlan {
             pushed_filter: None,
             zone_map_filters: Vec::new(),
             pushed_limit: None,
+            pushed_order: None,
             index_columns: Vec::new(),
             time_range: None,
             bloom_filter_columns: Vec::new(),
@@ -50,20 +50,20 @@ impl ScanPlan {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FilterPlan {
     pub predicate: LogicalExpr,
     pub input: Box<LogicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectPlan {
     pub expressions: Vec<LogicalExpr>,
     pub aliases: Vec<Option<String>>,
     pub input: Box<LogicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AggregatePlan {
     pub group_by: Vec<LogicalExpr>,
     pub aggregates: Vec<AggregateExpr>,
@@ -74,20 +74,20 @@ pub struct AggregatePlan {
     pub distinct: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SortPlan {
     pub sort_keys: Vec<SortKey>,
     pub input: Box<LogicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LimitPlan {
     pub limit: usize,
     pub offset: usize,
     pub input: Box<LogicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JoinPlan {
     pub left: Box<LogicalPlan>,
     pub right: Box<LogicalPlan>,
@@ -98,8 +98,17 @@ pub struct JoinPlan {
     pub output_schema: Schema,
 }
 
-/// TopN plan: optimized ORDER BY + LIMIT using heap sort.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemiJoinPlan {
+    pub left: Box<LogicalPlan>,
+    pub right: Box<LogicalPlan>,
+    pub condition: LogicalExpr,
+    pub left_schema: Schema,
+    pub right_schema: Schema,
+    pub is_anti: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TopNPlan {
     pub sort_keys: Vec<SortKey>,
     pub limit: usize,
@@ -108,13 +117,13 @@ pub struct TopNPlan {
 }
 
 /// Distinct plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DistinctPlan {
     pub input: Box<LogicalPlan>,
 }
 
 /// Window function plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowPlan {
     pub window_funcs: Vec<WindowFuncPlan>,
     pub partition_by: Vec<LogicalExpr>,
@@ -122,7 +131,7 @@ pub struct WindowPlan {
     pub input: Box<LogicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowFuncPlan {
     pub func: WindowFunc,
     pub output_name: String,
@@ -147,35 +156,37 @@ pub enum LogicalExpr {
     IsNull(Box<LogicalExpr>),
     IsNotNull(Box<LogicalExpr>),
     Aggregate(AggregateExpr),
-    /// IN expression
     In {
         expr: Box<LogicalExpr>,
         values: Vec<ScalarValue>,
         negated: bool,
     },
-    /// BETWEEN expression
     Between {
         expr: Box<LogicalExpr>,
         low: Box<LogicalExpr>,
         high: Box<LogicalExpr>,
         negated: bool,
     },
-    /// CASE WHEN expression
     Case {
         operand: Option<Box<LogicalExpr>>,
         when_clauses: Vec<(LogicalExpr, LogicalExpr)>,
         else_clause: Option<Box<LogicalExpr>>,
     },
-    /// LIKE pattern matching
     Like {
         expr: Box<LogicalExpr>,
         pattern: String,
         negated: bool,
     },
-    /// Scalar function call
     Function {
         name: String,
         args: Vec<LogicalExpr>,
+    },
+    ScalarSubquery(Box<LogicalPlan>),
+    ExistsSubquery(Box<LogicalPlan>),
+    InSubquery {
+        expr: Box<LogicalExpr>,
+        subquery: Box<LogicalPlan>,
+        negated: bool,
     },
     Wildcard,
 }
@@ -196,14 +207,14 @@ pub enum AggFunc {
     Max,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ZoneMapFilter {
     pub column: String,
     pub min_value: ScalarValue,
     pub max_value: ScalarValue,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TimeRange {
     pub column: String,
     pub start: Option<ScalarValue>,

@@ -9,6 +9,7 @@ use super::lexer::{Lexer, Token};
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    placeholder_count: usize,
 }
 
 impl Parser {
@@ -16,7 +17,7 @@ impl Parser {
     pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         let mut lexer = Lexer::new(sql);
         let tokens = lexer.tokenize()?;
-        let mut parser = Parser { tokens, pos: 0 };
+        let mut parser = Parser { tokens, pos: 0, placeholder_count: 0 };
         let mut stmts = Vec::new();
         loop {
             if parser.peek() == &Token::Eof {
@@ -34,8 +35,12 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.peek() {
-            Token::Create => self.parse_create_table(),
-            Token::Drop => self.parse_drop_table(),
+            Token::Create => self.parse_create(),
+            Token::Drop => self.parse_drop(),
+            Token::Alter => self.parse_alter(),
+            Token::Truncate => self.parse_truncate(),
+            Token::Grant => self.parse_grant(),
+            Token::Revoke => self.parse_revoke(),
             Token::Insert => self.parse_insert(),
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
@@ -43,6 +48,9 @@ impl Parser {
             Token::Show => self.parse_show(),
             Token::Use => self.parse_use(),
             Token::Explain => self.parse_explain(),
+            Token::Begin => self.parse_begin(),
+            Token::Commit => self.parse_commit(),
+            Token::Rollback => self.parse_rollback(),
             other => Err(MonaxError::Sql(format!("unexpected token: {}", other))),
         }
     }
@@ -61,8 +69,59 @@ impl Parser {
 
     // ---- CREATE TABLE ----
 
-    fn parse_create_table(&mut self) -> Result<Statement> {
+    fn parse_create(&mut self) -> Result<Statement> {
         self.expect(&Token::Create)?;
+        match self.peek() {
+            Token::Table => self.parse_create_table_rest(),
+            Token::Database => self.parse_create_database_rest(),
+            Token::User => self.parse_create_user(),
+            Token::Role => self.parse_create_role(),
+            other => Err(MonaxError::Sql(format!(
+                "expected TABLE, DATABASE, USER, or ROLE after CREATE, got {}", other
+            ))),
+        }
+    }
+
+    fn parse_create_user(&mut self) -> Result<Statement> {
+        self.expect(&Token::User)?;
+        let name = self.expect_ident()?;
+        if self.peek() == &Token::Identified {
+            self.advance();
+            self.expect(&Token::By)?;
+        }
+        let pw = match self.peek().clone() {
+            Token::StringLit(s) => {
+                self.advance();
+                s.clone()
+            }
+            other => Err(MonaxError::Sql(format!(
+                "expected credential string, got {}", other
+            )))?,
+        };
+        Ok(Statement::CreateUser { name, password: pw })
+    }
+
+    fn parse_create_role(&mut self) -> Result<Statement> {
+        self.expect(&Token::Role)?;
+        let name = self.expect_ident()?;
+        Ok(Statement::CreateRole { name })
+    }
+
+    fn parse_create_database_rest(&mut self) -> Result<Statement> {
+        self.expect(&Token::Database)?;
+        let if_not_exists = if self.peek() == &Token::If {
+            self.advance();
+            self.expect(&Token::Not)?;
+            self.expect(&Token::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        Ok(Statement::CreateDatabase { name, if_not_exists })
+    }
+
+    fn parse_create_table_rest(&mut self) -> Result<Statement> {
         self.expect(&Token::Table)?;
 
         let if_not_exists = if self.peek() == &Token::If {
@@ -150,6 +209,7 @@ impl Parser {
         let mut nullable = true;
         let mut scale = 0i32;
         let mut precision = 0i32;
+        let mut auto_increment = false;
 
         // Optional: (precision, scale)
         if self.peek() == &Token::LeftParen {
@@ -170,6 +230,12 @@ impl Parser {
             nullable = false;
         }
 
+        // Optional: AUTOINCREMENT / AUTO_INCREMENT
+        if self.peek() == &Token::AutoIncrement {
+            self.advance();
+            auto_increment = true;
+        }
+
         if data_type == DataType::Decimal && scale < 0 {
             return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
         }
@@ -183,13 +249,152 @@ impl Parser {
             nullable,
             scale,
             precision,
+            auto_increment,
         })
     }
 
     // ---- DROP TABLE ----
 
-    fn parse_drop_table(&mut self) -> Result<Statement> {
+    fn parse_drop(&mut self) -> Result<Statement> {
         self.expect(&Token::Drop)?;
+        match self.peek() {
+            Token::Table => self.parse_drop_table_rest(),
+            Token::Database => self.parse_drop_database_rest(),
+            Token::User => self.parse_drop_user(),
+            Token::Role => self.parse_drop_role(),
+            other => Err(MonaxError::Sql(format!(
+                "expected TABLE, DATABASE, USER, or ROLE after DROP, got {}", other
+            ))),
+        }
+    }
+
+    fn parse_drop_user(&mut self) -> Result<Statement> {
+        self.expect(&Token::User)?;
+        let if_exists = if self.peek() == &Token::If {
+            self.advance();
+            self.expect(&Token::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        Ok(Statement::DropUser { name, if_exists })
+    }
+
+    fn parse_drop_role(&mut self) -> Result<Statement> {
+        self.expect(&Token::Role)?;
+        let if_exists = if self.peek() == &Token::If {
+            self.advance();
+            self.expect(&Token::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        Ok(Statement::DropRole { name, if_exists })
+    }
+
+    fn parse_grant(&mut self) -> Result<Statement> {
+        self.expect(&Token::Grant)?;
+        let privileges = self.parse_privileges()?;
+        let on = if self.peek() == &Token::On {
+            self.advance();
+            Some(self.parse_grant_object()?)
+        } else {
+            None
+        };
+        self.expect(&Token::To)?;
+        let to = self.expect_ident()?;
+        Ok(Statement::Grant { privileges, on, to })
+    }
+
+    fn parse_revoke(&mut self) -> Result<Statement> {
+        self.expect(&Token::Revoke)?;
+        let privileges = self.parse_privileges()?;
+        let on = if self.peek() == &Token::On {
+            self.advance();
+            Some(self.parse_grant_object()?)
+        } else {
+            None
+        };
+        self.expect(&Token::From)?;
+        let from = self.expect_ident()?;
+        Ok(Statement::Revoke { privileges, on, from })
+    }
+
+    fn parse_privileges(&mut self) -> Result<Vec<Privilege>> {
+        if self.peek() == &Token::Privileges || self.peek() == &Token::All {
+            if self.peek() == &Token::All {
+                self.advance();
+                return Ok(vec![Privilege::All]);
+            }
+            self.advance();
+        }
+        let mut privileges = Vec::new();
+        loop {
+            let priv_name = self.expect_ident()?.to_uppercase();
+            let privilege = match priv_name.as_str() {
+                "ALL" | "ALL_PRIVILEGES" => Privilege::All,
+                "SELECT" => Privilege::Select,
+                "INSERT" => Privilege::Insert,
+                "UPDATE" => Privilege::Update,
+                "DELETE" => Privilege::Delete,
+                "CREATE" => Privilege::Create,
+                "DROP" => Privilege::Drop,
+                "ALTER" => Privilege::Alter,
+                "TRUNCATE" => Privilege::Truncate,
+                _ => return Err(MonaxError::Sql(format!("unknown privilege: {}", priv_name))),
+            };
+            privileges.push(privilege);
+            if self.peek() == &Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(privileges)
+    }
+
+    fn parse_grant_object(&mut self) -> Result<GrantObject> {
+        match self.peek() {
+            Token::Table => {
+                self.advance();
+                let name = self.expect_ident()?;
+                Ok(GrantObject::Table(name))
+            }
+            Token::Database => {
+                self.advance();
+                let name = self.expect_ident()?;
+                Ok(GrantObject::Database(name))
+            }
+            Token::Ident(_) => {
+                let name = self.expect_ident()?.to_uppercase();
+                match name.as_str() {
+                    "ALL" | "ALL_TABLES" => Ok(GrantObject::AllTables),
+                    "ALL_DATABASES" => Ok(GrantObject::AllDatabases),
+                    _ => Ok(GrantObject::Table(name)),
+                }
+            }
+            other => Err(MonaxError::Sql(format!(
+                "expected TABLE, DATABASE, or identifier after ON, got {}", other
+            ))),
+        }
+    }
+
+    fn parse_drop_database_rest(&mut self) -> Result<Statement> {
+        self.expect(&Token::Database)?;
+        let if_exists = if self.peek() == &Token::If {
+            self.advance();
+            self.expect(&Token::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        Ok(Statement::DropDatabase { name, if_exists })
+    }
+
+    fn parse_drop_table_rest(&mut self) -> Result<Statement> {
         self.expect(&Token::Table)?;
 
         let if_exists = if self.peek() == &Token::If {
@@ -202,6 +407,62 @@ impl Parser {
 
         let name = self.expect_ident()?;
         Ok(Statement::DropTable { name, if_exists })
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect(&Token::Alter)?;
+        self.expect(&Token::Table)?;
+        let name = self.expect_ident()?;
+        let mut operations = Vec::new();
+        loop {
+            let op = if self.peek() == &Token::Add {
+                self.advance();
+                self.expect(&Token::Column)?;
+                let column = self.parse_column_def()?;
+                AlterOperation::AddColumn { column }
+            } else if self.peek() == &Token::Drop {
+                self.advance();
+                self.expect(&Token::Column)?;
+                let col_name = self.expect_ident()?;
+                AlterOperation::DropColumn { name: col_name }
+            } else if self.peek() == &Token::Rename {
+                self.advance();
+                if self.peek() == &Token::Column {
+                    self.advance();
+                    let old_name = self.expect_ident()?;
+                    self.expect(&Token::To)?;
+                    let new_name = self.expect_ident()?;
+                    AlterOperation::RenameColumn { old_name, new_name }
+                } else if self.peek() == &Token::To {
+                    self.advance();
+                    let new_name = self.expect_ident()?;
+                    AlterOperation::RenameTable { new_name }
+                } else {
+                    return Err(MonaxError::Sql("expected COLUMN or TO after RENAME".into()));
+                }
+            } else if self.peek() == &Token::Modify {
+                self.advance();
+                self.expect(&Token::Column)?;
+                let column = self.parse_column_def()?;
+                AlterOperation::AddColumn { column }
+            } else {
+                break;
+            };
+            operations.push(op);
+            if self.peek() == &Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(Statement::AlterTable { name, operations })
+    }
+
+    fn parse_truncate(&mut self) -> Result<Statement> {
+        self.expect(&Token::Truncate)?;
+        self.expect(&Token::Table)?;
+        let table = self.expect_ident()?;
+        Ok(Statement::Truncate { table })
     }
 
     // ---- INSERT ----
@@ -539,8 +800,20 @@ impl Parser {
                 self.advance();
                 Ok(Statement::ShowDatabases)
             }
+            Token::Columns => {
+                self.advance();
+                self.expect(&Token::From)?;
+                let table = self.expect_ident()?;
+                Ok(Statement::ShowColumns { table })
+            }
+            Token::Create => {
+                self.advance();
+                self.expect(&Token::Table)?;
+                let table = self.expect_ident()?;
+                Ok(Statement::ShowCreateTable { table })
+            }
             other => Err(MonaxError::Sql(format!(
-                "expected TABLES or DATABASES after SHOW, got {}", other
+                "expected TABLES, DATABASES, COLUMNS, or CREATE after SHOW, got {}", other
             ))),
         }
     }
@@ -551,6 +824,30 @@ impl Parser {
         self.expect(&Token::Use)?;
         let name = self.expect_ident()?;
         Ok(Statement::UseDatabase(name))
+    }
+
+    fn parse_begin(&mut self) -> Result<Statement> {
+        self.expect(&Token::Begin)?;
+        if self.peek() == &Token::Transaction {
+            self.advance();
+        }
+        Ok(Statement::Begin)
+    }
+
+    fn parse_commit(&mut self) -> Result<Statement> {
+        self.expect(&Token::Commit)?;
+        if self.peek() == &Token::Transaction {
+            self.advance();
+        }
+        Ok(Statement::Commit)
+    }
+
+    fn parse_rollback(&mut self) -> Result<Statement> {
+        self.expect(&Token::Rollback)?;
+        if self.peek() == &Token::Transaction {
+            self.advance();
+        }
+        Ok(Statement::Rollback)
     }
 
     // ---- Expression parsing (Pratt-style precedence) ----
@@ -760,6 +1057,12 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.expect(&Token::RightParen)?;
                 Ok(expr)
+            }
+            Token::Placeholder => {
+                self.advance();
+                let idx = self.placeholder_count;
+                self.placeholder_count += 1;
+                Ok(Expr::Placeholder(idx))
             }
             ref other => Err(MonaxError::Sql(format!(
                 "unexpected token in expression: {}", other
@@ -1124,5 +1427,72 @@ mod tests {
             }
             _ => panic!("expected SELECT"),
         }
+    }
+
+    #[test]
+    fn test_begin() {
+        let stmts = Parser::parse("BEGIN").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Statement::Begin));
+    }
+
+    #[test]
+    fn test_begin_transaction() {
+        let stmts = Parser::parse("BEGIN TRANSACTION").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Statement::Begin));
+    }
+
+    #[test]
+    fn test_begin_txn() {
+        let stmts = Parser::parse("BEGIN TXN").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Statement::Begin));
+    }
+
+    #[test]
+    fn test_commit() {
+        let stmts = Parser::parse("COMMIT").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Statement::Commit));
+    }
+
+    #[test]
+    fn test_commit_transaction() {
+        let stmts = Parser::parse("COMMIT TRANSACTION").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Statement::Commit));
+    }
+
+    #[test]
+    fn test_rollback() {
+        let stmts = Parser::parse("ROLLBACK").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Statement::Rollback));
+    }
+
+    #[test]
+    fn test_rollback_transaction() {
+        let stmts = Parser::parse("ROLLBACK TRANSACTION").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(&stmts[0], Statement::Rollback));
+    }
+
+    #[test]
+    fn test_transaction_statements_with_semicolons() {
+        let stmts = Parser::parse("BEGIN; INSERT INTO t VALUES (1); COMMIT;").unwrap();
+        assert_eq!(stmts.len(), 3);
+        assert!(matches!(&stmts[0], Statement::Begin));
+        assert!(matches!(&stmts[1], Statement::Insert { .. }));
+        assert!(matches!(&stmts[2], Statement::Commit));
+    }
+
+    #[test]
+    fn test_transaction_rollback_flow() {
+        let stmts = Parser::parse("BEGIN; DELETE FROM users; ROLLBACK").unwrap();
+        assert_eq!(stmts.len(), 3);
+        assert!(matches!(&stmts[0], Statement::Begin));
+        assert!(matches!(&stmts[1], Statement::Delete { .. }));
+        assert!(matches!(&stmts[2], Statement::Rollback));
     }
 }

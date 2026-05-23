@@ -2,17 +2,28 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
+use crate::storage::memtable::MemTableState;
 use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ScanStats};
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use crate::sql::parser::ast::{BinOp, FromClause, SelectItem, Statement};
+use crate::sql::parser::ast::{BinOp, Expr, FromClause, SelectItem, Statement};
 use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan};
 
 pub fn exec_select(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, None)
+    exec_select_inner(engine, db, stmt, None, None)
+}
+
+/// Execute a SELECT using a cached logical plan, skipping re-planning.
+pub fn exec_select_with_plan(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    cached_plan: LogicalPlan,
+) -> Result<ExecResult> {
+    exec_select_inner(engine, db, stmt, None, Some(cached_plan))
 }
 
 /// Same as [exec_select], but populates per-table [ScanStats] in `stats`.
@@ -23,7 +34,7 @@ pub fn exec_select_with_stats(
     stmt: &Statement,
     stats: &mut HashMap<String, ScanStats>,
 ) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, Some(stats))
+    exec_select_inner(engine, db, stmt, Some(stats), None)
 }
 
 fn exec_select_inner(
@@ -31,6 +42,7 @@ fn exec_select_inner(
     db: &str,
     stmt: &Statement,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
+    cached_plan: Option<LogicalPlan>,
 ) -> Result<ExecResult> {
     let from = match stmt {
         Statement::Select { from, .. } => from,
@@ -39,7 +51,7 @@ fn exec_select_inner(
 
     match from {
         None => exec_literal_select(stmt),
-        Some(from_clause) => exec_table_select(engine, db, stmt, from_clause, stats.as_deref_mut()),
+        Some(from_clause) => exec_table_select(engine, db, stmt, from_clause, stats.as_deref_mut(), cached_plan),
     }
 }
 
@@ -68,10 +80,18 @@ fn exec_table_select(
     stmt: &Statement,
     from_clause: &FromClause,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
+    cached_plan: Option<LogicalPlan>,
 ) -> Result<ExecResult> {
     let table_names = extract_table_names(from_clause);
 
+    if cached_plan.is_none() {
+        if let Some(result) = try_count_star_fast_path(engine, db, stmt, &table_names) {
+            return result;
+        }
+    }
+
     let mut table_schemas = HashMap::new();
+    let mut table_cluster_keys: HashMap<String, Vec<String>> = HashMap::new();
     {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs.get(db)
@@ -82,11 +102,19 @@ fn exec_table_select(
                 .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table_name)))?
                 .clone();
             table_schemas.insert(table_name.clone(), Schema::new(meta.columns.clone()));
+            if !meta.cluster_key.is_empty() {
+                table_cluster_keys.insert(table_name.clone(), meta.cluster_key.clone());
+            }
         }
     }
 
-    let plan = crate::sql::planner::plan_select(stmt, &table_schemas)?;
-    let plan = crate::sql::optimizer::optimize(plan);
+    let plan = match cached_plan {
+        Some(p) => p,
+        None => {
+            let plan = crate::sql::planner::plan_select(stmt, &table_schemas)?;
+            crate::sql::optimizer::optimize(plan)
+        }
+    };
 
     let mut scan_predicates: HashMap<String, RowGroupPredicate> = HashMap::new();
     collect_scan_predicates(&plan, &mut scan_predicates);
@@ -96,10 +124,10 @@ fn exec_table_select(
     for table_name in &table_names {
         let table_dir = engine.data_dir().join(db).join(table_name);
         let mut batches = Vec::new();
+        let predicate = scan_predicates.get(table_name);
+        let pred_ref = predicate.filter(|p| !p.is_empty());
         if table_dir.exists() {
             let segment_files = SegmentManager::discover_segments(&table_dir)?;
-            let predicate = scan_predicates.get(table_name);
-            let pred_ref = predicate.filter(|p| !p.is_empty());
             if let Some(p) = pred_ref {
                 tracing::debug!(
                     table = %table_name,
@@ -114,8 +142,50 @@ fn exec_table_select(
                 batches.extend(reader.scan_with_predicate_and_stats(4096, pred_ref, table_stats)?);
             }
         }
+
+        let memtables = engine.memtable_manager().get_by_table(db, table_name);
+        for mt in memtables {
+            if let Some(mt_batch) = mt.read() {
+                if mt_batch.num_rows() > 0 {
+                    if let Some(pred) = pred_ref {
+                        let filtered = super::helpers::apply_row_group_predicate(&mt_batch, pred);
+                        if !filtered.is_empty() {
+                            batches.extend(filtered);
+                        }
+                    } else {
+                        batches.push(mt_batch);
+                    }
+                }
+            }
+        }
+
+        if let Some(cluster_key) = table_cluster_keys.get(table_name) {
+            if let Some(key_col) = cluster_key.first() {
+                if let Some(schema) = table_schemas.get(table_name) {
+                    if let Some(col_idx) = schema.index_of(key_col) {
+                        if let Some(pred) = scan_predicates.get(table_name) {
+                            if let Some(clause) = pred.clauses.iter().find(|c| c.column_index == col_idx && c.op == RangeOp::Eq) {
+                                let fast_scan = crate::storage::fastscan::FastScanEQ::new(col_idx, clause.value.clone());
+                                let mut filtered = Vec::with_capacity(batches.len());
+                                for batch in batches {
+                                    if let Some(result) = fast_scan.scan_batch_sorted(&batch, &[col_idx]) {
+                                        if result.num_rows() > 0 {
+                                            filtered.push(result);
+                                        }
+                                    }
+                                }
+                                batches = filtered;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         table_batches.insert(table_name.clone(), batches);
     }
+
+    let plan = try_skip_sort_for_cluster_key(plan, &table_batches, &table_cluster_keys, &table_schemas);
 
     let mut pipeline = super::operators::build_pipeline(plan, &table_batches)?;
     let mut result_batches = Vec::new();
@@ -131,7 +201,54 @@ fn exec_table_select(
     Ok(ExecResult::Query { schema, batches: result_batches })
 }
 
-fn extract_table_names(from: &FromClause) -> Vec<String> {
+fn try_skip_sort_for_cluster_key(
+    plan: LogicalPlan,
+    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_cluster_keys: &HashMap<String, Vec<String>>,
+    table_schemas: &HashMap<String, Schema>,
+) -> LogicalPlan {
+    let LogicalPlan::Sort(sort) = &plan else { return plan; };
+    if table_batches.len() != 1 {
+        return plan;
+    }
+    let (table_name, batches) = table_batches.iter().next().unwrap();
+    if batches.len() != 1 {
+        return plan;
+    }
+    let cluster_key = match table_cluster_keys.get(table_name) {
+        Some(k) => k,
+        None => return plan,
+    };
+    if cluster_key.is_empty() {
+        return plan;
+    }
+    let schema = match table_schemas.get(table_name) {
+        Some(s) => s,
+        None => return plan,
+    };
+    let all_asc = sort.sort_keys.iter().all(|sk| !sk.desc);
+    if !all_asc {
+        return plan;
+    }
+    let matches = sort.sort_keys.len() == cluster_key.len()
+        && sort.sort_keys.iter().zip(cluster_key.iter()).all(|(sk, ck)| {
+            match &sk.expr {
+                LogicalExpr::Column(idx) => {
+                    schema.columns.get(*idx)
+                        .map(|c| c.name == *ck)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }
+        });
+    if matches {
+        *sort.input.clone()
+    } else {
+        plan
+    }
+}
+
+pub fn extract_table_names(from: &FromClause) -> Vec<String> {
     match from {
         FromClause::Table(t) => vec![t.name.clone()],
         FromClause::Join(join_expr) => {
@@ -179,6 +296,10 @@ fn collect_scan_predicates(
         LogicalPlan::Join(j) => {
             collect_scan_predicates(&j.left, out);
             collect_scan_predicates(&j.right, out);
+        }
+        LogicalPlan::SemiJoin(s) => {
+            collect_scan_predicates(&s.left, out);
+            collect_scan_predicates(&s.right, out);
         }
         LogicalPlan::Empty => {}
     }
@@ -253,4 +374,123 @@ fn try_build_clause_mirrored(
         return Some(RangeClause { column_index: *idx, op: rop, value: val.clone() });
     }
     None
+}
+fn try_count_star_fast_path(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    table_names: &[String],
+) -> Option<Result<ExecResult>> {
+    let (select_list, where_clause, group_by) = match stmt {
+        Statement::Select { select_list, where_clause, group_by, .. } => {
+            (select_list, where_clause, group_by)
+        }
+        _ => return None,
+    };
+
+    if !group_by.is_empty() || table_names.len() != 1 {
+        return None;
+    }
+
+    if select_list.len() != 1 {
+        return None;
+    }
+
+    let is_count_star = match &select_list[0] {
+        SelectItem::Expr(Expr::Function { name, args, distinct: false }, _) => {
+            name.eq_ignore_ascii_case("count")
+                && args.len() == 1
+                && matches!(&args[0], Expr::Column(col) if col == "*")
+        }
+        _ => false,
+    };
+
+    if !is_count_star {
+        return None;
+    }
+
+    let table_name = &table_names[0];
+    let table_dir = engine.data_dir().join(db).join(table_name);
+
+    if !table_dir.exists() {
+        return None;
+    }
+
+    let table_schema = {
+        let catalogs = engine.catalogs().read().unwrap();
+        let catalog = catalogs.get(db)?;
+        let meta = catalog.get_table(table_name)?;
+        Schema::new(meta.columns.clone())
+    };
+
+    let segment_files = match SegmentManager::discover_segments(&table_dir) {
+        Ok(files) => files,
+        Err(e) => return Some(Err(e)),
+    };
+
+    let mgr = engine.segment_mgr();
+    let predicate = super::helpers::build_row_group_predicate(where_clause, &table_schema);
+    let mut total_rows: u64 = 0;
+
+    for seg_path in &segment_files {
+        match mgr.open_reader(seg_path) {
+            Ok(reader) => {
+                if where_clause.is_some() {
+                    let batches = match reader.scan_with_predicate(4096, predicate.as_ref()) {
+                        Ok(b) => b,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    for batch in batches {
+                        for row_idx in 0..batch.num_rows() {
+                            let matches = match where_clause {
+                                Some(ref expr) => match super::helpers::eval_where_clause(expr, &batch, row_idx, &table_schema) {
+                                    Ok(m) => m,
+                                    Err(_) => true,
+                                },
+                                None => true,
+                            };
+                            if matches {
+                                total_rows += 1;
+                            }
+                        }
+                    }
+                } else {
+                    let count = reader.row_count();
+                    let deleted = reader.deleted_row_count();
+                    total_rows += count.saturating_sub(deleted);
+                }
+            }
+            Err(e) => return Some(Err(e)),
+        }
+    }
+
+    let memtables = engine.memtable_manager().get_by_table(db, table_name);
+    for mt in &memtables {
+        if let Some(batch) = mt.read() {
+            if where_clause.is_some() {
+                for row_idx in 0..batch.num_rows() {
+                    let matches = match where_clause {
+                        Some(ref expr) => match super::helpers::eval_where_clause(expr, &batch, row_idx, &table_schema) {
+                            Ok(m) => m,
+                            Err(_) => true,
+                        },
+                        None => true,
+                    };
+                    if matches {
+                        total_rows += 1;
+                    }
+                }
+            } else {
+                total_rows += batch.num_rows() as u64;
+            }
+        }
+    }
+
+    let schema = Schema::new(vec![ColumnDef::new("count(*)", DataType::Int64)]);
+    let mut batch = RecordBatch::new(schema.clone());
+    if batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(total_rows as i64))).is_err() {
+        return None;
+    }
+
+    Some(Ok(ExecResult::Query { schema, batches: vec![batch] }))
 }

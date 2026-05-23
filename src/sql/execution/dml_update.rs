@@ -5,7 +5,7 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{eval_where_clause, eval_expr_to_scalar};
+use super::helpers::{eval_where_clause, eval_expr_to_scalar, build_row_group_predicate};
 use crate::sql::parser::ast::{Assignment, Expr};
 
 pub fn exec_update(
@@ -27,12 +27,13 @@ pub fn exec_update(
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
+    let predicate = build_row_group_predicate(where_clause, &table_schema);
     let mut all_batches = Vec::new();
     if table_dir.exists() {
         let segment_files = SegmentManager::discover_segments(&table_dir)?;
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            let batches = reader.scan(4096)?;
+            let batches = reader.scan_with_predicate(4096, predicate.as_ref())?;
             all_batches.extend(batches);
         }
     }

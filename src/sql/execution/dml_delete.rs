@@ -3,7 +3,7 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::Schema;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::eval_where_clause;
+use super::helpers::{eval_where_clause, build_row_group_predicate};
 use crate::sql::parser::ast::Expr;
 
 pub fn exec_delete(
@@ -30,6 +30,7 @@ pub fn exec_delete(
     let mgr = engine.segment_mgr();
     let segment_files = SegmentManager::discover_segments(&table_dir)?;
     let mut total_deleted: u64 = 0;
+    let predicate = build_row_group_predicate(where_clause, &table_schema);
 
     for seg_path in segment_files {
         let (new_bitmap, new_deleted_count, prev_deleted) = {
@@ -50,6 +51,12 @@ pub fn exec_delete(
             let mut newly_deleted: u64 = 0;
             let mut row_id: u64 = 0;
             for rg_idx in 0..reader.num_row_groups() {
+                if let Some(ref pred) = predicate {
+                    if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                        row_id += reader.row_group_rows(rg_idx);
+                        continue;
+                    }
+                }
                 let batch = reader.read_row_group(rg_idx)?;
                 for i in 0..batch.num_rows() {
                     let rid = row_id + i as u64;
