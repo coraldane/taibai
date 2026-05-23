@@ -5,6 +5,129 @@ use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{BinOp, Expr};
 
+pub fn eval_where_clause_batch(
+    expr: &Expr,
+    batch: &RecordBatch,
+    schema: &Schema,
+) -> Result<Vec<bool>> {
+    let num_rows = batch.num_rows();
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinOp::Eq => {
+                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(col_idx) = schema.index_of(col_name) {
+                            if let Some(col) = batch.column(col_idx) {
+                                return Ok(col.eq_vec(val));
+                            }
+                        }
+                    }
+                    if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(col_idx) = schema.index_of(col_name) {
+                            if let Some(col) = batch.column(col_idx) {
+                                return Ok(col.eq_vec(val));
+                            }
+                        }
+                    }
+                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+                }
+                BinOp::Lt => {
+                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(col_idx) = schema.index_of(col_name) {
+                            if let Some(col) = batch.column(col_idx) {
+                                return Ok(col.lt_vec(val));
+                            }
+                        }
+                    }
+                    if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(col_idx) = schema.index_of(col_name) {
+                            if let Some(col) = batch.column(col_idx) {
+                                return Ok(col.gt_vec(val));
+                            }
+                        }
+                    }
+                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+                }
+                BinOp::Gt => {
+                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(col_idx) = schema.index_of(col_name) {
+                            if let Some(col) = batch.column(col_idx) {
+                                return Ok(col.gt_vec(val));
+                            }
+                        }
+                    }
+                    if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(col_idx) = schema.index_of(col_name) {
+                            if let Some(col) = batch.column(col_idx) {
+                                return Ok(col.lt_vec(val));
+                            }
+                        }
+                    }
+                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+                }
+                BinOp::Lte => {
+                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(col_idx) = schema.index_of(col_name) {
+                            if let Some(col) = batch.column(col_idx) {
+                                return Ok(col.le_vec(val));
+                            }
+                        }
+                    }
+                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+                }
+                BinOp::Gte => {
+                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(col_idx) = schema.index_of(col_name) {
+                            if let Some(col) = batch.column(col_idx) {
+                                return Ok(col.ge_vec(val));
+                            }
+                        }
+                    }
+                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+                }
+                BinOp::And => {
+                    let left_mask = eval_where_clause_batch(left, batch, schema)?;
+                    let right_mask = eval_where_clause_batch(right, batch, schema)?;
+                    Ok(left_mask.iter().zip(right_mask.iter()).map(|(l, r)| *l && *r).collect())
+                }
+                BinOp::Or => {
+                    let left_mask = eval_where_clause_batch(left, batch, schema)?;
+                    let right_mask = eval_where_clause_batch(right, batch, schema)?;
+                    Ok(left_mask.iter().zip(right_mask.iter()).map(|(l, r)| *l || *r).collect())
+                }
+                _ => Ok(vec![true; num_rows]),
+            }
+        }
+        Expr::IsNull(inner) => {
+            if let Expr::Column(col_name) = inner.as_ref() {
+                if let Some(col_idx) = schema.index_of(col_name) {
+                    if let Some(col) = batch.column(col_idx) {
+                        return Ok(col.is_null_vec());
+                    }
+                }
+            }
+            Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+        }
+        Expr::IsNotNull(inner) => {
+            if let Expr::Column(col_name) = inner.as_ref() {
+                if let Some(col_idx) = schema.index_of(col_name) {
+                    if let Some(col) = batch.column(col_idx) {
+                        return Ok(col.is_not_null_vec());
+                    }
+                }
+            }
+            Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+        }
+        Expr::UnaryNot(inner) => {
+            let inner_mask = eval_where_clause_batch(inner, batch, schema)?;
+            Ok(inner_mask.iter().map(|b| !*b).collect())
+        }
+        Expr::Literal(v) => Ok(vec![!v.is_null(); num_rows]),
+        Expr::Column(_) => Ok(vec![true; num_rows]),
+        _ => Ok(vec![true; num_rows]),
+    }
+}
+
 pub fn eval_where_clause(
     expr: &Expr,
     batch: &RecordBatch,

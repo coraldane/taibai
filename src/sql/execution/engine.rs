@@ -11,6 +11,7 @@ use crate::storage::memtable::MemTableManager;
 use crate::storage::segment_manager::SegmentManager;
 use crate::storage::auth::AuthManager;
 use crate::storage::auto_increment::AutoIncrementManager;
+use crate::storage::index_manager::IndexManager;
 
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
@@ -30,6 +31,7 @@ pub struct Engine {
     bulk_mode: AtomicBool,
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
+    index_manager: Arc<IndexManager>,
 }
 
 impl Engine {
@@ -67,6 +69,7 @@ impl Engine {
 
         let auth_manager = Arc::new(AuthManager::new(data_dir)?);
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
+        let index_manager = Arc::new(IndexManager::new(Arc::clone(&segment_mgr)));
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
@@ -76,6 +79,7 @@ impl Engine {
             bulk_mode: AtomicBool::new(false),
             auth_manager,
             auto_increment_mgr,
+            index_manager,
         })
     }
 
@@ -245,6 +249,47 @@ impl Engine {
                 session.rollback_txn();
                 Ok(ExecResult::Ok { rows_affected: rolled_back })
             }
+            Statement::AlterUser { name, operations } => {
+                super::ddl::exec_alter_user(self, name, operations)
+            }
+            Statement::Union { left, right, all, order_by, limit, offset } => {
+                super::query::exec_union(self, &session.database, left, right, *all, order_by, limit, offset)
+            }
+            Statement::ShowUsers => {
+                super::ddl::exec_show_users(self)
+            }
+            Statement::ShowRoles => {
+                super::ddl::exec_show_roles(self)
+            }
+            Statement::ShowGrants { user } => {
+                super::ddl::exec_show_grants(self, user)
+            }
+            Statement::ShowPartitions { table } => {
+                super::ddl::exec_show_partitions(self, &session.database, table)
+            }
+            Statement::ShowStats => {
+                super::ddl::exec_show_stats(self, &session.database)
+            }
+            Statement::ShowEngines => {
+                super::ddl::exec_show_engines(self)
+            }
+            Statement::ShowProcesslist { full } => {
+                super::ddl::exec_show_processlist(self, *full)
+            }
+            Statement::FlushTable { table } => {
+                super::ddl::exec_flush_table(self, &session.database, table)
+            }
+            Statement::OptimizeTable { table } => {
+                super::ddl::exec_optimize_table(self, &session.database, table)
+            }
+            Statement::PauseFlush => {
+                self.segment_mgr().pause_flush();
+                Ok(ExecResult::Ok { rows_affected: 0 })
+            }
+            Statement::ResumeFlush => {
+                self.segment_mgr().resume_flush();
+                Ok(ExecResult::Ok { rows_affected: 0 })
+            }
         }
     }
 
@@ -270,6 +315,10 @@ impl Engine {
 
     pub fn auto_increment_manager(&self) -> &Arc<AutoIncrementManager> {
         &self.auto_increment_mgr
+    }
+
+    pub fn index_manager(&self) -> &Arc<IndexManager> {
+        &self.index_manager
     }
 
     pub fn get_table_meta(&self, db: &str, table: &str) -> Option<crate::storage::schema::TableMeta> {

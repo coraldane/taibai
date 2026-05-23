@@ -7,6 +7,9 @@ pub trait PredicateMatcher: Send + Sync {
     fn matches_row_group(&self, zone_maps: &[ZoneMap]) -> bool;
     fn matches_row(&self, row_idx: usize, batch: &RecordBatch) -> bool;
     fn matches_column_value(&self, val: &ScalarValue) -> bool;
+    fn matches_batch(&self, batch: &RecordBatch) -> Vec<bool> {
+        (0..batch.num_rows()).map(|i| self.matches_row(i, batch)).collect()
+    }
     fn column_index(&self) -> usize;
     fn is_fast_scan_compatible(&self) -> bool {
         false
@@ -48,6 +51,14 @@ impl PredicateMatcher for EqMatcher {
 
     fn matches_column_value(&self, val: &ScalarValue) -> bool {
         scalar_eq(val, &self.value)
+    }
+
+    fn matches_batch(&self, batch: &RecordBatch) -> Vec<bool> {
+        if let Some(col) = batch.column(self.column_index) {
+            col.eq_vec(&self.value)
+        } else {
+            vec![false; batch.num_rows()]
+        }
     }
 
     fn column_index(&self) -> usize {
@@ -105,6 +116,20 @@ impl PredicateMatcher for RangeMatcher {
             RangeOp::Le => scalar_le(val, &self.value),
             RangeOp::Gt => scalar_lt(&self.value, val),
             RangeOp::Ge => scalar_le(&self.value, val),
+        }
+    }
+
+    fn matches_batch(&self, batch: &RecordBatch) -> Vec<bool> {
+        if let Some(col) = batch.column(self.column_index) {
+            match self.op {
+                RangeOp::Eq => col.eq_vec(&self.value),
+                RangeOp::Lt => col.lt_vec(&self.value),
+                RangeOp::Le => col.le_vec(&self.value),
+                RangeOp::Gt => col.gt_vec(&self.value),
+                RangeOp::Ge => col.ge_vec(&self.value),
+            }
+        } else {
+            vec![false; batch.num_rows()]
         }
     }
 
@@ -398,6 +423,15 @@ impl FastScanEQ {
         }
     }
 
+    pub fn with_bloom_filter_check(&self, bloom_filter: Option<&crate::storage::bloomfilter::BloomFilter>) -> bool {
+        if let Some(bf) = bloom_filter {
+            if !bf.might_contain(&self.value) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn can_use_binary_search(&self, batch: &RecordBatch, key_indices: &[usize]) -> bool {
         if self.value.is_null() {
             return false;
@@ -458,6 +492,15 @@ impl FastScanEQ {
         filter_batch_by_predicate(batch, &self.matcher)
     }
 
+    pub fn scan_batch_fast(&self, batch: &RecordBatch) -> RecordBatch {
+        if let Some(col) = batch.column(self.column_index) {
+            let mask = col.eq_vec(&self.value);
+            apply_filter_mask_fast(batch, &mask)
+        } else {
+            RecordBatch::new(batch.schema.clone())
+        }
+    }
+
     pub fn scan_batch_sorted(&self, batch: &RecordBatch, key_indices: &[usize]) -> Option<RecordBatch> {
         if !self.can_use_binary_search(batch, key_indices) {
             return Some(self.scan_batch(batch));
@@ -468,7 +511,7 @@ impl FastScanEQ {
         if start >= end {
             return Some(RecordBatch::new(batch.schema.clone()));
         }
-        Some(split_batch(batch, start, end))
+        Some(split_batch_fast(batch, start, end))
     }
 
     pub fn matcher(&self) -> &dyn PredicateMatcher {
@@ -511,6 +554,10 @@ impl MultiPredicateFastScan {
     pub fn scan_batch(&self, batch: &RecordBatch) -> RecordBatch {
         if batch.num_rows() == 0 {
             return batch.clone();
+        }
+        if self.matchers.len() == 1 {
+            let mask = self.matchers[0].matches_batch(batch);
+            return apply_filter_mask(batch, &mask);
         }
         let mask: Vec<bool> = (0..batch.num_rows())
             .map(|i| self.matchers.iter().all(|m| m.matches_row(i, batch)))
@@ -571,16 +618,13 @@ fn filter_batch_by_predicate(batch: &RecordBatch, matcher: &dyn PredicateMatcher
 }
 
 fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
+    if mask.iter().all(|&m| m) {
+        return batch.clone();
+    }
     let mut columns = Vec::with_capacity(batch.num_columns());
     for col_idx in 0..batch.num_columns() {
         let col = batch.column(col_idx).unwrap();
-        let mut new_col = ColumnArray::empty(col.data_type());
-        for (i, &keep) in mask.iter().enumerate() {
-            if keep {
-                new_col.push(&col.scalar(i)).unwrap();
-            }
-        }
-        columns.push(new_col);
+        columns.push(col.filter_by_mask(mask));
     }
     RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
 }
@@ -662,4 +706,28 @@ impl RowGroupPredicate {
     pub fn to_multi_predicate_fast_scan(&self) -> MultiPredicateFastScan {
         MultiPredicateFastScan::from_row_group_predicate(self)
     }
+}
+
+pub fn apply_filter_mask_fast(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
+    if mask.iter().all(|&m| m) {
+        return batch.clone();
+    }
+    let match_count = mask.iter().filter(|&m| *m).count();
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for col_idx in 0..batch.num_columns() {
+        if let Some(col) = batch.column(col_idx) {
+            columns.push(col.filter_by_mask_fast(mask, match_count));
+        }
+    }
+    RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
+}
+
+pub fn split_batch_fast(batch: &RecordBatch, start: usize, end: usize) -> RecordBatch {
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for col_idx in 0..batch.num_columns() {
+        if let Some(col) = batch.column(col_idx) {
+            columns.push(col.slice_fast(start, end));
+        }
+    }
+    RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
 }

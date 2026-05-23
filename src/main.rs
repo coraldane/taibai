@@ -107,6 +107,7 @@ async fn run_client(
         Err(e) => eprintln!("Ping failed: {}", e),
     }
 
+    let start = std::time::Instant::now();
     if let Some(sql) = query {
         match client.query(&sql).await {
             Ok(QueryResult::Ok { rows_affected }) => {
@@ -138,6 +139,7 @@ async fn run_client(
                 std::process::exit(1);
             }
         }
+        println!("({:?})", start.elapsed());
     } else {
         println!("monax client interactive mode. Type SQL queries or 'quit' to exit.");
         let stdin = std::io::stdin();
@@ -163,9 +165,11 @@ async fn run_client(
                 continue;
             }
 
+            let start = std::time::Instant::now();
             match client.query(sql).await {
                 Ok(QueryResult::Ok { rows_affected }) => {
                     println!("OK, {} row(s) affected", rows_affected);
+                    println!("({:?})", start.elapsed());
                 }
                 Ok(QueryResult::Rows { schema, batches }) => {
                     let names: Vec<&str> = schema.column_names().collect();
@@ -182,12 +186,13 @@ async fn run_client(
                             println!("{}", cells.join("\t"));
                         }
                     }
+                    println!("({:?})", start.elapsed());
                 }
                 Ok(QueryResult::Error(msg)) => {
-                    eprintln!("Server error: {}", msg);
+                    eprintln!("Server error: {} ({:?})", msg, start.elapsed());
                 }
                 Err(e) => {
-                    eprintln!("Query failed: {}", e);
+                    eprintln!("Query failed: {} ({:?})", e, start.elapsed());
                 }
             }
         }

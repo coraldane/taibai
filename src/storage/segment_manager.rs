@@ -55,6 +55,7 @@ pub struct SegmentManager {
     data_dir: PathBuf,
     tables: RwLock<HashMap<String, Arc<TableSegmentState>>>,
     flush_stop: Arc<AtomicBool>,
+    flush_paused: Arc<AtomicBool>,
     next_txn_id: AtomicU64,
 }
 
@@ -89,11 +90,13 @@ impl SegmentManager {
         }
 
         let flush_stop = Arc::new(AtomicBool::new(false));
+        let flush_paused = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             tables: RwLock::new(tables),
             flush_stop,
+            flush_paused,
             next_txn_id: AtomicU64::new(0),
         })
     }
@@ -101,6 +104,7 @@ impl SegmentManager {
     pub fn start_flush_thread(mgr: &Arc<Self>) {
         let mgr_clone = Arc::clone(mgr);
         let stop = mgr.flush_stop.clone();
+        let paused = mgr.flush_paused.clone();
         std::thread::Builder::new()
             .name("monax-flush".into())
             .spawn(move || {
@@ -108,6 +112,10 @@ impl SegmentManager {
                     std::thread::sleep(std::time::Duration::from_secs(FLUSH_CHECK_INTERVAL_SECS));
                     if stop.load(Ordering::Acquire) {
                         break;
+                    }
+                    if paused.load(Ordering::Acquire) {
+                        tracing::debug!("flush thread paused, skipping periodic check");
+                        continue;
                     }
                     if let Err(e) = mgr_clone.periodic_flush_check() {
                         tracing::warn!(error = %e, "periodic flush check failed");
@@ -119,6 +127,20 @@ impl SegmentManager {
 
     pub fn shutdown(&self) {
         self.flush_stop.store(true, Ordering::Release);
+    }
+
+    pub fn pause_flush(&self) {
+        self.flush_paused.store(true, Ordering::Release);
+        tracing::info!("flush thread paused");
+    }
+
+    pub fn resume_flush(&self) {
+        self.flush_paused.store(false, Ordering::Release);
+        tracing::info!("flush thread resumed");
+    }
+
+    pub fn is_flush_paused(&self) -> bool {
+        self.flush_paused.load(Ordering::Acquire)
     }
 
     pub fn alloc_txn_id(&self) -> u64 {

@@ -16,3 +16,9 @@ pub mod mvcc;
 pub mod partition_function;
 pub mod metrics;
 pub mod fastscan;
+pub mod bloomfilter;
+pub mod sparse_index;
+pub mod index_manager;
+
+#[cfg(test)]
+mod optimization_tests;

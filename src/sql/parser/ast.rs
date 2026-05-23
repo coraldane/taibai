@@ -10,6 +10,13 @@ pub enum AlterOperation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum AlterUserOperation {
+    SetPassword { password: String },
+    Lock,
+    Unlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Privilege {
     All,
     Select,
@@ -62,6 +69,10 @@ pub enum Statement {
         name: String,
         password: String,
     },
+    AlterUser {
+        name: String,
+        operations: Vec<AlterUserOperation>,
+    },
     CreateRole {
         name: String,
     },
@@ -108,15 +119,34 @@ pub enum Statement {
         offset: Option<Expr>,
         distinct: bool,
     },
+    Union {
+        left: Box<Statement>,
+        right: Box<Statement>,
+        all: bool,
+        order_by: Vec<OrderByItem>,
+        limit: Option<Expr>,
+        offset: Option<Expr>,
+    },
     ShowTables,
     ShowDatabases,
     ShowColumns { table: String },
     ShowCreateTable { table: String },
+    ShowUsers,
+    ShowRoles,
+    ShowGrants { user: Option<String> },
+    ShowPartitions { table: Option<String> },
+    ShowStats,
+    ShowEngines,
+    ShowProcesslist { full: bool },
     UseDatabase(String),
     Explain { analyze: bool, stmt: Box<Statement> },
     Begin,
     Commit,
     Rollback,
+    FlushTable { table: Option<String> },
+    OptimizeTable { table: String },
+    PauseFlush,
+    ResumeFlush,
 }
 
 #[derive(Debug, Clone, PartialEq)]

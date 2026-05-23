@@ -6,6 +6,7 @@ use memmap2::Mmap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
+use crate::storage::bloomfilter::BloomFilter;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, Schema};
 use crate::types::bitmap::NullBitmap;
@@ -42,6 +43,15 @@ pub struct ZoneMap {
 }
 
 impl ZoneMap {
+    pub fn null() -> Self {
+        Self {
+            min_value: ScalarValue::Int64(None),
+            max_value: ScalarValue::Int64(None),
+            null_count: 0,
+            row_count: 0,
+        }
+    }
+
     fn null_for(dtype: DataType) -> ScalarValue {
         match dtype {
             DataType::Bool => ScalarValue::Bool(None),
@@ -64,6 +74,103 @@ impl ZoneMap {
             DataType::Blob => ScalarValue::Blob(None),
             DataType::Vector => ScalarValue::Vector(None),
         }
+    }
+
+    pub fn update(&mut self, value: &ScalarValue) {
+        self.row_count += 1;
+
+        if value.is_null() {
+            self.null_count += 1;
+            return;
+        }
+
+        if self.min_value.is_null() {
+            self.min_value = value.clone();
+            self.max_value = value.clone();
+        } else {
+            if crate::storage::sort_key::compare_scalars_for_sort(value, &self.min_value) == std::cmp::Ordering::Less {
+                self.min_value = value.clone();
+            }
+            if crate::storage::sort_key::compare_scalars_for_sort(value, &self.max_value) == std::cmp::Ordering::Greater {
+                self.max_value = value.clone();
+            }
+        }
+    }
+
+    pub fn contains(&self, value: &ScalarValue) -> bool {
+        if self.min_value.is_null() || value.is_null() {
+            return true;
+        }
+        crate::storage::sort_key::compare_scalars_for_sort(value, &self.min_value) >= std::cmp::Ordering::Equal
+            && crate::storage::sort_key::compare_scalars_for_sort(value, &self.max_value) <= std::cmp::Ordering::Equal
+    }
+
+    pub fn overlaps(&self, min: &ScalarValue, max: &ScalarValue) -> bool {
+        if self.min_value.is_null() {
+            return true;
+        }
+        if min.is_null() && max.is_null() {
+            return true;
+        }
+        if min.is_null() {
+            return crate::storage::sort_key::compare_scalars_for_sort(&self.min_value, max) <= std::cmp::Ordering::Equal;
+        }
+        if max.is_null() {
+            return crate::storage::sort_key::compare_scalars_for_sort(&self.max_value, min) >= std::cmp::Ordering::Equal;
+        }
+        crate::storage::sort_key::compare_scalars_for_sort(&self.max_value, min) >= std::cmp::Ordering::Equal
+            && crate::storage::sort_key::compare_scalars_for_sort(&self.min_value, max) <= std::cmp::Ordering::Equal
+    }
+
+    pub fn merge(&mut self, other: &ZoneMap) {
+        if other.min_value.is_null() {
+            return;
+        }
+
+        if self.min_value.is_null() {
+            self.min_value = other.min_value.clone();
+            self.max_value = other.max_value.clone();
+        } else {
+            if crate::storage::sort_key::compare_scalars_for_sort(&other.min_value, &self.min_value) == std::cmp::Ordering::Less {
+                self.min_value = other.min_value.clone();
+            }
+            if crate::storage::sort_key::compare_scalars_for_sort(&other.max_value, &self.max_value) == std::cmp::Ordering::Greater {
+                self.max_value = other.max_value.clone();
+            }
+        }
+
+        self.row_count += other.row_count;
+        self.null_count += other.null_count;
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_scalar_with_tag(&mut buf, &self.min_value);
+        encode_scalar_with_tag(&mut buf, &self.max_value);
+        buf.extend_from_slice(&self.null_count.to_le_bytes());
+        buf.extend_from_slice(&self.row_count.to_le_bytes());
+        buf
+    }
+
+    pub fn deserialize(data: &[u8]) -> Option<(Self, usize)> {
+        let mut cursor = std::io::Cursor::new(data);
+        let min_value = decode_scalar_with_tag(&mut cursor)?;
+        let max_value = decode_scalar_with_tag(&mut cursor)?;
+
+        let pos = cursor.position() as usize;
+        if data.len() < pos + 16 {
+            return None;
+        }
+
+        let null_count = u64::from_le_bytes(data[pos..pos+8].try_into().ok()?);
+        let row_count = u64::from_le_bytes(data[pos+8..pos+16].try_into().ok()?);
+
+        Some((Self {
+            min_value,
+            max_value,
+            null_count,
+            row_count,
+        }, pos + 16))
     }
 }
 
@@ -171,6 +278,7 @@ pub struct RowGroupMeta {
     pub compressed_sizes: Vec<u64>,
     pub uncompressed_sizes: Vec<u64>,
     pub zone_maps: Vec<ZoneMap>,
+    pub bloom_filters: Vec<Option<BloomFilter>>,
 }
 
 /// A row group being built in memory.
@@ -181,6 +289,7 @@ struct BuildingRowGroup {
     zone_mins: Vec<Option<ScalarValue>>,
     zone_maxs: Vec<Option<ScalarValue>>,
     null_counts: Vec<u64>,
+    bloom_filters: Vec<BloomFilter>,
 }
 
 impl BuildingRowGroup {
@@ -192,6 +301,7 @@ impl BuildingRowGroup {
             zone_mins: vec![None; num_columns],
             zone_maxs: vec![None; num_columns],
             null_counts: vec![0; num_columns],
+            bloom_filters: vec![BloomFilter::with_defaults(); num_columns],
         }
     }
 }
@@ -258,6 +368,11 @@ impl SegmentWriter {
                     &mut group.zone_maxs[col_idx],
                     &mut group.null_counts[col_idx],
                 );
+
+                for row_idx in offset..offset + to_write {
+                    let val = col.scalar(row_idx);
+                    group.bloom_filters[col_idx].add(&val);
+                }
 
                 let encoded = encode_column(col, offset, to_write)?;
                 let uncompressed_len = encoded.len() as u64;
@@ -343,6 +458,11 @@ impl SegmentWriter {
             });
         }
 
+        let bloom_filters: Vec<Option<BloomFilter>> = group.bloom_filters
+            .into_iter()
+            .map(|bf| if bf.is_empty() { None } else { Some(bf) })
+            .collect();
+
         self.row_groups.push(RowGroupMeta {
             offset,
             length: column_sizes.iter().sum(),
@@ -351,6 +471,7 @@ impl SegmentWriter {
             compressed_sizes,
             uncompressed_sizes: group.uncompressed_sizes,
             zone_maps,
+            bloom_filters,
         });
 
         Ok(())
@@ -436,6 +557,17 @@ pub fn encode_segment_footer(
             buf.extend_from_slice(&zm.null_count.to_le_bytes());
             buf.extend_from_slice(&zm.row_count.to_le_bytes());
         }
+        
+        for bf in &rg.bloom_filters {
+            if let Some(b) = bf {
+                buf.push(1);
+                let bf_data = b.serialize();
+                buf.extend_from_slice(&(bf_data.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bf_data);
+            } else {
+                buf.push(0);
+            }
+        }
     }
 
     // Reserved: delete-bitmap section (kept for forward compat)
@@ -476,6 +608,7 @@ struct RowGroupInfo {
     column_compressed_sizes: Vec<u64>,
     column_uncompressed_sizes: Vec<u64>,
     zone_maps: Vec<ZoneMap>,
+    bloom_filters: Vec<Option<BloomFilter>>,
 }
 
 impl SegmentReader {
@@ -563,6 +696,48 @@ impl SegmentReader {
     /// Return per-column zone maps (min/max/null_count/row_count) for a row group.
     pub fn zone_maps(&self, row_group: usize) -> &[ZoneMap] {
         &self.footer.row_groups[row_group].zone_maps
+    }
+
+    pub fn bloom_filters(&self, row_group: usize) -> &[Option<BloomFilter>] {
+        &self.footer.row_groups[row_group].bloom_filters
+    }
+
+    pub fn filter_row_groups_by_bloom_filter(&self, column_index: usize, value: &ScalarValue) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
+            if let Some(bf) = rg.bloom_filters.get(column_index).and_then(|b| b.as_ref()) {
+                if !bf.might_contain(value) {
+                    continue;
+                }
+            }
+            if let Some(zm) = rg.zone_maps.get(column_index) {
+                if !zm.contains(value) {
+                    continue;
+                }
+            }
+            candidates.push(rg_idx);
+        }
+        candidates
+    }
+
+    pub fn filter_row_groups_two_level(&self, predicate: &RowGroupPredicate, bloom_column: Option<usize>, bloom_value: Option<&ScalarValue>) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
+            if let (Some(col_idx), Some(val)) = (bloom_column, bloom_value) {
+                if let Some(bf) = rg.bloom_filters.get(col_idx).and_then(|b| b.as_ref()) {
+                    if !bf.might_contain(val) {
+                        continue;
+                    }
+                }
+            }
+
+            if !predicate.matches_row_group(&rg.zone_maps) {
+                continue;
+            }
+
+            candidates.push(rg_idx);
+        }
+        candidates
     }
 
     /// Number of rows in a given row group.
@@ -698,7 +873,6 @@ impl SegmentReader {
         let rg = &self.footer.row_groups[row_group];
         let col_def = &self.footer.schema.columns[column_idx];
 
-        // Calculate offset within the row group
         let mut col_offset = rg.offset as usize;
         for i in 0..column_idx {
             col_offset += rg.column_compressed_sizes[i] as usize;
@@ -713,6 +887,123 @@ impl SegmentReader {
         decode_column(&decompressed, rg.row_count as usize, col_def)
     }
 
+    pub fn read_row_group_batch(&self, row_group: usize, column_indices: &[usize]) -> Result<Vec<(usize, ColumnArray)>> {
+        if column_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rg = &self.footer.row_groups[row_group];
+        let total_size: usize = rg.column_compressed_sizes.iter().map(|s| *s as usize).sum();
+        if total_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let all_data = &self.mmap[rg.offset as usize..rg.offset as usize + total_size];
+
+        let col_offsets: Vec<usize> = rg.column_compressed_sizes.iter()
+            .scan(0, |acc, s| {
+                let offset = *acc;
+                *acc += *s as usize;
+                Some(offset)
+            })
+            .collect();
+
+        let pool = crate::storage::buffer_pool::global_batch_pool();
+        let mut results = Vec::with_capacity(column_indices.len());
+
+        for &col_idx in column_indices {
+            if col_idx >= col_offsets.len() {
+                continue;
+            }
+
+            let col_offset = col_offsets[col_idx];
+            let col_len = rg.column_compressed_sizes[col_idx] as usize;
+            let compressed = &all_data[col_offset..col_offset + col_len];
+
+            let mut buf = pool.acquire();
+            buf.reserve(col_len * 3);
+            
+            let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
+                .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
+            
+            pool.release(buf);
+
+            let col_def = &self.footer.schema.columns[col_idx];
+            let col_array = decode_column(&decompressed, rg.row_count as usize, col_def)?;
+            results.push((col_idx, col_array));
+        }
+
+        Ok(results)
+    }
+
+    pub fn read_columns_fast(&self, row_group: usize, column_indices: &[usize]) -> Result<crate::types::batch::RecordBatch> {
+        let columns_data = self.read_row_group_batch(row_group, column_indices)?;
+
+        let mut columns = Vec::with_capacity(column_indices.len());
+        let mut col_defs = Vec::with_capacity(column_indices.len());
+
+        for (col_idx, col_array) in columns_data {
+            columns.push(col_array);
+            col_defs.push(self.footer.schema.columns[col_idx].clone());
+        }
+
+        let schema = crate::types::batch::Schema::new(col_defs);
+        crate::types::batch::RecordBatch::try_new(schema, columns)
+    }
+
+    /// Read a single row by its global row index (sequential scan within row groups).
+    /// This is a convenience method for index-based lookups.
+    pub fn read_row_by_index(&self, global_row_idx: usize, column_names: &[String]) -> Result<crate::types::batch::RecordBatch> {
+        let mut cumulative_rows = 0usize;
+        let mut target_rg = 0;
+        let mut local_row_idx = 0;
+
+        for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
+            let rg_rows = rg.row_count as usize;
+            if global_row_idx < cumulative_rows + rg_rows {
+                target_rg = rg_idx;
+                local_row_idx = global_row_idx - cumulative_rows;
+                break;
+            }
+            cumulative_rows += rg_rows;
+        }
+
+        let mut column_indices = Vec::with_capacity(column_names.len());
+        for name in column_names {
+            if let Some(idx) = self.footer.schema.column_index(name) {
+                column_indices.push(idx);
+            }
+        }
+
+        let batch = self.read_columns_fast(target_rg, &column_indices)?;
+        
+        if batch.num_rows() == 0 {
+            return Ok(crate::types::batch::RecordBatch::empty(batch.schema.clone()));
+        }
+
+        let mut selected_columns = Vec::with_capacity(column_indices.len());
+        for (i, &col_idx) in column_indices.iter().enumerate() {
+            if let Some(col) = batch.column(i) {
+                let scalar = col.scalar(local_row_idx);
+                let mut single_col = ColumnArray::empty(col.data_type());
+                single_col.push(&scalar)?;
+                selected_columns.push(single_col);
+            }
+        }
+
+        let result_schema = crate::types::batch::Schema::new(
+            column_names.iter().zip(column_indices.iter())
+                .map(|(name, &idx)| crate::types::batch::ColumnDef {
+                    name: name.clone(),
+                    data_type: self.footer.schema.columns[idx].data_type.clone(),
+                    nullable: self.footer.schema.columns[idx].nullable,
+                })
+                .collect()
+        );
+
+        Ok(crate::types::batch::RecordBatch::try_new(result_schema, selected_columns)?)
+    }
+
     /// Read an entire row group as a RecordBatch.
     pub fn read_row_group(&self, row_group: usize) -> Result<crate::types::batch::RecordBatch> {
         let num_cols = self.footer.schema.num_columns();
@@ -721,6 +1012,17 @@ impl SegmentReader {
             columns.push(self.read_column(row_group, col_idx)?);
         }
         crate::types::batch::RecordBatch::try_new(self.footer.schema.clone(), columns)
+    }
+
+    pub fn read_row_group_with_projection(&self, row_group: usize, projection: &[usize]) -> Result<crate::types::batch::RecordBatch> {
+        let mut columns = Vec::with_capacity(projection.len());
+        let mut col_defs = Vec::with_capacity(projection.len());
+        for &col_idx in projection {
+            columns.push(self.read_column(row_group, col_idx)?);
+            col_defs.push(self.footer.schema.columns[col_idx].clone());
+        }
+        let schema = crate::types::batch::Schema::new(col_defs);
+        crate::types::batch::RecordBatch::try_new(schema, columns)
     }
 
     /// Scan all row groups and yield batches of up to `batch_size` rows.
@@ -740,6 +1042,26 @@ impl SegmentReader {
         predicate: Option<&RowGroupPredicate>,
         mut stats: Option<&mut ScanStats>,
     ) -> Result<Vec<crate::types::batch::RecordBatch>> {
+        self.scan_internal(batch_size, predicate, None, stats)
+    }
+
+    pub fn scan_with_projection_and_stats(
+        &self,
+        batch_size: usize,
+        predicate: Option<&RowGroupPredicate>,
+        projection: Option<&[usize]>,
+        mut stats: Option<&mut ScanStats>,
+    ) -> Result<Vec<crate::types::batch::RecordBatch>> {
+        self.scan_internal(batch_size, predicate, projection, stats)
+    }
+
+    fn scan_internal(
+        &self,
+        batch_size: usize,
+        predicate: Option<&RowGroupPredicate>,
+        projection: Option<&[usize]>,
+        mut stats: Option<&mut ScanStats>,
+    ) -> Result<Vec<crate::types::batch::RecordBatch>> {
         let mut batches = Vec::new();
         let total = self.footer.row_groups.len();
         if let Some(s) = stats.as_deref_mut() { s.segments_opened += 1; s.row_groups_total += total as u64; }
@@ -757,8 +1079,22 @@ impl SegmentReader {
                     continue;
                 }
             }
-            if let Some(s) = stats.as_deref_mut() { s.row_groups_read += 1; for &b in &self.footer.row_groups[rg_idx].column_compressed_sizes { s.bytes_read_compressed += b; } }
-            let mut batch = self.read_row_group(rg_idx)?;
+            if let Some(s) = stats.as_deref_mut() { s.row_groups_read += 1; 
+                if let Some(proj) = projection {
+                    for &idx in proj {
+                        if let Some(&b) = self.footer.row_groups[rg_idx].column_compressed_sizes.get(idx) {
+                            s.bytes_read_compressed += b;
+                        }
+                    }
+                } else {
+                    for &b in &self.footer.row_groups[rg_idx].column_compressed_sizes { s.bytes_read_compressed += b; }
+                }
+            }
+            let mut batch = if let Some(proj) = projection {
+                self.read_row_group_with_projection(rg_idx, proj)?
+            } else {
+                self.read_row_group(rg_idx)?
+            };
             if bitmap_active {
                 let before = batch.num_rows();
                 batch = filter_batch_by_delete_bitmap(&batch, rg_first_row, &self.footer.delete_bitmap);
@@ -855,6 +1191,21 @@ impl SegmentReader {
                 });
             }
 
+            let mut bloom_filters = Vec::with_capacity(col_count);
+            for _ in 0..col_count {
+                let has_bf = read_u8(&mut cursor)?;
+                if has_bf != 0 {
+                    let bf_len = read_u32_le(&mut cursor)? as usize;
+                    let bf_data_start = cursor.position() as usize;
+                    let bf_data = &buf[bf_data_start..bf_data_start + bf_len];
+                    let bf = BloomFilter::deserialize(bf_data);
+                    cursor.set_position((bf_data_start + bf_len) as u64);
+                    bloom_filters.push(bf);
+                } else {
+                    bloom_filters.push(None);
+                }
+            }
+
             row_groups.push(RowGroupInfo {
                 offset,
                 length,
@@ -862,6 +1213,7 @@ impl SegmentReader {
                 column_compressed_sizes: comp_sizes,
                 column_uncompressed_sizes: uncompressed_sizes,
                 zone_maps,
+                bloom_filters,
             });
         }
 

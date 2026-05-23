@@ -453,3 +453,164 @@ fn get_or_create_catalog<'a>(
     }
     Ok(catalogs.get_mut(db).unwrap())
 }
+
+use crate::sql::parser::ast::{AlterUserOperation, OrderByItem, Statement};
+
+pub fn exec_alter_user(
+    engine: &Engine,
+    name: &str,
+    operations: &[AlterUserOperation],
+) -> Result<ExecResult> {
+    for op in operations {
+        match op {
+            AlterUserOperation::SetPassword { password } => {
+                engine.auth_manager().alter_user_password(name, password)?;
+            }
+            AlterUserOperation::Lock => {
+                engine.auth_manager().lock_user(name)?;
+            }
+            AlterUserOperation::Unlock => {
+                engine.auth_manager().unlock_user(name)?;
+            }
+        }
+    }
+    tracing::info!(user = name, operations_count = operations.len(), "ALTER USER executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_show_users(engine: &Engine) -> Result<ExecResult> {
+    let users = engine.auth_manager().list_users();
+    let schema = Schema::new(vec![ColumnDef::new("User", DataType::VarChar)]);
+    let mut batch = RecordBatch::new(schema.clone());
+    for user in users {
+        batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(user)))?;
+    }
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_show_roles(engine: &Engine) -> Result<ExecResult> {
+    let roles = engine.auth_manager().list_roles();
+    let schema = Schema::new(vec![ColumnDef::new("Role", DataType::VarChar)]);
+    let mut batch = RecordBatch::new(schema.clone());
+    for role in roles {
+        batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(role)))?;
+    }
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_show_grants(
+    engine: &Engine,
+    user: &Option<String>,
+) -> Result<ExecResult> {
+    let user_name = user.clone().unwrap_or_else(|| "root".to_string());
+    let grants = engine.auth_manager().show_grants(&user_name);
+    let schema = Schema::new(vec![ColumnDef::new(format!("Grants for {}", user_name), DataType::VarChar)]);
+    let mut batch = RecordBatch::new(schema.clone());
+    for grant in grants {
+        batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(grant)))?;
+    }
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_show_partitions(
+    engine: &Engine,
+    db: &str,
+    table: &Option<String>,
+) -> Result<ExecResult> {
+    let schema = Schema::new(vec![
+        ColumnDef::new("Partition", DataType::VarChar),
+        ColumnDef::new("Rows", DataType::Int64),
+        ColumnDef::new("Size", DataType::Int64),
+    ]);
+    let batch = RecordBatch::new(schema.clone());
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_show_stats(
+    engine: &Engine,
+    db: &str,
+) -> Result<ExecResult> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let schema = Schema::new(vec![
+        ColumnDef::new("Table", DataType::VarChar),
+        ColumnDef::new("Rows", DataType::Int64),
+        ColumnDef::new("Size", DataType::Int64),
+        ColumnDef::new("LastUpdated", DataType::Timestamp),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    if let Some(catalog) = catalogs.get(db) {
+        for table_name in catalog.table_names() {
+            if let Some(meta) = catalog.get_table(&table_name) {
+                batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some(table_name)))?;
+                batch.column_mut(1).unwrap().push(&ScalarValue::Int64(Some(meta.row_count)))?;
+                batch.column_mut(2).unwrap().push(&ScalarValue::Int64(Some(0)))?;
+                batch.column_mut(3).unwrap().push(&ScalarValue::TimestampNanosecond(Some(0), None))?;
+            }
+        }
+    }
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_show_engines(engine: &Engine) -> Result<ExecResult> {
+    let schema = Schema::new(vec![
+        ColumnDef::new("Engine", DataType::VarChar),
+        ColumnDef::new("Support", DataType::VarChar),
+        ColumnDef::new("Comment", DataType::VarChar),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    batch.column_mut(0).unwrap().push(&ScalarValue::VarChar(Some("COLUMNAR".to_string())))?;
+    batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some("DEFAULT".to_string())))?;
+    batch.column_mut(2).unwrap().push(&ScalarValue::VarChar(Some("Columnar storage engine".to_string())))?;
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_show_processlist(
+    engine: &Engine,
+    full: bool,
+) -> Result<ExecResult> {
+    let schema = Schema::new(vec![
+        ColumnDef::new("Id", DataType::Int64),
+        ColumnDef::new("User", DataType::VarChar),
+        ColumnDef::new("Database", DataType::VarChar),
+        ColumnDef::new("Command", DataType::VarChar),
+        ColumnDef::new("Time", DataType::Int64),
+        ColumnDef::new("State", DataType::VarChar),
+        ColumnDef::new("Info", DataType::VarChar),
+    ]);
+    let batch = RecordBatch::new(schema.clone());
+    Ok(ExecResult::Query { schema, batches: vec![batch] })
+}
+
+pub fn exec_flush_table(
+    engine: &Engine,
+    db: &str,
+    table: &Option<String>,
+) -> Result<ExecResult> {
+    if let Some(table_name) = table {
+        let table_dir = engine.data_dir().join(db).join(table_name);
+        engine.segment_mgr().flush_all_active()?;
+        tracing::info!(db, table = table_name, "FLUSH TABLE executed");
+    } else {
+        engine.flush_all_buffers()?;
+        tracing::info!("FLUSH TABLES executed");
+    }
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+pub fn exec_optimize_table(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+) -> Result<ExecResult> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs.get(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+    
+    if catalog.get_table(table).is_none() {
+        return Err(MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)));
+    }
+    
+    engine.flush_all_buffers()?;
+    tracing::info!(db, table, "OPTIMIZE TABLE executed");
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}

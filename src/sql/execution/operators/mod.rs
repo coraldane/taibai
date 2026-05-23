@@ -35,13 +35,7 @@ pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for col_idx in 0..batch.num_columns() {
         let col = batch.column(col_idx).unwrap();
-        let mut new_col = ColumnArray::empty(col.data_type());
-        for (i, &keep) in mask.iter().enumerate() {
-            if keep {
-                new_col.push(&col.scalar(i)).unwrap();
-            }
-        }
-        columns.push(new_col);
+        columns.push(col.filter_by_mask(mask));
     }
     RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
 }

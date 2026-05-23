@@ -51,6 +51,10 @@ impl Parser {
             Token::Begin => self.parse_begin(),
             Token::Commit => self.parse_commit(),
             Token::Rollback => self.parse_rollback(),
+            Token::Flush => self.parse_flush(),
+            Token::Optimize => self.parse_optimize(),
+            Token::Pause => self.parse_pause(),
+            Token::Resume => self.parse_resume(),
             other => Err(MonaxError::Sql(format!("unexpected token: {}", other))),
         }
     }
@@ -411,7 +415,22 @@ impl Parser {
 
     fn parse_alter(&mut self) -> Result<Statement> {
         self.expect(&Token::Alter)?;
-        self.expect(&Token::Table)?;
+        match self.peek() {
+            Token::Table => {
+                self.advance();
+                self.parse_alter_table_rest()
+            },
+            Token::User => {
+                self.advance();
+                self.parse_alter_user_rest()
+            },
+            other => Err(MonaxError::Sql(format!(
+                "expected TABLE or USER after ALTER, got {}", other
+            ))),
+        }
+    }
+
+    fn parse_alter_table_rest(&mut self) -> Result<Statement> {
         let name = self.expect_ident()?;
         let mut operations = Vec::new();
         loop {
@@ -456,6 +475,49 @@ impl Parser {
             }
         }
         Ok(Statement::AlterTable { name, operations })
+    }
+
+    fn parse_alter_user_rest(&mut self) -> Result<Statement> {
+        let name = self.expect_ident()?;
+        let mut operations = Vec::new();
+        loop {
+            if self.peek() == &Token::Identified {
+                self.advance();
+                self.expect(&Token::By)?;
+                let pw = match self.peek().clone() {
+                    Token::StringLit(s) => {
+                        self.advance();
+                        s.clone()
+                    }
+                    other => Err(MonaxError::Sql(format!(
+                        "expected password string, got {}", other
+                    )))?,
+                };
+                operations.push(AlterUserOperation::SetPassword { password: pw });
+            } else if self.peek() == &Token::Password {
+                self.advance();
+                self.expect(&Token::Eq)?;
+                let pw = match self.peek().clone() {
+                    Token::StringLit(s) => {
+                        self.advance();
+                        s.clone()
+                    }
+                    other => Err(MonaxError::Sql(format!(
+                        "expected password string, got {}", other
+                    )))?,
+                };
+                operations.push(AlterUserOperation::SetPassword { password: pw });
+            } else if self.peek() == &Token::Lock {
+                self.advance();
+                operations.push(AlterUserOperation::Lock);
+            } else if self.peek() == &Token::Unlock {
+                self.advance();
+                operations.push(AlterUserOperation::Unlock);
+            } else {
+                break;
+            }
+        }
+        Ok(Statement::AlterUser { name, operations })
     }
 
     fn parse_truncate(&mut self) -> Result<Statement> {
@@ -663,7 +725,7 @@ impl Parser {
             None
         };
 
-        Ok(Statement::Select {
+        let select_stmt = Statement::Select {
             select_list,
             from,
             where_clause,
@@ -673,6 +735,73 @@ impl Parser {
             limit,
             offset,
             distinct,
+        };
+
+        self.parse_union_after_select(select_stmt)
+    }
+
+    fn parse_union_after_select(&mut self, left: Statement) -> Result<Statement> {
+        if self.peek() != &Token::Union {
+            return Ok(left);
+        }
+        self.advance();
+        let all = if self.peek() == &Token::All {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let right_raw = self.parse_select()?;
+        let right = self.parse_union_after_select(right_raw)?;
+        
+        let order_by = if self.peek() == &Token::Order {
+            self.advance();
+            self.expect(&Token::By)?;
+            let mut items = Vec::new();
+            loop {
+                let expr = self.parse_expr()?;
+                let desc = if self.peek() == &Token::Desc {
+                    self.advance();
+                    true
+                } else {
+                    if self.peek() == &Token::Asc {
+                        self.advance();
+                    }
+                    false
+                };
+                items.push(OrderByItem { expr, desc });
+                if self.peek() == &Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            items
+        } else {
+            Vec::new()
+        };
+
+        let limit = if self.peek() == &Token::Limit {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let offset = if self.peek() == &Token::Offset {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::Union {
+            left: Box::new(left),
+            right: Box::new(right),
+            all,
+            order_by,
+            limit,
+            offset,
         })
     }
 
@@ -812,8 +941,52 @@ impl Parser {
                 let table = self.expect_ident()?;
                 Ok(Statement::ShowCreateTable { table })
             }
+            Token::User => {
+                self.advance();
+                Ok(Statement::ShowUsers)
+            }
+            Token::Role => {
+                self.advance();
+                Ok(Statement::ShowRoles)
+            }
+            Token::Grants => {
+                self.advance();
+                let user = if self.peek() == &Token::For {
+                    self.advance();
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                Ok(Statement::ShowGrants { user })
+            }
+            Token::Partitions => {
+                self.advance();
+                let table = if self.peek() == &Token::From {
+                    self.advance();
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                Ok(Statement::ShowPartitions { table })
+            }
+            Token::Stats => {
+                self.advance();
+                Ok(Statement::ShowStats)
+            }
+            Token::Engines => {
+                self.advance();
+                Ok(Statement::ShowEngines)
+            }
+            Token::Processlist => {
+                self.advance();
+                let full = self.peek() == &Token::Full;
+                if full {
+                    self.advance();
+                }
+                Ok(Statement::ShowProcesslist { full })
+            }
             other => Err(MonaxError::Sql(format!(
-                "expected TABLES, DATABASES, COLUMNS, or CREATE after SHOW, got {}", other
+                "expected TABLES, DATABASES, COLUMNS, CREATE, USER, ROLE, GRANTS, PARTITIONS, STATS, ENGINES, or PROCESSLIST after SHOW, got {}", other
             ))),
         }
     }
@@ -848,6 +1021,38 @@ impl Parser {
             self.advance();
         }
         Ok(Statement::Rollback)
+    }
+
+    fn parse_flush(&mut self) -> Result<Statement> {
+        self.expect(&Token::Flush)?;
+        if self.peek() == &Token::Table {
+            self.advance();
+            let table = if matches!(self.peek(), Token::Ident(_)) {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            Ok(Statement::FlushTable { table })
+        } else {
+            Ok(Statement::FlushTable { table: None })
+        }
+    }
+
+    fn parse_optimize(&mut self) -> Result<Statement> {
+        self.expect(&Token::Optimize)?;
+        self.expect(&Token::Table)?;
+        let table = self.expect_ident()?;
+        Ok(Statement::OptimizeTable { table })
+    }
+
+    fn parse_pause(&mut self) -> Result<Statement> {
+        self.expect(&Token::Pause)?;
+        Ok(Statement::PauseFlush)
+    }
+
+    fn parse_resume(&mut self) -> Result<Statement> {
+        self.expect(&Token::Resume)?;
+        Ok(Statement::ResumeFlush)
     }
 
     // ---- Expression parsing (Pratt-style precedence) ----

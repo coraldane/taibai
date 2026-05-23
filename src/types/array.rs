@@ -416,3 +416,187 @@ mod tests {
         assert_eq!(col1.scalar(2), ScalarValue::Int64(Some(3)));
     }
 }
+
+impl ColumnArray {
+    pub fn eq_vec(&self, value: &ScalarValue) -> Vec<bool> {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        match (self, value) {
+            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] == *v).collect()
+            }
+            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] == *v).collect()
+            }
+            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && &data[i] == v).collect()
+            }
+            _ => vec![false; num_rows],
+        }
+    }
+
+    pub fn lt_vec(&self, value: &ScalarValue) -> Vec<bool> {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        match (self, value) {
+            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] < *v).collect()
+            }
+            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] < *v).collect()
+            }
+            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && &data[i] < v).collect()
+            }
+            _ => vec![false; num_rows],
+        }
+    }
+
+    pub fn le_vec(&self, value: &ScalarValue) -> Vec<bool> {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        match (self, value) {
+            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] <= *v).collect()
+            }
+            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] <= *v).collect()
+            }
+            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && &data[i] <= v).collect()
+            }
+            _ => vec![false; num_rows],
+        }
+    }
+
+    pub fn gt_vec(&self, value: &ScalarValue) -> Vec<bool> {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        match (self, value) {
+            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] > *v).collect()
+            }
+            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] > *v).collect()
+            }
+            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && &data[i] > v).collect()
+            }
+            _ => vec![false; num_rows],
+        }
+    }
+
+    pub fn ge_vec(&self, value: &ScalarValue) -> Vec<bool> {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        match (self, value) {
+            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] >= *v).collect()
+            }
+            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && data[i] >= *v).collect()
+            }
+            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
+                (0..num_rows).map(|i| !bitmap.is_null(i) && &data[i] >= v).collect()
+            }
+            _ => vec![false; num_rows],
+        }
+    }
+
+    pub fn is_null_vec(&self) -> Vec<bool> {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        (0..num_rows).map(|i| bitmap.is_null(i)).collect()
+    }
+
+    pub fn is_not_null_vec(&self) -> Vec<bool> {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        (0..num_rows).map(|i| !bitmap.is_null(i)).collect()
+    }
+
+    pub fn filter_by_mask(&self, mask: &[bool]) -> ColumnArray {
+        let mut new_col = ColumnArray::empty(self.data_type());
+        for (i, &keep) in mask.iter().enumerate() {
+            if keep {
+                new_col.push(&self.scalar(i)).unwrap();
+            }
+        }
+        new_col
+    }
+
+    pub fn filter_by_mask_fast(&self, mask: &[bool], match_count: usize) -> ColumnArray {
+        match self {
+            ColumnArray::Int64 { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(match_count);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(match_count);
+                for (i, &keep) in mask.iter().enumerate() {
+                    if keep {
+                        new_data.push(data[i]);
+                        if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
+                    }
+                }
+                ColumnArray::Int64 { data: new_data, bitmap: new_bitmap }
+            }
+            ColumnArray::Int32 { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(match_count);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(match_count);
+                for (i, &keep) in mask.iter().enumerate() {
+                    if keep {
+                        new_data.push(data[i]);
+                        if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
+                    }
+                }
+                ColumnArray::Int32 { data: new_data, bitmap: new_bitmap }
+            }
+            ColumnArray::VarChar { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(match_count);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(match_count);
+                for (i, &keep) in mask.iter().enumerate() {
+                    if keep {
+                        new_data.push(data[i].clone());
+                        if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
+                    }
+                }
+                ColumnArray::VarChar { data: new_data, bitmap: new_bitmap }
+            }
+            _ => self.filter_by_mask(mask)
+        }
+    }
+
+    pub fn slice_fast(&self, start: usize, end: usize) -> ColumnArray {
+        match self {
+            ColumnArray::Int64 { data, bitmap } => {
+                let new_data = data[start..end].to_vec();
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(end - start);
+                for i in start..end {
+                    if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
+                }
+                ColumnArray::Int64 { data: new_data, bitmap: new_bitmap }
+            }
+            ColumnArray::Int32 { data, bitmap } => {
+                let new_data = data[start..end].to_vec();
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(end - start);
+                for i in start..end {
+                    if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
+                }
+                ColumnArray::Int32 { data: new_data, bitmap: new_bitmap }
+            }
+            ColumnArray::VarChar { data, bitmap } => {
+                let new_data = data[start..end].to_vec();
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(end - start);
+                for i in start..end {
+                    if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
+                }
+                ColumnArray::VarChar { data: new_data, bitmap: new_bitmap }
+            }
+            _ => {
+                let mut new_col = ColumnArray::empty(self.data_type());
+                for i in start..end {
+                    new_col.push(&self.scalar(i)).unwrap();
+                }
+                new_col
+            }
+        }
+    }
+}

@@ -20,6 +20,22 @@ pub enum PermissionType {
     Truncate,
 }
 
+impl PermissionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PermissionType::All => "ALL",
+            PermissionType::Select => "SELECT",
+            PermissionType::Insert => "INSERT",
+            PermissionType::Update => "UPDATE",
+            PermissionType::Delete => "DELETE",
+            PermissionType::Create => "CREATE",
+            PermissionType::Drop => "DROP",
+            PermissionType::Alter => "ALTER",
+            PermissionType::Truncate => "TRUNCATE",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Permission {
     pub permission_type: PermissionType,
@@ -41,6 +57,8 @@ pub struct UserInfo {
     pub roles: Vec<String>,
     pub permissions: Vec<Permission>,
     pub created_at: i64,
+    #[serde(default)]
+    pub account_locked: bool,
 }
 
 impl UserInfo {
@@ -56,6 +74,7 @@ impl UserInfo {
             roles: Vec::new(),
             permissions: Vec::new(),
             created_at: now,
+            account_locked: false,
         }
     }
 
@@ -232,6 +251,54 @@ impl AuthStore {
     pub fn get_role(&self, name: &str) -> Option<&RoleInfo> {
         self.roles.get(name)
     }
+
+    pub fn alter_user_password(&mut self, name: &str, password: &str) -> Result<()> {
+        if let Some(user) = self.users.get_mut(name) {
+            user.password_hash = hash_password(password);
+            Ok(())
+        } else {
+            Err(MonaxError::Sql(format!("user '{}' does not exist", name)))
+        }
+    }
+
+    pub fn lock_user(&mut self, name: &str) -> Result<()> {
+        if let Some(user) = self.users.get_mut(name) {
+            user.account_locked = true;
+            Ok(())
+        } else {
+            Err(MonaxError::Sql(format!("user '{}' does not exist", name)))
+        }
+    }
+
+    pub fn unlock_user(&mut self, name: &str) -> Result<()> {
+        if let Some(user) = self.users.get_mut(name) {
+            user.account_locked = false;
+            Ok(())
+        } else {
+            Err(MonaxError::Sql(format!("user '{}' does not exist", name)))
+        }
+    }
+
+    pub fn list_users(&self) -> Vec<String> {
+        self.users.keys().cloned().collect()
+    }
+
+    pub fn list_roles(&self) -> Vec<String> {
+        self.roles.keys().cloned().collect()
+    }
+
+    pub fn show_grants(&self, name: &str) -> Vec<String> {
+        if let Some(user) = self.users.get(name) {
+            user.permissions.iter().map(|p| {
+                format!("GRANT {} ON {} TO {}", 
+                    p.permission_type.as_str(),
+                    p.object_name,
+                    name)
+            }).collect()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 pub struct AuthManager {
@@ -305,5 +372,46 @@ impl AuthManager {
             Some(user) => user.has_permission(perm_type, object_type, object_name),
             None => false,
         }
+    }
+
+    pub fn alter_user_password(&self, name: &str, password: &str) -> Result<()> {
+        let mut store = self.store.write().unwrap();
+        store.alter_user_password(name, password)?;
+        store.save(&self.path)?;
+        Ok(())
+    }
+
+    pub fn lock_user(&self, name: &str) -> Result<()> {
+        let mut store = self.store.write().unwrap();
+        store.lock_user(name)?;
+        store.save(&self.path)?;
+        Ok(())
+    }
+
+    pub fn unlock_user(&self, name: &str) -> Result<()> {
+        let mut store = self.store.write().unwrap();
+        store.unlock_user(name)?;
+        store.save(&self.path)?;
+        Ok(())
+    }
+
+    pub fn list_users(&self) -> Vec<String> {
+        let store = self.store.read().unwrap();
+        store.list_users()
+    }
+
+    pub fn list_roles(&self) -> Vec<String> {
+        let store = self.store.read().unwrap();
+        store.list_roles()
+    }
+
+    pub fn show_grants(&self, name: &str) -> Vec<String> {
+        let store = self.store.read().unwrap();
+        store.show_grants(name)
+    }
+
+    pub fn is_locked(&self, name: &str) -> bool {
+        let store = self.store.read().unwrap();
+        store.get_user(name).map(|u| u.account_locked).unwrap_or(false)
     }
 }
