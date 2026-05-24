@@ -143,7 +143,8 @@ impl FunctionRegistry {
     }
 
     fn register_alias(&mut self, alias: &str, canonical: &str) {
-        self.aliases.insert(alias.to_lowercase(), canonical.to_lowercase());
+        self.aliases
+            .insert(alias.to_lowercase(), canonical.to_lowercase());
     }
 
     /// Look up a function by name (case-insensitive, with alias support).

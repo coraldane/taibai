@@ -222,6 +222,8 @@ impl SegmentWriter {
         delete_bitmap: &[u8],
         deleted_row_count: u64,
     ) -> Result<Vec<u8>> {
+        let segment_zone_maps = compute_segment_zone_maps(&self.row_groups, self.schema.num_columns());
+
         Ok(encode_segment_footer(
             &self.schema,
             self.total_rows,
@@ -229,6 +231,7 @@ impl SegmentWriter {
             delete_bitmap,
             deleted_row_count,
             "",
+            &segment_zone_maps,
         ))
     }
 }
@@ -253,6 +256,7 @@ pub fn encode_segment_footer(
     delete_bitmap: &[u8],
     deleted_row_count: u64,
     table_name: &str,
+    segment_zone_maps: &[ZoneMap],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(FOOTER_SIZE);
 
@@ -279,6 +283,19 @@ pub fn encode_segment_footer(
         buf.push(if col.nullable { 1 } else { 0 });
         buf.extend_from_slice(&(col.scale as u32).to_le_bytes());
         buf.extend_from_slice(&(col.precision as u32).to_le_bytes());
+    }
+
+    if !segment_zone_maps.is_empty() {
+        buf.push(1);
+        buf.extend_from_slice(&(segment_zone_maps.len() as u32).to_le_bytes());
+        for zm in segment_zone_maps {
+            encode_scalar_with_tag(&mut buf, &zm.min_value);
+            encode_scalar_with_tag(&mut buf, &zm.max_value);
+            buf.extend_from_slice(&zm.null_count.to_le_bytes());
+            buf.extend_from_slice(&zm.row_count.to_le_bytes());
+        }
+    } else {
+        buf.push(0);
     }
 
     for rg in row_groups {
@@ -354,4 +371,55 @@ fn update_zone_map(
             }
         }
     }
+}
+
+fn compute_segment_zone_maps(row_groups: &[crate::storage::segment::RowGroupMeta], num_columns: usize) -> Vec<ZoneMap> {
+    if row_groups.is_empty() {
+        return Vec::new();
+    }
+
+    let mut segment_maps = Vec::with_capacity(num_columns);
+    for col_idx in 0..num_columns {
+        let mut seg_min: Option<ScalarValue> = None;
+        let mut seg_max: Option<ScalarValue> = None;
+        let mut total_null_count: u64 = 0;
+        let mut total_row_count: u64 = 0;
+
+        for rg in row_groups {
+            if let Some(zm) = rg.zone_maps.get(col_idx) {
+                total_row_count += zm.row_count;
+                total_null_count += zm.null_count;
+
+                if !zm.min_value.is_null() {
+                    match &seg_min {
+                        None => seg_min = Some(zm.min_value.clone()),
+                        Some(m) => {
+                            if crate::storage::sort_key::scalar_lt(&zm.min_value, m) {
+                                seg_min = Some(zm.min_value.clone());
+                            }
+                        }
+                    }
+                }
+                if !zm.max_value.is_null() {
+                    match &seg_max {
+                        None => seg_max = Some(zm.max_value.clone()),
+                        Some(m) => {
+                            if crate::storage::sort_key::scalar_lt(m, &zm.max_value) {
+                                seg_max = Some(zm.max_value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        segment_maps.push(ZoneMap {
+            min_value: seg_min.unwrap_or_else(|| ScalarValue::Int64(None)),
+            max_value: seg_max.unwrap_or_else(|| ScalarValue::Int64(None)),
+            null_count: total_null_count,
+            row_count: total_row_count,
+        });
+    }
+
+    segment_maps
 }

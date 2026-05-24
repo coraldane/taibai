@@ -529,7 +529,7 @@ impl ColumnArray {
         match self {
             ColumnArray::Int64 { data, bitmap } => {
                 let mut new_data = Vec::with_capacity(match_count);
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(match_count);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for (i, &keep) in mask.iter().enumerate() {
                     if keep {
                         new_data.push(data[i]);
@@ -540,7 +540,7 @@ impl ColumnArray {
             }
             ColumnArray::Int32 { data, bitmap } => {
                 let mut new_data = Vec::with_capacity(match_count);
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(match_count);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for (i, &keep) in mask.iter().enumerate() {
                     if keep {
                         new_data.push(data[i]);
@@ -551,7 +551,7 @@ impl ColumnArray {
             }
             ColumnArray::VarChar { data, bitmap } => {
                 let mut new_data = Vec::with_capacity(match_count);
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(match_count);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for (i, &keep) in mask.iter().enumerate() {
                     if keep {
                         new_data.push(data[i].clone());
@@ -568,7 +568,7 @@ impl ColumnArray {
         match self {
             ColumnArray::Int64 { data, bitmap } => {
                 let new_data = data[start..end].to_vec();
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(end - start);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for i in start..end {
                     if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
                 }
@@ -576,7 +576,7 @@ impl ColumnArray {
             }
             ColumnArray::Int32 { data, bitmap } => {
                 let new_data = data[start..end].to_vec();
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(end - start);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for i in start..end {
                     if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
                 }
@@ -584,7 +584,7 @@ impl ColumnArray {
             }
             ColumnArray::VarChar { data, bitmap } => {
                 let new_data = data[start..end].to_vec();
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(end - start);
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for i in start..end {
                     if bitmap.is_null(i) { new_bitmap.push_null(); } else { new_bitmap.push_valid(); }
                 }

@@ -26,21 +26,21 @@ fn apply_partition_pruning(plan: LogicalPlan) -> (LogicalPlan, bool) {
             if let LogicalPlan::Scan(ref mut scan) = *filter.input {
                 let time_range = extract_time_range(&filter.predicate, &scan.schema);
                 let partition_filter = extract_partition_filter(&filter.predicate, &scan.schema);
-                
+
                 let mut any_changed = changed;
-                
+
                 if let Some(tr) = time_range {
                     let is_new = scan.time_range.is_none();
                     scan.time_range = Some(tr);
                     any_changed = any_changed || is_new;
                 }
-                
+
                 if let Some(pf) = partition_filter {
                     let is_new = scan.partition_filter.is_none();
                     scan.partition_filter = Some(pf);
                     any_changed = any_changed || is_new;
                 }
-                
+
                 if any_changed != changed {
                     return (LogicalPlan::Filter(filter), any_changed);
                 }
@@ -88,49 +88,47 @@ fn apply_partition_pruning(plan: LogicalPlan) -> (LogicalPlan, bool) {
 
 fn extract_time_range(expr: &LogicalExpr, schema: &Schema) -> Option<TimeRange> {
     match expr {
-        LogicalExpr::BinaryOp { left, op, right } => {
-            match op {
-                BinOp::Gte | BinOp::Gt => {
-                    if let LogicalExpr::Column(idx) = **left {
-                        if let LogicalExpr::Literal(ref val) = **right {
-                            let col_name = schema.columns.get(idx)?.name.clone();
-                            return Some(TimeRange {
-                                column: col_name,
-                                start: Some(val.clone()),
-                                end: None,
-                            });
-                        }
+        LogicalExpr::BinaryOp { left, op, right } => match op {
+            BinOp::Gte | BinOp::Gt => {
+                if let LogicalExpr::Column(idx) = **left {
+                    if let LogicalExpr::Literal(ref val) = **right {
+                        let col_name = schema.columns.get(idx)?.name.clone();
+                        return Some(TimeRange {
+                            column: col_name,
+                            start: Some(val.clone()),
+                            end: None,
+                        });
                     }
                 }
-                BinOp::Lte | BinOp::Lt => {
-                    if let LogicalExpr::Column(idx) = **left {
-                        if let LogicalExpr::Literal(ref val) = **right {
-                            let col_name = schema.columns.get(idx)?.name.clone();
-                            return Some(TimeRange {
-                                column: col_name,
-                                start: None,
-                                end: Some(val.clone()),
-                            });
-                        }
-                    }
-                }
-                BinOp::And => {
-                    let left_range = extract_time_range(left, schema);
-                    let right_range = extract_time_range(right, schema);
-                    if let (Some(l), Some(r)) = (&left_range, &right_range) {
-                        if l.column == r.column {
-                            return Some(TimeRange {
-                                column: l.column.clone(),
-                                start: l.start.as_ref().or(r.start.as_ref()).cloned(),
-                                end: r.end.as_ref().or(l.end.as_ref()).cloned(),
-                            });
-                        }
-                    }
-                    return left_range.or(right_range);
-                }
-                _ => {}
             }
-        }
+            BinOp::Lte | BinOp::Lt => {
+                if let LogicalExpr::Column(idx) = **left {
+                    if let LogicalExpr::Literal(ref val) = **right {
+                        let col_name = schema.columns.get(idx)?.name.clone();
+                        return Some(TimeRange {
+                            column: col_name,
+                            start: None,
+                            end: Some(val.clone()),
+                        });
+                    }
+                }
+            }
+            BinOp::And => {
+                let left_range = extract_time_range(left, schema);
+                let right_range = extract_time_range(right, schema);
+                if let (Some(l), Some(r)) = (&left_range, &right_range) {
+                    if l.column == r.column {
+                        return Some(TimeRange {
+                            column: l.column.clone(),
+                            start: l.start.as_ref().or(r.start.as_ref()).cloned(),
+                            end: r.end.as_ref().or(l.end.as_ref()).cloned(),
+                        });
+                    }
+                }
+                return left_range.or(right_range);
+            }
+            _ => {}
+        },
         _ => {}
     }
     None
@@ -138,51 +136,55 @@ fn extract_time_range(expr: &LogicalExpr, schema: &Schema) -> Option<TimeRange> 
 
 fn extract_partition_filter(expr: &LogicalExpr, schema: &Schema) -> Option<PartitionFilter> {
     match expr {
-        LogicalExpr::BinaryOp { left, op, right } => {
-            match op {
-                BinOp::Eq => {
-                    if let LogicalExpr::Column(idx) = **left {
-                        if let LogicalExpr::Literal(ref val) = **right {
-                            let col_name = schema.columns.get(idx)?.name.clone();
-                            return Some(PartitionFilter {
-                                column: col_name,
-                                values: vec![val.clone()],
-                            });
-                        }
-                    }
-                    if let LogicalExpr::Column(idx) = **right {
-                        if let LogicalExpr::Literal(ref val) = **left {
-                            let col_name = schema.columns.get(idx)?.name.clone();
-                            return Some(PartitionFilter {
-                                column: col_name,
-                                values: vec![val.clone()],
-                            });
-                        }
+        LogicalExpr::BinaryOp { left, op, right } => match op {
+            BinOp::Eq => {
+                if let LogicalExpr::Column(idx) = **left {
+                    if let LogicalExpr::Literal(ref val) = **right {
+                        let col_name = schema.columns.get(idx)?.name.clone();
+                        return Some(PartitionFilter {
+                            column: col_name,
+                            values: vec![val.clone()],
+                        });
                     }
                 }
-                BinOp::And => {
-                    let left_filter = extract_partition_filter(left, schema);
-                    let right_filter = extract_partition_filter(right, schema);
-                    if let (Some(l), Some(r)) = (&left_filter, &right_filter) {
-                        if l.column == r.column {
-                            let merged_values: Vec<ScalarValue> = l.values.iter()
-                                .filter(|v| r.values.contains(v))
-                                .cloned()
-                                .collect();
-                            if !merged_values.is_empty() {
-                                return Some(PartitionFilter {
-                                    column: l.column.clone(),
-                                    values: merged_values,
-                                });
-                            }
-                        }
+                if let LogicalExpr::Column(idx) = **right {
+                    if let LogicalExpr::Literal(ref val) = **left {
+                        let col_name = schema.columns.get(idx)?.name.clone();
+                        return Some(PartitionFilter {
+                            column: col_name,
+                            values: vec![val.clone()],
+                        });
                     }
-                    return left_filter.or(right_filter);
                 }
-                _ => {}
             }
-        }
-        LogicalExpr::In { expr, values, negated: false } => {
+            BinOp::And => {
+                let left_filter = extract_partition_filter(left, schema);
+                let right_filter = extract_partition_filter(right, schema);
+                if let (Some(l), Some(r)) = (&left_filter, &right_filter) {
+                    if l.column == r.column {
+                        let merged_values: Vec<ScalarValue> = l
+                            .values
+                            .iter()
+                            .filter(|v| r.values.contains(v))
+                            .cloned()
+                            .collect();
+                        if !merged_values.is_empty() {
+                            return Some(PartitionFilter {
+                                column: l.column.clone(),
+                                values: merged_values,
+                            });
+                        }
+                    }
+                }
+                return left_filter.or(right_filter);
+            }
+            _ => {}
+        },
+        LogicalExpr::In {
+            expr,
+            values,
+            negated: false,
+        } => {
             if let LogicalExpr::Column(idx) = **expr {
                 let col_name = schema.columns.get(idx)?.name.clone();
                 return Some(PartitionFilter {

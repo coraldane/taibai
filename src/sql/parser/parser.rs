@@ -17,7 +17,11 @@ impl Parser {
     pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         let mut lexer = Lexer::new(sql);
         let tokens = lexer.tokenize()?;
-        let mut parser = Parser { tokens, pos: 0, placeholder_count: 0 };
+        let mut parser = Parser {
+            tokens,
+            pos: 0,
+            placeholder_count: 0,
+        };
         let mut stmts = Vec::new();
         loop {
             if parser.peek() == &Token::Eof {
@@ -68,7 +72,10 @@ impl Parser {
             false
         };
         let inner = self.parse_statement()?;
-        Ok(Statement::Explain { analyze, stmt: Box::new(inner) })
+        Ok(Statement::Explain {
+            analyze,
+            stmt: Box::new(inner),
+        })
     }
 
     // ---- CREATE TABLE ----
@@ -81,7 +88,8 @@ impl Parser {
             Token::User => self.parse_create_user(),
             Token::Role => self.parse_create_role(),
             other => Err(MonaxError::Sql(format!(
-                "expected TABLE, DATABASE, USER, or ROLE after CREATE, got {}", other
+                "expected TABLE, DATABASE, USER, or ROLE after CREATE, got {}",
+                other
             ))),
         }
     }
@@ -99,7 +107,8 @@ impl Parser {
                 s.clone()
             }
             other => Err(MonaxError::Sql(format!(
-                "expected credential string, got {}", other
+                "expected credential string, got {}",
+                other
             )))?,
         };
         Ok(Statement::CreateUser { name, password: pw })
@@ -122,7 +131,10 @@ impl Parser {
             false
         };
         let name = self.expect_ident()?;
-        Ok(Statement::CreateDatabase { name, if_not_exists })
+        Ok(Statement::CreateDatabase {
+            name,
+            if_not_exists,
+        })
     }
 
     fn parse_create_table_rest(&mut self) -> Result<Statement> {
@@ -181,7 +193,7 @@ impl Parser {
             self.advance();
             self.expect(&Token::By)?;
             let first_token = self.expect_ident()?.to_uppercase();
-            
+
             let (strategy, column, param) = if first_token == "HASH" {
                 self.expect(&Token::LeftParen)?;
                 let col = self.expect_ident()?;
@@ -207,8 +219,12 @@ impl Parser {
             } else {
                 (PartitionStrategy::Value, first_token, None)
             };
-            
-            Some(PartitionDef { column, strategy, param })
+
+            Some(PartitionDef {
+                column,
+                strategy,
+                param,
+            })
         } else {
             None
         };
@@ -261,7 +277,10 @@ impl Parser {
             return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
         }
         if data_type == DataType::Decimal && scale > 18 {
-            return Err(MonaxError::Sql(format!("decimal scale {} exceeds supported maximum 18", scale)));
+            return Err(MonaxError::Sql(format!(
+                "decimal scale {} exceeds supported maximum 18",
+                scale
+            )));
         }
 
         Ok(ColumnDefAst {
@@ -284,7 +303,8 @@ impl Parser {
             Token::User => self.parse_drop_user(),
             Token::Role => self.parse_drop_role(),
             other => Err(MonaxError::Sql(format!(
-                "expected TABLE, DATABASE, USER, or ROLE after DROP, got {}", other
+                "expected TABLE, DATABASE, USER, or ROLE after DROP, got {}",
+                other
             ))),
         }
     }
@@ -340,7 +360,11 @@ impl Parser {
         };
         self.expect(&Token::From)?;
         let from = self.expect_ident()?;
-        Ok(Statement::Revoke { privileges, on, from })
+        Ok(Statement::Revoke {
+            privileges,
+            on,
+            from,
+        })
     }
 
     fn parse_privileges(&mut self) -> Result<Vec<Privilege>> {
@@ -397,7 +421,8 @@ impl Parser {
                 }
             }
             other => Err(MonaxError::Sql(format!(
-                "expected TABLE, DATABASE, or identifier after ON, got {}", other
+                "expected TABLE, DATABASE, or identifier after ON, got {}",
+                other
             ))),
         }
     }
@@ -436,13 +461,14 @@ impl Parser {
             Token::Table => {
                 self.advance();
                 self.parse_alter_table_rest()
-            },
+            }
             Token::User => {
                 self.advance();
                 self.parse_alter_user_rest()
-            },
+            }
             other => Err(MonaxError::Sql(format!(
-                "expected TABLE or USER after ALTER, got {}", other
+                "expected TABLE or USER after ALTER, got {}",
+                other
             ))),
         }
     }
@@ -488,7 +514,9 @@ impl Parser {
                     let partition_key = self.expect_ident()?;
                     AlterOperation::TruncatePartition { partition_key }
                 } else {
-                    return Err(MonaxError::Sql("expected PARTITION after TRUNCATE in ALTER TABLE".into()));
+                    return Err(MonaxError::Sql(
+                        "expected PARTITION after TRUNCATE in ALTER TABLE".into(),
+                    ));
                 }
             } else if self.peek() == &Token::Rename {
                 self.advance();
@@ -536,7 +564,8 @@ impl Parser {
                         s.clone()
                     }
                     other => Err(MonaxError::Sql(format!(
-                        "expected password string, got {}", other
+                        "expected password string, got {}",
+                        other
                     )))?,
                 };
                 operations.push(AlterUserOperation::SetPassword { password: pw });
@@ -549,7 +578,8 @@ impl Parser {
                         s.clone()
                     }
                     other => Err(MonaxError::Sql(format!(
-                        "expected password string, got {}", other
+                        "expected password string, got {}",
+                        other
                     )))?,
                 };
                 operations.push(AlterUserOperation::SetPassword { password: pw });
@@ -799,7 +829,7 @@ impl Parser {
         };
         let right_raw = self.parse_select()?;
         let right = self.parse_union_after_select(right_raw)?;
-        
+
         let order_by = if self.peek() == &Token::Order {
             self.advance();
             self.expect(&Token::By)?;
@@ -864,11 +894,19 @@ impl Parser {
                     Some(self.expect_ident()?)
                 } else if matches!(self.peek(), Token::Ident(_)) {
                     let next = self.peek();
-                    if !matches!(next,
-                        Token::From | Token::Where | Token::Group |
-                        Token::Order | Token::Limit | Token::Offset |
-                        Token::Comma | Token::Semicolon | Token::Eof |
-                        Token::Union | Token::Having
+                    if !matches!(
+                        next,
+                        Token::From
+                            | Token::Where
+                            | Token::Group
+                            | Token::Order
+                            | Token::Limit
+                            | Token::Offset
+                            | Token::Comma
+                            | Token::Semicolon
+                            | Token::Eof
+                            | Token::Union
+                            | Token::Having
                     ) {
                         Some(self.expect_ident()?)
                     } else {
@@ -897,7 +935,8 @@ impl Parser {
         // Check for JOINs (including INNER, LEFT, CROSS variations)
         let mut joins = Vec::new();
         loop {
-            let is_join = matches!(self.peek(),
+            let is_join = matches!(
+                self.peek(),
                 Token::Join | Token::Inner | Token::Left | Token::Cross
             );
             if !is_join {
@@ -925,10 +964,21 @@ impl Parser {
             // Check if next token could be a keyword that starts a new clause
             // If not, treat as implicit alias
             let next = self.peek();
-            if !matches!(next,
-                Token::Join | Token::Inner | Token::Left | Token::Right |
-                Token::Cross | Token::On | Token::Where | Token::Group |
-                Token::Order | Token::Limit | Token::Offset | Token::Semicolon | Token::Eof
+            if !matches!(
+                next,
+                Token::Join
+                    | Token::Inner
+                    | Token::Left
+                    | Token::Right
+                    | Token::Cross
+                    | Token::On
+                    | Token::Where
+                    | Token::Group
+                    | Token::Order
+                    | Token::Limit
+                    | Token::Offset
+                    | Token::Semicolon
+                    | Token::Eof
             ) {
                 Some(self.expect_ident()?)
             } else {
@@ -971,7 +1021,11 @@ impl Parser {
             None
         };
 
-        Ok(JoinClause { join_type, right, condition })
+        Ok(JoinClause {
+            join_type,
+            right,
+            condition,
+        })
     }
 
     // ---- SHOW ----
@@ -1241,7 +1295,10 @@ impl Parser {
                 if self.peek() == &Token::Dot {
                     self.advance();
                     let column = self.expect_ident()?;
-                    Ok(Expr::QualifiedColumn { table: name, column })
+                    Ok(Expr::QualifiedColumn {
+                        table: name,
+                        column,
+                    })
                 } else if self.peek() == &Token::LeftParen {
                     // Check for function call
                     self.advance();
@@ -1268,7 +1325,11 @@ impl Parser {
                         }
                     }
                     self.expect(&Token::RightParen)?;
-                    Ok(Expr::Function { name, args, distinct })
+                    Ok(Expr::Function {
+                        name,
+                        args,
+                        distinct,
+                    })
                 } else if self.peek() == &Token::Ident("IS".into()) {
                     // Check for IS NULL / IS NOT NULL
                     self.advance();
@@ -1292,7 +1353,8 @@ impl Parser {
                     Token::Min => "MIN",
                     Token::Max => "MAX",
                     _ => unreachable!(),
-                }.to_string();
+                }
+                .to_string();
                 self.advance();
                 // Must be followed by (
                 self.expect(&Token::LeftParen)?;
@@ -1319,7 +1381,11 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RightParen)?;
-                Ok(Expr::Function { name, args, distinct })
+                Ok(Expr::Function {
+                    name,
+                    args,
+                    distinct,
+                })
             }
             Token::LeftParen => {
                 self.advance();
@@ -1334,7 +1400,8 @@ impl Parser {
                 Ok(Expr::Placeholder(idx))
             }
             ref other => Err(MonaxError::Sql(format!(
-                "unexpected token in expression: {}", other
+                "unexpected token in expression: {}",
+                other
             ))),
         }
     }
@@ -1358,7 +1425,8 @@ impl Parser {
             Ok(tok)
         } else {
             Err(MonaxError::Sql(format!(
-                "expected '{}', got '{}'", expected, tok
+                "expected '{}', got '{}'",
+                expected, tok
             )))
         }
     }
@@ -1372,7 +1440,10 @@ impl Parser {
             }
             other => Err(MonaxError::Sql(format!(
                 "expected identifier, got '{}'",
-                other.as_ref().map(|t| t.to_string()).unwrap_or("EOF".into())
+                other
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or("EOF".into())
             ))),
         }
     }
@@ -1386,7 +1457,10 @@ impl Parser {
             }
             other => Err(MonaxError::Sql(format!(
                 "expected integer, got '{}'",
-                other.as_ref().map(|t| t.to_string()).unwrap_or("EOF".into())
+                other
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or("EOF".into())
             ))),
         }
     }
@@ -1423,12 +1497,17 @@ mod tests {
 
     #[test]
     fn test_create_table() {
-        let stmts = Parser::parse(
-            "CREATE TABLE users (id INT64 NOT NULL, name VARCHAR, age INT32)"
-        ).unwrap();
+        let stmts =
+            Parser::parse("CREATE TABLE users (id INT64 NOT NULL, name VARCHAR, age INT32)")
+                .unwrap();
         assert_eq!(stmts.len(), 1);
         match &stmts[0] {
-            Statement::CreateTable { name, columns, if_not_exists, .. } => {
+            Statement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+                ..
+            } => {
                 assert_eq!(name, "users");
                 assert_eq!(columns.len(), 3);
                 assert_eq!(columns[0].name, "id");
@@ -1444,9 +1523,7 @@ mod tests {
 
     #[test]
     fn test_create_table_if_not_exists() {
-        let stmts = Parser::parse(
-            "CREATE TABLE IF NOT EXISTS t (id INT64)"
-        ).unwrap();
+        let stmts = Parser::parse("CREATE TABLE IF NOT EXISTS t (id INT64)").unwrap();
         match &stmts[0] {
             Statement::CreateTable { if_not_exists, .. } => {
                 assert!(if_not_exists);
@@ -1469,11 +1546,14 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        let stmts = Parser::parse(
-            "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')"
-        ).unwrap();
+        let stmts =
+            Parser::parse("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
         match &stmts[0] {
-            Statement::Insert { table, columns, values } => {
+            Statement::Insert {
+                table,
+                columns,
+                values,
+            } => {
                 assert_eq!(table, "users");
                 assert_eq!(columns, &vec!["id", "name"]);
                 assert_eq!(values.len(), 2);
@@ -1486,7 +1566,12 @@ mod tests {
     fn test_select_star() {
         let stmts = Parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
         match &stmts[0] {
-            Statement::Select { select_list, from, where_clause, .. } => {
+            Statement::Select {
+                select_list,
+                from,
+                where_clause,
+                ..
+            } => {
                 assert_eq!(select_list.len(), 1);
                 assert!(matches!(&select_list[0], SelectItem::Star));
                 assert!(from.is_some());
@@ -1498,9 +1583,15 @@ mod tests {
 
     #[test]
     fn test_select_with_limit() {
-        let stmts = Parser::parse("SELECT id, name FROM t ORDER BY id DESC LIMIT 10 OFFSET 5").unwrap();
+        let stmts =
+            Parser::parse("SELECT id, name FROM t ORDER BY id DESC LIMIT 10 OFFSET 5").unwrap();
         match &stmts[0] {
-            Statement::Select { order_by, limit, offset, .. } => {
+            Statement::Select {
+                order_by,
+                limit,
+                offset,
+                ..
+            } => {
                 assert_eq!(order_by.len(), 1);
                 assert!(order_by[0].desc);
                 assert!(limit.is_some());
@@ -1548,15 +1639,22 @@ mod tests {
 
     #[test]
     fn test_multiple_statements() {
-        let stmts = Parser::parse("CREATE TABLE t (id INT64); INSERT INTO t VALUES (1); SELECT * FROM t").unwrap();
+        let stmts =
+            Parser::parse("CREATE TABLE t (id INT64); INSERT INTO t VALUES (1); SELECT * FROM t")
+                .unwrap();
         assert_eq!(stmts.len(), 3);
     }
 
     #[test]
     fn test_update() {
-        let stmts = Parser::parse("UPDATE users SET name = 'Alice', age = 30 WHERE id = 1").unwrap();
+        let stmts =
+            Parser::parse("UPDATE users SET name = 'Alice', age = 30 WHERE id = 1").unwrap();
         match &stmts[0] {
-            Statement::Update { table, assignments, where_clause } => {
+            Statement::Update {
+                table,
+                assignments,
+                where_clause,
+            } => {
                 assert_eq!(table, "users");
                 assert_eq!(assignments.len(), 2);
                 assert_eq!(assignments[0].column, "name");
@@ -1571,7 +1669,11 @@ mod tests {
     fn test_update_without_where() {
         let stmts = Parser::parse("UPDATE t SET col = 123").unwrap();
         match &stmts[0] {
-            Statement::Update { table, assignments, where_clause } => {
+            Statement::Update {
+                table,
+                assignments,
+                where_clause,
+            } => {
                 assert_eq!(table, "t");
                 assert_eq!(assignments.len(), 1);
                 assert!(where_clause.is_none());
@@ -1584,7 +1686,10 @@ mod tests {
     fn test_delete() {
         let stmts = Parser::parse("DELETE FROM users WHERE id = 1").unwrap();
         match &stmts[0] {
-            Statement::Delete { table, where_clause } => {
+            Statement::Delete {
+                table,
+                where_clause,
+            } => {
                 assert_eq!(table, "users");
                 assert!(where_clause.is_some());
             }
@@ -1596,7 +1701,10 @@ mod tests {
     fn test_delete_without_where() {
         let stmts = Parser::parse("DELETE FROM t").unwrap();
         match &stmts[0] {
-            Statement::Delete { table, where_clause } => {
+            Statement::Delete {
+                table,
+                where_clause,
+            } => {
                 assert_eq!(table, "t");
                 assert!(where_clause.is_none());
             }
@@ -1653,9 +1761,8 @@ mod tests {
 
     #[test]
     fn test_multi_table_join() {
-        let stmts = Parser::parse(
-            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id"
-        ).unwrap();
+        let stmts =
+            Parser::parse("SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id").unwrap();
         match &stmts[0] {
             Statement::Select { from, .. } => {
                 let from_clause = from.as_ref().expect("expected FROM clause");

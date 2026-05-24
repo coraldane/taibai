@@ -12,7 +12,7 @@ pub mod operators;
 pub mod expressions;
 pub mod pipeline;
 pub mod join_hashtable;
-pub mod strategy;
+pub mod scan;
 pub mod functions;
 pub mod explain;
 

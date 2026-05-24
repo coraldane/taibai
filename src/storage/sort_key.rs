@@ -24,7 +24,11 @@ impl SortKeyInserter {
 
     /// Find the insertion position for a row with the given key values
     /// using binary search. Returns the index where the row should be inserted.
-    pub fn find_insert_position(&self, batch: &RecordBatch, key_values: &[ScalarValue]) -> Result<usize> {
+    pub fn find_insert_position(
+        &self,
+        batch: &RecordBatch,
+        key_values: &[ScalarValue],
+    ) -> Result<usize> {
         let num_rows = batch.num_rows();
         if num_rows == 0 {
             return Ok(0);
@@ -48,8 +52,14 @@ impl SortKeyInserter {
 
     /// Insert a row into the batch at the correct sorted position.
     /// Returns a new batch with the row inserted.
-    pub fn insert_sorted(&self, batch: &RecordBatch, values: &[ScalarValue]) -> Result<RecordBatch> {
-        let key_values: Vec<ScalarValue> = self.key_indices.iter()
+    pub fn insert_sorted(
+        &self,
+        batch: &RecordBatch,
+        values: &[ScalarValue],
+    ) -> Result<RecordBatch> {
+        let key_values: Vec<ScalarValue> = self
+            .key_indices
+            .iter()
             .map(|&idx| values[idx].clone())
             .collect();
         let pos = self.find_insert_position(batch, &key_values)?;
@@ -85,7 +95,9 @@ impl SortKeyInserter {
         key_values: &[ScalarValue],
     ) -> std::cmp::Ordering {
         for (ki, &col_idx) in self.key_indices.iter().enumerate() {
-            let row_val = batch.scalar(row_idx, col_idx).unwrap_or(ScalarValue::Int64(None));
+            let row_val = batch
+                .scalar(row_idx, col_idx)
+                .unwrap_or(ScalarValue::Int64(None));
             let key_val = &key_values[ki];
             let cmp = compare_scalars_for_sort(&row_val, key_val);
             let cmp = if self.desc.get(ki).copied().unwrap_or(false) {
@@ -108,7 +120,9 @@ impl SortKeyInserter {
 
         for i in 1..batch.num_rows() {
             for (ki, &col_idx) in self.key_indices.iter().enumerate() {
-                let prev = batch.scalar(i - 1, col_idx).unwrap_or(ScalarValue::Int64(None));
+                let prev = batch
+                    .scalar(i - 1, col_idx)
+                    .unwrap_or(ScalarValue::Int64(None));
                 let curr = batch.scalar(i, col_idx).unwrap_or(ScalarValue::Int64(None));
                 let cmp = compare_scalars_for_sort(&prev, &curr);
                 let cmp = if self.desc.get(ki).copied().unwrap_or(false) {
@@ -128,37 +142,47 @@ impl SortKeyInserter {
 
     /// Extract min and max values for the sort key columns from a batch.
     /// Returns Vec<(Option<ScalarValue>, Option<ScalarValue>)> per key column: (min, max).
-    pub fn extract_min_max(&self, batch: &RecordBatch) -> Vec<(Option<ScalarValue>, Option<ScalarValue>)> {
+    pub fn extract_min_max(
+        &self,
+        batch: &RecordBatch,
+    ) -> Vec<(Option<ScalarValue>, Option<ScalarValue>)> {
         let num_rows = batch.num_rows();
-        self.key_indices.iter().map(|&col_idx| {
-            if num_rows == 0 {
-                return (None, None);
-            }
-            let mut min_val = batch.scalar(0, col_idx);
-            let mut max_val = min_val.clone();
-            for i in 1..num_rows {
-                if let Some(val) = batch.scalar(i, col_idx) {
-                    if val.is_null() {
-                        continue;
-                    }
-                    let new_min = match &min_val {
-                        Some(m) if !m.is_null() => compare_scalars_for_sort(&val, m) == std::cmp::Ordering::Less,
-                        _ => true,
-                    };
-                    if new_min {
-                        min_val = Some(val.clone());
-                    }
-                    let new_max = match &max_val {
-                        Some(m) if !m.is_null() => compare_scalars_for_sort(&val, m) == std::cmp::Ordering::Greater,
-                        _ => true,
-                    };
-                    if new_max {
-                        max_val = Some(val);
+        self.key_indices
+            .iter()
+            .map(|&col_idx| {
+                if num_rows == 0 {
+                    return (None, None);
+                }
+                let mut min_val = batch.scalar(0, col_idx);
+                let mut max_val = min_val.clone();
+                for i in 1..num_rows {
+                    if let Some(val) = batch.scalar(i, col_idx) {
+                        if val.is_null() {
+                            continue;
+                        }
+                        let new_min = match &min_val {
+                            Some(m) if !m.is_null() => {
+                                compare_scalars_for_sort(&val, m) == std::cmp::Ordering::Less
+                            }
+                            _ => true,
+                        };
+                        if new_min {
+                            min_val = Some(val.clone());
+                        }
+                        let new_max = match &max_val {
+                            Some(m) if !m.is_null() => {
+                                compare_scalars_for_sort(&val, m) == std::cmp::Ordering::Greater
+                            }
+                            _ => true,
+                        };
+                        if new_max {
+                            max_val = Some(val);
+                        }
                     }
                 }
-            }
-            (min_val, max_val)
-        }).collect()
+                (min_val, max_val)
+            })
+            .collect()
     }
 
     /// Check if a range predicate on the sort key can possibly match any rows in this batch.
@@ -230,7 +254,6 @@ pub fn compare_scalars_for_sort(a: &ScalarValue, b: &ScalarValue) -> std::cmp::O
     }
 }
 
-
 pub fn scalar_lt(a: &ScalarValue, b: &ScalarValue) -> bool {
     if a.is_null() || b.is_null() {
         return false;
@@ -242,7 +265,10 @@ pub fn scalar_le(a: &ScalarValue, b: &ScalarValue) -> bool {
     if a.is_null() || b.is_null() {
         return false;
     }
-    matches!(compare_scalars_for_sort(a, b), std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    matches!(
+        compare_scalars_for_sort(a, b),
+        std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+    )
 }
 /// A segment index entry that stores min/max values for the sort key columns.
 /// Used for range pruning during query execution.
@@ -264,7 +290,9 @@ pub struct SegmentIndex {
 
 impl SegmentIndex {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Add a segment to the index.
@@ -274,7 +302,11 @@ impl SegmentIndex {
         row_count: usize,
         min_max: Vec<(Option<ScalarValue>, Option<ScalarValue>)>,
     ) {
-        self.entries.push(SegmentIndexEntry { path, row_count, min_max });
+        self.entries.push(SegmentIndexEntry {
+            path,
+            row_count,
+            min_max,
+        });
     }
 
     /// Prune segments that cannot match the given range predicate.
@@ -285,7 +317,8 @@ impl SegmentIndex {
         lower_bound: Option<&ScalarValue>,
         upper_bound: Option<&ScalarValue>,
     ) -> Vec<std::path::PathBuf> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|entry| inserter.range_overlaps(&entry.min_max, lower_bound, upper_bound))
             .map(|entry| entry.path.clone())
             .collect()
@@ -317,9 +350,21 @@ mod tests {
             (9, "irene", 79.5),
         ];
         for (id, name, score) in data {
-            batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(id))).unwrap();
-            batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some(name.to_string()))).unwrap();
-            batch.column_mut(2).unwrap().push(&ScalarValue::Float64(Some(score))).unwrap();
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(id)))
+                .unwrap();
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(name.to_string())))
+                .unwrap();
+            batch
+                .column_mut(2)
+                .unwrap()
+                .push(&ScalarValue::Float64(Some(score)))
+                .unwrap();
         }
         batch
     }
@@ -379,12 +424,36 @@ mod tests {
     fn test_is_sorted_false() {
         let schema = make_schema();
         let mut batch = RecordBatch::new(schema);
-        batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(5))).unwrap();
-        batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some("a".into()))).unwrap();
-        batch.column_mut(2).unwrap().push(&ScalarValue::Float64(Some(1.0))).unwrap();
-        batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(3))).unwrap();
-        batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some("b".into()))).unwrap();
-        batch.column_mut(2).unwrap().push(&ScalarValue::Float64(Some(2.0))).unwrap();
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(5)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("a".into())))
+            .unwrap();
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Float64(Some(1.0)))
+            .unwrap();
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(3)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("b".into())))
+            .unwrap();
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Float64(Some(2.0)))
+            .unwrap();
         let inserter = SortKeyInserter::new(vec![0], vec![false]);
         assert!(!inserter.is_sorted(&batch));
     }
@@ -406,16 +475,32 @@ mod tests {
         let min_max = inserter.extract_min_max(&batch);
 
         // Range fully within segment
-        assert!(inserter.range_overlaps(&min_max, Some(&ScalarValue::Int64(Some(2))), Some(&ScalarValue::Int64(Some(8)))));
+        assert!(inserter.range_overlaps(
+            &min_max,
+            Some(&ScalarValue::Int64(Some(2))),
+            Some(&ScalarValue::Int64(Some(8)))
+        ));
 
         // Range before segment
-        assert!(!inserter.range_overlaps(&min_max, Some(&ScalarValue::Int64(Some(-5))), Some(&ScalarValue::Int64(Some(0)))));
+        assert!(!inserter.range_overlaps(
+            &min_max,
+            Some(&ScalarValue::Int64(Some(-5))),
+            Some(&ScalarValue::Int64(Some(0)))
+        ));
 
         // Range after segment
-        assert!(!inserter.range_overlaps(&min_max, Some(&ScalarValue::Int64(Some(10))), Some(&ScalarValue::Int64(Some(20)))));
+        assert!(!inserter.range_overlaps(
+            &min_max,
+            Some(&ScalarValue::Int64(Some(10))),
+            Some(&ScalarValue::Int64(Some(20)))
+        ));
 
         // Range overlapping start
-        assert!(inserter.range_overlaps(&min_max, Some(&ScalarValue::Int64(Some(0))), Some(&ScalarValue::Int64(Some(2)))));
+        assert!(inserter.range_overlaps(
+            &min_max,
+            Some(&ScalarValue::Int64(Some(0))),
+            Some(&ScalarValue::Int64(Some(2)))
+        ));
 
         // No bounds = always matches
         assert!(inserter.range_overlaps(&min_max, None, None));
@@ -430,26 +515,44 @@ mod tests {
         index.add_entry(
             std::path::PathBuf::from("seg_00001.dat"),
             5,
-            vec![(Some(ScalarValue::Int64(Some(1))), Some(ScalarValue::Int64(Some(5))))],
+            vec![(
+                Some(ScalarValue::Int64(Some(1))),
+                Some(ScalarValue::Int64(Some(5))),
+            )],
         );
         index.add_entry(
             std::path::PathBuf::from("seg_00002.dat"),
             10,
-            vec![(Some(ScalarValue::Int64(Some(10))), Some(ScalarValue::Int64(Some(20))))],
+            vec![(
+                Some(ScalarValue::Int64(Some(10))),
+                Some(ScalarValue::Int64(Some(20))),
+            )],
         );
 
         // Query range [3,7] should only match first segment
-        let pruned = index.prune_ranges(&inserter, Some(&ScalarValue::Int64(Some(3))), Some(&ScalarValue::Int64(Some(7))));
+        let pruned = index.prune_ranges(
+            &inserter,
+            Some(&ScalarValue::Int64(Some(3))),
+            Some(&ScalarValue::Int64(Some(7))),
+        );
         assert_eq!(pruned.len(), 1);
         assert!(pruned[0].to_string_lossy().contains("seg_00001"));
 
         // Query range [15,25] should only match second segment
-        let pruned = index.prune_ranges(&inserter, Some(&ScalarValue::Int64(Some(15))), Some(&ScalarValue::Int64(Some(25))));
+        let pruned = index.prune_ranges(
+            &inserter,
+            Some(&ScalarValue::Int64(Some(15))),
+            Some(&ScalarValue::Int64(Some(25))),
+        );
         assert_eq!(pruned.len(), 1);
         assert!(pruned[0].to_string_lossy().contains("seg_00002"));
 
         // Query range [0,30] should match both
-        let pruned = index.prune_ranges(&inserter, Some(&ScalarValue::Int64(Some(0))), Some(&ScalarValue::Int64(Some(30))));
+        let pruned = index.prune_ranges(
+            &inserter,
+            Some(&ScalarValue::Int64(Some(0))),
+            Some(&ScalarValue::Int64(Some(30))),
+        );
         assert_eq!(pruned.len(), 2);
     }
 
@@ -458,9 +561,21 @@ mod tests {
         let schema = make_schema();
         let mut batch = RecordBatch::new(schema);
         for id in [9i64, 7, 5, 3, 1] {
-            batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(id))).unwrap();
-            batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some(format!("u{}", id)))).unwrap();
-            batch.column_mut(2).unwrap().push(&ScalarValue::Float64(Some(id as f64))).unwrap();
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(id)))
+                .unwrap();
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(format!("u{}", id))))
+                .unwrap();
+            batch
+                .column_mut(2)
+                .unwrap()
+                .push(&ScalarValue::Float64(Some(id as f64)))
+                .unwrap();
         }
         let inserter = SortKeyInserter::new(vec![0], vec![true]);
         assert!(inserter.is_sorted(&batch));

@@ -45,7 +45,8 @@ impl BindContext {
     }
 
     pub fn register_table_alias(&mut self, alias: &str, table_name: &str) {
-        self.table_alias_map.insert(alias.to_lowercase(), table_name.to_string());
+        self.table_alias_map
+            .insert(alias.to_lowercase(), table_name.to_string());
     }
 
     pub fn resolve_table_name(&self, name: &str) -> Option<String> {
@@ -73,7 +74,8 @@ impl BindContext {
         if let Some(schema) = &self.output_schema {
             schema.columns.get(idx).map(|c| c.data_type)
         } else if let Some(table) = &self.current_table {
-            self.table_schemas.get(table)
+            self.table_schemas
+                .get(table)
                 .and_then(|s| s.columns.get(idx))
                 .map(|c| c.data_type)
         } else {

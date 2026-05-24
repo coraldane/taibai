@@ -127,7 +127,11 @@ pub fn dictionary_encode(values: &[ScalarValue]) -> (Vec<ScalarValue>, Vec<u32>)
 pub fn dictionary_decode(dict: &[ScalarValue], indices: &[u32]) -> Vec<ScalarValue> {
     indices
         .iter()
-        .map(|&idx| dict.get(idx as usize).cloned().unwrap_or(ScalarValue::Int64(None)))
+        .map(|&idx| {
+            dict.get(idx as usize)
+                .cloned()
+                .unwrap_or(ScalarValue::Int64(None))
+        })
         .collect()
 }
 

@@ -245,9 +245,7 @@ mod tests {
             op: RangeOp::Eq,
             value: ScalarValue::Int64(Some(22)),
         }]);
-        let batches = reader
-            .scan_with_predicate(1000, Some(&pred))
-            .unwrap();
+        let batches = reader.scan_with_predicate(1000, Some(&pred)).unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 5, "only row group 2 should be returned");
 
@@ -256,9 +254,7 @@ mod tests {
             op: RangeOp::Gt,
             value: ScalarValue::Int64(Some(100)),
         }]);
-        let batches = reader
-            .scan_with_predicate(1000, Some(&pred))
-            .unwrap();
+        let batches = reader.scan_with_predicate(1000, Some(&pred)).unwrap();
         assert!(batches.is_empty(), "all row groups should be pruned");
 
         let pred = RowGroupPredicate::new(vec![RangeClause {
@@ -266,16 +262,12 @@ mod tests {
             op: RangeOp::Ge,
             value: ScalarValue::Int64(Some(15)),
         }]);
-        let batches = reader
-            .scan_with_predicate(1000, Some(&pred))
-            .unwrap();
+        let batches = reader.scan_with_predicate(1000, Some(&pred)).unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 15, "row groups 1+2 should be kept (10 + 5)");
 
         let pred = RowGroupPredicate::new(vec![]);
-        let batches = reader
-            .scan_with_predicate(1000, Some(&pred))
-            .unwrap();
+        let batches = reader.scan_with_predicate(1000, Some(&pred)).unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 25);
     }
@@ -329,9 +321,7 @@ mod tests {
             op: RangeOp::Eq,
             value: ScalarValue::Int32(Some(99)),
         }]);
-        let batches = reader
-            .scan_with_predicate(1000, Some(&pred))
-            .unwrap();
+        let batches = reader.scan_with_predicate(1000, Some(&pred)).unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);
 
@@ -340,9 +330,7 @@ mod tests {
             op: RangeOp::Eq,
             value: ScalarValue::Int32(Some(2)),
         }]);
-        let batches = reader
-            .scan_with_predicate(1000, Some(&pred))
-            .unwrap();
+        let batches = reader.scan_with_predicate(1000, Some(&pred)).unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 4, "rg 0 returned, rg 1 (all null) pruned");
     }
@@ -367,11 +355,7 @@ mod tests {
             Err(e) => e,
         };
         let msg = format!("{}", err);
-        assert!(
-            msg.contains("magic"),
-            "error should mention magic: {}",
-            msg
-        );
+        assert!(msg.contains("magic"), "error should mention magic: {}", msg);
     }
 
     #[test]
@@ -464,7 +448,8 @@ mod tests {
         let after_footer_off =
             u64::from_le_bytes(after[after.len() - 8..].try_into().unwrap()) as usize;
         assert_eq!(
-            after[..after_footer_off], original_data_section[..],
+            after[..after_footer_off],
+            original_data_section[..],
             "rewrite_footer_with_deletes must not modify data blocks"
         );
 

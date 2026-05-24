@@ -25,8 +25,10 @@ impl ZoneMap {
         if self.min_value.is_null() || value.is_null() {
             return true;
         }
-        crate::storage::sort_key::compare_scalars_for_sort(value, &self.min_value) >= std::cmp::Ordering::Equal
-            && crate::storage::sort_key::compare_scalars_for_sort(value, &self.max_value) <= std::cmp::Ordering::Equal
+        crate::storage::sort_key::compare_scalars_for_sort(value, &self.min_value)
+            >= std::cmp::Ordering::Equal
+            && crate::storage::sort_key::compare_scalars_for_sort(value, &self.max_value)
+                <= std::cmp::Ordering::Equal
     }
 
     pub fn update(&mut self, value: &ScalarValue) {

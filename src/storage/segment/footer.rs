@@ -8,6 +8,7 @@ use crate::storage::encoding::{
 };
 use crate::storage::pruning::ZoneMap;
 use crate::types::batch::{ColumnDef, Schema};
+use crate::types::scalar::ScalarValue;
 
 use super::constants::SEGMENT_MAGIC;
 use super::RowGroupMeta;
@@ -19,6 +20,7 @@ pub struct ParsedSegmentFooter {
     pub schema: Schema,
     pub deleted_row_count: u64,
     pub delete_bitmap: Vec<u8>,
+    pub segment_zone_maps: Vec<ZoneMap>,
 }
 
 pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
@@ -58,6 +60,24 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
         });
     }
     let schema = Schema::new(columns);
+
+    let mut segment_zone_maps = Vec::new();
+    let has_seg_zm = read_u8(&mut cursor).unwrap_or(0);
+    if has_seg_zm != 0 {
+        let seg_zm_count = read_u32_le(&mut cursor).unwrap_or(0) as usize;
+        for _ in 0..seg_zm_count {
+            let min_v = decode_scalar_with_tag(&mut cursor).unwrap_or(ScalarValue::Int64(None));
+            let max_v = decode_scalar_with_tag(&mut cursor).unwrap_or(ScalarValue::Int64(None));
+            let null_count = read_u64_le(&mut cursor).unwrap_or(0);
+            let zm_row_count = read_u64_le(&mut cursor).unwrap_or(0);
+            segment_zone_maps.push(ZoneMap {
+                min_value: min_v,
+                max_value: max_v,
+                null_count,
+                row_count: zm_row_count,
+            });
+        }
+    }
 
     let mut row_groups = Vec::with_capacity(row_group_count as usize);
     for _ in 0..row_group_count {
@@ -144,6 +164,7 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
         schema,
         deleted_row_count,
         delete_bitmap,
+        segment_zone_maps,
     })
 }
 
@@ -165,6 +186,18 @@ pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
         let _scale = read_u32_le(&mut cursor)?;
         let _precision = read_u32_le(&mut cursor)?;
     }
+
+    let has_seg_zm = read_u8(&mut cursor).unwrap_or(0);
+    if has_seg_zm != 0 {
+        let seg_zm_count = read_u32_le(&mut cursor).unwrap_or(0) as usize;
+        for _ in 0..seg_zm_count {
+            let _ = decode_scalar_with_tag(&mut cursor)?;
+            let _ = decode_scalar_with_tag(&mut cursor)?;
+            let _ = read_u64_le(&mut cursor)?;
+            let _ = read_u64_le(&mut cursor)?;
+        }
+    }
+
     for _ in 0..row_group_count {
         let _offset = read_u64_le(&mut cursor)?;
         let _length = read_u64_le(&mut cursor)?;

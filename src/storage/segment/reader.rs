@@ -1,12 +1,13 @@
+use std::io::{Read, Seek, SeekFrom, Write};
+
 use std::fs;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::storage::bloomfilter::BloomFilter;
-use crate::storage::encoding::{decode_column, read_u32_le, read_u64_le, read_u8};
+use crate::storage::encoding::decode_column;
 use crate::storage::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
 use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
@@ -23,6 +24,7 @@ struct SegmentFooter {
     schema: Schema,
     deleted_row_count: u64,
     delete_bitmap: Vec<u8>,
+    segment_zone_maps: Vec<ZoneMap>,
 }
 
 impl From<ParsedSegmentFooter> for SegmentFooter {
@@ -34,6 +36,7 @@ impl From<ParsedSegmentFooter> for SegmentFooter {
             schema: f.schema,
             deleted_row_count: f.deleted_row_count,
             delete_bitmap: f.delete_bitmap,
+            segment_zone_maps: f.segment_zone_maps,
         }
     }
 }
@@ -89,9 +92,7 @@ impl SegmentReader {
         if footer_offset < SEGMENT_HEADER_SIZE || footer_offset > file_len as usize {
             return Err(MonaxError::Storage(format!(
                 "invalid footer offset: {} (file size {}, header size {})",
-                footer_offset,
-                file_len,
-                SEGMENT_HEADER_SIZE
+                footer_offset, file_len, SEGMENT_HEADER_SIZE
             )));
         }
 
@@ -127,6 +128,10 @@ impl SegmentReader {
 
     pub fn bloom_filters(&self, row_group: usize) -> &[Option<BloomFilter>] {
         &self.footer.row_groups[row_group].bloom_filters
+    }
+
+    pub fn segment_zone_maps(&self) -> &[ZoneMap] {
+        &self.footer.segment_zone_maps
     }
 
     pub fn footer_row_groups_info(&self) -> Vec<RowGroupMeta> {
@@ -535,11 +540,8 @@ impl SegmentReader {
             };
             if bitmap_active {
                 let before = batch.num_rows();
-                batch = filter_batch_by_delete_bitmap(
-                    &batch,
-                    rg_first_row,
-                    &self.footer.delete_bitmap,
-                );
+                batch =
+                    filter_batch_by_delete_bitmap(&batch, rg_first_row, &self.footer.delete_bitmap);
                 if let Some(s) = stats.as_deref_mut() {
                     s.rows_filtered_by_delete_bitmap += (before - batch.num_rows()) as u64;
                 }
@@ -570,11 +572,7 @@ impl SegmentReader {
         Ok(batches)
     }
 
-    pub fn count_matching_rows_fast(
-        &self,
-        column_idx: usize,
-        value: &ScalarValue,
-    ) -> Result<u64> {
+    pub fn count_matching_rows_fast(&self, column_idx: usize, value: &ScalarValue) -> Result<u64> {
         let mut total_count: u64 = 0;
         let bitmap_active = !self.footer.delete_bitmap.is_empty();
 

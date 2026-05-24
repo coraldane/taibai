@@ -1,0 +1,399 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::common::error::Result;
+use crate::storage::segment::ScanStats;
+use crate::storage::segment_manager::SegmentManager;
+use crate::types::batch::RecordBatch;
+
+use super::count;
+use super::memtable;
+use super::partition;
+use super::row_filter;
+use super::row_group;
+use super::spec::ScanSpec;
+
+pub struct ScanExecutor<'a> {
+    spec: &'a ScanSpec,
+    engine: &'a crate::sql::execution::engine::Engine,
+    table_schema: crate::types::batch::Schema,
+    table_meta: crate::storage::schema::TableMeta,
+    db: &'a str,
+    stats: Option<&'a mut HashMap<String, ScanStats>>,
+}
+
+impl<'a> ScanExecutor<'a> {
+    pub fn new(
+        spec: &'a ScanSpec,
+        engine: &'a crate::sql::execution::engine::Engine,
+        table_schema: crate::types::batch::Schema,
+        table_meta: crate::storage::schema::TableMeta,
+        db: &'a str,
+    ) -> Self {
+        Self {
+            spec,
+            engine,
+            table_schema,
+            table_meta,
+            db,
+            stats: None,
+        }
+    }
+
+    pub fn with_stats(mut self, stats: &'a mut HashMap<String, ScanStats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    pub fn execute(&mut self) -> Result<Vec<RecordBatch>> {
+        if self.spec.is_count_star {
+            return self.execute_count_star();
+        }
+        self.execute_scan()
+    }
+
+    fn execute_count_star(&mut self) -> Result<Vec<RecordBatch>> {
+        let table_dir = self.engine.data_dir().join(self.db).join(&self.spec.table_name);
+        if !table_dir.exists() {
+            let result = count::build_count_star_result(0);
+            return match result {
+                crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
+                _ => Ok(Vec::new()),
+            };
+        }
+        let count = count::count_star(
+            self.spec,
+            &table_dir,
+            self.engine.segment_mgr(),
+            self.engine.memtable_manager(),
+            self.db,
+            self.stats.as_deref_mut(),
+        )?;
+        let result = count::build_count_star_result(count);
+        match result {
+            crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn execute_scan(&mut self) -> Result<Vec<RecordBatch>> {
+        let table_dir = self.engine.data_dir().join(self.db).join(&self.spec.table_name);
+        let mut batches = Vec::new();
+
+        if table_dir.exists() {
+            let all_segments = SegmentManager::discover_segments(&table_dir)?;
+
+            let filtered_segments = partition::prune_segments_by_partition(
+                all_segments,
+                self.spec,
+                Some(&self.table_meta),
+            );
+
+            let pred = self.spec.to_row_group_predicate();
+            let bloom_checks = row_group::build_bloom_check_list(self.spec);
+            let in_checks = row_group::build_in_check_list(self.spec);
+
+            let mgr = self.engine.segment_mgr();
+
+            let use_predicate_first = self.should_use_predicate_first();
+            let predicate_cols = self.compute_predicate_columns();
+            let projection_cols = self.compute_projection_columns();
+
+            let use_index = self.should_use_index();
+
+            if use_index {
+                if let Some(index_batches) = self.try_index_scan(&filtered_segments, &mgr, &projection_cols)? {
+                    batches.extend(index_batches);
+                    batches.extend(memtable::scan_memtables(
+                        self.engine.memtable_manager(),
+                        self.db,
+                        &self.spec.table_name,
+                        self.spec,
+                    ));
+                    return Ok(batches);
+                }
+            }
+
+            for seg_path in &filtered_segments {
+                let reader = match mgr.open_reader(seg_path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                if let Some(s) = self.stats.as_deref_mut() {
+                    s.entry(self.spec.table_name.clone())
+                        .or_default()
+                        .segments_opened += 1;
+                }
+
+                let segment_zone_maps = reader.segment_zone_maps();
+
+                if !row_group::prune_segment_by_zone_map(&pred, &segment_zone_maps) {
+                    continue;
+                }
+
+                let prune_result = row_group::prune_row_groups(
+                    &reader,
+                    &pred,
+                    &bloom_checks,
+                    &in_checks,
+                    &segment_zone_maps,
+                );
+
+                if let Some(s) = self.stats.as_deref_mut() {
+                    let stats_entry = s.entry(self.spec.table_name.clone()).or_default();
+                    stats_entry.row_groups_total += reader.num_row_groups() as u64;
+                    stats_entry.row_groups_pruned += (reader.num_row_groups() - prune_result.candidate_indices.len()) as u64;
+                    stats_entry.row_groups_read += prune_result.candidate_indices.len() as u64;
+                }
+
+                for rg_idx in &prune_result.candidate_indices {
+                    if use_predicate_first && !predicate_cols.is_empty() && !projection_cols.is_empty() {
+                        match row_filter::predicate_first_read(
+                            &reader,
+                            *rg_idx,
+                            &predicate_cols,
+                            &projection_cols,
+                            &self.spec.eq_predicates,
+                            &self.spec.range_predicates,
+                            &self.spec.in_predicates,
+                            self.spec.remaining_predicate.as_ref(),
+                        ) {
+                            Ok(batch) => {
+                                if batch.num_rows() > 0 {
+                                    if let Some(s) = self.stats.as_deref_mut() {
+                                        s.entry(self.spec.table_name.clone()).or_default().rows_scanned +=
+                                            batch.num_rows() as u64;
+                                    }
+                                    batches.push(batch);
+                                }
+                            }
+                            Err(_) => continue,
+                        }
+                    } else {
+                        let batch = match self.read_and_filter_row_group(&reader, *rg_idx, &projection_cols) {
+                            Ok(b) => b,
+                            Err(_) => continue,
+                        };
+                        if batch.num_rows() > 0 {
+                            batches.push(batch);
+                        }
+                    }
+                }
+            }
+        }
+
+        batches.extend(memtable::scan_memtables(
+            self.engine.memtable_manager(),
+            self.db,
+            &self.spec.table_name,
+            self.spec,
+        ));
+
+        if let Some(ref cluster_key) = self.spec.cluster_key {
+            if !cluster_key.is_empty() && self.spec.has_eq_predicate() {
+                row_filter::apply_cluster_key_fast_scan(
+                    &mut batches,
+                    cluster_key,
+                    &self.spec.eq_predicates,
+                    &self.table_schema,
+                );
+            }
+        }
+
+        Ok(batches)
+    }
+
+    fn read_and_filter_row_group(
+        &mut self,
+        reader: &crate::storage::segment::SegmentReader,
+        rg_idx: usize,
+        projection_cols: &[usize],
+    ) -> Result<RecordBatch> {
+        let mut batch = if projection_cols.is_empty() {
+            reader.read_row_group(rg_idx)?
+        } else {
+            reader.read_row_group_with_projection(rg_idx, projection_cols)?
+        };
+
+        let bitmap_active = !reader.delete_bitmap().is_empty();
+        if bitmap_active {
+            let rg_start_row: u64 = reader
+                .footer_row_groups_info()
+                .iter()
+                .take(rg_idx)
+                .map(|r| r.row_count)
+                .sum();
+            let before = batch.num_rows();
+            batch = filter_batch_by_delete_bitmap(&batch, rg_start_row, reader.delete_bitmap());
+            if let Some(s) = self.stats.as_deref_mut() {
+                s.entry(self.spec.table_name.clone())
+                    .or_default()
+                    .rows_filtered_by_delete_bitmap += (before - batch.num_rows()) as u64;
+            }
+        }
+
+        if let Some(s) = self.stats.as_deref_mut() {
+            s.entry(self.spec.table_name.clone()).or_default().rows_scanned += batch.num_rows() as u64;
+        }
+
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+
+        if self.spec.has_predicates() {
+            let filtered = row_filter::apply_predicates(
+                &batch,
+                &self.spec.eq_predicates,
+                &self.spec.range_predicates,
+                &self.spec.in_predicates,
+                self.spec.remaining_predicate.as_ref(),
+            );
+            Ok(filtered)
+        } else {
+            Ok(batch)
+        }
+    }
+
+    fn should_use_predicate_first(&self) -> bool {
+        if !self.spec.has_predicates() {
+            return false;
+        }
+        if self.spec.projection.is_none() {
+            return false;
+        }
+        let proj = match &self.spec.projection {
+            Some(p) => p,
+            None => return false,
+        };
+        let pred_cols = self.spec.all_predicate_columns();
+        if pred_cols.is_empty() {
+            return false;
+        }
+        let all_pred_in_proj = pred_cols.iter().all(|c| proj.contains(c));
+        !all_pred_in_proj
+    }
+
+    fn compute_predicate_columns(&self) -> Vec<usize> {
+        self.spec.all_predicate_columns()
+    }
+
+    fn compute_projection_columns(&self) -> Vec<usize> {
+        match &self.spec.projection {
+            Some(p) => p.clone(),
+            None => (0..self.table_schema.num_columns()).collect(),
+        }
+    }
+
+    fn should_use_index(&self) -> bool {
+        if self.spec.eq_predicates.len() != 1 {
+            return false;
+        }
+        if !self.spec.range_predicates.is_empty() || !self.spec.in_predicates.is_empty() {
+            return false;
+        }
+        if self.spec.remaining_predicate.is_some() {
+            return false;
+        }
+        true
+    }
+
+    fn try_index_scan(
+        &self,
+        segment_files: &[std::path::PathBuf],
+        mgr: &Arc<SegmentManager>,
+        projection_cols: &[usize],
+    ) -> Result<Option<Vec<RecordBatch>>> {
+        let (col_idx, eq_value) = &self.spec.eq_predicates[0];
+        let index_mgr = self.engine.index_manager();
+
+        if index_mgr.is_index_stale(self.db, &self.spec.table_name) {
+            return Ok(None);
+        }
+        if index_mgr.index_block_count(self.db, &self.spec.table_name) == 0 {
+            return Ok(None);
+        }
+
+        let Some(row_ids) = index_mgr.search(self.db, &self.spec.table_name, eq_value) else {
+            return Ok(None);
+        };
+        if row_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let projection_names: Vec<String> = projection_cols
+            .iter()
+            .map(|&idx| self.table_schema.columns[idx].name.clone())
+            .collect();
+
+        let mut batches = Vec::new();
+        for seg_path in segment_files {
+            let reader = match mgr.open_reader(seg_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for row_id in &row_ids {
+                if let Ok(batch) = reader.read_row_by_index(*row_id as usize, &projection_names) {
+                    if batch.num_rows() > 0 {
+                        let projected = apply_projection_to_batch(&batch, projection_cols);
+                        batches.push(projected);
+                    }
+                }
+            }
+        }
+
+        if batches.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(batches))
+    }
+}
+
+fn filter_batch_by_delete_bitmap(
+    batch: &RecordBatch,
+    first_row_id: u64,
+    delete_bitmap: &[u8],
+) -> RecordBatch {
+    let num_rows = batch.num_rows();
+    let mut keep = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        let row_id = first_row_id + i as u64;
+        let byte = (row_id / 8) as usize;
+        let bit = (row_id % 8) as u8;
+        let deleted = delete_bitmap
+            .get(byte)
+            .map_or(false, |b| (b & (1u8 << bit)) != 0);
+        if !deleted {
+            keep.push(i);
+        }
+    }
+    if keep.len() == num_rows {
+        return batch.clone();
+    }
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for c in 0..batch.num_columns() {
+        let src = batch.column(c).unwrap();
+        let mut new_col = crate::types::array::ColumnArray::empty(src.data_type());
+        for &i in &keep {
+            new_col.push(&src.scalar(i)).unwrap();
+        }
+        columns.push(new_col);
+    }
+    RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
+}
+
+fn apply_projection_to_batch(batch: &RecordBatch, projection: &[usize]) -> RecordBatch {
+    let mut col_defs = Vec::with_capacity(projection.len());
+    let mut columns = Vec::with_capacity(projection.len());
+    for &idx in projection {
+        if let Some(col) = batch.column(idx) {
+            columns.push(col.clone());
+            if let Some(col_def) = batch.schema.column(idx) {
+                col_defs.push(col_def.clone());
+            }
+        }
+    }
+    let schema = crate::types::batch::Schema::new(col_defs);
+    RecordBatch::try_new(schema, columns).unwrap_or_else(|_| batch.clone())
+}

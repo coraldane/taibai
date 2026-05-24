@@ -4,8 +4,8 @@ use crate::common::error::{MonaxError, Result};
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 
-use super::BindContext;
 use super::expression_binder::ExpressionBinder;
+use super::BindContext;
 
 pub struct StatementBinder;
 
@@ -14,12 +14,34 @@ impl StatementBinder {
         stmt: &Statement,
         table_schemas: &HashMap<String, Schema>,
     ) -> Result<BindContext> {
-        let (select_list, from, where_clause, group_by, _order_by, _limit, _offset, _distinct) = match stmt {
-            Statement::Select { select_list, from, where_clause, group_by, order_by, limit, offset, distinct, having: _ } => {
-                (select_list, from, where_clause, group_by, order_by, limit, offset, distinct)
-            }
-            _ => return Err(MonaxError::Internal("bind_select called with non-SELECT".into())),
-        };
+        let (select_list, from, where_clause, group_by, _order_by, _limit, _offset, _distinct) =
+            match stmt {
+                Statement::Select {
+                    select_list,
+                    from,
+                    where_clause,
+                    group_by,
+                    order_by,
+                    limit,
+                    offset,
+                    distinct,
+                    having: _,
+                } => (
+                    select_list,
+                    from,
+                    where_clause,
+                    group_by,
+                    order_by,
+                    limit,
+                    offset,
+                    distinct,
+                ),
+                _ => {
+                    return Err(MonaxError::Internal(
+                        "bind_select called with non-SELECT".into(),
+                    ))
+                }
+            };
 
         let (mut ctx, schema) = if let Some(from_clause) = from {
             Self::bind_from(from_clause, table_schemas)?
@@ -56,7 +78,8 @@ impl StatementBinder {
         match from {
             FromClause::Table(table_ref) => {
                 let table_name = &table_ref.name;
-                let schema = table_schemas.get(table_name)
+                let schema = table_schemas
+                    .get(table_name)
                     .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
                     .clone();
                 let mut ctx = BindContext::with_table(table_name, schema.clone());
@@ -71,11 +94,16 @@ impl StatementBinder {
 
                 for join_clause in &join_expr.joins {
                     let right_table = &join_clause.right.name;
-                    let right_schema = table_schemas.get(right_table)
-                        .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", right_table)))?
+                    let right_schema = table_schemas
+                        .get(right_table)
+                        .ok_or_else(|| {
+                            MonaxError::Sql(format!("table '{}' not found", right_table))
+                        })?
                         .clone();
 
-                    left_ctx.table_schemas.insert(right_table.clone(), right_schema.clone());
+                    left_ctx
+                        .table_schemas
+                        .insert(right_table.clone(), right_schema.clone());
 
                     if let Some(alias) = &join_clause.right.alias {
                         left_ctx.register_table_alias(alias, right_table);
@@ -85,7 +113,10 @@ impl StatementBinder {
                     left_ctx.output_schema = Some(current_schema.clone());
 
                     for (i, col) in right_schema.columns.iter().enumerate() {
-                        left_ctx.column_index_map.insert(col.name.to_lowercase(), current_schema.columns.len() - right_schema.columns.len() + i);
+                        left_ctx.column_index_map.insert(
+                            col.name.to_lowercase(),
+                            current_schema.columns.len() - right_schema.columns.len() + i,
+                        );
                     }
                 }
 
