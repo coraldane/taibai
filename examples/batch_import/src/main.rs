@@ -167,7 +167,7 @@ async fn ensure_tick_table(client: &mut Client) {
             bid_vol4 INT32, \
             bid_vol5 INT32, \
             local_time TIMESTAMP \
-        )",
+        ) partition by deal_date cluster by security_id",
         TICK_TABLE
     );
 

@@ -537,6 +537,7 @@ impl<'a> Lexer<'a> {
             "BLOB" | "BYTES" => Token::Ident("BLOB".into()),
             "VECTOR" => Token::Ident("VECTOR".into()),
             "DAY" => Token::Ident("DAY".into()),
+            "MONTH" => Token::Ident("MONTH".into()),
             "YEAR" => Token::Ident("YEAR".into()),
             _ => Token::Ident(word.to_string()),
         })

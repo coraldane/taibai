@@ -157,9 +157,6 @@ impl Parser {
             columns.push(self.parse_column_def()?);
             if self.peek() == &Token::Comma {
                 self.advance();
-                if self.peek() == &Token::Cluster {
-                    break;
-                }
                 if self.peek() == &Token::RightParen {
                     break;
                 }
@@ -169,65 +166,76 @@ impl Parser {
         }
         self.expect(&Token::RightParen)?;
 
-        let cluster_by = if self.peek() == &Token::Cluster {
-            self.advance();
-            self.expect(&Token::By)?;
-            self.expect(&Token::LeftParen)?;
-            let mut keys = Vec::new();
-            loop {
-                keys.push(self.expect_ident()?);
-                if self.peek() == &Token::Comma {
+        let mut cluster_by: Option<Vec<String>> = None;
+        let mut partition_by: Option<PartitionDef> = None;
+
+        loop {
+            if self.peek() == &Token::Cluster && cluster_by.is_none() {
+                self.advance();
+                self.expect(&Token::By)?;
+                let mut keys = Vec::new();
+                if self.peek() == &Token::LeftParen {
                     self.advance();
+                    loop {
+                        keys.push(self.expect_ident()?);
+                        if self.peek() == &Token::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&Token::RightParen)?;
                 } else {
-                    break;
+                    keys.push(self.expect_ident()?);
+                    while self.peek() == &Token::Comma {
+                        self.advance();
+                        keys.push(self.expect_ident()?);
+                    }
                 }
-            }
-            self.expect(&Token::RightParen)?;
-            Some(keys)
-        } else {
-            None
-        };
+                cluster_by = Some(keys);
+            } else if self.peek() == &Token::Partition && partition_by.is_none() {
+                self.advance();
+                self.expect(&Token::By)?;
 
-        // Optional: PARTITION BY DAY/YEAR(column)
-        let partition_by = if self.peek() == &Token::Partition {
-            self.advance();
-            self.expect(&Token::By)?;
-            let first_token = self.expect_ident()?.to_uppercase();
-
-            let (strategy, column, param) = if first_token == "HASH" {
-                self.expect(&Token::LeftParen)?;
-                let col = self.expect_ident()?;
-                let num_buckets = if self.peek() == &Token::Comma {
+                let (strategy, column, param) = if self.peek() == &Token::Hash {
                     self.advance();
-                    self.expect_integer()? as i32
+                    self.expect(&Token::LeftParen)?;
+                    let col = self.expect_ident()?;
+                    let num_buckets = if self.peek() == &Token::Comma {
+                        self.advance();
+                        self.expect_integer()? as i32
+                    } else {
+                        10
+                    };
+                    self.expect(&Token::RightParen)?;
+                    (PartitionStrategy::Hash(num_buckets), col, Some(num_buckets))
                 } else {
-                    10
+                    let first_token = self.expect_ident()?.to_uppercase();
+                    if matches!(first_token.as_str(), "DAY" | "YEAR" | "MONTH") {
+                        self.expect(&Token::LeftParen)?;
+                        let col = self.expect_ident()?;
+                        self.expect(&Token::RightParen)?;
+                        let strategy = match first_token.as_str() {
+                            "DAY" => PartitionStrategy::Day,
+                            "YEAR" => PartitionStrategy::Year,
+                            "MONTH" => PartitionStrategy::Month,
+                            _ => PartitionStrategy::Value,
+                        };
+                        (strategy, col, None)
+                    } else {
+                        (PartitionStrategy::Value, first_token, None)
+                    }
                 };
-                self.expect(&Token::RightParen)?;
-                (PartitionStrategy::Hash(num_buckets), col, Some(num_buckets))
-            } else if matches!(first_token.as_str(), "DAY" | "YEAR" | "MONTH") {
-                self.expect(&Token::LeftParen)?;
-                let col = self.expect_ident()?;
-                self.expect(&Token::RightParen)?;
-                let strategy = match first_token.as_str() {
-                    "DAY" => PartitionStrategy::Day,
-                    "YEAR" => PartitionStrategy::Year,
-                    "MONTH" => PartitionStrategy::Month,
-                    _ => PartitionStrategy::Value,
-                };
-                (strategy, col, None)
-            } else {
-                (PartitionStrategy::Value, first_token, None)
-            };
 
-            Some(PartitionDef {
-                column,
-                strategy,
-                param,
-            })
-        } else {
-            None
-        };
+                partition_by = Some(PartitionDef {
+                    column,
+                    strategy,
+                    param,
+                });
+            } else {
+                break;
+            }
+        }
 
         Ok(Statement::CreateTable {
             name,
@@ -1870,5 +1878,189 @@ mod tests {
         assert!(matches!(&stmts[0], Statement::Begin));
         assert!(matches!(&stmts[1], Statement::Delete { .. }));
         assert!(matches!(&stmts[2], Statement::Rollback));
+    }
+
+    #[test]
+    fn test_create_table_with_cluster_by() {
+        let stmts = Parser::parse("CREATE TABLE t (id INT64, name VARCHAR) CLUSTER BY (id, name)").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { name, columns, cluster_by, .. } => {
+                assert_eq!(name, "t");
+                assert_eq!(columns.len(), 2);
+                assert!(cluster_by.is_some());
+                let keys = cluster_by.as_ref().unwrap();
+                assert_eq!(keys.len(), 2);
+                assert_eq!(keys[0], "id");
+                assert_eq!(keys[1], "name");
+            }
+            _ => panic!("expected CREATE TABLE with CLUSTER BY"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_cluster_by_single() {
+        let stmts = Parser::parse("CREATE TABLE t (id INT64) CLUSTER BY (id)").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { cluster_by, .. } => {
+                assert!(cluster_by.is_some());
+                let keys = cluster_by.as_ref().unwrap();
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0], "id");
+            }
+            _ => panic!("expected CREATE TABLE with CLUSTER BY"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_partition_by_day() {
+        let stmts = Parser::parse("CREATE TABLE logs (id INT64, ts TIMESTAMP, msg VARCHAR) PARTITION BY DAY(ts)").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { name, columns, partition_by, .. } => {
+                assert_eq!(name, "logs");
+                assert_eq!(columns.len(), 3);
+                assert!(partition_by.is_some());
+                let pdef = partition_by.as_ref().unwrap();
+                assert_eq!(pdef.column, "ts");
+                assert_eq!(pdef.strategy, PartitionStrategy::Day);
+            }
+            _ => panic!("expected CREATE TABLE with PARTITION BY DAY"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_partition_by_year() {
+        let stmts = Parser::parse("CREATE TABLE yearly (id INT64, year_col INT32) PARTITION BY YEAR(year_col)").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { partition_by, .. } => {
+                assert!(partition_by.is_some());
+                let pdef = partition_by.as_ref().unwrap();
+                assert_eq!(pdef.column, "year_col");
+                assert_eq!(pdef.strategy, PartitionStrategy::Year);
+            }
+            _ => panic!("expected CREATE TABLE with PARTITION BY YEAR"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_partition_by_month() {
+        let stmts = Parser::parse("CREATE TABLE monthly (id INT64, month_col INT32) PARTITION BY MONTH(month_col)").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { partition_by, .. } => {
+                assert!(partition_by.is_some());
+                let pdef = partition_by.as_ref().unwrap();
+                assert_eq!(pdef.column, "month_col");
+                assert_eq!(pdef.strategy, PartitionStrategy::Month);
+            }
+            _ => panic!("expected CREATE TABLE with PARTITION BY MONTH"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_partition_by_hash() {
+        let stmts = Parser::parse("CREATE TABLE sharded (id INT64, data VARCHAR) PARTITION BY HASH(id, 16)").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { partition_by, .. } => {
+                assert!(partition_by.is_some());
+                let pdef = partition_by.as_ref().unwrap();
+                assert_eq!(pdef.column, "id");
+                assert_eq!(pdef.strategy, PartitionStrategy::Hash(16));
+                assert_eq!(pdef.param, Some(16));
+            }
+            _ => panic!("expected CREATE TABLE with PARTITION BY HASH"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_partition_by_hash_default_buckets() {
+        let stmts = Parser::parse("CREATE TABLE sharded (id INT64) PARTITION BY HASH(id)").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { partition_by, .. } => {
+                assert!(partition_by.is_some());
+                let pdef = partition_by.as_ref().unwrap();
+                assert_eq!(pdef.column, "id");
+                assert_eq!(pdef.strategy, PartitionStrategy::Hash(10));
+            }
+            _ => panic!("expected CREATE TABLE with PARTITION BY HASH"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_partition_by_column() {
+        let stmts = Parser::parse("CREATE TABLE by_cat (id INT64, category VARCHAR) PARTITION BY category").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { partition_by, .. } => {
+                assert!(partition_by.is_some());
+                let pdef = partition_by.as_ref().unwrap();
+                assert_eq!(pdef.column, "CATEGORY");
+                assert_eq!(pdef.strategy, PartitionStrategy::Value);
+            }
+            _ => panic!("expected CREATE TABLE with PARTITION BY column"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_both_cluster_and_partition() {
+        let stmts = Parser::parse("CREATE TABLE full_table (id INT64, ts TIMESTAMP, cat VARCHAR) CLUSTER BY (id) PARTITION BY DAY(ts)").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { name, cluster_by, partition_by, .. } => {
+                assert_eq!(name, "full_table");
+                assert!(cluster_by.is_some());
+                assert!(partition_by.is_some());
+                let keys = cluster_by.as_ref().unwrap();
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0], "id");
+                let pdef = partition_by.as_ref().unwrap();
+                assert_eq!(pdef.column, "ts");
+                assert_eq!(pdef.strategy, PartitionStrategy::Day);
+            }
+            _ => panic!("expected CREATE TABLE with CLUSTER BY and PARTITION BY"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_cluster_by_no_parens() {
+        let stmts = Parser::parse("CREATE TABLE t (id INT64, name VARCHAR) CLUSTER BY id").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { cluster_by, .. } => {
+                assert!(cluster_by.is_some());
+                let keys = cluster_by.as_ref().unwrap();
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0], "id");
+            }
+            _ => panic!("expected CREATE TABLE with CLUSTER BY"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_cluster_by_multiple_no_parens() {
+        let stmts = Parser::parse("CREATE TABLE t (id INT64, name VARCHAR) CLUSTER BY id, name").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { cluster_by, .. } => {
+                assert!(cluster_by.is_some());
+                let keys = cluster_by.as_ref().unwrap();
+                assert_eq!(keys.len(), 2);
+                assert_eq!(keys[0], "id");
+                assert_eq!(keys[1], "name");
+            }
+            _ => panic!("expected CREATE TABLE with CLUSTER BY"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_partition_then_cluster() {
+        let stmts = Parser::parse("CREATE TABLE t (id INT64, ts TIMESTAMP) PARTITION BY DAY(ts) CLUSTER BY id").unwrap();
+        match &stmts[0] {
+            Statement::CreateTable { cluster_by, partition_by, .. } => {
+                assert!(cluster_by.is_some());
+                assert!(partition_by.is_some());
+                let keys = cluster_by.as_ref().unwrap();
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0], "id");
+                let pdef = partition_by.as_ref().unwrap();
+                assert_eq!(pdef.column, "ts");
+                assert_eq!(pdef.strategy, PartitionStrategy::Day);
+            }
+            _ => panic!("expected CREATE TABLE with PARTITION BY and CLUSTER BY"),
+        }
     }
 }

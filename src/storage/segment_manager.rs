@@ -609,7 +609,9 @@ impl SegmentManager {
             let col_defs: Vec<crate::types::batch::ColumnDef> = req
                 .columns
                 .iter()
-                .map(|c| crate::types::batch::ColumnDef::new(c.name, c.data_type))
+                .map(|c| crate::types::batch::ColumnDef::new(c.name, c.data_type)
+                    .with_scale(c.scale)
+                    .with_precision(c.precision))
                 .collect();
             Schema::new(col_defs)
         };
@@ -710,11 +712,17 @@ impl SegmentManager {
         let table_dir = self.data_dir.join(db).join(req.table_name);
         std::fs::create_dir_all(&table_dir)?;
 
-        let schema = {
+        let (schema, partition_key) = {
             let table_meta = catalogs.get_table(req.table_name).ok_or_else(|| {
                 MonaxError::Sql(format!("table '{}.{}' does not exist", db, req.table_name))
             })?;
-            Schema::new(table_meta.columns.clone())
+            let schema = Schema::new(table_meta.columns.clone());
+            let partition_key = if table_meta.is_partitioned() {
+                compute_partition_key_from_bulk_payload(&req, table_meta)?
+            } else {
+                String::new()
+            };
+            (schema, partition_key)
         };
 
         if schema.num_columns() != req.columns.len() {
@@ -773,11 +781,11 @@ impl SegmentManager {
             self.get_or_create_active_segment_for_partition_locked(
                 &table_dir,
                 &schema,
-                "",
+                &partition_key,
                 &mut active_guard,
             )?;
 
-            let seg = active_guard.get_mut("").unwrap();
+            let seg = active_guard.get_mut(&partition_key).unwrap();
 
             if seg.current_size != seg.data_end {
                 seg.file.get_ref().set_len(seg.data_end)?;
@@ -820,7 +828,7 @@ impl SegmentManager {
 
             if seg.current_size >= self.max_segment_size() {
                 self.seal_segment(seg)?;
-                active_guard.remove("");
+                active_guard.remove(&partition_key);
             } else {
                 self.flush_meta(seg)?;
             }
@@ -1211,6 +1219,8 @@ struct DirectBulkRequest<'a> {
 struct DirectBulkColumn<'a> {
     name: &'a str,
     data_type: DataType,
+    scale: i32,
+    precision: i32,
     data: &'a [u8],
     nulls: &'a [u8],
 }
@@ -1231,8 +1241,8 @@ fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>> {
         let name_len = read_u16_at(payload, &mut pos)? as usize;
         let name = read_utf8_at(payload, &mut pos, name_len)?;
         let dtype = DataType::from_u8(read_u8_at(payload, &mut pos)?)?;
-        let _scale = read_u32_at(payload, &mut pos)? as i32;
-        let _precision = read_u32_at(payload, &mut pos)? as i32;
+        let scale = read_u32_at(payload, &mut pos)? as i32;
+        let precision = read_u32_at(payload, &mut pos)? as i32;
         let elem_count = read_u32_at(payload, &mut pos)? as usize;
         let nulls_size = read_u32_at(payload, &mut pos)? as usize;
 
@@ -1265,6 +1275,8 @@ fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>> {
         columns.push(DirectBulkColumn {
             name,
             data_type: dtype,
+            scale,
+            precision,
             data,
             nulls,
         });
@@ -1518,4 +1530,66 @@ fn compute_segment_zone_maps_from_active(row_groups: &[RowGroupMeta], num_column
     }
 
     segment_maps
+}
+
+fn compute_partition_key_from_bulk_payload(
+    req: &DirectBulkRequest<'_>,
+    table_meta: &crate::storage::schema::TableMeta,
+) -> Result<String> {
+    let col_idx = match table_meta.get_partition_column_index_cached() {
+        Some(idx) => idx,
+        None => return Ok(String::new()),
+    };
+
+    let bulk_col = req.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&table_meta.partition_key));
+    let bulk_col = match bulk_col {
+        Some(c) => c,
+        None => return Ok(String::new()),
+    };
+
+    if bulk_col.data.is_empty() || req.row_count == 0 {
+        return Ok(String::new());
+    }
+
+    use crate::storage::partition_function::compute_partition_key_from_scalar;
+    use crate::types::scalar::ScalarValue;
+
+    let first_val = match bulk_col.data_type {
+        DataType::Int32 => {
+            let v = i32::from_le_bytes(bulk_col.data[0..4].try_into().unwrap());
+            ScalarValue::Int32(Some(v))
+        }
+        DataType::Int64 => {
+            let v = i64::from_le_bytes(bulk_col.data[0..8].try_into().unwrap());
+            ScalarValue::Int64(Some(v))
+        }
+        DataType::Timestamp => {
+            let v = i64::from_le_bytes(bulk_col.data[0..8].try_into().unwrap());
+            ScalarValue::Timestamp(Some(v))
+        }
+        DataType::Date => {
+            let v = i32::from_le_bytes(bulk_col.data[0..4].try_into().unwrap());
+            ScalarValue::Date(Some(v))
+        }
+        DataType::UInt32 => {
+            let v = u32::from_le_bytes(bulk_col.data[0..4].try_into().unwrap());
+            ScalarValue::UInt32(Some(v))
+        }
+        DataType::UInt64 => {
+            let v = u64::from_le_bytes(bulk_col.data[0..8].try_into().unwrap());
+            ScalarValue::UInt64(Some(v))
+        }
+        DataType::VarChar => {
+            let len = u32::from_le_bytes(bulk_col.data[0..4].try_into().unwrap()) as usize;
+            if len + 4 > bulk_col.data.len() {
+                return Ok(String::new());
+            }
+            let s = std::str::from_utf8(&bulk_col.data[4..4 + len])
+                .map_err(|_| MonaxError::Protocol("invalid utf8 in partition column".into()))?;
+            ScalarValue::VarChar(Some(s.to_string()))
+        }
+        _ => return Ok(String::new()),
+    };
+
+    Ok(compute_partition_key_from_scalar(&table_meta.partition_strategy(), &first_val))
 }

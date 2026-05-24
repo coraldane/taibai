@@ -85,7 +85,9 @@ impl ExecutionOp for HashAggregateExec {
         for expr in &group_by {
             if let LogicalExpr::Column(idx) = expr {
                 if let Some(cd) = physical_schema.columns.get(*idx) {
-                    col_defs.push(ColumnDef::new(&cd.name, cd.data_type));
+                    col_defs.push(ColumnDef::new(&cd.name, cd.data_type)
+                        .with_scale(cd.scale)
+                        .with_precision(cd.precision));
                 }
             }
         }

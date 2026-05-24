@@ -33,7 +33,7 @@ pub const TICK_CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS {table} ( \
     bid_vol4 INT32, \
     bid_vol5 INT32, \
     local_time TIMESTAMP \
-)";
+) PARTITION BY deal_date CLUSTER BY security_id";
 
 pub struct TickElement {
     pub security_id: String,

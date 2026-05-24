@@ -572,7 +572,9 @@ impl ExecutionOp for HashAggregateExec {
             match expr {
                 LogicalExpr::Column(idx) => {
                     if let Some(cd) = self.input_schema.columns.get(*idx) {
-                        col_defs.push(ColumnDef::new(&cd.name, cd.data_type));
+                        col_defs.push(ColumnDef::new(&cd.name, cd.data_type)
+                            .with_scale(cd.scale)
+                            .with_precision(cd.precision));
                     }
                 }
                 _ => {}

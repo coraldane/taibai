@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use crate::storage::partition::{is_partition_segment, parse_partition_key, PartitionPruner, PartitionStrategy};
+use crate::storage::partition::{
+    is_partition_segment, parse_partition_key, PartitionPruner, PartitionStrategy,
+};
 use crate::storage::schema::TableMeta;
 use crate::types::scalar::ScalarValue;
 
@@ -31,23 +33,18 @@ pub fn prune_segments_by_partition(
     }
 
     if let Some(pf) = &pi.partition_filter {
-        return filter_by_partition_values(segment_files, pf);
+        if pf.column.eq_ignore_ascii_case(&meta.partition_key) {
+            return filter_by_partition_values(segment_files, pf);
+        }
     }
 
     let strategy = match meta.partition_type {
-        crate::storage::schema::PartitionType::Function => {
-            if meta.partition_key.to_lowercase().contains("day") {
-                PartitionStrategy::Day
-            } else if meta.partition_key.to_lowercase().contains("year") {
-                PartitionStrategy::Year
-            } else if meta.partition_key.to_lowercase().contains("month") {
-                PartitionStrategy::Month
-            } else {
-                return segment_files;
-            }
-        }
+        crate::storage::schema::PartitionType::Day => PartitionStrategy::Day,
+        crate::storage::schema::PartitionType::Year => PartitionStrategy::Year,
+        crate::storage::schema::PartitionType::Month => PartitionStrategy::Month,
         crate::storage::schema::PartitionType::Value => PartitionStrategy::None,
-        _ => return segment_files,
+        crate::storage::schema::PartitionType::Hash => return segment_files,
+        crate::storage::schema::PartitionType::None => return segment_files,
     };
 
     if strategy == PartitionStrategy::None {
@@ -94,7 +91,11 @@ pub fn prune_segments_by_partition(
         .collect()
 }
 
-fn extract_partition_eq_value(spec: &ScanSpec, pi: &PartitionScanInfo, meta: &TableMeta) -> Option<String> {
+fn extract_partition_eq_value(
+    spec: &ScanSpec,
+    pi: &PartitionScanInfo,
+    meta: &TableMeta,
+) -> Option<String> {
     let pk_idx = pi.partition_key_col_idx?;
     let val = spec.eq_value_for_column(pk_idx)?;
     Some(scalar_to_partition_key(val))
@@ -157,14 +158,68 @@ fn filter_by_partition_values(
         .collect()
 }
 
-pub fn extract_partition_key_from_in_predicate(spec: &ScanSpec, pi: &PartitionScanInfo) -> Vec<String> {
+pub fn extract_partition_key_from_in_predicate(
+    spec: &ScanSpec,
+    pi: &PartitionScanInfo,
+) -> Vec<String> {
     let Some(pk_idx) = pi.partition_key_col_idx else {
         return Vec::new();
     };
     for pred in &spec.in_predicates {
         if pred.column_index == pk_idx {
-            return pred.values.iter().map(scalar_to_partition_key).filter(|k| !k.is_empty()).collect();
+            return pred
+                .values
+                .iter()
+                .map(scalar_to_partition_key)
+                .filter(|k| !k.is_empty())
+                .collect();
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::protocol::types::DataType;
+    use crate::sql::optimizer::partition_pruning::PartitionFilter;
+    use crate::storage::schema::{PartitionType, TableMeta};
+    use crate::types::batch::ColumnDef;
+    use crate::types::scalar::ScalarValue;
+
+    use super::*;
+
+    #[test]
+    fn ignores_partition_filter_for_non_partition_column() {
+        let files = vec![
+            PathBuf::from("p20251111_0001.dat"),
+            PathBuf::from("p20251112_0001.dat"),
+        ];
+        let mut meta = TableMeta::new(
+            "main",
+            "stock_tick_multi",
+            vec![
+                ColumnDef::new("security_id", DataType::VarChar),
+                ColumnDef::new("deal_date", DataType::Int32),
+            ],
+        );
+        meta.partition_type = PartitionType::Value;
+        meta.partition_key = "DEAL_DATE".to_string();
+
+        let mut spec = ScanSpec::new("stock_tick_multi");
+        spec.partition_info = Some(PartitionScanInfo {
+            time_range: None,
+            partition_filter: Some(PartitionFilter {
+                column: "security_id".to_string(),
+                values: vec![ScalarValue::VarChar(Some("688256.SH".to_string()))],
+            }),
+            partition_key_col_idx: meta.get_partition_column_index(),
+            is_partitioned: true,
+        });
+
+        let pruned = prune_segments_by_partition(files.clone(), &spec, Some(&meta));
+
+        assert_eq!(pruned, files);
+    }
 }

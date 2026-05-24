@@ -12,8 +12,10 @@ use crate::types::batch::ColumnDef;
 pub enum PartitionType {
     None = 0,
     Value = 1,
-    Function = 2,
-    Hash = 3,
+    Day = 2,
+    Year = 3,
+    Month = 4,
+    Hash = 5,
 }
 
 impl Default for PartitionType {
@@ -32,6 +34,10 @@ pub struct PartitionInfo {
     pub modified_at: i64,
 }
 
+fn default_row_group_size() -> i32 { 8192 }
+fn default_partition_param() -> i32 { 0 }
+fn default_partition_key_idx() -> i32 { -1 }
+
 /// Table metadata stored in the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMeta {
@@ -41,12 +47,20 @@ pub struct TableMeta {
     pub row_count: i64,
     pub segment_count: i32,
     pub created_at: i64,
+    #[serde(default)]
     pub cluster_key: Vec<String>,
+    #[serde(default = "default_row_group_size")]
     pub row_group_size: i32,
+    #[serde(default)]
     pub partition_key: String,
+    #[serde(default)]
     pub partition_type: PartitionType,
+    #[serde(default = "default_partition_param")]
     pub partition_param: i32,
+    #[serde(default)]
     pub partitions: Vec<PartitionInfo>,
+    #[serde(default = "default_partition_key_idx")]
+    pub partition_key_idx: i32,
 }
 
 impl TableMeta {
@@ -68,7 +82,26 @@ impl TableMeta {
             partition_type: PartitionType::None,
             partition_param: 0,
             partitions: Vec::new(),
+            partition_key_idx: -1,
         }
+    }
+
+    pub fn update_partition_key_idx(&mut self) {
+        if self.partition_key.is_empty() {
+            self.partition_key_idx = -1;
+            return;
+        }
+        self.partition_key_idx = self.columns.iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&self.partition_key))
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+    }
+
+    pub fn get_partition_column_index_cached(&self) -> Option<usize> {
+        if self.partition_key_idx < 0 {
+            return None;
+        }
+        Some(self.partition_key_idx as usize)
     }
 
     pub fn data_path(&self, base_dir: &str) -> PathBuf {
@@ -80,20 +113,10 @@ impl TableMeta {
         match self.partition_type {
             PartitionType::None => PartitionFunction::Value,
             PartitionType::Value => PartitionFunction::Value,
-            PartitionType::Function => {
-                if self.partition_key.to_lowercase().contains("day") {
-                    PartitionFunction::Day
-                } else if self.partition_key.to_lowercase().contains("year") {
-                    PartitionFunction::Year
-                } else if self.partition_key.to_lowercase().contains("month") {
-                    PartitionFunction::Month
-                } else {
-                    PartitionFunction::Value
-                }
-            }
-            PartitionType::Hash => {
-                PartitionFunction::Hash(self.partition_param)
-            }
+            PartitionType::Day => PartitionFunction::Day,
+            PartitionType::Year => PartitionFunction::Year,
+            PartitionType::Month => PartitionFunction::Month,
+            PartitionType::Hash => PartitionFunction::Hash(self.partition_param),
         }
     }
     
@@ -105,7 +128,9 @@ impl TableMeta {
         if self.partition_key.is_empty() {
             return None;
         }
-        self.columns.iter().position(|c| c.name == self.partition_key)
+        self.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&self.partition_key))
     }
 }
 
@@ -135,8 +160,11 @@ impl DatabaseCatalog {
         if schema_path.exists() {
             let data = fs::read_to_string(&schema_path)
                 .map_err(|e| MonaxError::Storage(format!("failed to read schema.json: {}", e)))?;
-            let catalog: DatabaseCatalog = serde_json::from_str(&data)
+            let mut catalog: DatabaseCatalog = serde_json::from_str(&data)
                 .map_err(|e| MonaxError::Storage(format!("failed to parse schema.json: {}", e)))?;
+            for table in catalog.tables.values_mut() {
+                table.update_partition_key_idx();
+            }
             Ok(catalog)
         } else {
             let catalog = DatabaseCatalog::new(db_name);
@@ -335,5 +363,82 @@ mod tests {
         catalog.rename_table("old", "new").unwrap();
         assert!(catalog.get_table("old").is_none());
         assert!(catalog.get_table("new").is_some());
+    }
+
+    #[test]
+    fn test_partition_type_enum() {
+        let mut meta = TableMeta::new("testdb", "test_table", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("ts", DataType::Timestamp),
+        ]);
+        
+        meta.partition_type = PartitionType::Day;
+        meta.partition_key = "ts".to_string();
+        assert_eq!(meta.partition_strategy(), crate::storage::partition_function::PartitionFunction::Day);
+        
+        meta.partition_type = PartitionType::Year;
+        assert_eq!(meta.partition_strategy(), crate::storage::partition_function::PartitionFunction::Year);
+        
+        meta.partition_type = PartitionType::Month;
+        assert_eq!(meta.partition_strategy(), crate::storage::partition_function::PartitionFunction::Month);
+        
+        meta.partition_type = PartitionType::Hash;
+        meta.partition_param = 32;
+        assert_eq!(meta.partition_strategy(), crate::storage::partition_function::PartitionFunction::Hash(32));
+    }
+
+    #[test]
+    fn test_is_partitioned() {
+        let mut meta = TableMeta::new("testdb", "test_table", vec![
+            ColumnDef::new("id", DataType::Int64),
+        ]);
+        
+        assert!(!meta.is_partitioned());
+        
+        meta.partition_type = PartitionType::Day;
+        meta.partition_key = "ts".to_string();
+        assert!(meta.is_partitioned());
+        
+        meta.partition_type = PartitionType::None;
+        assert!(!meta.is_partitioned());
+    }
+
+    #[test]
+    fn test_cluster_key() {
+        let mut meta = TableMeta::new("testdb", "test_table", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("name", DataType::VarChar),
+        ]);
+        
+        assert!(meta.cluster_key.is_empty());
+        
+        meta.cluster_key = vec!["id".to_string(), "name".to_string()];
+        assert_eq!(meta.cluster_key.len(), 2);
+        assert_eq!(meta.cluster_key[0], "id");
+        assert_eq!(meta.cluster_key[1], "name");
+    }
+
+    #[test]
+    fn test_partition_column_index() {
+        let mut meta = TableMeta::new("testdb", "test_table", vec![
+            ColumnDef::new("id", DataType::Int64),
+            ColumnDef::new("ts", DataType::Timestamp),
+            ColumnDef::new("name", DataType::VarChar),
+        ]);
+        
+        assert!(meta.get_partition_column_index().is_none());
+        
+        meta.partition_key = "ts".to_string();
+        let idx = meta.get_partition_column_index();
+        assert!(idx.is_some());
+        assert_eq!(idx.unwrap(), 1);
+
+        meta.partition_key = "TS".to_string();
+        let idx = meta.get_partition_column_index();
+        assert!(idx.is_some());
+        assert_eq!(idx.unwrap(), 1);
+        
+        meta.partition_key = "nonexistent".to_string();
+        assert!(meta.get_partition_column_index().is_none());
     }
 }

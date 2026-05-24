@@ -134,7 +134,7 @@ fn determine_partition_key(
     if table_meta.partition_key.is_empty() {
         return String::new();
     }
-    let col_idx = match batch.schema.index_of(&table_meta.partition_key) {
+    let col_idx = match table_meta.get_partition_column_index_cached() {
         Some(idx) => idx,
         None => return String::new(),
     };
@@ -146,13 +146,7 @@ fn determine_partition_key(
 
     use crate::storage::schema::PartitionType;
     match table_meta.partition_type {
-        PartitionType::Function => {
-            crate::storage::partition_function::compute_partition_key_from_scalar(
-                &table_meta.partition_strategy(),
-                &val,
-            )
-        }
-        PartitionType::Hash => {
+        PartitionType::Day | PartitionType::Year | PartitionType::Month | PartitionType::Hash => {
             crate::storage::partition_function::compute_partition_key_from_scalar(
                 &table_meta.partition_strategy(),
                 &val,

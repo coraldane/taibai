@@ -34,8 +34,14 @@ pub fn determine_write_dir(
     };
 
     let strategy = match table_meta.partition_type {
-        crate::storage::schema::PartitionType::Function => {
+        crate::storage::schema::PartitionType::Day => {
             crate::storage::partition::PartitionStrategy::Day
+        }
+        crate::storage::schema::PartitionType::Year => {
+            crate::storage::partition::PartitionStrategy::Year
+        }
+        crate::storage::schema::PartitionType::Month => {
+            crate::storage::partition::PartitionStrategy::Month
         }
         crate::storage::schema::PartitionType::Value => crate::storage::partition::PartitionStrategy::Day,
         crate::storage::schema::PartitionType::Hash => {

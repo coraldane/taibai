@@ -320,6 +320,14 @@ impl SegmentReader {
         global_row_idx: usize,
         column_names: &[String],
     ) -> Result<crate::types::batch::RecordBatch> {
+        if global_row_idx >= self.row_count() as usize {
+            return Err(crate::common::error::MonaxError::Internal(format!(
+                "row index {} out of bounds for segment with {} rows",
+                global_row_idx,
+                self.row_count()
+            )));
+        }
+
         let mut cumulative_rows = 0usize;
         let mut target_rg = 0;
         let mut local_row_idx = 0;

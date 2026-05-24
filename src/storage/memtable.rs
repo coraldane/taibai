@@ -200,6 +200,21 @@ impl MemTableManager {
         schema: &Schema,
         txn_id: u64,
     ) -> Arc<MemTable> {
+        {
+            let memtables = self.memtables.read().unwrap();
+            for mt in memtables.iter() {
+                if mt.db() == db
+                    && mt.table() == table
+                    && mt.partition_key() == partition_key
+                    && mt.state() == MemTableState::Pending
+                    && mt.txn_id() == txn_id
+                    && mt.row_count() < self.max_rows_per_memtable
+                {
+                    return Arc::clone(mt);
+                }
+            }
+        }
+
         let mut memtables = self.memtables.write().unwrap();
         for mt in memtables.iter() {
             if mt.db() == db

@@ -1,5 +1,6 @@
 use crate::types::scalar::ScalarValue;
 
+#[derive(Debug, PartialEq)]
 pub enum PartitionFunction {
     Day,
     Year,

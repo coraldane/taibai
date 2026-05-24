@@ -46,15 +46,16 @@ pub fn exec_create_table(
         if let Some(ref pdef) = partition_by {
             meta.partition_key = pdef.column.clone();
             meta.partition_type = match pdef.strategy {
-                PartitionStrategy::Day => PartitionType::Function,
-                PartitionStrategy::Year => PartitionType::Function,
-                PartitionStrategy::Month => PartitionType::Function,
+                PartitionStrategy::Day => PartitionType::Day,
+                PartitionStrategy::Year => PartitionType::Year,
+                PartitionStrategy::Month => PartitionType::Month,
                 PartitionStrategy::Value => PartitionType::Value,
                 PartitionStrategy::Hash(buckets) => {
                     meta.partition_param = buckets;
                     PartitionType::Hash
                 }
             };
+            meta.update_partition_key_idx();
         }
     }
 
@@ -505,13 +506,12 @@ pub fn exec_show_create_table(
 
     if table_meta.is_partitioned() {
         let partition_str = match table_meta.partition_type {
-            PartitionType::Function => {
-                let func = if table_meta.partition_key.to_lowercase().contains("day") { "DAY" } else { "YEAR" };
-                format!(" PARTITION BY {}({})", func, table_meta.partition_key)
-            }
-            PartitionType::Value => format!(" PARTITION BY VALUE({})", table_meta.partition_key),
+            PartitionType::Day => format!(" PARTITION BY DAY({})", table_meta.partition_key),
+            PartitionType::Year => format!(" PARTITION BY YEAR({})", table_meta.partition_key),
+            PartitionType::Month => format!(" PARTITION BY MONTH({})", table_meta.partition_key),
+            PartitionType::Value => format!(" PARTITION BY {}", table_meta.partition_key),
             PartitionType::Hash => format!(" PARTITION BY HASH({})({})", table_meta.partition_key, table_meta.partition_param),
-            _ => String::new(),
+            PartitionType::None => String::new(),
         };
         create_sql.push_str(&partition_str);
     }
