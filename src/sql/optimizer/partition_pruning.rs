@@ -25,17 +25,24 @@ fn apply_partition_pruning(plan: LogicalPlan) -> (LogicalPlan, bool) {
 
             if let LogicalPlan::Scan(ref mut scan) = *filter.input {
                 let time_range = extract_time_range(&filter.predicate, &scan.schema);
+                let partition_filter = extract_partition_filter(&filter.predicate, &scan.schema);
+                
+                let mut any_changed = changed;
+                
                 if let Some(tr) = time_range {
                     let is_new = scan.time_range.is_none();
                     scan.time_range = Some(tr);
-                    return (LogicalPlan::Filter(filter), changed || is_new);
+                    any_changed = any_changed || is_new;
                 }
                 
-                let partition_filter = extract_partition_filter(&filter.predicate, &scan.schema);
                 if let Some(pf) = partition_filter {
                     let is_new = scan.partition_filter.is_none();
                     scan.partition_filter = Some(pf);
-                    return (LogicalPlan::Filter(filter), changed || is_new);
+                    any_changed = any_changed || is_new;
+                }
+                
+                if any_changed != changed {
+                    return (LogicalPlan::Filter(filter), any_changed);
                 }
             }
 

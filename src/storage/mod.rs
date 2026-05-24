@@ -19,6 +19,7 @@ pub mod fastscan;
 pub mod bloomfilter;
 pub mod sparse_index;
 pub mod index_manager;
+pub mod pruning;
 
 #[cfg(test)]
 mod optimization_tests;

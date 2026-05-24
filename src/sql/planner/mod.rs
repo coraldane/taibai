@@ -9,7 +9,9 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 pub use types::*;
-pub use expr::{ast_expr_to_logical, ast_expr_to_logical_join, collect_column_refs, collect_cols_from_expr, infer_type};
+pub use expr::{collect_column_refs, collect_cols_from_expr};
+
+pub type AliasMap = HashMap<String, String>;
 
 pub fn plan_select(
     stmt: &Statement,
@@ -22,16 +24,16 @@ pub fn plan_select(
         _ => return Err(MonaxError::Internal("plan_select called with non-SELECT".into())),
     };
 
-    let (base_plan, schema) = if let Some(from_clause) = from {
+    let (base_plan, schema, alias_map) = if let Some(from_clause) = from {
         plan_from_clause(from_clause, table_schemas)?
     } else {
-        (LogicalPlan::Empty, Schema::empty())
+        (LogicalPlan::Empty, Schema::empty(), AliasMap::new())
     };
 
     let mut plan: LogicalPlan = base_plan;
 
     if let Some(pred) = where_clause {
-        let predicate = expr::ast_expr_to_logical(pred, &schema)?;
+        let predicate = expr::ast_expr_to_logical(pred, &schema, &alias_map)?;
         plan = LogicalPlan::Filter(FilterPlan {
             predicate,
             input: Box::new(plan),
@@ -41,12 +43,12 @@ pub fn plan_select(
     let agg_funcs = expr::extract_aggregates(select_list);
     if !group_by.is_empty() || !agg_funcs.is_empty() {
         let group_exprs: Vec<LogicalExpr> = group_by.iter()
-            .map(|e| expr::ast_expr_to_logical(e, &schema))
+            .map(|e| expr::ast_expr_to_logical(e, &schema, &alias_map))
             .collect::<Result<Vec<_>>>()?;
 
         let agg_exprs: Vec<AggregateExpr> = agg_funcs.into_iter().map(|(func, arg_expr, distinct)| {
             let arg = match &arg_expr {
-                Some(e) => Box::new(expr::ast_expr_to_logical(e, &schema).unwrap_or(LogicalExpr::Wildcard)),
+                Some(e) => Box::new(expr::ast_expr_to_logical(e, &schema, &alias_map).unwrap_or(LogicalExpr::Wildcard)),
                 None => Box::new(LogicalExpr::Wildcard),
             };
             AggregateExpr { func, arg, distinct }
@@ -62,9 +64,25 @@ pub fn plan_select(
     }
 
     if !order_by.is_empty() {
+        let select_aliases: Vec<(String, usize)> = select_list.iter().enumerate()
+            .filter_map(|(i, item)| match item {
+                SelectItem::Expr(_, Some(alias)) => Some((alias.to_lowercase(), i)),
+                _ => None,
+            })
+            .collect();
+
         let sort_keys: Vec<SortKey> = order_by.iter()
             .map(|item| -> Result<SortKey> {
-                let e = expr::ast_expr_to_logical(&item.expr, &schema)?;
+                let e = if let Expr::Column(name) = &item.expr {
+                    select_aliases.iter()
+                        .find(|(alias, _)| alias == &name.to_lowercase())
+                        .map(|(_, idx)| LogicalExpr::Column(*idx))
+                        .map_or_else(|| {
+                            expr::ast_expr_to_logical(&item.expr, &schema, &alias_map)
+                        }, Ok)?
+                } else {
+                    expr::ast_expr_to_logical(&item.expr, &schema, &alias_map)?
+                };
                 Ok(SortKey { expr: e, desc: item.desc })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -85,7 +103,7 @@ pub fn plan_select(
         });
     }
 
-    let (proj_exprs, aliases) = expr::resolve_projection(select_list, &schema);
+    let (proj_exprs, aliases) = expr::resolve_projection_with_alias(select_list, &schema, &alias_map);
     plan = LogicalPlan::Project(ProjectPlan {
         expressions: proj_exprs,
         aliases,
@@ -98,7 +116,7 @@ pub fn plan_select(
 fn plan_from_clause(
     from: &FromClause,
     table_schemas: &HashMap<String, Schema>,
-) -> Result<(LogicalPlan, Schema)> {
+) -> Result<(LogicalPlan, Schema, AliasMap)> {
     match from {
         FromClause::Table(table_ref) => {
             let table_name = &table_ref.name;
@@ -106,10 +124,17 @@ fn plan_from_clause(
                 .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
                 .clone();
             let plan = LogicalPlan::Scan(ScanPlan::new(table_name.clone(), schema.clone()));
-            Ok((plan, schema))
+
+            let mut alias_map = AliasMap::new();
+            if let Some(alias) = &table_ref.alias {
+                alias_map.insert(alias.to_lowercase(), table_name.clone());
+            }
+            alias_map.insert(table_name.to_lowercase(), table_name.clone());
+
+            Ok((plan, schema, alias_map))
         }
         FromClause::Join(join_expr) => {
-            let (left_plan, left_schema) = plan_from_clause(&join_expr.left, table_schemas)?;
+            let (left_plan, left_schema, mut alias_map) = plan_from_clause(&join_expr.left, table_schemas)?;
 
             let mut current_plan = left_plan;
             let mut current_schema = left_schema;
@@ -120,12 +145,17 @@ fn plan_from_clause(
                     .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", right_table)))?
                     .clone();
 
+                if let Some(alias) = &join_clause.right.alias {
+                    alias_map.insert(alias.to_lowercase(), right_table.clone());
+                }
+                alias_map.insert(right_table.to_lowercase(), right_table.clone());
+
                 let right_plan = LogicalPlan::Scan(ScanPlan::new(right_table.clone(), right_schema.clone()));
 
                 let output_schema = types::merge_schemas(&current_schema, &right_schema);
 
                 let condition = match &join_clause.condition {
-                    Some(expr) => expr::ast_expr_to_logical_join(expr, &output_schema, &current_schema, &right_schema)?,
+                    Some(expr) => expr::ast_expr_to_logical_join(expr, &output_schema, &current_schema, &right_schema, &alias_map)?,
                     None => LogicalExpr::Literal(ScalarValue::Bool(Some(true))),
                 };
 
@@ -141,7 +171,7 @@ fn plan_from_clause(
                 current_schema = output_schema;
             }
 
-            Ok((current_plan, current_schema))
+            Ok((current_plan, current_schema, alias_map))
         }
     }
 }

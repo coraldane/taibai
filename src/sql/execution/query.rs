@@ -1,15 +1,18 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ScanStats};
 use crate::storage::segment_manager::SegmentManager;
+use crate::storage::partition::{parse_partition_key, is_partition_segment, PartitionPruner, PartitionStrategy};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{BinOp, Expr, FromClause, SelectItem, Statement};
-use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan};
+use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan, TimeRange};
+use crate::sql::optimizer::partition_pruning::PartitionFilter;
 
 pub fn exec_select(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecResult> {
     exec_select_inner(engine, db, stmt, None, None)
@@ -127,16 +130,42 @@ fn exec_table_select(
     let mut scan_projections: HashMap<String, Vec<usize>> = HashMap::new();
     collect_scan_projections(&plan, &mut scan_projections);
 
+    let mut partition_prune_info: HashMap<String, PartitionPruneInfo> = HashMap::new();
+    collect_partition_prune_info(&plan, &mut partition_prune_info);
+
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mgr = engine.segment_mgr();
+    
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs.get(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+    
     for table_name in &table_names {
         let table_dir = engine.data_dir().join(db).join(table_name);
         let mut batches = Vec::new();
         let predicate = scan_predicates.get(table_name);
         let pred_ref = predicate.filter(|p| !p.is_empty());
         let projection = scan_projections.get(table_name);
+        let prune_info = partition_prune_info.get(table_name);
+        let table_meta = catalog.get_table(table_name);
+        
         if table_dir.exists() {
             let segment_files = SegmentManager::discover_segments(&table_dir)?;
+            let filtered_segments = filter_segments_by_partition(
+                segment_files,
+                prune_info,
+                table_meta
+            );
+            
+            if prune_info.is_some() && filtered_segments.len() < SegmentManager::discover_segments(&table_dir)?.len() {
+                tracing::debug!(
+                    table = %table_name,
+                    original_count = SegmentManager::discover_segments(&table_dir)?.len(),
+                    filtered_count = filtered_segments.len(),
+                    "applied partition pruning"
+                );
+            }
+            
             if let Some(p) = pred_ref {
                 tracing::debug!(
                     table = %table_name,
@@ -144,7 +173,7 @@ fn exec_table_select(
                     "applying zone-map pruning to table scan"
                 );
             }
-            for seg_path in segment_files {
+            for seg_path in filtered_segments {
                 let reader = mgr.open_reader(&seg_path)?;
                 let table_stats = stats.as_deref_mut()
                     .map(|s| s.entry(table_name.clone()).or_default());
@@ -319,6 +348,143 @@ fn collect_scan_predicates(
     }
 }
 
+#[derive(Clone)]
+struct PartitionPruneInfo {
+    time_range: Option<TimeRange>,
+    partition_filter: Option<PartitionFilter>,
+}
+
+fn collect_partition_prune_info(
+    plan: &LogicalPlan,
+    out: &mut HashMap<String, PartitionPruneInfo>,
+) {
+    match plan {
+        LogicalPlan::Scan(scan) => {
+            if scan.time_range.is_some() || scan.partition_filter.is_some() {
+                out.insert(scan.table_name.clone(), PartitionPruneInfo {
+                    time_range: scan.time_range.clone(),
+                    partition_filter: scan.partition_filter.clone(),
+                });
+            }
+        }
+        LogicalPlan::Filter(f) => collect_partition_prune_info(&f.input, out),
+        LogicalPlan::Project(p) => collect_partition_prune_info(&p.input, out),
+        LogicalPlan::Aggregate(a) => collect_partition_prune_info(&a.input, out),
+        LogicalPlan::Sort(s) => collect_partition_prune_info(&s.input, out),
+        LogicalPlan::Limit(l) => collect_partition_prune_info(&l.input, out),
+        LogicalPlan::TopN(t) => collect_partition_prune_info(&t.input, out),
+        LogicalPlan::Distinct(d) => collect_partition_prune_info(&d.input, out),
+        LogicalPlan::Window(w) => collect_partition_prune_info(&w.input, out),
+        LogicalPlan::Join(j) => {
+            collect_partition_prune_info(&j.left, out);
+            collect_partition_prune_info(&j.right, out);
+        }
+        LogicalPlan::SemiJoin(s) => {
+            collect_partition_prune_info(&s.left, out);
+            collect_partition_prune_info(&s.right, out);
+        }
+        LogicalPlan::Empty => {}
+    }
+}
+
+fn filter_segments_by_partition(
+    segment_files: Vec<PathBuf>,
+    prune_info: Option<&PartitionPruneInfo>,
+    table_meta: Option<&crate::storage::schema::TableMeta>,
+) -> Vec<PathBuf> {
+    let Some(info) = prune_info else {
+        return segment_files;
+    };
+    
+    let Some(meta) = table_meta else {
+        return segment_files;
+    };
+    
+    if !meta.is_partitioned() {
+        return segment_files;
+    }
+    
+    let strategy = match meta.partition_type {
+        crate::storage::schema::PartitionType::Function => {
+            if meta.partition_key.to_lowercase().contains("day") {
+                PartitionStrategy::Day
+            } else if meta.partition_key.to_lowercase().contains("year") {
+                PartitionStrategy::Year
+            } else if meta.partition_key.to_lowercase().contains("month") {
+                PartitionStrategy::Month
+            } else {
+                return segment_files;
+            }
+        }
+        crate::storage::schema::PartitionType::Value => PartitionStrategy::None,
+        _ => return segment_files,
+    };
+    
+    if strategy == PartitionStrategy::None {
+        if let Some(pf) = &info.partition_filter {
+            let target_partition_keys: Vec<String> = pf.values.iter()
+                .filter_map(|v| match v {
+                    ScalarValue::VarChar(Some(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            
+            if target_partition_keys.is_empty() {
+                return segment_files;
+            }
+            
+            return segment_files.into_iter()
+                .filter(|path| {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if let Some(key) = parse_partition_key(name) {
+                            return target_partition_keys.contains(&key);
+                        }
+                    }
+                    true
+                })
+                .collect();
+        }
+        return segment_files;
+    }
+    
+    let pruner = PartitionPruner::new(strategy);
+    
+    let (lower_bound, upper_bound) = if let Some(tr) = &info.time_range {
+        (tr.start.as_ref(), tr.end.as_ref())
+    } else {
+        (None, None)
+    };
+    
+    if lower_bound.is_none() && upper_bound.is_none() {
+        return segment_files;
+    }
+    
+    let available_partitions: Vec<String> = segment_files.iter()
+        .filter_map(|path| {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                parse_partition_key(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    let pruned_partitions = pruner.prune(&available_partitions, lower_bound, upper_bound);
+    
+    segment_files.into_iter()
+        .filter(|path| {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if is_partition_segment(name) {
+                    if let Some(key) = parse_partition_key(name) {
+                        return pruned_partitions.contains(&key);
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 fn collect_scan_projections(
     plan: &LogicalPlan,
     out: &mut HashMap<String, Vec<usize>>,
@@ -460,14 +626,14 @@ fn try_count_star_fast_path(
         return None;
     }
 
-    let table_schema = {
+    let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs.get(db)?;
         let meta = catalog.get_table(table_name)?;
-        Schema::new(meta.columns.clone())
+        (Schema::new(meta.columns.clone()), meta.clone())
     };
 
-    let segment_files = match SegmentManager::discover_segments(&table_dir) {
+    let all_segment_files = match SegmentManager::discover_segments(&table_dir) {
         Ok(files) => files,
         Err(e) => return Some(Err(e)),
     };
@@ -478,6 +644,36 @@ fn try_count_star_fast_path(
     if let Some(ref expr) = where_clause {
         let eq_info = extract_simple_eq_clause(expr, &table_schema);
         if let Some((col_idx, value)) = eq_info {
+            let partition_key_col_idx = table_meta.get_partition_column_index();
+            let is_partition_key_query = partition_key_col_idx.map(|pk_idx| pk_idx == col_idx).unwrap_or(false);
+            
+            let segment_files = if table_meta.is_partitioned() && is_partition_key_query {
+                let target_key = match &value {
+                    ScalarValue::VarChar(Some(s)) => s.clone(),
+                    ScalarValue::Int32(Some(v)) => v.to_string(),
+                    ScalarValue::Int64(Some(v)) => v.to_string(),
+                    ScalarValue::Date(Some(v)) => v.to_string(),
+                    _ => String::new(),
+                };
+                
+                if target_key.is_empty() {
+                    all_segment_files
+                } else {
+                    all_segment_files.into_iter()
+                        .filter(|path| {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if let Some(key) = parse_partition_key(name) {
+                                    return key == target_key;
+                                }
+                            }
+                            true
+                        })
+                        .collect()
+                }
+            } else {
+                all_segment_files
+            };
+            
             for seg_path in &segment_files {
                 match mgr.open_reader(seg_path) {
                     Ok(reader) => {
@@ -505,7 +701,7 @@ fn try_count_star_fast_path(
             let predicate = super::helpers::build_row_group_predicate(where_clause, &table_schema);
             let filter_col_indices = extract_filter_column_indices(expr, &table_schema);
 
-            for seg_path in &segment_files {
+            for seg_path in &all_segment_files {
                 match mgr.open_reader(seg_path) {
                     Ok(reader) => {
                         let batches = match reader.scan_with_projection_and_stats(
@@ -547,7 +743,7 @@ fn try_count_star_fast_path(
             }
         }
     } else {
-        for seg_path in &segment_files {
+        for seg_path in &all_segment_files {
             match mgr.open_reader(seg_path) {
                 Ok(reader) => {
                     let count = reader.row_count();
@@ -613,11 +809,11 @@ fn try_fast_scan_multi_eq(
 
     let table_name = &table_names[0];
 
-    let table_schema = {
+    let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs.get(db)?;
         let meta = catalog.get_table(table_name)?;
-        Schema::new(meta.columns.clone())
+        (Schema::new(meta.columns.clone()), meta.clone())
     };
 
     let eq_clauses = extract_multi_eq_clauses(where_clause, &table_schema)?;
@@ -644,9 +840,44 @@ fn try_fast_scan_multi_eq(
 
     let table_dir = engine.data_dir().join(db).join(table_name);
     if table_dir.exists() {
-        let segment_files = match SegmentManager::discover_segments(&table_dir) {
+        let all_segment_files = match SegmentManager::discover_segments(&table_dir) {
             Ok(files) => files,
             Err(e) => return Some(Err(e)),
+        };
+        
+        let partition_key_col_idx = table_meta.get_partition_column_index();
+        let partition_col_eq_value: Option<(usize, ScalarValue)> = partition_key_col_idx
+            .and_then(|pk_idx| {
+                eq_clauses.iter()
+                    .find(|c| c.column_index == pk_idx)
+                    .map(|c| (c.column_index, c.value.clone()))
+            });
+        
+        let segment_files = if table_meta.is_partitioned() && partition_col_eq_value.is_some() {
+            let target_key = match &partition_col_eq_value.unwrap().1 {
+                ScalarValue::VarChar(Some(s)) => s.clone(),
+                ScalarValue::Int32(Some(v)) => v.to_string(),
+                ScalarValue::Int64(Some(v)) => v.to_string(),
+                ScalarValue::Date(Some(v)) => v.to_string(),
+                _ => String::new(),
+            };
+            
+            if target_key.is_empty() {
+                all_segment_files
+            } else {
+                all_segment_files.into_iter()
+                    .filter(|path| {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if let Some(key) = parse_partition_key(name) {
+                                return key == target_key;
+                            }
+                        }
+                        true
+                    })
+                    .collect()
+            }
+        } else {
+            all_segment_files
         };
 
         let mgr = engine.segment_mgr();
@@ -786,11 +1017,11 @@ fn try_fast_scan_eq_unified(
 
     let table_name = &table_names[0];
 
-    let table_schema = {
+    let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs.get(db)?;
         let meta = catalog.get_table(table_name)?;
-        Schema::new(meta.columns.clone())
+        (Schema::new(meta.columns.clone()), meta.clone())
     };
 
     let eq_clause = extract_single_eq_clause(where_clause, &table_schema)?;
@@ -806,9 +1037,39 @@ fn try_fast_scan_eq_unified(
 
     let table_dir = engine.data_dir().join(db).join(table_name);
     if table_dir.exists() {
-        let segment_files = match SegmentManager::discover_segments(&table_dir) {
+        let all_segment_files = match SegmentManager::discover_segments(&table_dir) {
             Ok(files) => files,
             Err(e) => return Some(Err(e)),
+        };
+        
+        let partition_key_col_idx = table_meta.get_partition_column_index();
+        let is_partition_key_query = partition_key_col_idx.map(|pk_idx| pk_idx == col_idx).unwrap_or(false);
+        
+        let segment_files = if table_meta.is_partitioned() && is_partition_key_query {
+            let target_key = match &eq_value {
+                ScalarValue::VarChar(Some(s)) => s.clone(),
+                ScalarValue::Int32(Some(v)) => v.to_string(),
+                ScalarValue::Int64(Some(v)) => v.to_string(),
+                ScalarValue::Date(Some(v)) => v.to_string(),
+                _ => String::new(),
+            };
+            
+            if target_key.is_empty() {
+                all_segment_files
+            } else {
+                all_segment_files.into_iter()
+                    .filter(|path| {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if let Some(key) = parse_partition_key(name) {
+                                return key == target_key;
+                            }
+                        }
+                        true
+                    })
+                    .collect()
+            }
+        } else {
+            all_segment_files
         };
 
         let mgr = engine.segment_mgr();

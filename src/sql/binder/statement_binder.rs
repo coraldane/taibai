@@ -59,7 +59,10 @@ impl StatementBinder {
                 let schema = table_schemas.get(table_name)
                     .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
                     .clone();
-                let ctx = BindContext::with_table(table_name, schema.clone());
+                let mut ctx = BindContext::with_table(table_name, schema.clone());
+                if let Some(alias) = &table_ref.alias {
+                    ctx.register_table_alias(alias, table_name);
+                }
                 Ok((ctx, schema))
             }
             FromClause::Join(join_expr) => {
@@ -71,8 +74,19 @@ impl StatementBinder {
                     let right_schema = table_schemas.get(right_table)
                         .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", right_table)))?
                         .clone();
+
+                    left_ctx.table_schemas.insert(right_table.clone(), right_schema.clone());
+
+                    if let Some(alias) = &join_clause.right.alias {
+                        left_ctx.register_table_alias(alias, right_table);
+                    }
+
                     current_schema = Self::merge_schemas(&current_schema, &right_schema);
                     left_ctx.output_schema = Some(current_schema.clone());
+
+                    for (i, col) in right_schema.columns.iter().enumerate() {
+                        left_ctx.column_index_map.insert(col.name.to_lowercase(), current_schema.columns.len() - right_schema.columns.len() + i);
+                    }
                 }
 
                 Ok((left_ctx, current_schema))

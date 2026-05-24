@@ -50,12 +50,12 @@ impl FunctionRegistry {
         // Math functions
         self.register_scalar("abs", super::math::abs);
         self.register_scalar("ceil", super::math::ceil);
-        self.register_scalar("ceiling", super::math::ceil);
+        self.register_alias("ceiling", "ceil");
         self.register_scalar("floor", super::math::floor);
         self.register_scalar("round", super::math::round);
         self.register_scalar("sqrt", super::math::sqrt);
         self.register_scalar("pow", super::math::pow);
-        self.register_scalar("power", super::math::pow);
+        self.register_alias("power", "pow");
         self.register_scalar("log", super::math::log);
         self.register_scalar("ln", super::math::ln);
         self.register_scalar("log10", super::math::log10);
@@ -75,16 +75,16 @@ impl FunctionRegistry {
 
         // String functions
         self.register_scalar("length", super::string::length);
-        self.register_scalar("len", super::string::length);
+        self.register_alias("len", "length");
         self.register_scalar("upper", super::string::upper);
-        self.register_scalar("ucase", super::string::upper);
+        self.register_alias("ucase", "upper");
         self.register_scalar("lower", super::string::lower);
-        self.register_scalar("lcase", super::string::lower);
+        self.register_alias("lcase", "lower");
         self.register_scalar("trim", super::string::trim);
         self.register_scalar("ltrim", super::string::ltrim);
         self.register_scalar("rtrim", super::string::rtrim);
         self.register_scalar("substring", super::string::substring);
-        self.register_scalar("substr", super::string::substring);
+        self.register_alias("substr", "substring");
         self.register_scalar("concat", super::string::concat);
         self.register_scalar("concat_ws", super::string::concat_ws);
         self.register_scalar("replace", super::string::replace);
@@ -94,7 +94,7 @@ impl FunctionRegistry {
         self.register_scalar("lpad", super::string::lpad);
         self.register_scalar("rpad", super::string::rpad);
         self.register_scalar("instr", super::string::instr);
-        self.register_scalar("locate", super::string::locate);
+        self.register_alias("locate", "instr");
         self.register_scalar("repeat", super::string::repeat);
         self.register_scalar("space", super::string::space);
 
@@ -140,6 +140,10 @@ impl FunctionRegistry {
 
     fn register_scalar(&mut self, name: &str, handler: FunctionHandler) {
         self.functions.insert(name.to_lowercase(), handler);
+    }
+
+    fn register_alias(&mut self, alias: &str, canonical: &str) {
+        self.aliases.insert(alias.to_lowercase(), canonical.to_lowercase());
     }
 
     /// Look up a function by name (case-insensitive, with alias support).

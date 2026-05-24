@@ -1,20 +1,23 @@
+use std::io::{self, Cursor, Read};
+
 use crate::common::error::{MonaxError, Result};
+use crate::protocol::types::DataType;
+use crate::types::array::ColumnArray;
+use crate::types::batch::ColumnDef;
+use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
-/// Encoding type for column data within a segment block.
+// ---------------------------------------------------------------------------
+// Encoding type selection (RLE, dictionary, delta, etc.)
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodingType {
-    /// Raw uncompressed fixed-width values.
     Plain,
-    /// Run-length encoding: (value, count) pairs.
     Rle,
-    /// Dictionary encoding: indices into a dictionary of unique values.
     Dictionary,
-    /// Delta encoding: store first value + differences.
     Delta,
-    /// Delta-of-delta encoding: store differences of differences (for monotonic sequences).
     DeltaOfDelta,
-    /// Bit-packed: pack values using fewer bits than their full width.
     BitPacked,
 }
 
@@ -43,8 +46,6 @@ impl EncodingType {
     }
 }
 
-/// Select the best encoding for a column of scalar values.
-/// Uses simple heuristics to pick the encoding with the best expected compression.
 pub fn select_encoding(values: &[ScalarValue]) -> EncodingType {
     if values.is_empty() {
         return EncodingType::Plain;
@@ -52,18 +53,15 @@ pub fn select_encoding(values: &[ScalarValue]) -> EncodingType {
 
     let n = values.len();
 
-    // Check for RLE: if there are few unique values relative to total
     let unique_count = count_unique(values);
     if unique_count <= 4 && n > 16 {
         return EncodingType::Rle;
     }
 
-    // Check for dictionary encoding: good when cardinality is much less than n
     if unique_count < n / 2 && n > 32 {
         return EncodingType::Dictionary;
     }
 
-    // Check for monotonic integer sequences (delta-of-delta)
     if is_monotonic_int(values) && n > 8 {
         let deltas_of_deltas = compute_deltas_of_deltas(values);
         if let Some(dod) = deltas_of_deltas {
@@ -78,7 +76,6 @@ pub fn select_encoding(values: &[ScalarValue]) -> EncodingType {
     EncodingType::Plain
 }
 
-/// RLE encode a slice of scalar values into (value, count) pairs.
 pub fn rle_encode(values: &[ScalarValue]) -> Vec<(ScalarValue, u32)> {
     if values.is_empty() {
         return Vec::new();
@@ -101,7 +98,6 @@ pub fn rle_encode(values: &[ScalarValue]) -> Vec<(ScalarValue, u32)> {
     result
 }
 
-/// RLE decode (value, count) pairs back into scalar values.
 pub fn rle_decode(pairs: &[(ScalarValue, u32)]) -> Vec<ScalarValue> {
     let mut result = Vec::new();
     for (val, count) in pairs {
@@ -112,7 +108,6 @@ pub fn rle_decode(pairs: &[(ScalarValue, u32)]) -> Vec<ScalarValue> {
     result
 }
 
-/// Dictionary encode a slice: returns (dictionary, indices).
 pub fn dictionary_encode(values: &[ScalarValue]) -> (Vec<ScalarValue>, Vec<u32>) {
     let mut dict: Vec<ScalarValue> = Vec::new();
     let mut indices = Vec::with_capacity(values.len());
@@ -129,14 +124,13 @@ pub fn dictionary_encode(values: &[ScalarValue]) -> (Vec<ScalarValue>, Vec<u32>)
     (dict, indices)
 }
 
-/// Dictionary decode: given dictionary and indices, reconstruct values.
 pub fn dictionary_decode(dict: &[ScalarValue], indices: &[u32]) -> Vec<ScalarValue> {
-    indices.iter()
+    indices
+        .iter()
         .map(|&idx| dict.get(idx as usize).cloned().unwrap_or(ScalarValue::Int64(None)))
         .collect()
 }
 
-/// Delta encode a slice of i64 values: first value + differences.
 pub fn delta_encode(values: &[i64]) -> Vec<i64> {
     if values.is_empty() {
         return Vec::new();
@@ -149,7 +143,6 @@ pub fn delta_encode(values: &[i64]) -> Vec<i64> {
     result
 }
 
-/// Delta decode: reconstruct original from first value + differences.
 pub fn delta_decode(deltas: &[i64]) -> Vec<i64> {
     if deltas.is_empty() {
         return Vec::new();
@@ -161,10 +154,6 @@ pub fn delta_decode(deltas: &[i64]) -> Vec<i64> {
     }
     result
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn count_unique(values: &[ScalarValue]) -> usize {
     let mut seen: Vec<&ScalarValue> = Vec::new();
@@ -201,7 +190,8 @@ fn is_monotonic_int(values: &[ScalarValue]) -> bool {
     if values.len() < 2 {
         return false;
     }
-    let ints: Vec<i64> = values.iter()
+    let ints: Vec<i64> = values
+        .iter()
         .filter_map(|v| match v {
             ScalarValue::Int64(Some(v)) => Some(*v),
             ScalarValue::Int32(Some(v)) => Some(*v as i64),
@@ -211,12 +201,12 @@ fn is_monotonic_int(values: &[ScalarValue]) -> bool {
     if ints.len() != values.len() {
         return false;
     }
-    // Check monotonic non-decreasing
     ints.windows(2).all(|w| w[0] <= w[1])
 }
 
 fn compute_deltas_of_deltas(values: &[ScalarValue]) -> Option<Vec<i64>> {
-    let ints: Vec<i64> = values.iter()
+    let ints: Vec<i64> = values
+        .iter()
         .filter_map(|v| match v {
             ScalarValue::Int64(Some(v)) => Some(*v),
             ScalarValue::Int32(Some(v)) => Some(*v as i64),
@@ -229,6 +219,479 @@ fn compute_deltas_of_deltas(values: &[ScalarValue]) -> Option<Vec<i64>> {
     let deltas: Vec<i64> = ints.windows(2).map(|w| w[1] - w[0]).collect();
     let dod: Vec<i64> = deltas.windows(2).map(|w| w[1] - w[0]).collect();
     Some(dod)
+}
+
+// ---------------------------------------------------------------------------
+// Segment column encoding / decoding
+// ---------------------------------------------------------------------------
+
+pub fn null_for_dtype(dtype: DataType) -> ScalarValue {
+    match dtype {
+        DataType::Bool => ScalarValue::Bool(None),
+        DataType::Int8 => ScalarValue::Int8(None),
+        DataType::Int16 => ScalarValue::Int16(None),
+        DataType::Int32 => ScalarValue::Int32(None),
+        DataType::Int64 => ScalarValue::Int64(None),
+        DataType::UInt8 => ScalarValue::UInt8(None),
+        DataType::UInt16 => ScalarValue::UInt16(None),
+        DataType::UInt32 => ScalarValue::UInt32(None),
+        DataType::UInt64 => ScalarValue::UInt64(None),
+        DataType::Float32 => ScalarValue::Float32(None),
+        DataType::Float64 => ScalarValue::Float64(None),
+        DataType::Decimal => ScalarValue::Decimal(None),
+        DataType::Date => ScalarValue::Date(None),
+        DataType::Time => ScalarValue::Time(None),
+        DataType::Timestamp => ScalarValue::Timestamp(None),
+        DataType::Interval => ScalarValue::Interval(None),
+        DataType::VarChar => ScalarValue::VarChar(None),
+        DataType::Blob => ScalarValue::Blob(None),
+        DataType::Vector => ScalarValue::Vector(None),
+    }
+}
+
+pub fn encode_column(col: &ColumnArray, offset: usize, count: usize) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+
+    let null_flags: Vec<bool> = (offset..offset + count)
+        .map(|i| col.bitmap().is_null(i))
+        .collect();
+    let bitmap = NullBitmap::from_bools(&null_flags);
+    let bitmap_bytes = bitmap.to_bytes();
+
+    buf.extend_from_slice(&(bitmap_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&bitmap_bytes);
+
+    for i in offset..offset + count {
+        if col.bitmap().is_null(i) {
+            continue;
+        }
+        encode_value(&mut buf, col, i);
+    }
+
+    Ok(buf)
+}
+
+pub fn encode_value(buf: &mut Vec<u8>, col: &ColumnArray, idx: usize) {
+    match col {
+        ColumnArray::Bool { data, .. } => buf.push(data[idx]),
+        ColumnArray::Int8 { data, .. } => buf.push(data[idx] as u8),
+        ColumnArray::Int16 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Int32 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Int64 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::UInt8 { data, .. } => buf.push(data[idx]),
+        ColumnArray::UInt16 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::UInt32 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::UInt64 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Float32 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Float64 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Decimal { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Date { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Time { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Timestamp { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::Interval { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
+        ColumnArray::VarChar { data, .. } => {
+            buf.extend_from_slice(&(data[idx].len() as u32).to_le_bytes());
+            buf.extend_from_slice(data[idx].as_bytes());
+        }
+        ColumnArray::Blob { data, .. } => {
+            buf.extend_from_slice(&(data[idx].len() as u32).to_le_bytes());
+            buf.extend_from_slice(&data[idx]);
+        }
+        ColumnArray::Vector { data, .. } => {
+            let v = &data[idx];
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for f in v {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+    }
+}
+
+pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Result<ColumnArray> {
+    let mut cursor = Cursor::new(data);
+    let bitmap_len = read_u32_le(&mut cursor)? as usize;
+    let mut bitmap_data = vec![0u8; bitmap_len];
+    cursor.read_exact(&mut bitmap_data)?;
+    let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
+
+    let remaining_data = &data[4 + bitmap_len..];
+    let mut dc = Cursor::new(remaining_data);
+
+    macro_rules! read_fixed {
+        ($ty:ty, $size:expr, $variant:ident) => {{
+            let mut vals = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                if bitmap.is_null(i) {
+                    vals.push(<$ty>::default());
+                } else {
+                    let mut b = [0u8; $size];
+                    dc.read_exact(&mut b)
+                        .map_err(|e| MonaxError::Storage(format!("read error: {}", e)))?;
+                    vals.push(<$ty>::from_le_bytes(b));
+                }
+            }
+            ColumnArray::$variant {
+                data: vals,
+                bitmap: bitmap.clone(),
+            }
+        }};
+    }
+
+    let col = match col_def.data_type {
+        DataType::Bool => {
+            let mut vals = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                vals.push(if bitmap.is_null(i) {
+                    0u8
+                } else {
+                    let mut b = [0u8; 1];
+                    dc.read_exact(&mut b)
+                        .map_err(|e| MonaxError::Storage(format!("read error: {}", e)))?;
+                    b[0]
+                });
+            }
+            ColumnArray::Bool {
+                data: vals,
+                bitmap: bitmap.clone(),
+            }
+        }
+        DataType::Int8 => {
+            let mut vals = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                vals.push(if bitmap.is_null(i) {
+                    0i8
+                } else {
+                    let mut b = [0u8; 1];
+                    dc.read_exact(&mut b)
+                        .map_err(|e| MonaxError::Storage(format!("read error: {}", e)))?;
+                    b[0] as i8
+                });
+            }
+            ColumnArray::Int8 {
+                data: vals,
+                bitmap: bitmap.clone(),
+            }
+        }
+        DataType::Int16 => read_fixed!(i16, 2, Int16),
+        DataType::Int32 => read_fixed!(i32, 4, Int32),
+        DataType::Int64 => read_fixed!(i64, 8, Int64),
+        DataType::UInt8 => {
+            let mut vals = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                vals.push(if bitmap.is_null(i) {
+                    0u8
+                } else {
+                    let mut b = [0u8; 1];
+                    dc.read_exact(&mut b)
+                        .map_err(|e| MonaxError::Storage(format!("read error: {}", e)))?;
+                    b[0]
+                });
+            }
+            ColumnArray::UInt8 {
+                data: vals,
+                bitmap: bitmap.clone(),
+            }
+        }
+        DataType::UInt16 => read_fixed!(u16, 2, UInt16),
+        DataType::UInt32 => read_fixed!(u32, 4, UInt32),
+        DataType::UInt64 => read_fixed!(u64, 8, UInt64),
+        DataType::Float32 => read_fixed!(f32, 4, Float32),
+        DataType::Float64 => read_fixed!(f64, 8, Float64),
+        DataType::Decimal => read_fixed!(i64, 8, Decimal),
+        DataType::Date => read_fixed!(i32, 4, Date),
+        DataType::Time => read_fixed!(i64, 8, Time),
+        DataType::Timestamp => read_fixed!(i64, 8, Timestamp),
+        DataType::Interval => read_fixed!(i64, 8, Interval),
+        DataType::VarChar => {
+            let mut vals = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                if bitmap.is_null(i) {
+                    vals.push(String::new());
+                } else {
+                    let len = read_u32_le(&mut dc).unwrap_or(0) as usize;
+                    let mut s = vec![0u8; len];
+                    dc.read_exact(&mut s).unwrap_or(());
+                    vals.push(String::from_utf8_lossy(&s).into_owned());
+                }
+            }
+            ColumnArray::VarChar {
+                data: vals,
+                bitmap: bitmap.clone(),
+            }
+        }
+        DataType::Blob => {
+            let mut vals = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                if bitmap.is_null(i) {
+                    vals.push(Vec::new());
+                } else {
+                    let len = read_u32_le(&mut dc).unwrap_or(0) as usize;
+                    let mut v = vec![0u8; len];
+                    dc.read_exact(&mut v).unwrap_or(());
+                    vals.push(v);
+                }
+            }
+            ColumnArray::Blob {
+                data: vals,
+                bitmap: bitmap.clone(),
+            }
+        }
+        DataType::Vector => {
+            let mut vals = Vec::with_capacity(row_count);
+            for i in 0..row_count {
+                if bitmap.is_null(i) {
+                    vals.push(Vec::new());
+                } else {
+                    let count = read_u32_le(&mut dc).unwrap_or(0) as usize;
+                    let mut v = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let mut b = [0u8; 4];
+                        dc.read_exact(&mut b).unwrap_or(());
+                        v.push(f32::from_le_bytes(b));
+                    }
+                    vals.push(v);
+                }
+            }
+            ColumnArray::Vector {
+                data: vals,
+                bitmap: bitmap.clone(),
+            }
+        }
+    };
+
+    Ok(col)
+}
+
+// ---------------------------------------------------------------------------
+// Scalar tag-based encoding / decoding (for zone maps in footer)
+// ---------------------------------------------------------------------------
+
+pub fn encode_scalar_with_tag(buf: &mut Vec<u8>, v: &ScalarValue) {
+    let tag = scalar_tag(v);
+    buf.push(tag);
+    if v.is_null() {
+        return;
+    }
+    match v {
+        ScalarValue::Bool(Some(x)) => buf.push(if *x { 1 } else { 0 }),
+        ScalarValue::Int8(Some(x)) => buf.push(*x as u8),
+        ScalarValue::Int16(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Int32(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Int64(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::UInt8(Some(x)) => buf.push(*x),
+        ScalarValue::UInt16(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::UInt32(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::UInt64(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Float32(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Float64(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Decimal(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Date(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Time(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Timestamp(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::Interval(Some(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        ScalarValue::VarChar(Some(x)) => {
+            buf.extend_from_slice(&(x.len() as u32).to_le_bytes());
+            buf.extend_from_slice(x.as_bytes());
+        }
+        ScalarValue::Blob(Some(x)) => {
+            buf.extend_from_slice(&(x.len() as u32).to_le_bytes());
+            buf.extend_from_slice(x);
+        }
+        ScalarValue::Vector(Some(x)) => {
+            buf.extend_from_slice(&(x.len() as u32).to_le_bytes());
+            for f in x {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scalar_tag(v: &ScalarValue) -> u8 {
+    let dtype_tag = match v.data_type() {
+        DataType::Bool => 1u8,
+        DataType::Int8 => 2,
+        DataType::Int16 => 3,
+        DataType::Int32 => 4,
+        DataType::Int64 => 5,
+        DataType::UInt8 => 6,
+        DataType::UInt16 => 7,
+        DataType::UInt32 => 8,
+        DataType::UInt64 => 9,
+        DataType::Float32 => 10,
+        DataType::Float64 => 11,
+        DataType::Decimal => 12,
+        DataType::Date => 13,
+        DataType::Time => 14,
+        DataType::Timestamp => 15,
+        DataType::Interval => 16,
+        DataType::VarChar => 17,
+        DataType::Blob => 18,
+        DataType::Vector => 19,
+    };
+    if v.is_null() {
+        dtype_tag | 0x80
+    } else {
+        dtype_tag
+    }
+}
+
+pub fn decode_scalar_with_tag(cursor: &mut Cursor<&[u8]>) -> Result<ScalarValue> {
+    let tag = read_u8(cursor).map_err(|e| MonaxError::Storage(format!("read tag: {}", e)))?;
+    let is_null = (tag & 0x80) != 0;
+    let dtype_tag = tag & 0x7F;
+    let dtype = match dtype_tag {
+        1 => DataType::Bool,
+        2 => DataType::Int8,
+        3 => DataType::Int16,
+        4 => DataType::Int32,
+        5 => DataType::Int64,
+        6 => DataType::UInt8,
+        7 => DataType::UInt16,
+        8 => DataType::UInt32,
+        9 => DataType::UInt64,
+        10 => DataType::Float32,
+        11 => DataType::Float64,
+        12 => DataType::Decimal,
+        13 => DataType::Date,
+        14 => DataType::Time,
+        15 => DataType::Timestamp,
+        16 => DataType::Interval,
+        17 => DataType::VarChar,
+        18 => DataType::Blob,
+        19 => DataType::Vector,
+        other => return Err(MonaxError::Storage(format!("bad scalar tag: {}", other))),
+    };
+    if is_null {
+        return Ok(null_for_dtype(dtype));
+    }
+    let v = match dtype {
+        DataType::Bool => ScalarValue::Bool(Some(read_u8(cursor).unwrap_or(0) != 0)),
+        DataType::Int8 => ScalarValue::Int8(Some(read_u8(cursor).unwrap_or(0) as i8)),
+        DataType::Int16 => {
+            let mut b = [0u8; 2];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Int16(Some(i16::from_le_bytes(b)))
+        }
+        DataType::Int32 => {
+            let mut b = [0u8; 4];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Int32(Some(i32::from_le_bytes(b)))
+        }
+        DataType::Int64 => {
+            let mut b = [0u8; 8];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Int64(Some(i64::from_le_bytes(b)))
+        }
+        DataType::UInt8 => ScalarValue::UInt8(Some(read_u8(cursor).unwrap_or(0))),
+        DataType::UInt16 => {
+            let mut b = [0u8; 2];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::UInt16(Some(u16::from_le_bytes(b)))
+        }
+        DataType::UInt32 => {
+            let mut b = [0u8; 4];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::UInt32(Some(u32::from_le_bytes(b)))
+        }
+        DataType::UInt64 => {
+            let mut b = [0u8; 8];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::UInt64(Some(u64::from_le_bytes(b)))
+        }
+        DataType::Float32 => {
+            let mut b = [0u8; 4];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Float32(Some(f32::from_le_bytes(b)))
+        }
+        DataType::Float64 => {
+            let mut b = [0u8; 8];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Float64(Some(f64::from_le_bytes(b)))
+        }
+        DataType::Decimal => {
+            let mut b = [0u8; 8];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Decimal(Some(i64::from_le_bytes(b)))
+        }
+        DataType::Date => {
+            let mut b = [0u8; 4];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Date(Some(i32::from_le_bytes(b)))
+        }
+        DataType::Time => {
+            let mut b = [0u8; 8];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Time(Some(i64::from_le_bytes(b)))
+        }
+        DataType::Timestamp => {
+            let mut b = [0u8; 8];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Timestamp(Some(i64::from_le_bytes(b)))
+        }
+        DataType::Interval => {
+            let mut b = [0u8; 8];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Interval(Some(i64::from_le_bytes(b)))
+        }
+        DataType::VarChar => {
+            let len = read_u32_le(cursor)? as usize;
+            let mut b = vec![0u8; len];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::VarChar(Some(String::from_utf8_lossy(&b).into_owned()))
+        }
+        DataType::Blob => {
+            let len = read_u32_le(cursor)? as usize;
+            let mut b = vec![0u8; len];
+            cursor.read_exact(&mut b)?;
+            ScalarValue::Blob(Some(b))
+        }
+        DataType::Vector => {
+            let len = read_u32_le(cursor)? as usize;
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                let mut b = [0u8; 4];
+                cursor.read_exact(&mut b)?;
+                v.push(f32::from_le_bytes(b));
+            }
+            ScalarValue::Vector(Some(v))
+        }
+    };
+    Ok(v)
+}
+
+// ---------------------------------------------------------------------------
+// Low-level I/O primitives for footer / header parsing
+// ---------------------------------------------------------------------------
+
+pub fn read_u8(cursor: &mut Cursor<&[u8]>) -> std::result::Result<u8, io::Error> {
+    let mut buf = [0u8; 1];
+    cursor.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+pub fn read_u32_le(cursor: &mut Cursor<&[u8]>) -> std::result::Result<u32, io::Error> {
+    let mut buf = [0u8; 4];
+    cursor.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+pub fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> std::result::Result<u64, io::Error> {
+    let mut buf = [0u8; 8];
+    cursor.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+pub fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> std::result::Result<String, io::Error> {
+    let len = read_u32_le(cursor)? as usize;
+    let mut buf = vec![0u8; len];
+    cursor.read_exact(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+pub fn encode_len_prefixed_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
 }
 
 #[cfg(test)]
@@ -265,8 +728,8 @@ mod tests {
             ScalarValue::VarChar(Some("b".into())),
         ];
         let (dict, indices) = dictionary_encode(&values);
-        assert_eq!(dict.len(), 3); // 3 unique values
-        assert_eq!(indices[0], indices[2]); // "a" at same position
+        assert_eq!(dict.len(), 3);
+        assert_eq!(indices[0], indices[2]);
 
         let decoded = dictionary_decode(&dict, &indices);
         assert_eq!(decoded, values);
@@ -292,10 +755,9 @@ mod tests {
 
     #[test]
     fn test_select_encoding_plain() {
-        // Non-monotonic values with high cardinality => Plain
-        let values: Vec<ScalarValue> = (0..50).map(|i| {
-            ScalarValue::Int64(Some(((i * 97 + 13) * 2654435761) % 1000))
-        }).collect();
+        let values: Vec<ScalarValue> = (0..50)
+            .map(|i| ScalarValue::Int64(Some(((i * 97 + 13) * 2654435761) % 1000)))
+            .collect();
         assert_eq!(select_encoding(&values), EncodingType::Plain);
     }
 
@@ -314,5 +776,23 @@ mod tests {
         let (dict, idx) = dictionary_encode(&[]);
         assert!(dict.is_empty());
         assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_scalar_tag_roundtrip() {
+        let values = vec![
+            ScalarValue::Int64(Some(42)),
+            ScalarValue::Int64(None),
+            ScalarValue::VarChar(Some("hello".into())),
+            ScalarValue::Bool(Some(true)),
+            ScalarValue::Float64(Some(3.14)),
+        ];
+        for v in &values {
+            let mut buf = Vec::new();
+            encode_scalar_with_tag(&mut buf, v);
+            let mut cursor = Cursor::new(buf.as_slice());
+            let decoded = decode_scalar_with_tag(&mut cursor).unwrap();
+            assert_eq!(v, &decoded);
+        }
     }
 }

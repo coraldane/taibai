@@ -230,6 +230,20 @@ pub fn compare_scalars_for_sort(a: &ScalarValue, b: &ScalarValue) -> std::cmp::O
     }
 }
 
+
+pub fn scalar_lt(a: &ScalarValue, b: &ScalarValue) -> bool {
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    compare_scalars_for_sort(a, b) == std::cmp::Ordering::Less
+}
+
+pub fn scalar_le(a: &ScalarValue, b: &ScalarValue) -> bool {
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    matches!(compare_scalars_for_sort(a, b), std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+}
 /// A segment index entry that stores min/max values for the sort key columns.
 /// Used for range pruning during query execution.
 #[derive(Debug, Clone)]

@@ -862,6 +862,18 @@ impl Parser {
                 let alias = if self.peek() == &Token::As {
                     self.advance();
                     Some(self.expect_ident()?)
+                } else if matches!(self.peek(), Token::Ident(_)) {
+                    let next = self.peek();
+                    if !matches!(next,
+                        Token::From | Token::Where | Token::Group |
+                        Token::Order | Token::Limit | Token::Offset |
+                        Token::Comma | Token::Semicolon | Token::Eof |
+                        Token::Union | Token::Having
+                    ) {
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };

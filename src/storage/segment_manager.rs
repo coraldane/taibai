@@ -10,12 +10,11 @@ use crate::protocol::types::DataType;
 use crate::storage::bloomfilter::BloomFilter;
 use crate::storage::segment::{
     encode_segment_footer, encode_segment_header, RowGroupMeta, SegmentReader, SegmentWriter,
-    ZoneMap, SEGMENT_HEADER_SIZE,
+    SEGMENT_HEADER_SIZE,
 };
+use crate::storage::pruning::ZoneMap;
 use crate::storage::wal::WalWriter;
 use crate::types::batch::{RecordBatch, Schema};
-
-const MAX_SEGMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
 const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 500_000;
 const FLUSH_CHECK_INTERVAL_SECS: u64 = 10;
@@ -670,7 +669,7 @@ impl SegmentManager {
             }
             
             let offset = seg.current_size;
-            let mut column_sizes = Vec::with_capacity(compressed_columns.len());
+            let mut column_compressed_sizes = Vec::with_capacity(compressed_columns.len());
             let mut compressed_sizes = Vec::with_capacity(compressed_columns.len());
             let mut uncompressed_sizes = Vec::with_capacity(compressed_columns.len());
             let mut total_length = 0u64;
@@ -678,7 +677,7 @@ impl SegmentManager {
 
             for (compressed, uncompressed_size) in &compressed_columns {
                 let n = compressed.len() as u64;
-                column_sizes.push(n);
+                column_compressed_sizes.push(n);
                 compressed_sizes.push(n);
                 uncompressed_sizes.push(*uncompressed_size);
                 total_length += n;
@@ -691,7 +690,7 @@ impl SegmentManager {
                 length: total_length,
                 row_count: req.row_count as u64,
                 zone_maps: placeholder_zone_maps(&seg.schema, req.row_count as u64),
-                column_sizes,
+                column_compressed_sizes,
                 compressed_sizes,
                 uncompressed_sizes,
                 bloom_filters: vec![None; seg.schema.num_columns()],
@@ -825,7 +824,7 @@ impl SegmentManager {
             }
             
             let offset = seg.current_size;
-            let mut column_sizes = Vec::with_capacity(compressed_columns.len());
+            let mut column_compressed_sizes = Vec::with_capacity(compressed_columns.len());
             let mut compressed_sizes = Vec::with_capacity(compressed_columns.len());
             let mut uncompressed_sizes = Vec::with_capacity(compressed_columns.len());
             let mut total_length = 0u64;
@@ -833,7 +832,7 @@ impl SegmentManager {
 
             for (compressed, uncompressed_size) in &compressed_columns {
                 let n = compressed.len() as u64;
-                column_sizes.push(n);
+                column_compressed_sizes.push(n);
                 compressed_sizes.push(n);
                 uncompressed_sizes.push(*uncompressed_size);
                 total_length += n;
@@ -846,7 +845,7 @@ impl SegmentManager {
                 length: total_length,
                 row_count: req.row_count as u64,
                 zone_maps: placeholder_zone_maps(&seg.schema, req.row_count as u64),
-                column_sizes,
+                column_compressed_sizes,
                 compressed_sizes,
                 uncompressed_sizes,
                 bloom_filters: vec![None; seg.schema.num_columns()],
@@ -1099,14 +1098,14 @@ impl SegmentManager {
         }
 
         let offset = segment.current_size;
-        let mut column_sizes = Vec::with_capacity(num_cols);
+        let mut column_compressed_sizes = Vec::with_capacity(num_cols);
         let mut compressed_sizes = Vec::with_capacity(num_cols);
         let mut uncompressed_sizes = Vec::with_capacity(num_cols);
         let mut total_length = 0u64;
         let mut write_buf = Vec::new();
         for (compressed, uncompressed_size) in &compressed_columns {
             let n = compressed.len() as u64;
-            column_sizes.push(n);
+            column_compressed_sizes.push(n);
             compressed_sizes.push(n);
             uncompressed_sizes.push(*uncompressed_size);
             total_length += n;
@@ -1118,7 +1117,7 @@ impl SegmentManager {
             length: total_length,
             row_count: rows_to_flush as u64,
             zone_maps: placeholder_zone_maps(&segment.schema, rows_to_flush as u64),
-            column_sizes,
+            column_compressed_sizes,
             compressed_sizes,
             uncompressed_sizes,
             bloom_filters: vec![None; segment.schema.num_columns()],
@@ -1231,7 +1230,7 @@ fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
         .columns
         .iter()
         .map(|col| {
-            let null = null_scalar_for(col.data_type);
+            let null = crate::storage::encoding::null_for_dtype(col.data_type);
             ZoneMap {
                 min_value: null.clone(),
                 max_value: null,
@@ -1240,31 +1239,6 @@ fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
             }
         })
         .collect()
-}
-
-fn null_scalar_for(dtype: DataType) -> crate::types::scalar::ScalarValue {
-    use crate::types::scalar::ScalarValue;
-    match dtype {
-        DataType::Bool => ScalarValue::Bool(None),
-        DataType::Int8 => ScalarValue::Int8(None),
-        DataType::Int16 => ScalarValue::Int16(None),
-        DataType::Int32 => ScalarValue::Int32(None),
-        DataType::Int64 => ScalarValue::Int64(None),
-        DataType::UInt8 => ScalarValue::UInt8(None),
-        DataType::UInt16 => ScalarValue::UInt16(None),
-        DataType::UInt32 => ScalarValue::UInt32(None),
-        DataType::UInt64 => ScalarValue::UInt64(None),
-        DataType::Float32 => ScalarValue::Float32(None),
-        DataType::Float64 => ScalarValue::Float64(None),
-        DataType::Decimal => ScalarValue::Decimal(None),
-        DataType::Date => ScalarValue::Date(None),
-        DataType::Time => ScalarValue::Time(None),
-        DataType::Timestamp => ScalarValue::Timestamp(None),
-        DataType::Interval => ScalarValue::Interval(None),
-        DataType::VarChar => ScalarValue::VarChar(None),
-        DataType::Blob => ScalarValue::Blob(None),
-        DataType::Vector => ScalarValue::Vector(None),
-    }
 }
 
 fn bulk_compression_level() -> i32 {

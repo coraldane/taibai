@@ -5,8 +5,9 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::types::*;
+use super::AliasMap;
 
-pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> {
+pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema, alias_map: &AliasMap) -> Result<LogicalExpr> {
     match expr {
         Expr::Literal(v) => Ok(LogicalExpr::Literal(v.clone())),
         Expr::Column(name) => {
@@ -15,13 +16,12 @@ pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> 
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
-            let idx = schema.index_of(column)
-                .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found in table '{}'", column, table)))?;
+            let idx = resolve_qualified_column_index(table, column, schema, alias_map)?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::BinaryOp { left, op, right } => {
-            let l = ast_expr_to_logical(left, schema)?;
-            let r = ast_expr_to_logical(right, schema)?;
+            let l = ast_expr_to_logical(left, schema, alias_map)?;
+            let r = ast_expr_to_logical(right, schema, alias_map)?;
             Ok(LogicalExpr::BinaryOp {
                 left: Box::new(l),
                 op: *op,
@@ -29,11 +29,11 @@ pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> 
             })
         }
         Expr::UnaryNot(inner) => {
-            let e = ast_expr_to_logical(inner, schema)?;
+            let e = ast_expr_to_logical(inner, schema, alias_map)?;
             Ok(LogicalExpr::Not(Box::new(e)))
         }
         Expr::UnaryMinus(inner) => {
-            let e = ast_expr_to_logical(inner, schema)?;
+            let e = ast_expr_to_logical(inner, schema, alias_map)?;
             Ok(LogicalExpr::BinaryOp {
                 left: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(0)))),
                 op: BinOp::Sub,
@@ -41,28 +41,28 @@ pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> 
             })
         }
         Expr::IsNull(inner) => {
-            let e = ast_expr_to_logical(inner, schema)?;
+            let e = ast_expr_to_logical(inner, schema, alias_map)?;
             Ok(LogicalExpr::IsNull(Box::new(e)))
         }
         Expr::IsNotNull(inner) => {
-            let e = ast_expr_to_logical(inner, schema)?;
+            let e = ast_expr_to_logical(inner, schema, alias_map)?;
             Ok(LogicalExpr::IsNotNull(Box::new(e)))
         }
         Expr::In { expr, values, negated } => {
-            let e = ast_expr_to_logical(expr, schema)?;
+            let e = ast_expr_to_logical(expr, schema, alias_map)?;
             let vals: Vec<ScalarValue> = values.iter()
                 .filter_map(|v| match v { Expr::Literal(s) => Some(s.clone()), _ => None })
                 .collect();
             Ok(LogicalExpr::In { expr: Box::new(e), values: vals, negated: *negated })
         }
         Expr::Between { expr, low, high, negated } => {
-            let e = ast_expr_to_logical(expr, schema)?;
-            let lo = ast_expr_to_logical(low, schema)?;
-            let hi = ast_expr_to_logical(high, schema)?;
+            let e = ast_expr_to_logical(expr, schema, alias_map)?;
+            let lo = ast_expr_to_logical(low, schema, alias_map)?;
+            let hi = ast_expr_to_logical(high, schema, alias_map)?;
             Ok(LogicalExpr::Between { expr: Box::new(e), low: Box::new(lo), high: Box::new(hi), negated: *negated })
         }
         Expr::Like { expr, pattern, negated } => {
-            let e = ast_expr_to_logical(expr, schema)?;
+            let e = ast_expr_to_logical(expr, schema, alias_map)?;
             let pat = match &**pattern { Expr::Literal(ScalarValue::VarChar(Some(s))) => s.clone(), _ => "%".to_string() };
             Ok(LogicalExpr::Like { expr: Box::new(e), pattern: pat, negated: *negated })
         }
@@ -78,7 +78,7 @@ pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> 
             let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*")) {
                 LogicalExpr::Wildcard
             } else {
-                ast_expr_to_logical(&args[0], schema)?
+                ast_expr_to_logical(&args[0], schema, alias_map)?
             };
             Ok(LogicalExpr::Aggregate(AggregateExpr {
                 func,
@@ -86,9 +86,18 @@ pub fn ast_expr_to_logical(expr: &Expr, schema: &Schema) -> Result<LogicalExpr> 
                 distinct: *distinct,
             }))
         }
-        // Unsupported expressions fall through
         _ => Err(MonaxError::Sql(format!("unsupported expression type"))),
     }
+}
+
+fn resolve_qualified_column_index(
+    table: &str,
+    column: &str,
+    schema: &Schema,
+    _alias_map: &AliasMap,
+) -> Result<usize> {
+    schema.index_of(column)
+        .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found in table '{}'", column, table)))
 }
 
 pub fn ast_expr_to_logical_join(
@@ -96,6 +105,7 @@ pub fn ast_expr_to_logical_join(
     output_schema: &Schema,
     left_schema: &Schema,
     right_schema: &Schema,
+    alias_map: &AliasMap,
 ) -> Result<LogicalExpr> {
     match expr {
         Expr::Literal(v) => Ok(LogicalExpr::Literal(v.clone())),
@@ -104,7 +114,11 @@ pub fn ast_expr_to_logical_join(
                 .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", name)))?;
             Ok(LogicalExpr::Column(idx))
         }
-        Expr::QualifiedColumn { table: _, column } => {
+        Expr::QualifiedColumn { table, column } => {
+            let _resolved_table = alias_map.get(&table.to_lowercase())
+                .map(|s| s.as_str())
+                .unwrap_or(table);
+
             let left_idx = left_schema.index_of(column);
             let right_idx = right_schema.index_of(column);
 
@@ -113,14 +127,15 @@ pub fn ast_expr_to_logical_join(
                 (None, Some(r)) => left_schema.columns.len() + r,
                 (Some(l), Some(_)) => l,
                 (None, None) => {
-                    return Err(MonaxError::Sql(format!("column '{}' not found", column)));
+                    return Err(MonaxError::Sql(format!("column '{}' not found in table '{}'", column, table)));
                 }
             };
+
             Ok(LogicalExpr::Column(idx))
         }
         Expr::BinaryOp { left, op, right } => {
-            let l = ast_expr_to_logical_join(left, output_schema, left_schema, right_schema)?;
-            let r = ast_expr_to_logical_join(right, output_schema, left_schema, right_schema)?;
+            let l = ast_expr_to_logical_join(left, output_schema, left_schema, right_schema, alias_map)?;
+            let r = ast_expr_to_logical_join(right, output_schema, left_schema, right_schema, alias_map)?;
             Ok(LogicalExpr::BinaryOp {
                 left: Box::new(l),
                 op: *op,
@@ -128,11 +143,11 @@ pub fn ast_expr_to_logical_join(
             })
         }
         Expr::UnaryNot(inner) => {
-            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema)?;
+            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema, alias_map)?;
             Ok(LogicalExpr::Not(Box::new(e)))
         }
         Expr::UnaryMinus(inner) => {
-            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema)?;
+            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema, alias_map)?;
             Ok(LogicalExpr::BinaryOp {
                 left: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(0)))),
                 op: BinOp::Sub,
@@ -140,11 +155,11 @@ pub fn ast_expr_to_logical_join(
             })
         }
         Expr::IsNull(inner) => {
-            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema)?;
+            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema, alias_map)?;
             Ok(LogicalExpr::IsNull(Box::new(e)))
         }
         Expr::IsNotNull(inner) => {
-            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema)?;
+            let e = ast_expr_to_logical_join(inner, output_schema, left_schema, right_schema, alias_map)?;
             Ok(LogicalExpr::IsNotNull(Box::new(e)))
         }
         Expr::Function { name, args, distinct } => {
@@ -159,7 +174,7 @@ pub fn ast_expr_to_logical_join(
             let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*")) {
                 LogicalExpr::Wildcard
             } else {
-                ast_expr_to_logical_join(&args[0], output_schema, left_schema, right_schema)?
+                ast_expr_to_logical_join(&args[0], output_schema, left_schema, right_schema, alias_map)?
             };
             Ok(LogicalExpr::Aggregate(AggregateExpr {
                 func,
@@ -167,7 +182,6 @@ pub fn ast_expr_to_logical_join(
                 distinct: *distinct,
             }))
         }
-        // Unsupported expressions for join context
         _ => Err(MonaxError::Sql(format!("unsupported expression type in join context"))),
     }
 }
@@ -203,7 +217,7 @@ fn extract_aggs_from_expr(expr: &Expr, aggs: &mut Vec<(AggFunc, Option<Expr>, bo
     }
 }
 
-pub fn resolve_projection(select_list: &[SelectItem], schema: &Schema) -> (Vec<LogicalExpr>, Vec<Option<String>>) {
+pub fn resolve_projection_with_alias(select_list: &[SelectItem], schema: &Schema, alias_map: &AliasMap) -> (Vec<LogicalExpr>, Vec<Option<String>>) {
     let mut exprs = Vec::new();
     let mut aliases = Vec::new();
 
@@ -216,7 +230,7 @@ pub fn resolve_projection(select_list: &[SelectItem], schema: &Schema) -> (Vec<L
                 }
             }
             SelectItem::Expr(expr, alias) => {
-                let logical = ast_expr_to_logical(expr, schema).unwrap_or(LogicalExpr::Wildcard);
+                let logical = ast_expr_to_logical(expr, schema, alias_map).unwrap_or(LogicalExpr::Wildcard);
                 exprs.push(logical);
                 aliases.push(alias.clone());
             }
