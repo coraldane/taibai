@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use crate::common::error::{MonaxError, Result};
-use crate::storage::bloomfilter::BloomFilter;
-use crate::storage::encoding::decode_column;
-use crate::storage::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
+use crate::storage::index::bloomfilter::BloomFilter;
+use crate::storage::codec::encoding::decode_column;
+use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
 use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
@@ -268,7 +268,7 @@ impl SegmentReader {
             })
             .collect();
 
-        let pool = crate::storage::buffer_pool::global_batch_pool();
+        let pool = crate::storage::core::buffer_pool::global_batch_pool();
         let mut results = Vec::with_capacity(column_indices.len());
 
         for &col_idx in column_indices {

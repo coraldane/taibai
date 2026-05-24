@@ -101,7 +101,7 @@ fn exec_table_select(
 
     let mut table_schemas = HashMap::new();
     let mut table_cluster_keys: HashMap<String, Vec<String>> = HashMap::new();
-    let mut table_metas: HashMap<String, crate::storage::schema::TableMeta> = HashMap::new();
+    let mut table_metas: HashMap<String, crate::storage::catalog::schema::TableMeta> = HashMap::new();
     {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs

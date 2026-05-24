@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::storage::partition::{
     is_partition_segment, parse_partition_key, PartitionPruner, PartitionStrategy,
 };
-use crate::storage::schema::TableMeta;
+use crate::storage::catalog::schema::TableMeta;
 use crate::types::scalar::ScalarValue;
 
 use super::spec::{PartitionScanInfo, ScanSpec};
@@ -39,12 +39,12 @@ pub fn prune_segments_by_partition(
     }
 
     let strategy = match meta.partition_type {
-        crate::storage::schema::PartitionType::Day => PartitionStrategy::Day,
-        crate::storage::schema::PartitionType::Year => PartitionStrategy::Year,
-        crate::storage::schema::PartitionType::Month => PartitionStrategy::Month,
-        crate::storage::schema::PartitionType::Value => PartitionStrategy::None,
-        crate::storage::schema::PartitionType::Hash => return segment_files,
-        crate::storage::schema::PartitionType::None => return segment_files,
+        crate::storage::catalog::schema::PartitionType::Day => PartitionStrategy::Day,
+        crate::storage::catalog::schema::PartitionType::Year => PartitionStrategy::Year,
+        crate::storage::catalog::schema::PartitionType::Month => PartitionStrategy::Month,
+        crate::storage::catalog::schema::PartitionType::Value => PartitionStrategy::None,
+        crate::storage::catalog::schema::PartitionType::Hash => return segment_files,
+        crate::storage::catalog::schema::PartitionType::None => return segment_files,
     };
 
     if strategy == PartitionStrategy::None {
@@ -184,7 +184,7 @@ mod tests {
 
     use crate::protocol::types::DataType;
     use crate::sql::optimizer::partition_pruning::PartitionFilter;
-    use crate::storage::schema::{PartitionType, TableMeta};
+    use crate::storage::catalog::schema::{PartitionType, TableMeta};
     use crate::types::batch::ColumnDef;
     use crate::types::scalar::ScalarValue;
 

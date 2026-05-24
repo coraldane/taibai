@@ -1,6 +1,6 @@
 use std::sync::{Mutex, RwLock};
 
-use crate::storage::bloomfilter::BloomFilter;
+use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::segment::ZoneMap;
 use crate::types::scalar::ScalarValue;
 

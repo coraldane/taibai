@@ -2,11 +2,11 @@ use std::io::{Cursor, Read};
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::bloomfilter::BloomFilter;
-use crate::storage::encoding::{
+use crate::storage::index::bloomfilter::BloomFilter;
+use crate::storage::codec::encoding::{
     decode_scalar_with_tag, read_len_prefixed_str, read_u32_le, read_u64_le, read_u8,
 };
-use crate::storage::pruning::ZoneMap;
+use crate::storage::partition::pruning::ZoneMap;
 use crate::types::batch::{ColumnDef, Schema};
 use crate::types::scalar::ScalarValue;
 

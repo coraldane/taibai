@@ -1,5 +1,5 @@
 use crate::common::error::{MonaxError, Result};
-use crate::storage::sort_key::SortKeyInserter;
+use crate::storage::index::sort_key::SortKeyInserter;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -128,7 +128,7 @@ pub fn exec_insert(
 }
 
 fn determine_partition_key(
-    table_meta: &crate::storage::schema::TableMeta,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
     batch: &RecordBatch,
 ) -> String {
     if table_meta.partition_key.is_empty() {
@@ -144,10 +144,10 @@ fn determine_partition_key(
     let val = batch.scalar(0, col_idx)
         .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
 
-    use crate::storage::schema::PartitionType;
+    use crate::storage::catalog::schema::PartitionType;
     match table_meta.partition_type {
         PartitionType::Day | PartitionType::Year | PartitionType::Month | PartitionType::Hash => {
-            crate::storage::partition_function::compute_partition_key_from_scalar(
+            crate::storage::partition::partition_function::compute_partition_key_from_scalar(
                 &table_meta.partition_strategy(),
                 &val,
             )

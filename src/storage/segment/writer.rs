@@ -3,11 +3,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{MonaxError, Result};
-use crate::storage::bloomfilter::BloomFilter;
-use crate::storage::encoding::{
+use crate::storage::index::bloomfilter::BloomFilter;
+use crate::storage::codec::encoding::{
     encode_column, encode_len_prefixed_str, encode_scalar_with_tag, null_for_dtype,
 };
-use crate::storage::pruning::ZoneMap;
+use crate::storage::partition::pruning::ZoneMap;
 use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
@@ -357,7 +357,7 @@ fn update_zone_map(
         match cur_min {
             None => *cur_min = Some(v.clone()),
             Some(m) => {
-                if crate::storage::sort_key::scalar_lt(&v, m) {
+                if crate::storage::index::sort_key::scalar_lt(&v, m) {
                     *cur_min = Some(v.clone());
                 }
             }
@@ -365,7 +365,7 @@ fn update_zone_map(
         match cur_max {
             None => *cur_max = Some(v),
             Some(m) => {
-                if crate::storage::sort_key::scalar_lt(m, &v) {
+                if crate::storage::index::sort_key::scalar_lt(m, &v) {
                     *cur_max = Some(v);
                 }
             }
@@ -394,7 +394,7 @@ fn compute_segment_zone_maps(row_groups: &[crate::storage::segment::RowGroupMeta
                     match &seg_min {
                         None => seg_min = Some(zm.min_value.clone()),
                         Some(m) => {
-                            if crate::storage::sort_key::scalar_lt(&zm.min_value, m) {
+                            if crate::storage::index::sort_key::scalar_lt(&zm.min_value, m) {
                                 seg_min = Some(zm.min_value.clone());
                             }
                         }
@@ -404,7 +404,7 @@ fn compute_segment_zone_maps(row_groups: &[crate::storage::segment::RowGroupMeta
                     match &seg_max {
                         None => seg_max = Some(zm.max_value.clone()),
                         Some(m) => {
-                            if crate::storage::sort_key::scalar_lt(m, &zm.max_value) {
+                            if crate::storage::index::sort_key::scalar_lt(m, &zm.max_value) {
                                 seg_max = Some(zm.max_value.clone());
                             }
                         }

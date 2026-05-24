@@ -108,8 +108,8 @@ impl TableMeta {
         PathBuf::from(base_dir).join(&self.database).join(&self.name)
     }
 
-    pub fn partition_strategy(&self) -> crate::storage::partition_function::PartitionFunction {
-        use crate::storage::partition_function::PartitionFunction;
+    pub fn partition_strategy(&self) -> crate::storage::partition::partition_function::PartitionFunction {
+        use crate::storage::partition::partition_function::PartitionFunction;
         match self.partition_type {
             PartitionType::None => PartitionFunction::Value,
             PartitionType::Value => PartitionFunction::Value,
@@ -374,17 +374,17 @@ mod tests {
         
         meta.partition_type = PartitionType::Day;
         meta.partition_key = "ts".to_string();
-        assert_eq!(meta.partition_strategy(), crate::storage::partition_function::PartitionFunction::Day);
+        assert_eq!(meta.partition_strategy(), crate::storage::partition::partition_function::PartitionFunction::Day);
         
         meta.partition_type = PartitionType::Year;
-        assert_eq!(meta.partition_strategy(), crate::storage::partition_function::PartitionFunction::Year);
+        assert_eq!(meta.partition_strategy(), crate::storage::partition::partition_function::PartitionFunction::Year);
         
         meta.partition_type = PartitionType::Month;
-        assert_eq!(meta.partition_strategy(), crate::storage::partition_function::PartitionFunction::Month);
+        assert_eq!(meta.partition_strategy(), crate::storage::partition::partition_function::PartitionFunction::Month);
         
         meta.partition_type = PartitionType::Hash;
         meta.partition_param = 32;
-        assert_eq!(meta.partition_strategy(), crate::storage::partition_function::PartitionFunction::Hash(32));
+        assert_eq!(meta.partition_strategy(), crate::storage::partition::partition_function::PartitionFunction::Hash(32));
     }
 
     #[test]

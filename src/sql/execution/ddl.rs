@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::auth::{AuthManager, Permission, PermissionObjectType, PermissionType};
-use crate::storage::auto_increment::AutoIncrementManager;
-use crate::storage::schema::{DatabaseCatalog, PartitionType};
+use crate::storage::catalog::auth::{AuthManager, Permission, PermissionObjectType, PermissionType};
+use crate::storage::catalog::auto_increment::AutoIncrementManager;
+use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -739,7 +739,7 @@ pub fn exec_optimize_table(
     
     engine.flush_all_buffers()?;
     
-    let compactor = crate::storage::compactor::Compactor::new(
+    let compactor = crate::storage::core::compactor::Compactor::new(
         engine.segment_mgr().clone(),
         engine.data_dir().to_path_buf(),
     );

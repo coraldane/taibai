@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
 use crate::sql::planner::{LogicalExpr, LogicalPlan, TimeRange};
-use crate::storage::pruning::RangeClause;
-use crate::storage::schema::TableMeta;
+use crate::storage::partition::pruning::RangeClause;
+use crate::storage::catalog::schema::TableMeta;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
@@ -103,17 +103,17 @@ impl ScanSpec {
         self.eq_predicates.iter().map(|(idx, v)| (*idx, v)).collect()
     }
 
-    pub fn to_row_group_predicate(&self) -> crate::storage::pruning::RowGroupPredicate {
+    pub fn to_row_group_predicate(&self) -> crate::storage::partition::pruning::RowGroupPredicate {
         let mut clauses = Vec::new();
         for (idx, val) in &self.eq_predicates {
             clauses.push(RangeClause {
                 column_index: *idx,
-                op: crate::storage::pruning::RangeOp::Eq,
+                op: crate::storage::partition::pruning::RangeOp::Eq,
                 value: val.clone(),
             });
         }
         clauses.extend(self.range_predicates.iter().cloned());
-        crate::storage::pruning::RowGroupPredicate::new(clauses)
+        crate::storage::partition::pruning::RowGroupPredicate::new(clauses)
     }
 }
 
@@ -237,12 +237,12 @@ fn extract_predicates(expr: &LogicalExpr, schema: &Schema, spec: &mut ScanSpec) 
             {
                 spec.range_predicates.push(RangeClause {
                     column_index: *idx,
-                    op: crate::storage::pruning::RangeOp::Ge,
+                    op: crate::storage::partition::pruning::RangeOp::Ge,
                     value: lo.clone(),
                 });
                 spec.range_predicates.push(RangeClause {
                     column_index: *idx,
-                    op: crate::storage::pruning::RangeOp::Le,
+                    op: crate::storage::partition::pruning::RangeOp::Le,
                     value: hi.clone(),
                 });
             } else {
@@ -304,7 +304,7 @@ fn try_extract_range_clause(
     right: &LogicalExpr,
     schema: &Schema,
 ) -> Option<RangeClause> {
-    use crate::storage::pruning::RangeOp;
+    use crate::storage::partition::pruning::RangeOp;
     if let LogicalExpr::Column(idx) = left {
         if let LogicalExpr::Literal(val) = right {
             let coerced = coerce_scalar(val, &schema.columns.get(*idx)?.data_type, schema.columns.get(*idx)?.scale)?;
@@ -332,7 +332,7 @@ fn try_extract_range_clause_mirrored(
     right: &LogicalExpr,
     schema: &Schema,
 ) -> Option<RangeClause> {
-    use crate::storage::pruning::RangeOp;
+    use crate::storage::partition::pruning::RangeOp;
     if let LogicalExpr::Literal(val) = left {
         if let LogicalExpr::Column(idx) = right {
             let coerced = coerce_scalar(val, &schema.columns.get(*idx)?.data_type, schema.columns.get(*idx)?.scale)?;

@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::common::error::{MonaxError, Result};
-use crate::storage::memtable::{MemTableManager, MemTableState};
+use crate::storage::core::memtable::{MemTableManager, MemTableState};
 use crate::storage::segment_manager::SegmentManager;
-use crate::storage::wal::RecordType;
+use crate::storage::core::wal::RecordType;
 use crate::types::batch::{RecordBatch, Schema};
 
 const DEFAULT_MAX_ROWS_PER_MEMTABLE: u64 = 500_000;
@@ -276,8 +276,8 @@ impl BatchWriter {
         Ok(())
     }
 
-    fn flush_memtable(segment_mgr: &Arc<SegmentManager>, mt: &Arc<crate::storage::memtable::MemTable>) -> Result<()> {
-        use crate::storage::memtable::MemTable;
+    fn flush_memtable(segment_mgr: &Arc<SegmentManager>, mt: &Arc<crate::storage::core::memtable::MemTable>) -> Result<()> {
+        use crate::storage::core::memtable::MemTable;
 
         if mt.state() != MemTableState::Pending {
             return Ok(());

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::common::error::Result;
-use crate::storage::sparse_index::SparseIndexImpl;
+use crate::storage::index::sparse_index::SparseIndexImpl;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::scalar::ScalarValue;
 
@@ -60,7 +60,7 @@ impl IndexManager {
                     continue;
                 }
 
-                block_data.push(crate::storage::sparse_index::SparseBlockData {
+                block_data.push(crate::storage::index::sparse_index::SparseBlockData {
                     block_id: block_data.len(),
                     zone_map: None,
                     bloom_filter: None,

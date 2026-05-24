@@ -1,4 +1,4 @@
-use crate::storage::bloomfilter::BloomFilter;
+use crate::storage::index::bloomfilter::BloomFilter;
 
 pub mod constants;
 pub mod footer;
@@ -13,7 +13,7 @@ pub struct RowGroupMeta {
     pub column_compressed_sizes: Vec<u64>,
     pub compressed_sizes: Vec<u64>,
     pub uncompressed_sizes: Vec<u64>,
-    pub zone_maps: Vec<crate::storage::pruning::ZoneMap>,
+    pub zone_maps: Vec<crate::storage::partition::pruning::ZoneMap>,
     pub bloom_filters: Vec<Option<BloomFilter>>,
 }
 
@@ -24,8 +24,8 @@ pub use constants::{
 pub use reader::SegmentReader;
 pub use writer::{encode_segment_footer, encode_segment_header, SegmentWriter};
 
-pub use crate::storage::encoding::decode_scalar_with_tag;
-pub use crate::storage::pruning::{RangeClause, RangeOp, RowGroupPredicate, ScanStats, ZoneMap};
+pub use crate::storage::codec::encoding::decode_scalar_with_tag;
+pub use crate::storage::partition::pruning::{RangeClause, RangeOp, RowGroupPredicate, ScanStats, ZoneMap};
 
 #[cfg(test)]
 mod tests {

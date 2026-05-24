@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use crate::storage::encoding::decode_scalar_with_tag;
+use crate::storage::codec::encoding::decode_scalar_with_tag;
 use crate::types::scalar::ScalarValue;
 
 #[derive(Debug, Clone)]
@@ -25,9 +25,9 @@ impl ZoneMap {
         if self.min_value.is_null() || value.is_null() {
             return true;
         }
-        crate::storage::sort_key::compare_scalars_for_sort(value, &self.min_value)
+        crate::storage::index::sort_key::compare_scalars_for_sort(value, &self.min_value)
             >= std::cmp::Ordering::Equal
-            && crate::storage::sort_key::compare_scalars_for_sort(value, &self.max_value)
+            && crate::storage::index::sort_key::compare_scalars_for_sort(value, &self.max_value)
                 <= std::cmp::Ordering::Equal
     }
 
@@ -40,10 +40,10 @@ impl ZoneMap {
             self.min_value = value.clone();
             self.max_value = value.clone();
         } else {
-            if crate::storage::sort_key::scalar_lt(value, &self.min_value) {
+            if crate::storage::index::sort_key::scalar_lt(value, &self.min_value) {
                 self.min_value = value.clone();
             }
-            if crate::storage::sort_key::scalar_lt(&self.max_value, value) {
+            if crate::storage::index::sort_key::scalar_lt(&self.max_value, value) {
                 self.max_value = value.clone();
             }
         }
@@ -57,14 +57,14 @@ impl ZoneMap {
         if min.is_null() || max.is_null() {
             return true;
         }
-        !crate::storage::sort_key::scalar_lt(max, &self.min_value)
-            && !crate::storage::sort_key::scalar_lt(&self.max_value, min)
+        !crate::storage::index::sort_key::scalar_lt(max, &self.min_value)
+            && !crate::storage::index::sort_key::scalar_lt(&self.max_value, min)
     }
 
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        crate::storage::encoding::encode_scalar_with_tag(&mut buf, &self.min_value);
-        crate::storage::encoding::encode_scalar_with_tag(&mut buf, &self.max_value);
+        crate::storage::codec::encoding::encode_scalar_with_tag(&mut buf, &self.min_value);
+        crate::storage::codec::encoding::encode_scalar_with_tag(&mut buf, &self.max_value);
         buf.extend_from_slice(&self.null_count.to_le_bytes());
         buf.extend_from_slice(&self.row_count.to_le_bytes());
         buf
@@ -176,12 +176,12 @@ impl RowGroupPredicate {
 fn clause_overlaps_range(c: &RangeClause, min_v: &ScalarValue, max_v: &ScalarValue) -> bool {
     match c.op {
         RangeOp::Eq => {
-            !crate::storage::sort_key::scalar_lt(&c.value, min_v)
-                && !crate::storage::sort_key::scalar_lt(max_v, &c.value)
+            !crate::storage::index::sort_key::scalar_lt(&c.value, min_v)
+                && !crate::storage::index::sort_key::scalar_lt(max_v, &c.value)
         }
-        RangeOp::Lt => crate::storage::sort_key::scalar_lt(min_v, &c.value),
-        RangeOp::Le => !crate::storage::sort_key::scalar_lt(&c.value, min_v),
-        RangeOp::Gt => crate::storage::sort_key::scalar_lt(&c.value, max_v),
-        RangeOp::Ge => !crate::storage::sort_key::scalar_lt(max_v, &c.value),
+        RangeOp::Lt => crate::storage::index::sort_key::scalar_lt(min_v, &c.value),
+        RangeOp::Le => !crate::storage::index::sort_key::scalar_lt(&c.value, min_v),
+        RangeOp::Gt => crate::storage::index::sort_key::scalar_lt(&c.value, max_v),
+        RangeOp::Ge => !crate::storage::index::sort_key::scalar_lt(max_v, &c.value),
     }
 }

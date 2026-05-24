@@ -5,13 +5,13 @@ use std::sync::{Arc, RwLock};
 
 use crate::common::error::{MonaxError, Result};
 use crate::net::session::Session;
-use crate::storage::schema::DatabaseCatalog;
-use crate::storage::batch_writer::{BatchWriter, BatchWriterConfig};
-use crate::storage::memtable::MemTableManager;
+use crate::storage::catalog::schema::DatabaseCatalog;
+use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
+use crate::storage::core::memtable::MemTableManager;
 use crate::storage::segment_manager::SegmentManager;
-use crate::storage::auth::AuthManager;
-use crate::storage::auto_increment::AutoIncrementManager;
-use crate::storage::index_manager::IndexManager;
+use crate::storage::catalog::auth::AuthManager;
+use crate::storage::catalog::auto_increment::AutoIncrementManager;
+use crate::storage::index::index_manager::IndexManager;
 
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
@@ -325,7 +325,7 @@ impl Engine {
         &self.index_manager
     }
 
-    pub fn get_table_meta(&self, db: &str, table: &str) -> Option<crate::storage::schema::TableMeta> {
+    pub fn get_table_meta(&self, db: &str, table: &str) -> Option<crate::storage::catalog::schema::TableMeta> {
         let catalogs = self.catalogs.read().unwrap();
         catalogs.get(db).and_then(|c| c.get_table(table).cloned())
     }

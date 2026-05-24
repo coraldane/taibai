@@ -1,5 +1,5 @@
-use crate::storage::fastscan::{apply_filter_mask_fast, FastScanEQ};
-use crate::storage::pruning::RangeOp;
+use crate::storage::codec::fastscan::{apply_filter_mask_fast, FastScanEQ};
+use crate::storage::partition::pruning::RangeOp;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
 
@@ -8,7 +8,7 @@ use super::spec::InPredicate;
 pub fn apply_predicates(
     batch: &RecordBatch,
     eq_predicates: &[(usize, ScalarValue)],
-    range_predicates: &[crate::storage::pruning::RangeClause],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> RecordBatch {
@@ -69,7 +69,7 @@ pub fn apply_eq_mask(batch: &RecordBatch, col_idx: usize, value: &ScalarValue, m
 
 fn apply_range_mask(
     batch: &RecordBatch,
-    clause: &crate::storage::pruning::RangeClause,
+    clause: &crate::storage::partition::pruning::RangeClause,
     mask: &mut Vec<bool>,
 ) {
     if let Some(col) = batch.column(clause.column_index) {
@@ -213,7 +213,7 @@ pub fn predicate_first_read(
     predicate_cols: &[usize],
     projection_cols: &[usize],
     eq_predicates: &[(usize, ScalarValue)],
-    range_predicates: &[crate::storage::pruning::RangeClause],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> crate::common::error::Result<RecordBatch> {
@@ -330,7 +330,7 @@ fn scalar_eq(a: &ScalarValue, b: &ScalarValue) -> bool {
     if a.is_null() || b.is_null() {
         return false;
     }
-    crate::storage::sort_key::compare_scalars_for_sort(a, b) == std::cmp::Ordering::Equal
+    crate::storage::index::sort_key::compare_scalars_for_sort(a, b) == std::cmp::Ordering::Equal
 }
 
 pub fn apply_cluster_key_fast_scan(

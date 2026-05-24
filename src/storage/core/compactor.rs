@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::error::{MonaxError, Result};
-use crate::storage::schema::TableMeta;
+use crate::storage::catalog::schema::TableMeta;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;

@@ -7,13 +7,13 @@ use std::time::Instant;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::bloomfilter::BloomFilter;
-use crate::storage::pruning::ZoneMap;
+use crate::storage::index::bloomfilter::BloomFilter;
+use crate::storage::partition::pruning::ZoneMap;
 use crate::storage::segment::{
     encode_segment_footer, encode_segment_header, RowGroupMeta, SegmentReader, SegmentWriter,
     SEGMENT_HEADER_SIZE,
 };
-use crate::storage::wal::WalWriter;
+use crate::storage::core::wal::WalWriter;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
@@ -700,7 +700,7 @@ impl SegmentManager {
         db: &str,
         payload: &[u8],
         disable_wal: bool,
-        catalogs: &crate::storage::schema::DatabaseCatalog,
+        catalogs: &crate::storage::catalog::schema::DatabaseCatalog,
     ) -> Result<u64> {
         use rayon::prelude::*;
 
@@ -1189,7 +1189,7 @@ fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
         .columns
         .iter()
         .map(|col| {
-            let null = crate::storage::encoding::null_for_dtype(col.data_type);
+            let null = crate::storage::codec::encoding::null_for_dtype(col.data_type);
             ZoneMap {
                 min_value: null.clone(),
                 max_value: null,
@@ -1502,7 +1502,7 @@ fn compute_segment_zone_maps_from_active(row_groups: &[RowGroupMeta], num_column
                     match &seg_min {
                         None => seg_min = Some(zm.min_value.clone()),
                         Some(m) => {
-                            if crate::storage::sort_key::scalar_lt(&zm.min_value, m) {
+                            if crate::storage::index::sort_key::scalar_lt(&zm.min_value, m) {
                                 seg_min = Some(zm.min_value.clone());
                             }
                         }
@@ -1512,7 +1512,7 @@ fn compute_segment_zone_maps_from_active(row_groups: &[RowGroupMeta], num_column
                     match &seg_max {
                         None => seg_max = Some(zm.max_value.clone()),
                         Some(m) => {
-                            if crate::storage::sort_key::scalar_lt(m, &zm.max_value) {
+                            if crate::storage::index::sort_key::scalar_lt(m, &zm.max_value) {
                                 seg_max = Some(zm.max_value.clone());
                             }
                         }
@@ -1534,7 +1534,7 @@ fn compute_segment_zone_maps_from_active(row_groups: &[RowGroupMeta], num_column
 
 fn compute_partition_key_from_bulk_payload(
     req: &DirectBulkRequest<'_>,
-    table_meta: &crate::storage::schema::TableMeta,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
 ) -> Result<String> {
     let col_idx = match table_meta.get_partition_column_index_cached() {
         Some(idx) => idx,
@@ -1551,7 +1551,7 @@ fn compute_partition_key_from_bulk_payload(
         return Ok(String::new());
     }
 
-    use crate::storage::partition_function::compute_partition_key_from_scalar;
+    use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
     use crate::types::scalar::ScalarValue;
 
     let first_val = match bulk_col.data_type {

@@ -2,7 +2,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::sql::execution::prepared::PreparedStatementCache;
-use crate::storage::txn::{AccessMode, IsolationLevel, Transaction};
+use crate::storage::txn::txn::{AccessMode, IsolationLevel, Transaction};
 
 pub struct Session {
     pub id: Uuid,

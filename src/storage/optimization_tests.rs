@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::storage::bloomfilter::BloomFilter;
-    use crate::storage::sparse_index::{SparseBlock, SparseBlockData, SparseIndexImpl};
+    use crate::storage::index::bloomfilter::BloomFilter;
+    use crate::storage::index::sparse_index::{SparseBlock, SparseBlockData, SparseIndexImpl};
     use crate::types::scalar::ScalarValue;
     use crate::storage::segment::{ZoneMap, RangeOp, RangeClause, RowGroupPredicate};
 

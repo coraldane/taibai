@@ -1,5 +1,5 @@
-use crate::storage::bloomfilter::BloomFilter;
-use crate::storage::pruning::{RowGroupPredicate, ZoneMap};
+use crate::storage::index::bloomfilter::BloomFilter;
+use crate::storage::partition::pruning::{RowGroupPredicate, ZoneMap};
 use crate::storage::segment::SegmentReader;
 use crate::types::scalar::ScalarValue;
 

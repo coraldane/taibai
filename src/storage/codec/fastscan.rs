@@ -423,7 +423,7 @@ impl FastScanEQ {
         }
     }
 
-    pub fn with_bloom_filter_check(&self, bloom_filter: Option<&crate::storage::bloomfilter::BloomFilter>) -> bool {
+    pub fn with_bloom_filter_check(&self, bloom_filter: Option<&crate::storage::index::bloomfilter::BloomFilter>) -> bool {
         if let Some(bf) = bloom_filter {
             if !bf.might_contain(&self.value) {
                 return false;

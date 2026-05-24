@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::common::error::Result;
-use crate::storage::schema::TableMeta;
+use crate::storage::catalog::schema::TableMeta;
 
 use super::engine::Engine;
 
@@ -34,23 +34,23 @@ pub fn determine_write_dir(
     };
 
     let strategy = match table_meta.partition_type {
-        crate::storage::schema::PartitionType::Day => {
+        crate::storage::catalog::schema::PartitionType::Day => {
             crate::storage::partition::PartitionStrategy::Day
         }
-        crate::storage::schema::PartitionType::Year => {
+        crate::storage::catalog::schema::PartitionType::Year => {
             crate::storage::partition::PartitionStrategy::Year
         }
-        crate::storage::schema::PartitionType::Month => {
+        crate::storage::catalog::schema::PartitionType::Month => {
             crate::storage::partition::PartitionStrategy::Month
         }
-        crate::storage::schema::PartitionType::Value => crate::storage::partition::PartitionStrategy::Day,
-        crate::storage::schema::PartitionType::Hash => {
+        crate::storage::catalog::schema::PartitionType::Value => crate::storage::partition::PartitionStrategy::Day,
+        crate::storage::catalog::schema::PartitionType::Hash => {
             let first_val = batch.scalar(0, col_idx)
                 .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-            let hash_val = crate::storage::partition_function::hash_partition_value(&first_val, table_meta.partition_param as i64);
+            let hash_val = crate::storage::partition::partition_function::hash_partition_value(&first_val, table_meta.partition_param as i64);
             return Ok((default_dir.to_path_buf(), format!("hash_{}", hash_val)));
         }
-        crate::storage::schema::PartitionType::None => return Ok((default_dir.to_path_buf(), String::new())),
+        crate::storage::catalog::schema::PartitionType::None => return Ok((default_dir.to_path_buf(), String::new())),
     };
 
     let first_val = batch.scalar(0, col_idx)

@@ -16,7 +16,7 @@ pub fn count_star(
     spec: &ScanSpec,
     table_dir: &Path,
     segment_mgr: &SegmentManager,
-    memtable_mgr: &crate::storage::memtable::MemTableManager,
+    memtable_mgr: &crate::storage::core::memtable::MemTableManager,
     db: &str,
     stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<u64> {
@@ -104,7 +104,7 @@ fn count_with_predicates(
     spec: &ScanSpec,
     segment_files: &[std::path::PathBuf],
     segment_mgr: &SegmentManager,
-    pred: &crate::storage::pruning::RowGroupPredicate,
+    pred: &crate::storage::partition::pruning::RowGroupPredicate,
     bloom_checks: &[(usize, ScalarValue)],
     in_checks: &[&super::spec::InPredicate],
     total_rows: &mut u64,

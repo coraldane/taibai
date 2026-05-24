@@ -15,7 +15,7 @@ pub struct ScanExecutor<'a> {
     spec: &'a ScanSpec,
     engine: &'a crate::sql::execution::engine::Engine,
     table_schema: crate::types::batch::Schema,
-    table_meta: crate::storage::schema::TableMeta,
+    table_meta: crate::storage::catalog::schema::TableMeta,
     db: &'a str,
     stats: Option<&'a mut HashMap<String, ScanStats>>,
 }
@@ -25,7 +25,7 @@ impl<'a> ScanExecutor<'a> {
         spec: &'a ScanSpec,
         engine: &'a crate::sql::execution::engine::Engine,
         table_schema: crate::types::batch::Schema,
-        table_meta: crate::storage::schema::TableMeta,
+        table_meta: crate::storage::catalog::schema::TableMeta,
         db: &'a str,
     ) -> Self {
         Self {

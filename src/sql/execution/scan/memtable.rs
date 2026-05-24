@@ -1,4 +1,4 @@
-use crate::storage::memtable::MemTableManager;
+use crate::storage::core::memtable::MemTableManager;
 use crate::types::batch::RecordBatch;
 
 use super::spec::ScanSpec;

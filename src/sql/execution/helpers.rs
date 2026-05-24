@@ -322,7 +322,7 @@ fn decimal_multiplier(scale: i32) -> Result<i64> {
 
 pub fn sort_batch_by_key(
     batch: &RecordBatch,
-    inserter: &crate::storage::sort_key::SortKeyInserter,
+    inserter: &crate::storage::index::sort_key::SortKeyInserter,
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
     if num_rows <= 1 {
@@ -340,7 +340,7 @@ pub fn sort_batch_by_key(
 
     rows_with_keys.sort_by(|a, b| {
         for (ki, _) in inserter.key_indices.iter().enumerate() {
-            let cmp = crate::storage::sort_key::compare_scalars_for_sort(&a.0[ki], &b.0[ki]);
+            let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(&a.0[ki], &b.0[ki]);
             let cmp = if inserter.desc.get(ki).copied().unwrap_or(false) {
                 cmp.reverse()
             } else {
