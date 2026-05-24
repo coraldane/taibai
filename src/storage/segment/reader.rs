@@ -138,60 +138,6 @@ impl SegmentReader {
         self.footer.row_groups.clone()
     }
 
-    pub fn filter_row_groups_two_level(
-        &self,
-        predicate: &RowGroupPredicate,
-        bloom_column: Option<usize>,
-        bloom_value: Option<&ScalarValue>,
-    ) -> Vec<usize> {
-        let mut candidates = Vec::new();
-        for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
-            if let (Some(col_idx), Some(val)) = (bloom_column, bloom_value) {
-                if let Some(bf) = rg.bloom_filters.get(col_idx).and_then(|b| b.as_ref()) {
-                    if !bf.might_contain(val) {
-                        continue;
-                    }
-                }
-            }
-
-            if !predicate.matches_row_group(&rg.zone_maps) {
-                continue;
-            }
-
-            candidates.push(rg_idx);
-        }
-        candidates
-    }
-
-    pub fn filter_row_groups_multi_bloom(
-        &self,
-        predicate: &RowGroupPredicate,
-        bloom_columns: &[(usize, ScalarValue)],
-    ) -> Vec<usize> {
-        let mut candidates = Vec::new();
-        'outer: for (rg_idx, rg) in self.footer.row_groups.iter().enumerate() {
-            for (col_idx, value) in bloom_columns {
-                if let Some(bf) = rg.bloom_filters.get(*col_idx).and_then(|b| b.as_ref()) {
-                    if !bf.might_contain(value) {
-                        continue 'outer;
-                    }
-                }
-                if let Some(zm) = rg.zone_maps.get(*col_idx) {
-                    if !zm.contains(value) {
-                        continue 'outer;
-                    }
-                }
-            }
-
-            if !predicate.matches_row_group(&rg.zone_maps) {
-                continue;
-            }
-
-            candidates.push(rg_idx);
-        }
-        candidates
-    }
-
     pub fn row_group_rows(&self, row_group: usize) -> u64 {
         self.footer.row_groups[row_group].row_count
     }

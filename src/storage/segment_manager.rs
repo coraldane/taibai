@@ -20,7 +20,6 @@ const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
 const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 500_000;
 const FLUSH_CHECK_INTERVAL_SECS: u64 = 10;
 const FLUSH_IDLE_THRESHOLD_SECS: u64 = 5;
-const FLUSH_ROW_THRESHOLD: u64 = 100_000;
 const FLUSH_META_AFTER_ROW_GROUP: bool = true;
 
 const DEFAULT_MIN_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
@@ -52,12 +51,6 @@ struct ActiveSegment {
     dirty_meta: bool,
     data_end: u64,
     last_write_at: Instant,
-}
-
-impl ActiveSegment {
-    fn is_sealed(&self) -> bool {
-        !self.dirty_meta && self.buffered_rows == 0 && self.row_groups.is_empty()
-    }
 }
 
 struct TableSegmentState {
@@ -402,40 +395,13 @@ impl SegmentManager {
             )?;
 
             let seg = active_guard.get_mut(partition_key).unwrap();
-            let mut wal_keys_to_clear = self.append_to_segment_buffer(seg, &batch)?;
-
-            let mut sealed = false;
-            let mut need_flush_buffer = false;
-            let mut need_flush_meta = false;
+            self.append_to_segment_buffer(seg, &batch)?;
 
             if seg.current_size >= self.max_segment_size() {
                 self.seal_segment(seg)?;
                 active_guard.remove(partition_key);
-                sealed = true;
-            } else {
-                if seg.dirty_meta {
-                    let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
-                    if idle >= FLUSH_IDLE_THRESHOLD_SECS || seg.total_rows >= FLUSH_ROW_THRESHOLD {
-                        need_flush_meta = true;
-                    }
-                }
-                if seg.buffered_rows > 0 && !need_flush_meta {
-                    let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
-                    if idle >= FLUSH_IDLE_THRESHOLD_SECS {
-                        need_flush_buffer = true;
-                        need_flush_meta = true;
-                    }
-                }
-            }
-
-            if need_flush_buffer && !sealed {
-                let seg = active_guard.get_mut(partition_key).unwrap();
-                if let Some(wk) = self.flush_segment_buffer(seg)? {
-                    wal_keys_to_clear.push(wk);
-                }
-            }
-            if need_flush_meta && !sealed {
-                let seg = active_guard.get_mut(partition_key).unwrap();
+            } else if seg.buffered_rows > 0 || seg.total_rows > 0 {
+                if let Some(_) = self.flush_segment_buffer(seg)? {}
                 self.flush_meta(seg)?;
             }
         }
@@ -716,24 +682,10 @@ impl SegmentManager {
             seg.data_end = seg.current_size;
             seg.last_write_at = Instant::now();
 
-            let mut sealed = false;
-            let mut need_flush_meta = false;
-
             if seg.current_size >= self.max_segment_size() {
                 self.seal_segment(seg)?;
                 active_guard.remove("");
-                sealed = true;
             } else {
-                if seg.dirty_meta {
-                    let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
-                    if idle >= FLUSH_IDLE_THRESHOLD_SECS || seg.total_rows >= FLUSH_ROW_THRESHOLD {
-                        need_flush_meta = true;
-                    }
-                }
-            }
-
-            if need_flush_meta && !sealed {
-                let seg = active_guard.get_mut("").unwrap();
                 self.flush_meta(seg)?;
             }
         }
@@ -866,24 +818,10 @@ impl SegmentManager {
             seg.data_end = seg.current_size;
             seg.last_write_at = Instant::now();
 
-            let mut sealed = false;
-            let mut need_flush_meta = false;
-
             if seg.current_size >= self.max_segment_size() {
                 self.seal_segment(seg)?;
                 active_guard.remove("");
-                sealed = true;
             } else {
-                if seg.dirty_meta {
-                    let idle = Instant::now().duration_since(seg.last_write_at).as_secs();
-                    if idle >= FLUSH_IDLE_THRESHOLD_SECS || seg.total_rows >= FLUSH_ROW_THRESHOLD {
-                        need_flush_meta = true;
-                    }
-                }
-            }
-
-            if need_flush_meta && !sealed {
-                let seg = active_guard.get_mut("").unwrap();
                 self.flush_meta(seg)?;
             }
         }
@@ -924,7 +862,7 @@ impl SegmentManager {
             }
 
             for (_, seg) in active_guard.iter_mut() {
-                if seg.total_rows > 0 {
+                if seg.total_rows > 0 || seg.buffered_rows > 0 {
                     if let Some(_) = self.flush_segment_buffer(seg)? {}
                     self.flush_meta(seg)?;
                     total += seg.total_rows;
@@ -932,6 +870,7 @@ impl SegmentManager {
                         path = %seg.path.display(),
                         size_mb = seg.current_size / (1024 * 1024),
                         rows = seg.total_rows,
+                        buffered = seg.buffered_rows,
                         "active segment flushed but kept open (below minimum seal size)"
                     );
                 }
