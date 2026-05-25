@@ -7,6 +7,8 @@ use crate::types::batch::ColumnDef;
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
+const COLUMN_ENCODING_MAGIC: &[u8; 4] = b"MXE1";
+
 // ---------------------------------------------------------------------------
 // Encoding type selection (RLE, dictionary, delta, etc.)
 // ---------------------------------------------------------------------------
@@ -265,6 +267,13 @@ pub fn encode_column(col: &ColumnArray, offset: usize, count: usize) -> Result<V
     buf.extend_from_slice(&(bitmap_bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(&bitmap_bytes);
 
+    if let Some(encoded) = encode_column_adaptive(col, offset, count) {
+        buf.extend_from_slice(COLUMN_ENCODING_MAGIC);
+        buf.push(encoded.0.to_u8());
+        buf.extend_from_slice(&encoded.1);
+        return Ok(buf);
+    }
+
     for i in offset..offset + count {
         if col.bitmap().is_null(i) {
             continue;
@@ -273,6 +282,222 @@ pub fn encode_column(col: &ColumnArray, offset: usize, count: usize) -> Result<V
     }
 
     Ok(buf)
+}
+
+fn encode_column_adaptive(
+    col: &ColumnArray,
+    offset: usize,
+    count: usize,
+) -> Option<(EncodingType, Vec<u8>)> {
+    if count < 128 {
+        return None;
+    }
+
+    match col {
+        ColumnArray::Int8 { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v as i64, 1)
+        }
+        ColumnArray::Int16 { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v as i64, 2)
+        }
+        ColumnArray::Int32 { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v as i64, 4)
+        }
+        ColumnArray::Int64 { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
+        }
+        ColumnArray::Decimal { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
+        }
+        ColumnArray::Date { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v as i64, 4)
+        }
+        ColumnArray::Time { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
+        }
+        ColumnArray::Timestamp { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
+        }
+        ColumnArray::Interval { data, bitmap } => {
+            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
+        }
+        ColumnArray::UInt8 { data, bitmap } => {
+            encode_unsigned_numeric_adaptive(data, bitmap, offset, count, |v| *v as u64, 1)
+        }
+        ColumnArray::UInt16 { data, bitmap } => {
+            encode_unsigned_numeric_adaptive(data, bitmap, offset, count, |v| *v as u64, 2)
+        }
+        ColumnArray::UInt32 { data, bitmap } => {
+            encode_unsigned_numeric_adaptive(data, bitmap, offset, count, |v| *v as u64, 4)
+        }
+        ColumnArray::UInt64 { data, bitmap } => {
+            encode_unsigned_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
+        }
+        ColumnArray::VarChar { data, bitmap } => {
+            encode_varchar_dictionary_adaptive(data, bitmap, offset, count)
+        }
+        _ => None,
+    }
+}
+
+fn encode_signed_numeric_adaptive<T, F>(
+    data: &[T],
+    bitmap: &NullBitmap,
+    offset: usize,
+    count: usize,
+    to_i64: F,
+    plain_width: usize,
+) -> Option<(EncodingType, Vec<u8>)>
+where
+    F: Fn(&T) -> i64,
+{
+    let values: Vec<i64> = (offset..offset + count)
+        .filter(|&i| !bitmap.is_null(i))
+        .map(|i| to_i64(&data[i]))
+        .collect();
+    choose_numeric_encoding(&values, plain_width)
+}
+
+fn encode_unsigned_numeric_adaptive<T, F>(
+    data: &[T],
+    bitmap: &NullBitmap,
+    offset: usize,
+    count: usize,
+    to_u64: F,
+    plain_width: usize,
+) -> Option<(EncodingType, Vec<u8>)>
+where
+    F: Fn(&T) -> u64,
+{
+    let mut values = Vec::new();
+    for i in offset..offset + count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        let v = to_u64(&data[i]);
+        if v > i64::MAX as u64 {
+            return None;
+        }
+        values.push(v as i64);
+    }
+    choose_numeric_encoding(&values, plain_width)
+}
+
+fn choose_numeric_encoding(values: &[i64], plain_width: usize) -> Option<(EncodingType, Vec<u8>)> {
+    if values.len() < 128 {
+        return None;
+    }
+    let plain_size = values.len().saturating_mul(plain_width);
+
+    let mut best: Option<(EncodingType, Vec<u8>)> = None;
+    let rle = encode_i64_rle_payload(values);
+    if rle.len() + 5 < plain_size {
+        best = Some((EncodingType::Rle, rle));
+    }
+
+    if values.windows(2).all(|w| w[0] <= w[1]) {
+        let delta = encode_i64_delta_payload(values);
+        if delta.len() + 5 < plain_size || plain_width == 8 && delta.len() < plain_size {
+            if best
+                .as_ref()
+                .map(|(_, payload)| delta.len() < payload.len())
+                .unwrap_or(true)
+            {
+                best = Some((EncodingType::Delta, delta));
+            }
+        }
+    }
+
+    best
+}
+
+fn encode_i64_rle_payload(values: &[i64]) -> Vec<u8> {
+    let mut runs = Vec::new();
+    let mut current = values[0];
+    let mut len = 1u32;
+    for &value in &values[1..] {
+        if value == current && len < u32::MAX {
+            len += 1;
+        } else {
+            runs.push((current, len));
+            current = value;
+            len = 1;
+        }
+    }
+    runs.push((current, len));
+
+    let mut out = Vec::with_capacity(4 + runs.len() * 12);
+    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    for (value, len) in runs {
+        out.extend_from_slice(&value.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    out
+}
+
+fn encode_i64_delta_payload(values: &[i64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + values.len() * 2);
+    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    out.extend_from_slice(&values[0].to_le_bytes());
+    let mut prev = values[0];
+    for &value in &values[1..] {
+        write_varint(&mut out, zigzag_encode(value - prev));
+        prev = value;
+    }
+    out
+}
+
+fn encode_varchar_dictionary_adaptive(
+    data: &[String],
+    bitmap: &NullBitmap,
+    offset: usize,
+    count: usize,
+) -> Option<(EncodingType, Vec<u8>)> {
+    let mut dict = Vec::<&str>::new();
+    let mut index_map = std::collections::HashMap::<&str, u32>::new();
+    let mut indices = Vec::new();
+    let mut plain_size = 0usize;
+
+    for i in offset..offset + count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        let value = data[i].as_str();
+        plain_size += 4 + value.len();
+        let idx = if let Some(&idx) = index_map.get(value) {
+            idx
+        } else {
+            if dict.len() >= u32::MAX as usize {
+                return None;
+            }
+            let idx = dict.len() as u32;
+            dict.push(value);
+            index_map.insert(value, idx);
+            idx
+        };
+        indices.push(idx);
+    }
+
+    if indices.len() < 128 || dict.len() >= indices.len() / 2 {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    for value in dict {
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+    for idx in indices {
+        out.extend_from_slice(&idx.to_le_bytes());
+    }
+
+    if out.len() + 5 < plain_size {
+        Some((EncodingType::Dictionary, out))
+    } else {
+        None
+    }
 }
 
 pub fn encode_value(buf: &mut Vec<u8>, col: &ColumnArray, idx: usize) {
@@ -319,6 +544,9 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
     let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
 
     let remaining_data = &data[4 + bitmap_len..];
+    if remaining_data.starts_with(COLUMN_ENCODING_MAGIC) {
+        return decode_adaptive_column(remaining_data, row_count, col_def, bitmap);
+    }
     let mut dc = Cursor::new(remaining_data);
 
     macro_rules! read_fixed {
@@ -466,6 +694,210 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
     Ok(col)
 }
 
+fn decode_adaptive_column(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: NullBitmap,
+) -> Result<ColumnArray> {
+    if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
+        return Err(MonaxError::Storage(
+            "adaptive column header truncated".into(),
+        ));
+    }
+    let encoding = EncodingType::from_u8(data[COLUMN_ENCODING_MAGIC.len()])?;
+    let payload = &data[COLUMN_ENCODING_MAGIC.len() + 1..];
+
+    match encoding {
+        EncodingType::Rle => {
+            let values = decode_i64_rle_payload(payload)?;
+            build_numeric_column_from_i64(values, row_count, col_def, bitmap)
+        }
+        EncodingType::Delta => {
+            let values = decode_i64_delta_payload(payload)?;
+            build_numeric_column_from_i64(values, row_count, col_def, bitmap)
+        }
+        EncodingType::Dictionary if col_def.data_type == DataType::VarChar => {
+            let values = decode_varchar_dictionary_payload(payload)?;
+            build_varchar_column(values, row_count, bitmap)
+        }
+        other => Err(MonaxError::Storage(format!(
+            "unsupported adaptive column encoding {:?} for {}",
+            other,
+            col_def.data_type.display_name()
+        ))),
+    }
+}
+
+fn decode_i64_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut values = Vec::new();
+    for _ in 0..run_count {
+        let mut value_buf = [0u8; 8];
+        cursor.read_exact(&mut value_buf)?;
+        let value = i64::from_le_bytes(value_buf);
+        let len = read_u32_le(&mut cursor)? as usize;
+        values.extend(std::iter::repeat(value).take(len));
+    }
+    Ok(values)
+}
+
+fn decode_i64_delta_payload(payload: &[u8]) -> Result<Vec<i64>> {
+    let mut cursor = Cursor::new(payload);
+    let count = read_u32_le(&mut cursor)? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut base_buf = [0u8; 8];
+    cursor.read_exact(&mut base_buf)?;
+    let mut values = Vec::with_capacity(count);
+    let mut prev = i64::from_le_bytes(base_buf);
+    values.push(prev);
+    for _ in 1..count {
+        let encoded = read_varint(&mut cursor)?;
+        let delta = zigzag_decode(encoded);
+        let next = prev
+            .checked_add(delta)
+            .ok_or_else(|| MonaxError::Storage("delta decoded value overflowed i64".into()))?;
+        values.push(next);
+        prev = next;
+    }
+    Ok(values)
+}
+
+fn decode_varchar_dictionary_payload(payload: &[u8]) -> Result<Vec<String>> {
+    let mut cursor = Cursor::new(payload);
+    let dict_count = read_u32_le(&mut cursor)? as usize;
+    let mut dict = Vec::with_capacity(dict_count);
+    for _ in 0..dict_count {
+        let len = read_u32_le(&mut cursor)? as usize;
+        let mut bytes = vec![0u8; len];
+        cursor.read_exact(&mut bytes)?;
+        dict.push(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let index_count = read_u32_le(&mut cursor)? as usize;
+    let mut values = Vec::with_capacity(index_count);
+    for _ in 0..index_count {
+        let idx = read_u32_le(&mut cursor)? as usize;
+        let value = dict.get(idx).ok_or_else(|| {
+            MonaxError::Storage(format!("dictionary index {} out of bounds", idx))
+        })?;
+        values.push(value.clone());
+    }
+    Ok(values)
+}
+
+fn build_numeric_column_from_i64(
+    values: Vec<i64>,
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: NullBitmap,
+) -> Result<ColumnArray> {
+    let expected = row_count.saturating_sub(bitmap.null_count());
+    if values.len() != expected {
+        return Err(MonaxError::Storage(format!(
+            "adaptive numeric value count mismatch: got {}, expected {}",
+            values.len(),
+            expected
+        )));
+    }
+
+    let mut value_pos = 0usize;
+    macro_rules! build_signed {
+        ($variant:ident, $ty:ty) => {{
+            let mut out = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                if bitmap.is_null(row) {
+                    out.push(<$ty>::default());
+                } else {
+                    out.push(values[value_pos] as $ty);
+                    value_pos += 1;
+                }
+            }
+            ColumnArray::$variant { data: out, bitmap }
+        }};
+    }
+    macro_rules! build_unsigned {
+        ($variant:ident, $ty:ty) => {{
+            let mut out = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                if bitmap.is_null(row) {
+                    out.push(<$ty>::default());
+                } else {
+                    out.push(values[value_pos] as $ty);
+                    value_pos += 1;
+                }
+            }
+            ColumnArray::$variant { data: out, bitmap }
+        }};
+    }
+
+    Ok(match col_def.data_type {
+        DataType::Int8 => build_signed!(Int8, i8),
+        DataType::Int16 => build_signed!(Int16, i16),
+        DataType::Int32 => build_signed!(Int32, i32),
+        DataType::Int64 => build_signed!(Int64, i64),
+        DataType::Decimal => build_signed!(Decimal, i64),
+        DataType::Date => build_signed!(Date, i32),
+        DataType::Time => build_signed!(Time, i64),
+        DataType::Timestamp => build_signed!(Timestamp, i64),
+        DataType::Interval => build_signed!(Interval, i64),
+        DataType::UInt8 => build_unsigned!(UInt8, u8),
+        DataType::UInt16 => build_unsigned!(UInt16, u16),
+        DataType::UInt32 => build_unsigned!(UInt32, u32),
+        DataType::UInt64 => build_unsigned!(UInt64, u64),
+        other => {
+            return Err(MonaxError::Storage(format!(
+                "adaptive numeric encoding cannot decode {}",
+                other.display_name()
+            )))
+        }
+    })
+}
+
+fn build_varchar_column(
+    values: Vec<String>,
+    row_count: usize,
+    bitmap: NullBitmap,
+) -> Result<ColumnArray> {
+    let expected = row_count.saturating_sub(bitmap.null_count());
+    if values.len() != expected {
+        return Err(MonaxError::Storage(format!(
+            "adaptive varchar value count mismatch: got {}, expected {}",
+            values.len(),
+            expected
+        )));
+    }
+
+    let mut data = Vec::with_capacity(row_count);
+    let mut value_pos = 0usize;
+    for row in 0..row_count {
+        if bitmap.is_null(row) {
+            data.push(String::new());
+        } else {
+            data.push(values[value_pos].clone());
+            value_pos += 1;
+        }
+    }
+    Ok(ColumnArray::VarChar { data, bitmap })
+}
+
+fn project_column(col: &ColumnArray, selected_rows: &[usize]) -> Result<ColumnArray> {
+    let mut out = ColumnArray::empty(col.data_type());
+    for &row in selected_rows {
+        if row >= col.len() {
+            return Err(MonaxError::Storage(format!(
+                "selected row {} out of bounds {}",
+                row,
+                col.len()
+            )));
+        }
+        out.push(&col.scalar(row))?;
+    }
+    Ok(out)
+}
+
 pub fn decode_column_selected(
     data: &[u8],
     row_count: usize,
@@ -478,6 +910,11 @@ pub fn decode_column_selected(
     cursor.read_exact(&mut bitmap_data)?;
     let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
     let values = &data[4 + bitmap_len..];
+
+    if values.starts_with(COLUMN_ENCODING_MAGIC) {
+        let decoded = decode_adaptive_column(values, row_count, col_def, bitmap)?;
+        return project_column(&decoded, selected_rows);
+    }
 
     macro_rules! decode_fixed_variant {
         ($ty:ty, $width:expr, $variant:ident) => {
@@ -988,6 +1425,39 @@ pub fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> std::result::Result<u64, io::E
     Ok(u64::from_le_bytes(buf))
 }
 
+fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
+
+fn read_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = read_u8(cursor)
+            .map_err(|e| MonaxError::Storage(format!("varint read error: {}", e)))?;
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(MonaxError::Storage("varint too long".into()));
+        }
+    }
+}
+
+fn zigzag_encode(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)) as u64
+}
+
+fn zigzag_decode(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ (-((value & 1) as i64))
+}
+
 pub fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> std::result::Result<String, io::Error> {
     let len = read_u32_le(cursor)? as usize;
     let mut buf = vec![0u8; len];
@@ -1082,6 +1552,55 @@ mod tests {
         let (dict, idx) = dictionary_encode(&[]);
         assert!(dict.is_empty());
         assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_adaptive_delta_roundtrip() {
+        let values: Vec<ScalarValue> = (0..512)
+            .map(|i| ScalarValue::Int64(Some(1_000_000 + i * 5)))
+            .collect();
+        let col = ColumnArray::from_scalar_values(DataType::Int64, &values).unwrap();
+        let encoded = encode_column(&col, 0, col.len()).unwrap();
+        assert!(encoded.windows(4).any(|w| w == COLUMN_ENCODING_MAGIC));
+
+        let col_def = ColumnDef::new("ts", DataType::Int64);
+        let decoded = decode_column(&encoded, col.len(), &col_def).unwrap();
+        for (i, expected) in values.iter().enumerate() {
+            assert_eq!(decoded.scalar(i), *expected);
+        }
+    }
+
+    #[test]
+    fn test_adaptive_numeric_rle_roundtrip() {
+        let values: Vec<ScalarValue> = (0..512)
+            .map(|i| ScalarValue::Int32(Some((i / 64) as i32)))
+            .collect();
+        let col = ColumnArray::from_scalar_values(DataType::Int32, &values).unwrap();
+        let encoded = encode_column(&col, 0, col.len()).unwrap();
+        assert!(encoded.windows(4).any(|w| w == COLUMN_ENCODING_MAGIC));
+
+        let col_def = ColumnDef::new("status", DataType::Int32);
+        let decoded = decode_column(&encoded, col.len(), &col_def).unwrap();
+        for (i, expected) in values.iter().enumerate() {
+            assert_eq!(decoded.scalar(i), *expected);
+        }
+    }
+
+    #[test]
+    fn test_adaptive_varchar_dictionary_roundtrip() {
+        let labels = ["SH", "SZ", "BJ", "HK"];
+        let values: Vec<ScalarValue> = (0..512)
+            .map(|i| ScalarValue::VarChar(Some(labels[i % labels.len()].to_string())))
+            .collect();
+        let col = ColumnArray::from_scalar_values(DataType::VarChar, &values).unwrap();
+        let encoded = encode_column(&col, 0, col.len()).unwrap();
+        assert!(encoded.windows(4).any(|w| w == COLUMN_ENCODING_MAGIC));
+
+        let col_def = ColumnDef::new("exchange", DataType::VarChar);
+        let decoded = decode_column(&encoded, col.len(), &col_def).unwrap();
+        for (i, expected) in values.iter().enumerate() {
+            assert_eq!(decoded.scalar(i), *expected);
+        }
     }
 
     #[test]

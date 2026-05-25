@@ -6,15 +6,19 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::common::error::{MonaxError, Result};
+use crate::protocol::types::DataType;
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::partition::parse_partition_key;
 use crate::storage::segment::SegmentWriter;
 use crate::storage::segment_manager::SegmentManager;
+use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
+use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
 const COMPACT_ROW_GROUP_SIZE: usize = 262_144;
+const WRITE_GATHER_CHUNK_ROWS: usize = COMPACT_ROW_GROUP_SIZE;
 const ROW_GROUP_CACHE_CAPACITY: usize = 8;
 const PARALLEL_SORT_THRESHOLD: usize = 1_000_000;
 
@@ -217,40 +221,65 @@ impl Compactor {
         row_refs: &[RowRef],
     ) -> Result<()> {
         let mut writer = SegmentWriter::create(path, schema.clone(), COMPACT_ROW_GROUP_SIZE)?;
+        let mut rows_written = 0usize;
         let mut row_group_cache = RowGroupCache::new(ROW_GROUP_CACHE_CAPACITY);
-        let mut current_batch = RecordBatch::new(schema.clone());
 
-        for row_ref in row_refs {
-            let source = source_row_groups.get(row_ref.batch_idx).ok_or_else(|| {
-                MonaxError::Storage(format!(
-                    "missing source row group for batch {}",
-                    row_ref.batch_idx
-                ))
-            })?;
-            let src_batch = row_group_cache.get(source, &self.segment_mgr)?;
-            for col_idx in 0..schema.columns.len() {
-                let val = src_batch.scalar(row_ref.row_idx, col_idx).ok_or_else(|| {
-                    MonaxError::Storage(format!(
-                        "failed to get scalar at batch {} row {} col {}",
-                        row_ref.batch_idx, row_ref.row_idx, col_idx
-                    ))
-                })?;
-                if let Some(col) = current_batch.column_mut(col_idx) {
-                    col.push(&val)?;
-                }
+        for chunk in row_refs.chunks(WRITE_GATHER_CHUNK_ROWS) {
+            let batch =
+                self.gather_sorted_chunk(schema, source_row_groups, chunk, &mut row_group_cache)?;
+            rows_written += batch.num_rows();
+            writer.write_batch(&batch)?;
+            if rows_written % (WRITE_GATHER_CHUNK_ROWS * 16) == 0 {
+                tracing::info!(
+                    rows_written,
+                    total_rows = row_refs.len(),
+                    "compact write progress"
+                );
             }
-
-            if current_batch.num_rows() >= COMPACT_ROW_GROUP_SIZE {
-                writer.write_batch(&current_batch)?;
-                current_batch = RecordBatch::new(schema.clone());
-            }
-        }
-
-        if current_batch.num_rows() > 0 {
-            writer.write_batch(&current_batch)?;
         }
 
         writer.seal()
+    }
+
+    fn gather_sorted_chunk(
+        &self,
+        schema: &Schema,
+        source_row_groups: &[SourceRowGroup],
+        row_refs: &[RowRef],
+        row_group_cache: &mut RowGroupCache,
+    ) -> Result<RecordBatch> {
+        let mut positions_by_source: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        for (output_pos, row_ref) in row_refs.iter().enumerate() {
+            positions_by_source
+                .entry(row_ref.batch_idx)
+                .or_default()
+                .push((output_pos, row_ref.row_idx));
+        }
+
+        let mut columns = schema
+            .columns
+            .iter()
+            .map(|col| empty_column_for_gather(col.data_type, row_refs.len()))
+            .collect::<Vec<_>>();
+
+        for (source_idx, positions) in positions_by_source {
+            let source = source_row_groups.get(source_idx).ok_or_else(|| {
+                MonaxError::Storage(format!("missing source row group {}", source_idx))
+            })?;
+            let src_batch = row_group_cache.get(source, &self.segment_mgr)?;
+
+            for col_idx in 0..schema.columns.len() {
+                let src_col = src_batch.column(col_idx).ok_or_else(|| {
+                    MonaxError::Storage(format!(
+                        "missing source column {} in row group {}",
+                        col_idx, source_idx
+                    ))
+                })?;
+                gather_column_positions(&mut columns[col_idx], src_col, &positions)?;
+            }
+        }
+
+        RecordBatch::try_new(schema.clone(), columns)
     }
 
     fn get_cluster_key_indices(
@@ -355,6 +384,321 @@ fn scalar_at(batches: &[RecordBatch], row_ref: RowRef, col_idx: usize) -> Scalar
         .unwrap_or_else(|| {
             ScalarValue::null_for_type(batches[row_ref.batch_idx].schema.columns[col_idx].data_type)
         })
+}
+
+fn empty_column_for_gather(data_type: DataType, len: usize) -> ColumnArray {
+    let bitmap = NullBitmap::new_all_null(len);
+    match data_type {
+        DataType::Bool => ColumnArray::Bool {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Int8 => ColumnArray::Int8 {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Int16 => ColumnArray::Int16 {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Int32 => ColumnArray::Int32 {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Int64 => ColumnArray::Int64 {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::UInt8 => ColumnArray::UInt8 {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::UInt16 => ColumnArray::UInt16 {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::UInt32 => ColumnArray::UInt32 {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::UInt64 => ColumnArray::UInt64 {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Float32 => ColumnArray::Float32 {
+            data: vec![0.0; len],
+            bitmap,
+        },
+        DataType::Float64 => ColumnArray::Float64 {
+            data: vec![0.0; len],
+            bitmap,
+        },
+        DataType::Decimal => ColumnArray::Decimal {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Date => ColumnArray::Date {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Time => ColumnArray::Time {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Timestamp => ColumnArray::Timestamp {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::Interval => ColumnArray::Interval {
+            data: vec![0; len],
+            bitmap,
+        },
+        DataType::VarChar => ColumnArray::VarChar {
+            data: vec![String::new(); len],
+            bitmap,
+        },
+        DataType::Blob => ColumnArray::Blob {
+            data: vec![Vec::new(); len],
+            bitmap,
+        },
+        DataType::Vector => ColumnArray::Vector {
+            data: vec![Vec::new(); len],
+            bitmap,
+        },
+    }
+}
+
+fn gather_column_positions(
+    dst: &mut ColumnArray,
+    src: &ColumnArray,
+    positions: &[(usize, usize)],
+) -> Result<()> {
+    macro_rules! copy_fixed {
+        ($dst_data:expr, $dst_bitmap:expr, $src_data:expr, $src_bitmap:expr) => {{
+            for &(output_pos, source_row_idx) in positions {
+                $dst_data[output_pos] = $src_data[source_row_idx];
+                if $src_bitmap.is_null(source_row_idx) {
+                    $dst_bitmap.set_null(output_pos);
+                } else {
+                    $dst_bitmap.set_valid(output_pos);
+                }
+            }
+        }};
+    }
+
+    macro_rules! copy_clone {
+        ($dst_data:expr, $dst_bitmap:expr, $src_data:expr, $src_bitmap:expr) => {{
+            for &(output_pos, source_row_idx) in positions {
+                $dst_data[output_pos] = $src_data[source_row_idx].clone();
+                if $src_bitmap.is_null(source_row_idx) {
+                    $dst_bitmap.set_null(output_pos);
+                } else {
+                    $dst_bitmap.set_valid(output_pos);
+                }
+            }
+        }};
+    }
+
+    match (dst, src) {
+        (
+            ColumnArray::Bool {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Bool {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Int8 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Int8 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Int16 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Int16 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Int32 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Int32 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Int64 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Int64 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::UInt8 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::UInt8 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::UInt16 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::UInt16 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::UInt32 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::UInt32 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::UInt64 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::UInt64 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Float32 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Float32 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Float64 {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Float64 {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Decimal {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Decimal {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Date {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Date {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Time {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Time {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Timestamp {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Timestamp {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Interval {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Interval {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_fixed!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::VarChar {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::VarChar {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_clone!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Blob {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Blob {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_clone!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (
+            ColumnArray::Vector {
+                data: dst_data,
+                bitmap: dst_bitmap,
+            },
+            ColumnArray::Vector {
+                data: src_data,
+                bitmap: src_bitmap,
+            },
+        ) => copy_clone!(dst_data, dst_bitmap, src_data, src_bitmap),
+        (dst, src) => {
+            return Err(MonaxError::Storage(format!(
+                "column type mismatch while compacting: dst={} src={}",
+                dst.data_type().display_name(),
+                src.data_type().display_name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn group_segments_by_partition(
