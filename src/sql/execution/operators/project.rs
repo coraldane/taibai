@@ -150,8 +150,8 @@ mod tests {
     #[test]
     fn project_preserves_decimal_scale_for_plain_columns() {
         let schema = Schema::new(vec![
-            ColumnDef::new("security_id", DataType::VarChar),
-            ColumnDef::new("pre_close", DataType::Decimal)
+            ColumnDef::new("name", DataType::VarChar),
+            ColumnDef::new("score", DataType::Decimal)
                 .with_scale(2)
                 .with_precision(9),
         ]);
@@ -160,7 +160,7 @@ mod tests {
             vec![
                 ColumnArray::from_scalar_values(
                     DataType::VarChar,
-                    &[ScalarValue::VarChar(Some("688256.SH".to_string()))],
+                    &[ScalarValue::VarChar(Some("alice".to_string()))],
                 )
                 .unwrap(),
                 ColumnArray::from_scalar_values(
@@ -184,7 +184,7 @@ mod tests {
 
         let result = exec.next_batch().unwrap().unwrap();
 
-        assert_eq!(result.schema.columns[0].name, "pre_close");
+        assert_eq!(result.schema.columns[0].name, "score");
         assert_eq!(result.schema.columns[0].data_type, DataType::Decimal);
         assert_eq!(result.schema.columns[0].scale, 2);
         assert_eq!(result.schema.columns[0].precision, 9);
@@ -197,9 +197,9 @@ mod tests {
     #[test]
     fn project_reorders_plain_columns_without_rebuilding_scalars() {
         let schema = Schema::new(vec![
-            ColumnDef::new("security_id", DataType::VarChar),
-            ColumnDef::new("trans_volume", DataType::Int64),
-            ColumnDef::new("local_time", DataType::Timestamp),
+            ColumnDef::new("name", DataType::VarChar),
+            ColumnDef::new("amount", DataType::Int64),
+            ColumnDef::new("created_at", DataType::Timestamp),
         ]);
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -207,8 +207,8 @@ mod tests {
                 ColumnArray::from_scalar_values(
                     DataType::VarChar,
                     &[
-                        ScalarValue::VarChar(Some("688256.SH".to_string())),
-                        ScalarValue::VarChar(Some("688256.SH".to_string())),
+                        ScalarValue::VarChar(Some("alice".to_string())),
+                        ScalarValue::VarChar(Some("alice".to_string())),
                     ],
                 )
                 .unwrap(),
@@ -242,14 +242,14 @@ mod tests {
         let result = exec.next_batch().unwrap().unwrap();
 
         assert_eq!(result.schema.columns[0].name, "lt");
-        assert_eq!(result.schema.columns[1].name, "security_id");
+        assert_eq!(result.schema.columns[1].name, "name");
         assert_eq!(
             result.scalar(0, 0).unwrap(),
             ScalarValue::Timestamp(Some(1000))
         );
         assert_eq!(
             result.scalar(1, 1).unwrap(),
-            ScalarValue::VarChar(Some("688256.SH".to_string()))
+            ScalarValue::VarChar(Some("alice".to_string()))
         );
     }
 }

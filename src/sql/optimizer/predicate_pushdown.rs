@@ -88,15 +88,15 @@ mod tests {
     #[test]
     fn predicate_pushdown_keeps_row_filter() {
         let schema = Schema::new(vec![
-            ColumnDef::new("security_id", DataType::VarChar),
-            ColumnDef::new("deal_date", DataType::Int32),
+            ColumnDef::new("name", DataType::VarChar),
+            ColumnDef::new("region_id", DataType::Int32),
         ]);
         let mut schemas = HashMap::new();
-        schemas.insert("stock_tick_multi".to_string(), schema);
+        schemas.insert("test_table".to_string(), schema);
 
         let stmt = Parser::parse(
-            "SELECT security_id FROM stock_tick_multi \
-             WHERE security_id = '688256.SH' AND deal_date = 20251111",
+            "SELECT name FROM test_table \
+             WHERE name = 'alice' AND region_id = 20251111",
         )
         .unwrap()
         .remove(0);

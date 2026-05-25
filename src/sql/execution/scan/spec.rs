@@ -89,6 +89,9 @@ impl ScanSpec {
                 cols.push(pred.column_index);
             }
         }
+        if let Some(expr) = &self.remaining_predicate {
+            collect_expr_columns(expr, &mut cols);
+        }
         cols
     }
 
@@ -145,6 +148,62 @@ pub fn compile_scan_spec(
     collect_from_plan(plan, table_schema, &mut spec);
 
     spec
+}
+
+fn collect_expr_columns(expr: &LogicalExpr, cols: &mut Vec<usize>) {
+    match expr {
+        LogicalExpr::Column(idx) => {
+            if !cols.contains(idx) {
+                cols.push(*idx);
+            }
+        }
+        LogicalExpr::BinaryOp { left, right, .. } => {
+            collect_expr_columns(left, cols);
+            collect_expr_columns(right, cols);
+        }
+        LogicalExpr::Not(inner) | LogicalExpr::IsNull(inner) | LogicalExpr::IsNotNull(inner) => {
+            collect_expr_columns(inner, cols);
+        }
+        LogicalExpr::In { expr, .. } | LogicalExpr::Like { expr, .. } => {
+            collect_expr_columns(expr, cols);
+        }
+        LogicalExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_columns(expr, cols);
+            collect_expr_columns(low, cols);
+            collect_expr_columns(high, cols);
+        }
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_columns(operand, cols);
+            }
+            for (when_expr, then_expr) in when_clauses {
+                collect_expr_columns(when_expr, cols);
+                collect_expr_columns(then_expr, cols);
+            }
+            if let Some(else_expr) = else_clause {
+                collect_expr_columns(else_expr, cols);
+            }
+        }
+        LogicalExpr::Function { args, .. } => {
+            for arg in args {
+                collect_expr_columns(arg, cols);
+            }
+        }
+        LogicalExpr::Aggregate(agg) => {
+            collect_expr_columns(&agg.arg, cols);
+        }
+        LogicalExpr::ScalarSubquery(_)
+        | LogicalExpr::ExistsSubquery(_)
+        | LogicalExpr::InSubquery { .. }
+        | LogicalExpr::Literal(_)
+        | LogicalExpr::Wildcard => {}
+    }
 }
 
 fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {

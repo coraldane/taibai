@@ -1,10 +1,17 @@
 use crate::storage::codec::fastscan::{apply_filter_mask_fast, FastScanEQ};
 use crate::storage::partition::pruning::RangeOp;
 use crate::types::array::ColumnArray;
-use crate::types::batch::RecordBatch;
+use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::spec::InPredicate;
+
+#[derive(Debug, Clone)]
+pub struct ClusterKeyBounds {
+    pub column_index: usize,
+    pub lower: Option<(ScalarValue, bool)>,
+    pub upper: Option<(ScalarValue, bool)>,
+}
 
 pub fn apply_predicates(
     batch: &RecordBatch,
@@ -359,6 +366,401 @@ pub fn predicate_first_read(
         .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))
 }
 
+pub fn cluster_key_range_read(
+    reader: &crate::storage::segment::SegmentReader,
+    rg_idx: usize,
+    bounds: &ClusterKeyBounds,
+    projection_cols: &[usize],
+    predicate_cols: &[usize],
+    eq_predicates: &[(usize, ScalarValue)],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
+    in_predicates: &[InPredicate],
+    remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
+) -> crate::common::error::Result<RecordBatch> {
+    let key_col_idx = bounds.column_index;
+    let key_batch = reader.read_columns_fast(rg_idx, &[key_col_idx])?;
+    if key_batch.num_rows() == 0 {
+        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+    }
+
+    let Some(key_col) = key_batch.column(0) else {
+        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+    };
+
+    let start = match &bounds.lower {
+        Some((value, inclusive)) => {
+            if *inclusive {
+                lower_bound(key_col, value)
+            } else {
+                upper_bound(key_col, value)
+            }
+        }
+        None => 0,
+    };
+    let end = match &bounds.upper {
+        Some((value, inclusive)) => {
+            if *inclusive {
+                upper_bound(key_col, value)
+            } else {
+                lower_bound(key_col, value)
+            }
+        }
+        None => key_col.len(),
+    };
+    if start == end {
+        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+    }
+
+    let selected_rows = selected_live_rows(reader, rg_idx, start, end);
+    if selected_rows.is_empty() {
+        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+    }
+
+    let union_cols = union_columns(projection_cols, predicate_cols);
+    let mut columns_by_idx: std::collections::HashMap<usize, ColumnArray> =
+        std::collections::HashMap::with_capacity(union_cols.len());
+    let mut cols_to_read = Vec::with_capacity(union_cols.len());
+
+    if union_cols.contains(&key_col_idx) {
+        let key_values = if reader.delete_bitmap().is_empty() {
+            key_col.slice_fast(start, end)
+        } else {
+            let key_mask = selected_rows_mask(key_batch.num_rows(), &selected_rows);
+            key_col.filter_by_mask_fast(&key_mask, selected_rows.len())
+        };
+        columns_by_idx.insert(key_col_idx, key_values);
+    }
+
+    for &col_idx in &union_cols {
+        if col_idx != key_col_idx && !cols_to_read.contains(&col_idx) {
+            cols_to_read.push(col_idx);
+        }
+    }
+
+    for (col_idx, col) in reader.read_columns_filtered(rg_idx, &cols_to_read, &selected_rows)? {
+        columns_by_idx.insert(col_idx, col);
+    }
+
+    let mut union_columns_data = Vec::with_capacity(union_cols.len());
+    for &col_idx in &union_cols {
+        let col = columns_by_idx.get(&col_idx).cloned().ok_or_else(|| {
+            crate::common::error::MonaxError::Internal(format!(
+                "candidate column {} was not read",
+                col_idx
+            ))
+        })?;
+        union_columns_data.push(col);
+    }
+    let union_schema = Schema::new(
+        union_cols
+            .iter()
+            .map(|&idx| reader.schema().columns[idx].clone())
+            .collect(),
+    );
+    let union_batch = RecordBatch::try_new(union_schema, union_columns_data)
+        .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))?;
+
+    let col_pos_by_original: std::collections::HashMap<usize, usize> = union_cols
+        .iter()
+        .enumerate()
+        .map(|(pos, &idx)| (idx, pos))
+        .collect();
+    let remapped_eq = remap_eq_predicates(eq_predicates, &col_pos_by_original)?;
+    let remapped_range = remap_range_predicates(range_predicates, &col_pos_by_original)?;
+    let remapped_in = remap_in_predicates(in_predicates, &col_pos_by_original)?;
+    let remapped_remaining = remaining_predicate
+        .map(|expr| remap_expr(expr, &col_pos_by_original))
+        .transpose()?;
+    let filtered = apply_predicates(
+        &union_batch,
+        &remapped_eq,
+        &remapped_range,
+        &remapped_in,
+        remapped_remaining.as_ref(),
+    );
+
+    project_filtered_union(&filtered, &union_cols, projection_cols)
+}
+
+fn lower_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
+    let mut lo = 0usize;
+    let mut hi = col.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mid_val = col.scalar(mid);
+        if crate::storage::index::sort_key::compare_scalars_for_sort(&mid_val, value)
+            == std::cmp::Ordering::Less
+        {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn upper_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
+    let mut lo = 0usize;
+    let mut hi = col.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mid_val = col.scalar(mid);
+        if crate::storage::index::sort_key::compare_scalars_for_sort(&mid_val, value)
+            == std::cmp::Ordering::Greater
+        {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+fn selected_live_rows(
+    reader: &crate::storage::segment::SegmentReader,
+    rg_idx: usize,
+    start: usize,
+    end: usize,
+) -> Vec<usize> {
+    if reader.delete_bitmap().is_empty() {
+        return (start..end).collect();
+    }
+
+    let rg_start_row: u64 = reader
+        .footer_row_groups_info()
+        .iter()
+        .take(rg_idx)
+        .map(|r| r.row_count)
+        .sum();
+    (start..end)
+        .filter(|row| !reader.is_row_deleted(rg_start_row + *row as u64))
+        .collect()
+}
+
+fn selected_rows_mask(num_rows: usize, selected_rows: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; num_rows];
+    for &row in selected_rows {
+        mask[row] = true;
+    }
+    mask
+}
+
+fn union_columns(projection_cols: &[usize], predicate_cols: &[usize]) -> Vec<usize> {
+    let mut cols = Vec::with_capacity(projection_cols.len() + predicate_cols.len());
+    for &col in projection_cols.iter().chain(predicate_cols.iter()) {
+        if !cols.contains(&col) {
+            cols.push(col);
+        }
+    }
+    cols
+}
+
+fn remap_eq_predicates(
+    predicates: &[(usize, ScalarValue)],
+    col_pos_by_original: &std::collections::HashMap<usize, usize>,
+) -> crate::common::error::Result<Vec<(usize, ScalarValue)>> {
+    predicates
+        .iter()
+        .map(|(idx, value)| {
+            Ok((
+                *col_pos_by_original.get(idx).ok_or_else(|| {
+                    crate::common::error::MonaxError::Internal(format!(
+                        "predicate column {} was not read",
+                        idx
+                    ))
+                })?,
+                value.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn remap_range_predicates(
+    predicates: &[crate::storage::partition::pruning::RangeClause],
+    col_pos_by_original: &std::collections::HashMap<usize, usize>,
+) -> crate::common::error::Result<Vec<crate::storage::partition::pruning::RangeClause>> {
+    predicates
+        .iter()
+        .map(|clause| {
+            let column_index = *col_pos_by_original
+                .get(&clause.column_index)
+                .ok_or_else(|| {
+                    crate::common::error::MonaxError::Internal(format!(
+                        "predicate column {} was not read",
+                        clause.column_index
+                    ))
+                })?;
+            Ok(crate::storage::partition::pruning::RangeClause {
+                column_index,
+                op: clause.op,
+                value: clause.value.clone(),
+            })
+        })
+        .collect()
+}
+
+fn remap_in_predicates(
+    predicates: &[InPredicate],
+    col_pos_by_original: &std::collections::HashMap<usize, usize>,
+) -> crate::common::error::Result<Vec<InPredicate>> {
+    predicates
+        .iter()
+        .map(|pred| {
+            let column_index = *col_pos_by_original.get(&pred.column_index).ok_or_else(|| {
+                crate::common::error::MonaxError::Internal(format!(
+                    "predicate column {} was not read",
+                    pred.column_index
+                ))
+            })?;
+            Ok(InPredicate {
+                column_index,
+                values: pred.values.clone(),
+            })
+        })
+        .collect()
+}
+
+fn remap_expr(
+    expr: &crate::sql::planner::LogicalExpr,
+    col_pos_by_original: &std::collections::HashMap<usize, usize>,
+) -> crate::common::error::Result<crate::sql::planner::LogicalExpr> {
+    use crate::sql::planner::LogicalExpr;
+    match expr {
+        LogicalExpr::Column(idx) => {
+            let pos = *col_pos_by_original.get(idx).ok_or_else(|| {
+                crate::common::error::MonaxError::Internal(format!(
+                    "predicate column {} was not read",
+                    idx
+                ))
+            })?;
+            Ok(LogicalExpr::Column(pos))
+        }
+        LogicalExpr::Literal(value) => Ok(LogicalExpr::Literal(value.clone())),
+        LogicalExpr::BinaryOp { left, op, right } => Ok(LogicalExpr::BinaryOp {
+            left: Box::new(remap_expr(left, col_pos_by_original)?),
+            op: *op,
+            right: Box::new(remap_expr(right, col_pos_by_original)?),
+        }),
+        LogicalExpr::Not(inner) => Ok(LogicalExpr::Not(Box::new(remap_expr(
+            inner,
+            col_pos_by_original,
+        )?))),
+        LogicalExpr::IsNull(inner) => Ok(LogicalExpr::IsNull(Box::new(remap_expr(
+            inner,
+            col_pos_by_original,
+        )?))),
+        LogicalExpr::IsNotNull(inner) => Ok(LogicalExpr::IsNotNull(Box::new(remap_expr(
+            inner,
+            col_pos_by_original,
+        )?))),
+        LogicalExpr::In {
+            expr,
+            values,
+            negated,
+        } => Ok(LogicalExpr::In {
+            expr: Box::new(remap_expr(expr, col_pos_by_original)?),
+            values: values.clone(),
+            negated: *negated,
+        }),
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Ok(LogicalExpr::Between {
+            expr: Box::new(remap_expr(expr, col_pos_by_original)?),
+            low: Box::new(remap_expr(low, col_pos_by_original)?),
+            high: Box::new(remap_expr(high, col_pos_by_original)?),
+            negated: *negated,
+        }),
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => Ok(LogicalExpr::Case {
+            operand: operand
+                .as_ref()
+                .map(|expr| remap_expr(expr, col_pos_by_original).map(Box::new))
+                .transpose()?,
+            when_clauses: when_clauses
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    Ok((
+                        remap_expr(when_expr, col_pos_by_original)?,
+                        remap_expr(then_expr, col_pos_by_original)?,
+                    ))
+                })
+                .collect::<crate::common::error::Result<_>>()?,
+            else_clause: else_clause
+                .as_ref()
+                .map(|expr| remap_expr(expr, col_pos_by_original).map(Box::new))
+                .transpose()?,
+        }),
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Ok(LogicalExpr::Like {
+            expr: Box::new(remap_expr(expr, col_pos_by_original)?),
+            pattern: pattern.clone(),
+            negated: *negated,
+        }),
+        LogicalExpr::Function { name, args } => Ok(LogicalExpr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| remap_expr(arg, col_pos_by_original))
+                .collect::<crate::common::error::Result<_>>()?,
+        }),
+        LogicalExpr::Aggregate(agg) => {
+            Ok(LogicalExpr::Aggregate(crate::sql::planner::AggregateExpr {
+                func: agg.func,
+                arg: Box::new(remap_expr(&agg.arg, col_pos_by_original)?),
+                distinct: agg.distinct,
+            }))
+        }
+        LogicalExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(LogicalExpr::InSubquery {
+            expr: Box::new(remap_expr(expr, col_pos_by_original)?),
+            subquery: subquery.clone(),
+            negated: *negated,
+        }),
+        other => Ok(other.clone()),
+    }
+}
+
+fn project_filtered_union(
+    batch: &RecordBatch,
+    union_cols: &[usize],
+    projection_cols: &[usize],
+) -> crate::common::error::Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(projection_cols.len());
+    let mut col_defs = Vec::with_capacity(projection_cols.len());
+    for &col_idx in projection_cols {
+        let pos = union_cols
+            .iter()
+            .position(|idx| *idx == col_idx)
+            .ok_or_else(|| {
+                crate::common::error::MonaxError::Internal(format!(
+                    "projected column {} was not read",
+                    col_idx
+                ))
+            })?;
+        columns.push(batch.column(pos).cloned().ok_or_else(|| {
+            crate::common::error::MonaxError::Internal(format!(
+                "projected column {} missing from candidate batch",
+                col_idx
+            ))
+        })?);
+        col_defs.push(batch.schema.columns[pos].clone());
+    }
+    RecordBatch::try_new(Schema::new(col_defs), columns)
+        .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))
+}
+
 fn empty_like(batch: &RecordBatch) -> RecordBatch {
     RecordBatch::new(batch.schema.clone())
 }
@@ -416,4 +818,100 @@ pub fn apply_cluster_key_fast_scan(
         }
     }
     *batches = filtered;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::storage::segment::{SegmentReader, SegmentWriter};
+    use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+    use tempfile::TempDir;
+
+    #[test]
+    fn cluster_key_range_read_returns_only_matching_sorted_range() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seg_00001.dat");
+        let schema = Schema::new(vec![
+            ColumnDef::new("name", DataType::VarChar),
+            ColumnDef::new("value", DataType::Int64),
+        ]);
+
+        let mut batch = RecordBatch::new(schema.clone());
+        for (name, value) in [
+            ("bob", 1),
+            ("alice", 2),
+            ("alice", 3),
+            ("alice", 4),
+            ("charlie", 5),
+        ] {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(name.to_string())))
+                .unwrap();
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(value)))
+                .unwrap();
+        }
+
+        {
+            let mut writer = SegmentWriter::create(&path, schema, 8192).unwrap();
+            writer.write_batch(&batch).unwrap();
+            writer.seal().unwrap();
+        }
+
+        let reader = SegmentReader::open(&path).unwrap();
+        let result = cluster_key_range_read(
+            &reader,
+            0,
+            &ClusterKeyBounds {
+                column_index: 0,
+                lower: Some((ScalarValue::VarChar(Some("alice".to_string())), true)),
+                upper: Some((ScalarValue::VarChar(Some("alice".to_string())), true)),
+            },
+            &[0, 1],
+            &[0],
+            &[(0, ScalarValue::VarChar(Some("alice".to_string())))],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(
+            result.scalar(0, 0).unwrap(),
+            ScalarValue::VarChar(Some("alice".to_string()))
+        );
+        assert_eq!(result.scalar(0, 1).unwrap(), ScalarValue::Int64(Some(2)));
+        assert_eq!(result.scalar(2, 1).unwrap(), ScalarValue::Int64(Some(4)));
+
+        let filtered = cluster_key_range_read(
+            &reader,
+            0,
+            &ClusterKeyBounds {
+                column_index: 0,
+                lower: Some((ScalarValue::VarChar(Some("alice".to_string())), true)),
+                upper: Some((ScalarValue::VarChar(Some("alice".to_string())), true)),
+            },
+            &[0, 1],
+            &[0, 1],
+            &[(0, ScalarValue::VarChar(Some("alice".to_string())))],
+            &[crate::storage::partition::pruning::RangeClause {
+                column_index: 1,
+                op: RangeOp::Gt,
+                value: ScalarValue::Int64(Some(2)),
+            }],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(filtered.num_rows(), 2);
+        assert_eq!(filtered.scalar(0, 1).unwrap(), ScalarValue::Int64(Some(3)));
+        assert_eq!(filtered.scalar(1, 1).unwrap(), ScalarValue::Int64(Some(4)));
+    }
 }
