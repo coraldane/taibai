@@ -14,7 +14,11 @@ pub struct ComparisonExpression {
 }
 
 impl ComparisonExpression {
-    pub fn new(left: Box<dyn ColumnExpression>, op: BinOp, right: Box<dyn ColumnExpression>) -> Self {
+    pub fn new(
+        left: Box<dyn ColumnExpression>,
+        op: BinOp,
+        right: Box<dyn ColumnExpression>,
+    ) -> Self {
         Self { left, op, right }
     }
 }
@@ -54,18 +58,24 @@ fn compare(l: &ScalarValue, op: &BinOp, r: &ScalarValue) -> bool {
 
 fn num_cmp<T: PartialOrd>(a: T, op: &BinOp, b: T) -> bool {
     match op {
-        BinOp::Eq => a == b, BinOp::Neq => a != b,
-        BinOp::Lt => a < b, BinOp::Gt => a > b,
-        BinOp::Lte => a <= b, BinOp::Gte => a >= b,
+        BinOp::Eq => a == b,
+        BinOp::Neq => a != b,
+        BinOp::Lt => a < b,
+        BinOp::Gt => a > b,
+        BinOp::Lte => a <= b,
+        BinOp::Gte => a >= b,
         _ => false,
     }
 }
 
 fn str_cmp(a: &str, op: &BinOp, b: &str) -> bool {
     match op {
-        BinOp::Eq => a == b, BinOp::Neq => a != b,
-        BinOp::Lt => a < b, BinOp::Gt => a > b,
-        BinOp::Lte => a <= b, BinOp::Gte => a >= b,
+        BinOp::Eq => a == b,
+        BinOp::Neq => a != b,
+        BinOp::Lt => a < b,
+        BinOp::Gt => a > b,
+        BinOp::Lte => a <= b,
+        BinOp::Gte => a >= b,
         _ => false,
     }
 }

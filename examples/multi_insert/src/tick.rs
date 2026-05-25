@@ -103,26 +103,106 @@ pub fn parse_tick_csv_line(line: &str) -> Option<TickElement> {
         total_num_trade: parse_int32(args[10]),
         trans_volume: parse_int64(args[11]),
         trans_value: parse_decimal(args[12], 2),
-        ask_px1: if args.len() > 13 { parse_decimal(args[13], 2) } else { 0 },
-        ask_px2: if args.len() > 14 { parse_decimal(args[14], 2) } else { 0 },
-        ask_px3: if args.len() > 15 { parse_decimal(args[15], 2) } else { 0 },
-        ask_px4: if args.len() > 16 { parse_decimal(args[16], 2) } else { 0 },
-        ask_px5: if args.len() > 17 { parse_decimal(args[17], 2) } else { 0 },
-        ask_vol1: if args.len() > 18 { parse_int32(args[18]) } else { 0 },
-        ask_vol2: if args.len() > 19 { parse_int32(args[19]) } else { 0 },
-        ask_vol3: if args.len() > 20 { parse_int32(args[20]) } else { 0 },
-        ask_vol4: if args.len() > 21 { parse_int32(args[21]) } else { 0 },
-        ask_vol5: if args.len() > 22 { parse_int32(args[22]) } else { 0 },
-        bid_px1: if args.len() > 23 { parse_decimal(args[23], 2) } else { 0 },
-        bid_px2: if args.len() > 24 { parse_decimal(args[24], 2) } else { 0 },
-        bid_px3: if args.len() > 25 { parse_decimal(args[25], 2) } else { 0 },
-        bid_px4: if args.len() > 26 { parse_decimal(args[26], 2) } else { 0 },
-        bid_px5: if args.len() > 27 { parse_decimal(args[27], 2) } else { 0 },
-        bid_vol1: if args.len() > 28 { parse_int32(args[28]) } else { 0 },
-        bid_vol2: if args.len() > 29 { parse_int32(args[29]) } else { 0 },
-        bid_vol3: if args.len() > 30 { parse_int32(args[30]) } else { 0 },
-        bid_vol4: if args.len() > 31 { parse_int32(args[31]) } else { 0 },
-        bid_vol5: if args.len() > 32 { parse_int32(args[32]) } else { 0 },
+        ask_px1: if args.len() > 13 {
+            parse_decimal(args[13], 2)
+        } else {
+            0
+        },
+        ask_px2: if args.len() > 14 {
+            parse_decimal(args[14], 2)
+        } else {
+            0
+        },
+        ask_px3: if args.len() > 15 {
+            parse_decimal(args[15], 2)
+        } else {
+            0
+        },
+        ask_px4: if args.len() > 16 {
+            parse_decimal(args[16], 2)
+        } else {
+            0
+        },
+        ask_px5: if args.len() > 17 {
+            parse_decimal(args[17], 2)
+        } else {
+            0
+        },
+        ask_vol1: if args.len() > 18 {
+            parse_int32(args[18])
+        } else {
+            0
+        },
+        ask_vol2: if args.len() > 19 {
+            parse_int32(args[19])
+        } else {
+            0
+        },
+        ask_vol3: if args.len() > 20 {
+            parse_int32(args[20])
+        } else {
+            0
+        },
+        ask_vol4: if args.len() > 21 {
+            parse_int32(args[21])
+        } else {
+            0
+        },
+        ask_vol5: if args.len() > 22 {
+            parse_int32(args[22])
+        } else {
+            0
+        },
+        bid_px1: if args.len() > 23 {
+            parse_decimal(args[23], 2)
+        } else {
+            0
+        },
+        bid_px2: if args.len() > 24 {
+            parse_decimal(args[24], 2)
+        } else {
+            0
+        },
+        bid_px3: if args.len() > 25 {
+            parse_decimal(args[25], 2)
+        } else {
+            0
+        },
+        bid_px4: if args.len() > 26 {
+            parse_decimal(args[26], 2)
+        } else {
+            0
+        },
+        bid_px5: if args.len() > 27 {
+            parse_decimal(args[27], 2)
+        } else {
+            0
+        },
+        bid_vol1: if args.len() > 28 {
+            parse_int32(args[28])
+        } else {
+            0
+        },
+        bid_vol2: if args.len() > 29 {
+            parse_int32(args[29])
+        } else {
+            0
+        },
+        bid_vol3: if args.len() > 30 {
+            parse_int32(args[30])
+        } else {
+            0
+        },
+        bid_vol4: if args.len() > 31 {
+            parse_int32(args[31])
+        } else {
+            0
+        },
+        bid_vol5: if args.len() > 32 {
+            parse_int32(args[32])
+        } else {
+            0
+        },
         local_time,
     })
 }
@@ -226,7 +306,12 @@ struct DecBuf {
 }
 
 impl DecBuf {
-    fn new() -> Self { DecBuf { buf: [0u8; 32], len: 0 } }
+    fn new() -> Self {
+        DecBuf {
+            buf: [0u8; 32],
+            len: 0,
+        }
+    }
 }
 
 struct IntBuf {
@@ -235,7 +320,12 @@ struct IntBuf {
 }
 
 impl IntBuf {
-    fn new() -> Self { IntBuf { buf: [0u8; 20], len: 0 } }
+    fn new() -> Self {
+        IntBuf {
+            buf: [0u8; 20],
+            len: 0,
+        }
+    }
 }
 
 fn write_decimal(buf: &mut DecBuf, sb: &mut String, raw: i64) {
@@ -361,7 +451,6 @@ fn escape_string_into(s: &str, sb: &mut String) {
     }
 }
 
-
 fn format_timestamp(micros: i64) -> String {
     let secs = micros / 1_000_000;
     let remainder = micros % 1_000_000;
@@ -387,7 +476,13 @@ fn format_timestamp(micros: i64) -> String {
         match m {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
             4 | 6 | 9 | 11 => 30,
-            2 => if is_leap(y) { 29 } else { 28 },
+            2 => {
+                if is_leap(y) {
+                    29
+                } else {
+                    28
+                }
+            }
             _ => 0,
         }
     };
@@ -404,9 +499,15 @@ fn format_timestamp(micros: i64) -> String {
     let day = (remaining_days + 1) as u32;
 
     if frac_millis > 0 {
-        format!("{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}", year, month, day, hour, minute, second, frac_millis)
+        format!(
+            "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            year, month, day, hour, minute, second, frac_millis
+        )
     } else {
-        format!("{}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, minute, second)
+        format!(
+            "{}-{:02}-{:02} {:02}:{:02}:{:02}",
+            year, month, day, hour, minute, second
+        )
     }
 }
 
@@ -434,7 +535,11 @@ fn parse_int32(s: &str) -> i32 {
         result = result.wrapping_mul(10).wrapping_add((b - b'0') as i32);
         idx += 1;
     }
-    if neg { -result } else { result }
+    if neg {
+        -result
+    } else {
+        result
+    }
 }
 
 #[inline]
@@ -476,7 +581,11 @@ fn parse_int64(s: &str) -> i64 {
     if has_dot && first_after_dot >= 5 {
         result += 1;
     }
-    if neg { -result } else { result }
+    if neg {
+        -result
+    } else {
+        result
+    }
 }
 
 #[inline]
@@ -526,7 +635,11 @@ fn parse_decimal(s: &str, scale: u32) -> i64 {
         result *= 10;
         decimals += 1;
     }
-    if neg { -result } else { result }
+    if neg {
+        -result
+    } else {
+        result
+    }
 }
 
 #[inline]

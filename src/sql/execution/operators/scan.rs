@@ -11,7 +11,11 @@ pub struct ScanExec {
 
 impl ScanExec {
     pub fn new(batches: Vec<RecordBatch>, projection: Option<Vec<usize>>) -> Self {
-        Self { batches, pos: 0, projection }
+        Self {
+            batches,
+            pos: 0,
+            projection,
+        }
     }
 }
 
@@ -28,9 +32,8 @@ impl ExecutionOp for ScanExec {
                 if is_already_projected(batch, indices) {
                     return Ok(Some(batch.clone()));
                 }
-                let schema_cols: Vec<&crate::types::batch::ColumnDef> = indices.iter()
-                    .map(|&i| &batch.schema.columns[i])
-                    .collect();
+                let schema_cols: Vec<&crate::types::batch::ColumnDef> =
+                    indices.iter().map(|&i| &batch.schema.columns[i]).collect();
                 let new_schema = Schema::new(schema_cols.iter().map(|c| (*c).clone()).collect());
                 let mut cols = Vec::with_capacity(indices.len());
                 for &idx in indices {
@@ -45,6 +48,11 @@ impl ExecutionOp for ScanExec {
 
 fn is_already_projected(batch: &RecordBatch, indices: &[usize]) -> bool {
     batch.schema.columns.len() == indices.len()
-        && (indices.iter().enumerate().all(|(idx, &source_idx)| idx == source_idx)
-            || indices.iter().any(|&source_idx| source_idx >= batch.schema.columns.len()))
+        && (indices
+            .iter()
+            .enumerate()
+            .all(|(idx, &source_idx)| idx == source_idx)
+            || indices
+                .iter()
+                .any(|&source_idx| source_idx >= batch.schema.columns.len()))
 }

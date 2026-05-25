@@ -23,8 +23,21 @@ pub struct HashAggregateExec {
 }
 
 impl HashAggregateExec {
-    pub fn new(group_by: Vec<LogicalExpr>, aggregates: Vec<AggregateExpr>, input: Box<dyn ExecutionOp>, input_schema: Schema) -> Self {
-        Self { group_by, aggregates, input, input_schema, having: None, distinct: false, done: false }
+    pub fn new(
+        group_by: Vec<LogicalExpr>,
+        aggregates: Vec<AggregateExpr>,
+        input: Box<dyn ExecutionOp>,
+        input_schema: Schema,
+    ) -> Self {
+        Self {
+            group_by,
+            aggregates,
+            input,
+            input_schema,
+            having: None,
+            distinct: false,
+            done: false,
+        }
     }
 
     pub fn with_having(mut self, having: LogicalExpr) -> Self {
@@ -60,10 +73,14 @@ impl ExecutionOp for HashAggregateExec {
             }
         }
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
-        let group_by: Vec<LogicalExpr> = self.group_by.iter()
+        let group_by: Vec<LogicalExpr> = self
+            .group_by
+            .iter()
             .map(|expr| remap_expr_for_batch(expr, &self.input_schema, &physical_schema))
             .collect();
-        let aggregates: Vec<AggregateExpr> = self.aggregates.iter()
+        let aggregates: Vec<AggregateExpr> = self
+            .aggregates
+            .iter()
             .map(|agg| remap_aggregate_for_batch(agg, &self.input_schema, &physical_schema))
             .collect();
 
@@ -71,7 +88,8 @@ impl ExecutionOp for HashAggregateExec {
         let mut groups: HashMap<Vec<String>, Vec<Vec<ScalarValue>>> = HashMap::new();
         let mut group_order: Vec<Vec<String>> = Vec::new();
         for row in &all_rows {
-            let key: Vec<String> = group_by.iter()
+            let key: Vec<String> = group_by
+                .iter()
                 .map(|expr| eval_group_key(expr, row))
                 .collect();
             if !groups.contains_key(&key) {
@@ -85,9 +103,11 @@ impl ExecutionOp for HashAggregateExec {
         for expr in &group_by {
             if let LogicalExpr::Column(idx) = expr {
                 if let Some(cd) = physical_schema.columns.get(*idx) {
-                    col_defs.push(ColumnDef::new(&cd.name, cd.data_type)
-                        .with_scale(cd.scale)
-                        .with_precision(cd.precision));
+                    col_defs.push(
+                        ColumnDef::new(&cd.name, cd.data_type)
+                            .with_scale(cd.scale)
+                            .with_precision(cd.precision),
+                    );
                 }
             }
         }
@@ -105,7 +125,12 @@ impl ExecutionOp for HashAggregateExec {
             let mut row_vals = Vec::new();
             for expr in &group_by {
                 if let LogicalExpr::Column(idx) = expr {
-                    row_vals.push(rows.first().and_then(|r| r.get(*idx)).cloned().unwrap_or(ScalarValue::Int64(None)));
+                    row_vals.push(
+                        rows.first()
+                            .and_then(|r| r.get(*idx))
+                            .cloned()
+                            .unwrap_or(ScalarValue::Int64(None)),
+                    );
                 }
             }
             for agg in &aggregates {
@@ -140,7 +165,11 @@ fn eval_group_key(expr: &LogicalExpr, row: &[ScalarValue]) -> String {
 pub fn format_aggregate_name(agg: &AggregateExpr, schema: &Schema) -> String {
     let arg_name = match &*agg.arg {
         LogicalExpr::Wildcard => "*".to_string(),
-        LogicalExpr::Column(idx) => schema.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default(),
+        LogicalExpr::Column(idx) => schema
+            .columns
+            .get(*idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_default(),
         _ => "expr".to_string(),
     };
     let distinct_str = if agg.distinct { "DISTINCT " } else { "" };
@@ -151,16 +180,22 @@ fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     match agg.func {
         AggFunc::Count => DataType::Int64,
         AggFunc::Sum | AggFunc::Avg => DataType::Float64,
-        AggFunc::Min | AggFunc::Max => {
-            match &*agg.arg {
-                LogicalExpr::Column(idx) => schema.columns.get(*idx).map(|c| c.data_type).unwrap_or(DataType::Int64),
-                _ => DataType::Int64,
-            }
-        }
+        AggFunc::Min | AggFunc::Max => match &*agg.arg {
+            LogicalExpr::Column(idx) => schema
+                .columns
+                .get(*idx)
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::Int64),
+            _ => DataType::Int64,
+        },
     }
 }
 
-pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], _schema: &Schema) -> ScalarValue {
+pub fn compute_aggregate(
+    agg: &AggregateExpr,
+    rows: &[Vec<ScalarValue>],
+    _schema: &Schema,
+) -> ScalarValue {
     let col_idx = match &*agg.arg {
         LogicalExpr::Column(idx) => Some(*idx),
         LogicalExpr::Wildcard => None,
@@ -175,17 +210,26 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], _schema
                 .filter_map(|r| r.get(idx))
                 .filter(|v| {
                     let s = v.to_string();
-                    if seen.contains(&s) { false } else { seen.push(s); true }
+                    if seen.contains(&s) {
+                        false
+                    } else {
+                        seen.push(s);
+                        true
+                    }
                 })
                 .collect()
         } else {
-            rows.iter().map(|r| r.first().unwrap_or(&ScalarValue::Int64(None))).collect()
+            rows.iter()
+                .map(|r| r.first().unwrap_or(&ScalarValue::Int64(None)))
+                .collect()
         }
     } else {
         if let Some(idx) = col_idx {
             rows.iter().filter_map(|r| r.get(idx)).collect()
         } else {
-            rows.iter().map(|r| r.first().unwrap_or(&ScalarValue::Int64(None))).collect()
+            rows.iter()
+                .map(|r| r.first().unwrap_or(&ScalarValue::Int64(None)))
+                .collect()
         }
     };
 
@@ -201,9 +245,7 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], _schema
             }
         }
         AggFunc::Sum => {
-            let sum: f64 = values.iter()
-                .filter_map(|v| scalar_to_f64(v))
-                .sum();
+            let sum: f64 = values.iter().filter_map(|v| scalar_to_f64(v)).sum();
             if sum == 0.0 && values.iter().all(|v| v.is_null()) {
                 ScalarValue::Float64(None)
             } else {
@@ -211,24 +253,29 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], _schema
             }
         }
         AggFunc::Avg => {
-            let vals: Vec<f64> = values.iter()
-                .filter_map(|v| scalar_to_f64(v))
-                .collect();
-            if vals.is_empty() { ScalarValue::Float64(None) }
-            else { ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64)) }
+            let vals: Vec<f64> = values.iter().filter_map(|v| scalar_to_f64(v)).collect();
+            if vals.is_empty() {
+                ScalarValue::Float64(None)
+            } else {
+                ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64))
+            }
         }
         AggFunc::Min => {
-            match values.iter()
+            match values
+                .iter()
                 .filter(|v| !v.is_null())
-                .min_by(|a, b| compare_scalars(a, b)) {
+                .min_by(|a, b| compare_scalars(a, b))
+            {
                 Some(v) => (*v).clone(),
                 None => ScalarValue::Int64(None),
             }
         }
         AggFunc::Max => {
-            match values.iter()
+            match values
+                .iter()
                 .filter(|v| !v.is_null())
-                .max_by(|a, b| compare_scalars(a, b)) {
+                .max_by(|a, b| compare_scalars(a, b))
+            {
                 Some(v) => (*v).clone(),
                 None => ScalarValue::Int64(None),
             }
@@ -252,9 +299,15 @@ pub fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
 }
 
 pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    if a.is_null() && b.is_null() { return std::cmp::Ordering::Equal; }
-    if a.is_null() { return std::cmp::Ordering::Less; }
-    if b.is_null() { return std::cmp::Ordering::Greater; }
+    if a.is_null() && b.is_null() {
+        return std::cmp::Ordering::Equal;
+    }
+    if a.is_null() {
+        return std::cmp::Ordering::Less;
+    }
+    if b.is_null() {
+        return std::cmp::Ordering::Greater;
+    }
     match (a, b) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
@@ -262,8 +315,12 @@ pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
         (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => l.cmp(r),
         (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => l.cmp(r),
         (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => l.cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
-        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
         (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l.cmp(r),
         (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l.cmp(r),
@@ -278,7 +335,12 @@ fn apply_distinct(batch: RecordBatch) -> RecordBatch {
 
     for row in 0..batch.num_rows() {
         let key: String = (0..batch.num_columns())
-            .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)).to_string())
+            .map(|c| {
+                batch
+                    .scalar(row, c)
+                    .unwrap_or(ScalarValue::Int64(None))
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("|");
         if !seen.contains(&key) {

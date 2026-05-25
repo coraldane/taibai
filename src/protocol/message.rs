@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::common::error::{MonaxError, Result};
+use bytes::Bytes;
 
 pub const MAGIC: [u8; 2] = [0x01, 0xDB];
 pub const HEADER_SIZE: usize = 7;
@@ -57,7 +57,10 @@ impl MessageHeader {
         }
         let msg_type = buf[2];
         let payload_len = u32::from_le_bytes([buf[3], buf[4], buf[5], buf[6]]);
-        Ok(MessageHeader { msg_type, payload_len })
+        Ok(MessageHeader {
+            msg_type,
+            payload_len,
+        })
     }
 }
 
@@ -73,13 +76,18 @@ impl Message {
     }
 
     pub fn empty(msg_type: u8) -> Self {
-        Self { msg_type, payload: Bytes::new() }
+        Self {
+            msg_type,
+            payload: Bytes::new(),
+        }
     }
 }
 
 pub fn read_len_prefixed_string(data: &[u8]) -> Result<(&str, &[u8])> {
     if data.len() < 4 {
-        return Err(MonaxError::Protocol("insufficient data for length prefix".into()));
+        return Err(MonaxError::Protocol(
+            "insufficient data for length prefix".into(),
+        ));
     }
     let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if data.len() < 4 + len {

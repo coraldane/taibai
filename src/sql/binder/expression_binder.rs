@@ -71,10 +71,11 @@ impl<'a> ExpressionBinder<'a> {
                 })
             }
             Expr::Column(name) => {
-                let idx = self.ctx.resolve_column(name)
+                let idx = self
+                    .ctx
+                    .resolve_column(name)
                     .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", name)))?;
-                let dt = self.ctx.column_type(idx)
-                    .unwrap_or(DataType::Int64);
+                let dt = self.ctx.column_type(idx).unwrap_or(DataType::Int64);
                 Ok(BoundExpr {
                     kind: BoundExprKind::ColumnRef {
                         index: idx,
@@ -84,10 +85,16 @@ impl<'a> ExpressionBinder<'a> {
                 })
             }
             Expr::QualifiedColumn { table, column } => {
-                let idx = self.ctx.resolve_qualified_column(table, column)
-                    .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found in table '{}'", column, table)))?;
-                let dt = self.ctx.column_type(idx)
-                    .unwrap_or(DataType::Int64);
+                let idx = self
+                    .ctx
+                    .resolve_qualified_column(table, column)
+                    .ok_or_else(|| {
+                        MonaxError::Sql(format!(
+                            "column '{}' not found in table '{}'",
+                            column, table
+                        ))
+                    })?;
+                let dt = self.ctx.column_type(idx).unwrap_or(DataType::Int64);
                 Ok(BoundExpr {
                     kind: BoundExprKind::ColumnRef {
                         index: idx,
@@ -99,7 +106,11 @@ impl<'a> ExpressionBinder<'a> {
             Expr::BinaryOp { left, op, right } => {
                 let l = self.bind(left)?;
                 let r = self.bind(right)?;
-                let dt = crate::sql::binder::type_resolver::resolve_binary_type(&l.data_type, op, &r.data_type);
+                let dt = crate::sql::binder::type_resolver::resolve_binary_type(
+                    &l.data_type,
+                    op,
+                    &r.data_type,
+                );
                 Ok(BoundExpr {
                     kind: BoundExprKind::BinaryOp {
                         left: Box::new(l),
@@ -130,7 +141,11 @@ impl<'a> ExpressionBinder<'a> {
                     data_type: DataType::Bool,
                 })
             }
-            Expr::Function { name, args, distinct } => {
+            Expr::Function {
+                name,
+                args,
+                distinct,
+            } => {
                 let func_name = name.to_uppercase();
                 let func = match func_name.as_str() {
                     "COUNT" => crate::sql::planner::AggFunc::Count,
@@ -140,7 +155,9 @@ impl<'a> ExpressionBinder<'a> {
                     "MAX" => crate::sql::planner::AggFunc::Max,
                     other => return Err(MonaxError::Sql(format!("unknown function '{}'", other))),
                 };
-                let arg = if args.is_empty() || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*")) {
+                let arg = if args.is_empty()
+                    || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
+                {
                     BoundExpr {
                         kind: BoundExprKind::Wildcard,
                         data_type: DataType::Int64,
@@ -169,7 +186,11 @@ impl<'a> ExpressionBinder<'a> {
                     data_type: DataType::Int64,
                 })
             }
-            Expr::In { expr, values, negated } => {
+            Expr::In {
+                expr,
+                values,
+                negated,
+            } => {
                 let bound_expr = self.bind(expr)?;
                 let bound_values: Result<Vec<_>> = values.iter().map(|v| self.bind(v)).collect();
                 Ok(BoundExpr {
@@ -181,7 +202,12 @@ impl<'a> ExpressionBinder<'a> {
                     data_type: DataType::Bool,
                 })
             }
-            Expr::Between { expr, low, high, negated } => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 let bound_expr = self.bind(expr)?;
                 let bound_low = self.bind(low)?;
                 let bound_high = self.bind(high)?;
@@ -195,7 +221,11 @@ impl<'a> ExpressionBinder<'a> {
                     data_type: DataType::Bool,
                 })
             }
-            Expr::Like { expr, pattern, negated } => {
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+            } => {
                 let bound_expr = self.bind(expr)?;
                 let bound_pattern = self.bind(pattern)?;
                 Ok(BoundExpr {
@@ -207,18 +237,21 @@ impl<'a> ExpressionBinder<'a> {
                     data_type: DataType::Bool,
                 })
             }
-            Expr::Case { operand: _, when_clauses: _, else_clause: _ } => {
-                Ok(BoundExpr {
-                    kind: BoundExprKind::Literal(ScalarValue::Bool(None)),
-                    data_type: DataType::Bool,
-                })
-            }
-            Expr::Exists(_) | Expr::Subquery(_) | Expr::WindowFunction { .. } | Expr::Placeholder(_) => {
-                Ok(BoundExpr {
-                    kind: BoundExprKind::Literal(ScalarValue::Bool(None)),
-                    data_type: DataType::Bool,
-                })
-            }
+            Expr::Case {
+                operand: _,
+                when_clauses: _,
+                else_clause: _,
+            } => Ok(BoundExpr {
+                kind: BoundExprKind::Literal(ScalarValue::Bool(None)),
+                data_type: DataType::Bool,
+            }),
+            Expr::Exists(_)
+            | Expr::Subquery(_)
+            | Expr::WindowFunction { .. }
+            | Expr::Placeholder(_) => Ok(BoundExpr {
+                kind: BoundExprKind::Literal(ScalarValue::Bool(None)),
+                data_type: DataType::Bool,
+            }),
         }
     }
 }

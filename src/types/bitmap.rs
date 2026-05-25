@@ -51,7 +51,12 @@ impl NullBitmap {
 
     #[inline]
     pub fn is_null(&self, idx: usize) -> bool {
-        debug_assert!(idx < self.len, "index {} out of bounds (len={})", idx, self.len);
+        debug_assert!(
+            idx < self.len,
+            "index {} out of bounds (len={})",
+            idx,
+            self.len
+        );
         self.data[idx / 64] & (1u64 << (idx % 64)) != 0
     }
 

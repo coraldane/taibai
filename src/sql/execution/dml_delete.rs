@@ -3,7 +3,7 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::Schema;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{eval_where_clause, build_row_group_predicate};
+use super::helpers::{build_row_group_predicate, eval_where_clause};
 use crate::sql::parser::ast::Expr;
 
 pub fn exec_delete(
@@ -14,9 +14,11 @@ pub fn exec_delete(
 ) -> Result<ExecResult> {
     let table_schema = {
         let catalogs = engine.catalogs().read().unwrap();
-        let catalog = catalogs.get(db)
+        let catalog = catalogs
+            .get(db)
             .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
-        let meta = catalog.get_table(table)
+        let meta = catalog
+            .get_table(table)
             .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?
             .clone();
         Schema::new(meta.columns.clone())
@@ -63,7 +65,9 @@ pub fn exec_delete(
                     let byte = (rid / 8) as usize;
                     let bit = (rid % 8) as u8;
                     let already = (new_bitmap[byte] & (1u8 << bit)) != 0;
-                    if already { continue; }
+                    if already {
+                        continue;
+                    }
                     let matches = if let Some(ref where_expr) = where_clause {
                         eval_where_clause(where_expr, &batch, i, &table_schema)?
                     } else {
@@ -100,5 +104,7 @@ pub fn exec_delete(
         }
     }
 
-    Ok(ExecResult::Ok { rows_affected: total_deleted })
+    Ok(ExecResult::Ok {
+        rows_affected: total_deleted,
+    })
 }

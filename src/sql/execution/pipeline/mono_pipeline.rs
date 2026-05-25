@@ -1,11 +1,11 @@
 use crate::common::error::Result;
-use crate::sql::planner::{LogicalPlan, LogicalExpr};
+use crate::sql::planner::{LogicalExpr, LogicalPlan};
 use crate::types::batch::RecordBatch;
 
-use super::push_filter::PushFilter;
-use super::push_project::PushProject;
 use super::push_aggregate::PushHashAggregate;
+use super::push_filter::PushFilter;
 use super::push_limit::PushLimit;
+use super::push_project::PushProject;
 use super::PushOp;
 
 pub enum MonoPipeline {
@@ -13,16 +13,23 @@ pub enum MonoPipeline {
     Project(PushProject),
     Aggregate(PushHashAggregate),
     Limit(PushLimit),
-    Chain { head: Box<MonoPipeline>, tail: Box<MonoPipeline> },
-    Source { batches: Vec<RecordBatch>, pos: usize },
+    Chain {
+        head: Box<MonoPipeline>,
+        tail: Box<MonoPipeline>,
+    },
+    Source {
+        batches: Vec<RecordBatch>,
+        pos: usize,
+    },
 }
 
 impl MonoPipeline {
     pub fn build(plan: &LogicalPlan) -> Result<Self> {
         match plan {
-            LogicalPlan::Scan(_) => {
-                Ok(MonoPipeline::Source { batches: Vec::new(), pos: 0 })
-            }
+            LogicalPlan::Scan(_) => Ok(MonoPipeline::Source {
+                batches: Vec::new(),
+                pos: 0,
+            }),
             LogicalPlan::Filter(f) => {
                 let child = Self::build(&f.input)?;
                 let push = PushFilter::new(f.predicate.clone(), schema_of(&f.input));
@@ -42,11 +49,8 @@ impl MonoPipeline {
             LogicalPlan::Aggregate(a) => {
                 let child = Self::build(&a.input)?;
                 let input_schema = schema_of(&a.input);
-                let push = PushHashAggregate::new(
-                    a.group_by.clone(),
-                    a.aggregates.clone(),
-                    input_schema,
-                );
+                let push =
+                    PushHashAggregate::new(a.group_by.clone(), a.aggregates.clone(), input_schema);
                 Ok(MonoPipeline::Chain {
                     head: Box::new(child),
                     tail: Box::new(MonoPipeline::Aggregate(push)),
@@ -60,7 +64,10 @@ impl MonoPipeline {
                     tail: Box::new(MonoPipeline::Limit(push)),
                 })
             }
-            _ => Ok(MonoPipeline::Source { batches: Vec::new(), pos: 0 }),
+            _ => Ok(MonoPipeline::Source {
+                batches: Vec::new(),
+                pos: 0,
+            }),
         }
     }
 
@@ -90,10 +97,13 @@ impl MonoPipeline {
                 Ok(Some(RecordBatch::try_new(schema, columns).unwrap()))
             }
             MonoPipeline::Filter(push) => {
-                let mut push_op = std::mem::replace(push, PushFilter::new(
-                    LogicalExpr::Literal(crate::types::scalar::ScalarValue::Bool(Some(true))),
-                    crate::types::batch::Schema::empty(),
-                ));
+                let mut push_op = std::mem::replace(
+                    push,
+                    PushFilter::new(
+                        LogicalExpr::Literal(crate::types::scalar::ScalarValue::Bool(Some(true))),
+                        crate::types::batch::Schema::empty(),
+                    ),
+                );
                 for batch in source_batches {
                     push_op.push(batch)?;
                 }
@@ -111,9 +121,8 @@ impl MonoPipeline {
                     push.push(batch)?;
                 }
                 let schema = crate::types::batch::Schema::empty();
-                let taken = std::mem::replace(push, PushHashAggregate::new(
-                    Vec::new(), Vec::new(), schema,
-                ));
+                let taken =
+                    std::mem::replace(push, PushHashAggregate::new(Vec::new(), Vec::new(), schema));
                 Box::new(taken).finalize()
             }
             MonoPipeline::Limit(push) => {
@@ -160,7 +169,10 @@ fn schema_of(plan: &LogicalPlan) -> crate::types::batch::Schema {
             }
             for agg in &a.aggregates {
                 let name = format!("{:?}", agg.func);
-                cols.push(crate::types::batch::ColumnDef::new(&name, crate::protocol::types::DataType::Float64));
+                cols.push(crate::types::batch::ColumnDef::new(
+                    &name,
+                    crate::protocol::types::DataType::Float64,
+                ));
             }
             crate::types::batch::Schema::new(cols)
         }

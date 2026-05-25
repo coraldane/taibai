@@ -10,7 +10,12 @@ use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 
-pub fn exec_explain(engine: &Engine, db: &str, inner: &Statement, analyze: bool) -> Result<ExecResult> {
+pub fn exec_explain(
+    engine: &Engine,
+    db: &str,
+    inner: &Statement,
+    analyze: bool,
+) -> Result<ExecResult> {
     let select_from = match inner {
         Statement::Select { .. } => inner,
         other => {
@@ -46,7 +51,9 @@ pub fn exec_explain(engine: &Engine, db: &str, inner: &Statement, analyze: bool)
         let result = super::query::exec_select_with_stats(engine, db, select_from, &mut stats)?;
         let elapsed = start.elapsed();
         let rows_returned = match &result {
-            ExecResult::Query { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            ExecResult::Query { batches, .. } => {
+                batches.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
             _ => 0,
         };
         out.push_str("\n=== ANALYZE ===\n");
@@ -58,7 +65,9 @@ pub fn exec_explain(engine: &Engine, db: &str, inner: &Statement, analyze: bool)
             out.push_str(&format!("  segments      : {}\n", s.segments_opened));
             let pruned_pct = if s.row_groups_total > 0 {
                 (s.row_groups_pruned as f64 / s.row_groups_total as f64) * 100.0
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             out.push_str(&format!(
                 "  row_groups    : {} total, {} read, {} pruned ({:.1}%)\n",
                 s.row_groups_total, s.row_groups_read, s.row_groups_pruned, pruned_pct
@@ -67,10 +76,16 @@ pub fn exec_explain(engine: &Engine, db: &str, inner: &Statement, analyze: bool)
                 "  rows          : {} scanned, {} filtered by delete bitmap\n",
                 s.rows_scanned, s.rows_filtered_by_delete_bitmap
             ));
-            out.push_str(&format!("  bytes_read    : {}\n", format_bytes(s.bytes_read_compressed)));
+            out.push_str(&format!(
+                "  bytes_read    : {}\n",
+                format_bytes(s.bytes_read_compressed)
+            ));
         }
         out.push_str(&format!("rows_returned    : {}\n", rows_returned));
-        out.push_str(&format!("execution_time   : {:.3} ms\n", elapsed.as_secs_f64() * 1000.0));
+        out.push_str(&format!(
+            "execution_time   : {:.3} ms\n",
+            elapsed.as_secs_f64() * 1000.0
+        ));
     }
 
     let schema = Schema::new(vec![ColumnDef::new("plan", DataType::VarChar)]);
@@ -82,7 +97,10 @@ pub fn exec_explain(engine: &Engine, db: &str, inner: &Statement, analyze: bool)
             .push(&ScalarValue::VarChar(Some(line.to_string())))?;
     }
 
-    Ok(ExecResult::Query { schema, batches: vec![batch] })
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
 }
 
 fn format_bytes(b: u64) -> String {
@@ -90,10 +108,15 @@ fn format_bytes(b: u64) -> String {
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
     let bf = b as f64;
-    if bf >= GB { format!("{:.2} GB", bf / GB) }
-    else if bf >= MB { format!("{:.2} MB", bf / MB) }
-    else if bf >= KB { format!("{:.2} KB", bf / KB) }
-    else { format!("{} B", b) }
+    if bf >= GB {
+        format!("{:.2} GB", bf / GB)
+    } else if bf >= MB {
+        format!("{:.2} MB", bf / MB)
+    } else if bf >= KB {
+        format!("{:.2} KB", bf / KB)
+    } else {
+        format!("{} B", b)
+    }
 }
 
 fn collect_tables_from_stmt<F: FnMut(&str)>(stmt: &Statement, mut f: F) {
@@ -127,7 +150,11 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String) {
             }
             out.push('\n');
             if let Some(f) = &scan.pushed_filter {
-                out.push_str(&format!("{}  pushed_filter: {}\n", pad, render_expr(f, &scan.schema)));
+                out.push_str(&format!(
+                    "{}  pushed_filter: {}\n",
+                    pad,
+                    render_expr(f, &scan.schema)
+                ));
             }
             if !scan.zone_map_filters.is_empty() {
                 out.push_str(&format!("{}  zone_map_filters:\n", pad));
@@ -139,14 +166,24 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String) {
                 }
             }
             if !scan.index_columns.is_empty() {
-                out.push_str(&format!("{}  index_columns: {:?}\n", pad, scan.index_columns));
+                out.push_str(&format!(
+                    "{}  index_columns: {:?}\n",
+                    pad, scan.index_columns
+                ));
             }
             if !scan.bloom_filter_columns.is_empty() {
-                out.push_str(&format!("{}  bloom_filter_columns: {:?}\n", pad, scan.bloom_filter_columns));
+                out.push_str(&format!(
+                    "{}  bloom_filter_columns: {:?}\n",
+                    pad, scan.bloom_filter_columns
+                ));
             }
         }
         LogicalPlan::Filter(f) => {
-            out.push_str(&format!("{}Filter: {}\n", pad, render_expr(&f.predicate, &get_input_schema(&f.input))));
+            out.push_str(&format!(
+                "{}Filter: {}\n",
+                pad,
+                render_expr(&f.predicate, &get_input_schema(&f.input))
+            ));
             render_plan(&f.input, depth + 1, out);
         }
         LogicalPlan::Project(p) => {
@@ -175,7 +212,13 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String) {
             render_plan(&l.input, depth + 1, out);
         }
         LogicalPlan::TopN(t) => {
-            out.push_str(&format!("{}TopN: limit={}, offset={}, sort_keys={}\n", pad, t.limit, t.offset, t.sort_keys.len()));
+            out.push_str(&format!(
+                "{}TopN: limit={}, offset={}, sort_keys={}\n",
+                pad,
+                t.limit,
+                t.offset,
+                t.sort_keys.len()
+            ));
             render_plan(&t.input, depth + 1, out);
         }
         LogicalPlan::Distinct(d) => {
@@ -183,7 +226,13 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String) {
             render_plan(&d.input, depth + 1, out);
         }
         LogicalPlan::Window(w) => {
-            out.push_str(&format!("{}Window: funcs={}, partition_by={}, order_by={}\n", pad, w.window_funcs.len(), w.partition_by.len(), w.order_by.len()));
+            out.push_str(&format!(
+                "{}Window: funcs={}, partition_by={}, order_by={}\n",
+                pad,
+                w.window_funcs.len(),
+                w.partition_by.len(),
+                w.order_by.len()
+            ));
             render_plan(&w.input, depth + 1, out);
         }
         LogicalPlan::Join(j) => {
@@ -262,20 +311,33 @@ fn render_expr(expr: &LogicalExpr, schema: &Schema) -> String {
         LogicalExpr::Not(e) => format!("NOT ({})", render_expr(e, schema)),
         LogicalExpr::IsNull(e) => format!("{} IS NULL", render_expr(e, schema)),
         LogicalExpr::IsNotNull(e) => format!("{} IS NOT NULL", render_expr(e, schema)),
-        LogicalExpr::In { expr, values, negated } => format!(
+        LogicalExpr::In {
+            expr,
+            values,
+            negated,
+        } => format!(
             "{} {}IN ({} values)",
             render_expr(expr, schema),
             if *negated { "NOT " } else { "" },
             values.len()
         ),
-        LogicalExpr::Between { expr, low, high, negated } => format!(
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
             "{} {}BETWEEN {} AND {}",
             render_expr(expr, schema),
             if *negated { "NOT " } else { "" },
             render_expr(low, schema),
             render_expr(high, schema)
         ),
-        LogicalExpr::Like { expr, pattern, negated } => format!(
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => format!(
             "{} {}LIKE {:?}",
             render_expr(expr, schema),
             if *negated { "NOT " } else { "" },

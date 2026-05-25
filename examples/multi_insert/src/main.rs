@@ -4,8 +4,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
-use monax::net::client::{Client, BulkImportConfig};
-use tick::{parse_tick_csv_line, build_multi_insert_sql, TICK_CREATE_TABLE_SQL};
+use monax::net::client::{BulkImportConfig, Client};
+use tick::{build_multi_insert_sql, parse_tick_csv_line, TICK_CREATE_TABLE_SQL};
 
 const TICK_TABLE: &str = "stock_tick_multi";
 const DEFAULT_BATCH_SIZE: usize = 5000;
@@ -23,23 +23,33 @@ macro_rules! log_msg {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  multi_insert <host> <csv_path> [--batch-size=<n>] [--no-header] [--database=<db>]");
+    eprintln!(
+        "  multi_insert <host> <csv_path> [--batch-size=<n>] [--no-header] [--database=<db>]"
+    );
     eprintln!();
     eprintln!("Arguments:");
     eprintln!("  host              Server address (e.g. 127.0.0.1:5151)");
     eprintln!("  csv_path          Path to CSV file with stock tick data");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --batch-size=<n>  Number of rows per INSERT batch (default: {})", DEFAULT_BATCH_SIZE);
+    eprintln!(
+        "  --batch-size=<n>  Number of rows per INSERT batch (default: {})",
+        DEFAULT_BATCH_SIZE
+    );
     eprintln!("  --no-header       Skip first line as header");
     eprintln!("  --database=<db>   Database name (default: main)");
     eprintln!("  --drop            Drop table before import (default: true)");
     eprintln!("  --no-drop         Do not drop table before import");
     eprintln!("  --max=<n>         Max rows to import (default: 0 = unlimited)");
-    eprintln!("  --pipeline=<n>    Pipeline depth (default: {})", PIPELINE_DEPTH);
+    eprintln!(
+        "  --pipeline=<n>    Pipeline depth (default: {})",
+        PIPELINE_DEPTH
+    );
     eprintln!("  --bulk            Use START/STOP BULK IMPORT mode");
     eprintln!();
-    eprintln!("This tool tests regular SQL INSERT performance (INSERT ... VALUES (...), (...), ...).");
+    eprintln!(
+        "This tool tests regular SQL INSERT performance (INSERT ... VALUES (...), (...), ...)."
+    );
     eprintln!("Use --bulk to enable bulk import mode for better performance.");
     eprintln!("For bulk binary import, use batch_import instead.");
 }
@@ -56,7 +66,8 @@ async fn main() {
     let host = &args[1];
     let csv_path = &args[2];
 
-    let batch_size = args.iter()
+    let batch_size = args
+        .iter()
         .find(|a| a.starts_with("--batch-size="))
         .and_then(|a| a.split('=').nth(1))
         .and_then(|s| s.parse::<usize>().ok())
@@ -64,20 +75,23 @@ async fn main() {
 
     let skip_header = args.iter().any(|a| a == "--no-header");
 
-    let database = args.iter()
+    let database = args
+        .iter()
         .find(|a| a.starts_with("--database="))
         .and_then(|a| a.split('=').nth(1))
         .map(|s| s.to_string())
         .unwrap_or_else(|| "main".to_string());
 
     let no_drop = args.iter().any(|a| a == "--no-drop");
-    let max_rows = args.iter()
+    let max_rows = args
+        .iter()
         .find(|a| a.starts_with("--max="))
         .and_then(|a| a.split('=').nth(1))
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let pipeline_depth = args.iter()
+    let pipeline_depth = args
+        .iter()
         .find(|a| a.starts_with("--pipeline="))
         .and_then(|a| a.split('=').nth(1))
         .and_then(|s| s.parse::<usize>().ok())
@@ -88,7 +102,10 @@ async fn main() {
     log_msg!("Connecting to {} ...", host);
     let mut client = Client::connect(host).await.expect("connect failed");
 
-    client.login("root", "pass", &database).await.expect("login failed");
+    client
+        .login("root", "pass", &database)
+        .await
+        .expect("login failed");
     log_msg!("Logged in to database '{}'.", database);
 
     if !no_drop {
@@ -100,27 +117,50 @@ async fn main() {
     }
 
     let create_sql = TICK_CREATE_TABLE_SQL.replace("{table}", TICK_TABLE);
-    client.execute(&create_sql).await.expect("create table failed");
+    client
+        .execute(&create_sql)
+        .await
+        .expect("create table failed");
     log_msg!("Created table {}.", TICK_TABLE);
 
     if use_bulk {
         log_msg!("Starting bulk import mode (WAL deferred sync, delayed catalog save)...");
-        client.start_bulk_import(&BulkImportConfig { disable_wal: false }).await.expect("start bulk import failed");
+        client
+            .start_bulk_import(&BulkImportConfig { disable_wal: false })
+            .await
+            .expect("start bulk import failed");
     }
 
     log_msg!("Starting pipelined multi-value INSERT mode...");
-    log_msg!("Importing from '{}' (batch_size={}, pipeline_depth={})", csv_path, batch_size, pipeline_depth);
+    log_msg!(
+        "Importing from '{}' (batch_size={}, pipeline_depth={})",
+        csv_path,
+        batch_size,
+        pipeline_depth
+    );
 
     let start_time = Instant::now();
 
-    let result = import_ticks_pipelined(csv_path, batch_size, skip_header, max_rows, pipeline_depth, &mut client).await;
+    let result = import_ticks_pipelined(
+        csv_path,
+        batch_size,
+        skip_header,
+        max_rows,
+        pipeline_depth,
+        &mut client,
+    )
+    .await;
 
     let elapsed = start_time.elapsed();
 
     match result {
         Ok(total_rows) => {
-            log_msg!("Import completed: {} rows in {:.2}s ({:.0} rows/sec)",
-                total_rows, elapsed.as_secs_f64(), total_rows as f64 / elapsed.as_secs_f64());
+            log_msg!(
+                "Import completed: {} rows in {:.2}s ({:.0} rows/sec)",
+                total_rows,
+                elapsed.as_secs_f64(),
+                total_rows as f64 / elapsed.as_secs_f64()
+            );
         }
         Err(e) => {
             eprintln!("Import failed: {}", e);
@@ -209,8 +249,13 @@ async fn import_ticks_pipelined(
             let now = Instant::now();
             if now.duration_since(last_progress_time) >= Duration::from_secs(5) {
                 let elapsed = start_time.elapsed().as_secs_f64();
-                log_msg!("Progress: read={} parsed={} sent={} ({:.0} rows/sec)",
-                    read_count, parsed_count, sent_count, sent_count as f64 / elapsed);
+                log_msg!(
+                    "Progress: read={} parsed={} sent={} ({:.0} rows/sec)",
+                    read_count,
+                    parsed_count,
+                    sent_count,
+                    sent_count as f64 / elapsed
+                );
                 last_progress_time = now;
             }
         }

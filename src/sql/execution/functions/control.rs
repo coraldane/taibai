@@ -35,7 +35,9 @@ pub fn ifnull(args: &[ScalarValue]) -> Result<ScalarValue> {
 
 pub fn isnull_func(args: &[ScalarValue]) -> Result<ScalarValue> {
     if args.len() < 2 {
-        return Ok(ScalarValue::Bool(Some(args.first().map(|v| v.is_null()).unwrap_or(true))));
+        return Ok(ScalarValue::Bool(Some(
+            args.first().map(|v| v.is_null()).unwrap_or(true),
+        )));
     }
     // ISNULL(a, b) = IFNULL(a, b)
     if args[0].is_null() {

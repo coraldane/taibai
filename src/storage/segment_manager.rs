@@ -10,9 +10,7 @@ use crate::storage::bulk_payload::parse_direct_bulk_payload;
 use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_bulk_payload;
-use crate::storage::partition::pruning::{
-    compute_segment_zone_maps_from_row_groups, ZoneMap,
-};
+use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::{
     encode_segment_footer, encode_segment_header, RowGroupMeta, SegmentReader, SegmentWriter,
     SEGMENT_HEADER_SIZE,
@@ -611,9 +609,11 @@ impl SegmentManager {
             let col_defs: Vec<crate::types::batch::ColumnDef> = req
                 .columns
                 .iter()
-                .map(|c| crate::types::batch::ColumnDef::new(c.name, c.data_type)
-                    .with_scale(c.scale)
-                    .with_precision(c.precision))
+                .map(|c| {
+                    crate::types::batch::ColumnDef::new(c.name, c.data_type)
+                        .with_scale(c.scale)
+                        .with_precision(c.precision)
+                })
                 .collect();
             Schema::new(col_defs)
         };
@@ -987,7 +987,10 @@ impl SegmentManager {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let segment_zone_maps = compute_segment_zone_maps_from_row_groups(&segment.row_groups, segment.schema.num_columns());
+        let segment_zone_maps = compute_segment_zone_maps_from_row_groups(
+            &segment.row_groups,
+            segment.schema.num_columns(),
+        );
         Ok(encode_segment_footer(
             &segment.schema,
             segment.total_rows,

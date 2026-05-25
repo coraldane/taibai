@@ -5,7 +5,7 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{eval_where_clause, eval_expr_to_scalar, build_row_group_predicate};
+use super::helpers::{build_row_group_predicate, eval_expr_to_scalar, eval_where_clause};
 use crate::sql::parser::ast::{Assignment, Expr};
 
 pub fn exec_update(
@@ -17,9 +17,11 @@ pub fn exec_update(
 ) -> Result<ExecResult> {
     let (table_schema, _table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
-        let catalog = catalogs.get(db)
+        let catalog = catalogs
+            .get(db)
             .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
-        let meta = catalog.get_table(table)
+        let meta = catalog
+            .get_table(table)
             .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?
             .clone();
         (Schema::new(meta.columns.clone()), meta)
@@ -59,18 +61,27 @@ pub fn exec_update(
                     let is_assigned = assignments.iter().any(|a| &a.column == col_name);
                     let val = if is_assigned {
                         let assign = assignments.iter().find(|a| &a.column == col_name).unwrap();
-                        eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type)?
+                        eval_expr_to_scalar(
+                            &assign.value,
+                            &table_schema.columns[col_idx].data_type,
+                        )?
                     } else {
-                        batch.scalar(row_idx, col_idx)
-                            .unwrap_or(ScalarValue::null_for_type(table_schema.columns[col_idx].data_type))
+                        batch
+                            .scalar(row_idx, col_idx)
+                            .unwrap_or(ScalarValue::null_for_type(
+                                table_schema.columns[col_idx].data_type,
+                            ))
                     };
                     new_batch.column_mut(col_idx).unwrap().push(&val)?;
                 }
                 updated_count += 1;
             } else {
                 for col_idx in 0..batch.num_columns() {
-                    let val = batch.scalar(row_idx, col_idx)
-                        .unwrap_or(ScalarValue::null_for_type(table_schema.columns[col_idx].data_type));
+                    let val = batch
+                        .scalar(row_idx, col_idx)
+                        .unwrap_or(ScalarValue::null_for_type(
+                            table_schema.columns[col_idx].data_type,
+                        ));
                     new_batch.column_mut(col_idx).unwrap().push(&val)?;
                 }
             }
@@ -103,5 +114,7 @@ pub fn exec_update(
         }
     }
 
-    Ok(ExecResult::Ok { rows_affected: updated_count })
+    Ok(ExecResult::Ok {
+        rows_affected: updated_count,
+    })
 }

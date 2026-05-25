@@ -25,7 +25,9 @@ pub use reader::SegmentReader;
 pub use writer::{encode_segment_footer, encode_segment_header, SegmentWriter};
 
 pub use crate::storage::codec::encoding::decode_scalar_with_tag;
-pub use crate::storage::partition::pruning::{RangeClause, RangeOp, RowGroupPredicate, ScanStats, ZoneMap};
+pub use crate::storage::partition::pruning::{
+    RangeClause, RangeOp, RowGroupPredicate, ScanStats, ZoneMap,
+};
 
 #[cfg(test)]
 mod tests {

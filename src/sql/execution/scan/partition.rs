@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
+use crate::storage::catalog::schema::TableMeta;
 use crate::storage::partition::{
     is_partition_segment, parse_partition_key, PartitionPruner, PartitionStrategy,
 };
-use crate::storage::catalog::schema::TableMeta;
 use crate::types::scalar::ScalarValue;
 
 use super::spec::{PartitionScanInfo, ScanSpec};

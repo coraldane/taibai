@@ -4,7 +4,7 @@ use std::io::{BufReader, Read};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use monax::net::client::{Client, BulkImportConfig};
+use monax::net::client::{BulkImportConfig, Client};
 use tokio::sync::mpsc;
 
 #[allow(dead_code)]
@@ -29,19 +29,27 @@ macro_rules! log_msg {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  stock_import <host> <csv_path> [--batch-size=<n>] [--no-header] [--database=<db>]");
+    eprintln!(
+        "  stock_import <host> <csv_path> [--batch-size=<n>] [--no-header] [--database=<db>]"
+    );
     eprintln!();
     eprintln!("Arguments:");
     eprintln!("  host          Server address (e.g. 127.0.0.1:5151)");
     eprintln!("  csv_path      Path to CSV file with stock tick data");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --batch-size=<n>  Number of rows per batch (default: {})", DEFAULT_BATCH_SIZE);
+    eprintln!(
+        "  --batch-size=<n>  Number of rows per batch (default: {})",
+        DEFAULT_BATCH_SIZE
+    );
     eprintln!("  --no-header       Skip first line as header");
     eprintln!("  --database=<db>   Database name (default: main)");
     eprintln!();
     eprintln!("Optimizations:");
-    eprintln!("  - Pipeline mode: {} concurrent in-flight batches", PIPELINE_DEPTH);
+    eprintln!(
+        "  - Pipeline mode: {} concurrent in-flight batches",
+        PIPELINE_DEPTH
+    );
     eprintln!("  - Producer-Consumer dual-task architecture");
     eprintln!("  - String-interned security_id (zero per-row heap allocation)");
     eprintln!("  - Block-level file I/O with manual line splitting");
@@ -61,7 +69,8 @@ async fn main() {
     let host = &args[1];
     let csv_path = &args[2];
 
-    let batch_size = args.iter()
+    let batch_size = args
+        .iter()
         .find(|a| a.starts_with("--batch-size="))
         .and_then(|a| a.split('=').nth(1))
         .and_then(|s| s.parse::<usize>().ok())
@@ -69,7 +78,8 @@ async fn main() {
 
     let skip_header = args.iter().any(|a| a == "--no-header");
 
-    let database = args.iter()
+    let database = args
+        .iter()
         .find(|a| a.starts_with("--database="))
         .and_then(|a| a.split('=').nth(1))
         .map(|s| s.to_string())
@@ -78,18 +88,32 @@ async fn main() {
     log_msg!("Connecting to {} ...", host);
     let mut client = Client::connect(host).await.expect("connect failed");
 
-    client.login("root", "pass", &database).await.expect("login failed");
+    client
+        .login("root", "pass", &database)
+        .await
+        .expect("login failed");
     log_msg!("Logged in to database '{}'.", database);
 
     ensure_tick_table(&mut client).await;
 
     log_msg!("Starting bulk import mode...");
-    client.start_bulk_import(&BulkImportConfig { disable_wal: true }).await.expect("start bulk import failed");
+    client
+        .start_bulk_import(&BulkImportConfig { disable_wal: true })
+        .await
+        .expect("start bulk import failed");
 
     log_msg!("Starting pipeline with depth={}...", PIPELINE_DEPTH);
-    client.start_pipeline(PIPELINE_DEPTH).await.expect("start pipeline failed");
+    client
+        .start_pipeline(PIPELINE_DEPTH)
+        .await
+        .expect("start pipeline failed");
 
-    log_msg!("Importing from '{}' (batch_size={}, pipeline_depth={})", csv_path, batch_size, PIPELINE_DEPTH);
+    log_msg!(
+        "Importing from '{}' (batch_size={}, pipeline_depth={})",
+        csv_path,
+        batch_size,
+        PIPELINE_DEPTH
+    );
     log_msg!("Progress will be displayed every 5 seconds...");
 
     let start_time = Instant::now();
@@ -99,8 +123,12 @@ async fn main() {
 
     match result {
         Ok(total_rows) => {
-            log_msg!("Import completed: {} rows in {:.2}s ({:.0} rows/sec)",
-                total_rows, elapsed.as_secs_f64(), total_rows as f64 / elapsed.as_secs_f64());
+            log_msg!(
+                "Import completed: {} rows in {:.2}s ({:.0} rows/sec)",
+                total_rows,
+                elapsed.as_secs_f64(),
+                total_rows as f64 / elapsed.as_secs_f64()
+            );
         }
         Err(e) => {
             eprintln!("Import failed: {}", e);
@@ -211,15 +239,20 @@ async fn import_tick_pipeline(
         while client.pipeline_in_flight() >= PIPELINE_DEPTH as i64 {
             client.drain_one_pipeline_response().await?;
         }
-        client.pipeline_bulk_insert_columnar(Bytes::from(batch.payload)).await?;
+        client
+            .pipeline_bulk_insert_columnar(Bytes::from(batch.payload))
+            .await?;
 
         total += batch.row_count;
 
         let now = Instant::now();
         if now.duration_since(last_progress_time) >= Duration::from_secs(5) {
             let elapsed = start_time.elapsed().as_secs_f64();
-            log_msg!("Progress: {} rows sent ({:.0} rows/sec)",
-                total, total as f64 / elapsed);
+            log_msg!(
+                "Progress: {} rows sent ({:.0} rows/sec)",
+                total,
+                total as f64 / elapsed
+            );
             last_progress_time = now;
         }
     }
@@ -282,10 +315,19 @@ async fn produce_batches(
                     if skip_header && line_num == 1 {
                         // skip
                     } else {
-                        if parse_tick_csv_line_interned(trimmed, &mut current_batch, &mut string_pool, &mut pool_strings) {
+                        if parse_tick_csv_line_interned(
+                            trimmed,
+                            &mut current_batch,
+                            &mut string_pool,
+                            &mut pool_strings,
+                        ) {
                             if current_batch.len() >= batch_size {
                                 let row_count = current_batch.len();
-                                let payload = encode_columnar_tick_batch_precise(TICK_TABLE, &current_batch, &pool_strings);
+                                let payload = encode_columnar_tick_batch_precise(
+                                    TICK_TABLE,
+                                    &current_batch,
+                                    &pool_strings,
+                                );
 
                                 if tx.send(ParsedBatch { payload, row_count }).await.is_err() {
                                     return Ok(());
@@ -311,8 +353,12 @@ async fn produce_batches(
         if !trimmed.is_empty() {
             line_num += 1;
             if !(skip_header && line_num == 1) {
-                if parse_tick_csv_line_interned(trimmed, &mut current_batch, &mut string_pool, &mut pool_strings) {
-                }
+                if parse_tick_csv_line_interned(
+                    trimmed,
+                    &mut current_batch,
+                    &mut string_pool,
+                    &mut pool_strings,
+                ) {}
             }
         }
     }
@@ -371,48 +417,110 @@ fn parse_tick_csv_line_interned(
     batch.security_id_indices.push(pool_idx);
 
     batch.deal_dates.push(deal_date);
-    batch.deal_times.push(csv_parser::parse_int32_bytes(fields[2]));
+    batch
+        .deal_times
+        .push(csv_parser::parse_int32_bytes(fields[2]));
 
-    batch.pre_closes.push(csv_parser::parse_decimal_bytes(fields[3], 2));
-    batch.open_pxs.push(csv_parser::parse_decimal_bytes(fields[4], 2));
-    batch.high_pxs.push(csv_parser::parse_decimal_bytes(fields[5], 2));
-    batch.low_pxs.push(csv_parser::parse_decimal_bytes(fields[6], 2));
-    batch.close_pxs.push(csv_parser::parse_decimal_bytes(fields[7], 2));
-    batch.high_limits.push(csv_parser::parse_decimal_bytes(fields[8], 2));
-    batch.low_limits.push(csv_parser::parse_decimal_bytes(fields[9], 2));
+    batch
+        .pre_closes
+        .push(csv_parser::parse_decimal_bytes(fields[3], 2));
+    batch
+        .open_pxs
+        .push(csv_parser::parse_decimal_bytes(fields[4], 2));
+    batch
+        .high_pxs
+        .push(csv_parser::parse_decimal_bytes(fields[5], 2));
+    batch
+        .low_pxs
+        .push(csv_parser::parse_decimal_bytes(fields[6], 2));
+    batch
+        .close_pxs
+        .push(csv_parser::parse_decimal_bytes(fields[7], 2));
+    batch
+        .high_limits
+        .push(csv_parser::parse_decimal_bytes(fields[8], 2));
+    batch
+        .low_limits
+        .push(csv_parser::parse_decimal_bytes(fields[9], 2));
 
-    batch.total_num_trades.push(csv_parser::parse_int32_bytes(fields[10]));
-    batch.trans_volumes.push(csv_parser::parse_int64_bytes(fields[11]));
-    batch.trans_values.push(csv_parser::parse_decimal_bytes(fields[12], 2));
+    batch
+        .total_num_trades
+        .push(csv_parser::parse_int32_bytes(fields[10]));
+    batch
+        .trans_volumes
+        .push(csv_parser::parse_int64_bytes(fields[11]));
+    batch
+        .trans_values
+        .push(csv_parser::parse_decimal_bytes(fields[12], 2));
 
     if field_count <= 13 {
         fill_zeros_fast(batch);
         return true;
     }
 
-    batch.ask_px1s.push(csv_parser::parse_decimal_bytes(fields[13], 2));
-    batch.ask_px2s.push(csv_parser::parse_decimal_bytes(fields[14], 2));
-    batch.ask_px3s.push(csv_parser::parse_decimal_bytes(fields[15], 2));
-    batch.ask_px4s.push(csv_parser::parse_decimal_bytes(fields[16], 2));
-    batch.ask_px5s.push(csv_parser::parse_decimal_bytes(fields[17], 2));
+    batch
+        .ask_px1s
+        .push(csv_parser::parse_decimal_bytes(fields[13], 2));
+    batch
+        .ask_px2s
+        .push(csv_parser::parse_decimal_bytes(fields[14], 2));
+    batch
+        .ask_px3s
+        .push(csv_parser::parse_decimal_bytes(fields[15], 2));
+    batch
+        .ask_px4s
+        .push(csv_parser::parse_decimal_bytes(fields[16], 2));
+    batch
+        .ask_px5s
+        .push(csv_parser::parse_decimal_bytes(fields[17], 2));
 
-    batch.ask_vol1s.push(csv_parser::parse_int32_bytes(fields[18]));
-    batch.ask_vol2s.push(csv_parser::parse_int32_bytes(fields[19]));
-    batch.ask_vol3s.push(csv_parser::parse_int32_bytes(fields[20]));
-    batch.ask_vol4s.push(csv_parser::parse_int32_bytes(fields[21]));
-    batch.ask_vol5s.push(csv_parser::parse_int32_bytes(fields[22]));
+    batch
+        .ask_vol1s
+        .push(csv_parser::parse_int32_bytes(fields[18]));
+    batch
+        .ask_vol2s
+        .push(csv_parser::parse_int32_bytes(fields[19]));
+    batch
+        .ask_vol3s
+        .push(csv_parser::parse_int32_bytes(fields[20]));
+    batch
+        .ask_vol4s
+        .push(csv_parser::parse_int32_bytes(fields[21]));
+    batch
+        .ask_vol5s
+        .push(csv_parser::parse_int32_bytes(fields[22]));
 
-    batch.bid_px1s.push(csv_parser::parse_decimal_bytes(fields[23], 2));
-    batch.bid_px2s.push(csv_parser::parse_decimal_bytes(fields[24], 2));
-    batch.bid_px3s.push(csv_parser::parse_decimal_bytes(fields[25], 2));
-    batch.bid_px4s.push(csv_parser::parse_decimal_bytes(fields[26], 2));
-    batch.bid_px5s.push(csv_parser::parse_decimal_bytes(fields[27], 2));
+    batch
+        .bid_px1s
+        .push(csv_parser::parse_decimal_bytes(fields[23], 2));
+    batch
+        .bid_px2s
+        .push(csv_parser::parse_decimal_bytes(fields[24], 2));
+    batch
+        .bid_px3s
+        .push(csv_parser::parse_decimal_bytes(fields[25], 2));
+    batch
+        .bid_px4s
+        .push(csv_parser::parse_decimal_bytes(fields[26], 2));
+    batch
+        .bid_px5s
+        .push(csv_parser::parse_decimal_bytes(fields[27], 2));
 
-    batch.bid_vol1s.push(csv_parser::parse_int32_bytes(fields[28]));
-    batch.bid_vol2s.push(csv_parser::parse_int32_bytes(fields[29]));
-    batch.bid_vol3s.push(csv_parser::parse_int32_bytes(fields[30]));
-    batch.bid_vol4s.push(csv_parser::parse_int32_bytes(fields[31]));
-    batch.bid_vol5s.push(csv_parser::parse_int32_bytes(fields[32]));
+    batch
+        .bid_vol1s
+        .push(csv_parser::parse_int32_bytes(fields[28]));
+    batch
+        .bid_vol2s
+        .push(csv_parser::parse_int32_bytes(fields[29]));
+    batch
+        .bid_vol3s
+        .push(csv_parser::parse_int32_bytes(fields[30]));
+    batch
+        .bid_vol4s
+        .push(csv_parser::parse_int32_bytes(fields[31]));
+    batch
+        .bid_vol5s
+        .push(csv_parser::parse_int32_bytes(fields[32]));
 
     let local_time = if field_count > 33 && !fields[33].is_empty() {
         csv_parser::parse_timestamp_bytes(fields[33])
@@ -485,7 +593,8 @@ fn estimate_payload_size(n: usize, avg_sec_id_len: usize) -> usize {
 
     let timestamp_cols = 1usize;
     let timestamp_data = n * 8;
-    let timestamp_col = timestamp_cols * (2 + 11 + 1 + 4 + 4 + 4 + 4) + timestamp_cols * timestamp_data;
+    let timestamp_col =
+        timestamp_cols * (2 + 11 + 1 + 4 + 4 + 4 + 4) + timestamp_cols * timestamp_data;
 
     table_header + batch_header + varchar_col + int32_col + int64_col + decimal_col + timestamp_col
 }
@@ -500,7 +609,9 @@ fn encode_columnar_tick_batch_precise(
         return Vec::new();
     }
 
-    let avg_sec_id_len = if pool_strings.is_empty() { 10 } else {
+    let avg_sec_id_len = if pool_strings.is_empty() {
+        10
+    } else {
         let total: usize = pool_strings.iter().map(|s| s.len()).sum();
         (total / pool_strings.len()).max(4)
     };
@@ -512,7 +623,12 @@ fn encode_columnar_tick_batch_precise(
     buf.extend_from_slice(&(n as u32).to_le_bytes());
     buf.extend_from_slice(&(NUM_COLUMNS as u32).to_le_bytes());
 
-    encode_interned_varchar_column(&mut buf, "security_id", &batch.security_id_indices, pool_strings);
+    encode_interned_varchar_column(
+        &mut buf,
+        "security_id",
+        &batch.security_id_indices,
+        pool_strings,
+    );
     encode_int32_column_fast(&mut buf, "deal_date", &batch.deal_dates);
     encode_int32_column_fast(&mut buf, "deal_time", &batch.deal_times);
     encode_decimal_column_fast(&mut buf, "pre_close", &batch.pre_closes, 2, 9);
@@ -550,7 +666,14 @@ fn encode_columnar_tick_batch_precise(
     buf
 }
 
-fn write_column_header(buf: &mut Vec<u8>, name: &str, dtype: u8, scale: i32, precision: i32, data_len: u32) {
+fn write_column_header(
+    buf: &mut Vec<u8>,
+    name: &str,
+    dtype: u8,
+    scale: i32,
+    precision: i32,
+    data_len: u32,
+) {
     buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
     buf.extend_from_slice(name.as_bytes());
     buf.push(dtype);
@@ -561,7 +684,14 @@ fn write_column_header(buf: &mut Vec<u8>, name: &str, dtype: u8, scale: i32, pre
 }
 
 fn encode_interned_varchar_column(buf: &mut Vec<u8>, name: &str, indices: &[u32], pool: &[String]) {
-    write_column_header(buf, name, monax::protocol::types::DataType::VarChar as u8, 0, 0, indices.len() as u32);
+    write_column_header(
+        buf,
+        name,
+        monax::protocol::types::DataType::VarChar as u8,
+        0,
+        0,
+        indices.len() as u32,
+    );
     for &idx in indices {
         let s = &pool[idx as usize];
         let bytes = s.as_bytes();
@@ -571,25 +701,59 @@ fn encode_interned_varchar_column(buf: &mut Vec<u8>, name: &str, indices: &[u32]
 }
 
 fn encode_int32_column_fast(buf: &mut Vec<u8>, name: &str, data: &[i32]) {
-    write_column_header(buf, name, monax::protocol::types::DataType::Int32 as u8, 0, 0, data.len() as u32);
+    write_column_header(
+        buf,
+        name,
+        monax::protocol::types::DataType::Int32 as u8,
+        0,
+        0,
+        data.len() as u32,
+    );
     let slice = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     buf.extend_from_slice(slice);
 }
 
 fn encode_int64_column_fast(buf: &mut Vec<u8>, name: &str, data: &[i64]) {
-    write_column_header(buf, name, monax::protocol::types::DataType::Int64 as u8, 0, 0, data.len() as u32);
+    write_column_header(
+        buf,
+        name,
+        monax::protocol::types::DataType::Int64 as u8,
+        0,
+        0,
+        data.len() as u32,
+    );
     let slice = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     buf.extend_from_slice(slice);
 }
 
-fn encode_decimal_column_fast(buf: &mut Vec<u8>, name: &str, data: &[i64], scale: i32, precision: i32) {
-    write_column_header(buf, name, monax::protocol::types::DataType::Decimal as u8, scale, precision, data.len() as u32);
+fn encode_decimal_column_fast(
+    buf: &mut Vec<u8>,
+    name: &str,
+    data: &[i64],
+    scale: i32,
+    precision: i32,
+) {
+    write_column_header(
+        buf,
+        name,
+        monax::protocol::types::DataType::Decimal as u8,
+        scale,
+        precision,
+        data.len() as u32,
+    );
     let slice = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     buf.extend_from_slice(slice);
 }
 
 fn encode_timestamp_column_fast(buf: &mut Vec<u8>, name: &str, data: &[i64]) {
-    write_column_header(buf, name, monax::protocol::types::DataType::Timestamp as u8, 0, 0, data.len() as u32);
+    write_column_header(
+        buf,
+        name,
+        monax::protocol::types::DataType::Timestamp as u8,
+        0,
+        0,
+        data.len() as u32,
+    );
     let slice = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     buf.extend_from_slice(slice);
 }

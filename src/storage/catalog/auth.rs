@@ -83,16 +83,24 @@ impl UserInfo {
         self.password_hash == hash
     }
 
-    pub fn has_permission(&self, perm_type: PermissionType, object_type: PermissionObjectType, object_name: &str) -> bool {
-        if self.permissions.iter().any(|p| p.permission_type == PermissionType::All) {
+    pub fn has_permission(
+        &self,
+        perm_type: PermissionType,
+        object_type: PermissionObjectType,
+        object_name: &str,
+    ) -> bool {
+        if self
+            .permissions
+            .iter()
+            .any(|p| p.permission_type == PermissionType::All)
+        {
             return true;
         }
         self.permissions.iter().any(|p| {
-            p.permission_type == perm_type && 
-            (p.object_type == PermissionObjectType::Global || 
-             (p.object_type == object_type && p.object_name == object_name))
-        }) ||
-        self.roles.iter().any(|role_name| false)
+            p.permission_type == perm_type
+                && (p.object_type == PermissionObjectType::Global
+                    || (p.object_type == object_type && p.object_name == object_name))
+        }) || self.roles.iter().any(|role_name| false)
     }
 }
 
@@ -149,8 +157,9 @@ impl AuthStore {
         } else {
             let store = AuthStore::new();
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| MonaxError::Storage(format!("failed to create auth dir: {}", e)))?;
+                fs::create_dir_all(parent).map_err(|e| {
+                    MonaxError::Storage(format!("failed to create auth dir: {}", e))
+                })?;
             }
             store.save(path)?;
             Ok(store)
@@ -214,31 +223,42 @@ impl AuthStore {
                 role.permissions.push(perm);
             }
         } else {
-            return Err(MonaxError::Sql(format!("user or role '{}' does not exist", target)));
+            return Err(MonaxError::Sql(format!(
+                "user or role '{}' does not exist",
+                target
+            )));
         }
         Ok(())
     }
 
-    pub fn revoke_permission(&mut self, target: &str, permissions: &[PermissionType], object: Option<&str>) -> Result<()> {
+    pub fn revoke_permission(
+        &mut self,
+        target: &str,
+        permissions: &[PermissionType],
+        object: Option<&str>,
+    ) -> Result<()> {
         let is_user = self.users.contains_key(target);
         let is_role = self.roles.contains_key(target);
-        
+
         if !is_user && !is_role {
-            return Err(MonaxError::Sql(format!("user or role '{}' does not exist", target)));
+            return Err(MonaxError::Sql(format!(
+                "user or role '{}' does not exist",
+                target
+            )));
         }
 
         if is_user {
             let user = self.users.get_mut(target).unwrap();
             user.permissions.retain(|p| {
-                !permissions.contains(&p.permission_type) &&
-                object.map_or(true, |obj| p.object_name != obj)
+                !permissions.contains(&p.permission_type)
+                    && object.map_or(true, |obj| p.object_name != obj)
             });
         }
         if is_role {
             let role = self.roles.get_mut(target).unwrap();
             role.permissions.retain(|p| {
-                !permissions.contains(&p.permission_type) &&
-                object.map_or(true, |obj| p.object_name != obj)
+                !permissions.contains(&p.permission_type)
+                    && object.map_or(true, |obj| p.object_name != obj)
             });
         }
         Ok(())
@@ -289,12 +309,17 @@ impl AuthStore {
 
     pub fn show_grants(&self, name: &str) -> Vec<String> {
         if let Some(user) = self.users.get(name) {
-            user.permissions.iter().map(|p| {
-                format!("GRANT {} ON {} TO {}", 
-                    p.permission_type.as_str(),
-                    p.object_name,
-                    name)
-            }).collect()
+            user.permissions
+                .iter()
+                .map(|p| {
+                    format!(
+                        "GRANT {} ON {} TO {}",
+                        p.permission_type.as_str(),
+                        p.object_name,
+                        name
+                    )
+                })
+                .collect()
         } else {
             Vec::new()
         }
@@ -351,7 +376,12 @@ impl AuthManager {
         Ok(())
     }
 
-    pub fn revoke(&self, target: &str, permissions: &[PermissionType], object: Option<&str>) -> Result<()> {
+    pub fn revoke(
+        &self,
+        target: &str,
+        permissions: &[PermissionType],
+        object: Option<&str>,
+    ) -> Result<()> {
         let mut store = self.store.write().unwrap();
         store.revoke_permission(target, permissions, object)?;
         store.save(&self.path)?;
@@ -366,7 +396,13 @@ impl AuthManager {
         }
     }
 
-    pub fn check_permission(&self, username: &str, perm_type: PermissionType, object_type: PermissionObjectType, object_name: &str) -> bool {
+    pub fn check_permission(
+        &self,
+        username: &str,
+        perm_type: PermissionType,
+        object_type: PermissionObjectType,
+        object_name: &str,
+    ) -> bool {
         let store = self.store.read().unwrap();
         match store.get_user(username) {
             Some(user) => user.has_permission(perm_type, object_type, object_name),
@@ -412,6 +448,9 @@ impl AuthManager {
 
     pub fn is_locked(&self, name: &str) -> bool {
         let store = self.store.read().unwrap();
-        store.get_user(name).map(|u| u.account_locked).unwrap_or(false)
+        store
+            .get_user(name)
+            .map(|u| u.account_locked)
+            .unwrap_or(false)
     }
 }

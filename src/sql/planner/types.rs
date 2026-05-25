@@ -1,6 +1,5 @@
-
-use crate::sql::parser::ast::*;
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
+use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
@@ -234,6 +233,8 @@ pub fn eval_const_usize(expr: &Expr) -> crate::common::error::Result<usize> {
     match expr {
         Expr::Literal(ScalarValue::Int64(Some(v))) => Ok(*v as usize),
         Expr::Literal(ScalarValue::Int32(Some(v))) => Ok(*v as usize),
-        _ => Err(crate::common::error::MonaxError::Sql("expected integer literal for LIMIT/OFFSET".into())),
+        _ => Err(crate::common::error::MonaxError::Sql(
+            "expected integer literal for LIMIT/OFFSET".into(),
+        )),
     }
 }

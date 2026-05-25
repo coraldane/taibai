@@ -26,7 +26,8 @@ fn prune_columns(plan: LogicalPlan) -> (LogicalPlan, bool) {
             all_used.sort();
             all_used.dedup();
 
-            let (optimized_input, input_changed) = if let LogicalPlan::Scan(mut scan) = *proj.input {
+            let (optimized_input, input_changed) = if let LogicalPlan::Scan(mut scan) = *proj.input
+            {
                 if !all_used.is_empty() {
                     let changed = scan.projection.as_ref().map_or(true, |p| *p != all_used);
                     scan.projection = Some(all_used);
@@ -38,11 +39,14 @@ fn prune_columns(plan: LogicalPlan) -> (LogicalPlan, bool) {
                 prune_columns(*proj.input)
             };
 
-            (LogicalPlan::Project(ProjectPlan {
-                expressions: proj.expressions,
-                aliases: proj.aliases,
-                input: Box::new(optimized_input),
-            }), input_changed)
+            (
+                LogicalPlan::Project(ProjectPlan {
+                    expressions: proj.expressions,
+                    aliases: proj.aliases,
+                    input: Box::new(optimized_input),
+                }),
+                input_changed,
+            )
         }
         LogicalPlan::Filter(mut filter) => {
             let (input, changed) = prune_columns(*filter.input);

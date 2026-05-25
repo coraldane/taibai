@@ -22,7 +22,7 @@ impl IndexManager {
 
     pub fn get_or_create_index(&self, db: &str, table: &str) -> Arc<SparseIndexImpl> {
         let indexes = self.indexes.read().unwrap();
-        
+
         if let Some(db_indexes) = indexes.get(db) {
             if let Some(idx) = db_indexes.get(table) {
                 return idx.clone();
@@ -30,32 +30,37 @@ impl IndexManager {
         }
 
         drop(indexes);
-        
+
         let new_index = Arc::new(SparseIndexImpl::new());
         let mut indexes = self.indexes.write().unwrap();
-        
+
         indexes
             .entry(db.to_string())
             .or_insert_with(HashMap::new)
             .insert(table.to_string(), new_index.clone());
-        
+
         new_index
     }
 
-    pub fn rebuild_index_from_segments(&self, db: &str, table: &str, segments: &[String]) -> Result<()> {
+    pub fn rebuild_index_from_segments(
+        &self,
+        db: &str,
+        table: &str,
+        segments: &[String],
+    ) -> Result<()> {
         let index = self.get_or_create_index(db, table);
         index.clear();
 
         let mut current_row_id: i64 = 0;
         let mut block_data = Vec::new();
-        
+
         for (seg_idx, seg_path) in segments.iter().enumerate() {
             let reader = self.segment_mgr.open_reader(Path::new(seg_path))?;
-            
+
             let num_row_groups = reader.num_row_groups();
             for rg_idx in 0..num_row_groups {
                 let rg_row_count = reader.row_group_rows(rg_idx) as i64;
-                
+
                 if rg_row_count == 0 {
                     continue;
                 }
@@ -78,20 +83,22 @@ impl IndexManager {
 
     pub fn search(&self, db: &str, table: &str, value: &ScalarValue) -> Option<Vec<i64>> {
         let indexes = self.indexes.read().unwrap();
-        
-        let idx = indexes
-            .get(db)
-            .and_then(|db_idx| db_idx.get(table))?;
+
+        let idx = indexes.get(db).and_then(|db_idx| db_idx.get(table))?;
 
         Some(idx.search(value))
     }
 
-    pub fn range_search(&self, db: &str, table: &str, min: &ScalarValue, max: &ScalarValue) -> Option<Vec<i64>> {
+    pub fn range_search(
+        &self,
+        db: &str,
+        table: &str,
+        min: &ScalarValue,
+        max: &ScalarValue,
+    ) -> Option<Vec<i64>> {
         let indexes = self.indexes.read().unwrap();
-        
-        let idx = indexes
-            .get(db)
-            .and_then(|db_idx| db_idx.get(table))?;
+
+        let idx = indexes.get(db).and_then(|db_idx| db_idx.get(table))?;
 
         Some(idx.range_search(min, max))
     }

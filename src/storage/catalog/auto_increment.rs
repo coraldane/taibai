@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock,
+};
 
 use crate::common::error::{MonaxError, Result};
 
@@ -50,7 +53,13 @@ impl AutoIncrementManager {
         }
     }
 
-    pub fn register(&self, db: &str, table: &str, column: &str, start_value: u64) -> Result<Arc<AutoIncrementCounter>> {
+    pub fn register(
+        &self,
+        db: &str,
+        table: &str,
+        column: &str,
+        start_value: u64,
+    ) -> Result<Arc<AutoIncrementCounter>> {
         let key = format!("{}:{}", db, table);
         {
             let counters = self.counters.read().unwrap();
@@ -58,13 +67,14 @@ impl AutoIncrementManager {
                 if counter.column() != column {
                     return Err(MonaxError::Internal(format!(
                         "auto_increment column mismatch: expected {}, got {}",
-                        counter.column(), column
+                        counter.column(),
+                        column
                     )));
                 }
                 return Ok(Arc::clone(counter));
             }
         }
-        
+
         let counter = Arc::new(AutoIncrementCounter::new(table, column, start_value));
         {
             let mut counters = self.counters.write().unwrap();
@@ -80,10 +90,12 @@ impl AutoIncrementManager {
     }
 
     pub fn next_value(&self, db: &str, table: &str) -> Result<u64> {
-        let counter = self.get(db, table)
-            .ok_or_else(|| MonaxError::Internal(format!(
-                "no auto_increment counter for table {}.{}", db, table
-            )))?;
+        let counter = self.get(db, table).ok_or_else(|| {
+            MonaxError::Internal(format!(
+                "no auto_increment counter for table {}.{}",
+                db, table
+            ))
+        })?;
         Ok(counter.next_value())
     }
 
@@ -96,10 +108,12 @@ impl AutoIncrementManager {
     }
 
     pub fn reset(&self, db: &str, table: &str, value: u64) -> Result<()> {
-        let counter = self.get(db, table)
-            .ok_or_else(|| MonaxError::Internal(format!(
-                "no auto_increment counter for table {}.{}", db, table
-            )))?;
+        let counter = self.get(db, table).ok_or_else(|| {
+            MonaxError::Internal(format!(
+                "no auto_increment counter for table {}.{}",
+                db, table
+            ))
+        })?;
         counter.set_value(value);
         Ok(())
     }
@@ -133,18 +147,16 @@ mod tests {
         use std::thread;
         let counter = Arc::new(AutoIncrementCounter::new("t", "id", 1));
         let mut handles = vec![];
-        
+
         for _ in 0..10 {
             let c = Arc::clone(&counter);
-            handles.push(thread::spawn(move || {
-                c.next_value()
-            }));
+            handles.push(thread::spawn(move || c.next_value()));
         }
-        
+
         let results: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let mut sorted = results.clone();
         sorted.sort();
-        
+
         for i in 0..10 {
             assert_eq!(sorted[i], (i + 1) as u64);
         }
@@ -156,7 +168,7 @@ mod tests {
         let manager = AutoIncrementManager::new();
         let counter = manager.register("db", "users", "id", 100).unwrap();
         assert_eq!(counter.next_value(), 100);
-        
+
         let counter2 = manager.get("db", "users").unwrap();
         assert_eq!(counter2.next_value(), 101);
     }

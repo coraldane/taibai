@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use crate::common::error::{MonaxError, Result};
+use crate::storage::codec::encoding::{decode_column, decode_column_selected};
 use crate::storage::index::bloomfilter::BloomFilter;
-use crate::storage::codec::encoding::decode_column;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
 use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
@@ -290,6 +290,60 @@ impl SegmentReader {
 
             let col_def = &self.footer.schema.columns[col_idx];
             let col_array = decode_column(&decompressed, rg.row_count as usize, col_def)?;
+            results.push((col_idx, col_array));
+        }
+
+        Ok(results)
+    }
+
+    pub fn read_columns_filtered(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        selected_rows: &[usize],
+    ) -> Result<Vec<(usize, ColumnArray)>> {
+        if column_indices.is_empty() || selected_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rg = &self.footer.row_groups[row_group];
+        let total_size: usize = rg.column_compressed_sizes.iter().map(|s| *s as usize).sum();
+        if total_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let all_data = &self.mmap[rg.offset as usize..rg.offset as usize + total_size];
+
+        let col_offsets: Vec<usize> = rg
+            .column_compressed_sizes
+            .iter()
+            .scan(0, |acc, s| {
+                let offset = *acc;
+                *acc += *s as usize;
+                Some(offset)
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(column_indices.len());
+
+        for &col_idx in column_indices {
+            if col_idx >= col_offsets.len() {
+                continue;
+            }
+
+            let col_offset = col_offsets[col_idx];
+            let col_len = rg.column_compressed_sizes[col_idx] as usize;
+            let compressed = &all_data[col_offset..col_offset + col_len];
+            let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
+                .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
+
+            let col_def = &self.footer.schema.columns[col_idx];
+            let col_array = decode_column_selected(
+                &decompressed,
+                rg.row_count as usize,
+                col_def,
+                selected_rows,
+            )?;
             results.push((col_idx, col_array));
         }
 

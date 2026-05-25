@@ -11,7 +11,7 @@ use super::ExecutionOp;
 
 pub struct WindowExec {
     pub window_funcs: Vec<WindowFunc>,
-    pub partition_by: Vec<usize>, // column indices for partition
+    pub partition_by: Vec<usize>,     // column indices for partition
     pub order_by: Vec<(usize, bool)>, // (column_idx, desc)
     pub frame: Option<(FrameType, FrameBound, FrameBound)>,
     pub input: Box<dyn ExecutionOp>,
@@ -28,7 +28,15 @@ impl WindowExec {
         input: Box<dyn ExecutionOp>,
         input_schema: Schema,
     ) -> Self {
-        Self { window_funcs, partition_by, order_by, frame, input, input_schema, done: false }
+        Self {
+            window_funcs,
+            partition_by,
+            order_by,
+            frame,
+            input,
+            input_schema,
+            done: false,
+        }
     }
 }
 
@@ -70,13 +78,17 @@ impl ExecutionOp for WindowExec {
             // First by partition
             for &col in partition_cols {
                 let cmp = compare_scalars_window(&a[col], &b[col]);
-                if cmp != std::cmp::Ordering::Equal { return cmp; }
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
             }
             // Then by order
             for &(col, desc) in order_cols {
                 let cmp = compare_scalars_window(&a[col], &b[col]);
                 let cmp = if desc { cmp.reverse() } else { cmp };
-                if cmp != std::cmp::Ordering::Equal { return cmp; }
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
             }
             std::cmp::Ordering::Equal
         });
@@ -98,7 +110,9 @@ impl ExecutionOp for WindowExec {
         // Compute window functions for each partition
         let ncols = rows[0].len();
         let nfuncs = self.window_funcs.len();
-        let mut window_columns: Vec<Vec<ScalarValue>> = (0..nfuncs).map(|_| vec![ScalarValue::Int64(None); rows.len()]).collect();
+        let mut window_columns: Vec<Vec<ScalarValue>> = (0..nfuncs)
+            .map(|_| vec![ScalarValue::Int64(None); rows.len()])
+            .collect();
 
         for (_key, row_indices) in &partitions {
             for (func_idx, func) in self.window_funcs.iter().enumerate() {
@@ -192,7 +206,8 @@ fn compute_window_func(
                 if i + offset < n {
                     result[i] = rows[row_indices[i + offset]][0].clone(); // simplified
                 } else {
-                    result[i] = default.as_ref()
+                    result[i] = default
+                        .as_ref()
                         .and_then(|_d| Some(ScalarValue::Int64(None)))
                         .unwrap_or(ScalarValue::Int64(None));
                 }
@@ -203,16 +218,27 @@ fn compute_window_func(
                 if i >= *offset {
                     result[i] = rows[row_indices[i - offset]][0].clone(); // simplified
                 } else {
-                    result[i] = default.as_ref()
+                    result[i] = default
+                        .as_ref()
                         .and_then(|_d| Some(ScalarValue::Int64(None)))
                         .unwrap_or(ScalarValue::Int64(None));
                 }
             }
         }
-        WindowFunc::Aggregate { func: agg_name, args: _, .. } => {
+        WindowFunc::Aggregate {
+            func: agg_name,
+            args: _,
+            ..
+        } => {
             // Simplified: compute aggregate over the entire partition
-            let values: Vec<ScalarValue> = row_indices.iter()
-                .map(|&idx| rows[idx].get(0).cloned().unwrap_or(ScalarValue::Int64(None)))
+            let values: Vec<ScalarValue> = row_indices
+                .iter()
+                .map(|&idx| {
+                    rows[idx]
+                        .get(0)
+                        .cloned()
+                        .unwrap_or(ScalarValue::Int64(None))
+                })
                 .collect();
             let agg_val = compute_simple_aggregate(agg_name, &values);
             for i in 0..n {
@@ -227,36 +253,63 @@ fn compute_simple_aggregate(func: &str, values: &[ScalarValue]) -> ScalarValue {
     match func.to_uppercase().as_str() {
         "COUNT" => ScalarValue::Int64(Some(values.iter().filter(|v| !v.is_null()).count() as i64)),
         "SUM" => {
-            let sum: f64 = values.iter().filter_map(|v| match v {
-                ScalarValue::Int64(Some(v)) => Some(*v as f64),
-                ScalarValue::Float64(Some(v)) => Some(*v),
-                _ => None,
-            }).sum();
+            let sum: f64 = values
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Int64(Some(v)) => Some(*v as f64),
+                    ScalarValue::Float64(Some(v)) => Some(*v),
+                    _ => None,
+                })
+                .sum();
             ScalarValue::Float64(Some(sum))
         }
         "AVG" => {
-            let vals: Vec<f64> = values.iter().filter_map(|v| match v {
-                ScalarValue::Int64(Some(v)) => Some(*v as f64),
-                ScalarValue::Float64(Some(v)) => Some(*v),
-                _ => None,
-            }).collect();
-            if vals.is_empty() { ScalarValue::Float64(None) }
-            else { ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64)) }
+            let vals: Vec<f64> = values
+                .iter()
+                .filter_map(|v| match v {
+                    ScalarValue::Int64(Some(v)) => Some(*v as f64),
+                    ScalarValue::Float64(Some(v)) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            if vals.is_empty() {
+                ScalarValue::Float64(None)
+            } else {
+                ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64))
+            }
         }
-        "MIN" => values.iter().filter(|v| !v.is_null()).min_by(|a, b| compare_scalars_window(a, b)).cloned().unwrap_or(ScalarValue::Int64(None)),
-        "MAX" => values.iter().filter(|v| !v.is_null()).max_by(|a, b| compare_scalars_window(a, b)).cloned().unwrap_or(ScalarValue::Int64(None)),
+        "MIN" => values
+            .iter()
+            .filter(|v| !v.is_null())
+            .min_by(|a, b| compare_scalars_window(a, b))
+            .cloned()
+            .unwrap_or(ScalarValue::Int64(None)),
+        "MAX" => values
+            .iter()
+            .filter(|v| !v.is_null())
+            .max_by(|a, b| compare_scalars_window(a, b))
+            .cloned()
+            .unwrap_or(ScalarValue::Int64(None)),
         _ => ScalarValue::Int64(None),
     }
 }
 
 fn compare_scalars_window(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    if a.is_null() && b.is_null() { return std::cmp::Ordering::Equal; }
-    if a.is_null() { return std::cmp::Ordering::Less; }
-    if b.is_null() { return std::cmp::Ordering::Greater; }
+    if a.is_null() && b.is_null() {
+        return std::cmp::Ordering::Equal;
+    }
+    if a.is_null() {
+        return std::cmp::Ordering::Less;
+    }
+    if b.is_null() {
+        return std::cmp::Ordering::Greater;
+    }
     match (a, b) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
         _ => std::cmp::Ordering::Equal,
     }

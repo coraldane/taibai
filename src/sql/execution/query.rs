@@ -10,8 +10,8 @@ use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{Expr, FromClause, SelectItem, Statement};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
-use super::scan::ScanExecutor;
 use super::scan::spec::compile_scan_spec;
+use super::scan::ScanExecutor;
 
 pub fn exec_select(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecResult> {
     exec_select_inner(engine, db, stmt, None, None)
@@ -101,7 +101,8 @@ fn exec_table_select(
 
     let mut table_schemas = HashMap::new();
     let mut table_cluster_keys: HashMap<String, Vec<String>> = HashMap::new();
-    let mut table_metas: HashMap<String, crate::storage::catalog::schema::TableMeta> = HashMap::new();
+    let mut table_metas: HashMap<String, crate::storage::catalog::schema::TableMeta> =
+        HashMap::new();
     {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs
@@ -134,6 +135,7 @@ fn exec_table_select(
     let is_count_star = detect_count_star(stmt, &table_names);
 
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
 
     for table_name in &table_names {
         let schema = table_schemas.get(table_name).unwrap().clone();
@@ -151,6 +153,10 @@ fn exec_table_select(
         }
 
         let batches = executor.execute()?;
+        fully_applied_scan_filters.insert(
+            table_name.clone(),
+            spec.has_predicates() && spec.remaining_predicate.is_none(),
+        );
 
         if spec.is_count_star {
             let result_schema = if let Some(b) = batches.first() {
@@ -166,6 +172,17 @@ fn exec_table_select(
 
         table_batches.insert(table_name.clone(), batches);
     }
+
+    let plan = if table_names.len() == 1
+        && fully_applied_scan_filters
+            .get(&table_names[0])
+            .copied()
+            .unwrap_or(false)
+    {
+        remove_redundant_pushed_filter(plan, &table_names[0])
+    } else {
+        plan
+    };
 
     let plan =
         try_skip_sort_for_cluster_key(plan, &table_batches, &table_cluster_keys, &table_schemas);
@@ -185,6 +202,51 @@ fn exec_table_select(
         schema,
         batches: result_batches,
     })
+}
+
+fn remove_redundant_pushed_filter(plan: LogicalPlan, table_name: &str) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Filter(filter) => {
+            let input = remove_redundant_pushed_filter(*filter.input, table_name);
+            match input {
+                LogicalPlan::Scan(scan)
+                    if scan.table_name.eq_ignore_ascii_case(table_name)
+                        && scan.pushed_filter.is_some() =>
+                {
+                    LogicalPlan::Scan(scan)
+                }
+                other => LogicalPlan::Filter(crate::sql::planner::FilterPlan {
+                    predicate: filter.predicate,
+                    input: Box::new(other),
+                }),
+            }
+        }
+        LogicalPlan::Project(mut project) => {
+            project.input = Box::new(remove_redundant_pushed_filter(*project.input, table_name));
+            LogicalPlan::Project(project)
+        }
+        LogicalPlan::Sort(mut sort) => {
+            sort.input = Box::new(remove_redundant_pushed_filter(*sort.input, table_name));
+            LogicalPlan::Sort(sort)
+        }
+        LogicalPlan::Limit(mut limit) => {
+            limit.input = Box::new(remove_redundant_pushed_filter(*limit.input, table_name));
+            LogicalPlan::Limit(limit)
+        }
+        LogicalPlan::TopN(mut topn) => {
+            topn.input = Box::new(remove_redundant_pushed_filter(*topn.input, table_name));
+            LogicalPlan::TopN(topn)
+        }
+        LogicalPlan::Distinct(mut distinct) => {
+            distinct.input = Box::new(remove_redundant_pushed_filter(*distinct.input, table_name));
+            LogicalPlan::Distinct(distinct)
+        }
+        LogicalPlan::Window(mut window) => {
+            window.input = Box::new(remove_redundant_pushed_filter(*window.input, table_name));
+            LogicalPlan::Window(window)
+        }
+        other => other,
+    }
 }
 
 fn detect_count_star(stmt: &Statement, table_names: &[String]) -> bool {

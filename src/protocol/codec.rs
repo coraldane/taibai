@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut, Buf};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::common::error::{MonaxError, Result};

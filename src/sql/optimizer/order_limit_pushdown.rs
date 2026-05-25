@@ -1,4 +1,4 @@
-use crate::sql::planner::{LogicalPlan, LogicalExpr, ScanPlan, SortKey, TopNPlan};
+use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan, SortKey, TopNPlan};
 
 use super::Rule;
 
@@ -18,50 +18,70 @@ fn push_order_limit_to_scan(plan: LogicalPlan) -> (LogicalPlan, bool) {
     match plan {
         LogicalPlan::TopN(mut topn) => {
             let (new_input, input_changed) = push_order_limit_to_scan(*topn.input);
-            
+
             if let LogicalPlan::Scan(scan) = &new_input {
-                if can_push_order_to_scan(&topn.sort_keys, scan) && scan.pushed_order.is_none() && scan.pushed_limit.is_none() {
+                if can_push_order_to_scan(&topn.sort_keys, scan)
+                    && scan.pushed_order.is_none()
+                    && scan.pushed_limit.is_none()
+                {
                     let mut new_scan = scan.clone();
                     new_scan.pushed_order = Some(topn.sort_keys.clone());
                     new_scan.pushed_limit = Some(topn.limit);
-                    return (LogicalPlan::TopN(TopNPlan {
-                        sort_keys: topn.sort_keys,
-                        limit: topn.limit,
-                        offset: topn.offset,
-                        input: Box::new(LogicalPlan::Scan(new_scan)),
-                    }), true);
+                    return (
+                        LogicalPlan::TopN(TopNPlan {
+                            sort_keys: topn.sort_keys,
+                            limit: topn.limit,
+                            offset: topn.offset,
+                            input: Box::new(LogicalPlan::Scan(new_scan)),
+                        }),
+                        true,
+                    );
                 }
             }
-            
+
             topn.input = Box::new(new_input);
             (LogicalPlan::TopN(topn), input_changed)
         }
         LogicalPlan::Limit(mut limit) => {
             let (new_input, input_changed) = push_order_limit_to_scan(*limit.input);
-            
+
             if let LogicalPlan::Scan(scan) = &new_input {
                 if scan.pushed_limit.is_none() {
                     let mut new_scan = scan.clone();
                     new_scan.pushed_limit = Some(limit.limit);
-                    let remaining_limit = if new_scan.pushed_filter.is_some() { None } else { Some(limit.limit) };
+                    let remaining_limit = if new_scan.pushed_filter.is_some() {
+                        None
+                    } else {
+                        Some(limit.limit)
+                    };
                     limit.input = Box::new(LogicalPlan::Scan(new_scan));
                     if remaining_limit.is_none() {
-                        return (LogicalPlan::Project(crate::sql::planner::ProjectPlan {
-                            expressions: (0..scan.schema.columns.len()).map(crate::sql::planner::LogicalExpr::Column).collect(),
-                            aliases: scan.schema.columns.iter().map(|c| Some(c.name.clone())).collect(),
-                            input: limit.input,
-                        }), true);
+                        return (
+                            LogicalPlan::Project(crate::sql::planner::ProjectPlan {
+                                expressions: (0..scan.schema.columns.len())
+                                    .map(crate::sql::planner::LogicalExpr::Column)
+                                    .collect(),
+                                aliases: scan
+                                    .schema
+                                    .columns
+                                    .iter()
+                                    .map(|c| Some(c.name.clone()))
+                                    .collect(),
+                                input: limit.input,
+                            }),
+                            true,
+                        );
                     }
                     return (LogicalPlan::Limit(limit), true);
                 }
             }
-            
+
             limit.input = Box::new(new_input);
             (LogicalPlan::Limit(limit), input_changed)
         }
         LogicalPlan::Sort(mut sort) => {
             let (new_input, input_changed) = push_order_limit_to_scan(*sort.input);
-            
+
             if let LogicalPlan::Scan(scan) = &new_input {
                 if can_push_order_to_scan(&sort.sort_keys, scan) && scan.pushed_order.is_none() {
                     let mut new_scan = scan.clone();
@@ -70,7 +90,7 @@ fn push_order_limit_to_scan(plan: LogicalPlan) -> (LogicalPlan, bool) {
                     return (LogicalPlan::Sort(sort), true);
                 }
             }
-            
+
             sort.input = Box::new(new_input);
             (LogicalPlan::Sort(sort), input_changed)
         }
@@ -122,7 +142,7 @@ fn can_push_order_to_scan(sort_keys: &[SortKey], scan: &ScanPlan) -> bool {
     if scan.pushed_filter.is_some() {
         return false;
     }
-    
+
     for sk in sort_keys {
         match &sk.expr {
             LogicalExpr::Column(idx) => {
@@ -137,26 +157,27 @@ fn can_push_order_to_scan(sort_keys: &[SortKey], scan: &ScanPlan) -> bool {
             _ => return false,
         }
     }
-    
+
     true
 }
 
 fn is_orderable_type(dt: crate::protocol::types::DataType) -> bool {
-    matches!(dt,
-        crate::protocol::types::DataType::Int8 |
-        crate::protocol::types::DataType::Int16 |
-        crate::protocol::types::DataType::Int32 |
-        crate::protocol::types::DataType::Int64 |
-        crate::protocol::types::DataType::UInt8 |
-        crate::protocol::types::DataType::UInt16 |
-        crate::protocol::types::DataType::UInt32 |
-        crate::protocol::types::DataType::UInt64 |
-        crate::protocol::types::DataType::Float32 |
-        crate::protocol::types::DataType::Float64 |
-        crate::protocol::types::DataType::Date |
-        crate::protocol::types::DataType::Time |
-        crate::protocol::types::DataType::Timestamp |
-        crate::protocol::types::DataType::VarChar
+    matches!(
+        dt,
+        crate::protocol::types::DataType::Int8
+            | crate::protocol::types::DataType::Int16
+            | crate::protocol::types::DataType::Int32
+            | crate::protocol::types::DataType::Int64
+            | crate::protocol::types::DataType::UInt8
+            | crate::protocol::types::DataType::UInt16
+            | crate::protocol::types::DataType::UInt32
+            | crate::protocol::types::DataType::UInt64
+            | crate::protocol::types::DataType::Float32
+            | crate::protocol::types::DataType::Float64
+            | crate::protocol::types::DataType::Date
+            | crate::protocol::types::DataType::Time
+            | crate::protocol::types::DataType::Timestamp
+            | crate::protocol::types::DataType::VarChar
     )
 }
 
@@ -174,67 +195,65 @@ impl Rule for TopNPushdownRule {
 
 fn push_topn_to_scan(plan: LogicalPlan) -> (LogicalPlan, bool) {
     match plan {
-        LogicalPlan::TopN(mut topn) => {
-            match *topn.input {
-                LogicalPlan::Scan(ref scan) => {
-                    if can_push_topn_to_scan(&topn, scan) {
-                        let mut new_scan = scan.clone();
-                        new_scan.pushed_order = Some(topn.sort_keys.clone());
-                        new_scan.pushed_limit = Some(topn.limit + topn.offset);
-                        let new_topn = LogicalPlan::TopN(TopNPlan {
-                            sort_keys: topn.sort_keys,
-                            limit: topn.limit,
-                            offset: topn.offset,
-                            input: Box::new(LogicalPlan::Scan(new_scan)),
-                        });
-                        return (new_topn, true);
-                    }
-                    topn.input = Box::new(LogicalPlan::Scan(scan.clone()));
-                    (LogicalPlan::TopN(topn), false)
+        LogicalPlan::TopN(mut topn) => match *topn.input {
+            LogicalPlan::Scan(ref scan) => {
+                if can_push_topn_to_scan(&topn, scan) {
+                    let mut new_scan = scan.clone();
+                    new_scan.pushed_order = Some(topn.sort_keys.clone());
+                    new_scan.pushed_limit = Some(topn.limit + topn.offset);
+                    let new_topn = LogicalPlan::TopN(TopNPlan {
+                        sort_keys: topn.sort_keys,
+                        limit: topn.limit,
+                        offset: topn.offset,
+                        input: Box::new(LogicalPlan::Scan(new_scan)),
+                    });
+                    return (new_topn, true);
                 }
-                LogicalPlan::Filter(ref filter) => {
-                    let topn_limit = topn.limit;
-                    let topn_offset = topn.offset;
-                    match *filter.input {
-                        LogicalPlan::Scan(ref scan) => {
-                            if can_push_topn_past_filter(&topn, &filter.predicate, scan) {
-                                let mut new_scan = scan.clone();
-                                new_scan.pushed_filter = Some(filter.predicate.clone());
-                                new_scan.pushed_limit = Some(topn_limit * 3 + topn_offset);
-                                let new_filter = crate::sql::planner::FilterPlan {
-                                    predicate: filter.predicate.clone(),
-                                    input: Box::new(LogicalPlan::Scan(new_scan)),
-                                };
-                                topn.input = Box::new(LogicalPlan::Filter(new_filter));
-                                return (LogicalPlan::TopN(topn), true);
-                            }
+                topn.input = Box::new(LogicalPlan::Scan(scan.clone()));
+                (LogicalPlan::TopN(topn), false)
+            }
+            LogicalPlan::Filter(ref filter) => {
+                let topn_limit = topn.limit;
+                let topn_offset = topn.offset;
+                match *filter.input {
+                    LogicalPlan::Scan(ref scan) => {
+                        if can_push_topn_past_filter(&topn, &filter.predicate, scan) {
+                            let mut new_scan = scan.clone();
+                            new_scan.pushed_filter = Some(filter.predicate.clone());
+                            new_scan.pushed_limit = Some(topn_limit * 3 + topn_offset);
                             let new_filter = crate::sql::planner::FilterPlan {
                                 predicate: filter.predicate.clone(),
-                                input: Box::new(LogicalPlan::Scan(scan.clone())),
+                                input: Box::new(LogicalPlan::Scan(new_scan)),
                             };
                             topn.input = Box::new(LogicalPlan::Filter(new_filter));
-                            (LogicalPlan::TopN(topn), false)
+                            return (LogicalPlan::TopN(topn), true);
                         }
-                        ref other => {
-                            let filter_pred = filter.predicate.clone();
-                            let other_plan = other.clone();
-                            let (new_input, changed) = push_topn_to_scan(other_plan);
-                            let new_filter = crate::sql::planner::FilterPlan {
-                                predicate: filter_pred,
-                                input: Box::new(new_input),
-                            };
-                            topn.input = Box::new(LogicalPlan::Filter(new_filter));
-                            (LogicalPlan::TopN(topn), changed)
-                        }
+                        let new_filter = crate::sql::planner::FilterPlan {
+                            predicate: filter.predicate.clone(),
+                            input: Box::new(LogicalPlan::Scan(scan.clone())),
+                        };
+                        topn.input = Box::new(LogicalPlan::Filter(new_filter));
+                        (LogicalPlan::TopN(topn), false)
+                    }
+                    ref other => {
+                        let filter_pred = filter.predicate.clone();
+                        let other_plan = other.clone();
+                        let (new_input, changed) = push_topn_to_scan(other_plan);
+                        let new_filter = crate::sql::planner::FilterPlan {
+                            predicate: filter_pred,
+                            input: Box::new(new_input),
+                        };
+                        topn.input = Box::new(LogicalPlan::Filter(new_filter));
+                        (LogicalPlan::TopN(topn), changed)
                     }
                 }
-                other => {
-                    let (new_input, changed) = push_topn_to_scan(other);
-                    topn.input = Box::new(new_input);
-                    (LogicalPlan::TopN(topn), changed)
-                }
             }
-        }
+            other => {
+                let (new_input, changed) = push_topn_to_scan(other);
+                topn.input = Box::new(new_input);
+                (LogicalPlan::TopN(topn), changed)
+            }
+        },
         LogicalPlan::Limit(mut limit) => {
             let (new_input, changed) = push_topn_to_scan(*limit.input);
             limit.input = Box::new(new_input);
@@ -303,25 +322,32 @@ fn can_push_topn_past_filter(topn: &TopNPlan, predicate: &LogicalExpr, scan: &Sc
     if scan.pushed_filter.is_some() || scan.pushed_order.is_some() || scan.pushed_limit.is_some() {
         return false;
     }
-    
+
     if !is_selective_predicate(predicate) {
         return false;
     }
-    
+
     can_push_order_to_scan(&topn.sort_keys, scan)
 }
 
 fn is_selective_predicate(expr: &LogicalExpr) -> bool {
     match expr {
         LogicalExpr::BinaryOp { op, .. } => {
-            matches!(op, crate::sql::parser::ast::BinOp::Eq | crate::sql::parser::ast::BinOp::Lt | crate::sql::parser::ast::BinOp::Gt)
+            matches!(
+                op,
+                crate::sql::parser::ast::BinOp::Eq
+                    | crate::sql::parser::ast::BinOp::Lt
+                    | crate::sql::parser::ast::BinOp::Gt
+            )
         }
         LogicalExpr::In { values, .. } => values.len() <= 100,
         LogicalExpr::Between { .. } => true,
         LogicalExpr::Like { .. } => false,
-        LogicalExpr::BinaryOp { op: crate::sql::parser::ast::BinOp::And, left, right } => {
-            is_selective_predicate(left) || is_selective_predicate(right)
-        }
+        LogicalExpr::BinaryOp {
+            op: crate::sql::parser::ast::BinOp::And,
+            left,
+            right,
+        } => is_selective_predicate(left) || is_selective_predicate(right),
         _ => false,
     }
 }

@@ -1,4 +1,4 @@
-use crate::storage::segment::{ZoneMap, RangeOp, RangeClause, RowGroupPredicate, ScanStats};
+use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ScanStats, ZoneMap};
 use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
@@ -8,7 +8,9 @@ pub trait PredicateMatcher: Send + Sync {
     fn matches_row(&self, row_idx: usize, batch: &RecordBatch) -> bool;
     fn matches_column_value(&self, val: &ScalarValue) -> bool;
     fn matches_batch(&self, batch: &RecordBatch) -> Vec<bool> {
-        (0..batch.num_rows()).map(|i| self.matches_row(i, batch)).collect()
+        (0..batch.num_rows())
+            .map(|i| self.matches_row(i, batch))
+            .collect()
     }
     fn column_index(&self) -> usize;
     fn is_fast_scan_compatible(&self) -> bool {
@@ -24,7 +26,10 @@ pub struct EqMatcher {
 
 impl EqMatcher {
     pub fn new(column_index: usize, value: ScalarValue) -> Self {
-        Self { column_index, value }
+        Self {
+            column_index,
+            value,
+        }
     }
 
     pub fn value(&self) -> &ScalarValue {
@@ -34,7 +39,9 @@ impl EqMatcher {
 
 impl PredicateMatcher for EqMatcher {
     fn matches_row_group(&self, zone_maps: &[ZoneMap]) -> bool {
-        let Some(zm) = zone_maps.get(self.column_index) else { return true };
+        let Some(zm) = zone_maps.get(self.column_index) else {
+            return true;
+        };
         if zm.row_count > 0 && zm.null_count == zm.row_count {
             return false;
         }
@@ -45,7 +52,9 @@ impl PredicateMatcher for EqMatcher {
     }
 
     fn matches_row(&self, row_idx: usize, batch: &RecordBatch) -> bool {
-        let val = batch.scalar(row_idx, self.column_index).unwrap_or(ScalarValue::Int64(None));
+        let val = batch
+            .scalar(row_idx, self.column_index)
+            .unwrap_or(ScalarValue::Int64(None));
         scalar_eq(&val, &self.value)
     }
 
@@ -82,13 +91,19 @@ pub struct RangeMatcher {
 
 impl RangeMatcher {
     pub fn new(column_index: usize, op: RangeOp, value: ScalarValue) -> Self {
-        Self { column_index, op, value }
+        Self {
+            column_index,
+            op,
+            value,
+        }
     }
 }
 
 impl PredicateMatcher for RangeMatcher {
     fn matches_row_group(&self, zone_maps: &[ZoneMap]) -> bool {
-        let Some(zm) = zone_maps.get(self.column_index) else { return true };
+        let Some(zm) = zone_maps.get(self.column_index) else {
+            return true;
+        };
         if zm.row_count > 0 && zm.null_count == zm.row_count {
             return false;
         }
@@ -99,7 +114,9 @@ impl PredicateMatcher for RangeMatcher {
     }
 
     fn matches_row(&self, row_idx: usize, batch: &RecordBatch) -> bool {
-        let val = batch.scalar(row_idx, self.column_index).unwrap_or(ScalarValue::Int64(None));
+        let val = batch
+            .scalar(row_idx, self.column_index)
+            .unwrap_or(ScalarValue::Int64(None));
         match self.op {
             RangeOp::Eq => scalar_eq(&val, &self.value),
             RangeOp::Lt => scalar_lt(&val, &self.value),
@@ -156,7 +173,11 @@ impl InMatcher {
     pub fn new(column_index: usize, values: Vec<ScalarValue>) -> Self {
         let mut sorted = values.clone();
         sorted.sort_by(|a, b| compare_scalars_for_sort(a, b));
-        Self { column_index, values, sorted_values: sorted }
+        Self {
+            column_index,
+            values,
+            sorted_values: sorted,
+        }
     }
 
     fn binary_search_contains(&self, val: &ScalarValue) -> bool {
@@ -180,7 +201,9 @@ impl InMatcher {
 
 impl PredicateMatcher for InMatcher {
     fn matches_row_group(&self, zone_maps: &[ZoneMap]) -> bool {
-        let Some(zm) = zone_maps.get(self.column_index) else { return true };
+        let Some(zm) = zone_maps.get(self.column_index) else {
+            return true;
+        };
         if zm.row_count > 0 && zm.null_count == zm.row_count {
             return false;
         }
@@ -196,7 +219,9 @@ impl PredicateMatcher for InMatcher {
     }
 
     fn matches_row(&self, row_idx: usize, batch: &RecordBatch) -> bool {
-        let val = batch.scalar(row_idx, self.column_index).unwrap_or(ScalarValue::Int64(None));
+        let val = batch
+            .scalar(row_idx, self.column_index)
+            .unwrap_or(ScalarValue::Int64(None));
         self.binary_search_contains(&val)
     }
 
@@ -227,8 +252,12 @@ impl AndMatcher {
     }
 
     pub fn from_clauses(clauses: &[RangeClause]) -> Self {
-        let matchers: Vec<Box<dyn PredicateMatcher>> = clauses.iter()
-            .map(|c| Box::new(RangeMatcher::new(c.column_index, c.op, c.value.clone())) as Box<dyn PredicateMatcher>)
+        let matchers: Vec<Box<dyn PredicateMatcher>> = clauses
+            .iter()
+            .map(|c| {
+                Box::new(RangeMatcher::new(c.column_index, c.op, c.value.clone()))
+                    as Box<dyn PredicateMatcher>
+            })
             .collect();
         Self { matchers }
     }
@@ -344,12 +373,16 @@ impl IsNullMatcher {
 
 impl PredicateMatcher for IsNullMatcher {
     fn matches_row_group(&self, zone_maps: &[ZoneMap]) -> bool {
-        let Some(zm) = zone_maps.get(self.column_index) else { return true };
+        let Some(zm) = zone_maps.get(self.column_index) else {
+            return true;
+        };
         zm.null_count > 0
     }
 
     fn matches_row(&self, row_idx: usize, batch: &RecordBatch) -> bool {
-        let val = batch.scalar(row_idx, self.column_index).unwrap_or(ScalarValue::Int64(None));
+        let val = batch
+            .scalar(row_idx, self.column_index)
+            .unwrap_or(ScalarValue::Int64(None));
         val.is_null()
     }
 
@@ -382,12 +415,16 @@ impl IsNotNullMatcher {
 
 impl PredicateMatcher for IsNotNullMatcher {
     fn matches_row_group(&self, zone_maps: &[ZoneMap]) -> bool {
-        let Some(zm) = zone_maps.get(self.column_index) else { return true };
+        let Some(zm) = zone_maps.get(self.column_index) else {
+            return true;
+        };
         zm.null_count < zm.row_count
     }
 
     fn matches_row(&self, row_idx: usize, batch: &RecordBatch) -> bool {
-        let val = batch.scalar(row_idx, self.column_index).unwrap_or(ScalarValue::Int64(None));
+        let val = batch
+            .scalar(row_idx, self.column_index)
+            .unwrap_or(ScalarValue::Int64(None));
         !val.is_null()
     }
 
@@ -423,7 +460,10 @@ impl FastScanEQ {
         }
     }
 
-    pub fn with_bloom_filter_check(&self, bloom_filter: Option<&crate::storage::index::bloomfilter::BloomFilter>) -> bool {
+    pub fn with_bloom_filter_check(
+        &self,
+        bloom_filter: Option<&crate::storage::index::bloomfilter::BloomFilter>,
+    ) -> bool {
         if let Some(bf) = bloom_filter {
             if !bf.might_contain(&self.value) {
                 return false;
@@ -501,7 +541,11 @@ impl FastScanEQ {
         }
     }
 
-    pub fn scan_batch_sorted(&self, batch: &RecordBatch, key_indices: &[usize]) -> Option<RecordBatch> {
+    pub fn scan_batch_sorted(
+        &self,
+        batch: &RecordBatch,
+        key_indices: &[usize],
+    ) -> Option<RecordBatch> {
         if !self.can_use_binary_search(batch, key_indices) {
             return Some(self.scan_batch(batch));
         }
@@ -535,7 +579,10 @@ pub struct MultiPredicateFastScan {
 impl MultiPredicateFastScan {
     pub fn new(matchers: Vec<Box<dyn PredicateMatcher>>) -> Self {
         let primary_column = matchers.first().map(|m| m.column_index()).unwrap_or(0);
-        Self { matchers, primary_column }
+        Self {
+            matchers,
+            primary_column,
+        }
     }
 
     pub fn from_row_group_predicate(pred: &RowGroupPredicate) -> Self {
@@ -572,7 +619,11 @@ impl MultiPredicateFastScan {
         result
     }
 
-    pub fn try_fast_scan_sorted(&self, batch: &RecordBatch, key_indices: &[usize]) -> Option<RecordBatch> {
+    pub fn try_fast_scan_sorted(
+        &self,
+        batch: &RecordBatch,
+        key_indices: &[usize],
+    ) -> Option<RecordBatch> {
         if self.matchers.len() != 1 {
             return None;
         }
@@ -660,10 +711,18 @@ fn scalar_le(a: &ScalarValue, b: &ScalarValue) -> bool {
     if a.is_null() || b.is_null() {
         return false;
     }
-    matches!(compare_scalars_for_sort(a, b), std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    matches!(
+        compare_scalars_for_sort(a, b),
+        std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+    )
 }
 
-fn clause_overlaps_range_impl(op: RangeOp, val: &ScalarValue, min_v: &ScalarValue, max_v: &ScalarValue) -> bool {
+fn clause_overlaps_range_impl(
+    op: RangeOp,
+    val: &ScalarValue,
+    min_v: &ScalarValue,
+    max_v: &ScalarValue,
+) -> bool {
     match op {
         RangeOp::Eq => !scalar_lt(val, min_v) && !scalar_lt(max_v, val),
         RangeOp::Lt => scalar_lt(min_v, val),
@@ -693,8 +752,12 @@ fn compare_scalars_for_sort(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Order
         (ScalarValue::UInt16(Some(l)), ScalarValue::UInt16(Some(r))) => l.cmp(r),
         (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => l.cmp(r),
         (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => l.cmp(r),
-        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
         (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l.cmp(r),
         (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l.cmp(r),

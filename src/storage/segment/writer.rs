@@ -3,10 +3,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{MonaxError, Result};
-use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::codec::encoding::{
     encode_column, encode_len_prefixed_str, encode_scalar_with_tag, null_for_dtype,
 };
+use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::ZoneMap;
 use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
@@ -222,7 +222,8 @@ impl SegmentWriter {
         delete_bitmap: &[u8],
         deleted_row_count: u64,
     ) -> Result<Vec<u8>> {
-        let segment_zone_maps = compute_segment_zone_maps(&self.row_groups, self.schema.num_columns());
+        let segment_zone_maps =
+            compute_segment_zone_maps(&self.row_groups, self.schema.num_columns());
 
         Ok(encode_segment_footer(
             &self.schema,
@@ -373,7 +374,10 @@ fn update_zone_map(
     }
 }
 
-fn compute_segment_zone_maps(row_groups: &[crate::storage::segment::RowGroupMeta], num_columns: usize) -> Vec<ZoneMap> {
+fn compute_segment_zone_maps(
+    row_groups: &[crate::storage::segment::RowGroupMeta],
+    num_columns: usize,
+) -> Vec<ZoneMap> {
     if row_groups.is_empty() {
         return Vec::new();
     }

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
 use crate::sql::planner::{LogicalExpr, LogicalPlan, TimeRange};
-use crate::storage::partition::pruning::RangeClause;
 use crate::storage::catalog::schema::TableMeta;
+use crate::storage::partition::pruning::RangeClause;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
@@ -100,7 +100,10 @@ impl ScanSpec {
     }
 
     pub fn bloom_check_columns(&self) -> Vec<(usize, &ScalarValue)> {
-        self.eq_predicates.iter().map(|(idx, v)| (*idx, v)).collect()
+        self.eq_predicates
+            .iter()
+            .map(|(idx, v)| (*idx, v))
+            .collect()
     }
 
     pub fn to_row_group_predicate(&self) -> crate::storage::partition::pruning::RowGroupPredicate {
@@ -161,7 +164,14 @@ fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
             }
         }
         LogicalPlan::Filter(f) => collect_from_plan(&f.input, schema, spec),
-        LogicalPlan::Project(p) => collect_from_plan(&p.input, schema, spec),
+        LogicalPlan::Project(p) => {
+            collect_from_plan(&p.input, schema, spec);
+            if spec.remaining_predicate.is_none() {
+                if let Some(cols) = plain_projection_columns(&p.expressions) {
+                    spec.projection = Some(cols);
+                }
+            }
+        }
         LogicalPlan::Aggregate(a) => {
             spec.has_aggregate = true;
             spec.has_group_by = !a.group_by.is_empty();
@@ -194,6 +204,17 @@ fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
     }
 }
 
+fn plain_projection_columns(expressions: &[LogicalExpr]) -> Option<Vec<usize>> {
+    let mut cols = Vec::with_capacity(expressions.len());
+    for expr in expressions {
+        let LogicalExpr::Column(idx) = expr else {
+            return None;
+        };
+        cols.push(*idx);
+    }
+    Some(cols)
+}
+
 fn extract_predicates(expr: &LogicalExpr, schema: &Schema, spec: &mut ScanSpec) {
     match expr {
         LogicalExpr::BinaryOp { left, op, right } => {
@@ -206,7 +227,8 @@ fn extract_predicates(expr: &LogicalExpr, schema: &Schema, spec: &mut ScanSpec) 
                 BinOp::Eq => {
                     if let Some((idx, val)) = try_extract_col_literal_eq(left, right, schema) {
                         spec.eq_predicates.push((idx, val));
-                    } else if let Some((idx, val)) = try_extract_col_literal_eq(right, left, schema) {
+                    } else if let Some((idx, val)) = try_extract_col_literal_eq(right, left, schema)
+                    {
                         spec.eq_predicates.push((idx, val));
                     } else {
                         set_remaining(expr.clone(), spec);
@@ -215,7 +237,9 @@ fn extract_predicates(expr: &LogicalExpr, schema: &Schema, spec: &mut ScanSpec) 
                 BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => {
                     if let Some(clause) = try_extract_range_clause(left, *op, right, schema) {
                         spec.range_predicates.push(clause);
-                    } else if let Some(clause) = try_extract_range_clause_mirrored(left, *op, right, schema) {
+                    } else if let Some(clause) =
+                        try_extract_range_clause_mirrored(left, *op, right, schema)
+                    {
                         spec.range_predicates.push(clause);
                     } else {
                         set_remaining(expr.clone(), spec);
@@ -291,7 +315,11 @@ fn try_extract_col_literal_eq(
 ) -> Option<(usize, ScalarValue)> {
     if let LogicalExpr::Column(idx) = left {
         if let LogicalExpr::Literal(val) = right {
-            let coerced = coerce_scalar(val, &schema.columns.get(*idx)?.data_type, schema.columns.get(*idx)?.scale)?;
+            let coerced = coerce_scalar(
+                val,
+                &schema.columns.get(*idx)?.data_type,
+                schema.columns.get(*idx)?.scale,
+            )?;
             return Some((*idx, coerced));
         }
     }
@@ -307,7 +335,11 @@ fn try_extract_range_clause(
     use crate::storage::partition::pruning::RangeOp;
     if let LogicalExpr::Column(idx) = left {
         if let LogicalExpr::Literal(val) = right {
-            let coerced = coerce_scalar(val, &schema.columns.get(*idx)?.data_type, schema.columns.get(*idx)?.scale)?;
+            let coerced = coerce_scalar(
+                val,
+                &schema.columns.get(*idx)?.data_type,
+                schema.columns.get(*idx)?.scale,
+            )?;
             let rop = match op {
                 crate::sql::parser::ast::BinOp::Eq => RangeOp::Eq,
                 crate::sql::parser::ast::BinOp::Lt => RangeOp::Lt,
@@ -335,7 +367,11 @@ fn try_extract_range_clause_mirrored(
     use crate::storage::partition::pruning::RangeOp;
     if let LogicalExpr::Literal(val) = left {
         if let LogicalExpr::Column(idx) = right {
-            let coerced = coerce_scalar(val, &schema.columns.get(*idx)?.data_type, schema.columns.get(*idx)?.scale)?;
+            let coerced = coerce_scalar(
+                val,
+                &schema.columns.get(*idx)?.data_type,
+                schema.columns.get(*idx)?.scale,
+            )?;
             let rop = match op {
                 crate::sql::parser::ast::BinOp::Eq => RangeOp::Eq,
                 crate::sql::parser::ast::BinOp::Lt => RangeOp::Gt,
@@ -354,7 +390,11 @@ fn try_extract_range_clause_mirrored(
     None
 }
 
-fn coerce_scalar(value: &ScalarValue, target_type: &crate::protocol::types::DataType, scale: i32) -> Option<ScalarValue> {
+fn coerce_scalar(
+    value: &ScalarValue,
+    target_type: &crate::protocol::types::DataType,
+    scale: i32,
+) -> Option<ScalarValue> {
     use crate::protocol::types::DataType;
     if value.is_null() {
         return Some(ScalarValue::null_for_type(*target_type));

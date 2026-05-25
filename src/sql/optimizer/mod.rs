@@ -1,18 +1,18 @@
-pub mod predicate_pushdown;
-pub mod column_pruning;
-pub mod zone_map_pruning;
-pub mod limit_pushdown;
-pub mod index_selection;
-pub mod partition_pruning;
-pub mod join_reorder;
 pub mod bloom_filter;
+pub mod column_pruning;
 pub mod cost;
-pub mod topn;
 pub mod expr_rules;
 pub mod filter_reorder;
-pub mod subquery;
-pub mod semi_join;
+pub mod index_selection;
+pub mod join_reorder;
+pub mod limit_pushdown;
 pub mod order_limit_pushdown;
+pub mod partition_pruning;
+pub mod predicate_pushdown;
+pub mod semi_join;
+pub mod subquery;
+pub mod topn;
+pub mod zone_map_pruning;
 
 use crate::sql::planner::LogicalPlan;
 

@@ -131,23 +131,42 @@ pub enum Statement {
     },
     ShowTables,
     ShowDatabases,
-    ShowColumns { table: String },
-    ShowIndexes { table: String },
-    ShowCreateTable { table: String },
+    ShowColumns {
+        table: String,
+    },
+    ShowIndexes {
+        table: String,
+    },
+    ShowCreateTable {
+        table: String,
+    },
     ShowUsers,
     ShowRoles,
-    ShowGrants { user: Option<String> },
-    ShowPartitions { table: Option<String> },
+    ShowGrants {
+        user: Option<String>,
+    },
+    ShowPartitions {
+        table: Option<String>,
+    },
     ShowStats,
     ShowEngines,
-    ShowProcesslist { full: bool },
+    ShowProcesslist {
+        full: bool,
+    },
     UseDatabase(String),
-    Explain { analyze: bool, stmt: Box<Statement> },
+    Explain {
+        analyze: bool,
+        stmt: Box<Statement>,
+    },
     Begin,
     Commit,
     Rollback,
-    FlushTable { table: Option<String> },
-    OptimizeTable { table: String },
+    FlushTable {
+        table: Option<String>,
+    },
+    OptimizeTable {
+        table: String,
+    },
     PauseFlush,
     ResumeFlush,
 }
@@ -305,9 +324,19 @@ pub enum WindowFunc {
     RowNumber,
     Rank,
     DenseRank,
-    Lead { offset: usize, default: Option<Box<Expr>> },
-    Lag { offset: usize, default: Option<Box<Expr>> },
-    Aggregate { func: String, args: Vec<Expr>, distinct: bool },
+    Lead {
+        offset: usize,
+        default: Option<Box<Expr>>,
+    },
+    Lag {
+        offset: usize,
+        default: Option<Box<Expr>>,
+    },
+    Aggregate {
+        func: String,
+        args: Vec<Expr>,
+        distinct: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -2,13 +2,13 @@
 mod tests {
     use crate::storage::index::bloomfilter::BloomFilter;
     use crate::storage::index::sparse_index::{SparseBlock, SparseBlockData, SparseIndexImpl};
+    use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ZoneMap};
     use crate::types::scalar::ScalarValue;
-    use crate::storage::segment::{ZoneMap, RangeOp, RangeClause, RowGroupPredicate};
 
     #[test]
     fn test_bloomfilter_basic() {
         let mut bf = BloomFilter::new(1000, 0.01);
-        
+
         bf.add(&ScalarValue::Int32(Some(42)));
         bf.add(&ScalarValue::Int32(Some(100)));
         bf.add(&ScalarValue::Int64(Some(999)));
@@ -30,11 +30,9 @@ mod tests {
     #[test]
     fn test_bloomfilter_batch_insert() {
         let mut bf = BloomFilter::new(1000, 0.01);
-        
-        let values: Vec<ScalarValue> = (0..100)
-            .map(|i| ScalarValue::Int32(Some(i)))
-            .collect();
-        
+
+        let values: Vec<ScalarValue> = (0..100).map(|i| ScalarValue::Int32(Some(i))).collect();
+
         for v in &values {
             bf.add(v);
         }
@@ -48,13 +46,13 @@ mod tests {
     #[test]
     fn test_bloomfilter_serialization() {
         let mut bf = BloomFilter::new(1000, 0.01);
-        
+
         bf.add(&ScalarValue::Int32(Some(1)));
         bf.add(&ScalarValue::Int32(Some(2)));
         bf.add(&ScalarValue::VarChar(Some("test".to_string())));
 
         let encoded = bf.serialize();
-        
+
         let decoded = BloomFilter::deserialize(&encoded).unwrap();
 
         assert!(decoded.might_contain(&ScalarValue::Int32(Some(1))));
@@ -93,11 +91,17 @@ mod tests {
         // Overlaps with range
         assert!(zm.overlaps(&ScalarValue::Int32(Some(20)), &ScalarValue::Int32(Some(50))));
         assert!(zm.overlaps(&ScalarValue::Int32(Some(5)), &ScalarValue::Int32(Some(15))));
-        assert!(zm.overlaps(&ScalarValue::Int32(Some(50)), &ScalarValue::Int32(Some(150))));
+        assert!(zm.overlaps(
+            &ScalarValue::Int32(Some(50)),
+            &ScalarValue::Int32(Some(150))
+        ));
 
         // No overlap
         assert!(!zm.overlaps(&ScalarValue::Int32(Some(1)), &ScalarValue::Int32(Some(5))));
-        assert!(!zm.overlaps(&ScalarValue::Int32(Some(101)), &ScalarValue::Int32(Some(200))));
+        assert!(!zm.overlaps(
+            &ScalarValue::Int32(Some(101)),
+            &ScalarValue::Int32(Some(200))
+        ));
     }
 
     #[test]
@@ -129,10 +133,8 @@ mod tests {
         }
 
         // Range search [30, 70]
-        let found = index.range_search(
-            &ScalarValue::Int32(Some(30)),
-            &ScalarValue::Int32(Some(70))
-        );
+        let found =
+            index.range_search(&ScalarValue::Int32(Some(30)), &ScalarValue::Int32(Some(70)));
 
         // Should contain values 30, 40, 50, 60, 70
         assert!(found.contains(&3)); // value 30
@@ -172,23 +174,19 @@ mod tests {
 
     #[test]
     fn test_row_group_predicate_with_bloomfilter() {
-        let pred = RowGroupPredicate::new(vec![
-            RangeClause {
-                column_index: 0,
-                op: RangeOp::Eq,
-                value: ScalarValue::Int32(Some(42)),
-            },
-        ]);
+        let pred = RowGroupPredicate::new(vec![RangeClause {
+            column_index: 0,
+            op: RangeOp::Eq,
+            value: ScalarValue::Int32(Some(42)),
+        }]);
 
         // Create zone map that contains the value
-        let zone_maps = vec![
-            ZoneMap {
-                min_value: ScalarValue::Int32(Some(0)),
-                max_value: ScalarValue::Int32(Some(100)),
-                null_count: 0,
-                row_count: 100,
-            },
-        ];
+        let zone_maps = vec![ZoneMap {
+            min_value: ScalarValue::Int32(Some(0)),
+            max_value: ScalarValue::Int32(Some(100)),
+            null_count: 0,
+            row_count: 100,
+        }];
 
         // ZoneMap should match
         assert!(pred.matches_row_group(&zone_maps));
@@ -206,7 +204,7 @@ mod tests {
 
         // Value 50 should pass BloomFilter
         assert!(bf.might_contain(&ScalarValue::Int32(Some(50))));
-        
+
         // Value 999 should be rejected by BloomFilter
         assert!(!bf.might_contain(&ScalarValue::Int32(Some(999))));
 
@@ -228,9 +226,9 @@ mod tests {
         // Test that false positive rate is within expected bounds
         let n = 10000;
         let fp_rate = 0.01;
-        
+
         let mut bf = BloomFilter::new(n, fp_rate);
-        
+
         // Insert n items
         for i in 0..n {
             bf.add(&ScalarValue::Int32(Some(i as i32)));
@@ -246,7 +244,7 @@ mod tests {
         }
 
         let actual_fp_rate = false_positives as f64 / test_count as f64;
-        
+
         // Should be approximately the target rate (allowing some variance)
         assert!(
             actual_fp_rate < fp_rate * 3.0,

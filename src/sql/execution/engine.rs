@@ -5,13 +5,13 @@ use std::sync::{Arc, RwLock};
 
 use crate::common::error::{MonaxError, Result};
 use crate::net::session::Session;
+use crate::storage::catalog::auth::AuthManager;
+use crate::storage::catalog::auto_increment::AutoIncrementManager;
 use crate::storage::catalog::schema::DatabaseCatalog;
 use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
 use crate::storage::core::memtable::MemTableManager;
-use crate::storage::segment_manager::SegmentManager;
-use crate::storage::catalog::auth::AuthManager;
-use crate::storage::catalog::auto_increment::AutoIncrementManager;
 use crate::storage::index::index_manager::IndexManager;
+use crate::storage::segment_manager::SegmentManager;
 
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
@@ -20,8 +20,13 @@ use crate::types::batch::{RecordBatch, Schema};
 
 #[derive(Debug)]
 pub enum ExecResult {
-    Ok { rows_affected: u64 },
-    Query { schema: Schema, batches: Vec<RecordBatch> },
+    Ok {
+        rows_affected: u64,
+    },
+    Query {
+        schema: Schema,
+        batches: Vec<RecordBatch>,
+    },
 }
 
 pub struct Engine {
@@ -54,7 +59,9 @@ impl Engine {
                             continue;
                         }
                         if !catalogs.contains_key(&db_name) {
-                            if let Ok(catalog) = DatabaseCatalog::load_or_create(&meta_dir, &db_name) {
+                            if let Ok(catalog) =
+                                DatabaseCatalog::load_or_create(&meta_dir, &db_name)
+                            {
                                 catalogs.insert(db_name, catalog);
                             }
                         }
@@ -98,7 +105,11 @@ impl Engine {
         self.execute_stmt(session, &stmts[0])
     }
 
-    pub fn execute_prepared(&self, session: &mut Session, prepared: &mut crate::sql::execution::prepared::PreparedStatement) -> Result<ExecResult> {
+    pub fn execute_prepared(
+        &self,
+        session: &mut Session,
+        prepared: &mut crate::sql::execution::prepared::PreparedStatement,
+    ) -> Result<ExecResult> {
         let has_placeholders = crate::sql::execution::prepared::has_placeholders(&prepared.stmt);
         let mut stmt = prepared.stmt.clone();
         if !prepared.params.is_empty() {
@@ -107,14 +118,22 @@ impl Engine {
         match &stmt {
             Statement::Select { .. } => {
                 if let Some(ref plan) = prepared.cached_plan {
-                    super::query::exec_select_with_plan(self, &session.database, &stmt, plan.clone())
+                    super::query::exec_select_with_plan(
+                        self,
+                        &session.database,
+                        &stmt,
+                        plan.clone(),
+                    )
                 } else {
                     let result = super::query::exec_select(self, &session.database, &stmt);
                     if let Ok(ref _r) = result {
                         // Only cache plan if statement has no placeholders (params won't change structure)
                         if !has_placeholders {
-                            let table_schemas = self.gather_table_schemas(&session.database, &stmt)?;
-                            if let Ok(plan) = crate::sql::planner::plan_select(&stmt, &table_schemas) {
+                            let table_schemas =
+                                self.gather_table_schemas(&session.database, &stmt)?;
+                            if let Ok(plan) =
+                                crate::sql::planner::plan_select(&stmt, &table_schemas)
+                            {
                                 prepared.cached_plan = Some(crate::sql::optimizer::optimize(plan));
                             }
                         }
@@ -126,7 +145,11 @@ impl Engine {
         }
     }
 
-    fn gather_table_schemas(&self, db: &str, stmt: &Statement) -> Result<std::collections::HashMap<String, crate::types::batch::Schema>> {
+    fn gather_table_schemas(
+        &self,
+        db: &str,
+        stmt: &Statement,
+    ) -> Result<std::collections::HashMap<String, crate::types::batch::Schema>> {
         use crate::types::batch::Schema;
         let mut table_names = Vec::new();
         if let Statement::Select { from, .. } = stmt {
@@ -148,9 +171,21 @@ impl Engine {
 
     fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
         match stmt {
-            Statement::CreateTable { name, columns, if_not_exists, cluster_by, partition_by } => {
-                super::ddl::exec_create_table(self, &session.database, name, columns, *if_not_exists, cluster_by, partition_by)
-            }
+            Statement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+                cluster_by,
+                partition_by,
+            } => super::ddl::exec_create_table(
+                self,
+                &session.database,
+                name,
+                columns,
+                *if_not_exists,
+                cluster_by,
+                partition_by,
+            ),
             Statement::DropTable { name, if_exists } => {
                 super::ddl::exec_drop_table(self, &session.database, name, *if_exists)
             }
@@ -160,18 +195,17 @@ impl Engine {
             Statement::Truncate { table } => {
                 super::ddl::exec_truncate_table(self, &session.database, table)
             }
-            Statement::CreateDatabase { name, if_not_exists } => {
-                super::ddl::exec_create_database(self, name, *if_not_exists)
-            }
+            Statement::CreateDatabase {
+                name,
+                if_not_exists,
+            } => super::ddl::exec_create_database(self, name, *if_not_exists),
             Statement::DropDatabase { name, if_exists } => {
                 super::ddl::exec_drop_database(self, name, *if_exists)
             }
             Statement::CreateUser { name, password } => {
                 super::ddl::exec_create_user(self, name, password)
             }
-            Statement::CreateRole { name } => {
-                super::ddl::exec_create_role(self, name)
-            }
+            Statement::CreateRole { name } => super::ddl::exec_create_role(self, name),
             Statement::DropUser { name, if_exists } => {
                 super::ddl::exec_drop_user(self, name, *if_exists)
             }
@@ -181,36 +215,53 @@ impl Engine {
             Statement::Grant { privileges, on, to } => {
                 super::ddl::exec_grant(self, privileges, on, to)
             }
-            Statement::Revoke { privileges, on, from } => {
-                super::ddl::exec_revoke(self, privileges, on, from)
-            }
-            Statement::Insert { table, columns, values } => {
+            Statement::Revoke {
+                privileges,
+                on,
+                from,
+            } => super::ddl::exec_revoke(self, privileges, on, from),
+            Statement::Insert {
+                table,
+                columns,
+                values,
+            } => {
                 let txn_id = session.active_txn_id();
-                let result = super::dml_insert::exec_insert(self, &session.database, table, columns, values, session.timezone_offset_hours, txn_id);
+                let result = super::dml_insert::exec_insert(
+                    self,
+                    &session.database,
+                    table,
+                    columns,
+                    values,
+                    session.timezone_offset_hours,
+                    txn_id,
+                );
                 if result.is_ok() && txn_id > 0 {
                     session.mark_txn_write();
                 }
                 result
             }
-            Statement::Update { table, assignments, where_clause } => {
-                super::dml_update::exec_update(self, &session.database, table, assignments, where_clause)
-            }
-            Statement::Delete { table, where_clause } => {
-                super::dml_delete::exec_delete(self, &session.database, table, where_clause)
-            }
-            Statement::Select { .. } => {
-                super::query::exec_select(self, &session.database, stmt)
-            }
+            Statement::Update {
+                table,
+                assignments,
+                where_clause,
+            } => super::dml_update::exec_update(
+                self,
+                &session.database,
+                table,
+                assignments,
+                where_clause,
+            ),
+            Statement::Delete {
+                table,
+                where_clause,
+            } => super::dml_delete::exec_delete(self, &session.database, table, where_clause),
+            Statement::Select { .. } => super::query::exec_select(self, &session.database, stmt),
             Statement::UseDatabase(database) => {
                 session.database = database.clone();
                 Ok(ExecResult::Ok { rows_affected: 0 })
             }
-            Statement::ShowTables => {
-                super::ddl::exec_show_tables(self, &session.database)
-            }
-            Statement::ShowDatabases => {
-                super::ddl::exec_show_databases(self)
-            }
+            Statement::ShowTables => super::ddl::exec_show_tables(self, &session.database),
+            Statement::ShowDatabases => super::ddl::exec_show_databases(self),
             Statement::ShowColumns { table } => {
                 super::ddl::exec_show_columns(self, &session.database, table)
             }
@@ -220,23 +271,30 @@ impl Engine {
             Statement::ShowCreateTable { table } => {
                 super::ddl::exec_show_create_table(self, &session.database, table)
             }
-            Statement::Explain { analyze, stmt: inner } => {
-                super::explain::exec_explain(self, &session.database, inner, *analyze)
-            }
+            Statement::Explain {
+                analyze,
+                stmt: inner,
+            } => super::explain::exec_explain(self, &session.database, inner, *analyze),
             Statement::Begin => {
                 if session.in_txn() {
                     return Err(MonaxError::Sql("transaction already in progress".into()));
                 }
                 let txn_id = self.alloc_txn_id();
                 session.begin_txn(txn_id);
-                Ok(ExecResult::Ok { rows_affected: txn_id })
+                Ok(ExecResult::Ok {
+                    rows_affected: txn_id,
+                })
             }
             Statement::Commit => {
                 if !session.in_txn() {
                     return Err(MonaxError::Sql("no active transaction".into()));
                 }
                 let txn_id = session.active_txn_id();
-                let had_writes = session.active_txn.as_ref().map(|t| t.had_writes).unwrap_or(false);
+                let had_writes = session
+                    .active_txn
+                    .as_ref()
+                    .map(|t| t.had_writes)
+                    .unwrap_or(false);
                 if had_writes {
                     self.batch_writer().commit_txn(txn_id)?;
                 }
@@ -249,37 +307,45 @@ impl Engine {
                 }
                 let txn_id = session.active_txn_id();
                 let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
-                tracing::debug!(txn_id, rows_rolled_back = rolled_back, "transaction rolled back");
+                tracing::debug!(
+                    txn_id,
+                    rows_rolled_back = rolled_back,
+                    "transaction rolled back"
+                );
                 session.rollback_txn();
-                Ok(ExecResult::Ok { rows_affected: rolled_back })
+                Ok(ExecResult::Ok {
+                    rows_affected: rolled_back,
+                })
             }
             Statement::AlterUser { name, operations } => {
                 super::ddl::exec_alter_user(self, name, operations)
             }
-            Statement::Union { left, right, all, order_by, limit, offset } => {
-                super::query::exec_union(self, &session.database, left, right, *all, order_by, limit, offset)
-            }
-            Statement::ShowUsers => {
-                super::ddl::exec_show_users(self)
-            }
-            Statement::ShowRoles => {
-                super::ddl::exec_show_roles(self)
-            }
-            Statement::ShowGrants { user } => {
-                super::ddl::exec_show_grants(self, user)
-            }
+            Statement::Union {
+                left,
+                right,
+                all,
+                order_by,
+                limit,
+                offset,
+            } => super::query::exec_union(
+                self,
+                &session.database,
+                left,
+                right,
+                *all,
+                order_by,
+                limit,
+                offset,
+            ),
+            Statement::ShowUsers => super::ddl::exec_show_users(self),
+            Statement::ShowRoles => super::ddl::exec_show_roles(self),
+            Statement::ShowGrants { user } => super::ddl::exec_show_grants(self, user),
             Statement::ShowPartitions { table } => {
                 super::ddl::exec_show_partitions(self, &session.database, table)
             }
-            Statement::ShowStats => {
-                super::ddl::exec_show_stats(self, &session.database)
-            }
-            Statement::ShowEngines => {
-                super::ddl::exec_show_engines(self)
-            }
-            Statement::ShowProcesslist { full } => {
-                super::ddl::exec_show_processlist(self, *full)
-            }
+            Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),
+            Statement::ShowEngines => super::ddl::exec_show_engines(self),
+            Statement::ShowProcesslist { full } => super::ddl::exec_show_processlist(self, *full),
             Statement::FlushTable { table } => {
                 super::ddl::exec_flush_table(self, &session.database, table)
             }
@@ -325,7 +391,11 @@ impl Engine {
         &self.index_manager
     }
 
-    pub fn get_table_meta(&self, db: &str, table: &str) -> Option<crate::storage::catalog::schema::TableMeta> {
+    pub fn get_table_meta(
+        &self,
+        db: &str,
+        table: &str,
+    ) -> Option<crate::storage::catalog::schema::TableMeta> {
         let catalogs = self.catalogs.read().unwrap();
         catalogs.get(db).and_then(|c| c.get_table(table).cloned())
     }
@@ -371,7 +441,8 @@ impl Engine {
         batch: RecordBatch,
         disable_wal: bool,
     ) -> Result<u64> {
-        self.segment_mgr.bulk_insert_batch(db, table, batch, disable_wal)
+        self.segment_mgr
+            .bulk_insert_batch(db, table, batch, disable_wal)
     }
 
     pub fn exec_bulk_insert_payload_with_wal_control(
@@ -385,7 +456,9 @@ impl Engine {
             .get(db)
             .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
 
-        let result = self.segment_mgr.bulk_insert_payload_with_catalog(db, payload, disable_wal, catalog)?;
+        let result =
+            self.segment_mgr
+                .bulk_insert_payload_with_catalog(db, payload, disable_wal, catalog)?;
         drop(catalogs);
 
         if !disable_wal {
@@ -393,15 +466,17 @@ impl Engine {
             if !bulk_mode {
                 let req = {
                     let catalogs = self.catalogs.read().unwrap();
-                    let catalog = catalogs.get(db)
-                        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+                    let catalog = catalogs.get(db).ok_or_else(|| {
+                        MonaxError::Sql(format!("database '{}' does not exist", db))
+                    })?;
                     let table_name = {
                         let mut pos = 0usize;
                         let payload_bytes = payload;
                         if payload_bytes.len() < 2 {
                             return Err(MonaxError::Protocol("bulk payload too short".into()));
                         }
-                        let table_len = u16::from_le_bytes(payload_bytes[0..2].try_into().unwrap()) as usize;
+                        let table_len =
+                            u16::from_le_bytes(payload_bytes[0..2].try_into().unwrap()) as usize;
                         pos += 2;
                         if pos + table_len > payload_bytes.len() {
                             return Err(MonaxError::Protocol("bulk payload truncated".into()));

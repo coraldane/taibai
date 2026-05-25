@@ -36,7 +36,9 @@ impl ColumnExpression for LogicalExpression {
         Ok(result)
     }
 
-    fn data_type(&self) -> DataType { DataType::Bool }
+    fn data_type(&self) -> DataType {
+        DataType::Bool
+    }
 }
 
 impl ColumnExpression for NotExpression {
@@ -55,19 +57,25 @@ impl ColumnExpression for NotExpression {
         Ok(result)
     }
 
-    fn data_type(&self) -> DataType { DataType::Bool }
+    fn data_type(&self) -> DataType {
+        DataType::Bool
+    }
 }
 
 fn and_bools(l: &ScalarValue, r: &ScalarValue) -> ScalarValue {
     match (l, r) {
-        (ScalarValue::Bool(Some(a)), ScalarValue::Bool(Some(b))) => ScalarValue::Bool(Some(*a && *b)),
+        (ScalarValue::Bool(Some(a)), ScalarValue::Bool(Some(b))) => {
+            ScalarValue::Bool(Some(*a && *b))
+        }
         _ => ScalarValue::Bool(None),
     }
 }
 
 fn or_bools(l: &ScalarValue, r: &ScalarValue) -> ScalarValue {
     match (l, r) {
-        (ScalarValue::Bool(Some(a)), ScalarValue::Bool(Some(b))) => ScalarValue::Bool(Some(*a || *b)),
+        (ScalarValue::Bool(Some(a)), ScalarValue::Bool(Some(b))) => {
+            ScalarValue::Bool(Some(*a || *b))
+        }
         _ => ScalarValue::Bool(None),
     }
 }

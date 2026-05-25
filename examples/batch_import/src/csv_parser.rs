@@ -127,7 +127,11 @@ impl ColumnarTickBatch {
     }
 }
 
-pub fn parse_tick_csv(file_path: &str, batch_size: usize, skip_header: bool) -> std::io::Result<(Vec<ColumnarTickBatch>, usize)> {
+pub fn parse_tick_csv(
+    file_path: &str,
+    batch_size: usize,
+    skip_header: bool,
+) -> std::io::Result<(Vec<ColumnarTickBatch>, usize)> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
 

@@ -12,7 +12,10 @@ use monax::tools::segment::discover_segments;
     version
 )]
 struct Args {
-    #[arg(long, default_value = "/Users/coral/Downloads/data/monax/main/stock_tick_multi")]
+    #[arg(
+        long,
+        default_value = "/Users/coral/Downloads/data/monax/main/stock_tick_multi"
+    )]
     data_dir: PathBuf,
 
     #[arg(long, default_value = "688256.SH")]
@@ -57,7 +60,12 @@ fn main() {
     for (i, file) in files.iter().enumerate() {
         let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
 
-        match filter_segment(file, &args.security_id, args.verbose, limit - total_matching as usize) {
+        match filter_segment(
+            file,
+            &args.security_id,
+            args.verbose,
+            limit - total_matching as usize,
+        ) {
             Ok(count) => {
                 total_matching += count;
                 if args.verbose {
@@ -164,7 +172,12 @@ fn format_decimal(n: i64) -> String {
         let integer_part = abs / 10000;
         let decimal_part = abs % 10000;
         let sign = if n < 0 { "-" } else { "" };
-        format!("{}{}.{}", sign, integer_part, format!("{:04}", decimal_part))
+        format!(
+            "{}{}.{}",
+            sign,
+            integer_part,
+            format!("{:04}", decimal_part)
+        )
     }
 }
 
@@ -207,14 +220,21 @@ fn format_timestamp(ts: i64) -> String {
         month += 1;
     }
 
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}", year, month, day, hour, minute, second, micros)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+        year, month, day, hour, minute, second, micros
+    )
 }
 
 fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-fn print_row(batch: &monax::types::batch::RecordBatch, row_idx: usize, schema: &monax::types::batch::Schema) {
+fn print_row(
+    batch: &monax::types::batch::RecordBatch,
+    row_idx: usize,
+    schema: &monax::types::batch::Schema,
+) {
     let mut parts = Vec::new();
     for col_idx in 0..batch.num_columns() {
         let col = batch.column(col_idx).unwrap();

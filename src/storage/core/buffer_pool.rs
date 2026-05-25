@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
+use std::sync::Arc;
 
 pub struct BufferPool {
     buffers: ArrayQueue<BytesMut>,
@@ -23,7 +23,8 @@ impl BufferPool {
 
     pub fn acquire(&self) -> BytesMut {
         self.buffers.pop().unwrap_or_else(|| {
-            self.created.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.created
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             BytesMut::with_capacity(self.default_size)
         })
     }
@@ -40,7 +41,10 @@ impl BufferPool {
     }
 
     pub fn stats(&self) -> (usize, u64) {
-        (self.buffers.len(), self.created.load(std::sync::atomic::Ordering::Relaxed))
+        (
+            self.buffers.len(),
+            self.created.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 }
 
@@ -57,7 +61,8 @@ pub struct EncodeBufferPool {
 impl EncodeBufferPool {
     pub fn new() -> Self {
         let sizes = [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024];
-        let pools = sizes.iter()
+        let pools = sizes
+            .iter()
             .map(|size| Arc::new(BufferPool::new(64, *size)))
             .collect();
         Self { pools }
@@ -104,7 +109,9 @@ impl BatchBufferPool {
     }
 
     pub fn acquire(&self) -> Vec<u8> {
-        self.pool.pop().unwrap_or_else(|| Vec::with_capacity(self.default_size))
+        self.pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.default_size))
     }
 
     pub fn release(&self, buf: Vec<u8>) {
@@ -121,17 +128,25 @@ impl Default for BatchBufferPool {
 }
 
 pub static GLOBAL_BUFFER_POOL: std::sync::OnceLock<Arc<BufferPool>> = std::sync::OnceLock::new();
-pub static GLOBAL_ENCODE_POOL: std::sync::OnceLock<Arc<EncodeBufferPool>> = std::sync::OnceLock::new();
-pub static GLOBAL_BATCH_POOL: std::sync::OnceLock<Arc<BatchBufferPool>> = std::sync::OnceLock::new();
+pub static GLOBAL_ENCODE_POOL: std::sync::OnceLock<Arc<EncodeBufferPool>> =
+    std::sync::OnceLock::new();
+pub static GLOBAL_BATCH_POOL: std::sync::OnceLock<Arc<BatchBufferPool>> =
+    std::sync::OnceLock::new();
 
 pub fn global_buffer_pool() -> Arc<BufferPool> {
-    GLOBAL_BUFFER_POOL.get_or_init(|| Arc::new(BufferPool::new(512, 64 * 1024))).clone()
+    GLOBAL_BUFFER_POOL
+        .get_or_init(|| Arc::new(BufferPool::new(512, 64 * 1024)))
+        .clone()
 }
 
 pub fn global_encode_pool() -> Arc<EncodeBufferPool> {
-    GLOBAL_ENCODE_POOL.get_or_init(|| Arc::new(EncodeBufferPool::new())).clone()
+    GLOBAL_ENCODE_POOL
+        .get_or_init(|| Arc::new(EncodeBufferPool::new()))
+        .clone()
 }
 
 pub fn global_batch_pool() -> Arc<BatchBufferPool> {
-    GLOBAL_BATCH_POOL.get_or_init(|| Arc::new(BatchBufferPool::new(128, 64 * 1024))).clone()
+    GLOBAL_BATCH_POOL
+        .get_or_init(|| Arc::new(BatchBufferPool::new(128, 64 * 1024)))
+        .clone()
 }

@@ -133,10 +133,12 @@ pub fn try_fast_parse_insert(sql: &str) -> Option<Result<Statement>> {
                     pos = end + 1;
                     Expr::Literal(ScalarValue::VarChar(Some(s)))
                 }
-                b'N' | b'n' if pos + 4 <= len
-                    && (bytes[pos+1] == b'U' || bytes[pos+1] == b'u')
-                    && (bytes[pos+2] == b'L' || bytes[pos+2] == b'l')
-                    && (bytes[pos+3] == b'L' || bytes[pos+3] == b'l') => {
+                b'N' | b'n'
+                    if pos + 4 <= len
+                        && (bytes[pos + 1] == b'U' || bytes[pos + 1] == b'u')
+                        && (bytes[pos + 2] == b'L' || bytes[pos + 2] == b'l')
+                        && (bytes[pos + 3] == b'L' || bytes[pos + 3] == b'l') =>
+                {
                     pos += 4;
                     Expr::Literal(ScalarValue::Int64(None))
                 }
@@ -229,7 +231,11 @@ mod tests {
         let sql = "INSERT INTO t VALUES (1, 'hello', -42)";
         let result = try_fast_parse_insert(sql).unwrap().unwrap();
         match result {
-            Statement::Insert { table, columns, values } => {
+            Statement::Insert {
+                table,
+                columns,
+                values,
+            } => {
                 assert_eq!(table, "t");
                 assert!(columns.is_empty());
                 assert_eq!(values.len(), 1);
@@ -244,7 +250,11 @@ mod tests {
         let sql = "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')";
         let result = try_fast_parse_insert(sql).unwrap().unwrap();
         match result {
-            Statement::Insert { table, columns, values } => {
+            Statement::Insert {
+                table,
+                columns,
+                values,
+            } => {
                 assert_eq!(table, "t");
                 assert_eq!(columns, vec!["a", "b"]);
                 assert_eq!(values.len(), 2);
@@ -270,12 +280,10 @@ mod tests {
         let sql = "INSERT INTO t VALUES ('it''s')";
         let result = try_fast_parse_insert(sql).unwrap().unwrap();
         match result {
-            Statement::Insert { values, .. } => {
-                match &values[0][0] {
-                    Expr::Literal(ScalarValue::VarChar(Some(s))) => assert_eq!(s, "it's"),
-                    _ => panic!("expected string"),
-                }
-            }
+            Statement::Insert { values, .. } => match &values[0][0] {
+                Expr::Literal(ScalarValue::VarChar(Some(s))) => assert_eq!(s, "it's"),
+                _ => panic!("expected string"),
+            },
             _ => panic!("expected insert"),
         }
     }

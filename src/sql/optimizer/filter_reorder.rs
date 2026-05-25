@@ -2,8 +2,8 @@
 /// Inspired by DuckDB's ExpressionHeuristics.
 /// Order: equality conditions (sel ~0.1) > range conditions (sel ~0.33) > LIKE (sel ~0.5) > other
 use crate::sql::parser::ast::BinOp;
-use crate::sql::planner::LogicalPlan;
 use crate::sql::planner::LogicalExpr;
+use crate::sql::planner::LogicalPlan;
 
 use super::Rule;
 
@@ -79,7 +79,11 @@ fn reorder_predicate(expr: LogicalExpr) -> (LogicalExpr, bool) {
 /// Flatten nested AND expressions into a list.
 fn flatten_and(expr: &LogicalExpr) -> Vec<LogicalExpr> {
     match expr {
-        LogicalExpr::BinaryOp { left, op: BinOp::And, right } => {
+        LogicalExpr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
             let mut result = flatten_and(left);
             result.extend(flatten_and(right));
             result
@@ -110,14 +114,14 @@ fn estimate_selectivity(expr: &LogicalExpr) -> u32 {
     match expr {
         LogicalExpr::BinaryOp { op, .. } => {
             match op {
-                BinOp::Eq => 10,         // Most selective
+                BinOp::Eq => 10, // Most selective
                 BinOp::Neq => 50,
                 BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => 33,
                 _ => 50,
             }
         }
         LogicalExpr::Like { .. } => 50, // LIKE is moderately selective
-        LogicalExpr::In { .. } => 10,    // IN is highly selective
+        LogicalExpr::In { .. } => 10,   // IN is highly selective
         LogicalExpr::Between { .. } => 33,
         LogicalExpr::IsNull(_) | LogicalExpr::IsNotNull(_) => 50,
         LogicalExpr::Not(_) => 60,

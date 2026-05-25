@@ -105,12 +105,8 @@ impl Default for ServerConfig {
                 flush_threshold_rows: 65536,
                 min_segment_seal_size_mb: 500,
             },
-            buffer: BufferSettings {
-                batch_size: 4096,
-            },
-            compression: CompressionSettings {
-                enabled: true,
-            },
+            buffer: BufferSettings { batch_size: 4096 },
+            compression: CompressionSettings { enabled: true },
             tls: TlsConfigYaml::default(),
             log: LogSettings {
                 level: "info".to_string(),

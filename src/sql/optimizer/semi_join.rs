@@ -1,7 +1,7 @@
-use crate::sql::planner::{LogicalPlan, LogicalExpr, SemiJoinPlan, ScanPlan};
-use crate::sql::parser::ast::{JoinType, BinOp};
-use crate::types::scalar::ScalarValue;
+use crate::sql::parser::ast::{BinOp, JoinType};
+use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan, SemiJoinPlan};
 use crate::types::batch::Schema;
+use crate::types::scalar::ScalarValue;
 
 use super::Rule;
 
@@ -20,12 +20,18 @@ impl Rule for SemiJoinRule {
 fn transform_to_semi_join(plan: LogicalPlan) -> (LogicalPlan, bool) {
     match plan {
         LogicalPlan::Filter(mut filter) => {
-            let (new_pred, pred_changed) = transform_expr_to_semi_join(&filter.predicate, &filter.input);
+            let (new_pred, pred_changed) =
+                transform_expr_to_semi_join(&filter.predicate, &filter.input);
             filter.predicate = new_pred;
             let (new_input, input_changed) = transform_to_semi_join(*filter.input);
             filter.input = Box::new(new_input);
-            
-            if let LogicalExpr::In { expr, values, negated } = &filter.predicate {
+
+            if let LogicalExpr::In {
+                expr,
+                values,
+                negated,
+            } = &filter.predicate
+            {
                 if !values.is_empty() && expr_is_column(expr) {
                     let left_plan = *filter.input.clone();
                     if let LogicalPlan::Scan(scan) = &left_plan {
@@ -36,7 +42,7 @@ fn transform_to_semi_join(plan: LogicalPlan) -> (LogicalPlan, bool) {
                     }
                 }
             }
-            
+
             (LogicalPlan::Filter(filter), pred_changed || input_changed)
         }
         LogicalPlan::Project(mut proj) => {
@@ -120,30 +126,34 @@ fn transform_expr_to_semi_join(expr: &LogicalExpr, input: &LogicalPlan) -> (Logi
             }
             (expr.clone(), false)
         }
-        LogicalExpr::BinaryOp { left, op, right } => {
-            match op {
-                BinOp::And => {
-                    let (new_left, lc) = transform_expr_to_semi_join(left, input);
-                    let (new_right, rc) = transform_expr_to_semi_join(right, input);
-                    (LogicalExpr::BinaryOp {
+        LogicalExpr::BinaryOp { left, op, right } => match op {
+            BinOp::And => {
+                let (new_left, lc) = transform_expr_to_semi_join(left, input);
+                let (new_right, rc) = transform_expr_to_semi_join(right, input);
+                (
+                    LogicalExpr::BinaryOp {
                         left: Box::new(new_left),
                         op: BinOp::And,
                         right: Box::new(new_right),
-                    }, lc || rc)
-                }
-                BinOp::Or => {
-                    let (new_left, lc) = transform_expr_to_semi_join(left, input);
-                    let (new_right, rc) = transform_expr_to_semi_join(right, input);
-                    (LogicalExpr::BinaryOp {
+                    },
+                    lc || rc,
+                )
+            }
+            BinOp::Or => {
+                let (new_left, lc) = transform_expr_to_semi_join(left, input);
+                let (new_right, rc) = transform_expr_to_semi_join(right, input);
+                (
+                    LogicalExpr::BinaryOp {
                         left: Box::new(new_left),
                         op: BinOp::Or,
                         right: Box::new(new_right),
-                    }, lc || rc)
-                }
-                _ => (expr.clone(), false)
+                    },
+                    lc || rc,
+                )
             }
-        }
-        _ => (expr.clone(), false)
+            _ => (expr.clone(), false),
+        },
+        _ => (expr.clone(), false),
     }
 }
 
@@ -151,18 +161,22 @@ fn expr_is_column(expr: &LogicalExpr) -> bool {
     matches!(expr, LogicalExpr::Column(_))
 }
 
-fn build_semi_join_from_in(scan: &ScanPlan, values: &[ScalarValue], negated: bool) -> Option<LogicalPlan> {
+fn build_semi_join_from_in(
+    scan: &ScanPlan,
+    values: &[ScalarValue],
+    negated: bool,
+) -> Option<LogicalPlan> {
     if values.is_empty() {
         return None;
     }
-    
+
     let col_idx = 0;
     let condition = LogicalExpr::BinaryOp {
         left: Box::new(LogicalExpr::Column(col_idx)),
         op: BinOp::Eq,
         right: Box::new(LogicalExpr::Literal(values[0].clone())),
     };
-    
+
     Some(LogicalPlan::SemiJoin(SemiJoinPlan {
         left: Box::new(LogicalPlan::Scan(scan.clone())),
         right: Box::new(build_values_scan(values)),
@@ -182,9 +196,7 @@ fn build_values_schema(values: &[ScalarValue]) -> crate::types::batch::Schema {
         return crate::types::batch::Schema::empty();
     }
     let dtype = values[0].data_type();
-    crate::types::batch::Schema::new(vec![
-        crate::types::batch::ColumnDef::new("value", dtype)
-    ])
+    crate::types::batch::Schema::new(vec![crate::types::batch::ColumnDef::new("value", dtype)])
 }
 
 fn extract_schema(plan: &LogicalPlan) -> crate::types::batch::Schema {
@@ -220,28 +232,35 @@ fn prune_semi_join_columns(plan: LogicalPlan) -> (LogicalPlan, bool) {
     match plan {
         LogicalPlan::SemiJoin(mut semi) => {
             let condition_cols = extract_condition_columns(&semi.condition);
-            let left_needed: Vec<usize> = condition_cols.iter()
+            let left_needed: Vec<usize> = condition_cols
+                .iter()
                 .filter(|&c| *c < semi.left_schema.columns.len())
                 .cloned()
                 .collect();
-            
-            let (new_left, left_changed) = apply_projection_to_input(*semi.left, &left_needed, &semi.left_schema);
+
+            let (new_left, left_changed) =
+                apply_projection_to_input(*semi.left, &left_needed, &semi.left_schema);
             semi.left = Box::new(new_left);
-            
-            let right_needed: Vec<usize> = condition_cols.iter()
+
+            let right_needed: Vec<usize> = condition_cols
+                .iter()
                 .filter(|&c| *c >= semi.left_schema.columns.len())
                 .map(|c| c - semi.left_schema.columns.len())
                 .collect();
-            
-            let (new_right, right_changed) = apply_projection_to_input(*semi.right, &right_needed, &semi.right_schema);
+
+            let (new_right, right_changed) =
+                apply_projection_to_input(*semi.right, &right_needed, &semi.right_schema);
             semi.right = Box::new(new_right);
-            
+
             let (new_left, new_left_changed) = prune_semi_join_columns(*semi.left);
             let (new_right, new_right_changed) = prune_semi_join_columns(*semi.right);
             semi.left = Box::new(new_left);
             semi.right = Box::new(new_right);
-            
-            (LogicalPlan::SemiJoin(semi), left_changed || right_changed || new_left_changed || new_right_changed)
+
+            (
+                LogicalPlan::SemiJoin(semi),
+                left_changed || right_changed || new_left_changed || new_right_changed,
+            )
         }
         LogicalPlan::Project(mut proj) => {
             let (new_input, changed) = prune_semi_join_columns(*proj.input);
@@ -314,12 +333,18 @@ fn extract_cols_from_expr(expr: &LogicalExpr, cols: &mut Vec<usize>) {
         LogicalExpr::IsNull(inner) => extract_cols_from_expr(inner, cols),
         LogicalExpr::IsNotNull(inner) => extract_cols_from_expr(inner, cols),
         LogicalExpr::In { expr, .. } => extract_cols_from_expr(expr, cols),
-        LogicalExpr::Between { expr, low, high, .. } => {
+        LogicalExpr::Between {
+            expr, low, high, ..
+        } => {
             extract_cols_from_expr(expr, cols);
             extract_cols_from_expr(low, cols);
             extract_cols_from_expr(high, cols);
         }
-        LogicalExpr::Case { operand, when_clauses, else_clause } => {
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
             if let Some(o) = operand {
                 extract_cols_from_expr(o, cols);
             }
@@ -342,25 +367,31 @@ fn extract_cols_from_expr(expr: &LogicalExpr, cols: &mut Vec<usize>) {
     }
 }
 
-fn apply_projection_to_input(plan: LogicalPlan, needed_cols: &[usize], schema: &crate::types::batch::Schema) -> (LogicalPlan, bool) {
+fn apply_projection_to_input(
+    plan: LogicalPlan,
+    needed_cols: &[usize],
+    schema: &crate::types::batch::Schema,
+) -> (LogicalPlan, bool) {
     if needed_cols.is_empty() {
         return (plan, false);
     }
-    
+
     match plan {
         LogicalPlan::Scan(mut scan) => {
-            let current_proj = scan.projection.as_ref()
+            let current_proj = scan
+                .projection
+                .as_ref()
                 .map(|p| p.iter().cloned().collect::<Vec<_>>())
                 .unwrap_or_else(|| (0..schema.columns.len()).collect());
-            
+
             let has_all = needed_cols.iter().all(|c| current_proj.contains(c));
             if has_all && scan.projection.is_some() {
                 return (LogicalPlan::Scan(scan), false);
             }
-            
+
             scan.projection = Some(needed_cols.to_vec());
             (LogicalPlan::Scan(scan), true)
         }
-        other => (other, false)
+        other => (other, false),
     }
 }

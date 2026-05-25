@@ -1,8 +1,8 @@
-use crate::sql::planner::{LogicalPlan, LogicalExpr, AggregateExpr, AggFunc};
+use crate::common::error::Result;
+use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr, LogicalPlan};
+use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
-use crate::types::array::ColumnArray;
-use crate::common::error::Result;
 
 use super::Rule;
 
@@ -23,7 +23,9 @@ fn optimize_subqueries(plan: LogicalPlan) -> (LogicalPlan, bool) {
         LogicalPlan::Project(mut proj) => {
             let input_plan = *proj.input.clone();
             let mut changed = false;
-            let new_exprs: Vec<LogicalExpr> = proj.expressions.iter()
+            let new_exprs: Vec<LogicalExpr> = proj
+                .expressions
+                .iter()
                 .map(|e| {
                     let (new_e, c) = replace_subquery_expr(e.clone(), &input_plan);
                     changed = changed || c;
@@ -37,38 +39,47 @@ fn optimize_subqueries(plan: LogicalPlan) -> (LogicalPlan, bool) {
         }
         LogicalPlan::Filter(mut filter) => {
             let input_plan = *filter.input.clone();
-            let (new_pred, pred_changed) = replace_subquery_expr(filter.predicate.clone(), &input_plan);
+            let (new_pred, pred_changed) =
+                replace_subquery_expr(filter.predicate.clone(), &input_plan);
             filter.predicate = new_pred;
             let (new_input, input_changed) = optimize_subqueries(*filter.input);
             filter.input = Box::new(new_input);
             (LogicalPlan::Filter(filter), pred_changed || input_changed)
         }
         LogicalPlan::Join(join) => {
-            let (new_cond, cond_changed) = replace_subquery_expr(join.condition.clone(), &LogicalPlan::Empty);
+            let (new_cond, cond_changed) =
+                replace_subquery_expr(join.condition.clone(), &LogicalPlan::Empty);
             let (new_left, left_changed) = optimize_subqueries(*join.left);
             let (new_right, right_changed) = optimize_subqueries(*join.right);
-            (LogicalPlan::Join(crate::sql::planner::JoinPlan {
-                condition: new_cond,
-                left: Box::new(new_left),
-                right: Box::new(new_right),
-                left_schema: join.left_schema,
-                right_schema: join.right_schema,
-                join_type: join.join_type,
-                output_schema: join.output_schema,
-            }), cond_changed || left_changed || right_changed)
+            (
+                LogicalPlan::Join(crate::sql::planner::JoinPlan {
+                    condition: new_cond,
+                    left: Box::new(new_left),
+                    right: Box::new(new_right),
+                    left_schema: join.left_schema,
+                    right_schema: join.right_schema,
+                    join_type: join.join_type,
+                    output_schema: join.output_schema,
+                }),
+                cond_changed || left_changed || right_changed,
+            )
         }
         LogicalPlan::SemiJoin(semi) => {
-            let (new_cond, cond_changed) = replace_subquery_expr(semi.condition.clone(), &LogicalPlan::Empty);
+            let (new_cond, cond_changed) =
+                replace_subquery_expr(semi.condition.clone(), &LogicalPlan::Empty);
             let (new_left, left_changed) = optimize_subqueries(*semi.left);
             let (new_right, right_changed) = optimize_subqueries(*semi.right);
-            (LogicalPlan::SemiJoin(crate::sql::planner::SemiJoinPlan {
-                condition: new_cond,
-                left: Box::new(new_left),
-                right: Box::new(new_right),
-                left_schema: semi.left_schema,
-                right_schema: semi.right_schema,
-                is_anti: semi.is_anti,
-            }), cond_changed || left_changed || right_changed)
+            (
+                LogicalPlan::SemiJoin(crate::sql::planner::SemiJoinPlan {
+                    condition: new_cond,
+                    left: Box::new(new_left),
+                    right: Box::new(new_right),
+                    left_schema: semi.left_schema,
+                    right_schema: semi.right_schema,
+                    is_anti: semi.is_anti,
+                }),
+                cond_changed || left_changed || right_changed,
+            )
         }
         LogicalPlan::Aggregate(mut agg) => {
             let (new_input, input_changed) = optimize_subqueries(*agg.input);
@@ -122,27 +133,42 @@ fn replace_subquery_expr(expr: LogicalExpr, _context_plan: &LogicalPlan) -> (Log
                 Err(_) => (LogicalExpr::ExistsSubquery(subquery_plan), false),
             }
         }
-        LogicalExpr::InSubquery { expr: inner_expr, subquery, negated } => {
+        LogicalExpr::InSubquery {
+            expr: inner_expr,
+            subquery,
+            negated,
+        } => {
             let result = evaluate_in_subquery(&subquery);
             match result {
-                Ok(values) => {
-                    (LogicalExpr::In {
+                Ok(values) => (
+                    LogicalExpr::In {
                         expr: inner_expr,
                         values,
                         negated,
-                    }, true)
-                }
-                Err(_) => (LogicalExpr::InSubquery { expr: inner_expr, subquery, negated }, false),
+                    },
+                    true,
+                ),
+                Err(_) => (
+                    LogicalExpr::InSubquery {
+                        expr: inner_expr,
+                        subquery,
+                        negated,
+                    },
+                    false,
+                ),
             }
         }
         LogicalExpr::BinaryOp { left, op, right } => {
             let (new_left, lc) = replace_subquery_expr(*left, _context_plan);
             let (new_right, rc) = replace_subquery_expr(*right, _context_plan);
-            (LogicalExpr::BinaryOp {
-                left: Box::new(new_left),
-                op,
-                right: Box::new(new_right),
-            }, lc || rc)
+            (
+                LogicalExpr::BinaryOp {
+                    left: Box::new(new_left),
+                    op,
+                    right: Box::new(new_right),
+                },
+                lc || rc,
+            )
         }
         LogicalExpr::Not(inner) => {
             let (new_inner, changed) = replace_subquery_expr(*inner, _context_plan);
@@ -156,29 +182,53 @@ fn replace_subquery_expr(expr: LogicalExpr, _context_plan: &LogicalPlan) -> (Log
             let (new_inner, changed) = replace_subquery_expr(*inner, _context_plan);
             (LogicalExpr::IsNotNull(Box::new(new_inner)), changed)
         }
-        LogicalExpr::In { expr: inner_expr, values, negated } => {
+        LogicalExpr::In {
+            expr: inner_expr,
+            values,
+            negated,
+        } => {
             let (new_expr, changed) = replace_subquery_expr(*inner_expr, _context_plan);
-            (LogicalExpr::In { expr: Box::new(new_expr), values, negated }, changed)
+            (
+                LogicalExpr::In {
+                    expr: Box::new(new_expr),
+                    values,
+                    negated,
+                },
+                changed,
+            )
         }
-        LogicalExpr::Between { expr, low, high, negated } => {
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let (new_expr, ec) = replace_subquery_expr(*expr, _context_plan);
             let (new_low, lc) = replace_subquery_expr(*low, _context_plan);
             let (new_high, hc) = replace_subquery_expr(*high, _context_plan);
-            (LogicalExpr::Between {
-                expr: Box::new(new_expr),
-                low: Box::new(new_low),
-                high: Box::new(new_high),
-                negated,
-            }, ec || lc || hc)
+            (
+                LogicalExpr::Between {
+                    expr: Box::new(new_expr),
+                    low: Box::new(new_low),
+                    high: Box::new(new_high),
+                    negated,
+                },
+                ec || lc || hc,
+            )
         }
-        LogicalExpr::Case { operand, when_clauses, else_clause } => {
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
             let mut changed = false;
             let new_operand = operand.map(|o| {
                 let (new_o, c) = replace_subquery_expr(*o, _context_plan);
                 changed = changed || c;
                 Box::new(new_o)
             });
-            let new_when: Vec<(LogicalExpr, LogicalExpr)> = when_clauses.iter()
+            let new_when: Vec<(LogicalExpr, LogicalExpr)> = when_clauses
+                .iter()
                 .map(|(cond, result)| {
                     let (new_cond, cc) = replace_subquery_expr(cond.clone(), _context_plan);
                     let (new_result, rc) = replace_subquery_expr(result.clone(), _context_plan);
@@ -191,30 +241,58 @@ fn replace_subquery_expr(expr: LogicalExpr, _context_plan: &LogicalPlan) -> (Log
                 changed = changed || c;
                 Box::new(new_e)
             });
-            (LogicalExpr::Case { operand: new_operand, when_clauses: new_when, else_clause: new_else }, changed)
+            (
+                LogicalExpr::Case {
+                    operand: new_operand,
+                    when_clauses: new_when,
+                    else_clause: new_else,
+                },
+                changed,
+            )
         }
-        LogicalExpr::Like { expr, pattern, negated } => {
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
             let (new_expr, changed) = replace_subquery_expr(*expr, _context_plan);
-            (LogicalExpr::Like { expr: Box::new(new_expr), pattern, negated }, changed)
+            (
+                LogicalExpr::Like {
+                    expr: Box::new(new_expr),
+                    pattern,
+                    negated,
+                },
+                changed,
+            )
         }
         LogicalExpr::Function { name, args } => {
             let mut changed = false;
-            let new_args: Vec<LogicalExpr> = args.iter()
+            let new_args: Vec<LogicalExpr> = args
+                .iter()
                 .map(|a| {
                     let (new_a, c) = replace_subquery_expr(a.clone(), _context_plan);
                     changed = changed || c;
                     new_a
                 })
                 .collect();
-            (LogicalExpr::Function { name, args: new_args }, changed)
+            (
+                LogicalExpr::Function {
+                    name,
+                    args: new_args,
+                },
+                changed,
+            )
         }
         LogicalExpr::Aggregate(agg) => {
             let (new_arg, changed) = replace_subquery_expr(*agg.arg, _context_plan);
-            (LogicalExpr::Aggregate(AggregateExpr {
-                func: agg.func,
-                arg: Box::new(new_arg),
-                distinct: agg.distinct,
-            }), changed)
+            (
+                LogicalExpr::Aggregate(AggregateExpr {
+                    func: agg.func,
+                    arg: Box::new(new_arg),
+                    distinct: agg.distinct,
+                }),
+                changed,
+            )
         }
         other => (other, false),
     }
@@ -247,9 +325,7 @@ fn evaluate_in_subquery(plan: &LogicalPlan) -> Result<Vec<ScalarValue>> {
 
 fn execute_simple_plan(plan: &LogicalPlan) -> Result<RecordBatch> {
     match plan {
-        LogicalPlan::Scan(scan) => {
-            Ok(RecordBatch::new(scan.schema.clone()))
-        }
+        LogicalPlan::Scan(scan) => Ok(RecordBatch::new(scan.schema.clone())),
         LogicalPlan::Aggregate(agg) => {
             let input_batch = execute_simple_plan(&agg.input)?;
             let mut result_batch = RecordBatch::new(input_batch.schema.clone());
@@ -273,18 +349,10 @@ fn execute_simple_plan(plan: &LogicalPlan) -> Result<RecordBatch> {
             }
             Ok(trim_batch(&input_batch, limit.offset, end))
         }
-        LogicalPlan::Project(proj) => {
-            execute_simple_plan(&proj.input)
-        }
-        LogicalPlan::Sort(sort) => {
-            execute_simple_plan(&sort.input)
-        }
-        LogicalPlan::TopN(topn) => {
-            execute_simple_plan(&topn.input)
-        }
-        LogicalPlan::Empty => {
-            Ok(RecordBatch::new(Schema::empty()))
-        }
+        LogicalPlan::Project(proj) => execute_simple_plan(&proj.input),
+        LogicalPlan::Sort(sort) => execute_simple_plan(&sort.input),
+        LogicalPlan::TopN(topn) => execute_simple_plan(&topn.input),
+        LogicalPlan::Empty => Ok(RecordBatch::new(Schema::empty())),
         _ => Ok(RecordBatch::new(Schema::empty())),
     }
 }
@@ -300,7 +368,12 @@ fn compute_simple_aggregate(agg: &AggregateExpr, batch: &RecordBatch) -> ScalarV
         AggFunc::Count => {
             if let Some(idx) = col_idx {
                 let non_null = (0..batch.num_rows())
-                    .filter(|i| !batch.scalar(*i, idx).unwrap_or(ScalarValue::Int64(None)).is_null())
+                    .filter(|i| {
+                        !batch
+                            .scalar(*i, idx)
+                            .unwrap_or(ScalarValue::Int64(None))
+                            .is_null()
+                    })
                     .count();
                 ScalarValue::Int64(Some(non_null as i64))
             } else {
@@ -415,12 +488,18 @@ fn extract_cols_from_expr_recursive(expr: &LogicalExpr, cols: &mut Vec<usize>) {
         LogicalExpr::IsNotNull(inner) => extract_cols_from_expr_recursive(inner, cols),
         LogicalExpr::Aggregate(agg) => extract_cols_from_expr_recursive(&agg.arg, cols),
         LogicalExpr::In { expr, .. } => extract_cols_from_expr_recursive(expr, cols),
-        LogicalExpr::Between { expr, low, high, .. } => {
+        LogicalExpr::Between {
+            expr, low, high, ..
+        } => {
             extract_cols_from_expr_recursive(expr, cols);
             extract_cols_from_expr_recursive(low, cols);
             extract_cols_from_expr_recursive(high, cols);
         }
-        LogicalExpr::Case { operand, when_clauses, else_clause } => {
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
             if let Some(o) = operand {
                 extract_cols_from_expr_recursive(o, cols);
             }

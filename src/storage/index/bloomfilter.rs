@@ -17,7 +17,7 @@ impl BloomFilter {
     pub fn new(expected_items: usize, false_positive_rate: f64) -> Self {
         let num_bits = Self::optimal_num_bits(expected_items, false_positive_rate);
         let num_hashes = Self::optimal_num_hashes(expected_items, num_bits);
-        
+
         Self {
             bits: vec![0u8; (num_bits + 7) / 8],
             num_bits,
@@ -49,10 +49,10 @@ impl BloomFilter {
         if value.is_null() {
             return;
         }
-        
+
         let hash1 = self.hash_value(value, 0);
         let hash2 = self.hash_value(value, hash1);
-        
+
         for i in 0..self.num_hashes {
             let combined_hash = hash1.wrapping_add((i as u64).wrapping_mul(hash2));
             let bit_index = combined_hash % (self.num_bits as u64);
@@ -64,10 +64,10 @@ impl BloomFilter {
         if value.is_null() {
             return true;
         }
-        
+
         let hash1 = self.hash_value(value, 0);
         let hash2 = self.hash_value(value, hash1);
-        
+
         for i in 0..self.num_hashes {
             let combined_hash = hash1.wrapping_add((i as u64).wrapping_mul(hash2));
             let bit_index = combined_hash % (self.num_bits as u64);
@@ -82,7 +82,7 @@ impl BloomFilter {
         if self.num_bits != other.num_bits {
             return;
         }
-        
+
         for (i, &byte) in other.bits.iter().enumerate() {
             if i < self.bits.len() {
                 self.bits[i] |= byte;
@@ -99,25 +99,85 @@ impl BloomFilter {
 
     fn hash_scalar(&self, value: &ScalarValue, hasher: &mut DefaultHasher) {
         match value {
-            ScalarValue::Bool(Some(v)) => { 0u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Int8(Some(v)) => { 1u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Int16(Some(v)) => { 2u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Int32(Some(v)) => { 3u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Int64(Some(v)) => { 4u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::UInt8(Some(v)) => { 5u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::UInt16(Some(v)) => { 6u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::UInt32(Some(v)) => { 7u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::UInt64(Some(v)) => { 8u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Float32(Some(v)) => { 9u8.hash(hasher); v.to_bits().hash(hasher); }
-            ScalarValue::Float64(Some(v)) => { 10u8.hash(hasher); v.to_bits().hash(hasher); }
-            ScalarValue::Decimal(Some(v)) => { 11u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Date(Some(v)) => { 12u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Time(Some(v)) => { 13u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Timestamp(Some(v)) => { 14u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Interval(Some(v)) => { 15u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::VarChar(Some(v)) => { 16u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Blob(Some(v)) => { 17u8.hash(hasher); v.hash(hasher); }
-            ScalarValue::Vector(Some(v)) => { 18u8.hash(hasher); v.len().hash(hasher); for f in v { f.to_bits().hash(hasher); } }
+            ScalarValue::Bool(Some(v)) => {
+                0u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Int8(Some(v)) => {
+                1u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Int16(Some(v)) => {
+                2u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Int32(Some(v)) => {
+                3u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Int64(Some(v)) => {
+                4u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::UInt8(Some(v)) => {
+                5u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::UInt16(Some(v)) => {
+                6u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::UInt32(Some(v)) => {
+                7u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::UInt64(Some(v)) => {
+                8u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Float32(Some(v)) => {
+                9u8.hash(hasher);
+                v.to_bits().hash(hasher);
+            }
+            ScalarValue::Float64(Some(v)) => {
+                10u8.hash(hasher);
+                v.to_bits().hash(hasher);
+            }
+            ScalarValue::Decimal(Some(v)) => {
+                11u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Date(Some(v)) => {
+                12u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Time(Some(v)) => {
+                13u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Timestamp(Some(v)) => {
+                14u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Interval(Some(v)) => {
+                15u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::VarChar(Some(v)) => {
+                16u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Blob(Some(v)) => {
+                17u8.hash(hasher);
+                v.hash(hasher);
+            }
+            ScalarValue::Vector(Some(v)) => {
+                18u8.hash(hasher);
+                v.len().hash(hasher);
+                for f in v {
+                    f.to_bits().hash(hasher);
+                }
+            }
             _ => {}
         }
     }
@@ -152,15 +212,15 @@ impl BloomFilter {
         if data.len() < 16 {
             return None;
         }
-        
+
         let num_bits = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
         let num_hashes = u64::from_le_bytes(data[8..16].try_into().ok()?) as usize;
         let bits_len = (num_bits + 7) / 8;
-        
+
         if data.len() < 16 + bits_len {
             return None;
         }
-        
+
         Some(Self {
             bits: data[16..16 + bits_len].to_vec(),
             num_bits,
@@ -190,10 +250,10 @@ mod tests {
     #[test]
     fn test_bloomfilter_basic() {
         let mut bf = BloomFilter::with_defaults();
-        
+
         bf.add(&ScalarValue::Int64(Some(42)));
         bf.add(&ScalarValue::VarChar(Some("test".into())));
-        
+
         assert!(bf.might_contain(&ScalarValue::Int64(Some(42))));
         assert!(bf.might_contain(&ScalarValue::VarChar(Some("test".into()))));
         assert!(!bf.might_contain(&ScalarValue::Int64(Some(999))));
@@ -203,7 +263,7 @@ mod tests {
     fn test_bloomfilter_null() {
         let mut bf = BloomFilter::with_defaults();
         bf.add(&ScalarValue::Int64(None));
-        
+
         assert!(bf.might_contain(&ScalarValue::Int64(None)));
     }
 
@@ -211,15 +271,15 @@ mod tests {
     fn test_bloomfilter_merge() {
         let mut bf1 = BloomFilter::new(100, 0.01);
         let mut bf2 = BloomFilter::new(100, 0.01);
-        
+
         bf1.add(&ScalarValue::Int64(Some(1)));
         bf1.add(&ScalarValue::Int64(Some(2)));
-        
+
         bf2.add(&ScalarValue::Int64(Some(3)));
         bf2.add(&ScalarValue::Int64(Some(4)));
-        
+
         bf1.merge(&bf2);
-        
+
         assert!(bf1.might_contain(&ScalarValue::Int64(Some(1))));
         assert!(bf1.might_contain(&ScalarValue::Int64(Some(3))));
     }
@@ -229,10 +289,10 @@ mod tests {
         let mut bf = BloomFilter::with_defaults();
         bf.add(&ScalarValue::Int64(Some(42)));
         bf.add(&ScalarValue::VarChar(Some("hello".into())));
-        
+
         let serialized = bf.serialize();
         let deserialized = BloomFilter::deserialize(&serialized).unwrap();
-        
+
         assert!(deserialized.might_contain(&ScalarValue::Int64(Some(42))));
         assert!(deserialized.might_contain(&ScalarValue::VarChar(Some("hello".into()))));
     }

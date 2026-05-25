@@ -29,7 +29,7 @@ impl PartitionFunction {
             }
         }
     }
-    
+
     pub fn apply_str(&self, s: &str) -> i64 {
         match self {
             PartitionFunction::Hash(buckets) => {
@@ -53,21 +53,16 @@ fn compute_string_hash(s: &str) -> i64 {
     hash.abs()
 }
 
-pub fn compute_partition_key_from_scalar(
-    func: &PartitionFunction,
-    val: &ScalarValue,
-) -> String {
+pub fn compute_partition_key_from_scalar(func: &PartitionFunction, val: &ScalarValue) -> String {
     match val {
         ScalarValue::Int64(Some(v)) => func.apply(*v).to_string(),
         ScalarValue::Int32(Some(v)) => func.apply(*v as i64).to_string(),
         ScalarValue::Timestamp(Some(v)) => func.apply(*v).to_string(),
         ScalarValue::Date(Some(v)) => func.apply(*v as i64).to_string(),
-        ScalarValue::VarChar(Some(s)) => {
-            match func {
-                PartitionFunction::Hash(_) => func.apply_str(s).to_string(),
-                _ => s.clone(),
-            }
-        }
+        ScalarValue::VarChar(Some(s)) => match func {
+            PartitionFunction::Hash(_) => func.apply_str(s).to_string(),
+            _ => s.clone(),
+        },
         _ => String::new(),
     }
 }
@@ -105,7 +100,10 @@ pub fn compute_partition_key_from_bulk_payload(
         None => return Ok(String::new()),
     };
 
-    let bulk_col = req.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&table_meta.partition_key));
+    let bulk_col = req
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&table_meta.partition_key));
     let bulk_col = match bulk_col {
         Some(c) => c,
         None => return Ok(String::new()),
@@ -152,5 +150,8 @@ pub fn compute_partition_key_from_bulk_payload(
         _ => return Ok(String::new()),
     };
 
-    Ok(compute_partition_key_from_scalar(&table_meta.partition_strategy(), &first_val))
+    Ok(compute_partition_key_from_scalar(
+        &table_meta.partition_strategy(),
+        &first_val,
+    ))
 }

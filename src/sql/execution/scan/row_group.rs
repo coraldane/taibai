@@ -61,7 +61,9 @@ pub fn prune_row_groups(
         candidates.push(rg_idx);
     }
 
-    RowGroupPruneResult { candidate_indices: candidates }
+    RowGroupPruneResult {
+        candidate_indices: candidates,
+    }
 }
 
 pub fn prune_segment_by_zone_map(
@@ -89,7 +91,10 @@ fn check_in_predicate_row_group(
         return true;
     }
 
-    if let Some(bf) = bloom_filters.get(pred.column_index).and_then(|b| b.as_ref()) {
+    if let Some(bf) = bloom_filters
+        .get(pred.column_index)
+        .and_then(|b| b.as_ref())
+    {
         let any_might = pred.values.iter().any(|v| bf.might_contain(v));
         if !any_might {
             return false;

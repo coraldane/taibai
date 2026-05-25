@@ -42,10 +42,13 @@ fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
                 }
                 other => {
                     let applied = input_changed;
-                    (LogicalPlan::Filter(FilterPlan {
-                        predicate: filter.predicate,
-                        input: Box::new(other),
-                    }), applied)
+                    (
+                        LogicalPlan::Filter(FilterPlan {
+                            predicate: filter.predicate,
+                            input: Box::new(other),
+                        }),
+                        applied,
+                    )
                 }
             }
         }

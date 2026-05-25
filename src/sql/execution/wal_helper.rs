@@ -5,7 +5,11 @@ use crate::storage::catalog::schema::TableMeta;
 
 use super::engine::Engine;
 
-pub fn write_wal(engine: &Engine, table_dir: &Path, batch: &crate::types::batch::RecordBatch) -> Result<()> {
+pub fn write_wal(
+    engine: &Engine,
+    table_dir: &Path,
+    batch: &crate::types::batch::RecordBatch,
+) -> Result<()> {
     if engine.is_bulk_mode() {
         return Ok(());
     }
@@ -26,7 +30,10 @@ pub fn determine_write_dir(
         return Ok((default_dir.to_path_buf(), String::new()));
     }
 
-    let part_col_idx = batch.schema.columns.iter()
+    let part_col_idx = batch
+        .schema
+        .columns
+        .iter()
         .position(|c| c.name == table_meta.partition_key);
 
     let Some(col_idx) = part_col_idx else {
@@ -43,17 +50,26 @@ pub fn determine_write_dir(
         crate::storage::catalog::schema::PartitionType::Month => {
             crate::storage::partition::PartitionStrategy::Month
         }
-        crate::storage::catalog::schema::PartitionType::Value => crate::storage::partition::PartitionStrategy::Day,
+        crate::storage::catalog::schema::PartitionType::Value => {
+            crate::storage::partition::PartitionStrategy::Day
+        }
         crate::storage::catalog::schema::PartitionType::Hash => {
-            let first_val = batch.scalar(0, col_idx)
+            let first_val = batch
+                .scalar(0, col_idx)
                 .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-            let hash_val = crate::storage::partition::partition_function::hash_partition_value(&first_val, table_meta.partition_param as i64);
+            let hash_val = crate::storage::partition::partition_function::hash_partition_value(
+                &first_val,
+                table_meta.partition_param as i64,
+            );
             return Ok((default_dir.to_path_buf(), format!("hash_{}", hash_val)));
         }
-        crate::storage::catalog::schema::PartitionType::None => return Ok((default_dir.to_path_buf(), String::new())),
+        crate::storage::catalog::schema::PartitionType::None => {
+            return Ok((default_dir.to_path_buf(), String::new()))
+        }
     };
 
-    let first_val = batch.scalar(0, col_idx)
+    let first_val = batch
+        .scalar(0, col_idx)
         .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
 
     let partition_key = crate::storage::partition::compute_partition_key(&first_val, strategy)
@@ -114,88 +130,74 @@ fn encode_column_raw(col: &crate::types::array::ColumnArray) -> Vec<u8> {
     match col {
         ColumnArray::Bool { data, .. } => data.clone(),
         ColumnArray::Int8 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len())
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
             bytes.to_vec()
         }
         ColumnArray::Int16 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
             bytes.to_vec()
         }
         ColumnArray::Int32 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
             bytes.to_vec()
         }
         ColumnArray::Int64 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
             bytes.to_vec()
         }
         ColumnArray::UInt8 { data, .. } => data.clone(),
         ColumnArray::UInt16 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
             bytes.to_vec()
         }
         ColumnArray::UInt32 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
             bytes.to_vec()
         }
         ColumnArray::UInt64 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
             bytes.to_vec()
         }
         ColumnArray::Float32 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
             bytes.to_vec()
         }
         ColumnArray::Float64 { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
             bytes.to_vec()
         }
         ColumnArray::Decimal { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
             bytes.to_vec()
         }
         ColumnArray::Date { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
             bytes.to_vec()
         }
         ColumnArray::Time { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
             bytes.to_vec()
         }
         ColumnArray::Timestamp { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
             bytes.to_vec()
         }
         ColumnArray::Interval { data, .. } => {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-            };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
             bytes.to_vec()
         }
         ColumnArray::VarChar { data, .. } => {
@@ -227,7 +229,10 @@ fn encode_column_raw(col: &crate::types::array::ColumnArray) -> Vec<u8> {
     }
 }
 
-pub fn deserialize_batch_from_wal(data: &[u8], schema: &crate::types::batch::Schema) -> Result<crate::types::batch::RecordBatch> {
+pub fn deserialize_batch_from_wal(
+    data: &[u8],
+    schema: &crate::types::batch::Schema,
+) -> Result<crate::types::batch::RecordBatch> {
     use crate::common::error::MonaxError;
 
     const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
@@ -272,9 +277,11 @@ pub fn deserialize_batch_from_wal(data: &[u8], schema: &crate::types::batch::Sch
     let num_rows = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]) as usize;
 
     if num_cols != schema.columns.len() {
-        return Err(MonaxError::Internal(
-            format!("WAL column count mismatch: {} vs {}", num_cols, schema.columns.len())
-        ));
+        return Err(MonaxError::Internal(format!(
+            "WAL column count mismatch: {} vs {}",
+            num_cols,
+            schema.columns.len()
+        )));
     }
 
     let mut batch = crate::types::batch::RecordBatch::new(schema.clone());
@@ -282,46 +289,72 @@ pub fn deserialize_batch_from_wal(data: &[u8], schema: &crate::types::batch::Sch
 
     for col_idx in 0..num_cols {
         if offset >= payload.len() {
-            return Err(MonaxError::Internal("WAL data truncated at column header".into()));
+            return Err(MonaxError::Internal(
+                "WAL data truncated at column header".into(),
+            ));
         }
 
         let _dtype_byte = payload[offset];
         offset += 1;
 
         if offset + 4 > payload.len() {
-            return Err(MonaxError::Internal("WAL data truncated at bitmap len".into()));
+            return Err(MonaxError::Internal(
+                "WAL data truncated at bitmap len".into(),
+            ));
         }
         let bitmap_len = u32::from_le_bytes([
-            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
         ]) as usize;
         offset += 4;
 
         let null_bitmap = if bitmap_len > 0 {
             if offset + bitmap_len > payload.len() {
-                return Err(MonaxError::Internal("WAL data truncated at bitmap data".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated at bitmap data".into(),
+                ));
             }
-            Some(crate::types::bitmap::NullBitmap::from_bytes(&payload[offset..offset + bitmap_len], num_rows))
+            Some(crate::types::bitmap::NullBitmap::from_bytes(
+                &payload[offset..offset + bitmap_len],
+                num_rows,
+            ))
         } else {
             None
         };
         offset += bitmap_len;
 
         if offset + 4 > payload.len() {
-            return Err(MonaxError::Internal("WAL data truncated at data len".into()));
+            return Err(MonaxError::Internal(
+                "WAL data truncated at data len".into(),
+            ));
         }
         let data_len = u32::from_le_bytes([
-            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
         ]) as usize;
         offset += 4;
 
         if offset + data_len > payload.len() {
-            return Err(MonaxError::Internal("WAL data truncated at column data".into()));
+            return Err(MonaxError::Internal(
+                "WAL data truncated at column data".into(),
+            ));
         }
         let col_data = &payload[offset..offset + data_len];
         offset += data_len;
 
         let dt = schema.columns[col_idx].data_type;
-        decode_column_raw(&mut batch, col_idx, dt, col_data, num_rows, null_bitmap.as_ref())?;
+        decode_column_raw(
+            &mut batch,
+            col_idx,
+            dt,
+            col_data,
+            num_rows,
+            null_bitmap.as_ref(),
+        )?;
     }
 
     Ok(batch)
@@ -354,7 +387,11 @@ fn decode_column_raw(
     Ok(())
 }
 
-fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::DataType) -> Result<crate::types::scalar::ScalarValue> {
+fn decode_fixed_value(
+    data: &[u8],
+    pos: &mut usize,
+    dt: crate::protocol::types::DataType,
+) -> Result<crate::types::scalar::ScalarValue> {
     use crate::common::error::MonaxError;
     use crate::types::scalar::ScalarValue;
 
@@ -387,7 +424,8 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Int32".into()));
             }
-            let v = i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            let v =
+                i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
             *pos += 4;
             Ok(ScalarValue::Int32(Some(v)))
         }
@@ -396,8 +434,14 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::
                 return Err(MonaxError::Internal("WAL data truncated for Int64".into()));
             }
             let v = i64::from_le_bytes([
-                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-                data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7],
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
             ]);
             *pos += 8;
             Ok(ScalarValue::Int64(Some(v)))
@@ -422,7 +466,8 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for UInt32".into()));
             }
-            let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            let v =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
             *pos += 4;
             Ok(ScalarValue::UInt32(Some(v)))
         }
@@ -431,38 +476,63 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::
                 return Err(MonaxError::Internal("WAL data truncated for UInt64".into()));
             }
             let v = u64::from_le_bytes([
-                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-                data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7],
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
             ]);
             *pos += 8;
             Ok(ScalarValue::UInt64(Some(v)))
         }
         crate::protocol::types::DataType::Float32 => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Float32".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for Float32".into(),
+                ));
             }
-            let v = f32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            let v =
+                f32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
             *pos += 4;
             Ok(ScalarValue::Float32(Some(v)))
         }
         crate::protocol::types::DataType::Float64 => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Float64".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for Float64".into(),
+                ));
             }
             let v = f64::from_le_bytes([
-                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-                data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7],
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
             ]);
             *pos += 8;
             Ok(ScalarValue::Float64(Some(v)))
         }
         crate::protocol::types::DataType::Decimal => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Decimal".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for Decimal".into(),
+                ));
             }
             let v = i64::from_le_bytes([
-                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-                data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7],
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
             ]);
             *pos += 8;
             Ok(ScalarValue::Decimal(Some(v)))
@@ -471,7 +541,8 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Date".into()));
             }
-            let v = i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+            let v =
+                i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
             *pos += 4;
             Ok(ScalarValue::Date(Some(v)))
         }
@@ -480,42 +551,70 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::
                 return Err(MonaxError::Internal("WAL data truncated for Time".into()));
             }
             let v = i64::from_le_bytes([
-                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-                data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7],
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
             ]);
             *pos += 8;
             Ok(ScalarValue::Time(Some(v)))
         }
         crate::protocol::types::DataType::Timestamp => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Timestamp".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for Timestamp".into(),
+                ));
             }
             let v = i64::from_le_bytes([
-                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-                data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7],
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
             ]);
             *pos += 8;
             Ok(ScalarValue::Timestamp(Some(v)))
         }
         crate::protocol::types::DataType::Interval => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Interval".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for Interval".into(),
+                ));
             }
             let v = i64::from_le_bytes([
-                data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-                data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7],
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
             ]);
             *pos += 8;
             Ok(ScalarValue::Interval(Some(v)))
         }
         crate::protocol::types::DataType::VarChar => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for VarChar".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for VarChar".into(),
+                ));
             }
-            let len = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
+            let len =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
+                    as usize;
             *pos += 4;
             if *pos + len > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for VarChar payload".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for VarChar payload".into(),
+                ));
             }
             let s = std::str::from_utf8(&data[*pos..*pos + len])
                 .map_err(|_| MonaxError::Internal("invalid UTF-8 in WAL".into()))?;
@@ -526,10 +625,14 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Blob".into()));
             }
-            let len = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
+            let len =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
+                    as usize;
             *pos += 4;
             if *pos + len > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Blob payload".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for Blob payload".into(),
+                ));
             }
             let v = data[*pos..*pos + len].to_vec();
             *pos += len;
@@ -539,17 +642,24 @@ fn decode_fixed_value(data: &[u8], pos: &mut usize, dt: crate::protocol::types::
             if *pos + 4 > data.len() {
                 return Err(MonaxError::Internal("WAL data truncated for Vector".into()));
             }
-            let len = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
+            let len =
+                u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
+                    as usize;
             *pos += 4;
             let total_bytes = len * 4;
             if *pos + total_bytes > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Vector payload".into()));
+                return Err(MonaxError::Internal(
+                    "WAL data truncated for Vector payload".into(),
+                ));
             }
             let mut floats = Vec::with_capacity(len);
             for i in 0..len {
                 let start = *pos + i * 4;
                 floats.push(f32::from_le_bytes([
-                    data[start], data[start + 1], data[start + 2], data[start + 3],
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
                 ]));
             }
             *pos += total_bytes;

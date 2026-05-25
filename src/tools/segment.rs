@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::segment::{decode_scalar_with_tag, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use crate::storage::segment::{
+    decode_scalar_with_tag, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION,
+};
 use crate::types::batch::{ColumnDef, Schema};
 #[allow(unused_imports)]
 use crate::types::scalar::ScalarValue;
@@ -50,10 +52,7 @@ pub struct RowGroupInfo {
 }
 
 pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let (partition_key, sequence) = parse_partition_filename(filename);
 
     let file = fs::File::open(path)?;
@@ -329,7 +328,11 @@ pub fn format_size(size: u64) -> String {
         exp += 1;
         n /= UNIT;
     }
-    format!("{:.2} {}B", size as f64 / div as f64, b"KMGTPE"[exp] as char)
+    format!(
+        "{:.2} {}B",
+        size as f64 / div as f64,
+        b"KMGTPE"[exp] as char
+    )
 }
 
 pub fn format_timestamp(ts: u64) -> String {
@@ -343,17 +346,17 @@ fn format_datetime_from_timestamp(secs: u64) -> String {
     const SECONDS_PER_DAY: u64 = 86400;
     const SECONDS_PER_HOUR: u64 = 3600;
     const SECONDS_PER_MINUTE: u64 = 60;
-    
+
     let days_since_epoch = secs / SECONDS_PER_DAY;
     let remaining_secs = secs % SECONDS_PER_DAY;
-    
+
     let hour = remaining_secs / SECONDS_PER_HOUR;
     let minute = (remaining_secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
     let second = remaining_secs % SECONDS_PER_MINUTE;
-    
+
     let mut year = 1970u64;
     let mut days_left = days_since_epoch;
-    
+
     loop {
         let days_in_year = if is_leap_year(year) { 366u64 } else { 365u64 };
         if days_left >= days_in_year {
@@ -363,13 +366,13 @@ fn format_datetime_from_timestamp(secs: u64) -> String {
             break;
         }
     }
-    
+
     let month_days = if is_leap_year(year) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
         [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
-    
+
     let mut month = 1u64;
     let mut day = days_left + 1;
     for &days_in_month in &month_days {
@@ -379,7 +382,7 @@ fn format_datetime_from_timestamp(secs: u64) -> String {
         day -= days_in_month as u64;
         month += 1;
     }
-    
+
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         year, month, day, hour, minute, second
@@ -391,16 +394,14 @@ pub fn format_system_time(time: Option<SystemTime>) -> String {
         Some(t) => t,
         None => return "N/A".to_string(),
     };
-    
+
     let duration = match time.duration_since(UNIX_EPOCH) {
         Ok(d) => d,
         Err(_) => return "N/A".to_string(),
     };
-    
+
     format_datetime_from_timestamp(duration.as_secs())
 }
-
-
 
 fn is_leap_year(year: u64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
@@ -495,7 +496,10 @@ mod tests {
         assert_eq!(info.row_group_count, 3);
         assert_eq!(info.footer_row_count, 10);
         assert_eq!(
-            info.row_groups.iter().map(|rg| rg.row_count).collect::<Vec<_>>(),
+            info.row_groups
+                .iter()
+                .map(|rg| rg.row_count)
+                .collect::<Vec<_>>(),
             vec![4, 4, 2]
         );
         assert_eq!(info.row_groups[0].offset, SEGMENT_HEADER_SIZE as u64);

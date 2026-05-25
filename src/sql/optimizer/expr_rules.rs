@@ -109,8 +109,8 @@ pub fn simplify_expr(expr: LogicalExpr) -> (LogicalExpr, bool) {
                     return (new_left, true);
                 }
                 // AND with false → false
-                (BinOp::And, LogicalExpr::Literal(ScalarValue::Bool(Some(false))), _) |
-                (BinOp::And, _, LogicalExpr::Literal(ScalarValue::Bool(Some(false)))) => {
+                (BinOp::And, LogicalExpr::Literal(ScalarValue::Bool(Some(false))), _)
+                | (BinOp::And, _, LogicalExpr::Literal(ScalarValue::Bool(Some(false)))) => {
                     return (LogicalExpr::Literal(ScalarValue::Bool(Some(false))), true);
                 }
                 // AND with true → other side
@@ -121,8 +121,8 @@ pub fn simplify_expr(expr: LogicalExpr) -> (LogicalExpr, bool) {
                     return (new_left, true);
                 }
                 // OR with true → true
-                (BinOp::Or, LogicalExpr::Literal(ScalarValue::Bool(Some(true))), _) |
-                (BinOp::Or, _, LogicalExpr::Literal(ScalarValue::Bool(Some(true)))) => {
+                (BinOp::Or, LogicalExpr::Literal(ScalarValue::Bool(Some(true))), _)
+                | (BinOp::Or, _, LogicalExpr::Literal(ScalarValue::Bool(Some(true)))) => {
                     return (LogicalExpr::Literal(ScalarValue::Bool(Some(true))), true);
                 }
                 // OR with false → other side
@@ -135,11 +135,14 @@ pub fn simplify_expr(expr: LogicalExpr) -> (LogicalExpr, bool) {
                 _ => {}
             }
 
-            (LogicalExpr::BinaryOp {
-                left: Box::new(new_left),
-                op,
-                right: Box::new(new_right),
-            }, changed)
+            (
+                LogicalExpr::BinaryOp {
+                    left: Box::new(new_left),
+                    op,
+                    right: Box::new(new_right),
+                },
+                changed,
+            )
         }
         LogicalExpr::Not(inner) => {
             let (new_inner, changed) = simplify_expr(*inner);
@@ -157,47 +160,41 @@ pub fn simplify_expr(expr: LogicalExpr) -> (LogicalExpr, bool) {
 fn fold_binary(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Option<ScalarValue> {
     match (left, right) {
         // Int64 arithmetic
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => {
-            match op {
-                BinOp::Add => Some(ScalarValue::Int64(Some(l + r))),
-                BinOp::Sub => Some(ScalarValue::Int64(Some(l - r))),
-                BinOp::Mul => Some(ScalarValue::Int64(Some(l * r))),
-                BinOp::Div if *r != 0 => Some(ScalarValue::Int64(Some(l / r))),
-                BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
-                BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
-                BinOp::Lt => Some(ScalarValue::Bool(Some(l < r))),
-                BinOp::Gt => Some(ScalarValue::Bool(Some(l > r))),
-                BinOp::Lte => Some(ScalarValue::Bool(Some(l <= r))),
-                BinOp::Gte => Some(ScalarValue::Bool(Some(l >= r))),
-                _ => None,
-            }
-        }
+        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => match op {
+            BinOp::Add => Some(ScalarValue::Int64(Some(l + r))),
+            BinOp::Sub => Some(ScalarValue::Int64(Some(l - r))),
+            BinOp::Mul => Some(ScalarValue::Int64(Some(l * r))),
+            BinOp::Div if *r != 0 => Some(ScalarValue::Int64(Some(l / r))),
+            BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
+            BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
+            BinOp::Lt => Some(ScalarValue::Bool(Some(l < r))),
+            BinOp::Gt => Some(ScalarValue::Bool(Some(l > r))),
+            BinOp::Lte => Some(ScalarValue::Bool(Some(l <= r))),
+            BinOp::Gte => Some(ScalarValue::Bool(Some(l >= r))),
+            _ => None,
+        },
         // Float64 arithmetic
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
-            match op {
-                BinOp::Add => Some(ScalarValue::Float64(Some(l + r))),
-                BinOp::Sub => Some(ScalarValue::Float64(Some(l - r))),
-                BinOp::Mul => Some(ScalarValue::Float64(Some(l * r))),
-                BinOp::Div if *r != 0.0 => Some(ScalarValue::Float64(Some(l / r))),
-                BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
-                BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
-                BinOp::Lt => Some(ScalarValue::Bool(Some(l < r))),
-                BinOp::Gt => Some(ScalarValue::Bool(Some(l > r))),
-                BinOp::Lte => Some(ScalarValue::Bool(Some(l <= r))),
-                BinOp::Gte => Some(ScalarValue::Bool(Some(l >= r))),
-                _ => None,
-            }
-        }
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => match op {
+            BinOp::Add => Some(ScalarValue::Float64(Some(l + r))),
+            BinOp::Sub => Some(ScalarValue::Float64(Some(l - r))),
+            BinOp::Mul => Some(ScalarValue::Float64(Some(l * r))),
+            BinOp::Div if *r != 0.0 => Some(ScalarValue::Float64(Some(l / r))),
+            BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
+            BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
+            BinOp::Lt => Some(ScalarValue::Bool(Some(l < r))),
+            BinOp::Gt => Some(ScalarValue::Bool(Some(l > r))),
+            BinOp::Lte => Some(ScalarValue::Bool(Some(l <= r))),
+            BinOp::Gte => Some(ScalarValue::Bool(Some(l >= r))),
+            _ => None,
+        },
         // Bool logic
-        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => {
-            match op {
-                BinOp::And => Some(ScalarValue::Bool(Some(*l && *r))),
-                BinOp::Or => Some(ScalarValue::Bool(Some(*l || *r))),
-                BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
-                BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
-                _ => None,
-            }
-        }
+        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => match op {
+            BinOp::And => Some(ScalarValue::Bool(Some(*l && *r))),
+            BinOp::Or => Some(ScalarValue::Bool(Some(*l || *r))),
+            BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
+            BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
+            _ => None,
+        },
         _ => None,
     }
 }

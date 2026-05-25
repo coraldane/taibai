@@ -1,6 +1,6 @@
 use crate::common::error::Result;
-use crate::sql::planner::LogicalExpr;
 use crate::sql::execution::operators::filter::eval_filter;
+use crate::sql::planner::LogicalExpr;
 use crate::types::batch::{RecordBatch, Schema};
 
 use super::PushOp;
@@ -13,7 +13,11 @@ pub struct PushFilter {
 
 impl PushFilter {
     pub fn new(predicate: LogicalExpr, schema: Schema) -> Self {
-        Self { predicate, output_schema: schema, buffer: Vec::new() }
+        Self {
+            predicate,
+            output_schema: schema,
+            buffer: Vec::new(),
+        }
     }
 }
 

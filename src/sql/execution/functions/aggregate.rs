@@ -9,37 +9,57 @@ use super::registry::{Accumulator, AggregateFunction};
 
 // --- COUNT ---
 pub struct CountAggregate;
-pub struct CountAccumulator { count: i64 }
+pub struct CountAccumulator {
+    count: i64,
+}
 
 impl AggregateFunction for CountAggregate {
-    fn name(&self) -> &str { "count" }
+    fn name(&self) -> &str {
+        "count"
+    }
     fn new_accumulator(&self) -> Box<dyn Accumulator> {
         Box::new(CountAccumulator { count: 0 })
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DataType { DataType::Int64 }
+    fn return_type(&self, _arg_types: &[DataType]) -> DataType {
+        DataType::Int64
+    }
 }
 
 impl Accumulator for CountAccumulator {
     fn update(&mut self, value: &ScalarValue) -> Result<()> {
-        if !value.is_null() { self.count += 1; }
+        if !value.is_null() {
+            self.count += 1;
+        }
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue> {
         Ok(ScalarValue::Int64(Some(self.count)))
     }
-    fn reset(&mut self) { self.count = 0; }
+    fn reset(&mut self) {
+        self.count = 0;
+    }
 }
 
 // --- SUM ---
 pub struct SumAggregate;
-pub struct SumAccumulator { sum: f64, has_value: bool }
+pub struct SumAccumulator {
+    sum: f64,
+    has_value: bool,
+}
 
 impl AggregateFunction for SumAggregate {
-    fn name(&self) -> &str { "sum" }
-    fn new_accumulator(&self) -> Box<dyn Accumulator> {
-        Box::new(SumAccumulator { sum: 0.0, has_value: false })
+    fn name(&self) -> &str {
+        "sum"
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DataType { DataType::Float64 }
+    fn new_accumulator(&self) -> Box<dyn Accumulator> {
+        Box::new(SumAccumulator {
+            sum: 0.0,
+            has_value: false,
+        })
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DataType {
+        DataType::Float64
+    }
 }
 
 impl Accumulator for SumAccumulator {
@@ -51,22 +71,35 @@ impl Accumulator for SumAccumulator {
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue> {
-        if self.has_value { Ok(ScalarValue::Float64(Some(self.sum))) }
-        else { Ok(ScalarValue::Float64(None)) }
+        if self.has_value {
+            Ok(ScalarValue::Float64(Some(self.sum)))
+        } else {
+            Ok(ScalarValue::Float64(None))
+        }
     }
-    fn reset(&mut self) { self.sum = 0.0; self.has_value = false; }
+    fn reset(&mut self) {
+        self.sum = 0.0;
+        self.has_value = false;
+    }
 }
 
 // --- AVG ---
 pub struct AvgAggregate;
-pub struct AvgAccumulator { sum: f64, count: i64 }
+pub struct AvgAccumulator {
+    sum: f64,
+    count: i64,
+}
 
 impl AggregateFunction for AvgAggregate {
-    fn name(&self) -> &str { "avg" }
+    fn name(&self) -> &str {
+        "avg"
+    }
     fn new_accumulator(&self) -> Box<dyn Accumulator> {
         Box::new(AvgAccumulator { sum: 0.0, count: 0 })
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> DataType { DataType::Float64 }
+    fn return_type(&self, _arg_types: &[DataType]) -> DataType {
+        DataType::Float64
+    }
 }
 
 impl Accumulator for AvgAccumulator {
@@ -78,18 +111,28 @@ impl Accumulator for AvgAccumulator {
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue> {
-        if self.count > 0 { Ok(ScalarValue::Float64(Some(self.sum / self.count as f64))) }
-        else { Ok(ScalarValue::Float64(None)) }
+        if self.count > 0 {
+            Ok(ScalarValue::Float64(Some(self.sum / self.count as f64)))
+        } else {
+            Ok(ScalarValue::Float64(None))
+        }
     }
-    fn reset(&mut self) { self.sum = 0.0; self.count = 0; }
+    fn reset(&mut self) {
+        self.sum = 0.0;
+        self.count = 0;
+    }
 }
 
 // --- MIN ---
 pub struct MinAggregate;
-pub struct MinAccumulator { min: Option<ScalarValue> }
+pub struct MinAccumulator {
+    min: Option<ScalarValue>,
+}
 
 impl AggregateFunction for MinAggregate {
-    fn name(&self) -> &str { "min" }
+    fn name(&self) -> &str {
+        "min"
+    }
     fn new_accumulator(&self) -> Box<dyn Accumulator> {
         Box::new(MinAccumulator { min: None })
     }
@@ -100,7 +143,9 @@ impl AggregateFunction for MinAggregate {
 
 impl Accumulator for MinAccumulator {
     fn update(&mut self, value: &ScalarValue) -> Result<()> {
-        if value.is_null() { return Ok(()); }
+        if value.is_null() {
+            return Ok(());
+        }
         match &self.min {
             None => self.min = Some(value.clone()),
             Some(current) => {
@@ -114,15 +159,21 @@ impl Accumulator for MinAccumulator {
     fn finalize(&self) -> Result<ScalarValue> {
         Ok(self.min.clone().unwrap_or(ScalarValue::Int64(None)))
     }
-    fn reset(&mut self) { self.min = None; }
+    fn reset(&mut self) {
+        self.min = None;
+    }
 }
 
 // --- MAX ---
 pub struct MaxAggregate;
-pub struct MaxAccumulator { max: Option<ScalarValue> }
+pub struct MaxAccumulator {
+    max: Option<ScalarValue>,
+}
 
 impl AggregateFunction for MaxAggregate {
-    fn name(&self) -> &str { "max" }
+    fn name(&self) -> &str {
+        "max"
+    }
     fn new_accumulator(&self) -> Box<dyn Accumulator> {
         Box::new(MaxAccumulator { max: None })
     }
@@ -133,7 +184,9 @@ impl AggregateFunction for MaxAggregate {
 
 impl Accumulator for MaxAccumulator {
     fn update(&mut self, value: &ScalarValue) -> Result<()> {
-        if value.is_null() { return Ok(()); }
+        if value.is_null() {
+            return Ok(());
+        }
         match &self.max {
             None => self.max = Some(value.clone()),
             Some(current) => {
@@ -147,7 +200,9 @@ impl Accumulator for MaxAccumulator {
     fn finalize(&self) -> Result<ScalarValue> {
         Ok(self.max.clone().unwrap_or(ScalarValue::Int64(None)))
     }
-    fn reset(&mut self) { self.max = None; }
+    fn reset(&mut self) {
+        self.max = None;
+    }
 }
 
 fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {

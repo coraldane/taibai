@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::common::error::{MonaxError, Result};
+use crate::sql::parser::ast::{Expr, Statement};
 use crate::sql::parser::parser::Parser;
-use crate::sql::parser::ast::{Statement, Expr};
 use crate::sql::planner::LogicalPlan;
 use crate::types::scalar::ScalarValue;
 
@@ -137,7 +137,11 @@ pub fn bind_params(stmt: &mut Statement, params: &[ScalarValue]) -> Result<()> {
                 }
             }
         }
-        Statement::Update { where_clause, assignments, .. } => {
+        Statement::Update {
+            where_clause,
+            assignments,
+            ..
+        } => {
             if let Some(ref mut expr) = where_clause {
                 substitute_placeholders(expr, params)?;
             }
@@ -161,7 +165,8 @@ fn substitute_placeholders(expr: &mut Expr, params: &[ScalarValue]) -> Result<()
             if *idx >= params.len() {
                 return Err(MonaxError::Sql(format!(
                     "parameter index {} out of bounds (only {} parameters provided)",
-                    idx, params.len()
+                    idx,
+                    params.len()
                 )));
             }
             *expr = Expr::Literal(params[*idx].clone());
@@ -170,21 +175,37 @@ fn substitute_placeholders(expr: &mut Expr, params: &[ScalarValue]) -> Result<()
             substitute_placeholders(left, params)?;
             substitute_placeholders(right, params)?;
         }
-        Expr::UnaryNot(inner) | Expr::UnaryMinus(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+        Expr::UnaryNot(inner)
+        | Expr::UnaryMinus(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner) => {
             substitute_placeholders(inner, params)?;
         }
-        Expr::In { expr: inner, values, .. } => {
+        Expr::In {
+            expr: inner,
+            values,
+            ..
+        } => {
             substitute_placeholders(inner, params)?;
             for v in values.iter_mut() {
                 substitute_placeholders(v, params)?;
             }
         }
-        Expr::Between { expr: inner, low, high, .. } => {
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
             substitute_placeholders(inner, params)?;
             substitute_placeholders(low, params)?;
             substitute_placeholders(high, params)?;
         }
-        Expr::Case { operand, when_clauses, else_clause } => {
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
             if let Some(ref mut op) = operand {
                 substitute_placeholders(op, params)?;
             }
@@ -196,7 +217,11 @@ fn substitute_placeholders(expr: &mut Expr, params: &[ScalarValue]) -> Result<()
                 substitute_placeholders(el, params)?;
             }
         }
-        Expr::Like { expr: inner, pattern, .. } => {
+        Expr::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
             substitute_placeholders(inner, params)?;
             substitute_placeholders(pattern, params)?;
         }
@@ -217,13 +242,33 @@ fn substitute_placeholders(expr: &mut Expr, params: &[ScalarValue]) -> Result<()
 pub fn has_placeholders(stmt: &Statement) -> bool {
     let mut found = false;
     match stmt {
-        Statement::Select { where_clause, group_by, having, order_by, limit, offset, .. } => {
-            if let Some(ref e) = where_clause { check_expr_for_placeholders(e, &mut found); }
-            for e in group_by { check_expr_for_placeholders(e, &mut found); }
-            if let Some(ref e) = having { check_expr_for_placeholders(e, &mut found); }
-            for item in order_by { check_expr_for_placeholders(&item.expr, &mut found); }
-            if let Some(ref e) = limit { check_expr_for_placeholders(e, &mut found); }
-            if let Some(ref e) = offset { check_expr_for_placeholders(e, &mut found); }
+        Statement::Select {
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            if let Some(ref e) = where_clause {
+                check_expr_for_placeholders(e, &mut found);
+            }
+            for e in group_by {
+                check_expr_for_placeholders(e, &mut found);
+            }
+            if let Some(ref e) = having {
+                check_expr_for_placeholders(e, &mut found);
+            }
+            for item in order_by {
+                check_expr_for_placeholders(&item.expr, &mut found);
+            }
+            if let Some(ref e) = limit {
+                check_expr_for_placeholders(e, &mut found);
+            }
+            if let Some(ref e) = offset {
+                check_expr_for_placeholders(e, &mut found);
+            }
         }
         Statement::Insert { values, .. } => {
             for row in values {
@@ -232,14 +277,22 @@ pub fn has_placeholders(stmt: &Statement) -> bool {
                 }
             }
         }
-        Statement::Update { where_clause, assignments, .. } => {
-            if let Some(ref e) = where_clause { check_expr_for_placeholders(e, &mut found); }
+        Statement::Update {
+            where_clause,
+            assignments,
+            ..
+        } => {
+            if let Some(ref e) = where_clause {
+                check_expr_for_placeholders(e, &mut found);
+            }
             for assign in assignments {
                 check_expr_for_placeholders(&assign.value, &mut found);
             }
         }
         Statement::Delete { where_clause, .. } => {
-            if let Some(ref e) = where_clause { check_expr_for_placeholders(e, &mut found); }
+            if let Some(ref e) = where_clause {
+                check_expr_for_placeholders(e, &mut found);
+            }
         }
         _ => {}
     }
@@ -247,28 +300,46 @@ pub fn has_placeholders(stmt: &Statement) -> bool {
 }
 
 fn check_expr_for_placeholders(expr: &Expr, found: &mut bool) {
-    if *found { return; }
+    if *found {
+        return;
+    }
     match expr {
         Expr::Placeholder(_) => *found = true,
         Expr::BinaryOp { left, right, .. } => {
             check_expr_for_placeholders(left, found);
             check_expr_for_placeholders(right, found);
         }
-        Expr::UnaryNot(inner) | Expr::UnaryMinus(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+        Expr::UnaryNot(inner)
+        | Expr::UnaryMinus(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner) => {
             check_expr_for_placeholders(inner, found);
         }
-        Expr::In { expr: inner, values, .. } => {
+        Expr::In {
+            expr: inner,
+            values,
+            ..
+        } => {
             check_expr_for_placeholders(inner, found);
             for v in values {
                 check_expr_for_placeholders(v, found);
             }
         }
-        Expr::Between { expr: inner, low, high, .. } => {
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
             check_expr_for_placeholders(inner, found);
             check_expr_for_placeholders(low, found);
             check_expr_for_placeholders(high, found);
         }
-        Expr::Case { operand, when_clauses, else_clause } => {
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
             if let Some(ref op) = operand {
                 check_expr_for_placeholders(op, found);
             }
@@ -280,7 +351,11 @@ fn check_expr_for_placeholders(expr: &Expr, found: &mut bool) {
                 check_expr_for_placeholders(el, found);
             }
         }
-        Expr::Like { expr: inner, pattern, .. } => {
+        Expr::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
             check_expr_for_placeholders(inner, found);
             check_expr_for_placeholders(pattern, found);
         }

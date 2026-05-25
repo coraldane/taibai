@@ -466,6 +466,308 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
     Ok(col)
 }
 
+pub fn decode_column_selected(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    selected_rows: &[usize],
+) -> Result<ColumnArray> {
+    let mut cursor = Cursor::new(data);
+    let bitmap_len = read_u32_le(&mut cursor)? as usize;
+    let mut bitmap_data = vec![0u8; bitmap_len];
+    cursor.read_exact(&mut bitmap_data)?;
+    let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
+    let values = &data[4 + bitmap_len..];
+
+    macro_rules! decode_fixed_variant {
+        ($ty:ty, $width:expr, $variant:ident) => {
+            decode_selected_fixed::<$ty, $width, _>(
+                values,
+                &bitmap,
+                row_count,
+                selected_rows,
+                |data, bitmap| ColumnArray::$variant { data, bitmap },
+            )
+        };
+    }
+
+    match col_def.data_type {
+        DataType::Bool => decode_fixed_variant!(u8, 1, Bool),
+        DataType::Int8 => decode_fixed_variant!(i8, 1, Int8),
+        DataType::Int16 => decode_fixed_variant!(i16, 2, Int16),
+        DataType::Int32 => decode_fixed_variant!(i32, 4, Int32),
+        DataType::Int64 => decode_fixed_variant!(i64, 8, Int64),
+        DataType::UInt8 => decode_fixed_variant!(u8, 1, UInt8),
+        DataType::UInt16 => decode_fixed_variant!(u16, 2, UInt16),
+        DataType::UInt32 => decode_fixed_variant!(u32, 4, UInt32),
+        DataType::UInt64 => decode_fixed_variant!(u64, 8, UInt64),
+        DataType::Float32 => decode_fixed_variant!(f32, 4, Float32),
+        DataType::Float64 => decode_fixed_variant!(f64, 8, Float64),
+        DataType::Decimal => decode_fixed_variant!(i64, 8, Decimal),
+        DataType::Date => decode_fixed_variant!(i32, 4, Date),
+        DataType::Time => decode_fixed_variant!(i64, 8, Time),
+        DataType::Timestamp => decode_fixed_variant!(i64, 8, Timestamp),
+        DataType::Interval => decode_fixed_variant!(i64, 8, Interval),
+        DataType::VarChar => decode_selected_varchar(values, &bitmap, row_count, selected_rows),
+        DataType::Blob => decode_selected_blob(values, &bitmap, row_count, selected_rows),
+        DataType::Vector => decode_selected_vector(values, &bitmap, row_count, selected_rows),
+    }
+}
+
+trait FixedLe: Copy + Default {
+    fn from_le_bytes(bytes: &[u8]) -> Self;
+}
+
+macro_rules! impl_fixed_le {
+    ($ty:ty, $size:expr) => {
+        impl FixedLe for $ty {
+            fn from_le_bytes(bytes: &[u8]) -> Self {
+                <$ty>::from_le_bytes(bytes[..$size].try_into().unwrap())
+            }
+        }
+    };
+}
+
+impl_fixed_le!(u8, 1);
+impl_fixed_le!(i8, 1);
+impl_fixed_le!(i16, 2);
+impl_fixed_le!(i32, 4);
+impl_fixed_le!(i64, 8);
+impl_fixed_le!(u16, 2);
+impl_fixed_le!(u32, 4);
+impl_fixed_le!(u64, 8);
+impl_fixed_le!(f32, 4);
+impl_fixed_le!(f64, 8);
+
+fn selected_bitmap(bitmap: &NullBitmap, selected_rows: &[usize]) -> NullBitmap {
+    let null_flags: Vec<bool> = selected_rows
+        .iter()
+        .map(|&row| bitmap.is_null(row))
+        .collect();
+    NullBitmap::from_bools(&null_flags)
+}
+
+fn decode_selected_fixed<T, const WIDTH: usize, F>(
+    values: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    selected_rows: &[usize],
+    build: F,
+) -> Result<ColumnArray>
+where
+    T: FixedLe,
+    F: FnOnce(Vec<T>, NullBitmap) -> ColumnArray,
+{
+    let mut out = Vec::with_capacity(selected_rows.len());
+    let out_bitmap = selected_bitmap(bitmap, selected_rows);
+
+    if bitmap.null_count() == 0 {
+        for &row in selected_rows {
+            if row >= row_count {
+                return Err(MonaxError::Storage(format!(
+                    "selected row {} out of bounds {}",
+                    row, row_count
+                )));
+            }
+            let offset = row
+                .checked_mul(WIDTH)
+                .ok_or_else(|| MonaxError::Storage("fixed column offset overflow".into()))?;
+            let end = offset + WIDTH;
+            if end > values.len() {
+                return Err(MonaxError::Storage(
+                    "fixed column selected offset exceeds data".into(),
+                ));
+            }
+            out.push(T::from_le_bytes(&values[offset..end]));
+        }
+        return Ok(build(out, out_bitmap));
+    }
+
+    let mut selected_pos = 0usize;
+    let mut value_offset = 0usize;
+    for row in 0..row_count {
+        let is_selected = selected_pos < selected_rows.len() && selected_rows[selected_pos] == row;
+        if bitmap.is_null(row) {
+            if is_selected {
+                out.push(T::default());
+                selected_pos += 1;
+            }
+            continue;
+        }
+
+        let end = value_offset + WIDTH;
+        if end > values.len() {
+            return Err(MonaxError::Storage(
+                "fixed column selected scan exceeds data".into(),
+            ));
+        }
+        if is_selected {
+            out.push(T::from_le_bytes(&values[value_offset..end]));
+            selected_pos += 1;
+            if selected_pos == selected_rows.len() {
+                break;
+            }
+        }
+        value_offset = end;
+    }
+
+    Ok(build(out, out_bitmap))
+}
+
+fn decode_selected_varchar(
+    values: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    selected_rows: &[usize],
+) -> Result<ColumnArray> {
+    let mut out = Vec::with_capacity(selected_rows.len());
+    let out_bitmap = selected_bitmap(bitmap, selected_rows);
+    let mut selected_pos = 0usize;
+    let mut value_offset = 0usize;
+
+    for row in 0..row_count {
+        let is_selected = selected_pos < selected_rows.len() && selected_rows[selected_pos] == row;
+        if bitmap.is_null(row) {
+            if is_selected {
+                out.push(String::new());
+                selected_pos += 1;
+            }
+            continue;
+        }
+        if value_offset + 4 > values.len() {
+            return Err(MonaxError::Storage(
+                "variable column length prefix truncated".into(),
+            ));
+        }
+        let len =
+            u32::from_le_bytes(values[value_offset..value_offset + 4].try_into().unwrap()) as usize;
+        let start = value_offset + 4;
+        let end = start + len;
+        if end > values.len() {
+            return Err(MonaxError::Storage(
+                "variable column selected value truncated".into(),
+            ));
+        }
+        if is_selected {
+            out.push(String::from_utf8_lossy(&values[start..end]).into_owned());
+            selected_pos += 1;
+            if selected_pos == selected_rows.len() {
+                break;
+            }
+        }
+        value_offset = end;
+    }
+
+    Ok(ColumnArray::VarChar {
+        data: out,
+        bitmap: out_bitmap,
+    })
+}
+
+fn decode_selected_blob(
+    values: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    selected_rows: &[usize],
+) -> Result<ColumnArray> {
+    let mut out = Vec::with_capacity(selected_rows.len());
+    let out_bitmap = selected_bitmap(bitmap, selected_rows);
+    let mut selected_pos = 0usize;
+    let mut value_offset = 0usize;
+
+    for row in 0..row_count {
+        let is_selected = selected_pos < selected_rows.len() && selected_rows[selected_pos] == row;
+        if bitmap.is_null(row) {
+            if is_selected {
+                out.push(Vec::new());
+                selected_pos += 1;
+            }
+            continue;
+        }
+        if value_offset + 4 > values.len() {
+            return Err(MonaxError::Storage(
+                "blob column length prefix truncated".into(),
+            ));
+        }
+        let len =
+            u32::from_le_bytes(values[value_offset..value_offset + 4].try_into().unwrap()) as usize;
+        let start = value_offset + 4;
+        let end = start + len;
+        if end > values.len() {
+            return Err(MonaxError::Storage(
+                "blob column selected value truncated".into(),
+            ));
+        }
+        if is_selected {
+            out.push(values[start..end].to_vec());
+            selected_pos += 1;
+            if selected_pos == selected_rows.len() {
+                break;
+            }
+        }
+        value_offset = end;
+    }
+
+    Ok(ColumnArray::Blob {
+        data: out,
+        bitmap: out_bitmap,
+    })
+}
+
+fn decode_selected_vector(
+    values: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    selected_rows: &[usize],
+) -> Result<ColumnArray> {
+    let mut out = Vec::with_capacity(selected_rows.len());
+    let out_bitmap = selected_bitmap(bitmap, selected_rows);
+    let mut selected_pos = 0usize;
+    let mut value_offset = 0usize;
+
+    for row in 0..row_count {
+        let is_selected = selected_pos < selected_rows.len() && selected_rows[selected_pos] == row;
+        if bitmap.is_null(row) {
+            if is_selected {
+                out.push(Vec::new());
+                selected_pos += 1;
+            }
+            continue;
+        }
+        if value_offset + 4 > values.len() {
+            return Err(MonaxError::Storage(
+                "vector column length prefix truncated".into(),
+            ));
+        }
+        let count =
+            u32::from_le_bytes(values[value_offset..value_offset + 4].try_into().unwrap()) as usize;
+        let start = value_offset + 4;
+        let end = start + count * 4;
+        if end > values.len() {
+            return Err(MonaxError::Storage(
+                "vector column selected value truncated".into(),
+            ));
+        }
+        if is_selected {
+            let mut v = Vec::with_capacity(count);
+            for chunk in values[start..end].chunks_exact(4) {
+                v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            out.push(v);
+            selected_pos += 1;
+            if selected_pos == selected_rows.len() {
+                break;
+            }
+        }
+        value_offset = end;
+    }
+
+    Ok(ColumnArray::Vector {
+        data: out,
+        bitmap: out_bitmap,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Scalar tag-based encoding / decoding (for zone maps in footer)
 // ---------------------------------------------------------------------------
@@ -798,5 +1100,53 @@ mod tests {
             let decoded = decode_scalar_with_tag(&mut cursor).unwrap();
             assert_eq!(v, &decoded);
         }
+    }
+
+    #[test]
+    fn test_decode_column_selected_fixed_with_nulls() {
+        let col = ColumnArray::Int64 {
+            data: vec![10, 0, 30, 40, 0, 60],
+            bitmap: NullBitmap::from_bools(&[false, true, false, false, true, false]),
+        };
+        let encoded = encode_column(&col, 0, col.len()).unwrap();
+        let decoded = decode_column_selected(
+            &encoded,
+            col.len(),
+            &ColumnDef::new("c", DataType::Int64),
+            &[0, 2, 4, 5],
+        )
+        .unwrap();
+
+        assert_eq!(decoded.scalar(0), ScalarValue::Int64(Some(10)));
+        assert_eq!(decoded.scalar(1), ScalarValue::Int64(Some(30)));
+        assert_eq!(decoded.scalar(2), ScalarValue::Int64(None));
+        assert_eq!(decoded.scalar(3), ScalarValue::Int64(Some(60)));
+    }
+
+    #[test]
+    fn test_decode_column_selected_varchar_with_nulls() {
+        let col = ColumnArray::VarChar {
+            data: vec![
+                "aa".into(),
+                "".into(),
+                "ccc".into(),
+                "dddd".into(),
+                "".into(),
+                "f".into(),
+            ],
+            bitmap: NullBitmap::from_bools(&[false, true, false, false, true, false]),
+        };
+        let encoded = encode_column(&col, 0, col.len()).unwrap();
+        let decoded = decode_column_selected(
+            &encoded,
+            col.len(),
+            &ColumnDef::new("c", DataType::VarChar),
+            &[1, 3, 5],
+        )
+        .unwrap();
+
+        assert_eq!(decoded.scalar(0), ScalarValue::VarChar(None));
+        assert_eq!(decoded.scalar(1), ScalarValue::VarChar(Some("dddd".into())));
+        assert_eq!(decoded.scalar(2), ScalarValue::VarChar(Some("f".into())));
     }
 }

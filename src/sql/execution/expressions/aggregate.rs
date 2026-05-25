@@ -15,7 +15,11 @@ pub struct AggregateExpression {
 
 impl AggregateExpression {
     pub fn new(func: AggFunc, child: Box<dyn ColumnExpression>, distinct: bool) -> Self {
-        Self { func, child, distinct }
+        Self {
+            func,
+            child,
+            distinct,
+        }
     }
 }
 
@@ -31,9 +35,7 @@ impl ColumnExpression for AggregateExpression {
         let mut result = ColumnArray::empty(result_type);
         let val = match self.func {
             AggFunc::Count => {
-                let non_null = (0..num_rows)
-                    .filter(|&i| !col.scalar(i).is_null())
-                    .count();
+                let non_null = (0..num_rows).filter(|&i| !col.scalar(i).is_null()).count();
                 ScalarValue::Int64(Some(non_null as i64))
             }
             AggFunc::Sum => {
@@ -46,8 +48,11 @@ impl ColumnExpression for AggregateExpression {
                 let vals: Vec<f64> = (0..num_rows)
                     .filter_map(|i| scalar_to_f64(&col.scalar(i)))
                     .collect();
-                if vals.is_empty() { ScalarValue::Float64(None) }
-                else { ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64)) }
+                if vals.is_empty() {
+                    ScalarValue::Float64(None)
+                } else {
+                    ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64))
+                }
             }
             AggFunc::Min => find_min(&col, num_rows),
             AggFunc::Max => find_max(&col, num_rows),
@@ -94,7 +99,9 @@ fn find_max(col: &ColumnArray, num_rows: usize) -> ScalarValue {
 fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     match (a, b) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
         _ => std::cmp::Ordering::Equal,
     }
 }

@@ -63,7 +63,7 @@ impl SparseIndexImpl {
 
         let blocks = self.blocks.read().unwrap();
         let block_idx = self.find_block_for_row_id(&blocks, row_id);
-        
+
         if block_idx < 0 || block_idx >= blocks.len() as i32 {
             *self.stale.lock().unwrap() = true;
             return false;
@@ -123,7 +123,12 @@ impl SparseIndexImpl {
         self.collect_row_ids(&blocks, &block_ids)
     }
 
-    pub fn range_search_blocks(&self, blocks: &[SparseBlock], min: &ScalarValue, max: &ScalarValue) -> Vec<usize> {
+    pub fn range_search_blocks(
+        &self,
+        blocks: &[SparseBlock],
+        min: &ScalarValue,
+        max: &ScalarValue,
+    ) -> Vec<usize> {
         let mut candidates = Vec::new();
 
         for block in blocks {
@@ -165,7 +170,7 @@ impl SparseIndexImpl {
 
     pub fn add_block(&self, block: SparseBlock) {
         let mut blocks = self.blocks.write().unwrap();
-        
+
         let block = if block.zone_map.is_none() {
             SparseBlock {
                 zone_map: Some(ZoneMap::null()),
@@ -196,7 +201,9 @@ impl SparseIndexImpl {
             let block = SparseBlock {
                 block_id: data.block_id,
                 zone_map: data.zone_map.or_else(|| Some(ZoneMap::null())),
-                bloom_filter: data.bloom_filter.or_else(|| Some(BloomFilter::with_defaults())),
+                bloom_filter: data
+                    .bloom_filter
+                    .or_else(|| Some(BloomFilter::with_defaults())),
                 start_row_id: data.start_row_id,
                 row_count: data.row_count,
             };
@@ -283,11 +290,11 @@ impl SparseIndexImpl {
                 return None;
             }
 
-            let block_id = u64::from_le_bytes(data[offset..offset+8].try_into().ok()?) as usize;
+            let block_id = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?) as usize;
             offset += 8;
-            let start_row_id = i64::from_le_bytes(data[offset..offset+8].try_into().ok()?);
+            let start_row_id = i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
             offset += 8;
-            let row_count = i64::from_le_bytes(data[offset..offset+8].try_into().ok()?);
+            let row_count = i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
             offset += 8;
 
             let has_zm = data[offset] != 0;
@@ -301,7 +308,11 @@ impl SparseIndexImpl {
                 None
             };
 
-            let has_bf = if offset < data.len() { data[offset] != 0 } else { false };
+            let has_bf = if offset < data.len() {
+                data[offset] != 0
+            } else {
+                false
+            };
             offset += 1;
             let bloom_filter = if has_bf && offset < data.len() {
                 BloomFilter::deserialize(&data[offset..]).map(|bf| {
@@ -344,7 +355,7 @@ mod tests {
     #[test]
     fn test_sparse_index_basic() {
         let index = SparseIndexImpl::new();
-        
+
         index.add_block(SparseBlock::new(0, 0, 8192));
         index.add_block(SparseBlock::new(1, 8192, 8192));
 
@@ -359,12 +370,12 @@ mod tests {
     #[test]
     fn test_sparse_index_range_search() {
         let index = SparseIndexImpl::new();
-        
+
         index.add_block(SparseBlock::new(0, 0, 8192));
 
         let results = index.range_search(
             &ScalarValue::Int64(Some(0)),
-            &ScalarValue::Int64(Some(10000))
+            &ScalarValue::Int64(Some(10000)),
         );
         assert!(!results.is_empty());
     }
@@ -372,7 +383,7 @@ mod tests {
     #[test]
     fn test_sparse_index_serialize_deserialize() {
         let index = SparseIndexImpl::new();
-        
+
         index.add_block(SparseBlock::new(0, 0, 100));
         index.insert(&ScalarValue::Int64(Some(42)), 10);
 

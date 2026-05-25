@@ -1,12 +1,11 @@
-use std::sync::Arc;
 use bytes::Bytes;
+use std::sync::Arc;
 
 use crate::common::config::ServerConfig;
 use crate::common::error::Result;
 use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::sql::execution::{Engine, ExecResult};
-use crate::types::scalar::ScalarValue;
 
 pub struct Handler {
     pub session: Option<Session>,
@@ -27,7 +26,9 @@ impl Handler {
         if let Some(ref session) = self.session {
             if session.had_writes {
                 match self.engine.flush_all_buffers() {
-                    Ok(n) => tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed buffers on disconnect"),
+                    Ok(n) => {
+                        tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed buffers on disconnect")
+                    }
                     Err(e) => tracing::warn!(error = %e, "failed to flush buffers on disconnect"),
                 }
             }
@@ -54,9 +55,7 @@ impl Handler {
             MSG_TYPE_COMMIT_TXN => self.handle_commit_txn(),
             MSG_TYPE_ROLLBACK_TXN => self.handle_rollback_txn(),
 
-            MSG_TYPE_AUTH_FAIL => {
-                Ok(vec![build_error("authentication failed")])
-            }
+            MSG_TYPE_AUTH_FAIL => Ok(vec![build_error("authentication failed")]),
 
             MSG_TYPE_CURSOR => self.handle_cursor_open(&msg.payload),
             MSG_TYPE_CURSOR_FETCH => self.handle_cursor_fetch(&msg.payload),
@@ -68,7 +67,9 @@ impl Handler {
 
             other => {
                 tracing::warn!(msg_type = other, "unsupported message type");
-                Ok(vec![build_error(&format!("unsupported message type: {other:#04X}"))])
+                Ok(vec![build_error(&format!(
+                    "unsupported message type: {other:#04X}"
+                ))])
             }
         }
     }
@@ -85,7 +86,7 @@ impl Handler {
         };
 
         let binary_results = rest.first().map(|&b| b != 0).unwrap_or(false);
-        
+
         let timezone_offset_hours = if rest.len() >= 5 {
             i32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]])
         } else {
@@ -109,11 +110,11 @@ impl Handler {
 
         let (_database, rest) = match read_len_prefixed_string(payload) {
             Ok(v) => v,
-            Err(_) => ("", payload)
+            Err(_) => ("", payload),
         };
         let sql = match read_len_prefixed_string(rest) {
             Ok((s, _)) => s.trim(),
-            Err(_) => std::str::from_utf8(payload).unwrap_or("").trim()
+            Err(_) => std::str::from_utf8(payload).unwrap_or("").trim(),
         };
 
         let is_insert = sql.to_uppercase().starts_with("INSERT");
@@ -164,7 +165,8 @@ impl Handler {
     }
 
     fn handle_start_bulk_import(&mut self, sql: &str) -> Result<Vec<Message>> {
-        let disable_wal = sql.contains("\"disable_wal\":true") || sql.contains("\"disable_wal\": true");
+        let disable_wal =
+            sql.contains("\"disable_wal\":true") || sql.contains("\"disable_wal\": true");
 
         self.engine.set_bulk_mode(true);
 
@@ -200,7 +202,10 @@ impl Handler {
             session.had_writes = true;
         }
 
-        match self.engine.exec_bulk_insert_payload_with_wal_control(&db, payload, disable_wal) {
+        match self
+            .engine
+            .exec_bulk_insert_payload_with_wal_control(&db, payload, disable_wal)
+        {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
             Err(e) => {
                 tracing::warn!(error = %e, "bulk insert error");
@@ -240,7 +245,9 @@ impl Handler {
         session.touch();
 
         if payload.len() < 4 {
-            return Ok(vec![build_error("invalid execute message: missing statement ID")]);
+            return Ok(vec![build_error(
+                "invalid execute message: missing statement ID",
+            )]);
         }
         let stmt_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
 
@@ -249,7 +256,12 @@ impl Handler {
         // Take prepared statement out of cache temporarily to allow mutation
         let mut stmt = match session.prepared_statements.remove(stmt_id) {
             Some(s) => s,
-            None => return Ok(vec![build_error(&format!("prepared statement {} not found", stmt_id))]),
+            None => {
+                return Ok(vec![build_error(&format!(
+                    "prepared statement {} not found",
+                    stmt_id
+                ))])
+            }
         };
 
         let result = self.engine.execute_prepared(session, &mut stmt);
@@ -258,9 +270,7 @@ impl Handler {
         session.prepared_statements.insert(stmt);
 
         match result {
-            Ok(ExecResult::Ok { rows_affected }) => {
-                Ok(vec![build_ok(rows_affected)])
-            }
+            Ok(ExecResult::Ok { rows_affected }) => Ok(vec![build_ok(rows_affected)]),
             Ok(ExecResult::Query { schema, batches }) => {
                 if use_binary {
                     Ok(vec![build_binary_query_result(&schema, &batches)])
@@ -308,7 +318,11 @@ impl Handler {
             return Ok(vec![build_error("no active transaction")]);
         }
         let txn_id = session.active_txn_id();
-        let had_writes = session.active_txn.as_ref().map(|t| t.had_writes).unwrap_or(false);
+        let had_writes = session
+            .active_txn
+            .as_ref()
+            .map(|t| t.had_writes)
+            .unwrap_or(false);
         if had_writes {
             self.engine.batch_writer().commit_txn(txn_id)?;
         }
@@ -369,14 +383,20 @@ fn build_pong() -> Message {
 }
 
 pub fn build_ok(rows_affected: u64) -> Message {
-    Message::new(MSG_TYPE_OK, Bytes::copy_from_slice(&rows_affected.to_le_bytes()))
+    Message::new(
+        MSG_TYPE_OK,
+        Bytes::copy_from_slice(&rows_affected.to_le_bytes()),
+    )
 }
 
 pub fn build_error(msg: &str) -> Message {
     Message::new(MSG_TYPE_ERROR, Bytes::from(msg.to_string()))
 }
 
-fn build_query_result(schema: &crate::types::batch::Schema, batches: &[crate::types::batch::RecordBatch]) -> Message {
+fn build_query_result(
+    schema: &crate::types::batch::Schema,
+    batches: &[crate::types::batch::RecordBatch],
+) -> Message {
     let mut buf = Vec::new();
 
     buf.extend_from_slice(&(schema.columns.len() as u32).to_le_bytes());
@@ -394,14 +414,9 @@ fn build_query_result(schema: &crate::types::batch::Schema, batches: &[crate::ty
         for row in 0..batch.num_rows() {
             for col_idx in 0..schema.columns.len() {
                 let col_def = &schema.columns[col_idx];
-                let scalar = batch.scalar(row, col_idx)
-                    .unwrap_or(ScalarValue::null_for_type(col_def.data_type));
-
-                if scalar.is_null() {
-                    buf.push(1);
-                } else {
-                    buf.push(0);
-                    write_scalar_value_with_scale(&mut buf, &scalar, col_def.scale);
+                match batch.column(col_idx) {
+                    Some(col) => write_column_value_with_scale(&mut buf, col, row, col_def.scale),
+                    None => buf.push(1),
                 }
             }
         }
@@ -410,7 +425,10 @@ fn build_query_result(schema: &crate::types::batch::Schema, batches: &[crate::ty
     Message::new(MSG_TYPE_RESULT, Bytes::from(buf))
 }
 
-fn build_binary_query_result(schema: &crate::types::batch::Schema, batches: &[crate::types::batch::RecordBatch]) -> Message {
+fn build_binary_query_result(
+    schema: &crate::types::batch::Schema,
+    batches: &[crate::types::batch::RecordBatch],
+) -> Message {
     let merged = if batches.len() == 1 {
         batches[0].clone()
     } else if batches.is_empty() {
@@ -421,6 +439,95 @@ fn build_binary_query_result(schema: &crate::types::batch::Schema, batches: &[cr
 
     let encoded = crate::protocol::result::encode_binary_result(&merged);
     Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(encoded))
+}
+
+fn write_column_value_with_scale(
+    buf: &mut Vec<u8>,
+    col: &crate::types::array::ColumnArray,
+    row: usize,
+    scale: i32,
+) {
+    if col.bitmap().is_null(row) {
+        buf.push(1);
+        return;
+    }
+
+    buf.push(0);
+    match col {
+        crate::types::array::ColumnArray::Bool { data, .. } => {
+            buf.push(if data[row] != 0 { 1 } else { 0 })
+        }
+        crate::types::array::ColumnArray::Int8 { data, .. } => buf.push(data[row] as u8),
+        crate::types::array::ColumnArray::Int16 { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::Int32 { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::Int64 { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::UInt8 { data, .. } => buf.push(data[row]),
+        crate::types::array::ColumnArray::UInt16 { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::UInt32 { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::UInt64 { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::Float32 { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::Float64 { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::Decimal { data, .. } => {
+            write_decimal_value_with_scale(buf, data[row], scale)
+        }
+        crate::types::array::ColumnArray::Date { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::Time { data, .. }
+        | crate::types::array::ColumnArray::Timestamp { data, .. }
+        | crate::types::array::ColumnArray::Interval { data, .. } => {
+            buf.extend_from_slice(&data[row].to_le_bytes())
+        }
+        crate::types::array::ColumnArray::VarChar { data, .. } => {
+            let bytes = data[row].as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        crate::types::array::ColumnArray::Blob { data, .. } => {
+            buf.extend_from_slice(&(data[row].len() as u32).to_le_bytes());
+            buf.extend_from_slice(&data[row]);
+        }
+        crate::types::array::ColumnArray::Vector { data, .. } => {
+            buf.extend_from_slice(&(data[row].len() as u32).to_le_bytes());
+            for f in &data[row] {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+    }
+}
+
+fn write_decimal_value_with_scale(buf: &mut Vec<u8>, value: i64, scale: i32) {
+    if scale > 0 {
+        let divisor = 10_i64.pow(scale as u32);
+        let int_part = value / divisor;
+        let frac_part = (value.abs() % divisor) as u32;
+        let s = if frac_part == 0 {
+            format!("{}", int_part)
+        } else {
+            let width = scale as usize;
+            format!("{}.{:0width$}", int_part, frac_part)
+        };
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    } else {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
 }
 
 fn merge_batches(batches: &[crate::types::batch::RecordBatch]) -> crate::types::batch::RecordBatch {
@@ -447,65 +554,16 @@ fn merge_batches(batches: &[crate::types::batch::RecordBatch]) -> crate::types::
     crate::types::batch::RecordBatch::try_new(schema, columns).unwrap()
 }
 
-fn write_scalar_value_with_scale(buf: &mut Vec<u8>, val: &ScalarValue, scale: i32) {
-    match val {
-        ScalarValue::Bool(Some(v)) => buf.push(if *v { 1 } else { 0 }),
-        ScalarValue::Int8(Some(v)) => buf.push(*v as u8),
-        ScalarValue::Int16(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Int32(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Int64(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::UInt8(Some(v)) => buf.push(*v),
-        ScalarValue::UInt16(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::UInt32(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::UInt64(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Float32(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Float64(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Decimal(Some(v)) => {
-            if scale > 0 {
-                let divisor = 10_i64.pow(scale as u32);
-                let int_part = v / divisor;
-                let frac_part = (v.abs() % divisor) as u32;
-                let s = if frac_part == 0 {
-                    format!("{}", int_part)
-                } else {
-                    let width = scale as usize;
-                    format!("{}.{:0width$}", int_part, frac_part)
-                };
-                buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                buf.extend_from_slice(s.as_bytes());
-            } else {
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ScalarValue::Date(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Time(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Timestamp(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::Interval(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-        ScalarValue::VarChar(Some(v)) => {
-            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            buf.extend_from_slice(v.as_bytes());
-        }
-        ScalarValue::Blob(Some(v)) => {
-            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            buf.extend_from_slice(v);
-        }
-        ScalarValue::Vector(Some(v)) => {
-            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            for f in v {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_header_round_trip() {
-        let h = MessageHeader { msg_type: MSG_TYPE_PING, payload_len: 0 };
+        let h = MessageHeader {
+            msg_type: MSG_TYPE_PING,
+            payload_len: 0,
+        };
         let encoded = h.encode();
         let decoded = MessageHeader::decode(&encoded).unwrap();
         assert_eq!(decoded.msg_type, MSG_TYPE_PING);
@@ -597,24 +655,34 @@ mod tests {
         write_len_prefixed_string(&mut payload, "root");
         write_len_prefixed_string(&mut payload, "pass");
         write_len_prefixed_string(&mut payload, "main");
-        handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
+        handler
+            .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+            .unwrap();
 
         let mut sql_payload = Vec::new();
         write_len_prefixed_string(&mut sql_payload, "main");
         write_len_prefixed_string(&mut sql_payload, "CREATE TABLE t (id INT64)");
-        handler.handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload))).unwrap();
+        handler
+            .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+            .unwrap();
 
         let mut prep_payload = Vec::new();
         write_len_prefixed_string(&mut prep_payload, "SELECT 42");
-        let resp = handler.handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload))).unwrap();
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_PREPARE);
 
         let exec_payload = Bytes::copy_from_slice(&1u32.to_le_bytes());
-        let resp = handler.handle_message(Message::new(MSG_TYPE_EXECUTE, exec_payload)).unwrap();
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_EXECUTE, exec_payload))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_RESULT);
 
         let close_payload = Bytes::copy_from_slice(&1u32.to_le_bytes());
-        let resp = handler.handle_message(Message::new(MSG_TYPE_CLOSE_STMT, close_payload)).unwrap();
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_CLOSE_STMT, close_payload))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
     }
 
@@ -629,16 +697,26 @@ mod tests {
         write_len_prefixed_string(&mut payload, "root");
         write_len_prefixed_string(&mut payload, "pass");
         write_len_prefixed_string(&mut payload, "main");
-        handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
+        handler
+            .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+            .unwrap();
 
-        let resp = handler.handle_message(Message::empty(MSG_TYPE_BEGIN_TXN)).unwrap();
+        let resp = handler
+            .handle_message(Message::empty(MSG_TYPE_BEGIN_TXN))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
 
-        let resp = handler.handle_message(Message::empty(MSG_TYPE_COMMIT_TXN)).unwrap();
+        let resp = handler
+            .handle_message(Message::empty(MSG_TYPE_COMMIT_TXN))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
 
-        handler.handle_message(Message::empty(MSG_TYPE_BEGIN_TXN)).unwrap();
-        let resp = handler.handle_message(Message::empty(MSG_TYPE_ROLLBACK_TXN)).unwrap();
+        handler
+            .handle_message(Message::empty(MSG_TYPE_BEGIN_TXN))
+            .unwrap();
+        let resp = handler
+            .handle_message(Message::empty(MSG_TYPE_ROLLBACK_TXN))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
     }
 
@@ -653,10 +731,16 @@ mod tests {
         write_len_prefixed_string(&mut payload, "root");
         write_len_prefixed_string(&mut payload, "pass");
         write_len_prefixed_string(&mut payload, "main");
-        handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
+        handler
+            .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+            .unwrap();
 
-        handler.handle_message(Message::empty(MSG_TYPE_BEGIN_TXN)).unwrap();
-        let resp = handler.handle_message(Message::empty(MSG_TYPE_BEGIN_TXN)).unwrap();
+        handler
+            .handle_message(Message::empty(MSG_TYPE_BEGIN_TXN))
+            .unwrap();
+        let resp = handler
+            .handle_message(Message::empty(MSG_TYPE_BEGIN_TXN))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_ERROR);
         let msg = String::from_utf8_lossy(&resp[0].payload);
         assert!(msg.contains("already in progress"), "got: {msg}");
@@ -673,9 +757,13 @@ mod tests {
         write_len_prefixed_string(&mut payload, "root");
         write_len_prefixed_string(&mut payload, "pass");
         write_len_prefixed_string(&mut payload, "main");
-        handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
+        handler
+            .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+            .unwrap();
 
-        let resp = handler.handle_message(Message::empty(MSG_TYPE_COMMIT_TXN)).unwrap();
+        let resp = handler
+            .handle_message(Message::empty(MSG_TYPE_COMMIT_TXN))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_ERROR);
         let msg = String::from_utf8_lossy(&resp[0].payload);
         assert!(msg.contains("no active transaction"), "got: {msg}");
@@ -692,9 +780,13 @@ mod tests {
         write_len_prefixed_string(&mut payload, "root");
         write_len_prefixed_string(&mut payload, "pass");
         write_len_prefixed_string(&mut payload, "main");
-        handler.handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload))).unwrap();
+        handler
+            .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+            .unwrap();
 
-        let resp = handler.handle_message(Message::empty(MSG_TYPE_ROLLBACK_TXN)).unwrap();
+        let resp = handler
+            .handle_message(Message::empty(MSG_TYPE_ROLLBACK_TXN))
+            .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_ERROR);
         let msg = String::from_utf8_lossy(&resp[0].payload);
         assert!(msg.contains("no active transaction"), "got: {msg}");

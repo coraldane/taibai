@@ -37,7 +37,10 @@ impl RecordType {
             6 => Ok(RecordType::Checkpoint),
             7 => Ok(RecordType::CompactSwap),
             8 => Ok(RecordType::BatchInsert),
-            _ => Err(MonaxError::Storage(format!("unknown WAL record type: {}", v))),
+            _ => Err(MonaxError::Storage(format!(
+                "unknown WAL record type: {}",
+                v
+            ))),
         }
     }
 }
@@ -53,7 +56,13 @@ pub struct WalRecord {
 impl WalRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(HEADER_SIZE + self.data.len());
-        encode_record_to(&mut buf, self.sequence, self.record_type, self.txn_id, &self.data);
+        encode_record_to(
+            &mut buf,
+            self.sequence,
+            self.record_type,
+            self.txn_id,
+            &self.data,
+        );
         buf
     }
 
@@ -83,7 +92,15 @@ impl WalRecord {
         }
 
         let total_len = HEADER_SIZE + data_len;
-        Ok((WalRecord { sequence, record_type, txn_id, data }, total_len))
+        Ok((
+            WalRecord {
+                sequence,
+                record_type,
+                txn_id,
+                data,
+            },
+            total_len,
+        ))
     }
 }
 
@@ -153,7 +170,13 @@ impl WalWriter {
     pub fn write(&mut self, record_type: RecordType, txn_id: u64, data: &[u8]) -> Result<u64> {
         self.sequence += 1;
         self.batch_buf.clear();
-        encode_record_to(&mut self.batch_buf, self.sequence, record_type, txn_id, data);
+        encode_record_to(
+            &mut self.batch_buf,
+            self.sequence,
+            record_type,
+            txn_id,
+            data,
+        );
         let buf = self.batch_buf.clone();
         self.write_raw(&buf)?;
         Ok(self.sequence)
@@ -163,7 +186,13 @@ impl WalWriter {
         self.batch_buf.clear();
 
         self.sequence += 1;
-        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::Begin, txn_id, &[]);
+        encode_record_to(
+            &mut self.batch_buf,
+            self.sequence,
+            RecordType::Begin,
+            txn_id,
+            &[],
+        );
 
         for &(rt, data) in records {
             self.sequence += 1;
@@ -171,7 +200,13 @@ impl WalWriter {
         }
 
         self.sequence += 1;
-        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::Commit, txn_id, &[]);
+        encode_record_to(
+            &mut self.batch_buf,
+            self.sequence,
+            RecordType::Commit,
+            txn_id,
+            &[],
+        );
 
         let buf = self.batch_buf.clone();
         self.write_raw(&buf)?;
@@ -191,11 +226,21 @@ impl WalWriter {
         Ok(())
     }
 
-    pub fn write_batch_no_sync(&mut self, txn_id: u64, records: &[(RecordType, &[u8])]) -> Result<u64> {
+    pub fn write_batch_no_sync(
+        &mut self,
+        txn_id: u64,
+        records: &[(RecordType, &[u8])],
+    ) -> Result<u64> {
         self.batch_buf.clear();
 
         self.sequence += 1;
-        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::Begin, txn_id, &[]);
+        encode_record_to(
+            &mut self.batch_buf,
+            self.sequence,
+            RecordType::Begin,
+            txn_id,
+            &[],
+        );
 
         for &(rt, data) in records {
             self.sequence += 1;
@@ -203,7 +248,13 @@ impl WalWriter {
         }
 
         self.sequence += 1;
-        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::Commit, txn_id, &[]);
+        encode_record_to(
+            &mut self.batch_buf,
+            self.sequence,
+            RecordType::Commit,
+            txn_id,
+            &[],
+        );
 
         let buf = self.batch_buf.clone();
         self.write_raw(&buf)?;
@@ -213,7 +264,13 @@ impl WalWriter {
     pub fn write_compact(&mut self, txn_id: u64, data: &[u8], sync: bool) -> Result<u64> {
         self.sequence += 1;
         self.batch_buf.clear();
-        encode_record_to(&mut self.batch_buf, self.sequence, RecordType::BatchInsert, txn_id, data);
+        encode_record_to(
+            &mut self.batch_buf,
+            self.sequence,
+            RecordType::BatchInsert,
+            txn_id,
+            data,
+        );
         let buf = self.batch_buf.clone();
         self.write_raw(&buf)?;
 
@@ -300,7 +357,9 @@ pub struct WalReader {
 
 impl WalReader {
     pub fn new(dir: &Path) -> Self {
-        Self { dir: dir.to_path_buf() }
+        Self {
+            dir: dir.to_path_buf(),
+        }
     }
 
     pub fn read_all(&self) -> Result<Vec<WalRecord>> {
@@ -504,7 +563,9 @@ mod tests {
         let mut writer = WalWriter::open(&wal_dir, 1024 * 1024).unwrap();
 
         let insert_data = vec![1, 2, 3];
-        writer.write_batch(1, &[(RecordType::Insert, insert_data.as_slice())]).unwrap();
+        writer
+            .write_batch(1, &[(RecordType::Insert, insert_data.as_slice())])
+            .unwrap();
         assert!(writer.sequence() > 0);
 
         writer.write(RecordType::Insert, 2, &[4, 5, 6]).unwrap();
@@ -527,7 +588,9 @@ mod tests {
 
         let mut writer = WalWriter::open(&wal_dir, 1024 * 1024).unwrap();
 
-        writer.write_batch(1, &[(RecordType::Insert, &[1, 2, 3])]).unwrap();
+        writer
+            .write_batch(1, &[(RecordType::Insert, &[1, 2, 3])])
+            .unwrap();
 
         writer.write(RecordType::Begin, 2, &[]).unwrap();
         writer.write(RecordType::Insert, 2, &[4, 5, 6]).unwrap();

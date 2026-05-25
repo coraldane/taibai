@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
-use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
 use crate::sql::execution::operators::aggregate::compute_aggregate;
+use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -17,8 +17,17 @@ pub struct PushHashAggregate {
 }
 
 impl PushHashAggregate {
-    pub fn new(group_by: Vec<LogicalExpr>, aggregates: Vec<AggregateExpr>, input_schema: Schema) -> Self {
-        Self { group_by, aggregates, input_schema, groups: HashMap::new() }
+    pub fn new(
+        group_by: Vec<LogicalExpr>,
+        aggregates: Vec<AggregateExpr>,
+        input_schema: Schema,
+    ) -> Self {
+        Self {
+            group_by,
+            aggregates,
+            input_schema,
+            groups: HashMap::new(),
+        }
     }
 }
 
@@ -28,9 +37,13 @@ impl PushOp for PushHashAggregate {
             let vals: Vec<ScalarValue> = (0..batch.num_columns())
                 .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
                 .collect();
-            let key: Vec<String> = self.group_by.iter()
+            let key: Vec<String> = self
+                .group_by
+                .iter()
                 .map(|expr| match expr {
-                    LogicalExpr::Column(idx) => vals.get(*idx).map(|v| format!("{}", v)).unwrap_or_default(),
+                    LogicalExpr::Column(idx) => {
+                        vals.get(*idx).map(|v| format!("{}", v)).unwrap_or_default()
+                    }
                     _ => String::new(),
                 })
                 .collect();
@@ -47,19 +60,33 @@ impl PushOp for PushHashAggregate {
         for expr in &self.group_by {
             if let LogicalExpr::Column(idx) = expr {
                 if let Some(cd) = self.input_schema.columns.get(*idx) {
-                    col_defs.push(ColumnDef::new(&cd.name, cd.data_type)
-                    .with_scale(cd.scale)
-                    .with_precision(cd.precision));
+                    col_defs.push(
+                        ColumnDef::new(&cd.name, cd.data_type)
+                            .with_scale(cd.scale)
+                            .with_precision(cd.precision),
+                    );
                 }
             }
         }
         for agg in &self.aggregates {
-            let name = format!("{:?}({})", agg.func, match &*agg.arg {
-                LogicalExpr::Wildcard => "*".into(),
-                LogicalExpr::Column(idx) => self.input_schema.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default(),
-                _ => "expr".into(),
-            });
-            let dt = match agg.func { AggFunc::Count => DataType::Int64, _ => DataType::Float64 };
+            let name = format!(
+                "{:?}({})",
+                agg.func,
+                match &*agg.arg {
+                    LogicalExpr::Wildcard => "*".into(),
+                    LogicalExpr::Column(idx) => self
+                        .input_schema
+                        .columns
+                        .get(*idx)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default(),
+                    _ => "expr".into(),
+                }
+            );
+            let dt = match agg.func {
+                AggFunc::Count => DataType::Int64,
+                _ => DataType::Float64,
+            };
             col_defs.push(ColumnDef::new(&name, dt));
         }
         let schema = Schema::new(col_defs);
@@ -68,7 +95,12 @@ impl PushOp for PushHashAggregate {
             let mut row_vals = Vec::new();
             for expr in &self.group_by {
                 if let LogicalExpr::Column(idx) = expr {
-                    row_vals.push(rows.first().and_then(|r| r.get(*idx)).cloned().unwrap_or(ScalarValue::Int64(None)));
+                    row_vals.push(
+                        rows.first()
+                            .and_then(|r| r.get(*idx))
+                            .cloned()
+                            .unwrap_or(ScalarValue::Int64(None)),
+                    );
                 }
             }
             for agg in &self.aggregates {

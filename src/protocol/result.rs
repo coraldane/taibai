@@ -1,5 +1,5 @@
-use crate::types::batch::RecordBatch;
 use crate::protocol::types::DataType;
+use crate::types::batch::RecordBatch;
 
 /// Binary query result encoder for MsgTypeBinaryQueryResult (0x24).
 /// Uses a zero-copy friendly format:
@@ -39,10 +39,16 @@ pub fn encode_binary_result(batch: &RecordBatch) -> Vec<u8> {
         let col = batch.column(col_idx).unwrap();
 
         // Null bitmap (1 byte per row for simplicity; bit=1 means NULL)
-        let null_bitmap: Vec<u8> = (0..num_rows).map(|i| {
-            let val = col.scalar(i);
-            if val.is_null() { 1u8 } else { 0u8 }
-        }).collect();
+        let null_bitmap: Vec<u8> = (0..num_rows)
+            .map(|i| {
+                let val = col.scalar(i);
+                if val.is_null() {
+                    1u8
+                } else {
+                    0u8
+                }
+            })
+            .collect();
 
         buf.extend_from_slice(&(null_bitmap.len() as u32).to_le_bytes());
         buf.extend_from_slice(&null_bitmap);
@@ -146,8 +152,16 @@ mod tests {
             ColumnDef::new("name", DataType::VarChar),
         ]);
         let mut batch = RecordBatch::new(schema);
-        batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(42))).unwrap();
-        batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some("hello".into()))).unwrap();
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(42)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("hello".into())))
+            .unwrap();
 
         let encoded = encode_binary_result(&batch);
         assert!(encoded.len() > 10);
@@ -162,7 +176,11 @@ mod tests {
         let schema = Schema::new(vec![ColumnDef::new("val", DataType::Float64)]);
         let mut batch = RecordBatch::new(schema);
         for i in 0..5i64 {
-            batch.column_mut(0).unwrap().push(&ScalarValue::Float64(Some(i as f64))).unwrap();
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Float64(Some(i as f64)))
+                .unwrap();
         }
 
         let encoded = encode_binary_result(&batch);

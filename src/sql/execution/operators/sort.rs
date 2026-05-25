@@ -1,4 +1,3 @@
-
 use crate::common::error::Result;
 use crate::sql::execution::operators::filter::remap_expr_for_batch;
 use crate::sql::planner::{LogicalExpr, SortKey};
@@ -18,7 +17,13 @@ pub struct SortExec {
 
 impl SortExec {
     pub fn new(sort_keys: Vec<SortKey>, input: Box<dyn ExecutionOp>, schema: Schema) -> Self {
-        Self { sort_keys, input, schema, limit: None, done: false }
+        Self {
+            sort_keys,
+            input,
+            schema,
+            limit: None,
+            done: false,
+        }
     }
 
     pub fn with_limit(mut self, limit: usize) -> Self {
@@ -59,7 +64,9 @@ impl ExecutionOp for SortExec {
             }
         }
 
-        let sort_key_indices: Vec<(usize, bool)> = self.sort_keys.iter()
+        let sort_key_indices: Vec<(usize, bool)> = self
+            .sort_keys
+            .iter()
             .map(|sk| {
                 let expr = remap_expr_for_batch(&sk.expr, &self.schema, &output_schema);
                 match &expr {
@@ -101,7 +108,11 @@ fn topn_sort(rows: &mut Vec<Vec<ScalarValue>>, sort_key_indices: &[(usize, bool)
     rows[..limit].sort_by(|a, b| compare_rows(a, b, sort_key_indices));
 }
 
-fn compare_rows(a: &[ScalarValue], b: &[ScalarValue], keys: &[(usize, bool)]) -> std::cmp::Ordering {
+fn compare_rows(
+    a: &[ScalarValue],
+    b: &[ScalarValue],
+    keys: &[(usize, bool)],
+) -> std::cmp::Ordering {
     for &(idx, desc) in keys {
         let cmp = compare_scalars(&a[idx], &b[idx]);
         let cmp = if desc { cmp.reverse() } else { cmp };
@@ -113,9 +124,15 @@ fn compare_rows(a: &[ScalarValue], b: &[ScalarValue], keys: &[(usize, bool)]) ->
 }
 
 pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    if a.is_null() && b.is_null() { return std::cmp::Ordering::Equal; }
-    if a.is_null() { return std::cmp::Ordering::Less; }
-    if b.is_null() { return std::cmp::Ordering::Greater; }
+    if a.is_null() && b.is_null() {
+        return std::cmp::Ordering::Equal;
+    }
+    if a.is_null() {
+        return std::cmp::Ordering::Less;
+    }
+    if b.is_null() {
+        return std::cmp::Ordering::Greater;
+    }
     match (a, b) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
@@ -123,16 +140,24 @@ pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
         (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => l.cmp(r),
         (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => l.cmp(r),
         (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => l.cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
-        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
         (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l.cmp(r),
         (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l.cmp(r),
         // Cross-type comparison: promote to i64
         (ScalarValue::Int64(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(&(*r as i64)),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int64(Some(r))) => (*l as i64).cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Int64(Some(r))) => l.partial_cmp(&(*r as f64)).unwrap_or(std::cmp::Ordering::Equal),
-        (ScalarValue::Int64(Some(l)), ScalarValue::Float64(Some(r))) => (*l as f64).partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Float64(Some(l)), ScalarValue::Int64(Some(r))) => l
+            .partial_cmp(&(*r as f64))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Int64(Some(l)), ScalarValue::Float64(Some(r))) => (*l as f64)
+            .partial_cmp(r)
+            .unwrap_or(std::cmp::Ordering::Equal),
         _ => std::cmp::Ordering::Equal,
     }
 }

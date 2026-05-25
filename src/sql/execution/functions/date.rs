@@ -1,5 +1,5 @@
 /// Date/Time SQL functions using chrono crate.
-use chrono::{Datelike, Timelike, Local, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 
 use crate::common::error::Result;
 use crate::types::scalar::ScalarValue;
@@ -13,11 +13,11 @@ pub fn parse_timestamp_smart(value: &str, timezone_offset_hours: i32) -> Option<
     if value.is_empty() {
         return None;
     }
-    
+
     if let Ok(num) = value.parse::<i64>() {
         return Some(normalize_timestamp_precision(num));
     }
-    
+
     parse_datetime_string(value, timezone_offset_hours)
 }
 
@@ -36,13 +36,15 @@ fn normalize_timestamp_precision(num: i64) -> i64 {
 }
 
 fn parse_datetime_string(s: &str, timezone_offset_hours: i32) -> Option<i64> {
-    let dt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").ok()
+    let dt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
         .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok())
         .or_else(|| {
-            NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+            NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .ok()
                 .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
         });
-    
+
     dt.map(|d| {
         let utc_dt = if timezone_offset_hours != 0 {
             d - chrono::Duration::hours(timezone_offset_hours as i64)
@@ -67,7 +69,8 @@ pub fn current_date(_args: &[ScalarValue]) -> Result<ScalarValue> {
 
 pub fn current_time(_args: &[ScalarValue]) -> Result<ScalarValue> {
     let now = Local::now().time();
-    let micros = (now.hour() as i64 * 3600 + now.minute() as i64 * 60 + now.second() as i64) * 1_000_000
+    let micros = (now.hour() as i64 * 3600 + now.minute() as i64 * 60 + now.second() as i64)
+        * 1_000_000
         + now.nanosecond() as i64 / 1000;
     Ok(ScalarValue::Time(Some(micros)))
 }
@@ -121,7 +124,9 @@ pub fn second(args: &[ScalarValue]) -> Result<ScalarValue> {
 
 pub fn dayofweek(args: &[ScalarValue]) -> Result<ScalarValue> {
     match extract_date(args) {
-        Some(dt) => Ok(ScalarValue::Int64(Some(dt.weekday().num_days_from_sunday() as i64 + 1))),
+        Some(dt) => Ok(ScalarValue::Int64(Some(
+            dt.weekday().num_days_from_sunday() as i64 + 1,
+        ))),
         None => Ok(ScalarValue::Int64(None)),
     }
 }
@@ -153,7 +158,9 @@ pub fn date_format(args: &[ScalarValue]) -> Result<ScalarValue> {
     match (dt, fmt) {
         (Some(dt), Some(fmt)) => {
             let chrono_fmt = sql_to_chrono_format(&fmt);
-            Ok(ScalarValue::VarChar(Some(dt.format(&chrono_fmt).to_string())))
+            Ok(ScalarValue::VarChar(Some(
+                dt.format(&chrono_fmt).to_string(),
+            )))
         }
         _ => Ok(ScalarValue::VarChar(None)),
     }
@@ -180,26 +187,25 @@ pub fn last_day(args: &[ScalarValue]) -> Result<ScalarValue> {
 
 fn extract_date(args: &[ScalarValue]) -> Option<NaiveDate> {
     match args.first() {
-        Some(ScalarValue::Date(Some(days))) => {
-            NaiveDate::from_num_days_from_ce_opt(*days + 719163)
-        }
-        Some(ScalarValue::VarChar(Some(s))) => {
-            NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
-        }
+        Some(ScalarValue::Date(Some(days))) => NaiveDate::from_num_days_from_ce_opt(*days + 719163),
+        Some(ScalarValue::VarChar(Some(s))) => NaiveDate::parse_from_str(s, "%Y-%m-%d").ok(),
         _ => None,
     }
 }
 
 fn extract_datetime(args: &[ScalarValue]) -> Option<NaiveDateTime> {
     match args.first() {
-        Some(ScalarValue::Timestamp(Some(micros))) => {
-            Local.timestamp_opt(*micros / 1_000_000, (*micros % 1_000_000) as u32 * 1000).single().map(|dt| dt.naive_local())
-        }
+        Some(ScalarValue::Timestamp(Some(micros))) => Local
+            .timestamp_opt(*micros / 1_000_000, (*micros % 1_000_000) as u32 * 1000)
+            .single()
+            .map(|dt| dt.naive_local()),
         Some(ScalarValue::VarChar(Some(s))) => {
-            NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").ok()
+            NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
                 .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok())
                 .or_else(|| {
-                    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+                    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .ok()
                         .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
                 })
         }

@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio_util::codec::Framed;
-use futures::StreamExt;
 use futures::SinkExt;
-use tokio_rustls::TlsAcceptor;
+use futures::StreamExt;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tokio_util::codec::Framed;
 
 use crate::common::config::ServerConfig;
 use crate::common::error::{MonaxError, Result};
@@ -22,35 +22,37 @@ pub struct Server {
 impl Server {
     pub fn new(config: Arc<ServerConfig>, engine: Arc<Engine>) -> Self {
         let tls_acceptor = match config.tls_mode() {
-            TlsMode::Enable(tls_config) => {
-                match tls_config.validate() {
-                    Ok(()) => {
-                        tracing::info!(
-                            "TLS enabled: cert={:?}, key={:?}",
-                            tls_config.cert_path,
-                            tls_config.key_path
-                        );
-                        match tls_config.load_server_config() {
-                            Ok(server_config) => {
-                                tracing::info!("TLS configuration loaded successfully");
-                                Some(TlsAcceptor::from(server_config))
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to load TLS configuration: {}", e);
-                                None
-                            }
+            TlsMode::Enable(tls_config) => match tls_config.validate() {
+                Ok(()) => {
+                    tracing::info!(
+                        "TLS enabled: cert={:?}, key={:?}",
+                        tls_config.cert_path,
+                        tls_config.key_path
+                    );
+                    match tls_config.load_server_config() {
+                        Ok(server_config) => {
+                            tracing::info!("TLS configuration loaded successfully");
+                            Some(TlsAcceptor::from(server_config))
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to load TLS configuration: {}", e);
+                            None
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("TLS configuration invalid: {}", e);
-                        None
-                    }
                 }
-            }
+                Err(e) => {
+                    tracing::error!("TLS configuration invalid: {}", e);
+                    None
+                }
+            },
             TlsMode::Disable => None,
         };
 
-        Self { config, engine, tls_acceptor }
+        Self {
+            config,
+            engine,
+            tls_acceptor,
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -85,10 +87,10 @@ async fn handle_connection(
 ) -> Result<()> {
     if let Some(acceptor) = tls_acceptor {
         tracing::debug!("Performing TLS handshake");
-        let tls_stream = acceptor.accept(stream).await
-            .map_err(|e| MonaxError::Network(
-                format!("TLS handshake failed: {}", e)
-            ))?;
+        let tls_stream = acceptor
+            .accept(stream)
+            .await
+            .map_err(|e| MonaxError::Network(format!("TLS handshake failed: {}", e)))?;
         tracing::debug!("TLS handshake completed");
         handle_framed(tls_stream, config, engine).await
     } else {
@@ -100,7 +102,11 @@ async fn handle_framed<S>(stream: S, config: Arc<ServerConfig>, engine: Arc<Engi
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let compress_threshold = if config.compression.enabled { 4096 } else { usize::MAX };
+    let compress_threshold = if config.compression.enabled {
+        4096
+    } else {
+        usize::MAX
+    };
     let mut framed = Framed::new(
         stream,
         MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),

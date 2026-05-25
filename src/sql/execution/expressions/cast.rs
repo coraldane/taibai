@@ -1,9 +1,9 @@
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
+use crate::sql::execution::functions::date::parse_timestamp_smart;
 use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
-use crate::sql::execution::functions::date::parse_timestamp_smart;
 
 use super::ColumnExpression;
 
@@ -36,7 +36,11 @@ impl ColumnExpression for CastExpression {
     }
 }
 
-pub fn cast_scalar_with_timezone(v: &ScalarValue, target: &DataType, timezone_offset_hours: i32) -> ScalarValue {
+pub fn cast_scalar_with_timezone(
+    v: &ScalarValue,
+    target: &DataType,
+    timezone_offset_hours: i32,
+) -> ScalarValue {
     if v.is_null() {
         return ScalarValue::null_for_type(*target);
     }
@@ -45,18 +49,14 @@ pub fn cast_scalar_with_timezone(v: &ScalarValue, target: &DataType, timezone_of
         (ScalarValue::Int32(Some(n)), DataType::Float64) => ScalarValue::Float64(Some(*n as f64)),
         (ScalarValue::Int32(Some(n)), DataType::Int64) => ScalarValue::Int64(Some(*n as i64)),
         (ScalarValue::Float64(Some(n)), DataType::Int64) => ScalarValue::Int64(Some(*n as i64)),
-        (ScalarValue::VarChar(Some(s)), DataType::Int64) => {
-            match s.parse::<i64>() {
-                Ok(n) => ScalarValue::Int64(Some(n)),
-                Err(_) => ScalarValue::Int64(None),
-            }
-        }
-        (ScalarValue::VarChar(Some(s)), DataType::Float64) => {
-            match s.parse::<f64>() {
-                Ok(n) => ScalarValue::Float64(Some(n)),
-                Err(_) => ScalarValue::Float64(None),
-            }
-        }
+        (ScalarValue::VarChar(Some(s)), DataType::Int64) => match s.parse::<i64>() {
+            Ok(n) => ScalarValue::Int64(Some(n)),
+            Err(_) => ScalarValue::Int64(None),
+        },
+        (ScalarValue::VarChar(Some(s)), DataType::Float64) => match s.parse::<f64>() {
+            Ok(n) => ScalarValue::Float64(Some(n)),
+            Err(_) => ScalarValue::Float64(None),
+        },
         (ScalarValue::VarChar(Some(s)), DataType::Timestamp) => {
             match parse_timestamp_smart(s, timezone_offset_hours) {
                 Some(ts) => ScalarValue::Timestamp(Some(ts)),

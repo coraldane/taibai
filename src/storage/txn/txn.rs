@@ -106,7 +106,10 @@ impl ConcurrencyControl {
                     | IsolationLevel::Serializable
             ),
             ConcurrencyControl::OptimisticConcurrencyControl => {
-                matches!(level, IsolationLevel::ReadCommitted | IsolationLevel::Serializable)
+                matches!(
+                    level,
+                    IsolationLevel::ReadCommitted | IsolationLevel::Serializable
+                )
             }
             ConcurrencyControl::TwoPhaseLocking => true,
         }

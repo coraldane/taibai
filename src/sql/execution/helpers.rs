@@ -28,92 +28,124 @@ pub fn eval_where_clause_batch(
 ) -> Result<Vec<bool>> {
     let num_rows = batch.num_rows();
     match expr {
-        Expr::BinaryOp { left, op, right } => {
-            match op {
-                BinOp::Eq => {
-                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(col_idx) = schema.index_of(col_name) {
-                            if let Some(col) = batch.column(col_idx) {
-                                return Ok(col.eq_vec(val));
-                            }
+        Expr::BinaryOp { left, op, right } => match op {
+            BinOp::Eq => {
+                if let (Expr::Column(col_name), Expr::Literal(val)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            return Ok(col.eq_vec(val));
                         }
                     }
-                    if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(col_idx) = schema.index_of(col_name) {
-                            if let Some(col) = batch.column(col_idx) {
-                                return Ok(col.eq_vec(val));
-                            }
-                        }
-                    }
-                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
                 }
-                BinOp::Lt => {
-                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(col_idx) = schema.index_of(col_name) {
-                            if let Some(col) = batch.column(col_idx) {
-                                return Ok(col.lt_vec(val));
-                            }
+                if let (Expr::Literal(val), Expr::Column(col_name)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            return Ok(col.eq_vec(val));
                         }
                     }
-                    if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(col_idx) = schema.index_of(col_name) {
-                            if let Some(col) = batch.column(col_idx) {
-                                return Ok(col.gt_vec(val));
-                            }
-                        }
-                    }
-                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
                 }
-                BinOp::Gt => {
-                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(col_idx) = schema.index_of(col_name) {
-                            if let Some(col) = batch.column(col_idx) {
-                                return Ok(col.gt_vec(val));
-                            }
-                        }
-                    }
-                    if let (Expr::Literal(val), Expr::Column(col_name)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(col_idx) = schema.index_of(col_name) {
-                            if let Some(col) = batch.column(col_idx) {
-                                return Ok(col.lt_vec(val));
-                            }
-                        }
-                    }
-                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
-                }
-                BinOp::Lte => {
-                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(col_idx) = schema.index_of(col_name) {
-                            if let Some(col) = batch.column(col_idx) {
-                                return Ok(col.le_vec(val));
-                            }
-                        }
-                    }
-                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
-                }
-                BinOp::Gte => {
-                    if let (Expr::Column(col_name), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(col_idx) = schema.index_of(col_name) {
-                            if let Some(col) = batch.column(col_idx) {
-                                return Ok(col.ge_vec(val));
-                            }
-                        }
-                    }
-                    Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
-                }
-                BinOp::And => {
-                    let left_mask = eval_where_clause_batch(left, batch, schema)?;
-                    let right_mask = eval_where_clause_batch(right, batch, schema)?;
-                    Ok(left_mask.iter().zip(right_mask.iter()).map(|(l, r)| *l && *r).collect())
-                }
-                BinOp::Or => {
-                    let left_mask = eval_where_clause_batch(left, batch, schema)?;
-                    let right_mask = eval_where_clause_batch(right, batch, schema)?;
-                    Ok(left_mask.iter().zip(right_mask.iter()).map(|(l, r)| *l || *r).collect())
-                }
-                _ => Ok(vec![true; num_rows]),
+                Ok((0..num_rows)
+                    .map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true))
+                    .collect())
             }
-        }
+            BinOp::Lt => {
+                if let (Expr::Column(col_name), Expr::Literal(val)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            return Ok(col.lt_vec(val));
+                        }
+                    }
+                }
+                if let (Expr::Literal(val), Expr::Column(col_name)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            return Ok(col.gt_vec(val));
+                        }
+                    }
+                }
+                Ok((0..num_rows)
+                    .map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true))
+                    .collect())
+            }
+            BinOp::Gt => {
+                if let (Expr::Column(col_name), Expr::Literal(val)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            return Ok(col.gt_vec(val));
+                        }
+                    }
+                }
+                if let (Expr::Literal(val), Expr::Column(col_name)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            return Ok(col.lt_vec(val));
+                        }
+                    }
+                }
+                Ok((0..num_rows)
+                    .map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true))
+                    .collect())
+            }
+            BinOp::Lte => {
+                if let (Expr::Column(col_name), Expr::Literal(val)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            return Ok(col.le_vec(val));
+                        }
+                    }
+                }
+                Ok((0..num_rows)
+                    .map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true))
+                    .collect())
+            }
+            BinOp::Gte => {
+                if let (Expr::Column(col_name), Expr::Literal(val)) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            return Ok(col.ge_vec(val));
+                        }
+                    }
+                }
+                Ok((0..num_rows)
+                    .map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true))
+                    .collect())
+            }
+            BinOp::And => {
+                let left_mask = eval_where_clause_batch(left, batch, schema)?;
+                let right_mask = eval_where_clause_batch(right, batch, schema)?;
+                Ok(left_mask
+                    .iter()
+                    .zip(right_mask.iter())
+                    .map(|(l, r)| *l && *r)
+                    .collect())
+            }
+            BinOp::Or => {
+                let left_mask = eval_where_clause_batch(left, batch, schema)?;
+                let right_mask = eval_where_clause_batch(right, batch, schema)?;
+                Ok(left_mask
+                    .iter()
+                    .zip(right_mask.iter())
+                    .map(|(l, r)| *l || *r)
+                    .collect())
+            }
+            _ => Ok(vec![true; num_rows]),
+        },
         Expr::IsNull(inner) => {
             if let Expr::Column(col_name) = inner.as_ref() {
                 if let Some(col_idx) = schema.index_of(col_name) {
@@ -122,7 +154,9 @@ pub fn eval_where_clause_batch(
                     }
                 }
             }
-            Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+            Ok((0..num_rows)
+                .map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true))
+                .collect())
         }
         Expr::IsNotNull(inner) => {
             if let Expr::Column(col_name) = inner.as_ref() {
@@ -132,7 +166,9 @@ pub fn eval_where_clause_batch(
                     }
                 }
             }
-            Ok((0..num_rows).map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true)).collect())
+            Ok((0..num_rows)
+                .map(|i| eval_where_clause(expr, batch, i, schema).unwrap_or(true))
+                .collect())
         }
         Expr::UnaryNot(inner) => {
             let inner_mask = eval_where_clause_batch(inner, batch, schema)?;
@@ -157,10 +193,18 @@ pub fn eval_where_clause(
             match op {
                 BinOp::Eq => Ok(left_val == right_val),
                 BinOp::Neq => Ok(left_val != right_val),
-                BinOp::Lt => Ok(compare_scalars(&left_val, &right_val) == Some(std::cmp::Ordering::Less)),
-                BinOp::Gt => Ok(compare_scalars(&left_val, &right_val) == Some(std::cmp::Ordering::Greater)),
-                BinOp::Lte => Ok(compare_scalars(&left_val, &right_val) != Some(std::cmp::Ordering::Greater)),
-                BinOp::Gte => Ok(compare_scalars(&left_val, &right_val) != Some(std::cmp::Ordering::Less)),
+                BinOp::Lt => {
+                    Ok(compare_scalars(&left_val, &right_val) == Some(std::cmp::Ordering::Less))
+                }
+                BinOp::Gt => {
+                    Ok(compare_scalars(&left_val, &right_val) == Some(std::cmp::Ordering::Greater))
+                }
+                BinOp::Lte => {
+                    Ok(compare_scalars(&left_val, &right_val) != Some(std::cmp::Ordering::Greater))
+                }
+                BinOp::Gte => {
+                    Ok(compare_scalars(&left_val, &right_val) != Some(std::cmp::Ordering::Less))
+                }
                 BinOp::And => {
                     let left_bool = eval_where_clause(left, batch, row_idx, schema)?;
                     let right_bool = eval_where_clause(right, batch, row_idx, schema)?;
@@ -210,28 +254,32 @@ pub fn eval_expr_for_row(
 ) -> Result<ScalarValue> {
     match expr {
         Expr::Column(col_name) => {
-            let col_idx = schema.index_of(col_name)
+            let col_idx = schema
+                .index_of(col_name)
                 .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", col_name)))?;
-            Ok(batch.scalar(row_idx, col_idx)
-                .unwrap_or(ScalarValue::null_for_type(schema.columns[col_idx].data_type)))
+            Ok(batch
+                .scalar(row_idx, col_idx)
+                .unwrap_or(ScalarValue::null_for_type(
+                    schema.columns[col_idx].data_type,
+                )))
         }
         Expr::Literal(v) => Ok(v.clone()),
         Expr::BinaryOp { left, op, right } => {
             let left_val = eval_expr_for_row(left, batch, row_idx, schema)?;
             let right_val = eval_expr_for_row(right, batch, row_idx, schema)?;
             match op {
-                BinOp::Add => {
-                    match (&left_val, &right_val) {
-                        (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => Ok(ScalarValue::Int64(Some(a + b))),
-                        _ => Ok(left_val),
+                BinOp::Add => match (&left_val, &right_val) {
+                    (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => {
+                        Ok(ScalarValue::Int64(Some(a + b)))
                     }
-                }
-                BinOp::Sub => {
-                    match (&left_val, &right_val) {
-                        (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => Ok(ScalarValue::Int64(Some(a - b))),
-                        _ => Ok(left_val),
+                    _ => Ok(left_val),
+                },
+                BinOp::Sub => match (&left_val, &right_val) {
+                    (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => {
+                        Ok(ScalarValue::Int64(Some(a - b)))
                     }
-                }
+                    _ => Ok(left_val),
+                },
                 _ => Ok(left_val),
             }
         }
@@ -239,10 +287,14 @@ pub fn eval_expr_for_row(
         Expr::IsNotNull(inner) => eval_expr_for_row(inner, batch, row_idx, schema),
         Expr::UnaryNot(inner) => eval_expr_for_row(inner, batch, row_idx, schema),
         Expr::QualifiedColumn { column, .. } => {
-            let col_idx = schema.index_of(column)
+            let col_idx = schema
+                .index_of(column)
                 .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", column)))?;
-            Ok(batch.scalar(row_idx, col_idx)
-                .unwrap_or(ScalarValue::null_for_type(schema.columns[col_idx].data_type)))
+            Ok(batch
+                .scalar(row_idx, col_idx)
+                .unwrap_or(ScalarValue::null_for_type(
+                    schema.columns[col_idx].data_type,
+                )))
         }
         Expr::Function { .. } => Ok(ScalarValue::Int64(None)),
         Expr::UnaryMinus(_) => Ok(ScalarValue::Int64(None)),
@@ -272,41 +324,60 @@ pub fn eval_expr_to_scalar(expr: &Expr, dt: &DataType) -> Result<ScalarValue> {
     eval_expr_to_scalar_with_scale_timezone(expr, dt, 0, 0)
 }
 
-pub fn eval_expr_to_scalar_with_timezone(expr: &Expr, dt: &DataType, timezone_offset_hours: i32) -> Result<ScalarValue> {
+pub fn eval_expr_to_scalar_with_timezone(
+    expr: &Expr,
+    dt: &DataType,
+    timezone_offset_hours: i32,
+) -> Result<ScalarValue> {
     eval_expr_to_scalar_with_scale_timezone(expr, dt, 0, timezone_offset_hours)
 }
 
-pub fn eval_expr_to_scalar_with_scale_timezone(expr: &Expr, dt: &DataType, scale: i32, timezone_offset_hours: i32) -> Result<ScalarValue> {
+pub fn eval_expr_to_scalar_with_scale_timezone(
+    expr: &Expr,
+    dt: &DataType,
+    scale: i32,
+    timezone_offset_hours: i32,
+) -> Result<ScalarValue> {
     match expr {
         Expr::Literal(v) if v.is_null() => Ok(ScalarValue::null_for_type(*dt)),
-        Expr::Literal(v) => {
-            match (dt, v) {
-                (DataType::Int32, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int32(Some(*v as i32))),
-                (DataType::Int16, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int16(Some(*v as i16))),
-                (DataType::Int8, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int8(Some(*v as i8))),
-                (DataType::Float32, ScalarValue::Float64(Some(v))) => Ok(ScalarValue::Float32(Some(*v as f32))),
-                (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
-                    let multiplier = decimal_multiplier(scale)?;
-                    Ok(ScalarValue::Decimal(Some((*v * multiplier as f64).round() as i64)))
-                }
-                (DataType::Decimal, ScalarValue::Int64(Some(v))) => {
-                    let multiplier = decimal_multiplier(scale)?;
-                    Ok(ScalarValue::Decimal(Some(v.checked_mul(multiplier).ok_or_else(|| MonaxError::Sql(format!("decimal value '{}' overflows scale {}", v, scale)))?)))
-                }
-                (DataType::Timestamp, ScalarValue::VarChar(Some(s))) => {
-                    use crate::sql::execution::functions::date::parse_timestamp_smart;
-                    match parse_timestamp_smart(s, timezone_offset_hours) {
-                        Some(ts) => Ok(ScalarValue::Timestamp(Some(ts))),
-                        None => Ok(ScalarValue::Timestamp(None)),
-                    }
-                }
-                (DataType::Timestamp, ScalarValue::Int64(Some(n))) => {
-                    use crate::sql::execution::functions::date::parse_timestamp_from_int;
-                    Ok(ScalarValue::Timestamp(Some(parse_timestamp_from_int(*n))))
-                }
-                _ => Ok(v.clone()),
+        Expr::Literal(v) => match (dt, v) {
+            (DataType::Int32, ScalarValue::Int64(Some(v))) => {
+                Ok(ScalarValue::Int32(Some(*v as i32)))
             }
-        }
+            (DataType::Int16, ScalarValue::Int64(Some(v))) => {
+                Ok(ScalarValue::Int16(Some(*v as i16)))
+            }
+            (DataType::Int8, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int8(Some(*v as i8))),
+            (DataType::Float32, ScalarValue::Float64(Some(v))) => {
+                Ok(ScalarValue::Float32(Some(*v as f32)))
+            }
+            (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
+                let multiplier = decimal_multiplier(scale)?;
+                Ok(ScalarValue::Decimal(Some(
+                    (*v * multiplier as f64).round() as i64
+                )))
+            }
+            (DataType::Decimal, ScalarValue::Int64(Some(v))) => {
+                let multiplier = decimal_multiplier(scale)?;
+                Ok(ScalarValue::Decimal(Some(
+                    v.checked_mul(multiplier).ok_or_else(|| {
+                        MonaxError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
+                    })?,
+                )))
+            }
+            (DataType::Timestamp, ScalarValue::VarChar(Some(s))) => {
+                use crate::sql::execution::functions::date::parse_timestamp_smart;
+                match parse_timestamp_smart(s, timezone_offset_hours) {
+                    Some(ts) => Ok(ScalarValue::Timestamp(Some(ts))),
+                    None => Ok(ScalarValue::Timestamp(None)),
+                }
+            }
+            (DataType::Timestamp, ScalarValue::Int64(Some(n))) => {
+                use crate::sql::execution::functions::date::parse_timestamp_from_int;
+                Ok(ScalarValue::Timestamp(Some(parse_timestamp_from_int(*n))))
+            }
+            _ => Ok(v.clone()),
+        },
         Expr::Column(_) => Ok(ScalarValue::null_for_type(*dt)),
         _ => Ok(ScalarValue::null_for_type(*dt)),
     }
@@ -316,7 +387,8 @@ fn decimal_multiplier(scale: i32) -> Result<i64> {
     if scale < 0 || scale > 18 {
         return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
     }
-    10_i64.checked_pow(scale as u32)
+    10_i64
+        .checked_pow(scale as u32)
         .ok_or_else(|| MonaxError::Sql(format!("invalid decimal scale {}", scale)))
 }
 
@@ -331,9 +403,16 @@ pub fn sort_batch_by_key(
 
     let mut rows_with_keys: Vec<(Vec<ScalarValue>, usize)> = Vec::with_capacity(num_rows);
     for row_idx in 0..num_rows {
-        let key_values: Vec<ScalarValue> = inserter.key_indices.iter()
-            .map(|&col_idx| batch.scalar(row_idx, col_idx)
-                .unwrap_or(ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)))
+        let key_values: Vec<ScalarValue> = inserter
+            .key_indices
+            .iter()
+            .map(|&col_idx| {
+                batch
+                    .scalar(row_idx, col_idx)
+                    .unwrap_or(ScalarValue::null_for_type(
+                        batch.schema.columns[col_idx].data_type,
+                    ))
+            })
             .collect();
         rows_with_keys.push((key_values, row_idx));
     }
@@ -356,8 +435,11 @@ pub fn sort_batch_by_key(
     let mut sorted_batch = RecordBatch::new(batch.schema.clone());
     for (_, orig_row_idx) in rows_with_keys {
         for col_idx in 0..batch.num_columns() {
-            let val = batch.scalar(orig_row_idx, col_idx)
-                .unwrap_or(ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type));
+            let val = batch
+                .scalar(orig_row_idx, col_idx)
+                .unwrap_or(ScalarValue::null_for_type(
+                    batch.schema.columns[col_idx].data_type,
+                ));
             sorted_batch.column_mut(col_idx).unwrap().push(&val)?;
         }
     }
@@ -365,7 +447,10 @@ pub fn sort_batch_by_key(
     Ok(sorted_batch)
 }
 
-pub fn apply_row_group_predicate(batch: &RecordBatch, pred: &crate::storage::segment::RowGroupPredicate) -> Vec<RecordBatch> {
+pub fn apply_row_group_predicate(
+    batch: &RecordBatch,
+    pred: &crate::storage::segment::RowGroupPredicate,
+) -> Vec<RecordBatch> {
     let num_rows = batch.num_rows();
     if num_rows == 0 || pred.is_empty() {
         return vec![batch.clone()];
@@ -374,8 +459,12 @@ pub fn apply_row_group_predicate(batch: &RecordBatch, pred: &crate::storage::seg
     for row_idx in 0..num_rows {
         let mut passes = true;
         for clause in &pred.clauses {
-            let val = batch.scalar(row_idx, clause.column_index)
-                .unwrap_or(ScalarValue::null_for_type(batch.schema.columns[clause.column_index].data_type));
+            let val =
+                batch
+                    .scalar(row_idx, clause.column_index)
+                    .unwrap_or(ScalarValue::null_for_type(
+                        batch.schema.columns[clause.column_index].data_type,
+                    ));
             if !eval_range_clause(&val, clause) {
                 passes = false;
                 break;
@@ -383,8 +472,11 @@ pub fn apply_row_group_predicate(batch: &RecordBatch, pred: &crate::storage::seg
         }
         if passes {
             for col_idx in 0..batch.num_columns() {
-                let val = batch.scalar(row_idx, col_idx)
-                    .unwrap_or(ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type));
+                let val = batch
+                    .scalar(row_idx, col_idx)
+                    .unwrap_or(ScalarValue::null_for_type(
+                        batch.schema.columns[col_idx].data_type,
+                    ));
                 let _ = matched.column_mut(col_idx).unwrap().push(&val);
             }
         }
@@ -401,13 +493,20 @@ fn eval_range_clause(val: &ScalarValue, clause: &crate::storage::segment::RangeC
     match clause.op {
         RangeOp::Eq => val == &clause.value,
         RangeOp::Lt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Less),
-        RangeOp::Le => compare_scalars(val, &clause.value).map_or(false, |o| o != std::cmp::Ordering::Greater),
+        RangeOp::Le => {
+            compare_scalars(val, &clause.value).map_or(false, |o| o != std::cmp::Ordering::Greater)
+        }
         RangeOp::Gt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Greater),
-        RangeOp::Ge => compare_scalars(val, &clause.value).map_or(false, |o| o != std::cmp::Ordering::Less),
+        RangeOp::Ge => {
+            compare_scalars(val, &clause.value).map_or(false, |o| o != std::cmp::Ordering::Less)
+        }
     }
 }
 
-pub fn build_row_group_predicate(where_clause: &Option<Expr>, schema: &Schema) -> Option<crate::storage::segment::RowGroupPredicate> {
+pub fn build_row_group_predicate(
+    where_clause: &Option<Expr>,
+    schema: &Schema,
+) -> Option<crate::storage::segment::RowGroupPredicate> {
     let expr = where_clause.as_ref()?;
     let mut clauses = Vec::new();
     extract_range_clauses(expr, schema, &mut clauses);
@@ -418,38 +517,40 @@ pub fn build_row_group_predicate(where_clause: &Option<Expr>, schema: &Schema) -
     }
 }
 
-fn extract_range_clauses(expr: &Expr, schema: &Schema, clauses: &mut Vec<crate::storage::segment::RangeClause>) {
+fn extract_range_clauses(
+    expr: &Expr,
+    schema: &Schema,
+    clauses: &mut Vec<crate::storage::segment::RangeClause>,
+) {
     match expr {
-        Expr::BinaryOp { left, op, right } => {
-            match op {
-                BinOp::Eq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
-                    if let Expr::Column(col_name) = left.as_ref() {
-                        if let Expr::Literal(ref val) = right.as_ref() {
-                            if let Some(idx) = schema.index_of(col_name) {
-                                let op = match op {
-                                    BinOp::Eq => crate::storage::segment::RangeOp::Eq,
-                                    BinOp::Lt => crate::storage::segment::RangeOp::Lt,
-                                    BinOp::Lte => crate::storage::segment::RangeOp::Le,
-                                    BinOp::Gt => crate::storage::segment::RangeOp::Gt,
-                                    BinOp::Gte => crate::storage::segment::RangeOp::Ge,
-                                    _ => unreachable!(),
-                                };
-                                clauses.push(crate::storage::segment::RangeClause {
-                                    column_index: idx,
-                                    op,
-                                    value: val.clone(),
-                                });
-                            }
+        Expr::BinaryOp { left, op, right } => match op {
+            BinOp::Eq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
+                if let Expr::Column(col_name) = left.as_ref() {
+                    if let Expr::Literal(ref val) = right.as_ref() {
+                        if let Some(idx) = schema.index_of(col_name) {
+                            let op = match op {
+                                BinOp::Eq => crate::storage::segment::RangeOp::Eq,
+                                BinOp::Lt => crate::storage::segment::RangeOp::Lt,
+                                BinOp::Lte => crate::storage::segment::RangeOp::Le,
+                                BinOp::Gt => crate::storage::segment::RangeOp::Gt,
+                                BinOp::Gte => crate::storage::segment::RangeOp::Ge,
+                                _ => unreachable!(),
+                            };
+                            clauses.push(crate::storage::segment::RangeClause {
+                                column_index: idx,
+                                op,
+                                value: val.clone(),
+                            });
                         }
                     }
                 }
-                BinOp::And => {
-                    extract_range_clauses(left, schema, clauses);
-                    extract_range_clauses(right, schema, clauses);
-                }
-                _ => {}
             }
-        }
+            BinOp::And => {
+                extract_range_clauses(left, schema, clauses);
+                extract_range_clauses(right, schema, clauses);
+            }
+            _ => {}
+        },
         Expr::UnaryNot(inner) => {
             if let Expr::IsNull(col_expr) = inner.as_ref() {
                 if let Expr::Column(col_name) = col_expr.as_ref() {

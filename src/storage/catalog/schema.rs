@@ -34,9 +34,15 @@ pub struct PartitionInfo {
     pub modified_at: i64,
 }
 
-fn default_row_group_size() -> i32 { 8192 }
-fn default_partition_param() -> i32 { 0 }
-fn default_partition_key_idx() -> i32 { -1 }
+fn default_row_group_size() -> i32 {
+    8192
+}
+fn default_partition_param() -> i32 {
+    0
+}
+fn default_partition_key_idx() -> i32 {
+    -1
+}
 
 /// Table metadata stored in the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +97,9 @@ impl TableMeta {
             self.partition_key_idx = -1;
             return;
         }
-        self.partition_key_idx = self.columns.iter()
+        self.partition_key_idx = self
+            .columns
+            .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&self.partition_key))
             .map(|i| i as i32)
             .unwrap_or(-1);
@@ -105,10 +113,14 @@ impl TableMeta {
     }
 
     pub fn data_path(&self, base_dir: &str) -> PathBuf {
-        PathBuf::from(base_dir).join(&self.database).join(&self.name)
+        PathBuf::from(base_dir)
+            .join(&self.database)
+            .join(&self.name)
     }
 
-    pub fn partition_strategy(&self) -> crate::storage::partition::partition_function::PartitionFunction {
+    pub fn partition_strategy(
+        &self,
+    ) -> crate::storage::partition::partition_function::PartitionFunction {
         use crate::storage::partition::partition_function::PartitionFunction;
         match self.partition_type {
             PartitionType::None => PartitionFunction::Value,
@@ -119,11 +131,11 @@ impl TableMeta {
             PartitionType::Hash => PartitionFunction::Hash(self.partition_param),
         }
     }
-    
+
     pub fn is_partitioned(&self) -> bool {
         self.partition_type != PartitionType::None
     }
-    
+
     pub fn get_partition_column_index(&self) -> Option<usize> {
         if self.partition_key.is_empty() {
             return None;
@@ -219,10 +231,16 @@ impl DatabaseCatalog {
 
     pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()> {
         if !self.tables.contains_key(old_name) {
-            return Err(MonaxError::Sql(format!("table '{}' does not exist", old_name)));
+            return Err(MonaxError::Sql(format!(
+                "table '{}' does not exist",
+                old_name
+            )));
         }
         if self.tables.contains_key(new_name) {
-            return Err(MonaxError::Sql(format!("table '{}' already exists", new_name)));
+            return Err(MonaxError::Sql(format!(
+                "table '{}' already exists",
+                new_name
+            )));
         }
         let mut meta = self.tables.remove(old_name).unwrap();
         meta.name = new_name.to_string();
@@ -231,32 +249,65 @@ impl DatabaseCatalog {
     }
 
     pub fn add_column(&mut self, table_name: &str, column: ColumnDef) -> Result<()> {
-        let table = self.tables.get_mut(table_name)
+        let table = self
+            .tables
+            .get_mut(table_name)
             .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
         if table.columns.iter().any(|c| c.name == column.name) {
-            return Err(MonaxError::Sql(format!("column '{}' already exists in table '{}'", column.name, table_name)));
+            return Err(MonaxError::Sql(format!(
+                "column '{}' already exists in table '{}'",
+                column.name, table_name
+            )));
         }
         table.columns.push(column);
         Ok(())
     }
 
     pub fn drop_column(&mut self, table_name: &str, column_name: &str) -> Result<()> {
-        let table = self.tables.get_mut(table_name)
+        let table = self
+            .tables
+            .get_mut(table_name)
             .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
-        let idx = table.columns.iter().position(|c| c.name == column_name)
-            .ok_or_else(|| MonaxError::Sql(format!("column '{}' does not exist in table '{}'", column_name, table_name)))?;
+        let idx = table
+            .columns
+            .iter()
+            .position(|c| c.name == column_name)
+            .ok_or_else(|| {
+                MonaxError::Sql(format!(
+                    "column '{}' does not exist in table '{}'",
+                    column_name, table_name
+                ))
+            })?;
         table.columns.remove(idx);
         Ok(())
     }
 
-    pub fn rename_column(&mut self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
-        let table = self.tables.get_mut(table_name)
+    pub fn rename_column(
+        &mut self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let table = self
+            .tables
+            .get_mut(table_name)
             .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
         if table.columns.iter().any(|c| c.name == new_name) {
-            return Err(MonaxError::Sql(format!("column '{}' already exists in table '{}'", new_name, table_name)));
+            return Err(MonaxError::Sql(format!(
+                "column '{}' already exists in table '{}'",
+                new_name, table_name
+            )));
         }
-        let col = table.columns.iter_mut().find(|c| c.name == old_name)
-            .ok_or_else(|| MonaxError::Sql(format!("column '{}' does not exist in table '{}'", old_name, table_name)))?;
+        let col = table
+            .columns
+            .iter_mut()
+            .find(|c| c.name == old_name)
+            .ok_or_else(|| {
+                MonaxError::Sql(format!(
+                    "column '{}' does not exist in table '{}'",
+                    old_name, table_name
+                ))
+            })?;
         col.name = new_name.to_string();
         Ok(())
     }
@@ -271,10 +322,15 @@ mod tests {
     #[test]
     fn test_create_and_get_table() {
         let mut catalog = DatabaseCatalog::new("testdb");
-        catalog.create_table("users", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("name", DataType::VarChar),
-        ]).unwrap();
+        catalog
+            .create_table(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("name", DataType::VarChar),
+                ],
+            )
+            .unwrap();
 
         let table = catalog.get_table("users").unwrap();
         assert_eq!(table.name, "users");
@@ -285,22 +341,20 @@ mod tests {
     #[test]
     fn test_duplicate_table() {
         let mut catalog = DatabaseCatalog::new("testdb");
-        catalog.create_table("t", vec![
-            ColumnDef::new("id", DataType::Int64),
-        ]).unwrap();
+        catalog
+            .create_table("t", vec![ColumnDef::new("id", DataType::Int64)])
+            .unwrap();
 
-        let result = catalog.create_table("t", vec![
-            ColumnDef::new("id", DataType::Int64),
-        ]);
+        let result = catalog.create_table("t", vec![ColumnDef::new("id", DataType::Int64)]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_drop_table() {
         let mut catalog = DatabaseCatalog::new("testdb");
-        catalog.create_table("t", vec![
-            ColumnDef::new("id", DataType::Int64),
-        ]).unwrap();
+        catalog
+            .create_table("t", vec![ColumnDef::new("id", DataType::Int64)])
+            .unwrap();
 
         catalog.drop_table("t").unwrap();
         assert!(catalog.get_table("t").is_none());
@@ -319,10 +373,15 @@ mod tests {
         let meta_dir = dir.path().join("meta");
 
         let mut catalog = DatabaseCatalog::new("testdb");
-        catalog.create_table("users", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("name", DataType::VarChar),
-        ]).unwrap();
+        catalog
+            .create_table(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Int64),
+                    ColumnDef::new("name", DataType::VarChar),
+                ],
+            )
+            .unwrap();
         catalog.save(&meta_dir).unwrap();
 
         let loaded = DatabaseCatalog::load_or_create(&meta_dir, "testdb").unwrap();
@@ -347,8 +406,12 @@ mod tests {
     #[test]
     fn test_table_names() {
         let mut catalog = DatabaseCatalog::new("testdb");
-        catalog.create_table("a", vec![ColumnDef::new("id", DataType::Int64)]).unwrap();
-        catalog.create_table("b", vec![ColumnDef::new("id", DataType::Int64)]).unwrap();
+        catalog
+            .create_table("a", vec![ColumnDef::new("id", DataType::Int64)])
+            .unwrap();
+        catalog
+            .create_table("b", vec![ColumnDef::new("id", DataType::Int64)])
+            .unwrap();
 
         let mut names = catalog.table_names();
         names.sort();
@@ -358,8 +421,10 @@ mod tests {
     #[test]
     fn test_rename_table() {
         let mut catalog = DatabaseCatalog::new("testdb");
-        catalog.create_table("old", vec![ColumnDef::new("id", DataType::Int64)]).unwrap();
-        
+        catalog
+            .create_table("old", vec![ColumnDef::new("id", DataType::Int64)])
+            .unwrap();
+
         catalog.rename_table("old", "new").unwrap();
         assert!(catalog.get_table("old").is_none());
         assert!(catalog.get_table("new").is_some());
@@ -367,51 +432,73 @@ mod tests {
 
     #[test]
     fn test_partition_type_enum() {
-        let mut meta = TableMeta::new("testdb", "test_table", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("ts", DataType::Timestamp),
-        ]);
-        
+        let mut meta = TableMeta::new(
+            "testdb",
+            "test_table",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("ts", DataType::Timestamp),
+            ],
+        );
+
         meta.partition_type = PartitionType::Day;
         meta.partition_key = "ts".to_string();
-        assert_eq!(meta.partition_strategy(), crate::storage::partition::partition_function::PartitionFunction::Day);
-        
+        assert_eq!(
+            meta.partition_strategy(),
+            crate::storage::partition::partition_function::PartitionFunction::Day
+        );
+
         meta.partition_type = PartitionType::Year;
-        assert_eq!(meta.partition_strategy(), crate::storage::partition::partition_function::PartitionFunction::Year);
-        
+        assert_eq!(
+            meta.partition_strategy(),
+            crate::storage::partition::partition_function::PartitionFunction::Year
+        );
+
         meta.partition_type = PartitionType::Month;
-        assert_eq!(meta.partition_strategy(), crate::storage::partition::partition_function::PartitionFunction::Month);
-        
+        assert_eq!(
+            meta.partition_strategy(),
+            crate::storage::partition::partition_function::PartitionFunction::Month
+        );
+
         meta.partition_type = PartitionType::Hash;
         meta.partition_param = 32;
-        assert_eq!(meta.partition_strategy(), crate::storage::partition::partition_function::PartitionFunction::Hash(32));
+        assert_eq!(
+            meta.partition_strategy(),
+            crate::storage::partition::partition_function::PartitionFunction::Hash(32)
+        );
     }
 
     #[test]
     fn test_is_partitioned() {
-        let mut meta = TableMeta::new("testdb", "test_table", vec![
-            ColumnDef::new("id", DataType::Int64),
-        ]);
-        
+        let mut meta = TableMeta::new(
+            "testdb",
+            "test_table",
+            vec![ColumnDef::new("id", DataType::Int64)],
+        );
+
         assert!(!meta.is_partitioned());
-        
+
         meta.partition_type = PartitionType::Day;
         meta.partition_key = "ts".to_string();
         assert!(meta.is_partitioned());
-        
+
         meta.partition_type = PartitionType::None;
         assert!(!meta.is_partitioned());
     }
 
     #[test]
     fn test_cluster_key() {
-        let mut meta = TableMeta::new("testdb", "test_table", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("name", DataType::VarChar),
-        ]);
-        
+        let mut meta = TableMeta::new(
+            "testdb",
+            "test_table",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("name", DataType::VarChar),
+            ],
+        );
+
         assert!(meta.cluster_key.is_empty());
-        
+
         meta.cluster_key = vec!["id".to_string(), "name".to_string()];
         assert_eq!(meta.cluster_key.len(), 2);
         assert_eq!(meta.cluster_key[0], "id");
@@ -420,14 +507,18 @@ mod tests {
 
     #[test]
     fn test_partition_column_index() {
-        let mut meta = TableMeta::new("testdb", "test_table", vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("ts", DataType::Timestamp),
-            ColumnDef::new("name", DataType::VarChar),
-        ]);
-        
+        let mut meta = TableMeta::new(
+            "testdb",
+            "test_table",
+            vec![
+                ColumnDef::new("id", DataType::Int64),
+                ColumnDef::new("ts", DataType::Timestamp),
+                ColumnDef::new("name", DataType::VarChar),
+            ],
+        );
+
         assert!(meta.get_partition_column_index().is_none());
-        
+
         meta.partition_key = "ts".to_string();
         let idx = meta.get_partition_column_index();
         assert!(idx.is_some());
@@ -437,7 +528,7 @@ mod tests {
         let idx = meta.get_partition_column_index();
         assert!(idx.is_some());
         assert_eq!(idx.unwrap(), 1);
-        
+
         meta.partition_key = "nonexistent".to_string();
         assert!(meta.get_partition_column_index().is_none());
     }

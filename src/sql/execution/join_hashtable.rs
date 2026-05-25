@@ -12,7 +12,12 @@ pub struct JoinKey(Vec<ScalarValueHashable>);
 
 impl JoinKey {
     pub fn from_scalars(values: &[ScalarValue]) -> Self {
-        Self(values.iter().map(ScalarValueHashable::from_scalar).collect())
+        Self(
+            values
+                .iter()
+                .map(ScalarValueHashable::from_scalar)
+                .collect(),
+        )
     }
 }
 
@@ -48,8 +53,12 @@ impl ScalarValueHashable {
             ScalarValue::UInt16(i) => ScalarValueHashable::UInt16(*i),
             ScalarValue::UInt32(i) => ScalarValueHashable::UInt32(*i),
             ScalarValue::UInt64(i) => ScalarValueHashable::UInt64(*i),
-            ScalarValue::Float32(f) => ScalarValueHashable::FloatToI64(f.map(|v| v.to_bits() as i64)),
-            ScalarValue::Float64(f) => ScalarValueHashable::FloatToI64(f.map(|v| v.to_bits() as i64)),
+            ScalarValue::Float32(f) => {
+                ScalarValueHashable::FloatToI64(f.map(|v| v.to_bits() as i64))
+            }
+            ScalarValue::Float64(f) => {
+                ScalarValueHashable::FloatToI64(f.map(|v| v.to_bits() as i64))
+            }
             ScalarValue::VarChar(s) => ScalarValueHashable::VarChar(s.clone()),
             ScalarValue::Date(d) => ScalarValueHashable::Date(*d),
             ScalarValue::Time(t) => ScalarValueHashable::Time(*t),
@@ -98,8 +107,14 @@ impl JoinHashTable {
         let num_rows = batch.num_rows();
 
         for row_idx in 0..num_rows {
-            let key_values: Vec<ScalarValue> = self.key_columns.iter()
-                .map(|&col_idx| batch.scalar(row_idx, col_idx).unwrap_or(ScalarValue::Int64(None)))
+            let key_values: Vec<ScalarValue> = self
+                .key_columns
+                .iter()
+                .map(|&col_idx| {
+                    batch
+                        .scalar(row_idx, col_idx)
+                        .unwrap_or(ScalarValue::Int64(None))
+                })
                 .collect();
 
             // Skip rows with NULL keys (NULL != NULL in SQL joins)
@@ -188,14 +203,17 @@ pub struct AsofJoinIndex {
 
 impl AsofJoinIndex {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Build the index from batches, extracting the timestamp column.
     pub fn build(&mut self, batches: Vec<RecordBatch>, ts_col_idx: usize) {
         for (batch_idx, batch) in batches.iter().enumerate() {
             for row_idx in 0..batch.num_rows() {
-                let ts = batch.scalar(row_idx, ts_col_idx)
+                let ts = batch
+                    .scalar(row_idx, ts_col_idx)
                     .unwrap_or(ScalarValue::Int64(None));
                 self.entries.push((ts, RowPointer { batch_idx, row_idx }));
             }

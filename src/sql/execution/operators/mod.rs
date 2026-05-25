@@ -1,28 +1,27 @@
-pub mod scan;
-pub mod filter;
-pub mod project;
 pub mod aggregate;
-pub mod sort;
-pub mod limit;
+pub mod filter;
 pub mod join;
-pub mod window;
+pub mod limit;
+pub mod project;
+pub mod scan;
 pub mod semi_join;
+pub mod sort;
+pub mod window;
 
 use std::collections::HashMap;
 
 use crate::common::error::Result;
 use crate::sql::planner::*;
 use crate::types::batch::{RecordBatch, Schema};
-use crate::types::array::ColumnArray;
 
-use scan::ScanExec;
-use filter::FilterExec;
-use project::ProjectExec;
 use aggregate::HashAggregateExec;
-use sort::SortExec;
-use limit::LimitExec;
+use filter::FilterExec;
 use join::HashJoinExec;
+use limit::LimitExec;
+use project::ProjectExec;
+use scan::ScanExec;
 use semi_join::SemiJoinExec;
+use sort::SortExec;
 
 pub trait ExecutionOp {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
@@ -32,10 +31,14 @@ pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
     if mask.iter().all(|&m| m) {
         return batch.clone();
     }
+    let match_count = mask.iter().filter(|&&m| m).count();
+    if match_count == 0 {
+        return RecordBatch::new(batch.schema.clone());
+    }
     let mut columns = Vec::with_capacity(batch.num_columns());
     for col_idx in 0..batch.num_columns() {
         let col = batch.column(col_idx).unwrap();
-        columns.push(col.filter_by_mask(mask));
+        columns.push(col.filter_by_mask_fast(mask, match_count));
     }
     RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
 }
@@ -46,7 +49,10 @@ pub fn build_pipeline(
 ) -> Result<Box<dyn ExecutionOp>> {
     match plan {
         LogicalPlan::Scan(scan) => {
-            let batches = table_batches.get(&scan.table_name).cloned().unwrap_or_default();
+            let batches = table_batches
+                .get(&scan.table_name)
+                .cloned()
+                .unwrap_or_default();
             Ok(Box::new(ScanExec::new(batches, scan.projection)))
         }
         LogicalPlan::Filter(filter) => {
@@ -76,12 +82,22 @@ pub fn build_pipeline(
         LogicalPlan::Limit(limit) => {
             let schema = get_scan_schema(&limit.input);
             let input = build_pipeline(*limit.input, table_batches)?;
-            Ok(Box::new(LimitExec::new(limit.limit, limit.offset, input, schema)))
+            Ok(Box::new(LimitExec::new(
+                limit.limit,
+                limit.offset,
+                input,
+                schema,
+            )))
         }
         LogicalPlan::Aggregate(agg) => {
             let input_schema = get_scan_schema(&agg.input);
             let input = build_pipeline(*agg.input, table_batches)?;
-            Ok(Box::new(HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema)))
+            Ok(Box::new(HashAggregateExec::new(
+                agg.group_by,
+                agg.aggregates,
+                input,
+                input_schema,
+            )))
         }
         LogicalPlan::Join(join) => {
             let left = build_pipeline(*join.left, table_batches)?;
@@ -111,7 +127,9 @@ pub fn build_pipeline(
         LogicalPlan::TopN(topn) => {
             let schema = get_scan_schema(&topn.input);
             let input = build_pipeline(*topn.input, table_batches)?;
-            Ok(Box::new(SortExec::new(topn.sort_keys, input, schema).with_limit(topn.limit)))
+            Ok(Box::new(
+                SortExec::new(topn.sort_keys, input, schema).with_limit(topn.limit),
+            ))
         }
         LogicalPlan::Distinct(distinct) => {
             let input = build_pipeline(*distinct.input, table_batches)?;
@@ -121,9 +139,7 @@ pub fn build_pipeline(
             let input = build_pipeline(*window.input, table_batches)?;
             Ok(input)
         }
-        LogicalPlan::Empty => {
-            Ok(Box::new(ScanExec::new(vec![], None)))
-        }
+        LogicalPlan::Empty => Ok(Box::new(ScanExec::new(vec![], None))),
     }
 }
 

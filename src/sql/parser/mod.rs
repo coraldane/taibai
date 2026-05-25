@@ -1,4 +1,4 @@
-pub mod lexer;
 pub mod ast;
-pub mod parser;
 pub mod fast_insert;
+pub mod lexer;
+pub mod parser;

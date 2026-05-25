@@ -53,8 +53,14 @@ impl SemiJoinExec {
     fn collect_right(&mut self) -> Result<()> {
         while let Some(batch) = self.right.next_batch()? {
             for row in 0..batch.num_rows() {
-                let key: Vec<crate::types::scalar::ScalarValue> = self.right_key_cols.iter()
-                    .map(|&idx| batch.scalar(row, idx).unwrap_or(crate::types::scalar::ScalarValue::Int64(None)))
+                let key: Vec<crate::types::scalar::ScalarValue> = self
+                    .right_key_cols
+                    .iter()
+                    .map(|&idx| {
+                        batch
+                            .scalar(row, idx)
+                            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None))
+                    })
                     .collect();
                 self.right_hash_set.insert(key);
             }
@@ -68,8 +74,14 @@ impl SemiJoinExec {
             let batch_start = self.matched_left_rows.len();
             self.matched_left_rows.extend(vec![false; batch.num_rows()]);
             for row in 0..batch.num_rows() {
-                let key: Vec<crate::types::scalar::ScalarValue> = self.left_key_cols.iter()
-                    .map(|&idx| batch.scalar(row, idx).unwrap_or(crate::types::scalar::ScalarValue::Int64(None)))
+                let key: Vec<crate::types::scalar::ScalarValue> = self
+                    .left_key_cols
+                    .iter()
+                    .map(|&idx| {
+                        batch
+                            .scalar(row, idx)
+                            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None))
+                    })
                     .collect();
                 if self.right_hash_set.contains(&key) {
                     self.matched_left_rows[batch_start + row] = true;
@@ -97,7 +109,11 @@ impl ExecutionOp for SemiJoinExec {
             }
             let batch = &self.left_batches[self.left_batch_idx];
             while self.left_row_idx < batch.num_rows() && output_rows.len() < BATCH_SIZE {
-                let global_idx = self.left_batches[..self.left_batch_idx].iter().map(|b| b.num_rows()).sum::<usize>() + self.left_row_idx;
+                let global_idx = self.left_batches[..self.left_batch_idx]
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum::<usize>()
+                    + self.left_row_idx;
                 let should_emit = if self.is_anti {
                     !self.matched_left_rows[global_idx]
                 } else {
@@ -105,7 +121,11 @@ impl ExecutionOp for SemiJoinExec {
                 };
                 if should_emit {
                     let row_vals: Vec<crate::types::scalar::ScalarValue> = (0..batch.num_columns())
-                        .map(|c| batch.scalar(self.left_row_idx, c).unwrap_or(crate::types::scalar::ScalarValue::Int64(None)))
+                        .map(|c| {
+                            batch
+                                .scalar(self.left_row_idx, c)
+                                .unwrap_or(crate::types::scalar::ScalarValue::Int64(None))
+                        })
                         .collect();
                     output_rows.push(row_vals);
                 }
@@ -132,7 +152,10 @@ impl ExecutionOp for SemiJoinExec {
             }
         }
 
-        Ok(Some(RecordBatch::try_new(self.left_schema.clone(), columns)?))
+        Ok(Some(RecordBatch::try_new(
+            self.left_schema.clone(),
+            columns,
+        )?))
     }
 }
 

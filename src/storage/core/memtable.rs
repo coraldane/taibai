@@ -47,7 +47,13 @@ impl MemTable {
         }
     }
 
-    pub fn with_txn(db: String, table: String, partition_key: String, schema: Schema, txn_id: u64) -> Self {
+    pub fn with_txn(
+        db: String,
+        table: String,
+        partition_key: String,
+        schema: Schema,
+        txn_id: u64,
+    ) -> Self {
         Self {
             db,
             table,
@@ -251,7 +257,9 @@ impl MemTableManager {
         let memtables = self.memtables.read().unwrap();
         memtables
             .iter()
-            .filter(|mt| mt.db() == db && mt.table() == table && mt.state() == MemTableState::Pending)
+            .filter(|mt| {
+                mt.db() == db && mt.table() == table && mt.state() == MemTableState::Pending
+            })
             .cloned()
             .collect()
     }

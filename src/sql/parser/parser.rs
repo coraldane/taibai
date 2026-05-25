@@ -4,12 +4,12 @@ use crate::protocol::types::DataType;
 use super::ast::*;
 use super::lexer::{Lexer, Token};
 
-#[path = "expr.rs"]
-mod expr;
 #[path = "ddl.rs"]
 mod ddl;
 #[path = "dml.rs"]
 mod dml;
+#[path = "expr.rs"]
+mod expr;
 #[path = "query.rs"]
 mod query;
 #[path = "show.rs"]

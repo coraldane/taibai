@@ -60,7 +60,9 @@ impl Schema {
     }
 
     pub fn empty() -> Self {
-        Self { columns: Vec::new() }
+        Self {
+            columns: Vec::new(),
+        }
     }
 
     /// Returns the number of columns.
@@ -70,7 +72,9 @@ impl Schema {
 
     /// Find the index of a column by name (case-insensitive).
     pub fn index_of(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Get a column definition by index.
@@ -99,7 +103,9 @@ pub struct RecordBatch {
 impl RecordBatch {
     /// Create a new empty RecordBatch with the given schema.
     pub fn new(schema: Schema) -> Self {
-        let columns = schema.columns.iter()
+        let columns = schema
+            .columns
+            .iter()
             .map(|c| ColumnArray::empty(c.data_type))
             .collect();
         Self { schema, columns }
@@ -178,9 +184,7 @@ mod tests {
 
     #[test]
     fn test_empty_batch() {
-        let schema = Schema::new(vec![
-            ColumnDef::new("id", DataType::Int64),
-        ]);
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
         let batch = RecordBatch::new(schema);
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 1);
@@ -189,9 +193,7 @@ mod tests {
 
     #[test]
     fn test_batch_type_mismatch() {
-        let schema = Schema::new(vec![
-            ColumnDef::new("id", DataType::Int64),
-        ]);
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
         let columns = vec![ColumnArray::empty(DataType::VarChar)];
         let result = RecordBatch::try_new(schema, columns);
         assert!(result.is_err());

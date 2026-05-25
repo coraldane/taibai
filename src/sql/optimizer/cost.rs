@@ -48,36 +48,34 @@ impl CostEstimator {
 
     fn estimate_selectivity(&self, expr: &LogicalExpr) -> f64 {
         match expr {
-            LogicalExpr::BinaryOp { left, op, right } => {
-                match op {
-                    BinOp::Eq => {
-                        if let LogicalExpr::Column(idx) = **left {
-                            if let LogicalExpr::Literal(_) = **right {
-                                if let Some(col_name) = self.column_name_by_index(idx) {
-                                    if let Some(stats) = self.stats.column_stats.get(&col_name) {
-                                        if stats.distinct_count > 0 {
-                                            return 1.0 / stats.distinct_count as f64;
-                                        }
+            LogicalExpr::BinaryOp { left, op, right } => match op {
+                BinOp::Eq => {
+                    if let LogicalExpr::Column(idx) = **left {
+                        if let LogicalExpr::Literal(_) = **right {
+                            if let Some(col_name) = self.column_name_by_index(idx) {
+                                if let Some(stats) = self.stats.column_stats.get(&col_name) {
+                                    if stats.distinct_count > 0 {
+                                        return 1.0 / stats.distinct_count as f64;
                                     }
                                 }
                             }
                         }
-                        0.1
                     }
-                    BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => 0.33,
-                    BinOp::And => {
-                        let l = self.estimate_selectivity(left);
-                        let r = self.estimate_selectivity(right);
-                        l * r
-                    }
-                    BinOp::Or => {
-                        let l = self.estimate_selectivity(left);
-                        let r = self.estimate_selectivity(right);
-                        l + r - l * r
-                    }
-                    _ => 1.0,
+                    0.1
                 }
-            }
+                BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => 0.33,
+                BinOp::And => {
+                    let l = self.estimate_selectivity(left);
+                    let r = self.estimate_selectivity(right);
+                    l * r
+                }
+                BinOp::Or => {
+                    let l = self.estimate_selectivity(left);
+                    let r = self.estimate_selectivity(right);
+                    l + r - l * r
+                }
+                _ => 1.0,
+            },
             _ => 1.0,
         }
     }

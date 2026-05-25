@@ -1,13 +1,13 @@
 use crate::common::error::Result;
-use crate::storage::segment_manager::SegmentManager;
-use crate::storage::segment::ScanStats;
-use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::protocol::types::DataType;
+use crate::storage::segment::ScanStats;
+use crate::storage::segment_manager::SegmentManager;
+use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use super::spec::ScanSpec;
-use super::row_group;
 use super::row_filter;
+use super::row_group;
+use super::spec::ScanSpec;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,9 +33,26 @@ pub fn count_star(
         && spec.remaining_predicate.is_none()
     {
         let (col_idx, value) = &spec.eq_predicates[0];
-        count_with_single_eq(spec, &segment_files, segment_mgr, *col_idx, value, &mut total_rows, stats)?;
+        count_with_single_eq(
+            spec,
+            &segment_files,
+            segment_mgr,
+            *col_idx,
+            value,
+            &mut total_rows,
+            stats,
+        )?;
     } else if spec.has_predicates() {
-        count_with_predicates(spec, &segment_files, segment_mgr, &pred, &bloom_checks, &in_checks, &mut total_rows, stats)?;
+        count_with_predicates(
+            spec,
+            &segment_files,
+            segment_mgr,
+            &pred,
+            &bloom_checks,
+            &in_checks,
+            &mut total_rows,
+            stats,
+        )?;
     } else {
         count_no_predicate(&segment_files, segment_mgr, &mut total_rows, stats)?;
     }
@@ -127,13 +144,20 @@ fn count_with_predicates(
             continue;
         }
 
-        let prune_result = row_group::prune_row_groups(&reader, pred, bloom_checks, in_checks, reader.segment_zone_maps());
+        let prune_result = row_group::prune_row_groups(
+            &reader,
+            pred,
+            bloom_checks,
+            in_checks,
+            reader.segment_zone_maps(),
+        );
 
         for rg_idx in &prune_result.candidate_indices {
             let mut batch = reader.read_row_group_with_projection(*rg_idx, &filter_columns)?;
             let bitmap_active = !reader.delete_bitmap().is_empty();
             if bitmap_active {
-                let rg_start_row: u64 = reader.footer_row_groups_info()
+                let rg_start_row: u64 = reader
+                    .footer_row_groups_info()
                     .iter()
                     .take(*rg_idx)
                     .map(|r| r.row_count)

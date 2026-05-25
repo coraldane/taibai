@@ -57,7 +57,9 @@ pub fn substring(args: &[ScalarValue]) -> Result<ScalarValue> {
                 return Ok(ScalarValue::VarChar(Some(String::new())));
             }
             let end_idx = (start_idx + len as usize).min(s.len());
-            Ok(ScalarValue::VarChar(Some(s[start_idx..end_idx].to_string())))
+            Ok(ScalarValue::VarChar(Some(
+                s[start_idx..end_idx].to_string(),
+            )))
         }
         _ => Ok(ScalarValue::VarChar(None)),
     }
@@ -102,9 +104,7 @@ pub fn replace(args: &[ScalarValue]) -> Result<ScalarValue> {
     let from = args_to_string(args, 1);
     let to = args_to_string(args, 2);
     match (s, from, to) {
-        (Some(s), Some(from), Some(to)) => {
-            Ok(ScalarValue::VarChar(Some(s.replace(&from, &to))))
-        }
+        (Some(s), Some(from), Some(to)) => Ok(ScalarValue::VarChar(Some(s.replace(&from, &to)))),
         _ => Ok(ScalarValue::VarChar(None)),
     }
 }
@@ -133,7 +133,11 @@ pub fn right(args: &[ScalarValue]) -> Result<ScalarValue> {
     let n = args_to_i64(args, 1);
     match (s, n) {
         (Some(s), Some(n)) if n >= 0 => {
-            let start = if (n as usize) >= s.len() { 0 } else { s.len() - n as usize };
+            let start = if (n as usize) >= s.len() {
+                0
+            } else {
+                s.len() - n as usize
+            };
             Ok(ScalarValue::VarChar(Some(s[start..].to_string())))
         }
         _ => Ok(ScalarValue::VarChar(None)),
@@ -199,7 +203,11 @@ pub fn locate(args: &[ScalarValue]) -> Result<ScalarValue> {
     let start_pos = args_to_i64(args, 2).unwrap_or(1);
     match (substr, s) {
         (Some(sub), Some(s)) => {
-            let start = if start_pos > 0 { (start_pos - 1) as usize } else { 0 };
+            let start = if start_pos > 0 {
+                (start_pos - 1) as usize
+            } else {
+                0
+            };
             if start >= s.len() {
                 return Ok(ScalarValue::Int64(Some(0)));
             }
@@ -216,9 +224,7 @@ pub fn repeat(args: &[ScalarValue]) -> Result<ScalarValue> {
     let s = args_to_string(args, 0);
     let n = args_to_i64(args, 1);
     match (s, n) {
-        (Some(s), Some(n)) if n >= 0 => {
-            Ok(ScalarValue::VarChar(Some(s.repeat(n as usize))))
-        }
+        (Some(s), Some(n)) if n >= 0 => Ok(ScalarValue::VarChar(Some(s.repeat(n as usize)))),
         _ => Ok(ScalarValue::VarChar(None)),
     }
 }

@@ -18,6 +18,16 @@ impl ExecutionOp for ProjectExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self.input.next_batch()? {
             Some(batch) => {
+                if let Some((positions, col_defs)) = resolve_plain_column_projection(
+                    &batch,
+                    &self.expressions,
+                    &self.aliases,
+                    &self.input_schema,
+                ) {
+                    let projected = project_plain_columns(batch, positions, col_defs)?;
+                    return Ok(Some(projected));
+                }
+
                 let mut columns = Vec::with_capacity(self.expressions.len());
                 let mut col_defs = Vec::with_capacity(self.expressions.len());
 
@@ -44,6 +54,60 @@ impl ExecutionOp for ProjectExec {
             None => Ok(None),
         }
     }
+}
+
+fn resolve_plain_column_projection(
+    batch: &RecordBatch,
+    expressions: &[LogicalExpr],
+    aliases: &[Option<String>],
+    input_schema: &Schema,
+) -> Option<(Vec<usize>, Vec<crate::types::batch::ColumnDef>)> {
+    if expressions.is_empty() {
+        return None;
+    }
+
+    let mut positions = Vec::with_capacity(expressions.len());
+    let mut col_defs = Vec::with_capacity(expressions.len());
+
+    for (i, expr) in expressions.iter().enumerate() {
+        let LogicalExpr::Column(logical_idx) = expr else {
+            return None;
+        };
+        let source_def = input_schema.columns.get(*logical_idx)?;
+        let batch_pos = batch.schema.index_of(&source_def.name)?;
+
+        let mut out_def = batch.schema.columns[batch_pos].clone();
+        if let Some(alias) = aliases.get(i).and_then(|a| a.as_deref()) {
+            out_def.name = alias.to_string();
+        }
+        positions.push(batch_pos);
+        col_defs.push(out_def);
+    }
+
+    Some((positions, col_defs))
+}
+
+fn project_plain_columns(
+    mut batch: RecordBatch,
+    positions: Vec<usize>,
+    col_defs: Vec<crate::types::batch::ColumnDef>,
+) -> Result<RecordBatch> {
+    let already_in_order = positions
+        .iter()
+        .enumerate()
+        .all(|(expected, &actual)| expected == actual)
+        && positions.len() == batch.num_columns();
+
+    if already_in_order {
+        batch.schema = Schema::new(col_defs);
+        return Ok(batch);
+    }
+
+    let columns = positions
+        .iter()
+        .map(|&pos| batch.columns[pos].clone())
+        .collect();
+    RecordBatch::try_new(Schema::new(col_defs), columns)
 }
 
 pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
@@ -127,6 +191,65 @@ mod tests {
         assert_eq!(
             result.scalar(0, 0).unwrap(),
             ScalarValue::Decimal(Some(1234))
+        );
+    }
+
+    #[test]
+    fn project_reorders_plain_columns_without_rebuilding_scalars() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("security_id", DataType::VarChar),
+            ColumnDef::new("trans_volume", DataType::Int64),
+            ColumnDef::new("local_time", DataType::Timestamp),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                ColumnArray::from_scalar_values(
+                    DataType::VarChar,
+                    &[
+                        ScalarValue::VarChar(Some("688256.SH".to_string())),
+                        ScalarValue::VarChar(Some("688256.SH".to_string())),
+                    ],
+                )
+                .unwrap(),
+                ColumnArray::from_scalar_values(
+                    DataType::Int64,
+                    &[ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(20))],
+                )
+                .unwrap(),
+                ColumnArray::from_scalar_values(
+                    DataType::Timestamp,
+                    &[
+                        ScalarValue::Timestamp(Some(1000)),
+                        ScalarValue::Timestamp(Some(2000)),
+                    ],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let mut exec = ProjectExec {
+            expressions: vec![LogicalExpr::Column(2), LogicalExpr::Column(0)],
+            aliases: vec![Some("lt".to_string()), None],
+            input: Box::new(crate::sql::execution::operators::scan::ScanExec::new(
+                vec![batch],
+                None,
+            )),
+            input_schema: schema,
+        };
+
+        let result = exec.next_batch().unwrap().unwrap();
+
+        assert_eq!(result.schema.columns[0].name, "lt");
+        assert_eq!(result.schema.columns[1].name, "security_id");
+        assert_eq!(
+            result.scalar(0, 0).unwrap(),
+            ScalarValue::Timestamp(Some(1000))
+        );
+        assert_eq!(
+            result.scalar(1, 1).unwrap(),
+            ScalarValue::VarChar(Some("688256.SH".to_string()))
         );
     }
 }

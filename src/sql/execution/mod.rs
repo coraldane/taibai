@@ -1,19 +1,19 @@
-pub mod engine;
 pub mod ddl;
+pub mod dml_delete;
 pub mod dml_insert;
 pub mod dml_update;
-pub mod dml_delete;
-pub mod query;
-pub mod wal_helper;
+pub mod engine;
+pub mod explain;
+pub mod expressions;
+pub mod functions;
 pub mod helpers;
-pub mod prepared;
+pub mod join_hashtable;
 pub mod morsel;
 pub mod operators;
-pub mod expressions;
 pub mod pipeline;
-pub mod join_hashtable;
+pub mod prepared;
+pub mod query;
 pub mod scan;
-pub mod functions;
-pub mod explain;
+pub mod wal_helper;
 
 pub use engine::{Engine, ExecResult};

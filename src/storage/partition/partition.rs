@@ -22,7 +22,10 @@ impl PartitionStrategy {
             "DAY" => Ok(PartitionStrategy::Day),
             "YEAR" => Ok(PartitionStrategy::Year),
             "MONTH" => Ok(PartitionStrategy::Month),
-            _ => Err(MonaxError::Sql(format!("unknown partition strategy: '{}'", s))),
+            _ => Err(MonaxError::Sql(format!(
+                "unknown partition strategy: '{}'",
+                s
+            ))),
         }
     }
 }
@@ -47,7 +50,11 @@ pub fn compute_partition_key(value: &ScalarValue, strategy: PartitionStrategy) -
         PartitionStrategy::Year => {
             format!("{:04}", datetime.0)
         }
-        PartitionStrategy::None => return Err(MonaxError::Internal("cannot compute partition key for None strategy".into())),
+        PartitionStrategy::None => {
+            return Err(MonaxError::Internal(
+                "cannot compute partition key for None strategy".into(),
+            ))
+        }
     };
 
     Ok(key)
@@ -60,7 +67,8 @@ fn extract_timestamp_millis(value: &ScalarValue) -> Result<i64> {
         ScalarValue::Date(Some(v)) => Ok((*v as i64) * 86_400_000),
         ScalarValue::Float64(Some(v)) => Ok(*v as i64),
         _ => Err(MonaxError::Sql(format!(
-            "cannot extract timestamp for partition key from value: {:?}", value
+            "cannot extract timestamp for partition key from value: {:?}",
+            value
         ))),
     }
 }
@@ -68,7 +76,11 @@ fn extract_timestamp_millis(value: &ScalarValue) -> Result<i64> {
 fn chrono_from_millis(secs: i64) -> (i32, u32, u32) {
     let days = secs / 86400;
     let z = days + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
@@ -135,7 +147,8 @@ impl PartitionPruner {
         let lower_key = lower_bound.and_then(|v| compute_partition_key(v, self.strategy).ok());
         let upper_key = upper_bound.and_then(|v| compute_partition_key(v, self.strategy).ok());
 
-        available_partitions.iter()
+        available_partitions
+            .iter()
             .filter(|key| {
                 if let Some(ref lk) = lower_key {
                     if *key < lk {
@@ -172,7 +185,11 @@ impl PartitionPruner {
         Ok(partitions)
     }
 
-    pub fn discover_partition_segments(&self, table_dir: &Path, partition_key: &str) -> Result<Vec<PathBuf>> {
+    pub fn discover_partition_segments(
+        &self,
+        table_dir: &Path,
+        partition_key: &str,
+    ) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
         if !table_dir.exists() {
             return Ok(files);
@@ -206,8 +223,14 @@ mod tests {
 
     #[test]
     fn test_parse_partition_key() {
-        assert_eq!(parse_partition_key("p20260501_0001.dat"), Some("20260501".to_string()));
-        assert_eq!(parse_partition_key("p2024_0003.dat"), Some("2024".to_string()));
+        assert_eq!(
+            parse_partition_key("p20260501_0001.dat"),
+            Some("20260501".to_string())
+        );
+        assert_eq!(
+            parse_partition_key("p2024_0003.dat"),
+            Some("2024".to_string())
+        );
         assert_eq!(parse_partition_key("seg_00001.dat"), None);
         assert_eq!(parse_partition_key("random.dat"), None);
         assert_eq!(parse_partition_key("p_noseq.dat"), None);
@@ -263,9 +286,18 @@ mod tests {
 
     #[test]
     fn test_partition_strategy_from_str() {
-        assert_eq!(PartitionStrategy::from_str("day").unwrap(), PartitionStrategy::Day);
-        assert_eq!(PartitionStrategy::from_str("YEAR").unwrap(), PartitionStrategy::Year);
-        assert_eq!(PartitionStrategy::from_str("month").unwrap(), PartitionStrategy::Month);
+        assert_eq!(
+            PartitionStrategy::from_str("day").unwrap(),
+            PartitionStrategy::Day
+        );
+        assert_eq!(
+            PartitionStrategy::from_str("YEAR").unwrap(),
+            PartitionStrategy::Year
+        );
+        assert_eq!(
+            PartitionStrategy::from_str("month").unwrap(),
+            PartitionStrategy::Month
+        );
         assert!(PartitionStrategy::from_str("invalid").is_err());
     }
 }

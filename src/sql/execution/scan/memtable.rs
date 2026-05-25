@@ -59,7 +59,11 @@ pub fn count_memtable_rows(
                 continue;
             }
 
-            if spec.eq_predicates.len() == 1 && spec.range_predicates.is_empty() && spec.in_predicates.is_empty() && spec.remaining_predicate.is_none() {
+            if spec.eq_predicates.len() == 1
+                && spec.range_predicates.is_empty()
+                && spec.in_predicates.is_empty()
+                && spec.remaining_predicate.is_none()
+            {
                 let (col_idx, value) = &spec.eq_predicates[0];
                 if let Some(col) = mt_batch.column(*col_idx) {
                     let mask = col.eq_vec(value);

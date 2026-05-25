@@ -139,34 +139,44 @@ impl<'a> ScanExecutor<'a> {
                     stats_entry.row_groups_read += prune_result.candidate_indices.len() as u64;
                 }
 
-                for rg_idx in &prune_result.candidate_indices {
-                    if use_predicate_first
-                        && !predicate_cols.is_empty()
-                        && !projection_cols.is_empty()
-                    {
-                        match row_filter::predicate_first_read(
-                            &reader,
-                            *rg_idx,
-                            &predicate_cols,
-                            &projection_cols,
-                            &self.spec.eq_predicates,
-                            &self.spec.range_predicates,
-                            &self.spec.in_predicates,
-                            self.spec.remaining_predicate.as_ref(),
-                        ) {
-                            Ok(batch) => {
-                                if batch.num_rows() > 0 {
-                                    if let Some(s) = self.stats.as_deref_mut() {
-                                        s.entry(self.spec.table_name.clone())
-                                            .or_default()
-                                            .rows_scanned += batch.num_rows() as u64;
-                                    }
-                                    batches.push(batch);
-                                }
-                            }
-                            Err(_) => continue,
-                        }
-                    } else {
+                if use_predicate_first && !predicate_cols.is_empty() && !projection_cols.is_empty()
+                {
+                    use rayon::prelude::*;
+
+                    let mut rg_batches: Vec<(usize, RecordBatch)> = prune_result
+                        .candidate_indices
+                        .par_iter()
+                        .enumerate()
+                        .filter_map(|(pos, rg_idx)| {
+                            row_filter::predicate_first_read(
+                                &reader,
+                                *rg_idx,
+                                &predicate_cols,
+                                &projection_cols,
+                                &self.spec.eq_predicates,
+                                &self.spec.range_predicates,
+                                &self.spec.in_predicates,
+                                self.spec.remaining_predicate.as_ref(),
+                            )
+                            .ok()
+                            .filter(|batch| batch.num_rows() > 0)
+                            .map(|batch| (pos, batch))
+                        })
+                        .collect();
+                    rg_batches.sort_by_key(|(pos, _)| *pos);
+
+                    let rows_scanned = rg_batches
+                        .iter()
+                        .map(|(_, batch)| batch.num_rows() as u64)
+                        .sum::<u64>();
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        s.entry(self.spec.table_name.clone())
+                            .or_default()
+                            .rows_scanned += rows_scanned;
+                    }
+                    batches.extend(rg_batches.into_iter().map(|(_, batch)| batch));
+                } else {
+                    for rg_idx in &prune_result.candidate_indices {
                         let batch = match self.read_and_filter_row_group(
                             &reader,
                             *rg_idx,
@@ -253,16 +263,11 @@ impl<'a> ScanExecutor<'a> {
         if self.spec.projection.is_none() {
             return false;
         }
-        let proj = match &self.spec.projection {
-            Some(p) => p,
-            None => return false,
-        };
         let pred_cols = self.spec.all_predicate_columns();
         if pred_cols.is_empty() {
             return false;
         }
-        let all_pred_in_proj = pred_cols.iter().all(|c| proj.contains(c));
-        !all_pred_in_proj
+        true
     }
 
     fn compute_predicate_columns(&self) -> Vec<usize> {

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::common::error::{MonaxError, Result};
 use crate::storage::core::memtable::{MemTableManager, MemTableState};
-use crate::storage::segment_manager::SegmentManager;
 use crate::storage::core::wal::RecordType;
+use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 
 const DEFAULT_MAX_ROWS_PER_MEMTABLE: u64 = 500_000;
@@ -63,10 +63,7 @@ pub struct BatchWriter {
 }
 
 impl BatchWriter {
-    pub fn new(
-        config: BatchWriterConfig,
-        segment_mgr: Arc<SegmentManager>,
-    ) -> Self {
+    pub fn new(config: BatchWriterConfig, segment_mgr: Arc<SegmentManager>) -> Self {
         let memtable_mgr = Arc::new(MemTableManager::new(
             config.max_rows_per_memtable,
             config.flush_interval_secs,
@@ -154,7 +151,9 @@ impl BatchWriter {
         if row_count == 0 {
             return Ok(0);
         }
-        let mt = self.memtable_mgr.get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
+        let mt =
+            self.memtable_mgr
+                .get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
         mt.append(&batch)?;
 
         if txn_id == 0 && mt.row_count() >= self.config.max_rows_per_memtable {
@@ -189,7 +188,11 @@ impl BatchWriter {
             }
         }
         self.segment_mgr.rollback_txn(txn_id)?;
-        tracing::debug!(txn_id, rows_discarded = rolled_back_rows, "transaction rolled back");
+        tracing::debug!(
+            txn_id,
+            rows_discarded = rolled_back_rows,
+            "transaction rolled back"
+        );
         Ok(rolled_back_rows)
     }
 
@@ -255,7 +258,11 @@ impl BatchWriter {
                 }
                 Ok(WriteCommand::TxnRollback { txn_id }) => {
                     let rolled_back_rows = memtable_mgr.rollback_txn(txn_id);
-                    tracing::debug!(txn_id, rows_discarded = rolled_back_rows, "transaction rolled back in worker");
+                    tracing::debug!(
+                        txn_id,
+                        rows_discarded = rolled_back_rows,
+                        "transaction rolled back in worker"
+                    );
                 }
                 Ok(WriteCommand::Shutdown) => break,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
@@ -276,7 +283,10 @@ impl BatchWriter {
         Ok(())
     }
 
-    fn flush_memtable(segment_mgr: &Arc<SegmentManager>, mt: &Arc<crate::storage::core::memtable::MemTable>) -> Result<()> {
+    fn flush_memtable(
+        segment_mgr: &Arc<SegmentManager>,
+        mt: &Arc<crate::storage::core::memtable::MemTable>,
+    ) -> Result<()> {
         use crate::storage::core::memtable::MemTable;
 
         if mt.state() != MemTableState::Pending {

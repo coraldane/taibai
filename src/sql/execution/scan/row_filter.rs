@@ -1,5 +1,6 @@
 use crate::storage::codec::fastscan::{apply_filter_mask_fast, FastScanEQ};
 use crate::storage::partition::pruning::RangeOp;
+use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
 
@@ -54,7 +55,12 @@ pub fn apply_predicates(
     apply_filter_mask_fast(batch, &mask)
 }
 
-pub fn apply_eq_mask(batch: &RecordBatch, col_idx: usize, value: &ScalarValue, mask: &mut Vec<bool>) {
+pub fn apply_eq_mask(
+    batch: &RecordBatch,
+    col_idx: usize,
+    value: &ScalarValue,
+    mask: &mut Vec<bool>,
+) {
     if let Some(col) = batch.column(col_idx) {
         let col_mask = col.eq_vec(value);
         for (i, m) in col_mask.iter().enumerate() {
@@ -136,12 +142,16 @@ fn eval_logical_expr_batch(
                     Ok(lm.iter().zip(rm.iter()).map(|(l, r)| *l || *r).collect())
                 }
                 BinOp::Eq => {
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) = (&**left, &**right) {
+                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
+                        (&**left, &**right)
+                    {
                         if let Some(col) = batch.column(*idx) {
                             return Ok(col.eq_vec(val));
                         }
                     }
-                    if let (LogicalExpr::Literal(val), LogicalExpr::Column(idx)) = (&**left, &**right) {
+                    if let (LogicalExpr::Literal(val), LogicalExpr::Column(idx)) =
+                        (&**left, &**right)
+                    {
                         if let Some(col) = batch.column(*idx) {
                             return Ok(col.eq_vec(val));
                         }
@@ -149,7 +159,9 @@ fn eval_logical_expr_batch(
                     Ok(vec![true; num_rows])
                 }
                 BinOp::Lt => {
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) = (&**left, &**right) {
+                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
+                        (&**left, &**right)
+                    {
                         if let Some(col) = batch.column(*idx) {
                             return Ok(col.lt_vec(val));
                         }
@@ -157,7 +169,9 @@ fn eval_logical_expr_batch(
                     Ok(vec![true; num_rows])
                 }
                 BinOp::Gt => {
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) = (&**left, &**right) {
+                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
+                        (&**left, &**right)
+                    {
                         if let Some(col) = batch.column(*idx) {
                             return Ok(col.gt_vec(val));
                         }
@@ -165,7 +179,9 @@ fn eval_logical_expr_batch(
                     Ok(vec![true; num_rows])
                 }
                 BinOp::Lte => {
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) = (&**left, &**right) {
+                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
+                        (&**left, &**right)
+                    {
                         if let Some(col) = batch.column(*idx) {
                             return Ok(col.le_vec(val));
                         }
@@ -173,7 +189,9 @@ fn eval_logical_expr_batch(
                     Ok(vec![true; num_rows])
                 }
                 BinOp::Gte => {
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) = (&**left, &**right) {
+                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
+                        (&**left, &**right)
+                    {
                         if let Some(col) = batch.column(*idx) {
                             return Ok(col.ge_vec(val));
                         }
@@ -290,13 +308,46 @@ pub fn predicate_first_read(
     if match_count == 0 {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
+    if match_count == pred_batch.num_rows() {
+        return reader.read_columns_fast(rg_idx, projection_cols);
+    }
 
-    let proj_batch = reader.read_columns_fast(rg_idx, projection_cols)?;
-    let mut columns = Vec::with_capacity(projection_cols.len());
-    for pos in 0..projection_cols.len() {
-        if let Some(col) = proj_batch.column(pos) {
-            columns.push(col.filter_by_mask_fast(&mask, match_count));
+    let selected_rows: Vec<usize> = mask
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, keep)| (*keep).then_some(idx))
+        .collect();
+
+    let mut columns_by_idx: std::collections::HashMap<usize, ColumnArray> =
+        std::collections::HashMap::with_capacity(projection_cols.len());
+    let mut cols_to_read = Vec::with_capacity(projection_cols.len());
+
+    for &col_idx in projection_cols {
+        if columns_by_idx.contains_key(&col_idx) || cols_to_read.contains(&col_idx) {
+            continue;
         }
+        if let Some(&pos) = pred_to_batch_pos.get(&col_idx) {
+            if let Some(col) = pred_batch.column(pos) {
+                columns_by_idx.insert(col_idx, col.filter_by_mask_fast(&mask, match_count));
+                continue;
+            }
+        }
+        cols_to_read.push(col_idx);
+    }
+
+    for (col_idx, col) in reader.read_columns_filtered(rg_idx, &cols_to_read, &selected_rows)? {
+        columns_by_idx.insert(col_idx, col);
+    }
+
+    let mut columns = Vec::with_capacity(projection_cols.len());
+    for &col_idx in projection_cols {
+        let col = columns_by_idx.get(&col_idx).cloned().ok_or_else(|| {
+            crate::common::error::MonaxError::Internal(format!(
+                "projected column {} was not read",
+                col_idx
+            ))
+        })?;
+        columns.push(col);
     }
     let proj_schema = crate::types::batch::Schema::new(
         projection_cols

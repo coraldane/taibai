@@ -1,9 +1,9 @@
 mod common;
-mod types;
-mod protocol;
-mod storage;
-mod sql;
 mod net;
+mod protocol;
+mod sql;
+mod storage;
+mod types;
 
 use std::sync::Arc;
 
@@ -47,7 +47,10 @@ async fn run_server(config: ServerConfig) {
         std::process::exit(1);
     }
 
-    let engine = match Engine::new(std::path::Path::new(&config.storage.data_dir), &config.storage.default_database) {
+    let engine = match Engine::new(
+        std::path::Path::new(&config.storage.data_dir),
+        &config.storage.default_database,
+    ) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize engine");
@@ -121,7 +124,8 @@ async fn run_client(
                     for row in 0..batch.num_rows() {
                         let cells: Vec<String> = (0..schema.num_columns())
                             .map(|col| {
-                                batch.scalar(row, col)
+                                batch
+                                    .scalar(row, col)
                                     .map(|v| format_cell(&v, schema.columns[col].scale))
                                     .unwrap_or_else(|| "NULL".to_string())
                             })
@@ -178,7 +182,8 @@ async fn run_client(
                         for row in 0..batch.num_rows() {
                             let cells: Vec<String> = (0..schema.num_columns())
                                 .map(|col| {
-                                    batch.scalar(row, col)
+                                    batch
+                                        .scalar(row, col)
                                         .map(|v| format_cell(&v, schema.columns[col].scale))
                                         .unwrap_or_else(|| "NULL".to_string())
                                 })

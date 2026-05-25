@@ -4,9 +4,11 @@ use crate::common::error::{MonaxError, Result};
 pub fn gzip_compress(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(data)
+    encoder
+        .write_all(data)
         .map_err(|e| MonaxError::Protocol(format!("gzip compress error: {}", e)))?;
-    encoder.finish()
+    encoder
+        .finish()
         .map_err(|e| MonaxError::Protocol(format!("gzip finalize error: {}", e)))
 }
 
@@ -15,7 +17,8 @@ pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut decoder = flate2::read::GzDecoder::new(data);
     let mut result = Vec::new();
-    decoder.read_to_end(&mut result)
+    decoder
+        .read_to_end(&mut result)
         .map_err(|e| MonaxError::Protocol(format!("gzip decompress error: {}", e)))?;
     Ok(result)
 }
@@ -24,9 +27,11 @@ pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>> {
 pub fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder.write_all(data)
+    encoder
+        .write_all(data)
         .map_err(|e| MonaxError::Protocol(format!("zlib compress error: {}", e)))?;
-    encoder.finish()
+    encoder
+        .finish()
         .map_err(|e| MonaxError::Protocol(format!("zlib finalize error: {}", e)))
 }
 
@@ -35,7 +40,8 @@ pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut decoder = flate2::read::ZlibDecoder::new(data);
     let mut result = Vec::new();
-    decoder.read_to_end(&mut result)
+    decoder
+        .read_to_end(&mut result)
         .map_err(|e| MonaxError::Protocol(format!("zlib decompress error: {}", e)))?;
     Ok(result)
 }

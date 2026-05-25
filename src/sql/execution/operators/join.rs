@@ -61,10 +61,8 @@ impl HashJoinExec {
         right_schema: Schema,
         output_schema: Schema,
     ) -> Self {
-        let (left_key_cols, right_key_cols) = extract_join_keys(
-            &condition,
-            left_schema.columns.len(),
-        );
+        let (left_key_cols, right_key_cols) =
+            extract_join_keys(&condition, left_schema.columns.len());
 
         Self {
             left,
@@ -87,9 +85,8 @@ impl HashJoinExec {
         match self.join_type {
             JoinType::Right | JoinType::Full => {
                 // For RIGHT/FULL join, build hash table from right side
-                let right_key_cols: Vec<usize> = self.right_key_cols.iter()
-                    .map(|&idx| idx)
-                    .collect();
+                let right_key_cols: Vec<usize> =
+                    self.right_key_cols.iter().map(|&idx| idx).collect();
                 let mut ht = JoinHashTable::new(right_key_cols);
                 while let Some(batch) = self.right.next_batch()? {
                     ht.insert_batch(batch);
@@ -155,7 +152,9 @@ impl HashJoinExec {
                 Some(row) => row,
                 None => return Ok(None),
             };
-            let key: Vec<ScalarValue> = self.right_key_cols.iter()
+            let key: Vec<ScalarValue> = self
+                .right_key_cols
+                .iter()
                 .map(|&idx| right_row[idx].clone())
                 .collect();
             let matches = {
@@ -164,7 +163,9 @@ impl HashJoinExec {
             };
             for ptr in &matches {
                 let left_row = self.collect_left_row(ptr);
-                self.probe_state.output_buffer.push((left_row, Some(right_row.clone())));
+                self.probe_state
+                    .output_buffer
+                    .push((left_row, Some(right_row.clone())));
             }
             if self.probe_state.output_buffer.is_empty() {
                 continue;
@@ -193,7 +194,9 @@ impl HashJoinExec {
                     return self.drain_buffer();
                 }
             };
-            let key: Vec<ScalarValue> = self.right_key_cols.iter()
+            let key: Vec<ScalarValue> = self
+                .right_key_cols
+                .iter()
                 .map(|&idx| right_row[idx].clone())
                 .collect();
             let matches = {
@@ -209,7 +212,9 @@ impl HashJoinExec {
                 }
                 for ptr in &matches {
                     let left_row = self.collect_left_row(ptr);
-                    self.probe_state.output_buffer.push((left_row, Some(right_row.clone())));
+                    self.probe_state
+                        .output_buffer
+                        .push((left_row, Some(right_row.clone())));
                 }
             }
             if self.probe_state.output_buffer.is_empty() {
@@ -239,7 +244,9 @@ impl HashJoinExec {
                     return self.drain_buffer();
                 }
             };
-            let key: Vec<ScalarValue> = self.left_key_cols.iter()
+            let key: Vec<ScalarValue> = self
+                .left_key_cols
+                .iter()
                 .map(|&idx| left_row[idx].clone())
                 .collect();
             let matches = {
@@ -258,7 +265,9 @@ impl HashJoinExec {
                         let ht = self.hash_table.as_ref().unwrap();
                         self.collect_build_row(ht, ptr)
                     };
-                    self.probe_state.output_buffer.push((left_row.clone(), Some(right_row)));
+                    self.probe_state
+                        .output_buffer
+                        .push((left_row.clone(), Some(right_row)));
                 }
             }
             if self.probe_state.output_buffer.is_empty() {
@@ -288,7 +297,9 @@ impl HashJoinExec {
                     return self.drain_buffer();
                 }
             };
-            let key: Vec<ScalarValue> = self.left_key_cols.iter()
+            let key: Vec<ScalarValue> = self
+                .left_key_cols
+                .iter()
                 .map(|&idx| left_row[idx].clone())
                 .collect();
             let matches = {
@@ -297,7 +308,9 @@ impl HashJoinExec {
             };
             if matches.is_empty() {
                 let null_right = self.make_null_right_row();
-                self.probe_state.output_buffer.push((left_row, Some(null_right)));
+                self.probe_state
+                    .output_buffer
+                    .push((left_row, Some(null_right)));
             } else {
                 {
                     let ht = self.hash_table.as_mut().unwrap();
@@ -310,7 +323,9 @@ impl HashJoinExec {
                         let ht = self.hash_table.as_ref().unwrap();
                         self.collect_build_row(ht, ptr)
                     };
-                    self.probe_state.output_buffer.push((left_row.clone(), Some(right_row)));
+                    self.probe_state
+                        .output_buffer
+                        .push((left_row.clone(), Some(right_row)));
                 }
             }
             if self.probe_state.output_buffer.is_empty() {
@@ -344,9 +359,15 @@ impl HashJoinExec {
                 for right_batch in &self.probe_state.right_batches {
                     for right_row_idx in 0..right_batch.num_rows() {
                         let right_row: Vec<ScalarValue> = (0..right_batch.num_columns())
-                            .map(|c| right_batch.scalar(right_row_idx, c).unwrap_or(ScalarValue::Int64(None)))
+                            .map(|c| {
+                                right_batch
+                                    .scalar(right_row_idx, c)
+                                    .unwrap_or(ScalarValue::Int64(None))
+                            })
                             .collect();
-                        self.probe_state.output_buffer.push((left_row.clone(), Some(right_row)));
+                        self.probe_state
+                            .output_buffer
+                            .push((left_row.clone(), Some(right_row)));
                     }
                 }
             }
@@ -364,7 +385,9 @@ impl HashJoinExec {
                 Some(row) => row,
                 None => return Ok(None),
             };
-            let key: Vec<ScalarValue> = self.right_key_cols.iter()
+            let key: Vec<ScalarValue> = self
+                .right_key_cols
+                .iter()
                 .map(|&idx| right_row[idx].clone())
                 .collect();
             let matches = {
@@ -390,7 +413,9 @@ impl HashJoinExec {
                     let right_row: Vec<ScalarValue> = (0..batch.num_columns())
                         .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
                         .collect();
-                    let key: Vec<ScalarValue> = self.right_key_cols.iter()
+                    let key: Vec<ScalarValue> = self
+                        .right_key_cols
+                        .iter()
                         .map(|&idx| right_row[idx].clone())
                         .collect();
                     let _matches = {
@@ -435,10 +460,14 @@ impl HashJoinExec {
                 let right_row: Vec<ScalarValue> = (0..self.right_schema.columns.len())
                     .map(|_| ScalarValue::Int64(None))
                     .collect();
-                self.probe_state.output_buffer.push((left_row, Some(right_row)));
+                self.probe_state
+                    .output_buffer
+                    .push((left_row, Some(right_row)));
             } else {
                 let null_right = self.make_null_right_row();
-                self.probe_state.output_buffer.push((left_row, Some(null_right)));
+                self.probe_state
+                    .output_buffer
+                    .push((left_row, Some(null_right)));
             }
             return self.drain_buffer();
         }
@@ -456,7 +485,11 @@ impl HashJoinExec {
             let batch = &self.probe_state.right_batches[self.probe_state.right_batch_idx];
             if self.probe_state.right_row_idx < batch.num_rows() {
                 let row: Vec<ScalarValue> = (0..batch.num_columns())
-                    .map(|c| batch.scalar(self.probe_state.right_row_idx, c).unwrap_or(ScalarValue::Int64(None)))
+                    .map(|c| {
+                        batch
+                            .scalar(self.probe_state.right_row_idx, c)
+                            .unwrap_or(ScalarValue::Int64(None))
+                    })
                     .collect();
                 self.probe_state.right_row_idx += 1;
                 if self.probe_state.right_row_idx >= batch.num_rows() {
@@ -477,7 +510,8 @@ impl HashJoinExec {
                 }
                 // Buffer and return first row
                 self.probe_state.right_batches.push(batch);
-                let batch_ref = &self.probe_state.right_batches[self.probe_state.right_batches.len() - 1];
+                let batch_ref =
+                    &self.probe_state.right_batches[self.probe_state.right_batches.len() - 1];
                 let row: Vec<ScalarValue> = (0..batch_ref.num_columns())
                     .map(|c| batch_ref.scalar(0, c).unwrap_or(ScalarValue::Int64(None)))
                     .collect();
@@ -512,13 +546,17 @@ impl HashJoinExec {
     }
 
     fn make_null_right_row(&self) -> Vec<ScalarValue> {
-        self.right_schema.columns.iter()
+        self.right_schema
+            .columns
+            .iter()
             .map(|c| ScalarValue::null_for_type(c.data_type))
             .collect()
     }
 
     fn make_null_left_row(&self) -> Vec<ScalarValue> {
-        self.left_schema.columns.iter()
+        self.left_schema
+            .columns
+            .iter()
             .map(|c| ScalarValue::null_for_type(c.data_type))
             .collect()
     }
@@ -531,7 +569,9 @@ impl HashJoinExec {
         let null_right = self.make_null_right_row();
         for ptr in &unmatched {
             let left_row = self.collect_left_row(ptr);
-            self.probe_state.output_buffer.push((left_row, Some(null_right.clone())));
+            self.probe_state
+                .output_buffer
+                .push((left_row, Some(null_right.clone())));
         }
         Ok(())
     }
@@ -547,7 +587,9 @@ impl HashJoinExec {
                 let ht = self.hash_table.as_ref().unwrap();
                 self.collect_build_row_inner(ht, ptr)
             };
-            self.probe_state.output_buffer.push((null_left.clone(), Some(right_row)));
+            self.probe_state
+                .output_buffer
+                .push((null_left.clone(), Some(right_row)));
         }
         Ok(())
     }
@@ -589,7 +631,8 @@ impl HashJoinExec {
                     // For semi/anti join, right side is not emitted
                     if output_ncols > left_ncols {
                         for i in 0..right_ncols {
-                            let null_val = ScalarValue::null_for_type(self.right_schema.columns[i].data_type);
+                            let null_val =
+                                ScalarValue::null_for_type(self.right_schema.columns[i].data_type);
                             columns[left_ncols + i].push(&null_val)?;
                         }
                     }

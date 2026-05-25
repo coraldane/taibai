@@ -159,7 +159,8 @@ impl UserCatalog {
         if self.users.contains_key(name) {
             return Err(MonaxError::Sql(format!("user '{}' already exists", name)));
         }
-        self.users.insert(name.to_string(), User::new(name, password));
+        self.users
+            .insert(name.to_string(), User::new(name, password));
         Ok(())
     }
 
@@ -194,10 +195,15 @@ impl UserCatalog {
     }
 
     pub fn grant_to_user(&mut self, user_name: &str, role_name: &str) -> Result<()> {
-        let user = self.users.get_mut(user_name)
+        let user = self
+            .users
+            .get_mut(user_name)
             .ok_or_else(|| MonaxError::Sql(format!("user '{}' does not exist", user_name)))?;
         if !self.roles.contains_key(role_name) {
-            return Err(MonaxError::Sql(format!("role '{}' does not exist", role_name)));
+            return Err(MonaxError::Sql(format!(
+                "role '{}' does not exist",
+                role_name
+            )));
         }
         if !user.roles.contains(&role_name.to_string()) {
             user.roles.push(role_name.to_string());
@@ -206,14 +212,23 @@ impl UserCatalog {
     }
 
     pub fn revoke_from_user(&mut self, user_name: &str, role_name: &str) -> Result<()> {
-        let user = self.users.get_mut(user_name)
+        let user = self
+            .users
+            .get_mut(user_name)
             .ok_or_else(|| MonaxError::Sql(format!("user '{}' does not exist", user_name)))?;
         user.roles.retain(|r| r != role_name);
         Ok(())
     }
 
-    pub fn grant_to_role(&mut self, role_name: &str, scope: PermissionScope, permissions: Vec<Permission>) -> Result<()> {
-        let role = self.roles.get_mut(role_name)
+    pub fn grant_to_role(
+        &mut self,
+        role_name: &str,
+        scope: PermissionScope,
+        permissions: Vec<Permission>,
+    ) -> Result<()> {
+        let role = self
+            .roles
+            .get_mut(role_name)
             .ok_or_else(|| MonaxError::Sql(format!("role '{}' does not exist", role_name)))?;
         let key = scope_to_key(&scope);
         let existing = role.privileges.entry(key).or_insert_with(Vec::new);
@@ -225,8 +240,15 @@ impl UserCatalog {
         Ok(())
     }
 
-    pub fn revoke_from_role(&mut self, role_name: &str, scope: PermissionScope, permissions: Vec<Permission>) -> Result<()> {
-        let role = self.roles.get_mut(role_name)
+    pub fn revoke_from_role(
+        &mut self,
+        role_name: &str,
+        scope: PermissionScope,
+        permissions: Vec<Permission>,
+    ) -> Result<()> {
+        let role = self
+            .roles
+            .get_mut(role_name)
             .ok_or_else(|| MonaxError::Sql(format!("role '{}' does not exist", role_name)))?;
         let key = scope_to_key(&scope);
         if let Some(existing) = role.privileges.get_mut(&key) {
@@ -237,7 +259,12 @@ impl UserCatalog {
         Ok(())
     }
 
-    pub fn check_permission(&self, user_name: &str, scope: &PermissionScope, permission: &Permission) -> bool {
+    pub fn check_permission(
+        &self,
+        user_name: &str,
+        scope: &PermissionScope,
+        permission: &Permission,
+    ) -> bool {
         let user = self.users.get(user_name);
         if user.is_none() {
             return false;
@@ -264,10 +291,15 @@ fn scope_to_key(scope: &PermissionScope) -> String {
 }
 
 fn role_has_permission(role: &Role, scope: &PermissionScope, permission: &Permission) -> bool {
-    if role.privileges.get("*").map(|p| p.contains(&Permission::All)).unwrap_or(false) {
+    if role
+        .privileges
+        .get("*")
+        .map(|p| p.contains(&Permission::All))
+        .unwrap_or(false)
+    {
         return true;
     }
-    
+
     let key = scope_to_key(scope);
     if let Some(perms) = role.privileges.get(&key) {
         if perms.contains(&Permission::All) {
@@ -363,11 +395,16 @@ impl UserManager {
         }
     }
 
-    pub fn grant(&self, permissions: Vec<Permission>, scope: Option<PermissionScope>, target: &str) -> Result<()> {
+    pub fn grant(
+        &self,
+        permissions: Vec<Permission>,
+        scope: Option<PermissionScope>,
+        target: &str,
+    ) -> Result<()> {
         {
             let mut catalog = self.catalog.write().unwrap();
             let scope = scope.unwrap_or(PermissionScope::Global);
-            
+
             if catalog.roles.contains_key(target) {
                 catalog.grant_to_role(target, scope, permissions)?;
             } else if catalog.users.contains_key(target) {
@@ -380,18 +417,26 @@ impl UserManager {
                     catalog.grant_to_user(target, &role_name)?;
                 }
             } else {
-                return Err(MonaxError::Sql(format!("'{}' is not a valid user or role", target)));
+                return Err(MonaxError::Sql(format!(
+                    "'{}' is not a valid user or role",
+                    target
+                )));
             }
             catalog.save(&self.meta_dir)?;
         }
         Ok(())
     }
 
-    pub fn revoke(&self, permissions: Vec<Permission>, scope: Option<PermissionScope>, target: &str) -> Result<()> {
+    pub fn revoke(
+        &self,
+        permissions: Vec<Permission>,
+        scope: Option<PermissionScope>,
+        target: &str,
+    ) -> Result<()> {
         {
             let mut catalog = self.catalog.write().unwrap();
             let scope = scope.unwrap_or(PermissionScope::Global);
-            
+
             if catalog.roles.contains_key(target) {
                 catalog.revoke_from_role(target, scope, permissions)?;
             } else if catalog.users.contains_key(target) {
@@ -400,7 +445,10 @@ impl UserManager {
                     catalog.revoke_from_role(&role_name, scope, permissions)?;
                 }
             } else {
-                return Err(MonaxError::Sql(format!("'{}' is not a valid user or role", target)));
+                return Err(MonaxError::Sql(format!(
+                    "'{}' is not a valid user or role",
+                    target
+                )));
             }
             catalog.save(&self.meta_dir)?;
         }
@@ -411,11 +459,19 @@ impl UserManager {
         let catalog = self.catalog.read().unwrap();
         match catalog.get_user(user_name) {
             Some(user) => Ok(user.verify_password(password)),
-            None => Err(MonaxError::Sql(format!("user '{}' does not exist", user_name))),
+            None => Err(MonaxError::Sql(format!(
+                "user '{}' does not exist",
+                user_name
+            ))),
         }
     }
 
-    pub fn check_permission(&self, user_name: &str, scope: &PermissionScope, permission: &Permission) -> bool {
+    pub fn check_permission(
+        &self,
+        user_name: &str,
+        scope: &PermissionScope,
+        permission: &Permission,
+    ) -> bool {
         let catalog = self.catalog.read().unwrap();
         catalog.check_permission(user_name, scope, permission)
     }
@@ -458,9 +514,15 @@ mod tests {
     fn test_grant_role() {
         let mut catalog = UserCatalog::new();
         catalog.create_role("reader").unwrap();
-        catalog.grant_to_role("reader", PermissionScope::Global, vec![Permission::Select]).unwrap();
+        catalog
+            .grant_to_role("reader", PermissionScope::Global, vec![Permission::Select])
+            .unwrap();
         let role = catalog.get_role("reader").unwrap();
-        assert!(role.privileges.get("*").unwrap().contains(&Permission::Select));
+        assert!(role
+            .privileges
+            .get("*")
+            .unwrap()
+            .contains(&Permission::Select));
     }
 
     #[test]
@@ -477,12 +539,12 @@ mod tests {
     fn test_save_load() {
         let dir = TempDir::new().unwrap();
         let meta_dir = dir.path().join("meta");
-        
+
         let mut catalog = UserCatalog::new();
         catalog.create_user("dave", "pass").unwrap();
         catalog.create_role("editor").unwrap();
         catalog.save(&meta_dir).unwrap();
-        
+
         let loaded = UserCatalog::load_or_create(&meta_dir).unwrap();
         assert!(loaded.get_user("dave").is_some());
         assert!(loaded.get_role("editor").is_some());

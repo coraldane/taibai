@@ -15,8 +15,18 @@ pub struct ArithmeticExpression {
 }
 
 impl ArithmeticExpression {
-    pub fn new(left: Box<dyn ColumnExpression>, op: BinOp, right: Box<dyn ColumnExpression>, result_type: DataType) -> Self {
-        Self { left, op, right, result_type }
+    pub fn new(
+        left: Box<dyn ColumnExpression>,
+        op: BinOp,
+        right: Box<dyn ColumnExpression>,
+        result_type: DataType,
+    ) -> Self {
+        Self {
+            left,
+            op,
+            right,
+            result_type,
+        }
     }
 }
 
@@ -47,16 +57,20 @@ fn compute(l: &ScalarValue, op: &BinOp, r: &ScalarValue, dt: &DataType) -> Scala
     match (l, r) {
         (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => {
             let v = match op {
-                BinOp::Add => *a + *b, BinOp::Sub => *a - *b,
-                BinOp::Mul => *a * *b, BinOp::Div => *a / *b,
+                BinOp::Add => *a + *b,
+                BinOp::Sub => *a - *b,
+                BinOp::Mul => *a * *b,
+                BinOp::Div => *a / *b,
                 _ => return ScalarValue::null_for_type(*dt),
             };
             ScalarValue::Int64(Some(v))
         }
         (ScalarValue::Float64(Some(a)), ScalarValue::Float64(Some(b))) => {
             let v = match op {
-                BinOp::Add => *a + *b, BinOp::Sub => *a - *b,
-                BinOp::Mul => *a * *b, BinOp::Div => *a / *b,
+                BinOp::Add => *a + *b,
+                BinOp::Sub => *a - *b,
+                BinOp::Mul => *a * *b,
+                BinOp::Div => *a / *b,
                 _ => return ScalarValue::null_for_type(*dt),
             };
             ScalarValue::Float64(Some(v))

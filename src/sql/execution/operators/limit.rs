@@ -16,7 +16,15 @@ pub struct LimitExec {
 
 impl LimitExec {
     pub fn new(limit: usize, offset: usize, input: Box<dyn ExecutionOp>, schema: Schema) -> Self {
-        Self { limit, offset, input, schema, rows_returned: 0, skip_remaining: offset, done: false }
+        Self {
+            limit,
+            offset,
+            input,
+            schema,
+            rows_returned: 0,
+            skip_remaining: offset,
+            done: false,
+        }
     }
 }
 

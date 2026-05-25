@@ -2,8 +2,8 @@ use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 
 use crate::sql::parser::ast::{
-    AlterOperation, AlterUserOperation, ColumnDefAst, GrantObject, PartitionDef,
-    PartitionStrategy, Privilege, Statement,
+    AlterOperation, AlterUserOperation, ColumnDefAst, GrantObject, PartitionDef, PartitionStrategy,
+    Privilege, Statement,
 };
 use crate::sql::parser::lexer::Token;
 use crate::sql::parser::parser::{parse_data_type, Parser};

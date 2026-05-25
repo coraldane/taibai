@@ -62,7 +62,10 @@ fn apply_zone_map_pruning(plan: LogicalPlan) -> (LogicalPlan, bool) {
     }
 }
 
-fn extract_zone_maps(expr: &LogicalExpr, schema: &crate::types::batch::Schema) -> Vec<ZoneMapFilter> {
+fn extract_zone_maps(
+    expr: &LogicalExpr,
+    schema: &crate::types::batch::Schema,
+) -> Vec<ZoneMapFilter> {
     let mut filters = Vec::new();
     extract_zone_maps_recursive(expr, schema, &mut filters);
     filters
@@ -74,28 +77,26 @@ fn extract_zone_maps_recursive(
     filters: &mut Vec<ZoneMapFilter>,
 ) {
     match expr {
-        LogicalExpr::BinaryOp { left, op, right } => {
-            match op {
-                BinOp::Eq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => {
-                    if let LogicalExpr::Column(idx) = **left {
-                        if let LogicalExpr::Literal(ref val) = **right {
-                            if let Some(col_def) = schema.columns.get(idx) {
-                                filters.push(ZoneMapFilter {
-                                    column: col_def.name.clone(),
-                                    min_value: val.clone(),
-                                    max_value: val.clone(),
-                                });
-                            }
+        LogicalExpr::BinaryOp { left, op, right } => match op {
+            BinOp::Eq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => {
+                if let LogicalExpr::Column(idx) = **left {
+                    if let LogicalExpr::Literal(ref val) = **right {
+                        if let Some(col_def) = schema.columns.get(idx) {
+                            filters.push(ZoneMapFilter {
+                                column: col_def.name.clone(),
+                                min_value: val.clone(),
+                                max_value: val.clone(),
+                            });
                         }
                     }
                 }
-                BinOp::And => {
-                    extract_zone_maps_recursive(left, schema, filters);
-                    extract_zone_maps_recursive(right, schema, filters);
-                }
-                _ => {}
             }
-        }
+            BinOp::And => {
+                extract_zone_maps_recursive(left, schema, filters);
+                extract_zone_maps_recursive(right, schema, filters);
+            }
+            _ => {}
+        },
         _ => {}
     }
 }

@@ -48,10 +48,7 @@ fn main() {
         process::exit(1);
     }
 
-    println!(
-        "scanning table: {} (database: {})",
-        args.table, args.db
-    );
+    println!("scanning table: {} (database: {})", args.table, args.db);
     println!("directory: {}\n", table_dir.display());
 
     let files = match segment::discover_segments(&table_dir) {
@@ -139,7 +136,13 @@ fn main() {
                     total_uncompressed += info.uncompressed_size;
                     total_row_groups += info.row_group_count;
 
-                    print_info(i + 1, &info, args.verbose, args.show_header, args.show_zonemaps);
+                    print_info(
+                        i + 1,
+                        &info,
+                        args.verbose,
+                        args.show_header,
+                        args.show_zonemaps,
+                    );
 
                     if args.verbose {
                         let schema = &info.schema;
@@ -156,11 +159,7 @@ fn main() {
                                     col.scale
                                 );
                             } else {
-                                println!(
-                                    "      - {} ({})",
-                                    col.name,
-                                    col.data_type.display_name()
-                                );
+                                println!("      - {} ({})", col.name, col.data_type.display_name());
                             }
                         }
                         println!();
@@ -190,7 +189,10 @@ fn main() {
         );
     }
     println!("  total file size: {}", segment::format_size(total_size));
-    println!("  total compressed: {}", segment::format_size(total_compressed));
+    println!(
+        "  total compressed: {}",
+        segment::format_size(total_compressed)
+    );
     println!(
         "  total uncompressed: {}",
         segment::format_size(total_uncompressed)
@@ -211,7 +213,13 @@ fn main() {
     }
 }
 
-fn print_info(idx: usize, info: &SegmentInspectInfo, verbose: bool, show_header: bool, show_zonemaps: bool) {
+fn print_info(
+    idx: usize,
+    info: &SegmentInspectInfo,
+    verbose: bool,
+    show_header: bool,
+    show_zonemaps: bool,
+) {
     let name = info
         .path
         .file_name()
@@ -239,7 +247,10 @@ fn print_info(idx: usize, info: &SegmentInspectInfo, verbose: bool, show_header:
             info.header_flags
         );
     }
-    println!("    version: {}, generation: {}", info.version, info.generation);
+    println!(
+        "    version: {}, generation: {}",
+        info.version, info.generation
+    );
     if info.deleted_row_count > 0 || info.delete_bitmap_len > 0 {
         println!(
             "    deleted rows: {} (bitmap bytes: {})",
@@ -366,7 +377,13 @@ fn print_info(idx: usize, info: &SegmentInspectInfo, verbose: bool, show_header:
 fn magic_as_ascii(m: u32) -> String {
     let b = m.to_le_bytes();
     b.iter()
-        .map(|c| if c.is_ascii_graphic() { *c as char } else { '?' })
+        .map(|c| {
+            if c.is_ascii_graphic() {
+                *c as char
+            } else {
+                '?'
+            }
+        })
         .collect()
 }
 
@@ -409,7 +426,10 @@ fn inspect_with_filter(
     Ok((info, match_count))
 }
 
-fn parse_scalar_value(s: &str, dt: monax::protocol::types::DataType) -> monax::types::scalar::ScalarValue {
+fn parse_scalar_value(
+    s: &str,
+    dt: monax::protocol::types::DataType,
+) -> monax::types::scalar::ScalarValue {
     use monax::types::scalar::ScalarValue;
 
     match dt {
@@ -446,9 +466,7 @@ fn parse_scalar_value(s: &str, dt: monax::protocol::types::DataType) -> monax::t
         monax::protocol::types::DataType::Float64 => {
             ScalarValue::Float64(Some(s.parse::<f64>().unwrap_or(0.0)))
         }
-        monax::protocol::types::DataType::VarChar => {
-            ScalarValue::VarChar(Some(s.to_string()))
-        }
+        monax::protocol::types::DataType::VarChar => ScalarValue::VarChar(Some(s.to_string())),
         monax::protocol::types::DataType::Timestamp => {
             ScalarValue::Timestamp(Some(s.parse::<i64>().unwrap_or(0)))
         }
@@ -478,8 +496,12 @@ fn scalar_matches(
         (ScalarValue::UInt16(Some(a)), ScalarValue::UInt16(Some(b))) => a == b,
         (ScalarValue::UInt32(Some(a)), ScalarValue::UInt32(Some(b))) => a == b,
         (ScalarValue::UInt64(Some(a)), ScalarValue::UInt64(Some(b))) => a == b,
-        (ScalarValue::Float32(Some(a)), ScalarValue::Float32(Some(b))) => (a - b).abs() < f32::EPSILON,
-        (ScalarValue::Float64(Some(a)), ScalarValue::Float64(Some(b))) => (a - b).abs() < f64::EPSILON,
+        (ScalarValue::Float32(Some(a)), ScalarValue::Float32(Some(b))) => {
+            (a - b).abs() < f32::EPSILON
+        }
+        (ScalarValue::Float64(Some(a)), ScalarValue::Float64(Some(b))) => {
+            (a - b).abs() < f64::EPSILON
+        }
         (ScalarValue::VarChar(Some(a)), ScalarValue::VarChar(Some(b))) => a == b,
         (ScalarValue::Timestamp(Some(a)), ScalarValue::Timestamp(Some(b))) => a == b,
         (ScalarValue::Date(Some(a)), ScalarValue::Date(Some(b))) => a == b,

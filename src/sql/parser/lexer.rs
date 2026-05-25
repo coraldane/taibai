@@ -267,33 +267,76 @@ impl<'a> Lexer<'a> {
 
             let ch = self.bytes[self.pos];
             let token = match ch {
-                b'(' => { self.pos += 1; Token::LeftParen }
-                b')' => { self.pos += 1; Token::RightParen }
-                b',' => { self.pos += 1; Token::Comma }
-                b';' => { self.pos += 1; Token::Semicolon }
-                b'.' => { self.pos += 1; Token::Dot }
-                b'*' => { self.pos += 1; Token::Star }
-                b'?' => { self.pos += 1; Token::Placeholder }
-                b'+' => { self.pos += 1; Token::Plus }
-                b'=' => { self.pos += 1; Token::Eq }
+                b'(' => {
+                    self.pos += 1;
+                    Token::LeftParen
+                }
+                b')' => {
+                    self.pos += 1;
+                    Token::RightParen
+                }
+                b',' => {
+                    self.pos += 1;
+                    Token::Comma
+                }
+                b';' => {
+                    self.pos += 1;
+                    Token::Semicolon
+                }
+                b'.' => {
+                    self.pos += 1;
+                    Token::Dot
+                }
+                b'*' => {
+                    self.pos += 1;
+                    Token::Star
+                }
+                b'?' => {
+                    self.pos += 1;
+                    Token::Placeholder
+                }
+                b'+' => {
+                    self.pos += 1;
+                    Token::Plus
+                }
+                b'=' => {
+                    self.pos += 1;
+                    Token::Eq
+                }
                 b'<' => {
                     self.pos += 1;
-                    if self.peek_byte() == Some(b'=') { self.pos += 1; Token::Lte }
-                    else { Token::Lt }
+                    if self.peek_byte() == Some(b'=') {
+                        self.pos += 1;
+                        Token::Lte
+                    } else {
+                        Token::Lt
+                    }
                 }
                 b'>' => {
                     self.pos += 1;
-                    if self.peek_byte() == Some(b'=') { self.pos += 1; Token::Gte }
-                    else { Token::Gt }
+                    if self.peek_byte() == Some(b'=') {
+                        self.pos += 1;
+                        Token::Gte
+                    } else {
+                        Token::Gt
+                    }
                 }
                 b'!' => {
                     self.pos += 1;
-                    if self.peek_byte() == Some(b'=') { self.pos += 1; Token::Neq }
-                    else { return Err(MonaxError::Sql("unexpected character '!'".into())); }
+                    if self.peek_byte() == Some(b'=') {
+                        self.pos += 1;
+                        Token::Neq
+                    } else {
+                        return Err(MonaxError::Sql("unexpected character '!'".into()));
+                    }
                 }
                 b'-' => {
                     self.pos += 1;
-                    if self.peek_byte().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    if self
+                        .peek_byte()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
                         self.read_negative_number()?
                     } else {
                         Token::Minus
@@ -386,11 +429,15 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
             let s = &self.input[start..self.pos];
-            let v = s.parse::<f64>().map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
+            let v = s
+                .parse::<f64>()
+                .map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
             Ok(Token::Float(v))
         } else {
             let s = &self.input[start..self.pos];
-            let v = s.parse::<i64>().map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
+            let v = s
+                .parse::<i64>()
+                .map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
             Ok(Token::Integer(v))
         }
     }
@@ -406,11 +453,15 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
             let s = &self.input[start..self.pos];
-            let v = s.parse::<f64>().map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
+            let v = s
+                .parse::<f64>()
+                .map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
             Ok(Token::Float(-v))
         } else {
             let s = &self.input[start..self.pos];
-            let v = s.parse::<i64>().map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
+            let v = s
+                .parse::<i64>()
+                .map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
             Ok(Token::Integer(-v))
         }
     }
