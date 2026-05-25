@@ -117,21 +117,11 @@ async fn run_client(
                 println!("OK, {} row(s) affected", rows_affected);
             }
             Ok(QueryResult::Rows { schema, batches }) => {
-                let names: Vec<&str> = schema.column_names().collect();
-                println!("{}", names.join("\t"));
-
-                for batch in &batches {
-                    for row in 0..batch.num_rows() {
-                        let cells: Vec<String> = (0..schema.num_columns())
-                            .map(|col| {
-                                batch
-                                    .scalar(row, col)
-                                    .map(|v| format_cell(&v, schema.columns[col].scale))
-                                    .unwrap_or_else(|| "NULL".to_string())
-                            })
-                            .collect();
-                        println!("{}", cells.join("\t"));
-                    }
+                let stdout = std::io::stdout();
+                let mut out = std::io::BufWriter::new(stdout.lock());
+                if let Err(e) = write_query_rows(&mut out, &schema, &batches) {
+                    eprintln!("IO error: {}", e);
+                    std::process::exit(1);
                 }
             }
             Ok(QueryResult::Error(msg)) => {
@@ -176,20 +166,11 @@ async fn run_client(
                     println!("({:?})", start.elapsed());
                 }
                 Ok(QueryResult::Rows { schema, batches }) => {
-                    let names: Vec<&str> = schema.column_names().collect();
-                    println!("{}", names.join("\t"));
-                    for batch in &batches {
-                        for row in 0..batch.num_rows() {
-                            let cells: Vec<String> = (0..schema.num_columns())
-                                .map(|col| {
-                                    batch
-                                        .scalar(row, col)
-                                        .map(|v| format_cell(&v, schema.columns[col].scale))
-                                        .unwrap_or_else(|| "NULL".to_string())
-                                })
-                                .collect();
-                            println!("{}", cells.join("\t"));
-                        }
+                    let stdout = std::io::stdout();
+                    let mut out = std::io::BufWriter::new(stdout.lock());
+                    if let Err(e) = write_query_rows(&mut out, &schema, &batches) {
+                        eprintln!("IO error: {}", e);
+                        break;
                     }
                     println!("({:?})", start.elapsed());
                 }
@@ -208,20 +189,125 @@ async fn run_client(
     println!("Disconnected.");
 }
 
-fn format_cell(value: &types::scalar::ScalarValue, scale: i32) -> String {
-    match value {
-        types::scalar::ScalarValue::Decimal(Some(v)) if scale > 0 => {
-            let divisor = 10_i64.pow(scale as u32);
-            let sign = if *v < 0 { "-" } else { "" };
-            let abs = v.abs();
-            format!(
-                "{}{}.{:0width$}",
-                sign,
-                abs / divisor,
-                abs % divisor,
-                width = scale as usize
-            )
+fn write_query_rows<W: std::io::Write>(
+    out: &mut W,
+    schema: &types::batch::Schema,
+    batches: &[types::batch::RecordBatch],
+) -> std::io::Result<()> {
+    let mut line = String::with_capacity(schema.num_columns().saturating_mul(24));
+
+    for (idx, col) in schema.columns.iter().enumerate() {
+        if idx > 0 {
+            line.push('\t');
         }
-        _ => value.to_text().unwrap_or_else(|| "NULL".to_string()),
+        line.push_str(&col.name);
     }
+    line.push('\n');
+    out.write_all(line.as_bytes())?;
+
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            line.clear();
+            for col_idx in 0..schema.num_columns() {
+                if col_idx > 0 {
+                    line.push('\t');
+                }
+                match batch.column(col_idx) {
+                    Some(col) => {
+                        append_column_cell(&mut line, col, row, schema.columns[col_idx].scale)
+                    }
+                    None => line.push_str("NULL"),
+                }
+            }
+            line.push('\n');
+            out.write_all(line.as_bytes())?;
+        }
+    }
+    out.flush()
+}
+
+fn append_column_cell(line: &mut String, col: &types::array::ColumnArray, row: usize, scale: i32) {
+    use std::fmt::Write as _;
+
+    if col.bitmap().is_null(row) {
+        line.push_str("NULL");
+        return;
+    }
+
+    match col {
+        types::array::ColumnArray::Bool { data, .. } => {
+            line.push_str(if data[row] != 0 { "true" } else { "false" });
+        }
+        types::array::ColumnArray::Int8 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Int16 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Int32 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Int64 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::UInt8 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::UInt16 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::UInt32 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::UInt64 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Float32 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Float64 { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Decimal { data, .. } if scale > 0 => {
+            append_decimal_scaled(line, data[row], scale);
+        }
+        types::array::ColumnArray::Decimal { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Date { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Time { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Timestamp { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::Interval { data, .. } => {
+            let _ = write!(line, "{}", data[row]);
+        }
+        types::array::ColumnArray::VarChar { data, .. } => line.push_str(&data[row]),
+        types::array::ColumnArray::Blob { data, .. } => {
+            let _ = write!(line, "{:?}", data[row]);
+        }
+        types::array::ColumnArray::Vector { data, .. } => {
+            let _ = write!(line, "{:?}", data[row]);
+        }
+    }
+}
+
+fn append_decimal_scaled(line: &mut String, value: i64, scale: i32) {
+    use std::fmt::Write as _;
+
+    let divisor = 10_i64.pow(scale as u32);
+    let sign = if value < 0 { "-" } else { "" };
+    let abs = value.abs();
+    let _ = write!(
+        line,
+        "{}{}.{:0width$}",
+        sign,
+        abs / divisor,
+        abs % divisor,
+        width = scale as usize
+    );
 }

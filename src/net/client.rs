@@ -427,8 +427,10 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
         });
     }
 
-    let mut col_builders: Vec<Vec<ScalarValue>> = (0..schema.columns.len())
-        .map(|_| Vec::with_capacity(row_count))
+    let mut arrays: Vec<ColumnArray> = schema
+        .columns
+        .iter()
+        .map(|col| ColumnArray::empty(col.data_type))
         .collect();
 
     for _ in 0..row_count {
@@ -440,21 +442,16 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
             offset += 1;
 
             let dt = schema.columns[col_idx].data_type;
-            if is_null {
-                col_builders[col_idx].push(ScalarValue::null_for_type(dt));
+            let value = if is_null {
+                ScalarValue::null_for_type(dt)
             } else {
                 let scale = schema.columns[col_idx].scale;
                 let (val, consumed) = read_scalar_value(&payload[offset..], dt, scale)?;
-                col_builders[col_idx].push(val);
                 offset += consumed;
-            }
+                val
+            };
+            arrays[col_idx].push(&value)?;
         }
-    }
-
-    let mut arrays = Vec::with_capacity(schema.columns.len());
-    for (col_idx, builder) in col_builders.into_iter().enumerate() {
-        let dt = schema.columns[col_idx].data_type;
-        arrays.push(ColumnArray::from_scalar_values(dt, &builder)?);
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
