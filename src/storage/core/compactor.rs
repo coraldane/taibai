@@ -19,7 +19,6 @@ use crate::types::scalar::ScalarValue;
 
 const COMPACT_ROW_GROUP_SIZE: usize = 262_144;
 const WRITE_GATHER_CHUNK_ROWS: usize = COMPACT_ROW_GROUP_SIZE;
-const ROW_GROUP_CACHE_CAPACITY: usize = 8;
 const PARALLEL_SORT_THRESHOLD: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -222,7 +221,14 @@ impl Compactor {
     ) -> Result<()> {
         let mut writer = SegmentWriter::create(path, schema.clone(), COMPACT_ROW_GROUP_SIZE)?;
         let mut rows_written = 0usize;
-        let mut row_group_cache = RowGroupCache::new(ROW_GROUP_CACHE_CAPACITY);
+        let mut row_group_cache = RowGroupCache::new(source_row_groups.len());
+
+        tracing::info!(
+            source_row_groups = source_row_groups.len(),
+            cache_capacity = row_group_cache.capacity(),
+            chunk_rows = WRITE_GATHER_CHUNK_ROWS,
+            "compact write using decoded row group cache"
+        );
 
         for chunk in row_refs.chunks(WRITE_GATHER_CHUNK_ROWS) {
             let batch =
@@ -237,6 +243,14 @@ impl Compactor {
                 );
             }
         }
+
+        tracing::info!(
+            rows_written,
+            cache_hits = row_group_cache.hits(),
+            cache_misses = row_group_cache.misses(),
+            cached_row_groups = row_group_cache.len(),
+            "compact write gathered sorted rows"
+        );
 
         writer.seal()
     }
@@ -302,6 +316,8 @@ struct RowGroupCache {
     capacity: usize,
     batches: HashMap<(PathBuf, usize), RecordBatch>,
     order: VecDeque<(PathBuf, usize)>,
+    hits: usize,
+    misses: usize,
 }
 
 impl RowGroupCache {
@@ -310,7 +326,25 @@ impl RowGroupCache {
             capacity: capacity.max(1),
             batches: HashMap::new(),
             order: VecDeque::new(),
+            hits: 0,
+            misses: 0,
         }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn len(&self) -> usize {
+        self.batches.len()
+    }
+
+    fn hits(&self) -> usize {
+        self.hits
+    }
+
+    fn misses(&self) -> usize {
+        self.misses
     }
 
     fn get(
@@ -320,10 +354,12 @@ impl RowGroupCache {
     ) -> Result<&RecordBatch> {
         let key = (source.segment_path.clone(), source.row_group_idx);
         if self.batches.contains_key(&key) {
+            self.hits += 1;
             self.touch(&key);
             return Ok(self.batches.get(&key).unwrap());
         }
 
+        self.misses += 1;
         let reader = segment_mgr.open_reader(&source.segment_path)?;
         let batch = reader.read_row_group(source.row_group_idx)?;
         self.batches.insert(key.clone(), batch);
