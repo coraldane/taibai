@@ -199,21 +199,21 @@ mod tests {
         ];
         let mut meta = TableMeta::new(
             "main",
-            "stock_tick_multi",
+            "test_table",
             vec![
-                ColumnDef::new("security_id", DataType::VarChar),
-                ColumnDef::new("deal_date", DataType::Int32),
+                ColumnDef::new("name", DataType::VarChar),
+                ColumnDef::new("region_id", DataType::Int32),
             ],
         );
         meta.partition_type = PartitionType::Value;
         meta.partition_key = "DEAL_DATE".to_string();
 
-        let mut spec = ScanSpec::new("stock_tick_multi");
+        let mut spec = ScanSpec::new("test_table");
         spec.partition_info = Some(PartitionScanInfo {
             time_range: None,
             partition_filter: Some(PartitionFilter {
-                column: "security_id".to_string(),
-                values: vec![ScalarValue::VarChar(Some("688256.SH".to_string()))],
+                column: "name".to_string(),
+                values: vec![ScalarValue::VarChar(Some("alice".to_string()))],
             }),
             partition_key_col_idx: meta.get_partition_column_index(),
             is_partitioned: true,

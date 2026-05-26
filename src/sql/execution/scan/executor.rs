@@ -102,6 +102,7 @@ impl<'a> ScanExecutor<'a> {
             let mgr = self.engine.segment_mgr();
 
             let use_predicate_first = self.should_use_predicate_first();
+            let cluster_key_bounds = self.cluster_key_bounds();
             let predicate_cols = self.compute_predicate_columns();
             let projection_cols = self.compute_projection_columns();
 
@@ -139,7 +140,45 @@ impl<'a> ScanExecutor<'a> {
                     stats_entry.row_groups_read += prune_result.candidate_indices.len() as u64;
                 }
 
-                if use_predicate_first && !predicate_cols.is_empty() && !projection_cols.is_empty()
+                if let Some(bounds) = cluster_key_bounds.as_ref() {
+                    use rayon::prelude::*;
+
+                    let mut rg_batches: Vec<(usize, RecordBatch)> = prune_result
+                        .candidate_indices
+                        .par_iter()
+                        .enumerate()
+                        .filter_map(|(pos, rg_idx)| {
+                            row_filter::cluster_key_range_read(
+                                &reader,
+                                *rg_idx,
+                                bounds,
+                                &projection_cols,
+                                &predicate_cols,
+                                &self.spec.eq_predicates,
+                                &self.spec.range_predicates,
+                                &self.spec.in_predicates,
+                                self.spec.remaining_predicate.as_ref(),
+                            )
+                            .ok()
+                            .filter(|batch| batch.num_rows() > 0)
+                            .map(|batch| (pos, batch))
+                        })
+                        .collect();
+                    rg_batches.sort_by_key(|(pos, _)| *pos);
+
+                    let rows_scanned = rg_batches
+                        .iter()
+                        .map(|(_, batch)| batch.num_rows() as u64)
+                        .sum::<u64>();
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        s.entry(self.spec.table_name.clone())
+                            .or_default()
+                            .rows_scanned += rows_scanned;
+                    }
+                    batches.extend(rg_batches.into_iter().map(|(_, batch)| batch));
+                } else if use_predicate_first
+                    && !predicate_cols.is_empty()
+                    && !projection_cols.is_empty()
                 {
                     use rayon::prelude::*;
 
@@ -279,6 +318,99 @@ impl<'a> ScanExecutor<'a> {
             Some(p) => p.clone(),
             None => (0..self.table_schema.num_columns()).collect(),
         }
+    }
+
+    fn cluster_key_bounds(&self) -> Option<row_filter::ClusterKeyBounds> {
+        let cluster_key = self.spec.cluster_key.as_ref()?;
+        let key_col = cluster_key.first()?;
+        let key_col_idx = self.table_schema.index_of(key_col)?;
+
+        if let Some(value) = self.spec.eq_value_for_column(key_col_idx) {
+            return Some(row_filter::ClusterKeyBounds {
+                column_index: key_col_idx,
+                lower: Some((value.clone(), true)),
+                upper: Some((value.clone(), true)),
+            });
+        }
+
+        let mut lower: Option<(crate::types::scalar::ScalarValue, bool)> = None;
+        let mut upper: Option<(crate::types::scalar::ScalarValue, bool)> = None;
+        for clause in &self.spec.range_predicates {
+            if clause.column_index != key_col_idx {
+                continue;
+            }
+            match clause.op {
+                crate::storage::partition::pruning::RangeOp::Eq => {
+                    return Some(row_filter::ClusterKeyBounds {
+                        column_index: key_col_idx,
+                        lower: Some((clause.value.clone(), true)),
+                        upper: Some((clause.value.clone(), true)),
+                    });
+                }
+                crate::storage::partition::pruning::RangeOp::Gt => {
+                    set_tighter_lower(&mut lower, clause.value.clone(), false);
+                }
+                crate::storage::partition::pruning::RangeOp::Ge => {
+                    set_tighter_lower(&mut lower, clause.value.clone(), true);
+                }
+                crate::storage::partition::pruning::RangeOp::Lt => {
+                    set_tighter_upper(&mut upper, clause.value.clone(), false);
+                }
+                crate::storage::partition::pruning::RangeOp::Le => {
+                    set_tighter_upper(&mut upper, clause.value.clone(), true);
+                }
+            }
+        }
+
+        if lower.is_some() || upper.is_some() {
+            Some(row_filter::ClusterKeyBounds {
+                column_index: key_col_idx,
+                lower,
+                upper,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+fn set_tighter_lower(
+    current: &mut Option<(crate::types::scalar::ScalarValue, bool)>,
+    candidate: crate::types::scalar::ScalarValue,
+    inclusive: bool,
+) {
+    let replace = match current {
+        Some((value, current_inclusive)) => {
+            match crate::storage::index::sort_key::compare_scalars_for_sort(&candidate, value) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => !inclusive && *current_inclusive,
+                std::cmp::Ordering::Less => false,
+            }
+        }
+        None => true,
+    };
+    if replace {
+        *current = Some((candidate, inclusive));
+    }
+}
+
+fn set_tighter_upper(
+    current: &mut Option<(crate::types::scalar::ScalarValue, bool)>,
+    candidate: crate::types::scalar::ScalarValue,
+    inclusive: bool,
+) {
+    let replace = match current {
+        Some((value, current_inclusive)) => {
+            match crate::storage::index::sort_key::compare_scalars_for_sort(&candidate, value) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => !inclusive && *current_inclusive,
+                std::cmp::Ordering::Greater => false,
+            }
+        }
+        None => true,
+    };
+    if replace {
+        *current = Some((candidate, inclusive));
     }
 }
 

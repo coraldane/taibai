@@ -860,8 +860,16 @@ pub fn exec_optimize_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
         engine.data_dir().to_path_buf(),
     );
 
-    compactor.optimize_table(db, table, &table_meta)?;
+    let stats = compactor.optimize_table(db, table, &table_meta)?;
 
-    tracing::info!(db, table, "OPTIMIZE TABLE executed");
-    Ok(ExecResult::Ok { rows_affected: 0 })
+    tracing::info!(
+        db,
+        table,
+        rows_written = stats.rows_written,
+        rows_dropped = stats.rows_dropped,
+        "OPTIMIZE TABLE executed"
+    );
+    Ok(ExecResult::Ok {
+        rows_affected: stats.rows_written,
+    })
 }

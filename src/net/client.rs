@@ -726,13 +726,13 @@ mod tests {
     fn parses_scaled_decimal_without_misaligning_following_varchar() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&2u32.to_le_bytes());
-        write_column_meta(&mut payload, "security_id", DataType::VarChar, 0);
-        write_column_meta(&mut payload, "pre_close", DataType::Decimal, 2);
+        write_column_meta(&mut payload, "name", DataType::VarChar, 0);
+        write_column_meta(&mut payload, "score", DataType::Decimal, 2);
         payload.extend_from_slice(&2u32.to_le_bytes());
 
-        write_varchar_cell(&mut payload, "688256.SH");
+        write_varchar_cell(&mut payload, "alice");
         write_decimal_cell(&mut payload, "12.34");
-        write_varchar_cell(&mut payload, "688257.SH");
+        write_varchar_cell(&mut payload, "dave");
         write_decimal_cell(&mut payload, "0");
 
         let result = parse_text_result(&payload).unwrap();
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(schema.columns[1].scale, 2);
         assert_eq!(
             batches[0].scalar(0, 0).unwrap(),
-            ScalarValue::VarChar(Some("688256.SH".into()))
+            ScalarValue::VarChar(Some("alice".into()))
         );
         assert_eq!(
             batches[0].scalar(0, 1).unwrap(),
@@ -751,7 +751,7 @@ mod tests {
         );
         assert_eq!(
             batches[0].scalar(1, 0).unwrap(),
-            ScalarValue::VarChar(Some("688257.SH".into()))
+            ScalarValue::VarChar(Some("dave".into()))
         );
         assert_eq!(
             batches[0].scalar(1, 1).unwrap(),
