@@ -600,14 +600,19 @@ impl SegmentReader {
                     if !zm.contains(value) {
                         continue;
                     }
+                    if zm.min_value == *value && zm.max_value == *value && !bitmap_active {
+                        total_count += zm.row_count - zm.null_count;
+                        continue;
+                    }
                 }
             }
 
-            let col = self.read_column(rg_idx, column_idx)?;
-            let mask = col.eq_vec(value);
-            let mut match_count = mask.iter().filter(|&&m| m).count() as u64;
-
-            if bitmap_active {
+            let match_count = if bitmap_active {
+                let col = self.read_column(rg_idx, column_idx)?;
+                let raw_count = col.count_eq(value);
+                if raw_count == 0 {
+                    continue;
+                }
                 let rg_start_row = self
                     .footer
                     .row_groups
@@ -615,17 +620,39 @@ impl SegmentReader {
                     .take(rg_idx)
                     .map(|r| r.row_count)
                     .sum::<u64>();
-                for (i, &matched) in mask.iter().enumerate() {
-                    if matched && self.is_row_deleted(rg_start_row + i as u64) {
-                        match_count -= 1;
-                    }
-                }
-            }
+                let deleted = col.count_eq_deleted(value, rg_start_row, &self.footer.delete_bitmap);
+                raw_count.saturating_sub(deleted)
+            } else {
+                self.count_eq_raw(rg_idx, column_idx, value)?
+            };
 
             total_count += match_count;
         }
 
         Ok(total_count)
+    }
+
+    fn count_eq_raw(&self, row_group: usize, column_idx: usize, value: &ScalarValue) -> Result<u64> {
+        let rg = &self.footer.row_groups[row_group];
+        let col_def = &self.footer.schema.columns[column_idx];
+
+        let mut col_offset = rg.offset as usize;
+        for i in 0..column_idx {
+            col_offset += rg.column_compressed_sizes[i] as usize;
+        }
+        let col_len = rg.column_compressed_sizes[column_idx] as usize;
+
+        let compressed = &self.mmap[col_offset..col_offset + col_len];
+
+        let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
+            .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
+
+        crate::storage::codec::encoding::count_eq_from_raw(
+            &decompressed,
+            rg.row_count as usize,
+            col_def,
+            value,
+        )
     }
 }
 

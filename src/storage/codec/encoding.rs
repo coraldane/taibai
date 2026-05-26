@@ -899,6 +899,397 @@ fn project_column(col: &ColumnArray, selected_rows: &[usize]) -> Result<ColumnAr
     Ok(out)
 }
 
+pub fn count_eq_from_raw(data: &[u8], row_count: usize, col_def: &ColumnDef, value: &ScalarValue) -> Result<u64> {
+    let mut cursor = Cursor::new(data);
+    let bitmap_len = read_u32_le(&mut cursor)? as usize;
+    let mut bitmap_data = vec![0u8; bitmap_len];
+    cursor.read_exact(&mut bitmap_data)?;
+    let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
+
+    let remaining = &data[4 + bitmap_len..];
+
+    if remaining.starts_with(COLUMN_ENCODING_MAGIC) {
+        return count_eq_adaptive(remaining, row_count, col_def, &bitmap, value);
+    }
+
+    let count = match (&col_def.data_type, value) {
+        (DataType::Int64, ScalarValue::Int64(Some(v))) => {
+            count_eq_fixed_le8(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::Int32, ScalarValue::Int32(Some(v))) => {
+            count_eq_fixed_le4(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::Int16, ScalarValue::Int16(Some(v))) => {
+            count_eq_fixed_le2(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::Int8, ScalarValue::Int8(Some(v))) => {
+            count_eq_fixed_le1(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::UInt64, ScalarValue::UInt64(Some(v))) => {
+            count_eq_fixed_le8(&remaining, &bitmap, row_count, *v as i64)
+        }
+        (DataType::UInt32, ScalarValue::UInt32(Some(v))) => {
+            count_eq_fixed_le4(&remaining, &bitmap, row_count, *v as i32)
+        }
+        (DataType::UInt16, ScalarValue::UInt16(Some(v))) => {
+            count_eq_fixed_le2(&remaining, &bitmap, row_count, *v as i16)
+        }
+        (DataType::UInt8, ScalarValue::UInt8(Some(v))) => {
+            count_eq_fixed_le1(&remaining, &bitmap, row_count, *v as i8)
+        }
+        (DataType::Float64, ScalarValue::Float64(Some(v))) => {
+            count_eq_fixed_le8f(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::Float32, ScalarValue::Float32(Some(v))) => {
+            count_eq_fixed_le4f(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::Decimal, ScalarValue::Decimal(Some(v))) => {
+            count_eq_fixed_le8(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::Date, ScalarValue::Date(Some(v))) => {
+            count_eq_fixed_le4(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::Timestamp, ScalarValue::Timestamp(Some(v))) => {
+            count_eq_fixed_le8(&remaining, &bitmap, row_count, *v)
+        }
+        (DataType::VarChar, ScalarValue::VarChar(Some(v))) => {
+            count_eq_varchar(&remaining, &bitmap, row_count, v)
+        }
+        _ => return Ok(0),
+    };
+
+    Ok(count)
+}
+
+fn count_eq_fixed_le8(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i64) -> u64 {
+    let mut count: u64 = 0;
+    let mut offset = 0usize;
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if offset + 8 > data.len() {
+            break;
+        }
+        let val = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        if val == target {
+            count += 1;
+        }
+        offset += 8;
+    }
+    count
+}
+
+fn count_eq_fixed_le4(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i32) -> u64 {
+    let mut count: u64 = 0;
+    let mut offset = 0usize;
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if offset + 4 > data.len() {
+            break;
+        }
+        let val = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        if val == target {
+            count += 1;
+        }
+        offset += 4;
+    }
+    count
+}
+
+fn count_eq_fixed_le2(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i16) -> u64 {
+    let mut count: u64 = 0;
+    let mut offset = 0usize;
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if offset + 2 > data.len() {
+            break;
+        }
+        let val = i16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
+        if val == target {
+            count += 1;
+        }
+        offset += 2;
+    }
+    count
+}
+
+fn count_eq_fixed_le1(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i8) -> u64 {
+    let mut count: u64 = 0;
+    let mut offset = 0usize;
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if offset + 1 > data.len() {
+            break;
+        }
+        if data[offset] as i8 == target {
+            count += 1;
+        }
+        offset += 1;
+    }
+    count
+}
+
+fn count_eq_fixed_le8f(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: f64) -> u64 {
+    let mut count: u64 = 0;
+    let mut offset = 0usize;
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if offset + 8 > data.len() {
+            break;
+        }
+        let val = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        if val == target {
+            count += 1;
+        }
+        offset += 8;
+    }
+    count
+}
+
+fn count_eq_fixed_le4f(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: f32) -> u64 {
+    let mut count: u64 = 0;
+    let mut offset = 0usize;
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if offset + 4 > data.len() {
+            break;
+        }
+        let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        if val == target {
+            count += 1;
+        }
+        offset += 4;
+    }
+    count
+}
+
+fn count_eq_varchar(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: &str) -> u64 {
+    let target_bytes = target.as_bytes();
+    let mut count: u64 = 0;
+    let mut pos = 0usize;
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if pos + 4 > data.len() {
+            break;
+        }
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + len > data.len() {
+            break;
+        }
+        if &data[pos..pos + len] == target_bytes {
+            count += 1;
+        }
+        pos += len;
+    }
+    count
+}
+
+fn count_eq_adaptive(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: &NullBitmap,
+    value: &ScalarValue,
+) -> Result<u64> {
+    if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
+        return Err(MonaxError::Storage("adaptive column header truncated".into()));
+    }
+    let encoding = EncodingType::from_u8(data[COLUMN_ENCODING_MAGIC.len()])?;
+    let payload = &data[COLUMN_ENCODING_MAGIC.len() + 1..];
+
+    match encoding {
+        EncodingType::Rle => count_eq_rle_raw(payload, row_count, col_def, bitmap, value),
+        EncodingType::Delta => {
+            let values = decode_i64_delta_payload(payload)?;
+            count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
+        }
+        EncodingType::Dictionary if col_def.data_type == DataType::VarChar => {
+            count_eq_varchar_dictionary(payload, row_count, bitmap, value)
+        }
+        other => Err(MonaxError::Storage(format!(
+            "unsupported adaptive column encoding {:?} for count_eq",
+            other
+        ))),
+    }
+}
+
+fn count_eq_rle_raw(
+    payload: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: &NullBitmap,
+    value: &ScalarValue,
+) -> Result<u64> {
+    let target = match extract_i64_from_scalar(value) {
+        Some(t) => t,
+        None => return Ok(0),
+    };
+
+    if !is_numeric_type(&col_def.data_type) {
+        return Ok(0);
+    }
+
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut runs = Vec::with_capacity(run_count);
+    for _ in 0..run_count {
+        let mut value_buf = [0u8; 8];
+        cursor.read_exact(&mut value_buf)?;
+        let val = i64::from_le_bytes(value_buf);
+        let len = read_u32_le(&mut cursor)? as usize;
+        runs.push((val, len));
+    }
+
+    let mut count: u64 = 0;
+    let mut row = 0usize;
+    for (val, len) in &runs {
+        for _ in 0..*len {
+            if row >= row_count {
+                break;
+            }
+            if !bitmap.is_null(row) && *val == target {
+                count += 1;
+            }
+            row += 1;
+        }
+    }
+
+    Ok(count)
+}
+
+fn count_eq_numeric_from_i64(
+    values: &[i64],
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: &NullBitmap,
+    value: &ScalarValue,
+) -> Result<u64> {
+    let target = match extract_i64_from_scalar(value) {
+        Some(t) => t,
+        None => return Ok(0),
+    };
+
+    if !is_numeric_type(&col_def.data_type) {
+        return Ok(0);
+    }
+
+    let mut count: u64 = 0;
+    let mut val_pos = 0usize;
+
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if val_pos < values.len() && values[val_pos] == target {
+            count += 1;
+        }
+        val_pos += 1;
+    }
+
+    Ok(count)
+}
+
+fn count_eq_varchar_dictionary(
+    payload: &[u8],
+    row_count: usize,
+    bitmap: &NullBitmap,
+    value: &ScalarValue,
+) -> Result<u64> {
+    let target_str = match value {
+        ScalarValue::VarChar(Some(s)) => s.as_str(),
+        _ => return Ok(0),
+    };
+
+    let mut cursor = Cursor::new(payload);
+    let dict_count = read_u32_le(&mut cursor)? as usize;
+    let mut dict = Vec::with_capacity(dict_count);
+    for _ in 0..dict_count {
+        let len = read_u32_le(&mut cursor)? as usize;
+        let mut bytes = vec![0u8; len];
+        cursor.read_exact(&mut bytes)?;
+        dict.push(String::from_utf8_lossy(&bytes).into_owned());
+    }
+
+    let mut match_dict_idx: Option<u32> = None;
+    for (idx, entry) in dict.iter().enumerate() {
+        if entry == target_str {
+            match_dict_idx = Some(idx as u32);
+            break;
+        }
+    }
+
+    let index_count = read_u32_le(&mut cursor)? as usize;
+    let mut count: u64 = 0;
+    let mut val_pos = 0usize;
+
+    for i in 0..row_count {
+        if bitmap.is_null(i) {
+            continue;
+        }
+        if val_pos < index_count {
+            let idx = read_u32_le(&mut cursor).unwrap_or(u32::MAX);
+            if let Some(target_idx) = match_dict_idx {
+                if idx == target_idx {
+                    count += 1;
+                }
+            }
+        }
+        val_pos += 1;
+    }
+
+    Ok(count)
+}
+
+fn extract_i64_from_scalar(value: &ScalarValue) -> Option<i64> {
+    match value {
+        ScalarValue::Int64(Some(v)) => Some(*v),
+        ScalarValue::Int32(Some(v)) => Some(*v as i64),
+        ScalarValue::Int16(Some(v)) => Some(*v as i64),
+        ScalarValue::Int8(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt64(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt32(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt16(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt8(Some(v)) => Some(*v as i64),
+        ScalarValue::Decimal(Some(v)) => Some(*v),
+        ScalarValue::Date(Some(v)) => Some(*v as i64),
+        ScalarValue::Timestamp(Some(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+fn is_numeric_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Decimal
+            | DataType::Date
+            | DataType::Timestamp
+            | DataType::Time
+            | DataType::Interval
+    )
+}
+
 pub fn decode_column_selected(
     data: &[u8],
     row_count: usize,

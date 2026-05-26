@@ -666,6 +666,102 @@ mod tests {
 }
 
 impl ColumnArray {
+    pub fn count_eq(&self, value: &ScalarValue) -> u64 {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        match (self, value) {
+            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::Int16 { data, .. }, ScalarValue::Int16(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::Int8 { data, .. }, ScalarValue::Int8(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::UInt64 { data, .. }, ScalarValue::UInt64(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::UInt32 { data, .. }, ScalarValue::UInt32(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::UInt16 { data, .. }, ScalarValue::UInt16(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::UInt8 { data, .. }, ScalarValue::UInt8(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::Float64 { data, .. }, ScalarValue::Float64(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::Float32 { data, .. }, ScalarValue::Float32(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::Decimal { data, .. }, ScalarValue::Decimal(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::Date { data, .. }, ScalarValue::Date(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            (ColumnArray::Timestamp { data, .. }, ScalarValue::Timestamp(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count() as u64,
+            _ => 0,
+        }
+    }
+
+    pub fn count_eq_deleted(&self, value: &ScalarValue, rg_start_row: u64, delete_bitmap: &[u8]) -> u64 {
+        let num_rows = self.len();
+        let bitmap = self.bitmap();
+        let mut deleted_count: u64 = 0;
+        match (self, value) {
+            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
+                for i in 0..num_rows {
+                    if !bitmap.is_null(i) && data[i] == *v {
+                        let row_id = rg_start_row + i as u64;
+                        let byte = (row_id / 8) as usize;
+                        let bit = (row_id % 8) as u8;
+                        if delete_bitmap.get(byte).map_or(false, |b| (b & (1u8 << bit)) != 0) {
+                            deleted_count += 1;
+                        }
+                    }
+                }
+            }
+            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
+                for i in 0..num_rows {
+                    if !bitmap.is_null(i) && data[i] == *v {
+                        let row_id = rg_start_row + i as u64;
+                        let byte = (row_id / 8) as usize;
+                        let bit = (row_id % 8) as u8;
+                        if delete_bitmap.get(byte).map_or(false, |b| (b & (1u8 << bit)) != 0) {
+                            deleted_count += 1;
+                        }
+                    }
+                }
+            }
+            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
+                for i in 0..num_rows {
+                    if !bitmap.is_null(i) && data[i] == *v {
+                        let row_id = rg_start_row + i as u64;
+                        let byte = (row_id / 8) as usize;
+                        let bit = (row_id % 8) as u8;
+                        if delete_bitmap.get(byte).map_or(false, |b| (b & (1u8 << bit)) != 0) {
+                            deleted_count += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        deleted_count
+    }
+
     pub fn eq_vec(&self, value: &ScalarValue) -> Vec<bool> {
         let num_rows = self.len();
         let bitmap = self.bitmap();
