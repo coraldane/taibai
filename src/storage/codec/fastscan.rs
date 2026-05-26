@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ScanStats, ZoneMap};
 use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
@@ -472,7 +473,7 @@ impl FastScanEQ {
         true
     }
 
-    pub fn can_use_binary_search(&self, batch: &RecordBatch, key_indices: &[usize]) -> bool {
+    pub fn can_use_binary_search(&self, _batch: &RecordBatch, key_indices: &[usize]) -> bool {
         if self.value.is_null() {
             return false;
         }

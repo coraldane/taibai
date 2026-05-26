@@ -1,9 +1,10 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::Result;
 use crate::types::batch::{RecordBatch, Schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

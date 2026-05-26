@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub const SEGMENT_MAGIC: u32 = 0x5441_4958;
 pub const SEGMENT_VERSION: u32 = 1;
 pub const DEFAULT_ROW_GROUP_SIZE: usize = 8192;

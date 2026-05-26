@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -499,7 +500,7 @@ impl SegmentManager {
         partition_key: &str,
         min_seal_size: u64,
     ) -> Result<Option<(PathBuf, Schema, u64)>> {
-        let pattern = format!("p{}_*", partition_key);
+        let _pattern = format!("p{}_*", partition_key);
         let segments: Vec<PathBuf> = if let Ok(entries) = std::fs::read_dir(table_dir) {
             entries
                 .filter_map(|e| e.ok())
@@ -701,7 +702,7 @@ impl SegmentManager {
         &self,
         db: &str,
         payload: &[u8],
-        disable_wal: bool,
+        _disable_wal: bool,
         catalogs: &crate::storage::catalog::schema::DatabaseCatalog,
     ) -> Result<u64> {
         use rayon::prelude::*;

@@ -94,7 +94,7 @@ pub fn prune_segments_by_partition(
 fn extract_partition_eq_value(
     spec: &ScanSpec,
     pi: &PartitionScanInfo,
-    meta: &TableMeta,
+    _meta: &TableMeta,
 ) -> Option<String> {
     let pk_idx = pi.partition_key_col_idx?;
     let val = spec.eq_value_for_column(pk_idx)?;
@@ -158,6 +158,7 @@ fn filter_by_partition_values(
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn extract_partition_key_from_in_predicate(
     spec: &ScanSpec,
     pi: &PartitionScanInfo,

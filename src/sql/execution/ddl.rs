@@ -3,9 +3,8 @@ use std::collections::HashMap;
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{
-    AuthManager, Permission, PermissionObjectType, PermissionType,
+    Permission, PermissionObjectType, PermissionType,
 };
-use crate::storage::catalog::auto_increment::AutoIncrementManager;
 use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -612,7 +611,7 @@ fn get_or_create_catalog<'a>(
     Ok(catalogs.get_mut(db).unwrap())
 }
 
-use crate::sql::parser::ast::{AlterUserOperation, OrderByItem, Statement};
+use crate::sql::parser::ast::AlterUserOperation;
 
 pub fn exec_alter_user(
     engine: &Engine,
@@ -786,7 +785,7 @@ pub fn exec_show_stats(engine: &Engine, db: &str) -> Result<ExecResult> {
     })
 }
 
-pub fn exec_show_engines(engine: &Engine) -> Result<ExecResult> {
+pub fn exec_show_engines(_engine: &Engine) -> Result<ExecResult> {
     let schema = Schema::new(vec![
         ColumnDef::new("Engine", DataType::VarChar),
         ColumnDef::new("Support", DataType::VarChar),
@@ -813,7 +812,7 @@ pub fn exec_show_engines(engine: &Engine) -> Result<ExecResult> {
     })
 }
 
-pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> {
+pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult> {
     let schema = Schema::new(vec![
         ColumnDef::new("Id", DataType::Int64),
         ColumnDef::new("User", DataType::VarChar),
@@ -832,7 +831,7 @@ pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> 
 
 pub fn exec_flush_table(engine: &Engine, db: &str, table: &Option<String>) -> Result<ExecResult> {
     if let Some(table_name) = table {
-        let table_dir = engine.data_dir().join(db).join(table_name);
+        let _table_dir = engine.data_dir().join(db).join(table_name);
         engine.segment_mgr().flush_all_active()?;
         tracing::info!(db, table = table_name, "FLUSH TABLE executed");
     } else {

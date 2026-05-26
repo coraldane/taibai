@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+
+#![allow(dead_code)]
 
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
 use crate::sql::planner::{LogicalExpr, LogicalPlan, TimeRange};

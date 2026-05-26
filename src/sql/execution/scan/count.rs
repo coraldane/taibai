@@ -128,7 +128,7 @@ fn count_with_predicates(
     mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<()> {
     let filter_columns = spec.all_predicate_columns();
-    let projection = if filter_columns.is_empty() {
+    let _projection = if filter_columns.is_empty() {
         None
     } else {
         Some(filter_columns.as_slice())

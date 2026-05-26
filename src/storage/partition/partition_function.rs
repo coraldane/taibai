@@ -95,7 +95,7 @@ pub fn compute_partition_key_from_bulk_payload(
     req: &DirectBulkRequest<'_>,
     table_meta: &TableMeta,
 ) -> Result<String> {
-    let col_idx = match table_meta.get_partition_column_index_cached() {
+    let _col_idx = match table_meta.get_partition_column_index_cached() {
         Some(idx) => idx,
         None => return Ok(String::new()),
     };

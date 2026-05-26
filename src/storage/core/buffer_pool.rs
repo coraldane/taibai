@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;

@@ -1,7 +1,8 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -100,7 +101,7 @@ impl UserInfo {
             p.permission_type == perm_type
                 && (p.object_type == PermissionObjectType::Global
                     || (p.object_type == object_type && p.object_name == object_name))
-        }) || self.roles.iter().any(|role_name| false)
+        }) || self.roles.iter().any(|_role_name| false)
     }
 }
 

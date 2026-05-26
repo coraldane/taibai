@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use std::fs;
@@ -410,7 +411,7 @@ impl SegmentReader {
         }
 
         let mut selected_columns = Vec::with_capacity(column_indices.len());
-        for (i, &col_idx) in column_indices.iter().enumerate() {
+        for (i, &_col_idx) in column_indices.iter().enumerate() {
             if let Some(col) = batch.column(i) {
                 let scalar = col.scalar(local_row_idx);
                 let mut single_col = ColumnArray::empty(col.data_type());
@@ -480,7 +481,7 @@ impl SegmentReader {
         &self,
         batch_size: usize,
         predicate: Option<&RowGroupPredicate>,
-        mut stats: Option<&mut ScanStats>,
+        stats: Option<&mut ScanStats>,
     ) -> Result<Vec<crate::types::batch::RecordBatch>> {
         self.scan_internal(batch_size, predicate, None, stats)
     }
@@ -490,7 +491,7 @@ impl SegmentReader {
         batch_size: usize,
         predicate: Option<&RowGroupPredicate>,
         projection: Option<&[usize]>,
-        mut stats: Option<&mut ScanStats>,
+        stats: Option<&mut ScanStats>,
     ) -> Result<Vec<crate::types::batch::RecordBatch>> {
         self.scan_internal(batch_size, predicate, projection, stats)
     }

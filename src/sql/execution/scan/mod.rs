@@ -7,4 +7,3 @@ pub mod row_group;
 pub mod spec;
 
 pub use executor::ScanExecutor;
-pub use spec::ScanSpec;

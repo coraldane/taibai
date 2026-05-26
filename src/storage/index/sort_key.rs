@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::common::error::Result;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;

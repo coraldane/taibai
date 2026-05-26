@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod aggregate;
 pub mod arithmetic;
 pub mod cast;

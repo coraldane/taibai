@@ -1,11 +1,9 @@
+#![allow(dead_code)]
 use std::sync::{Mutex, RwLock};
 
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::segment::ZoneMap;
 use crate::types::scalar::ScalarValue;
-
-const DEFAULT_EXPECTED_ITEMS: usize = 8192;
-const DEFAULT_FALSE_POSITIVE_RATE: f64 = 0.01;
 
 #[derive(Debug, Clone)]
 pub struct SparseBlock {

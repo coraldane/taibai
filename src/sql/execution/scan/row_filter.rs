@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::storage::codec::fastscan::{apply_filter_mask_fast, FastScanEQ};
 use crate::storage::partition::pruning::RangeOp;
 use crate::types::array::ColumnArray;

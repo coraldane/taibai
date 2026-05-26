@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::Result;
 use crate::storage::core::memtable::{MemTableManager, MemTableState};
-use crate::storage::core::wal::RecordType;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 
@@ -287,7 +287,7 @@ impl BatchWriter {
         segment_mgr: &Arc<SegmentManager>,
         mt: &Arc<crate::storage::core::memtable::MemTable>,
     ) -> Result<()> {
-        use crate::storage::core::memtable::MemTable;
+        
 
         if mt.state() != MemTableState::Pending {
             return Ok(());

@@ -1,6 +1,5 @@
 use crate::sql::parser::ast::{BinOp, JoinType};
 use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan, SemiJoinPlan};
-use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::Rule;
@@ -114,7 +113,7 @@ fn transform_expr_to_semi_join(expr: &LogicalExpr, input: &LogicalPlan) -> (Logi
     match expr {
         LogicalExpr::ExistsSubquery(subquery) => {
             if let LogicalPlan::Scan(scan) = input {
-                let semi = LogicalPlan::SemiJoin(SemiJoinPlan {
+                let _semi = LogicalPlan::SemiJoin(SemiJoinPlan {
                     left: Box::new(LogicalPlan::Scan(scan.clone())),
                     right: subquery.clone(),
                     condition: LogicalExpr::Literal(ScalarValue::Bool(Some(true))),
@@ -187,7 +186,7 @@ fn build_semi_join_from_in(
     }))
 }
 
-fn build_values_scan(values: &[ScalarValue]) -> LogicalPlan {
+fn build_values_scan(_values: &[ScalarValue]) -> LogicalPlan {
     LogicalPlan::Empty
 }
 

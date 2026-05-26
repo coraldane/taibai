@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 pub mod bloom_filter;
 pub mod column_pruning;
 pub mod cost;

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::common::error::{MonaxError, Result};
 
 /// SQL token types.

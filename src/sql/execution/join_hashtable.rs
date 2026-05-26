@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 /// Join Hash Table implementation inspired by DuckDB's columnar JoinHashTable.
 /// Uses a two-phase approach: Build (insert keys) -> Probe (lookup matches).
 /// Stores data in columnar format using RecordBatch for cache efficiency.

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
 use crate::common::error::Result;
@@ -368,7 +369,7 @@ fn decode_column_raw(
     num_rows: usize,
     null_bitmap: Option<&crate::types::bitmap::NullBitmap>,
 ) -> Result<()> {
-    use crate::common::error::MonaxError;
+    
     use crate::types::scalar::ScalarValue;
 
     let col = batch.column_mut(col_idx).unwrap();

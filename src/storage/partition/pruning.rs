@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::io::Cursor;
 
 use crate::storage::codec::encoding::decode_scalar_with_tag;

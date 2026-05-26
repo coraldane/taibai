@@ -332,6 +332,11 @@ fn can_push_topn_past_filter(topn: &TopNPlan, predicate: &LogicalExpr, scan: &Sc
 
 fn is_selective_predicate(expr: &LogicalExpr) -> bool {
     match expr {
+        LogicalExpr::BinaryOp {
+            op: crate::sql::parser::ast::BinOp::And,
+            left,
+            right,
+        } => is_selective_predicate(left) || is_selective_predicate(right),
         LogicalExpr::BinaryOp { op, .. } => {
             matches!(
                 op,
@@ -343,11 +348,6 @@ fn is_selective_predicate(expr: &LogicalExpr) -> bool {
         LogicalExpr::In { values, .. } => values.len() <= 100,
         LogicalExpr::Between { .. } => true,
         LogicalExpr::Like { .. } => false,
-        LogicalExpr::BinaryOp {
-            op: crate::sql::parser::ast::BinOp::And,
-            left,
-            right,
-        } => is_selective_predicate(left) || is_selective_predicate(right),
         _ => false,
     }
 }

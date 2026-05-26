@@ -15,7 +15,7 @@ pub fn prune_row_groups(
     predicate: &RowGroupPredicate,
     eq_checks: &[(usize, ScalarValue)],
     in_checks: &[&InPredicate],
-    segment_zone_maps: &[ZoneMap],
+    _segment_zone_maps: &[ZoneMap],
 ) -> RowGroupPruneResult {
     let num_rgs = reader.num_row_groups();
     let mut candidates = Vec::new();

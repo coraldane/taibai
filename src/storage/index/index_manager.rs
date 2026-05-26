@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -54,7 +55,7 @@ impl IndexManager {
         let mut current_row_id: i64 = 0;
         let mut block_data = Vec::new();
 
-        for (seg_idx, seg_path) in segments.iter().enumerate() {
+        for (_seg_idx, seg_path) in segments.iter().enumerate() {
             let reader = self.segment_mgr.open_reader(Path::new(seg_path))?;
 
             let num_row_groups = reader.num_row_groups();
