@@ -899,7 +899,37 @@ fn project_column(col: &ColumnArray, selected_rows: &[usize]) -> Result<ColumnAr
     Ok(out)
 }
 
-pub fn count_eq_from_raw(data: &[u8], row_count: usize, col_def: &ColumnDef, value: &ScalarValue) -> Result<u64> {
+pub fn selected_eq_rows_from_raw(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    value: &ScalarValue,
+) -> Result<Vec<usize>> {
+    let mut cursor = Cursor::new(data);
+    let bitmap_len = read_u32_le(&mut cursor)? as usize;
+    let mut bitmap_data = vec![0u8; bitmap_len];
+    cursor.read_exact(&mut bitmap_data)?;
+    let bitmap = NullBitmap::from_bytes(&bitmap_data, row_count);
+
+    let remaining = &data[4 + bitmap_len..];
+    if remaining.starts_with(COLUMN_ENCODING_MAGIC) {
+        return selected_eq_rows_adaptive(remaining, row_count, col_def, &bitmap, value);
+    }
+
+    match (&col_def.data_type, value) {
+        (DataType::VarChar, ScalarValue::VarChar(Some(v))) => {
+            selected_eq_rows_varchar(remaining, &bitmap, row_count, v.as_bytes())
+        }
+        _ => selected_eq_rows_fixed(remaining, &bitmap, row_count, col_def.data_type, value),
+    }
+}
+
+pub fn count_eq_from_raw(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    value: &ScalarValue,
+) -> Result<u64> {
     let mut cursor = Cursor::new(data);
     let bitmap_len = read_u32_le(&mut cursor)? as usize;
     let mut bitmap_data = vec![0u8; bitmap_len];
@@ -959,6 +989,207 @@ pub fn count_eq_from_raw(data: &[u8], row_count: usize, col_def: &ColumnDef, val
     };
 
     Ok(count)
+}
+
+fn selected_eq_rows_adaptive(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: &NullBitmap,
+    value: &ScalarValue,
+) -> Result<Vec<usize>> {
+    if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
+        return Err(MonaxError::Storage("adaptive column header truncated".into()));
+    }
+    let encoding = EncodingType::from_u8(data[COLUMN_ENCODING_MAGIC.len()])?;
+    let payload = &data[COLUMN_ENCODING_MAGIC.len() + 1..];
+
+    match encoding {
+        EncodingType::Dictionary if col_def.data_type == DataType::VarChar => {
+            let target = match value {
+                ScalarValue::VarChar(Some(s)) => s.as_bytes(),
+                _ => return Ok(Vec::new()),
+            };
+            selected_eq_rows_varchar_dictionary(payload, row_count, bitmap, target)
+        }
+        _ => {
+            let decoded = decode_adaptive_column(data, row_count, col_def, bitmap.clone())?;
+            Ok((0..decoded.len())
+                .filter(|&row| scalar_values_equal(&decoded.scalar(row), value))
+                .collect())
+        }
+    }
+}
+
+fn selected_eq_rows_varchar_dictionary(
+    payload: &[u8],
+    row_count: usize,
+    bitmap: &NullBitmap,
+    target: &[u8],
+) -> Result<Vec<usize>> {
+    let mut cursor = Cursor::new(payload);
+    let dict_count = read_u32_le(&mut cursor)? as usize;
+    let mut target_idx = None;
+    for idx in 0..dict_count {
+        let len = read_u32_le(&mut cursor)? as usize;
+        let start = cursor.position() as usize;
+        let end = start + len;
+        if end > payload.len() {
+            return Err(MonaxError::Storage("dictionary value truncated".into()));
+        }
+        if &payload[start..end] == target {
+            target_idx = Some(idx as u32);
+        }
+        cursor.set_position(end as u64);
+    }
+
+    let index_count = read_u32_le(&mut cursor)? as usize;
+    let Some(target_idx) = target_idx else {
+        return Ok(Vec::new());
+    };
+
+    let mut selected = Vec::new();
+    let mut value_pos = 0usize;
+    for row in 0..row_count {
+        if bitmap.is_null(row) {
+            continue;
+        }
+        if value_pos >= index_count {
+            break;
+        }
+        let idx = read_u32_le(&mut cursor)?;
+        if idx == target_idx {
+            selected.push(row);
+        }
+        value_pos += 1;
+    }
+    Ok(selected)
+}
+
+fn selected_eq_rows_varchar(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    target: &[u8],
+) -> Result<Vec<usize>> {
+    let mut selected = Vec::new();
+    let mut pos = 0usize;
+    for row in 0..row_count {
+        if bitmap.is_null(row) {
+            continue;
+        }
+        if pos + 4 > data.len() {
+            return Err(MonaxError::Storage(
+                "variable column length prefix truncated".into(),
+            ));
+        }
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let start = pos + 4;
+        let end = start + len;
+        if end > data.len() {
+            return Err(MonaxError::Storage(
+                "variable column selected value truncated".into(),
+            ));
+        }
+        if &data[start..end] == target {
+            selected.push(row);
+        }
+        pos = end;
+    }
+    Ok(selected)
+}
+
+fn selected_eq_rows_fixed(
+    data: &[u8],
+    bitmap: &NullBitmap,
+    row_count: usize,
+    data_type: DataType,
+    value: &ScalarValue,
+) -> Result<Vec<usize>> {
+    let Some(width) = data_type.fixed_size() else {
+        return Ok(Vec::new());
+    };
+    let mut selected = Vec::new();
+    let mut offset = 0usize;
+    for row in 0..row_count {
+        if bitmap.is_null(row) {
+            continue;
+        }
+        let end = offset + width;
+        if end > data.len() {
+            return Err(MonaxError::Storage(
+                "fixed column selected scan exceeds data".into(),
+            ));
+        }
+        if fixed_value_matches(&data[offset..end], data_type, value) {
+            selected.push(row);
+        }
+        offset = end;
+    }
+    Ok(selected)
+}
+
+fn fixed_value_matches(bytes: &[u8], data_type: DataType, value: &ScalarValue) -> bool {
+    match (data_type, value) {
+        (DataType::Bool, ScalarValue::Bool(Some(v))) => (bytes[0] != 0) == *v,
+        (DataType::Int8, ScalarValue::Int8(Some(v))) => bytes[0] as i8 == *v,
+        (DataType::UInt8, ScalarValue::UInt8(Some(v))) => bytes[0] == *v,
+        (DataType::Int16, ScalarValue::Int16(Some(v))) => {
+            i16::from_le_bytes(bytes[..2].try_into().unwrap()) == *v
+        }
+        (DataType::UInt16, ScalarValue::UInt16(Some(v))) => {
+            u16::from_le_bytes(bytes[..2].try_into().unwrap()) == *v
+        }
+        (DataType::Int32, ScalarValue::Int32(Some(v))) => {
+            i32::from_le_bytes(bytes[..4].try_into().unwrap()) == *v
+        }
+        (DataType::UInt32, ScalarValue::UInt32(Some(v))) => {
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()) == *v
+        }
+        (DataType::Int64, ScalarValue::Int64(Some(v)))
+        | (DataType::Time, ScalarValue::Time(Some(v)))
+        | (DataType::Timestamp, ScalarValue::Timestamp(Some(v)))
+        | (DataType::Interval, ScalarValue::Interval(Some(v)))
+        | (DataType::Decimal, ScalarValue::Decimal(Some(v))) => {
+            i64::from_le_bytes(bytes[..8].try_into().unwrap()) == *v
+        }
+        (DataType::UInt64, ScalarValue::UInt64(Some(v))) => {
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()) == *v
+        }
+        (DataType::Date, ScalarValue::Date(Some(v))) => {
+            i32::from_le_bytes(bytes[..4].try_into().unwrap()) == *v
+        }
+        (DataType::Float32, ScalarValue::Float32(Some(v))) => {
+            f32::from_le_bytes(bytes[..4].try_into().unwrap()) == *v
+        }
+        (DataType::Float64, ScalarValue::Float64(Some(v))) => {
+            f64::from_le_bytes(bytes[..8].try_into().unwrap()) == *v
+        }
+        _ => false,
+    }
+}
+
+fn scalar_values_equal(left: &ScalarValue, right: &ScalarValue) -> bool {
+    match (left, right) {
+        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => l == r,
+        (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => l == r,
+        (ScalarValue::Int16(Some(l)), ScalarValue::Int16(Some(r))) => l == r,
+        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l == r,
+        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l == r,
+        (ScalarValue::UInt8(Some(l)), ScalarValue::UInt8(Some(r))) => l == r,
+        (ScalarValue::UInt16(Some(l)), ScalarValue::UInt16(Some(r))) => l == r,
+        (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => l == r,
+        (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => l == r,
+        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => l == r,
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l == r,
+        (ScalarValue::Decimal(Some(l)), ScalarValue::Decimal(Some(r))) => l == r,
+        (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => l == r,
+        (ScalarValue::Time(Some(l)), ScalarValue::Time(Some(r))) => l == r,
+        (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => l == r,
+        (ScalarValue::Interval(Some(l)), ScalarValue::Interval(Some(r))) => l == r,
+        (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l == r,
+        _ => false,
+    }
 }
 
 fn count_eq_fixed_le8(data: &[u8], bitmap: &NullBitmap, row_count: usize, target: i64) -> u64 {

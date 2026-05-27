@@ -1,5 +1,5 @@
-use crate::protocol::types::DataType;
-use crate::types::batch::RecordBatch;
+use crate::types::array::ColumnArray;
+use crate::types::batch::{RecordBatch, Schema};
 
 /// Binary query result encoder for MsgTypeBinaryQueryResult (0x24).
 /// Uses a zero-copy friendly format:
@@ -15,19 +15,23 @@ use crate::types::batch::RecordBatch;
 ///   [u32 data_len] [data bytes]
 /// ```
 pub fn encode_binary_result(batch: &RecordBatch) -> Vec<u8> {
+    encode_binary_result_batches(&batch.schema, std::slice::from_ref(batch))
+}
+
+pub fn encode_binary_result_batches(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
     let mut buf = Vec::new();
-    let num_cols = batch.num_columns();
-    let num_rows = batch.num_rows();
+    let num_cols = schema.num_columns();
+    let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     // Number of columns
     buf.extend_from_slice(&(num_cols as u32).to_le_bytes());
 
     // Column headers
-    for col_def in &batch.schema.columns {
+    for col_def in &schema.columns {
         let name_bytes = col_def.name.as_bytes();
         buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(name_bytes);
-        buf.push(dtype_to_u8(col_def.data_type));
+        buf.push(col_def.data_type as u8);
         buf.extend_from_slice(&(col_def.scale as u32).to_le_bytes());
     }
 
@@ -36,25 +40,20 @@ pub fn encode_binary_result(batch: &RecordBatch) -> Vec<u8> {
 
     // Column data
     for col_idx in 0..num_cols {
-        let col = batch.column(col_idx).unwrap();
-
-        // Null bitmap (1 byte per row for simplicity; bit=1 means NULL)
-        let null_bitmap: Vec<u8> = (0..num_rows)
-            .map(|i| {
-                let val = col.scalar(i);
-                if val.is_null() {
-                    1u8
-                } else {
-                    0u8
+        let mut null_bitmap = Vec::with_capacity(num_rows);
+        for batch in batches {
+            if let Some(col) = batch.column(col_idx) {
+                for row in 0..batch.num_rows() {
+                    null_bitmap.push(if col.bitmap().is_null(row) { 1 } else { 0 });
                 }
-            })
-            .collect();
+            }
+        }
 
         buf.extend_from_slice(&(null_bitmap.len() as u32).to_le_bytes());
         buf.extend_from_slice(&null_bitmap);
 
         // Data payload
-        let data = encode_column_data(col_idx, batch);
+        let data = encode_column_data_batches(col_idx, batches);
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(&data);
     }
@@ -64,74 +63,86 @@ pub fn encode_binary_result(batch: &RecordBatch) -> Vec<u8> {
 
 /// Encode column data as fixed-width little-endian values.
 fn encode_column_data(col_idx: usize, batch: &RecordBatch) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let num_rows = batch.num_rows();
-    let col = batch.column(col_idx).unwrap();
-    let dt = col.data_type();
+    encode_column_data_batches(col_idx, std::slice::from_ref(batch))
+}
 
-    for i in 0..num_rows {
-        let val = col.scalar(i);
-        if val.is_null() {
-            // Write zero placeholder
-            match dt {
-                DataType::Int64 | DataType::Timestamp => buf.extend_from_slice(&0i64.to_le_bytes()),
-                DataType::Int32 | DataType::Date => buf.extend_from_slice(&0i32.to_le_bytes()),
-                DataType::Int16 => buf.extend_from_slice(&0i16.to_le_bytes()),
-                DataType::Int8 => buf.push(0),
-                DataType::Float64 => buf.extend_from_slice(&0.0f64.to_le_bytes()),
-                DataType::Float32 => buf.extend_from_slice(&0.0f32.to_le_bytes()),
-                DataType::Bool => buf.push(0),
-                DataType::VarChar => buf.extend_from_slice(&0u32.to_le_bytes()),
-                _ => buf.extend_from_slice(&0u32.to_le_bytes()),
-            }
+fn encode_column_data_batches(col_idx: usize, batches: &[RecordBatch]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for batch in batches {
+        let Some(col) = batch.column(col_idx) else {
             continue;
-        }
-        match val {
-            ScalarValue::Int64(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            ScalarValue::Int32(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            ScalarValue::Int16(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            ScalarValue::Int8(Some(v)) => buf.push(v as u8),
-            ScalarValue::UInt64(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            ScalarValue::UInt32(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            ScalarValue::Float64(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            ScalarValue::Float32(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            ScalarValue::Bool(Some(v)) => buf.push(if v { 1 } else { 0 }),
-            ScalarValue::VarChar(Some(v)) => {
-                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                buf.extend_from_slice(v.as_bytes());
-            }
-            ScalarValue::Timestamp(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            ScalarValue::Date(Some(v)) => buf.extend_from_slice(&v.to_le_bytes()),
-            _ => {}
-        }
+        };
+        append_column_data(col, &mut buf);
     }
     buf
 }
 
-fn dtype_to_u8(dt: DataType) -> u8 {
-    match dt {
-        DataType::Int8 => 1,
-        DataType::Int16 => 2,
-        DataType::Int32 => 3,
-        DataType::Int64 => 4,
-        DataType::UInt32 => 5,
-        DataType::UInt64 => 6,
-        DataType::Float32 => 7,
-        DataType::Float64 => 8,
-        DataType::Bool => 9,
-        DataType::VarChar => 10,
-        DataType::Date => 11,
-        DataType::Timestamp => 12,
-        _ => 0,
+fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
+    macro_rules! append_fixed {
+        ($data:expr) => {{
+            if $data.is_empty() {
+                return;
+            }
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    $data.as_ptr() as *const u8,
+                    $data.len() * std::mem::size_of_val(&$data[0]),
+                )
+            };
+            buf.extend_from_slice(bytes);
+        }};
+    }
+
+    match col {
+        ColumnArray::Bool { data, .. } => buf.extend_from_slice(data),
+        ColumnArray::Int8 { data, .. } => {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
+            buf.extend_from_slice(bytes);
+        }
+        ColumnArray::Int16 { data, .. } => append_fixed!(data),
+        ColumnArray::Int32 { data, .. } => append_fixed!(data),
+        ColumnArray::Int64 { data, .. } => append_fixed!(data),
+        ColumnArray::UInt8 { data, .. } => buf.extend_from_slice(data),
+        ColumnArray::UInt16 { data, .. } => append_fixed!(data),
+        ColumnArray::UInt32 { data, .. } => append_fixed!(data),
+        ColumnArray::UInt64 { data, .. } => append_fixed!(data),
+        ColumnArray::Float32 { data, .. } => append_fixed!(data),
+        ColumnArray::Float64 { data, .. } => append_fixed!(data),
+        ColumnArray::Decimal { data, .. } => append_fixed!(data),
+        ColumnArray::Date { data, .. } => append_fixed!(data),
+        ColumnArray::Time { data, .. } => append_fixed!(data),
+        ColumnArray::Timestamp { data, .. } => append_fixed!(data),
+        ColumnArray::Interval { data, .. } => append_fixed!(data),
+        ColumnArray::VarChar { data, .. } => {
+            for v in data {
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(v.as_bytes());
+            }
+        }
+        ColumnArray::Blob { data, .. } => {
+            for v in data {
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(v);
+            }
+        }
+        ColumnArray::Vector { data, .. } => {
+            for v in data {
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for f in v {
+                    buf.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+        }
     }
 }
-
-use crate::types::scalar::ScalarValue;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::types::DataType;
     use crate::types::batch::{ColumnDef, Schema};
+    use crate::types::scalar::ScalarValue;
 
     #[test]
     fn test_encode_empty_result() {

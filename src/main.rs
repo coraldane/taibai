@@ -60,6 +60,7 @@ async fn run_server(config: ServerConfig) {
 
     let config = Arc::new(config);
     let engine = Arc::new(engine);
+    let _ = rayon::ThreadPoolBuilder::new().build_global();
     let server = Server::new(config, engine.clone());
 
     let server_handle = tokio::spawn(async move {
@@ -116,22 +117,49 @@ async fn run_client(
             Ok(QueryResult::Ok {
                 rows_affected,
                 server_elapsed,
+                server_timings,
+                client_timings,
             }) => {
+                let output_start = std::time::Instant::now();
                 println!("OK, {} row(s) affected", rows_affected);
-                print_elapsed(start.elapsed(), server_elapsed);
+                let output_elapsed = output_start.elapsed();
+                print_elapsed(
+                    start.elapsed(),
+                    server_elapsed,
+                    server_timings.as_ref(),
+                    client_timings.as_ref(),
+                    output_elapsed,
+                    None,
+                );
             }
             Ok(QueryResult::Rows {
                 schema,
                 batches,
                 server_elapsed,
+                server_timings,
+                client_timings,
             }) => {
+                let output_start = std::time::Instant::now();
                 let stdout = std::io::stdout();
                 let mut out = std::io::BufWriter::new(stdout.lock());
                 if let Err(e) = write_query_rows(&mut out, &schema, &batches) {
                     eprintln!("IO error: {}", e);
                     std::process::exit(1);
                 }
-                print_elapsed(start.elapsed(), server_elapsed);
+                if let Err(e) = std::io::Write::flush(&mut out) {
+                    eprintln!("IO error: {}", e);
+                    std::process::exit(1);
+                }
+                let output_elapsed = output_start.elapsed();
+                let row_count = total_batch_rows(&batches);
+                print_elapsed(
+                    start.elapsed(),
+                    server_elapsed,
+                    server_timings.as_ref(),
+                    client_timings.as_ref(),
+                    output_elapsed,
+                    Some(row_count),
+                );
             }
             Ok(QueryResult::Error(msg)) => {
                 eprintln!("Server error: {}", msg);
@@ -172,22 +200,49 @@ async fn run_client(
                 Ok(QueryResult::Ok {
                     rows_affected,
                     server_elapsed,
+                    server_timings,
+                    client_timings,
                 }) => {
+                    let output_start = std::time::Instant::now();
                     println!("OK, {} row(s) affected", rows_affected);
-                    print_elapsed(start.elapsed(), server_elapsed);
+                    let output_elapsed = output_start.elapsed();
+                    print_elapsed(
+                        start.elapsed(),
+                        server_elapsed,
+                        server_timings.as_ref(),
+                        client_timings.as_ref(),
+                        output_elapsed,
+                        None,
+                    );
                 }
                 Ok(QueryResult::Rows {
                     schema,
                     batches,
                     server_elapsed,
+                    server_timings,
+                    client_timings,
                 }) => {
+                    let output_start = std::time::Instant::now();
                     let stdout = std::io::stdout();
                     let mut out = std::io::BufWriter::new(stdout.lock());
                     if let Err(e) = write_query_rows(&mut out, &schema, &batches) {
                         eprintln!("IO error: {}", e);
                         break;
                     }
-                    print_elapsed(start.elapsed(), server_elapsed);
+                    if let Err(e) = std::io::Write::flush(&mut out) {
+                        eprintln!("IO error: {}", e);
+                        break;
+                    }
+                    let output_elapsed = output_start.elapsed();
+                    let row_count = total_batch_rows(&batches);
+                    print_elapsed(
+                        start.elapsed(),
+                        server_elapsed,
+                        server_timings.as_ref(),
+                        client_timings.as_ref(),
+                        output_elapsed,
+                        Some(row_count),
+                    );
                 }
                 Ok(QueryResult::Error(msg)) => {
                     eprintln!("Server error: {} ({:?})", msg, start.elapsed());
@@ -204,11 +259,39 @@ async fn run_client(
     println!("Disconnected.");
 }
 
-fn print_elapsed(total: std::time::Duration, server: Option<std::time::Duration>) {
-    match server {
-        Some(server) => println!("(total: {:?}, server: {:?})", total, server),
-        None => println!("(total: {:?}, server: n/a)", total),
+fn print_elapsed(
+    total: std::time::Duration,
+    server: Option<std::time::Duration>,
+    _timings: Option<&net::client::ServerTimings>,
+    client: Option<&net::client::ClientTimings>,
+    output: std::time::Duration,
+    rows: Option<usize>,
+) {
+    let rows_text = rows
+        .map(|rows| format!(", rows: {}", rows))
+        .unwrap_or_default();
+    match (server, client) {
+        (Some(server), Some(client)) => println!(
+            "(total: {:?}, server: {:?}, client_recv: {:?}, output: {:?}{})",
+            total, server, client.recv, output, rows_text
+        ),
+        (Some(server), None) => println!(
+            "(total: {:?}, server: {:?}, client_recv: n/a, output: {:?}{})",
+            total, server, output, rows_text
+        ),
+        (None, Some(client)) => println!(
+            "(total: {:?}, server: n/a, client_recv: {:?}, output: {:?}{})",
+            total, client.recv, output, rows_text
+        ),
+        (None, None) => println!(
+            "(total: {:?}, server: n/a, client_recv: n/a, output: {:?}{})",
+            total, output, rows_text
+        ),
     }
+}
+
+fn total_batch_rows(batches: &[types::batch::RecordBatch]) -> usize {
+    batches.iter().map(|batch| batch.num_rows()).sum()
 }
 
 fn write_query_rows<W: std::io::Write>(

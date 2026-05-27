@@ -139,6 +139,15 @@ impl SegmentReader {
         self.footer.row_groups.clone()
     }
 
+    pub fn row_group_start_row(&self, row_group: usize) -> u64 {
+        self.footer
+            .row_groups
+            .iter()
+            .take(row_group)
+            .map(|r| r.row_count)
+            .sum()
+    }
+
     pub fn row_group_rows(&self, row_group: usize) -> u64 {
         self.footer.row_groups[row_group].row_count
     }
@@ -228,6 +237,12 @@ impl SegmentReader {
         let rg = &self.footer.row_groups[row_group];
         let col_def = &self.footer.schema.columns[column_idx];
 
+        let decompressed = self.read_column_raw(row_group, column_idx)?;
+        decode_column(&decompressed, rg.row_count as usize, col_def)
+    }
+
+    pub fn read_column_raw(&self, row_group: usize, column_idx: usize) -> Result<Vec<u8>> {
+        let rg = &self.footer.row_groups[row_group];
         let mut col_offset = rg.offset as usize;
         for i in 0..column_idx {
             col_offset += rg.column_compressed_sizes[i] as usize;
@@ -236,10 +251,8 @@ impl SegmentReader {
 
         let compressed = &self.mmap[col_offset..col_offset + col_len];
 
-        let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-            .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
-
-        decode_column(&decompressed, rg.row_count as usize, col_def)
+        zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
+            .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))
     }
 
     pub fn read_row_group_batch(
@@ -325,11 +338,12 @@ impl SegmentReader {
             })
             .collect();
 
-        let mut results = Vec::with_capacity(column_indices.len());
-
-        for &col_idx in column_indices {
+        use rayon::prelude::*;
+        let results: Vec<Option<(usize, ColumnArray)>> = column_indices
+            .par_iter()
+            .map(|&col_idx| -> Result<Option<(usize, ColumnArray)>> {
             if col_idx >= col_offsets.len() {
-                continue;
+                return Ok(None);
             }
 
             let col_offset = col_offsets[col_idx];
@@ -345,10 +359,11 @@ impl SegmentReader {
                 col_def,
                 selected_rows,
             )?;
-            results.push((col_idx, col_array));
-        }
+            Ok(Some((col_idx, col_array)))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        Ok(results)
+        Ok(results.into_iter().flatten().collect())
     }
 
     pub fn read_columns_fast(

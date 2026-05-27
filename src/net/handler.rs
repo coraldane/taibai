@@ -14,6 +14,13 @@ pub struct Handler {
     engine: Arc<Engine>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ServerTimings {
+    total: Duration,
+    execute: Duration,
+    encode: Duration,
+}
+
 impl Handler {
     pub fn new(config: Arc<ServerConfig>, engine: Arc<Engine>) -> Self {
         Self {
@@ -139,7 +146,11 @@ impl Handler {
 
         let use_binary = session.binary_results;
 
-        match self.engine.execute(session, sql) {
+        let execute_start = Instant::now();
+        let result = self.engine.execute(session, sql);
+        let execute_elapsed = execute_start.elapsed();
+
+        match result {
             Ok(ExecResult::Ok { rows_affected }) => {
                 if is_insert && rows_affected > 0 {
                     if let Some(s) = self.session.as_mut() {
@@ -147,18 +158,26 @@ impl Handler {
                         s.mark_txn_write();
                     }
                 }
-                Ok(vec![build_ok_with_server_elapsed(
-                    rows_affected,
-                    server_start.elapsed(),
-                )])
+                let timings = ServerTimings {
+                    total: server_start.elapsed(),
+                    execute: execute_elapsed,
+                    encode: Duration::ZERO,
+                };
+                Ok(vec![build_ok_with_server_timings(rows_affected, timings)])
             }
             Ok(ExecResult::Query { schema, batches }) => {
+                let encode_start = Instant::now();
                 let msg = if use_binary {
                     build_binary_query_result(&schema, &batches)
                 } else {
                     build_query_result(&schema, &batches)
                 };
-                Ok(vec![append_server_elapsed(msg, server_start.elapsed())])
+                let timings = ServerTimings {
+                    total: server_start.elapsed(),
+                    execute: execute_elapsed,
+                    encode: encode_start.elapsed(),
+                };
+                Ok(vec![append_server_timings(msg, timings)])
             }
             Err(e) => {
                 if !is_insert {
@@ -271,23 +290,35 @@ impl Handler {
             }
         };
 
+        let execute_start = Instant::now();
         let result = self.engine.execute_prepared(session, &mut stmt);
+        let execute_elapsed = execute_start.elapsed();
 
         // Put it back into cache
         session.prepared_statements.insert(stmt);
 
         match result {
-            Ok(ExecResult::Ok { rows_affected }) => Ok(vec![build_ok_with_server_elapsed(
-                rows_affected,
-                server_start.elapsed(),
-            )]),
+            Ok(ExecResult::Ok { rows_affected }) => {
+                let timings = ServerTimings {
+                    total: server_start.elapsed(),
+                    execute: execute_elapsed,
+                    encode: Duration::ZERO,
+                };
+                Ok(vec![build_ok_with_server_timings(rows_affected, timings)])
+            }
             Ok(ExecResult::Query { schema, batches }) => {
+                let encode_start = Instant::now();
                 let msg = if use_binary {
                     build_binary_query_result(&schema, &batches)
                 } else {
                     build_query_result(&schema, &batches)
                 };
-                Ok(vec![append_server_elapsed(msg, server_start.elapsed())])
+                let timings = ServerTimings {
+                    total: server_start.elapsed(),
+                    execute: execute_elapsed,
+                    encode: encode_start.elapsed(),
+                };
+                Ok(vec![append_server_timings(msg, timings)])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
         }
@@ -400,10 +431,10 @@ pub fn build_ok(rows_affected: u64) -> Message {
     )
 }
 
-fn build_ok_with_server_elapsed(rows_affected: u64, elapsed: Duration) -> Message {
-    let mut buf = Vec::with_capacity(20);
+fn build_ok_with_server_timings(rows_affected: u64, timings: ServerTimings) -> Message {
+    let mut buf = Vec::with_capacity(36);
     buf.extend_from_slice(&rows_affected.to_le_bytes());
-    append_server_elapsed_trailer(&mut buf, elapsed);
+    append_server_timing_trailer(&mut buf, timings);
     Message::new(MSG_TYPE_OK, Bytes::from(buf))
 }
 
@@ -411,15 +442,21 @@ pub fn build_error(msg: &str) -> Message {
     Message::new(MSG_TYPE_ERROR, Bytes::from(msg.to_string()))
 }
 
-fn append_server_elapsed(msg: Message, elapsed: Duration) -> Message {
-    let mut payload = Vec::with_capacity(msg.payload.len() + 12);
+fn append_server_timings(msg: Message, timings: ServerTimings) -> Message {
+    let mut payload = Vec::with_capacity(msg.payload.len() + 28);
     payload.extend_from_slice(&msg.payload);
-    append_server_elapsed_trailer(&mut payload, elapsed);
+    append_server_timing_trailer(&mut payload, timings);
     Message::new(msg.msg_type, Bytes::from(payload))
 }
 
-fn append_server_elapsed_trailer(buf: &mut Vec<u8>, elapsed: Duration) {
-    buf.extend_from_slice(b"MXTM");
+fn append_server_timing_trailer(buf: &mut Vec<u8>, timings: ServerTimings) {
+    buf.extend_from_slice(b"MXTP");
+    append_duration_micros(buf, timings.total);
+    append_duration_micros(buf, timings.execute);
+    append_duration_micros(buf, timings.encode);
+}
+
+fn append_duration_micros(buf: &mut Vec<u8>, elapsed: Duration) {
     buf.extend_from_slice(&(elapsed.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
 }
 
@@ -459,15 +496,7 @@ fn build_binary_query_result(
     schema: &crate::types::batch::Schema,
     batches: &[crate::types::batch::RecordBatch],
 ) -> Message {
-    let merged = if batches.len() == 1 {
-        batches[0].clone()
-    } else if batches.is_empty() {
-        crate::types::batch::RecordBatch::new(schema.clone())
-    } else {
-        merge_batches(batches)
-    };
-
-    let encoded = crate::protocol::result::encode_binary_result(&merged);
+    let encoded = crate::protocol::result::encode_binary_result_batches(schema, batches);
     Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(encoded))
 }
 
@@ -558,30 +587,6 @@ fn write_decimal_value_with_scale(buf: &mut Vec<u8>, value: i64, scale: i32) {
     } else {
         buf.extend_from_slice(&value.to_le_bytes());
     }
-}
-
-fn merge_batches(batches: &[crate::types::batch::RecordBatch]) -> crate::types::batch::RecordBatch {
-    if batches.is_empty() {
-        return crate::types::batch::RecordBatch::new(crate::types::batch::Schema::empty());
-    }
-    let schema = batches[0].schema.clone();
-    let num_cols = schema.columns.len();
-    let mut columns = Vec::with_capacity(num_cols);
-
-    for col_idx in 0..num_cols {
-        let dt = schema.columns[col_idx].data_type;
-        let mut col = crate::types::array::ColumnArray::empty(dt);
-        for batch in batches {
-            if let Some(src) = batch.column(col_idx) {
-                for i in 0..batch.num_rows() {
-                    col.push(&src.scalar(i)).unwrap();
-                }
-            }
-        }
-        columns.push(col);
-    }
-
-    crate::types::batch::RecordBatch::try_new(schema, columns).unwrap()
 }
 
 #[cfg(test)]

@@ -44,15 +44,33 @@ pub struct Client {
 }
 
 #[derive(Debug, Clone)]
+pub struct ServerTimings {
+    pub total: Duration,
+    pub execute: Option<Duration>,
+    pub encode: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientTimings {
+    pub send: Duration,
+    pub recv: Duration,
+    pub decode: Duration,
+}
+
+#[derive(Debug, Clone)]
 pub enum QueryResult {
     Ok {
         rows_affected: u64,
         server_elapsed: Option<Duration>,
+        server_timings: Option<ServerTimings>,
+        client_timings: Option<ClientTimings>,
     },
     Rows {
         schema: Schema,
         batches: Vec<RecordBatch>,
         server_elapsed: Option<Duration>,
+        server_timings: Option<ServerTimings>,
+        client_timings: Option<ClientTimings>,
     },
     Error(String),
 }
@@ -97,7 +115,7 @@ impl Client {
         write_len_prefixed_string(&mut payload, username);
         write_len_prefixed_string(&mut payload, password);
         write_len_prefixed_string(&mut payload, database);
-        payload.push(0);
+        payload.push(1);
         payload.extend_from_slice(&timezone_offset_hours.to_le_bytes());
 
         self.send(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
@@ -138,22 +156,32 @@ impl Client {
         write_len_prefixed_string(&mut payload, "");
         write_len_prefixed_string(&mut payload, sql);
 
+        let send_start = tokio::time::Instant::now();
         self.send(Message::new(MSG_TYPE_QUERY, Bytes::from(payload)))
             .await?;
+        let send_elapsed = send_start.elapsed();
 
+        let recv_start = tokio::time::Instant::now();
         let resp = self.recv().await?;
-        match resp.msg_type {
+        let recv_elapsed = recv_start.elapsed();
+
+        let decode_start = tokio::time::Instant::now();
+        let mut result = match resp.msg_type {
             MSG_TYPE_OK => {
                 if resp.payload.len() < 8 {
                     return Err(MonaxError::Protocol("OK payload too short".into()));
                 }
                 let rows_affected = u64::from_le_bytes(resp.payload[..8].try_into().unwrap());
+                let server_timings = parse_server_timing_trailer(&resp.payload, 8);
                 Ok(QueryResult::Ok {
                     rows_affected,
-                    server_elapsed: parse_server_elapsed_trailer(&resp.payload, 8),
+                    server_elapsed: server_timings.as_ref().map(|t| t.total),
+                    server_timings,
+                    client_timings: None,
                 })
             }
             MSG_TYPE_RESULT => Ok(parse_text_result(&resp.payload)?),
+            MSG_TYPE_BINARY_QUERY_RESULT => Ok(parse_binary_result(&resp.payload)?),
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
                 Ok(QueryResult::Error(msg))
@@ -161,7 +189,17 @@ impl Client {
             other => Err(MonaxError::Protocol(format!(
                 "unexpected query response type: {other:#04X}"
             ))),
-        }
+        }?;
+        let decode_elapsed = decode_start.elapsed();
+        attach_client_timings(
+            &mut result,
+            ClientTimings {
+                send: send_elapsed,
+                recv: recv_elapsed,
+                decode: decode_elapsed,
+            },
+        );
+        Ok(result)
     }
 
     pub async fn execute(&mut self, sql: &str) -> Result<u64> {
@@ -427,11 +465,13 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     let schema = Schema::new(columns);
 
     if row_count == 0 {
-        let server_elapsed = parse_server_elapsed_trailer(payload, offset);
+        let server_timings = parse_server_timing_trailer(payload, offset);
         return Ok(QueryResult::Rows {
             schema: schema.clone(),
             batches: vec![RecordBatch::new(schema)],
-            server_elapsed,
+            server_elapsed: server_timings.as_ref().map(|t| t.total),
+            server_timings,
+            client_timings: None,
         });
     }
 
@@ -463,11 +503,155 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    let server_elapsed = parse_server_elapsed_trailer(payload, offset);
+    let server_timings = parse_server_timing_trailer(payload, offset);
     Ok(QueryResult::Rows {
         schema,
         batches: vec![batch],
-        server_elapsed,
+        server_elapsed: server_timings.as_ref().map(|t| t.total),
+        server_timings,
+        client_timings: None,
+    })
+}
+
+fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
+    if payload.len() < 4 {
+        return Err(MonaxError::Protocol(
+            "binary result payload too short".into(),
+        ));
+    }
+    let mut offset = 0usize;
+    let col_count = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let mut columns = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let (name, rest) = read_len_prefixed_string(&payload[offset..])?;
+        if rest.len() < 5 {
+            return Err(MonaxError::Protocol(
+                "truncated binary column metadata".into(),
+            ));
+        }
+        let data_type = DataType::from_u8(rest[0])?;
+        let scale = u32::from_le_bytes(rest[1..5].try_into().unwrap()) as i32;
+        columns.push(ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            scale,
+            precision: 0,
+            auto_increment: false,
+        });
+        offset += 4 + name.len() + 5;
+    }
+
+    if payload.len() < offset + 4 {
+        return Err(MonaxError::Protocol(
+            "binary result missing row count".into(),
+        ));
+    }
+    let row_count = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+
+    let schema = Schema::new(columns);
+    let mut arrays = Vec::with_capacity(schema.num_columns());
+    for col_def in &schema.columns {
+        if payload.len() < offset + 4 {
+            return Err(MonaxError::Protocol(
+                "binary result missing null bitmap length".into(),
+            ));
+        }
+        let bitmap_len =
+            u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if payload.len() < offset + bitmap_len + 4 {
+            return Err(MonaxError::Protocol(
+                "binary result null bitmap truncated".into(),
+            ));
+        }
+        let nulls = &payload[offset..offset + bitmap_len];
+        offset += bitmap_len;
+
+        let data_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if payload.len() < offset + data_len {
+            return Err(MonaxError::Protocol(
+                "binary result column data truncated".into(),
+            ));
+        }
+        let data = &payload[offset..offset + data_len];
+        offset += data_len;
+        arrays.push(decode_binary_column(
+            col_def.data_type,
+            data,
+            nulls,
+            row_count,
+        )?);
+    }
+
+    let server_timings = parse_server_timing_trailer(payload, offset);
+    Ok(QueryResult::Rows {
+        schema: schema.clone(),
+        batches: vec![RecordBatch::try_new(schema, arrays)?],
+        server_elapsed: server_timings.as_ref().map(|t| t.total),
+        server_timings,
+        client_timings: None,
+    })
+}
+
+fn attach_client_timings(result: &mut QueryResult, timings: ClientTimings) {
+    match result {
+        QueryResult::Ok { client_timings, .. } | QueryResult::Rows { client_timings, .. } => {
+            *client_timings = Some(timings);
+        }
+        QueryResult::Error(_) => {}
+    }
+}
+
+fn decode_binary_column(
+    data_type: DataType,
+    data: &[u8],
+    nulls: &[u8],
+    row_count: usize,
+) -> Result<ColumnArray> {
+    let mut col = ColumnArray::empty(data_type);
+    let mut offset = 0usize;
+    for row in 0..row_count {
+        let is_null = nulls.get(row).copied().unwrap_or(0) != 0;
+        let value = if is_null {
+            ScalarValue::null_for_type(data_type)
+        } else {
+            let (value, consumed) =
+                read_scalar_value(data.get(offset..).unwrap_or(&[]), data_type, 0)?;
+            offset += consumed;
+            value
+        };
+
+        if is_null {
+            offset += data_type.fixed_size().unwrap_or(4);
+        }
+        col.push(&value)?;
+    }
+    Ok(col)
+}
+
+fn parse_server_timing_trailer(payload: &[u8], offset: usize) -> Option<ServerTimings> {
+    if let Some(trailer) = payload.get(offset..offset + 28) {
+        if &trailer[..4] == b"MXTP" {
+            let total = u64::from_le_bytes(trailer[4..12].try_into().ok()?);
+            let execute = u64::from_le_bytes(trailer[12..20].try_into().ok()?);
+            let encode = u64::from_le_bytes(trailer[20..28].try_into().ok()?);
+            return Some(ServerTimings {
+                total: Duration::from_micros(total),
+                execute: Some(Duration::from_micros(execute)),
+                encode: Some(Duration::from_micros(encode)),
+            });
+        }
+    }
+
+    parse_server_elapsed_trailer(payload, offset).map(|total| ServerTimings {
+        total,
+        execute: None,
+        encode: None,
     })
 }
 
@@ -786,6 +970,45 @@ mod tests {
         assert_eq!(parse_scaled_decimal_text("123.4", 2).unwrap(), 12340);
         assert_eq!(parse_scaled_decimal_text("-0.23", 2).unwrap(), -23);
         assert!(parse_scaled_decimal_text("1.234", 2).is_err());
+    }
+
+    #[test]
+    fn parses_binary_decimal_result() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("symbol", DataType::VarChar),
+            ColumnDef::new("price", DataType::Decimal).with_scale(2),
+        ]);
+        let mut batch = RecordBatch::new(schema.clone());
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("688256.SH".into())))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Decimal(Some(12345)))
+            .unwrap();
+
+        let payload = crate::protocol::result::encode_binary_result(&batch);
+        let QueryResult::Rows {
+            schema: parsed_schema,
+            batches,
+            ..
+        } = parse_binary_result(&payload).unwrap()
+        else {
+            panic!("expected rows");
+        };
+
+        assert_eq!(parsed_schema.columns[1].scale, 2);
+        assert_eq!(
+            batches[0].scalar(0, 0).unwrap(),
+            ScalarValue::VarChar(Some("688256.SH".into()))
+        );
+        assert_eq!(
+            batches[0].scalar(0, 1).unwrap(),
+            ScalarValue::Decimal(Some(12345))
+        );
     }
 
     fn write_column_meta(buf: &mut Vec<u8>, name: &str, data_type: DataType, scale: i32) {

@@ -1,6 +1,8 @@
 #![allow(dead_code)]
+use crate::storage::codec::encoding::selected_eq_rows_from_raw;
 use crate::storage::codec::fastscan::{apply_filter_mask_fast, FastScanEQ};
 use crate::storage::partition::pruning::RangeOp;
+use crate::types::bitmap::NullBitmap;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -379,6 +381,17 @@ pub fn cluster_key_range_read(
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> crate::common::error::Result<RecordBatch> {
     let key_col_idx = bounds.column_index;
+    if let Some(eq_value) = simple_cluster_eq_value(
+        key_col_idx,
+        bounds,
+        eq_predicates,
+        range_predicates,
+        in_predicates,
+        remaining_predicate,
+    ) {
+        return cluster_key_eq_read(reader, rg_idx, key_col_idx, eq_value, projection_cols);
+    }
+
     let key_batch = reader.read_columns_fast(rg_idx, &[key_col_idx])?;
     if key_batch.num_rows() == 0 {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
@@ -481,6 +494,182 @@ pub fn cluster_key_range_read(
     );
 
     project_filtered_union(&filtered, &union_cols, projection_cols)
+}
+
+fn simple_cluster_eq_value<'a>(
+    key_col_idx: usize,
+    bounds: &'a ClusterKeyBounds,
+    eq_predicates: &'a [(usize, ScalarValue)],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
+    in_predicates: &[InPredicate],
+    remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
+) -> Option<&'a ScalarValue> {
+    if !in_predicates.is_empty() || remaining_predicate.is_some() {
+        return None;
+    }
+    let (Some((lower, true)), Some((upper, true))) = (&bounds.lower, &bounds.upper) else {
+        return None;
+    };
+    if crate::storage::index::sort_key::compare_scalars_for_sort(lower, upper)
+        != std::cmp::Ordering::Equal
+    {
+        return None;
+    }
+    if eq_predicates.iter().any(|(col_idx, value)| {
+        *col_idx != key_col_idx
+            || crate::storage::index::sort_key::compare_scalars_for_sort(value, lower)
+                != std::cmp::Ordering::Equal
+    }) {
+        return None;
+    }
+    if range_predicates.iter().any(|clause| {
+        clause.column_index != key_col_idx
+            || clause.op != crate::storage::partition::pruning::RangeOp::Eq
+            || crate::storage::index::sort_key::compare_scalars_for_sort(&clause.value, lower)
+                != std::cmp::Ordering::Equal
+    }) {
+        return None;
+    }
+    Some(lower)
+}
+
+fn cluster_key_eq_read(
+    reader: &crate::storage::segment::SegmentReader,
+    rg_idx: usize,
+    key_col_idx: usize,
+    value: &ScalarValue,
+    projection_cols: &[usize],
+) -> crate::common::error::Result<RecordBatch> {
+    let raw = reader.read_column_raw(rg_idx, key_col_idx)?;
+    let col_def = &reader.schema().columns[key_col_idx];
+    let mut selected_rows =
+        selected_eq_rows_from_raw(&raw, reader.row_group_rows(rg_idx) as usize, col_def, value)?;
+    if !reader.delete_bitmap().is_empty() {
+        let rg_start_row = reader.row_group_start_row(rg_idx);
+        selected_rows.retain(|row| !reader.is_row_deleted(rg_start_row + *row as u64));
+    }
+    if selected_rows.is_empty() {
+        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+    }
+
+    let cols_to_read: Vec<usize> = projection_cols
+        .iter()
+        .copied()
+        .filter(|idx| *idx != key_col_idx)
+        .collect();
+    let mut columns_by_idx: std::collections::HashMap<usize, ColumnArray> =
+        std::collections::HashMap::with_capacity(projection_cols.len());
+
+    if projection_cols.contains(&key_col_idx) {
+        columns_by_idx.insert(
+            key_col_idx,
+            repeated_scalar_column(value, selected_rows.len())?,
+        );
+    }
+
+    for (col_idx, col) in reader.read_columns_filtered(rg_idx, &cols_to_read, &selected_rows)? {
+        columns_by_idx.insert(col_idx, col);
+    }
+
+    let mut columns = Vec::with_capacity(projection_cols.len());
+    for &col_idx in projection_cols {
+        let col = columns_by_idx.remove(&col_idx).ok_or_else(|| {
+            crate::common::error::MonaxError::Internal(format!(
+                "projected column {} was not read",
+                col_idx
+            ))
+        })?;
+        columns.push(col);
+    }
+
+    let schema = Schema::new(
+        projection_cols
+            .iter()
+            .map(|&idx| reader.schema().columns[idx].clone())
+            .collect(),
+    );
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))
+}
+
+fn repeated_scalar_column(value: &ScalarValue, len: usize) -> crate::common::error::Result<ColumnArray> {
+    let bitmap = NullBitmap::new_valid(len);
+    let col = match value {
+        ScalarValue::Bool(Some(v)) => ColumnArray::Bool {
+            data: vec![u8::from(*v); len],
+            bitmap,
+        },
+        ScalarValue::Int8(Some(v)) => ColumnArray::Int8 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Int16(Some(v)) => ColumnArray::Int16 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Int32(Some(v)) => ColumnArray::Int32 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Int64(Some(v)) => ColumnArray::Int64 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::UInt8(Some(v)) => ColumnArray::UInt8 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::UInt16(Some(v)) => ColumnArray::UInt16 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::UInt32(Some(v)) => ColumnArray::UInt32 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::UInt64(Some(v)) => ColumnArray::UInt64 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Float32(Some(v)) => ColumnArray::Float32 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Float64(Some(v)) => ColumnArray::Float64 {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Decimal(Some(v)) => ColumnArray::Decimal {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Date(Some(v)) => ColumnArray::Date {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Time(Some(v)) => ColumnArray::Time {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Timestamp(Some(v)) => ColumnArray::Timestamp {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::Interval(Some(v)) => ColumnArray::Interval {
+            data: vec![*v; len],
+            bitmap,
+        },
+        ScalarValue::VarChar(Some(v)) => ColumnArray::VarChar {
+            data: vec![v.clone(); len],
+            bitmap,
+        },
+        _ => {
+            return Err(crate::common::error::MonaxError::Internal(
+                "cluster key equality value cannot be NULL".into(),
+            ))
+        }
+    };
+    Ok(col)
 }
 
 fn lower_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
