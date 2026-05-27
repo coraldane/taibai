@@ -197,7 +197,7 @@ impl SegmentManager {
             reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
             flush_stop,
             flush_paused,
-            next_txn_id: AtomicU64::new(0),
+            next_txn_id: AtomicU64::new(1),
             config,
         })
     }
