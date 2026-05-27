@@ -136,41 +136,21 @@ impl ExecutionOp for WindowExec {
                 if i < ncols {
                     ColumnArray::empty(self.input_schema.columns[i].data_type)
                 } else {
-                    ColumnArray::empty(ScalarValue::Int64(None).data_type())
-                }
-            })
-            .collect();
-
-        for row in &rows {
-            for (c, val) in row.iter().enumerate() {
-                columns[c].push(val)?;
-            }
-            for f in 0..nfuncs {
-                columns[ncols + f].push(&window_columns[f][0])?; // placeholder
-            }
-        }
-
-        // Fix: use actual window values
-        let mut columns_fixed: Vec<ColumnArray> = (0..ncols + nfuncs)
-            .map(|i| {
-                if i < ncols {
-                    ColumnArray::empty(self.input_schema.columns[i].data_type)
-                } else {
-                    ColumnArray::empty(DataType::Int64)
+                    ColumnArray::empty(DataType::Float64)
                 }
             })
             .collect();
 
         for (row_idx, row) in rows.iter().enumerate() {
             for (c, val) in row.iter().enumerate() {
-                columns_fixed[c].push(val)?;
+                columns[c].push(val)?;
             }
             for f in 0..nfuncs {
-                columns_fixed[ncols + f].push(&window_columns[f][row_idx])?;
+                columns[ncols + f].push(&window_columns[f][row_idx])?;
             }
         }
 
-        Ok(Some(RecordBatch::try_new(output_schema, columns_fixed)?))
+        Ok(Some(RecordBatch::try_new(output_schema, columns)?))
     }
 }
 
@@ -180,10 +160,11 @@ fn compute_window_func(
     func: &WindowFunc,
     row_indices: &[usize],
     rows: &[Vec<ScalarValue>],
-    _order_by: &[(usize, bool)],
+    order_by: &[(usize, bool)],
 ) -> Vec<ScalarValue> {
     let n = row_indices.len();
     let mut result = vec![ScalarValue::Int64(None); n];
+    let order_by_cols: Vec<usize> = order_by.iter().map(|(c, _)| *c).collect();
 
     match func {
         WindowFunc::RowNumber => {
@@ -192,13 +173,41 @@ fn compute_window_func(
             }
         }
         WindowFunc::Rank => {
+            let mut rank = 1i64;
             for i in 0..n {
-                result[i] = ScalarValue::Int64(Some((i + 1) as i64));
+                if i > 0 {
+                    let prev_key: Vec<ScalarValue> = order_by_cols
+                        .iter()
+                        .map(|&c| rows[row_indices[i]][c].clone())
+                        .collect();
+                    let curr_key: Vec<ScalarValue> = order_by_cols
+                        .iter()
+                        .map(|&c| rows[row_indices[i - 1]][c].clone())
+                        .collect();
+                    if prev_key != curr_key {
+                        rank = (i + 1) as i64;
+                    }
+                }
+                result[i] = ScalarValue::Int64(Some(rank));
             }
         }
         WindowFunc::DenseRank => {
+            let mut dense_rank = 1i64;
             for i in 0..n {
-                result[i] = ScalarValue::Int64(Some((i + 1) as i64));
+                if i > 0 {
+                    let prev_key: Vec<ScalarValue> = order_by_cols
+                        .iter()
+                        .map(|&c| rows[row_indices[i]][c].clone())
+                        .collect();
+                    let curr_key: Vec<ScalarValue> = order_by_cols
+                        .iter()
+                        .map(|&c| rows[row_indices[i - 1]][c].clone())
+                        .collect();
+                    if prev_key != curr_key {
+                        dense_rank += 1;
+                    }
+                }
+                result[i] = ScalarValue::Int64(Some(dense_rank));
             }
         }
         WindowFunc::Lead { offset, default } => {

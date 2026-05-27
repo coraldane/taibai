@@ -84,7 +84,7 @@ impl Handler {
 
     fn handle_login(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
         let (username, rest) = read_len_prefixed_string(payload)?;
-        let (_password, rest) = read_len_prefixed_string(rest)?;
+        let (password, rest) = read_len_prefixed_string(rest)?;
         let (database, rest) = read_len_prefixed_string(rest)?;
 
         let database = if database.is_empty() {
@@ -100,6 +100,18 @@ impl Handler {
         } else {
             0
         };
+
+        let auth_result = self.engine.auth_manager().authenticate(username, &password)?;
+        if !auth_result {
+            tracing::warn!(username, "login failed: invalid credentials");
+            return Ok(vec![build_auth_fail("invalid username or password")]);
+        }
+
+        let is_locked = self.engine.auth_manager().is_locked(username);
+        if is_locked {
+            tracing::warn!(username, "login failed: account locked");
+            return Ok(vec![build_auth_fail("account is locked")]);
+        }
 
         let mut session = Session::new(username.to_string(), database);
         session.binary_results = binary_results;
@@ -418,6 +430,10 @@ impl Handler {
 
 fn build_auth_ok(session_id: &str) -> Message {
     Message::new(MSG_TYPE_AUTH_OK, Bytes::from(session_id.to_string()))
+}
+
+fn build_auth_fail(reason: &str) -> Message {
+    Message::new(MSG_TYPE_AUTH_FAIL, Bytes::from(reason.to_string()))
 }
 
 fn build_pong() -> Message {

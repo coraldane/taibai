@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use crate::common::error::{MonaxError, Result};
+use crate::protocol::types::DataType;
 use crate::storage::bulk_payload::parse_direct_bulk_payload;
 use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::core::wal::WalWriter;
@@ -17,6 +18,7 @@ use crate::storage::segment::{
     SEGMENT_HEADER_SIZE,
 };
 use crate::types::batch::{RecordBatch, Schema};
+use crate::types::scalar::ScalarValue;
 const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
 const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 500_000;
 const FLUSH_CHECK_INTERVAL_SECS: u64 = 10;
@@ -773,7 +775,7 @@ impl SegmentManager {
                 offset,
                 length: total_length,
                 row_count: req.row_count as u64,
-                zone_maps: placeholder_zone_maps(&seg.schema, req.row_count as u64),
+                zone_maps: compute_zone_maps_from_bulk_columns(&req.columns, &seg.schema, req.row_count as u64),
                 column_compressed_sizes,
                 compressed_sizes,
                 uncompressed_sizes,
@@ -915,7 +917,7 @@ impl SegmentManager {
                 offset,
                 length: total_length,
                 row_count: req.row_count as u64,
-                zone_maps: placeholder_zone_maps(&seg.schema, req.row_count as u64),
+                zone_maps: compute_zone_maps_from_bulk_columns(&req.columns, &seg.schema, req.row_count as u64),
                 column_compressed_sizes,
                 compressed_sizes,
                 uncompressed_sizes,
@@ -1180,7 +1182,7 @@ impl SegmentManager {
             offset,
             length: total_length,
             row_count: rows_to_flush as u64,
-            zone_maps: placeholder_zone_maps(&segment.schema, rows_to_flush as u64),
+            zone_maps: compute_zone_maps_from_batch(&buffered, 0, rows_to_flush),
             column_compressed_sizes,
             compressed_sizes,
             uncompressed_sizes,
@@ -1303,6 +1305,188 @@ fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
             }
         })
         .collect()
+}
+
+fn compute_zone_maps_from_batch(
+    batch: &RecordBatch,
+    start_row: usize,
+    row_count: usize,
+) -> Vec<ZoneMap> {
+    let num_cols = batch.num_columns();
+    let mut zone_maps = Vec::with_capacity(num_cols);
+    for col_idx in 0..num_cols {
+        let mut zm = ZoneMap::default();
+        if let Some(col) = batch.column(col_idx) {
+            for row in start_row..start_row + row_count {
+                if col.bitmap().is_null(row) {
+                    zm.null_count += 1;
+                } else {
+                    let val = col.scalar(row);
+                    zm.update(&val);
+                }
+            }
+        }
+        zm.row_count = row_count as u64;
+        zone_maps.push(zm);
+    }
+    zone_maps
+}
+
+fn compute_zone_maps_from_bulk_columns(
+    columns: &[crate::storage::bulk_payload::DirectBulkColumn<'_>],
+    schema: &Schema,
+    row_count: u64,
+) -> Vec<ZoneMap> {
+    let mut zone_maps = Vec::with_capacity(columns.len());
+    for (_col_idx, col) in columns.iter().enumerate() {
+        let mut zm = ZoneMap::default();
+        let dtype = col.data_type;
+        let data = col.data;
+        let nulls = col.nulls;
+        let elem_count = row_count as usize;
+
+        let mut null_count = 0u64;
+        let mut non_null_idx = 0usize;
+
+        if let Some(width) = dtype.fixed_size() {
+            for i in 0..elem_count {
+                if is_null_at(nulls, i) {
+                    null_count += 1;
+                    continue;
+                }
+                let offset = non_null_idx * width;
+                if let Some(val) = read_fixed_scalar(data, offset, dtype) {
+                    zm.update(&val);
+                }
+                non_null_idx += 1;
+            }
+        } else {
+            let mut offset = 0usize;
+            for i in 0..elem_count {
+                if is_null_at(nulls, i) {
+                    null_count += 1;
+                    continue;
+                }
+                if dtype == DataType::VarChar {
+                    if offset + 4 > data.len() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if offset + len > data.len() {
+                        break;
+                    }
+                    let s = std::str::from_utf8(&data[offset..offset + len])
+                        .unwrap_or("")
+                        .to_string();
+                    zm.update(&ScalarValue::VarChar(Some(s)));
+                    offset += len;
+                } else if dtype == DataType::Blob {
+                    if offset + 4 > data.len() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    offset += len;
+                } else if dtype == DataType::Vector {
+                    if offset + 4 > data.len() {
+                        break;
+                    }
+                    let dim = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    offset += dim * 4;
+                }
+            }
+        }
+
+        zm.null_count = null_count;
+        zm.row_count = row_count;
+        zone_maps.push(zm);
+    }
+    zone_maps
+}
+
+fn is_null_at(nulls: &[u8], idx: usize) -> bool {
+    if nulls.is_empty() {
+        return false;
+    }
+    let byte_idx = idx / 8;
+    let bit_idx = idx % 8;
+    if byte_idx >= nulls.len() {
+        return false;
+    }
+    (nulls[byte_idx] & (1 << bit_idx)) != 0
+}
+
+fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<crate::types::scalar::ScalarValue> {
+    use crate::types::scalar::ScalarValue;
+    match dtype {
+        DataType::Bool => {
+            if offset >= data.len() { return None; }
+            Some(ScalarValue::Bool(Some(data[offset] != 0)))
+        }
+        DataType::Int8 => {
+            if offset >= data.len() { return None; }
+            Some(ScalarValue::Int8(Some(data[offset] as i8)))
+        }
+        DataType::Int16 => {
+            if offset + 2 > data.len() { return None; }
+            Some(ScalarValue::Int16(Some(i16::from_le_bytes(data[offset..offset + 2].try_into().ok()?))))
+        }
+        DataType::Int32 => {
+            if offset + 4 > data.len() { return None; }
+            Some(ScalarValue::Int32(Some(i32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))))
+        }
+        DataType::Int64 => {
+            if offset + 8 > data.len() { return None; }
+            Some(ScalarValue::Int64(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+        }
+        DataType::UInt8 => {
+            if offset >= data.len() { return None; }
+            Some(ScalarValue::UInt8(Some(data[offset])))
+        }
+        DataType::UInt16 => {
+            if offset + 2 > data.len() { return None; }
+            Some(ScalarValue::UInt16(Some(u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?))))
+        }
+        DataType::UInt32 => {
+            if offset + 4 > data.len() { return None; }
+            Some(ScalarValue::UInt32(Some(u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))))
+        }
+        DataType::UInt64 => {
+            if offset + 8 > data.len() { return None; }
+            Some(ScalarValue::UInt64(Some(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+        }
+        DataType::Float32 => {
+            if offset + 4 > data.len() { return None; }
+            Some(ScalarValue::Float32(Some(f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))))
+        }
+        DataType::Float64 => {
+            if offset + 8 > data.len() { return None; }
+            Some(ScalarValue::Float64(Some(f64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+        }
+        DataType::Decimal => {
+            if offset + 8 > data.len() { return None; }
+            Some(ScalarValue::Decimal(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+        }
+        DataType::Date => {
+            if offset + 4 > data.len() { return None; }
+            Some(ScalarValue::Date(Some(i32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))))
+        }
+        DataType::Time => {
+            if offset + 8 > data.len() { return None; }
+            Some(ScalarValue::Time(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+        }
+        DataType::Timestamp => {
+            if offset + 8 > data.len() { return None; }
+            Some(ScalarValue::Timestamp(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+        }
+        DataType::Interval => {
+            if offset + 8 > data.len() { return None; }
+            Some(ScalarValue::Interval(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+        }
+        _ => None,
+    }
 }
 
 fn bulk_compression_level() -> i32 {

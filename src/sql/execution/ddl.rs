@@ -527,7 +527,7 @@ pub fn exec_show_indexes(engine: &Engine, db: &str, table: &str) -> Result<ExecR
         batch
             .column_mut(5)
             .unwrap()
-            .push(&ScalarValue::VarChar(Some("BTREE".to_string())))?;
+            .push(&ScalarValue::VarChar(Some("CLUSTER_BY".to_string())))?;
     }
 
     Ok(ExecResult::Query {
