@@ -1294,7 +1294,7 @@ fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
         .columns
         .iter()
         .map(|col| {
-            let null = crate::storage::codec::encoding::null_for_dtype(col.data_type);
+            let null = crate::storage::codec::scalar_tag::null_for_dtype(col.data_type);
             ZoneMap {
                 min_value: null.clone(),
                 max_value: null,

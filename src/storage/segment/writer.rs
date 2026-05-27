@@ -3,9 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{MonaxError, Result};
-use crate::storage::codec::encoding::{
-    encode_column, encode_len_prefixed_str, encode_scalar_with_tag, null_for_dtype,
-};
+use crate::storage::codec::column_codec::encode_column;
+use crate::storage::codec::io_util::encode_len_prefixed_str;
+use crate::storage::codec::scalar_tag::{encode_scalar_with_tag, null_for_dtype};
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::ZoneMap;
 use crate::types::array::ColumnArray;

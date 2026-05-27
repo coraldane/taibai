@@ -24,7 +24,7 @@ pub use reader::SegmentReader;
 pub use writer::{encode_segment_footer, encode_segment_header, SegmentWriter};
 
 #[allow(unused_imports)]
-pub use crate::storage::codec::encoding::decode_scalar_with_tag;
+pub use crate::storage::codec::scalar_tag::decode_scalar_with_tag;
 pub use crate::storage::partition::pruning::{
     RangeClause, RangeOp, RowGroupPredicate, ScanStats, ZoneMap,
 };

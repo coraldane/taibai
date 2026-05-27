@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use crate::common::error::{MonaxError, Result};
-use crate::storage::codec::encoding::{decode_column, decode_column_selected};
+use crate::storage::codec::column_codec::{decode_column, decode_column_selected};
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
 use crate::types::array::ColumnArray;
@@ -662,7 +662,7 @@ impl SegmentReader {
         let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
             .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
 
-        crate::storage::codec::encoding::count_eq_from_raw(
+        crate::storage::codec::predicate_scan::count_eq_from_raw(
             &decompressed,
             rg.row_count as usize,
             col_def,
