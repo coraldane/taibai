@@ -77,46 +77,60 @@ impl StatementBinder {
     ) -> Result<(BindContext, Schema)> {
         match from {
             FromClause::Table(table_ref) => {
-                let table_name = &table_ref.name;
-                let schema = table_schemas
-                    .get(table_name)
-                    .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
-                    .clone();
-                let mut ctx = BindContext::with_table(table_name, schema.clone());
-                if let Some(alias) = &table_ref.alias {
-                    ctx.register_table_alias(alias, table_name);
+                match table_ref {
+                    TableRef::Table { name, alias } => {
+                        let table_name = name;
+                        let schema = table_schemas
+                            .get(table_name)
+                            .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
+                            .clone();
+                        let mut ctx = BindContext::with_table(table_name, schema.clone());
+                        if let Some(a) = alias {
+                            ctx.register_table_alias(a, table_name);
+                        }
+                        Ok((ctx, schema))
+                    }
+                    TableRef::Subquery { query: _, alias: _ } => {
+                        Err(MonaxError::Sql("subquery in FROM not yet supported".into()))
+                    }
                 }
-                Ok((ctx, schema))
             }
             FromClause::Join(join_expr) => {
                 let (mut left_ctx, left_schema) = Self::bind_from(&join_expr.left, table_schemas)?;
                 let mut current_schema = left_schema;
 
                 for join_clause in &join_expr.joins {
-                    let right_table = &join_clause.right.name;
-                    let right_schema = table_schemas
-                        .get(right_table)
-                        .ok_or_else(|| {
-                            MonaxError::Sql(format!("table '{}' not found", right_table))
-                        })?
-                        .clone();
+                    match &join_clause.right {
+                        TableRef::Table { name, alias } => {
+                            let right_table = name;
+                            let right_schema = table_schemas
+                                .get(right_table)
+                                .ok_or_else(|| {
+                                    MonaxError::Sql(format!("table '{}' not found", right_table))
+                                })?
+                                .clone();
 
-                    left_ctx
-                        .table_schemas
-                        .insert(right_table.clone(), right_schema.clone());
+                            left_ctx
+                                .table_schemas
+                                .insert(right_table.clone(), right_schema.clone());
 
-                    if let Some(alias) = &join_clause.right.alias {
-                        left_ctx.register_table_alias(alias, right_table);
-                    }
+                            if let Some(a) = alias {
+                                left_ctx.register_table_alias(a, right_table);
+                            }
 
-                    current_schema = Self::merge_schemas(&current_schema, &right_schema);
-                    left_ctx.output_schema = Some(current_schema.clone());
+                            current_schema = Self::merge_schemas(&current_schema, &right_schema);
+                            left_ctx.output_schema = Some(current_schema.clone());
 
-                    for (i, col) in right_schema.columns.iter().enumerate() {
-                        left_ctx.column_index_map.insert(
-                            col.name.to_lowercase(),
-                            current_schema.columns.len() - right_schema.columns.len() + i,
-                        );
+                            for (i, col) in right_schema.columns.iter().enumerate() {
+                                left_ctx.column_index_map.insert(
+                                    col.name.to_lowercase(),
+                                    current_schema.columns.len() - right_schema.columns.len() + i,
+                                );
+                            }
+                        }
+                        TableRef::Subquery { query: _, alias: _ } => {
+                            return Err(MonaxError::Sql("subquery in JOIN not yet supported".into()));
+                        }
                     }
                 }
 

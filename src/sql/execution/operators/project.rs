@@ -119,20 +119,22 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
             .unwrap_or(DataType::Int64),
         LogicalExpr::Literal(v) => v.data_type(),
         LogicalExpr::BinaryOp { .. } => DataType::Int64,
-        LogicalExpr::Aggregate(agg) => match agg.func {
-            crate::sql::planner::AggFunc::Count => DataType::Int64,
-            crate::sql::planner::AggFunc::Sum | crate::sql::planner::AggFunc::Avg => DataType::Float64,
-            crate::sql::planner::AggFunc::Min | crate::sql::planner::AggFunc::Max => {
-                match &*agg.arg {
-                    LogicalExpr::Column(idx) => schema
-                        .columns
-                        .get(*idx)
-                        .map(|c| c.data_type)
-                        .unwrap_or(DataType::Int64),
-                    _ => DataType::Int64,
-                }
-            }
-        },
+        LogicalExpr::Aggregate(agg) => {
+            let agg_prefix = match agg.func {
+                crate::sql::planner::AggFunc::Count => "COUNT",
+                crate::sql::planner::AggFunc::Sum => "SUM",
+                crate::sql::planner::AggFunc::Avg => "AVG",
+                crate::sql::planner::AggFunc::Min => "MIN",
+                crate::sql::planner::AggFunc::Max => "MAX",
+            };
+            
+            schema
+                .columns
+                .iter()
+                .find(|c| c.name.starts_with(&format!("{}(", agg_prefix)) || c.name == format!("{}(*)", agg_prefix))
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::Int64)
+        }
         _ => DataType::Int64,
     }
 }

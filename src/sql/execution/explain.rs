@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::sql::parser::ast::Statement;
+use crate::sql::parser::ast::{Statement, TableRef};
 use crate::sql::planner::*;
 use crate::storage::segment::ScanStats;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
@@ -126,11 +126,17 @@ fn collect_tables_from_stmt<F: FnMut(&str)>(stmt: &Statement, mut f: F) {
     }
     fn walk_from<F: FnMut(&str)>(fc: &FromClause, f: &mut F) {
         match fc {
-            FromClause::Table(t) => f(&t.name),
+            FromClause::Table(t) => match t {
+                TableRef::Table { name, .. } => f(name),
+                TableRef::Subquery { alias, .. } => f(alias),
+            },
             FromClause::Join(je) => {
                 walk_from(&je.left, f);
                 for jc in &je.joins {
-                    f(&jc.right.name);
+                    match &jc.right {
+                        TableRef::Table { name, .. } => f(name),
+                        TableRef::Subquery { alias, .. } => f(alias),
+                    }
                 }
             }
         }

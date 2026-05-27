@@ -237,7 +237,19 @@ fn null_scalar_of_type(dt: DataType) -> ScalarValue {
 fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     match agg.func {
         AggFunc::Count => DataType::Int64,
-        AggFunc::Sum | AggFunc::Avg => DataType::Float64,
+        AggFunc::Sum => match &*agg.arg {
+            LogicalExpr::Column(idx) => schema
+                .columns
+                .get(*idx)
+                .map(|c| match c.data_type {
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
+                    DataType::Float32 | DataType::Float64 => DataType::Float64,
+                    other => other,
+                })
+                .unwrap_or(DataType::Int64),
+            _ => DataType::Int64,
+        },
+        AggFunc::Avg => DataType::Float64,
         AggFunc::Min | AggFunc::Max => match &*agg.arg {
             LogicalExpr::Column(idx) => schema
                 .columns
@@ -252,7 +264,7 @@ fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
 pub fn compute_aggregate(
     agg: &AggregateExpr,
     rows: &[Vec<ScalarValue>],
-    _schema: &Schema,
+    schema: &Schema,
 ) -> ScalarValue {
     let col_idx = match &*agg.arg {
         LogicalExpr::Column(idx) => Some(*idx),
@@ -303,11 +315,37 @@ pub fn compute_aggregate(
             }
         }
         AggFunc::Sum => {
-            let sum: f64 = values.iter().filter_map(|v| scalar_to_f64(v)).sum();
-            if sum == 0.0 && values.iter().all(|v| v.is_null()) {
-                ScalarValue::Float64(None)
+            let input_type = col_idx
+                .and_then(|idx| schema.columns.get(idx))
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::Int64);
+            
+            let has_non_null = values.iter().any(|v| !v.is_null());
+            if !has_non_null {
+                match input_type {
+                    DataType::Float32 | DataType::Float64 => ScalarValue::Float64(None),
+                    _ => ScalarValue::Int64(None),
+                }
             } else {
-                ScalarValue::Float64(Some(sum))
+                match input_type {
+                    DataType::Float32 | DataType::Float64 => {
+                        let sum: f64 = values.iter().filter_map(|v| scalar_to_f64(v)).sum();
+                        ScalarValue::Float64(Some(sum))
+                    }
+                    _ => {
+                        let sum: i64 = values
+                            .iter()
+                            .filter_map(|v| match v {
+                                ScalarValue::Int8(Some(n)) => Some(*n as i64),
+                                ScalarValue::Int16(Some(n)) => Some(*n as i64),
+                                ScalarValue::Int32(Some(n)) => Some(*n as i64),
+                                ScalarValue::Int64(Some(n)) => Some(*n),
+                                _ => None,
+                            })
+                            .sum();
+                        ScalarValue::Int64(Some(sum))
+                    }
+                }
             }
         }
         AggFunc::Avg => {
@@ -327,7 +365,7 @@ pub fn compute_aggregate(
                 Some(v) => (*v).clone(),
                 None => {
                     if let LogicalExpr::Column(idx) = &*agg.arg {
-                        if let Some(col) = _schema.columns.get(*idx) {
+                        if let Some(col) = schema.columns.get(*idx) {
                             null_scalar_of_type(col.data_type)
                         } else {
                             ScalarValue::Int64(None)
@@ -347,7 +385,7 @@ pub fn compute_aggregate(
                 Some(v) => (*v).clone(),
                 None => {
                     if let LogicalExpr::Column(idx) = &*agg.arg {
-                        if let Some(col) = _schema.columns.get(*idx) {
+                        if let Some(col) = schema.columns.get(*idx) {
                             null_scalar_of_type(col.data_type)
                         } else {
                             ScalarValue::Int64(None)

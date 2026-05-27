@@ -256,9 +256,15 @@ pub enum SelectItem {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TableRef {
-    pub name: String,
-    pub alias: Option<String>,
+pub enum TableRef {
+    Table {
+        name: String,
+        alias: Option<String>,
+    },
+    Subquery {
+        query: Box<Statement>,
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

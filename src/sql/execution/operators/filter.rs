@@ -287,8 +287,19 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             Ok(result)
         }
         LogicalExpr::Aggregate(agg) => {
-            let agg_name = crate::sql::execution::operators::aggregate::format_aggregate_name(agg, &batch.schema);
-            let col_idx = batch.schema.index_of(&agg_name);
+            let agg_type_prefix = match agg.func {
+                crate::sql::planner::AggFunc::Count => "COUNT",
+                crate::sql::planner::AggFunc::Sum => "SUM",
+                crate::sql::planner::AggFunc::Avg => "AVG",
+                crate::sql::planner::AggFunc::Min => "MIN",
+                crate::sql::planner::AggFunc::Max => "MAX",
+            };
+
+            let col_idx = batch.schema.columns.iter().position(|c| {
+                c.name.starts_with(&format!("{}(", agg_type_prefix))
+                    || c.name == format!("{}(*)", agg_type_prefix)
+            });
+            
             if let Some(idx) = col_idx {
                 Ok((0..num_rows)
                     .map(|i| batch.scalar(i, idx).unwrap_or(ScalarValue::Int64(None)))

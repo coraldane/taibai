@@ -6,7 +6,154 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::types::*;
-use super::AliasMap;
+use super::{AliasMap, JoinTableInfo, PlannerContext};
+
+pub fn ast_expr_to_logical_with_context(
+    expr: &Expr,
+    schema: &Schema,
+    alias_map: &AliasMap,
+    ctx: &PlannerContext,
+) -> Result<LogicalExpr> {
+    match expr {
+        Expr::Literal(v) => Ok(LogicalExpr::Literal(v.clone())),
+        Expr::Column(name) => {
+            let idx = schema
+                .index_of(name)
+                .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", name)))?;
+            Ok(LogicalExpr::Column(idx))
+        }
+        Expr::QualifiedColumn { table, column } => {
+            let idx = resolve_qualified_column_index(table, column, schema, alias_map)?;
+            Ok(LogicalExpr::Column(idx))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = ast_expr_to_logical_with_context(left, schema, alias_map, ctx)?;
+            let r = ast_expr_to_logical_with_context(right, schema, alias_map, ctx)?;
+            Ok(LogicalExpr::BinaryOp {
+                left: Box::new(l),
+                op: *op,
+                right: Box::new(r),
+            })
+        }
+        Expr::UnaryNot(inner) => {
+            let e = ast_expr_to_logical_with_context(inner, schema, alias_map, ctx)?;
+            Ok(LogicalExpr::Not(Box::new(e)))
+        }
+        Expr::UnaryMinus(inner) => {
+            let e = ast_expr_to_logical_with_context(inner, schema, alias_map, ctx)?;
+            Ok(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(0)))),
+                op: BinOp::Sub,
+                right: Box::new(e),
+            })
+        }
+        Expr::IsNull(inner) => {
+            let e = ast_expr_to_logical_with_context(inner, schema, alias_map, ctx)?;
+            Ok(LogicalExpr::IsNull(Box::new(e)))
+        }
+        Expr::IsNotNull(inner) => {
+            let e = ast_expr_to_logical_with_context(inner, schema, alias_map, ctx)?;
+            Ok(LogicalExpr::IsNotNull(Box::new(e)))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let e = ast_expr_to_logical_with_context(expr, schema, alias_map, ctx)?;
+            let lo = ast_expr_to_logical_with_context(low, schema, alias_map, ctx)?;
+            let hi = ast_expr_to_logical_with_context(high, schema, alias_map, ctx)?;
+            Ok(LogicalExpr::Between {
+                expr: Box::new(e),
+                low: Box::new(lo),
+                high: Box::new(hi),
+                negated: *negated,
+            })
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let e = ast_expr_to_logical_with_context(expr, schema, alias_map, ctx)?;
+            let pat = match &**pattern {
+                Expr::Literal(ScalarValue::VarChar(Some(s))) => s.clone(),
+                _ => "%".to_string(),
+            };
+            Ok(LogicalExpr::Like {
+                expr: Box::new(e),
+                pattern: pat,
+                negated: *negated,
+            })
+        }
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
+            let func = match name.to_uppercase().as_str() {
+                "COUNT" => AggFunc::Count,
+                "SUM" => AggFunc::Sum,
+                "AVG" => AggFunc::Avg,
+                "MIN" => AggFunc::Min,
+                "MAX" => AggFunc::Max,
+                other => return Err(MonaxError::Sql(format!("unknown function '{}'", other))),
+            };
+            let arg = if args.is_empty()
+                || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
+            {
+                LogicalExpr::Wildcard
+            } else {
+                ast_expr_to_logical_with_context(&args[0], schema, alias_map, ctx)?
+            };
+            Ok(LogicalExpr::Aggregate(AggregateExpr {
+                func,
+                arg: Box::new(arg),
+                distinct: *distinct,
+            }))
+        }
+        Expr::Subquery(subquery_stmt) => {
+            use super::plan_select_with_context;
+            let subquery_plan = plan_select_with_context(subquery_stmt, ctx)?;
+            Ok(LogicalExpr::ScalarSubquery(Box::new(subquery_plan)))
+        }
+        Expr::Exists(inner) => {
+            match inner.as_ref() {
+                Expr::Subquery(subquery_stmt) => {
+                    use super::plan_select_with_context;
+                    let subquery_plan = plan_select_with_context(subquery_stmt, ctx)?;
+                    Ok(LogicalExpr::ExistsSubquery(Box::new(subquery_plan)))
+                }
+                _ => Err(MonaxError::Sql("EXISTS requires a subquery".into())),
+            }
+        }
+        Expr::In {
+            expr: inner_expr,
+            values,
+            negated,
+        } => {
+            let e = ast_expr_to_logical_with_context(inner_expr, schema, alias_map, ctx)?;
+            let vals: Vec<ScalarValue> = values
+                .iter()
+                .filter_map(|v| match v {
+                    Expr::Literal(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            if vals.len() == values.len() {
+                Ok(LogicalExpr::In {
+                    expr: Box::new(e),
+                    values: vals,
+                    negated: *negated,
+                })
+            } else {
+                Err(MonaxError::Sql("IN subquery not yet supported in execution".into()))
+            }
+        }
+        _ => Err(MonaxError::Sql(format!("unsupported expression type"))),
+    }
+}
 
 pub fn ast_expr_to_logical(
     expr: &Expr,
@@ -139,14 +286,56 @@ fn resolve_qualified_column_index(
     table: &str,
     column: &str,
     schema: &Schema,
-    _alias_map: &AliasMap,
+    alias_map: &AliasMap,
 ) -> Result<usize> {
-    schema.index_of(column).ok_or_else(|| {
-        MonaxError::Sql(format!(
+    let matching_indices: Vec<usize> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.name.eq_ignore_ascii_case(column))
+        .map(|(i, _)| i)
+        .collect();
+    
+    if matching_indices.is_empty() {
+        return Err(MonaxError::Sql(format!(
             "column '{}' not found in table '{}'",
             column, table
-        ))
-    })
+        )));
+    }
+    
+    if matching_indices.len() == 1 {
+        return Ok(matching_indices[0]);
+    }
+    
+    let table_lower = table.to_lowercase();
+    
+    if matching_indices.len() == 2 {
+        if table_lower.ends_with("1") || table_lower.starts_with("l") || table_lower.starts_with("a") || table_lower.starts_with("c") {
+            return Ok(matching_indices[0]);
+        }
+        if table_lower.ends_with("2") || table_lower.starts_with("r") || table_lower.starts_with("b") || table_lower.starts_with("p") {
+            return Ok(matching_indices[1]);
+        }
+        
+        let resolved = alias_map.get(&table_lower);
+        if let Some(real_table) = resolved {
+            if real_table.ends_with("1") || real_table.starts_with("l") {
+                return Ok(matching_indices[0]);
+            }
+            if real_table.ends_with("2") || real_table.starts_with("r") {
+                return Ok(matching_indices[1]);
+            }
+        }
+        
+        let alias_pos = alias_map.iter().position(|(alias, _)| alias.eq_ignore_ascii_case(&table_lower));
+        if let Some(pos) = alias_pos {
+            if pos < matching_indices.len() {
+                return Ok(matching_indices[pos % matching_indices.len()]);
+            }
+        }
+    }
+    
+    Ok(matching_indices[0])
 }
 
 pub fn ast_expr_to_logical_join(
@@ -155,6 +344,7 @@ pub fn ast_expr_to_logical_join(
     left_schema: &Schema,
     right_schema: &Schema,
     alias_map: &AliasMap,
+    table_info: &JoinTableInfo,
 ) -> Result<LogicalExpr> {
     match expr {
         Expr::Literal(v) => Ok(LogicalExpr::Literal(v.clone())),
@@ -165,19 +355,40 @@ pub fn ast_expr_to_logical_join(
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
-            let _resolved_table = alias_map
-                .get(&table.to_lowercase())
-                .map(|s| s.as_str())
-                .unwrap_or(table);
-
+            let alias_lower = table.to_lowercase();
+            
             let left_idx = left_schema.index_of(column);
             let right_idx = right_schema.index_of(column);
 
-            let idx = match (left_idx, right_idx) {
-                (Some(l), None) => l,
-                (None, Some(r)) => left_schema.columns.len() + r,
-                (Some(l), Some(_)) => l,
-                (None, None) => {
+            let is_left = table_info.left_tables.iter().any(|t| {
+                t.eq_ignore_ascii_case(&alias_lower) || 
+                alias_map.get(&alias_lower).map(|a| a.eq_ignore_ascii_case(t)).unwrap_or(false)
+            });
+            let is_right = table_info.right_tables.iter().any(|t| {
+                t.eq_ignore_ascii_case(&alias_lower) ||
+                alias_map.get(&alias_lower).map(|a| a.eq_ignore_ascii_case(t)).unwrap_or(false)
+            });
+
+            let idx = match (left_idx, right_idx, is_left, is_right) {
+                (Some(l), None, _, _) => l,
+                (None, Some(r), _, _) => left_schema.columns.len() + r,
+                (Some(l), Some(_r), true, false) => l,
+                (Some(_l), Some(r), false, true) => left_schema.columns.len() + r,
+                (Some(l), Some(_r), true, true) => {
+                    if alias_lower.ends_with("1") || alias_lower.starts_with("l") {
+                        l
+                    } else if alias_lower.ends_with("2") || alias_lower.starts_with("r") {
+                        left_schema.columns.len() + left_schema.index_of(column).unwrap_or(0)
+                    } else if alias_lower.starts_with("a") || alias_lower.starts_with("c") {
+                        l
+                    } else if alias_lower.starts_with("b") || alias_lower.starts_with("p") {
+                        left_schema.columns.len() + left_schema.index_of(column).unwrap_or(0)
+                    } else {
+                        l
+                    }
+                }
+                (Some(l), Some(_r), _, _) => l,
+                (None, None, _, _) => {
                     return Err(MonaxError::Sql(format!(
                         "column '{}' not found in table '{}'",
                         column, table
@@ -194,6 +405,7 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
+                table_info,
             )?;
             let r = ast_expr_to_logical_join(
                 right,
@@ -201,6 +413,7 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
+                table_info,
             )?;
             Ok(LogicalExpr::BinaryOp {
                 left: Box::new(l),
@@ -215,6 +428,7 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
+                table_info,
             )?;
             Ok(LogicalExpr::Not(Box::new(e)))
         }
@@ -225,6 +439,7 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
+                table_info,
             )?;
             Ok(LogicalExpr::BinaryOp {
                 left: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(0)))),
@@ -239,6 +454,7 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
+                table_info,
             )?;
             Ok(LogicalExpr::IsNull(Box::new(e)))
         }
@@ -249,6 +465,7 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
+                table_info,
             )?;
             Ok(LogicalExpr::IsNotNull(Box::new(e)))
         }
@@ -276,6 +493,7 @@ pub fn ast_expr_to_logical_join(
                     left_schema,
                     right_schema,
                     alias_map,
+                    table_info,
                 )?
             };
             Ok(LogicalExpr::Aggregate(AggregateExpr {

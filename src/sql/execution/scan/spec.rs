@@ -23,6 +23,7 @@ pub struct ScanSpec {
     pub has_aggregate: bool,
     pub has_order_by: bool,
     pub has_group_by: bool,
+    pub has_join: bool,
     pub limit: Option<usize>,
 
     pub cluster_key: Option<Vec<String>>,
@@ -56,6 +57,7 @@ impl ScanSpec {
             has_aggregate: false,
             has_order_by: false,
             has_group_by: false,
+            has_join: false,
             limit: None,
             cluster_key: None,
             partition_info: None,
@@ -226,7 +228,7 @@ fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
         LogicalPlan::Filter(f) => collect_from_plan(&f.input, schema, spec),
         LogicalPlan::Project(p) => {
             collect_from_plan(&p.input, schema, spec);
-            if spec.remaining_predicate.is_none() {
+            if spec.remaining_predicate.is_none() && !spec.has_join {
                 if let Some(cols) = plain_projection_columns(&p.expressions) {
                     spec.projection = Some(cols);
                 }
@@ -253,10 +255,12 @@ fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
         LogicalPlan::Distinct(d) => collect_from_plan(&d.input, schema, spec),
         LogicalPlan::Window(w) => collect_from_plan(&w.input, schema, spec),
         LogicalPlan::Join(j) => {
+            spec.has_join = true;
             collect_from_plan(&j.left, schema, spec);
             collect_from_plan(&j.right, schema, spec);
         }
         LogicalPlan::SemiJoin(s) => {
+            spec.has_join = true;
             collect_from_plan(&s.left, schema, spec);
             collect_from_plan(&s.right, schema, spec);
         }

@@ -7,7 +7,7 @@ use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use crate::sql::parser::ast::{Expr, FromClause, SelectItem, Statement};
+use crate::sql::parser::ast::{Expr, FromClause, SelectItem, Statement, TableRef};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
 use super::scan::spec::compile_scan_spec;
@@ -336,7 +336,10 @@ fn try_skip_sort_for_cluster_key(
 
 pub fn extract_table_names(from: &FromClause) -> Vec<String> {
     match from {
-        FromClause::Table(t) => vec![t.name.clone()],
+        FromClause::Table(t) => match t {
+            TableRef::Table { name, .. } => vec![name.clone()],
+            TableRef::Subquery { alias, .. } => vec![alias.clone()],
+        },
         FromClause::Join(join_expr) => {
             let mut names = Vec::new();
             collect_table_names_from_join(join_expr, &mut names);
@@ -350,11 +353,17 @@ fn collect_table_names_from_join(
     names: &mut Vec<String>,
 ) {
     match &*join_expr.left {
-        FromClause::Table(t) => names.push(t.name.clone()),
+        FromClause::Table(t) => match t {
+            TableRef::Table { name, .. } => names.push(name.clone()),
+            TableRef::Subquery { alias, .. } => names.push(alias.clone()),
+        },
         FromClause::Join(inner) => collect_table_names_from_join(inner, names),
     }
     for jc in &join_expr.joins {
-        names.push(jc.right.name.clone());
+        match &jc.right {
+            TableRef::Table { name, .. } => names.push(name.clone()),
+            TableRef::Subquery { alias, .. } => names.push(alias.clone()),
+        }
     }
 }
 

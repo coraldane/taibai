@@ -13,9 +13,34 @@ pub use types::*;
 
 pub type AliasMap = HashMap<String, String>;
 
+#[derive(Debug, Clone, Default)]
+pub struct JoinTableInfo {
+    pub left_tables: Vec<String>,
+    pub right_tables: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlannerContext {
+    pub table_schemas: HashMap<String, Schema>,
+}
+
+impl PlannerContext {
+    pub fn new(table_schemas: HashMap<String, Schema>) -> Self {
+        Self { table_schemas }
+    }
+}
+
 pub fn plan_select(
     stmt: &Statement,
     table_schemas: &HashMap<String, Schema>,
+) -> Result<LogicalPlan> {
+    let ctx = PlannerContext::new(table_schemas.clone());
+    plan_select_with_context(stmt, &ctx)
+}
+
+pub fn plan_select_with_context(
+    stmt: &Statement,
+    ctx: &PlannerContext,
 ) -> Result<LogicalPlan> {
     let (select_list, from, where_clause, group_by, _having, order_by, limit, offset, _distinct) =
         match stmt {
@@ -47,16 +72,16 @@ pub fn plan_select(
             }
         };
 
-    let (base_plan, schema, alias_map) = if let Some(from_clause) = from {
-        plan_from_clause(from_clause, table_schemas)?
+    let (base_plan, schema, alias_map, _table_info) = if let Some(from_clause) = from {
+        plan_from_clause(from_clause, &ctx.table_schemas)?
     } else {
-        (LogicalPlan::Empty, Schema::empty(), AliasMap::new())
+        (LogicalPlan::Empty, Schema::empty(), AliasMap::new(), JoinTableInfo::default())
     };
 
     let mut plan: LogicalPlan = base_plan;
 
     if let Some(pred) = where_clause {
-        let predicate = expr::ast_expr_to_logical(pred, &schema, &alias_map)?;
+        let predicate = expr::ast_expr_to_logical_with_context(pred, &schema, &alias_map, ctx)?;
         plan = LogicalPlan::Filter(FilterPlan {
             predicate,
             input: Box::new(plan),
@@ -67,7 +92,7 @@ pub fn plan_select(
     if !group_by.is_empty() || !agg_funcs.is_empty() {
         let group_exprs: Vec<LogicalExpr> = group_by
             .iter()
-            .map(|e| expr::ast_expr_to_logical(e, &schema, &alias_map))
+            .map(|e| expr::ast_expr_to_logical_with_context(e, &schema, &alias_map, ctx))
             .collect::<Result<Vec<_>>>()?;
 
         let agg_exprs: Vec<AggregateExpr> = agg_funcs
@@ -75,7 +100,7 @@ pub fn plan_select(
             .map(|(func, arg_expr, distinct)| {
                 let arg = match &arg_expr {
                     Some(e) => Box::new(
-                        expr::ast_expr_to_logical(e, &schema, &alias_map)
+                        expr::ast_expr_to_logical_with_context(e, &schema, &alias_map, ctx)
                             .unwrap_or(LogicalExpr::Wildcard),
                     ),
                     None => Box::new(LogicalExpr::Wildcard),
@@ -116,11 +141,11 @@ pub fn plan_select(
                         .find(|(alias, _)| alias == &name.to_lowercase())
                         .map(|(_, idx)| LogicalExpr::Column(*idx))
                         .map_or_else(
-                            || expr::ast_expr_to_logical(&item.expr, &schema, &alias_map),
+                            || expr::ast_expr_to_logical_with_context(&item.expr, &schema, &alias_map, ctx),
                             Ok,
                         )?
                 } else {
-                    expr::ast_expr_to_logical(&item.expr, &schema, &alias_map)?
+                    expr::ast_expr_to_logical_with_context(&item.expr, &schema, &alias_map, ctx)?
                 };
                 Ok(SortKey {
                     expr: e,
@@ -163,72 +188,93 @@ pub fn plan_select(
 fn plan_from_clause(
     from: &FromClause,
     table_schemas: &HashMap<String, Schema>,
-) -> Result<(LogicalPlan, Schema, AliasMap)> {
+) -> Result<(LogicalPlan, Schema, AliasMap, JoinTableInfo)> {
     match from {
         FromClause::Table(table_ref) => {
-            let table_name = &table_ref.name;
-            let schema = table_schemas
-                .get(table_name)
-                .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
-                .clone();
-            let plan = LogicalPlan::Scan(ScanPlan::new(table_name.clone(), schema.clone()));
+            match table_ref {
+                TableRef::Table { name, alias } => {
+                    let table_name = name;
+                    let schema = table_schemas
+                        .get(table_name)
+                        .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
+                        .clone();
+                    let plan = LogicalPlan::Scan(ScanPlan::new(table_name.clone(), schema.clone()));
 
-            let mut alias_map = AliasMap::new();
-            if let Some(alias) = &table_ref.alias {
-                alias_map.insert(alias.to_lowercase(), table_name.clone());
+                    let mut alias_map = AliasMap::new();
+                    if let Some(a) = alias {
+                        alias_map.insert(a.to_lowercase(), table_name.clone());
+                    }
+                    alias_map.insert(table_name.to_lowercase(), table_name.clone());
+
+                    let table_info = JoinTableInfo {
+                        left_tables: vec![table_name.clone()],
+                        right_tables: Vec::new(),
+                    };
+
+                    Ok((plan, schema, alias_map, table_info))
+                }
+                TableRef::Subquery { query: _, alias: _ } => {
+                    Err(MonaxError::Sql("subquery in FROM not yet supported in planner".into()))
+                }
             }
-            alias_map.insert(table_name.to_lowercase(), table_name.clone());
-
-            Ok((plan, schema, alias_map))
         }
         FromClause::Join(join_expr) => {
-            let (left_plan, left_schema, mut alias_map) =
+            let (left_plan, left_schema, mut alias_map, mut table_info) =
                 plan_from_clause(&join_expr.left, table_schemas)?;
 
             let mut current_plan = left_plan;
             let mut current_schema = left_schema;
 
             for join_clause in &join_expr.joins {
-                let right_table = &join_clause.right.name;
-                let right_schema = table_schemas
-                    .get(right_table)
-                    .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", right_table)))?
-                    .clone();
+                match &join_clause.right {
+                    TableRef::Table { name, alias } => {
+                        let right_table = name;
+                        let right_schema = table_schemas
+                            .get(right_table)
+                            .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", right_table)))?
+                            .clone();
 
-                if let Some(alias) = &join_clause.right.alias {
-                    alias_map.insert(alias.to_lowercase(), right_table.clone());
+                        if let Some(a) = alias {
+                            alias_map.insert(a.to_lowercase(), right_table.clone());
+                        }
+                        alias_map.insert(right_table.to_lowercase(), right_table.clone());
+                        table_info.right_tables.push(right_table.clone());
+
+                        let right_plan =
+                            LogicalPlan::Scan(ScanPlan::new(right_table.clone(), right_schema.clone()));
+
+                        let output_schema = types::merge_schemas(&current_schema, &right_schema);
+
+                        let condition = match &join_clause.condition {
+                            Some(expr) => expr::ast_expr_to_logical_join(
+                                expr,
+                                &output_schema,
+                                &current_schema,
+                                &right_schema,
+                                &alias_map,
+                                &table_info,
+                            )?,
+                            None => LogicalExpr::Literal(ScalarValue::Bool(Some(true))),
+                        };
+
+                        current_plan = LogicalPlan::Join(JoinPlan {
+                            left: Box::new(current_plan),
+                            right: Box::new(right_plan),
+                            join_type: join_clause.join_type,
+                            condition,
+                            left_schema: current_schema.clone(),
+                            right_schema: right_schema.clone(),
+                            output_schema: output_schema.clone(),
+                        });
+                        current_schema = output_schema;
+                    }
+                    TableRef::Subquery { query: _, alias: _ } => {
+                        return Err(MonaxError::Sql("subquery in JOIN not yet supported in planner".into()));
+                    }
                 }
-                alias_map.insert(right_table.to_lowercase(), right_table.clone());
-
-                let right_plan =
-                    LogicalPlan::Scan(ScanPlan::new(right_table.clone(), right_schema.clone()));
-
-                let output_schema = types::merge_schemas(&current_schema, &right_schema);
-
-                let condition = match &join_clause.condition {
-                    Some(expr) => expr::ast_expr_to_logical_join(
-                        expr,
-                        &output_schema,
-                        &current_schema,
-                        &right_schema,
-                        &alias_map,
-                    )?,
-                    None => LogicalExpr::Literal(ScalarValue::Bool(Some(true))),
-                };
-
-                current_plan = LogicalPlan::Join(JoinPlan {
-                    left: Box::new(current_plan),
-                    right: Box::new(right_plan),
-                    join_type: join_clause.join_type,
-                    condition,
-                    left_schema: current_schema.clone(),
-                    right_schema: right_schema.clone(),
-                    output_schema: output_schema.clone(),
-                });
-                current_schema = output_schema;
             }
 
-            Ok((current_plan, current_schema, alias_map))
+            Ok((current_plan, current_schema, alias_map, table_info))
         }
     }
 }

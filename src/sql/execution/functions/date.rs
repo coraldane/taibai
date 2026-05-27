@@ -35,7 +35,7 @@ fn normalize_timestamp_precision(num: i64) -> i64 {
     }
 }
 
-fn parse_datetime_string(s: &str, timezone_offset_hours: i32) -> Option<i64> {
+pub fn parse_datetime_string(s: &str, timezone_offset_hours: i32) -> Option<i64> {
     let dt = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
         .ok()
         .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok())

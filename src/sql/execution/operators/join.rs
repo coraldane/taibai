@@ -2,6 +2,7 @@
 /// Supports: Inner, Left, Right, Full, Cross, Semi, Anti, and Asof joins.
 /// Uses columnar data processing through RecordBatch for cache efficiency.
 use crate::common::error::Result;
+use crate::protocol::types::DataType;
 use crate::sql::execution::join_hashtable::{AsofJoinIndex, JoinHashTable, RowPointer};
 use crate::sql::parser::ast::JoinType;
 use crate::sql::planner::LogicalExpr;
@@ -34,17 +35,16 @@ pub struct HashJoinExec {
 
 #[derive(Default)]
 struct ProbeState {
-    /// Collected right-side batches for probe
     right_batches: Vec<RecordBatch>,
-    /// Current position in probe iteration
+    left_batches: Vec<RecordBatch>,
     right_batch_idx: usize,
     right_row_idx: usize,
-    /// Buffered output rows for current next_batch call
+    right_collected: bool,
+    left_batch_idx: usize,
+    left_row_idx: usize,
     output_buffer: Vec<OutputRow>,
     buffer_pos: usize,
-    /// Whether build phase is complete
     build_done: bool,
-    /// Whether all output has been emitted (including LEFT/FULL null rows)
     finalize_done: bool,
 }
 
@@ -106,7 +106,10 @@ impl HashJoinExec {
                 self.asof_index = Some(asof_idx);
             }
             _ => {
-                // For Inner/Left/Semi/Anti/Cross: build hash table from left side
+                if self.join_type == JoinType::Cross {
+                    self.probe_state.build_done = true;
+                    return Ok(());
+                }
                 let mut ht = JoinHashTable::new(self.left_key_cols.clone());
                 while let Some(batch) = self.left.next_batch()? {
                     ht.insert_batch(batch);
@@ -203,7 +206,10 @@ impl HashJoinExec {
                 let ht = self.hash_table.as_ref().unwrap();
                 ht.probe(&key)
             };
-            if !matches.is_empty() {
+            if matches.is_empty() {
+                // No left match for this right row - for LEFT JOIN, we don't emit this case
+                // We only emit unmatched left rows at the end
+            } else {
                 {
                     let ht = self.hash_table.as_mut().unwrap();
                     for ptr in &matches {
@@ -337,8 +343,7 @@ impl HashJoinExec {
 
     /// Cross join: Cartesian product of left and right.
     fn probe_cross(&mut self) -> Result<Option<RecordBatch>> {
-        // Collect all left rows first
-        if self.probe_state.right_batches.is_empty() {
+        if !self.probe_state.right_collected {
             let mut left_rows = Vec::new();
             while let Some(batch) = self.left.next_batch()? {
                 for row in 0..batch.num_rows() {
@@ -348,13 +353,10 @@ impl HashJoinExec {
                     left_rows.push(vals);
                 }
             }
-            // Store in right_batches temporarily as left_rows
-            // Actually, we need to store them differently
-            self.probe_state.right_batches = Vec::new();
-            while let Some(batch) = self.right.next_batch()? {
+            while let Ok(Some(batch)) = self.right.next_batch() {
                 self.probe_state.right_batches.push(batch);
             }
-            // Store left rows as the buffer source
+            self.probe_state.right_collected = true;
             for left_row in &left_rows {
                 for right_batch in &self.probe_state.right_batches {
                     for right_row_idx in 0..right_batch.num_rows() {
@@ -407,8 +409,8 @@ impl HashJoinExec {
 
     /// Anti join: emit left rows that have NO match in right.
     fn probe_anti(&mut self) -> Result<Option<RecordBatch>> {
-        if self.probe_state.right_batches.is_empty() {
-            while let Some(batch) = self.right.next_batch()? {
+        if !self.probe_state.right_collected {
+            while let Ok(Some(batch)) = self.right.next_batch() {
                 for row in 0..batch.num_rows() {
                     let right_row: Vec<ScalarValue> = (0..batch.num_columns())
                         .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
@@ -428,6 +430,7 @@ impl HashJoinExec {
                     };
                 }
             }
+            self.probe_state.right_collected = true;
             let unmatched = {
                 let ht = self.hash_table.as_ref().unwrap();
                 ht.unmatched_rows()
@@ -476,11 +479,14 @@ impl HashJoinExec {
     // --- Helper methods ---
 
     fn get_next_right_row(&mut self) -> Option<Vec<ScalarValue>> {
-        // First collect all right batches
-        if self.probe_state.right_batches.is_empty() && !self.probe_state.build_done {
-            // Already collected during build for RIGHT/FULL/Asof
+        if !self.probe_state.right_collected {
+            while let Ok(Some(batch)) = self.right.next_batch() {
+                if batch.num_rows() > 0 {
+                    self.probe_state.right_batches.push(batch);
+                }
+            }
+            self.probe_state.right_collected = true;
         }
-        // Try to get from already-collected batches
         if self.probe_state.right_batch_idx < self.probe_state.right_batches.len() {
             let batch = &self.probe_state.right_batches[self.probe_state.right_batch_idx];
             if self.probe_state.right_row_idx < batch.num_rows() {
@@ -503,28 +509,37 @@ impl HashJoinExec {
     }
 
     fn get_next_left_row(&mut self) -> Option<Vec<ScalarValue>> {
-        match self.left.next_batch() {
-            Ok(Some(batch)) => {
-                if batch.num_rows() == 0 {
-                    return self.get_next_left_row();
-                }
-                // Buffer and return first row
-                self.probe_state.right_batches.push(batch);
-                let batch_ref =
-                    &self.probe_state.right_batches[self.probe_state.right_batches.len() - 1];
-                let row: Vec<ScalarValue> = (0..batch_ref.num_columns())
-                    .map(|c| batch_ref.scalar(0, c).unwrap_or(ScalarValue::Int64(None)))
-                    .collect();
-                // Store remaining rows
-                for r in 1..batch_ref.num_rows() {
-                    let vals: Vec<ScalarValue> = (0..batch_ref.num_columns())
-                        .map(|c| batch_ref.scalar(r, c).unwrap_or(ScalarValue::Int64(None)))
+        loop {
+            if self.probe_state.left_batch_idx < self.probe_state.left_batches.len() {
+                let batch = &self.probe_state.left_batches[self.probe_state.left_batch_idx];
+                if self.probe_state.left_row_idx < batch.num_rows() {
+                    let row: Vec<ScalarValue> = (0..batch.num_columns())
+                        .map(|c| {
+                            batch
+                                .scalar(self.probe_state.left_row_idx, c)
+                                .unwrap_or(ScalarValue::Int64(None))
+                        })
                         .collect();
-                    self.probe_state.output_buffer.push((vals, None)); // temporarily store
+                    self.probe_state.left_row_idx += 1;
+                    if self.probe_state.left_row_idx >= batch.num_rows() {
+                        self.probe_state.left_batch_idx += 1;
+                        self.probe_state.left_row_idx = 0;
+                    }
+                    return Some(row);
                 }
-                Some(row)
             }
-            _ => None,
+            match self.left.next_batch() {
+                Ok(Some(batch)) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    self.probe_state.left_batches.push(batch);
+                    self.probe_state.left_batch_idx =
+                        self.probe_state.left_batches.len() - 1;
+                    self.probe_state.left_row_idx = 0;
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -628,7 +643,6 @@ impl HashJoinExec {
                     }
                 }
                 None => {
-                    // For semi/anti join, right side is not emitted
                     if output_ncols > left_ncols {
                         for i in 0..right_ncols {
                             let null_val =

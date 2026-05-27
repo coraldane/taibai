@@ -377,6 +377,23 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
                 use crate::sql::execution::functions::date::parse_timestamp_from_int;
                 Ok(ScalarValue::Timestamp(Some(parse_timestamp_from_int(*n))))
             }
+            (DataType::Date, ScalarValue::VarChar(Some(s))) => {
+                // Parse date string to days since epoch
+                // Format: YYYY-MM-DD
+                use crate::sql::execution::functions::date::parse_datetime_string;
+                match parse_datetime_string(s, timezone_offset_hours) {
+                    Some(ts) => {
+                        // Convert timestamp (seconds) to days
+                        let days = (ts / 86400) as i32;
+                        Ok(ScalarValue::Date(Some(days)))
+                    }
+                    None => Ok(ScalarValue::Date(None)),
+                }
+            }
+            (DataType::Date, ScalarValue::Int64(Some(n))) => {
+                // Interpret as days directly
+                Ok(ScalarValue::Date(Some(*n as i32)))
+            }
             _ => Ok(v.clone()),
         },
         Expr::Column(_) => Ok(ScalarValue::null_for_type(*dt)),

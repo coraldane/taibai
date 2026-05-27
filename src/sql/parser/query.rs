@@ -1,4 +1,4 @@
-use crate::common::error::Result;
+use crate::common::error::{MonaxError, Result};
 
 use crate::sql::parser::ast::{
     FromClause, JoinClause, JoinExpr, JoinType, OrderByItem, SelectItem, Statement, TableRef,
@@ -249,36 +249,58 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef> {
-        let name = self.expect_ident()?;
-        let alias = if self.peek() == &Token::As {
+        if self.peek() == &Token::LeftParen {
             self.advance();
-            Some(self.expect_ident()?)
-        } else if matches!(self.peek(), Token::Ident(_)) {
-            let next = self.peek();
-            if !matches!(
-                next,
-                Token::Join
-                    | Token::Inner
-                    | Token::Left
-                    | Token::Right
-                    | Token::Cross
-                    | Token::On
-                    | Token::Where
-                    | Token::Group
-                    | Token::Order
-                    | Token::Limit
-                    | Token::Offset
-                    | Token::Semicolon
-                    | Token::Eof
-            ) {
-                Some(self.expect_ident()?)
+            if self.peek() == &Token::Select {
+                let stmt = self.parse_select()?;
+                self.expect(&Token::RightParen)?;
+                let alias = if self.peek() == &Token::As {
+                    self.advance();
+                    self.expect_ident()?
+                } else if matches!(self.peek(), Token::Ident(_)) {
+                    self.expect_ident()?
+                } else {
+                    return Err(MonaxError::Sql("derived table requires an alias".into()));
+                };
+                Ok(TableRef::Subquery {
+                    query: Box::new(stmt),
+                    alias,
+                })
             } else {
-                None
+                return Err(MonaxError::Sql("expected SELECT in derived table".into()));
             }
         } else {
-            None
-        };
-        Ok(TableRef { name, alias })
+            let name = self.expect_ident()?;
+            let alias = if self.peek() == &Token::As {
+                self.advance();
+                Some(self.expect_ident()?)
+            } else if matches!(self.peek(), Token::Ident(_)) {
+                let next = self.peek();
+                if !matches!(
+                    next,
+                    Token::Join
+                        | Token::Inner
+                        | Token::Left
+                        | Token::Right
+                        | Token::Cross
+                        | Token::On
+                        | Token::Where
+                        | Token::Group
+                        | Token::Order
+                        | Token::Limit
+                        | Token::Offset
+                        | Token::Semicolon
+                        | Token::Eof
+                ) {
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(TableRef::Table { name, alias })
+        }
     }
 
     fn parse_join_clause(&mut self) -> Result<JoinClause> {

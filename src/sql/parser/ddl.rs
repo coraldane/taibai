@@ -336,7 +336,7 @@ impl Parser {
         match self.peek() {
             Token::Table => {
                 self.advance();
-                let name = self.expect_ident()?;
+                let name = self.parse_qualified_name()?;
                 Ok(GrantObject::Table(name))
             }
             Token::Database => {
@@ -344,9 +344,24 @@ impl Parser {
                 let name = self.expect_ident()?;
                 Ok(GrantObject::Database(name))
             }
+            Token::Star => {
+                self.advance();
+                if self.peek() == &Token::Dot {
+                    self.advance();
+                    if self.peek() == &Token::Star {
+                        self.advance();
+                        Ok(GrantObject::AllTables)
+                    } else {
+                        Err(MonaxError::Sql("expected '*' after '*.'".into()))
+                    }
+                } else {
+                    Ok(GrantObject::AllTables)
+                }
+            }
             Token::Ident(_) => {
-                let name = self.expect_ident()?.to_uppercase();
-                match name.as_str() {
+                let name = self.parse_qualified_name()?;
+                let upper = name.to_uppercase();
+                match upper.as_str() {
                     "ALL" | "ALL_TABLES" => Ok(GrantObject::AllTables),
                     "ALL_DATABASES" => Ok(GrantObject::AllDatabases),
                     _ => Ok(GrantObject::Table(name)),
@@ -356,6 +371,22 @@ impl Parser {
                 "expected TABLE, DATABASE, or identifier after ON, got {}",
                 other
             ))),
+        }
+    }
+
+    fn parse_qualified_name(&mut self) -> Result<String> {
+        let first = self.expect_ident()?;
+        if self.peek() == &Token::Dot {
+            self.advance();
+            if self.peek() == &Token::Star {
+                self.advance();
+                Ok(format!("{}.*", first))
+            } else {
+                let second = self.expect_ident()?;
+                Ok(format!("{}.{}", first, second))
+            }
+        } else {
+            Ok(first)
         }
     }
 
