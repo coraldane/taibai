@@ -107,7 +107,7 @@ impl<'a> ScanExecutor<'a> {
             let projection_cols = self.compute_projection_columns();
 
             for seg_path in &filtered_segments {
-                let reader = match mgr.open_reader(seg_path) {
+                let reader = match mgr.open_reader_cached(seg_path) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };

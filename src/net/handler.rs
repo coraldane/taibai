@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::common::config::ServerConfig;
 use crate::common::error::Result;
@@ -104,6 +105,8 @@ impl Handler {
     }
 
     fn handle_query(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let server_start = Instant::now();
+
         if let Some(session) = &mut self.session {
             session.touch();
         }
@@ -144,16 +147,18 @@ impl Handler {
                         s.mark_txn_write();
                     }
                 }
-                Ok(vec![build_ok(rows_affected)])
+                Ok(vec![build_ok_with_server_elapsed(
+                    rows_affected,
+                    server_start.elapsed(),
+                )])
             }
             Ok(ExecResult::Query { schema, batches }) => {
-                if use_binary {
-                    let msg = build_binary_query_result(&schema, &batches);
-                    Ok(vec![msg])
+                let msg = if use_binary {
+                    build_binary_query_result(&schema, &batches)
                 } else {
-                    let msg = build_query_result(&schema, &batches);
-                    Ok(vec![msg])
-                }
+                    build_query_result(&schema, &batches)
+                };
+                Ok(vec![append_server_elapsed(msg, server_start.elapsed())])
             }
             Err(e) => {
                 if !is_insert {
@@ -238,6 +243,8 @@ impl Handler {
     }
 
     fn handle_execute(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let server_start = Instant::now();
+
         let session = match &mut self.session {
             Some(s) => s,
             None => return Ok(vec![build_error("not logged in")]),
@@ -270,13 +277,17 @@ impl Handler {
         session.prepared_statements.insert(stmt);
 
         match result {
-            Ok(ExecResult::Ok { rows_affected }) => Ok(vec![build_ok(rows_affected)]),
+            Ok(ExecResult::Ok { rows_affected }) => Ok(vec![build_ok_with_server_elapsed(
+                rows_affected,
+                server_start.elapsed(),
+            )]),
             Ok(ExecResult::Query { schema, batches }) => {
-                if use_binary {
-                    Ok(vec![build_binary_query_result(&schema, &batches)])
+                let msg = if use_binary {
+                    build_binary_query_result(&schema, &batches)
                 } else {
-                    Ok(vec![build_query_result(&schema, &batches)])
-                }
+                    build_query_result(&schema, &batches)
+                };
+                Ok(vec![append_server_elapsed(msg, server_start.elapsed())])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
         }
@@ -389,8 +400,27 @@ pub fn build_ok(rows_affected: u64) -> Message {
     )
 }
 
+fn build_ok_with_server_elapsed(rows_affected: u64, elapsed: Duration) -> Message {
+    let mut buf = Vec::with_capacity(20);
+    buf.extend_from_slice(&rows_affected.to_le_bytes());
+    append_server_elapsed_trailer(&mut buf, elapsed);
+    Message::new(MSG_TYPE_OK, Bytes::from(buf))
+}
+
 pub fn build_error(msg: &str) -> Message {
     Message::new(MSG_TYPE_ERROR, Bytes::from(msg.to_string()))
+}
+
+fn append_server_elapsed(msg: Message, elapsed: Duration) -> Message {
+    let mut payload = Vec::with_capacity(msg.payload.len() + 12);
+    payload.extend_from_slice(&msg.payload);
+    append_server_elapsed_trailer(&mut payload, elapsed);
+    Message::new(msg.msg_type, Bytes::from(payload))
+}
+
+fn append_server_elapsed_trailer(buf: &mut Vec<u8>, elapsed: Duration) {
+    buf.extend_from_slice(b"MXTM");
+    buf.extend_from_slice(&(elapsed.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
 }
 
 fn build_query_result(

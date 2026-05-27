@@ -2,9 +2,7 @@ use std::collections::HashMap;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::catalog::auth::{
-    Permission, PermissionObjectType, PermissionType,
-};
+use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
 use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -108,6 +106,7 @@ pub fn exec_drop_table(
 
     let table_dir = engine.data_dir().join(db).join(name);
     engine.segment_mgr().remove_wal(&table_dir);
+    engine.segment_mgr().invalidate_readers_under(&table_dir);
 
     if table_dir.exists() {
         let _ = std::fs::remove_dir_all(&table_dir);
@@ -169,6 +168,7 @@ pub fn exec_alter_table(
                             if file_name.starts_with(&format!("p{}", partition_key))
                                 && file_name.ends_with(".seg")
                             {
+                                engine.segment_mgr().invalidate_reader(&e.path());
                                 let _ = std::fs::remove_file(e.path());
                             }
                         }
@@ -187,6 +187,7 @@ pub fn exec_alter_table(
                             if file_name.starts_with(&format!("p{}", partition_key))
                                 && file_name.ends_with(".seg")
                             {
+                                engine.segment_mgr().invalidate_reader(&e.path());
                                 let _ = std::fs::remove_file(e.path());
                             }
                         }
@@ -224,6 +225,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
 
     let table_dir = engine.data_dir().join(db).join(table);
     engine.segment_mgr().remove_wal(&table_dir);
+    engine.segment_mgr().invalidate_readers_under(&table_dir);
 
     if table_dir.exists() {
         for entry in std::fs::read_dir(&table_dir)? {

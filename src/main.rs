@@ -113,16 +113,25 @@ async fn run_client(
     let start = std::time::Instant::now();
     if let Some(sql) = query {
         match client.query(&sql).await {
-            Ok(QueryResult::Ok { rows_affected }) => {
+            Ok(QueryResult::Ok {
+                rows_affected,
+                server_elapsed,
+            }) => {
                 println!("OK, {} row(s) affected", rows_affected);
+                print_elapsed(start.elapsed(), server_elapsed);
             }
-            Ok(QueryResult::Rows { schema, batches }) => {
+            Ok(QueryResult::Rows {
+                schema,
+                batches,
+                server_elapsed,
+            }) => {
                 let stdout = std::io::stdout();
                 let mut out = std::io::BufWriter::new(stdout.lock());
                 if let Err(e) = write_query_rows(&mut out, &schema, &batches) {
                     eprintln!("IO error: {}", e);
                     std::process::exit(1);
                 }
+                print_elapsed(start.elapsed(), server_elapsed);
             }
             Ok(QueryResult::Error(msg)) => {
                 eprintln!("Server error: {}", msg);
@@ -133,7 +142,6 @@ async fn run_client(
                 std::process::exit(1);
             }
         }
-        println!("({:?})", start.elapsed());
     } else {
         println!("monax client interactive mode. Type SQL queries or 'quit' to exit.");
         let stdin = std::io::stdin();
@@ -161,18 +169,25 @@ async fn run_client(
 
             let start = std::time::Instant::now();
             match client.query(sql).await {
-                Ok(QueryResult::Ok { rows_affected }) => {
+                Ok(QueryResult::Ok {
+                    rows_affected,
+                    server_elapsed,
+                }) => {
                     println!("OK, {} row(s) affected", rows_affected);
-                    println!("({:?})", start.elapsed());
+                    print_elapsed(start.elapsed(), server_elapsed);
                 }
-                Ok(QueryResult::Rows { schema, batches }) => {
+                Ok(QueryResult::Rows {
+                    schema,
+                    batches,
+                    server_elapsed,
+                }) => {
                     let stdout = std::io::stdout();
                     let mut out = std::io::BufWriter::new(stdout.lock());
                     if let Err(e) = write_query_rows(&mut out, &schema, &batches) {
                         eprintln!("IO error: {}", e);
                         break;
                     }
-                    println!("({:?})", start.elapsed());
+                    print_elapsed(start.elapsed(), server_elapsed);
                 }
                 Ok(QueryResult::Error(msg)) => {
                     eprintln!("Server error: {} ({:?})", msg, start.elapsed());
@@ -187,6 +202,13 @@ async fn run_client(
     let _ = client.logout().await;
     let _ = client.close().await;
     println!("Disconnected.");
+}
+
+fn print_elapsed(total: std::time::Duration, server: Option<std::time::Duration>) {
+    match server {
+        Some(server) => println!("(total: {:?}, server: {:?})", total, server),
+        None => println!("(total: {:?}, server: n/a)", total),
+    }
 }
 
 fn write_query_rows<W: std::io::Write>(

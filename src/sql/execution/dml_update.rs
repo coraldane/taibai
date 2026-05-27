@@ -92,6 +92,7 @@ pub fn exec_update(
     }
 
     if table_dir.exists() {
+        mgr.invalidate_readers_under(&table_dir);
         for seg_file in SegmentManager::discover_segments(&table_dir)? {
             std::fs::remove_file(&seg_file)?;
         }

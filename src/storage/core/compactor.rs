@@ -17,7 +17,7 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
-const COMPACT_ROW_GROUP_SIZE: usize = 262_144;
+const COMPACT_ROW_GROUP_SIZE: usize = 8192;
 const WRITE_GATHER_CHUNK_ROWS: usize = COMPACT_ROW_GROUP_SIZE;
 const PARALLEL_SORT_THRESHOLD: usize = 1_000_000;
 
@@ -169,6 +169,7 @@ impl Compactor {
 
         if row_refs.is_empty() {
             for old_seg in segment_files {
+                self.segment_mgr.invalidate_reader(old_seg);
                 std::fs::remove_file(old_seg)?;
             }
             return Ok(CompactStats {
@@ -183,8 +184,13 @@ impl Compactor {
         let final_path = next_compact_segment_path(table_dir, partition_key)?;
         let tmp_path = compact_tmp_path(&final_path);
 
-        let write_result =
-            self.write_sorted_segment(&tmp_path, schema, &source_row_groups, &row_refs);
+        let write_result = self.write_sorted_segment(
+            &tmp_path,
+            schema,
+            cluster_key_indices,
+            &source_row_groups,
+            &row_refs,
+        );
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
@@ -200,9 +206,11 @@ impl Compactor {
 
         for old_seg in segment_files {
             if old_seg != &final_path {
+                self.segment_mgr.invalidate_reader(old_seg);
                 std::fs::remove_file(old_seg)?;
             }
         }
+        let _ = self.segment_mgr.open_reader_cached(&final_path);
 
         Ok(CompactStats {
             segments_read: segment_files.len(),
@@ -216,10 +224,16 @@ impl Compactor {
         &self,
         path: &Path,
         schema: &Schema,
+        bloom_column_indices: &[usize],
         source_row_groups: &[SourceRowGroup],
         row_refs: &[RowRef],
     ) -> Result<()> {
-        let mut writer = SegmentWriter::create(path, schema.clone(), COMPACT_ROW_GROUP_SIZE)?;
+        let mut writer = SegmentWriter::create_with_bloom_columns(
+            path,
+            schema.clone(),
+            COMPACT_ROW_GROUP_SIZE,
+            bloom_column_indices,
+        )?;
         let mut rows_written = 0usize;
         let mut row_group_cache = RowGroupCache::new(source_row_groups.len());
 

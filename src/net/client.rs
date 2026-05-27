@@ -47,10 +47,12 @@ pub struct Client {
 pub enum QueryResult {
     Ok {
         rows_affected: u64,
+        server_elapsed: Option<Duration>,
     },
     Rows {
         schema: Schema,
         batches: Vec<RecordBatch>,
+        server_elapsed: Option<Duration>,
     },
     Error(String),
 }
@@ -146,7 +148,10 @@ impl Client {
                     return Err(MonaxError::Protocol("OK payload too short".into()));
                 }
                 let rows_affected = u64::from_le_bytes(resp.payload[..8].try_into().unwrap());
-                Ok(QueryResult::Ok { rows_affected })
+                Ok(QueryResult::Ok {
+                    rows_affected,
+                    server_elapsed: parse_server_elapsed_trailer(&resp.payload, 8),
+                })
             }
             MSG_TYPE_RESULT => Ok(parse_text_result(&resp.payload)?),
             MSG_TYPE_ERROR => {
@@ -161,7 +166,7 @@ impl Client {
 
     pub async fn execute(&mut self, sql: &str) -> Result<u64> {
         match self.query(sql).await? {
-            QueryResult::Ok { rows_affected } => Ok(rows_affected),
+            QueryResult::Ok { rows_affected, .. } => Ok(rows_affected),
             QueryResult::Error(msg) => Err(MonaxError::Sql(msg)),
             QueryResult::Rows { .. } => Ok(0),
         }
@@ -422,9 +427,11 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     let schema = Schema::new(columns);
 
     if row_count == 0 {
+        let server_elapsed = parse_server_elapsed_trailer(payload, offset);
         return Ok(QueryResult::Rows {
             schema: schema.clone(),
             batches: vec![RecordBatch::new(schema)],
+            server_elapsed,
         });
     }
 
@@ -456,10 +463,21 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    let server_elapsed = parse_server_elapsed_trailer(payload, offset);
     Ok(QueryResult::Rows {
         schema,
         batches: vec![batch],
+        server_elapsed,
     })
+}
+
+fn parse_server_elapsed_trailer(payload: &[u8], offset: usize) -> Option<Duration> {
+    let trailer = payload.get(offset..offset + 12)?;
+    if &trailer[..4] != b"MXTM" {
+        return None;
+    }
+    let micros = u64::from_le_bytes(trailer[4..12].try_into().ok()?);
+    Some(Duration::from_micros(micros))
 }
 
 fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarValue, usize)> {
@@ -736,7 +754,10 @@ mod tests {
         write_decimal_cell(&mut payload, "0");
 
         let result = parse_text_result(&payload).unwrap();
-        let QueryResult::Rows { schema, batches } = result else {
+        let QueryResult::Rows {
+            schema, batches, ..
+        } = result
+        else {
             panic!("expected row result");
         };
 

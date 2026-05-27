@@ -21,11 +21,11 @@ struct BuildingRowGroup {
     zone_mins: Vec<Option<ScalarValue>>,
     zone_maxs: Vec<Option<ScalarValue>>,
     null_counts: Vec<u64>,
-    bloom_filters: Vec<BloomFilter>,
+    bloom_filters: Vec<Option<BloomFilter>>,
 }
 
 impl BuildingRowGroup {
-    fn new(num_columns: usize) -> Self {
+    fn new(num_columns: usize, bloom_columns: &[bool]) -> Self {
         Self {
             columns: vec![Vec::new(); num_columns],
             row_count: 0,
@@ -33,7 +33,10 @@ impl BuildingRowGroup {
             zone_mins: vec![None; num_columns],
             zone_maxs: vec![None; num_columns],
             null_counts: vec![0; num_columns],
-            bloom_filters: vec![BloomFilter::with_defaults(); num_columns],
+            bloom_filters: bloom_columns
+                .iter()
+                .map(|enabled| enabled.then(BloomFilter::with_defaults))
+                .collect(),
         }
     }
 }
@@ -46,10 +49,21 @@ pub struct SegmentWriter {
     row_groups: Vec<crate::storage::segment::RowGroupMeta>,
     current_group: Option<BuildingRowGroup>,
     total_rows: u64,
+    bloom_columns: Vec<bool>,
 }
 
 impl SegmentWriter {
     pub fn create(path: &Path, schema: Schema, row_group_size: usize) -> Result<Self> {
+        let bloom_columns: Vec<usize> = (0..schema.num_columns()).collect();
+        Self::create_with_bloom_columns(path, schema, row_group_size, &bloom_columns)
+    }
+
+    pub fn create_with_bloom_columns(
+        path: &Path,
+        schema: Schema,
+        row_group_size: usize,
+        bloom_column_indices: &[usize],
+    ) -> Result<Self> {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -58,6 +72,12 @@ impl SegmentWriter {
 
         let header = encode_segment_header();
         file.write_all(&header)?;
+        let mut bloom_columns = vec![false; schema.num_columns()];
+        for &idx in bloom_column_indices {
+            if idx < bloom_columns.len() {
+                bloom_columns[idx] = true;
+            }
+        }
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -67,6 +87,7 @@ impl SegmentWriter {
             row_groups: Vec::new(),
             current_group: None,
             total_rows: 0,
+            bloom_columns,
         })
     }
 
@@ -77,7 +98,7 @@ impl SegmentWriter {
 
         let num_cols = self.schema.num_columns();
         if self.current_group.is_none() {
-            self.current_group = Some(BuildingRowGroup::new(num_cols));
+            self.current_group = Some(BuildingRowGroup::new(num_cols, &self.bloom_columns));
         }
 
         let mut remaining = batch.num_rows();
@@ -85,13 +106,13 @@ impl SegmentWriter {
 
         while remaining > 0 {
             if self.current_group.is_none() {
-                self.current_group = Some(BuildingRowGroup::new(num_cols));
+                self.current_group = Some(BuildingRowGroup::new(num_cols, &self.bloom_columns));
             }
             let group = self.current_group.as_mut().unwrap();
             let can_fit = self.row_group_size - group.row_count;
             if can_fit == 0 {
                 self.flush_row_group()?;
-                self.current_group = Some(BuildingRowGroup::new(num_cols));
+                self.current_group = Some(BuildingRowGroup::new(num_cols, &self.bloom_columns));
             }
             let group = self.current_group.as_mut().unwrap();
             let can_fit = self.row_group_size - group.row_count;
@@ -110,7 +131,9 @@ impl SegmentWriter {
 
                 for row_idx in offset..offset + to_write {
                     let val = col.scalar(row_idx);
-                    group.bloom_filters[col_idx].add(&val);
+                    if let Some(bloom_filter) = &mut group.bloom_filters[col_idx] {
+                        bloom_filter.add(&val);
+                    }
                 }
 
                 let encoded = encode_column(col, offset, to_write)?;
@@ -200,7 +223,7 @@ impl SegmentWriter {
         let bloom_filters: Vec<Option<BloomFilter>> = group
             .bloom_filters
             .into_iter()
-            .map(|bf| if bf.is_empty() { None } else { Some(bf) })
+            .map(|bf| bf.filter(|b| !b.is_empty()))
             .collect();
 
         self.row_groups.push(crate::storage::segment::RowGroupMeta {

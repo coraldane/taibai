@@ -69,7 +69,7 @@ fn count_no_predicate(
     mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<()> {
     for seg_path in segment_files {
-        match segment_mgr.open_reader(seg_path) {
+        match segment_mgr.open_reader_cached(seg_path) {
             Ok(reader) => {
                 let count = reader.row_count();
                 let deleted = reader.deleted_row_count();
@@ -96,7 +96,7 @@ fn count_with_single_eq(
     let pred = spec.to_row_group_predicate();
 
     for seg_path in segment_files {
-        let reader = match segment_mgr.open_reader(seg_path) {
+        let reader = match segment_mgr.open_reader_cached(seg_path) {
             Ok(r) => r,
             Err(e) => return Err(e),
         };
@@ -135,7 +135,7 @@ fn count_with_predicates(
     };
 
     for seg_path in segment_files {
-        let reader = match segment_mgr.open_reader(seg_path) {
+        let reader = match segment_mgr.open_reader_cached(seg_path) {
             Ok(r) => r,
             Err(e) => return Err(e),
         };

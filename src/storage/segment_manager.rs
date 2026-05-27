@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -25,6 +25,7 @@ const FLUSH_META_AFTER_ROW_GROUP: bool = true;
 
 const DEFAULT_MIN_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
+const DEFAULT_READER_CACHE_CAPACITY: usize = 1024;
 
 pub struct SegmentConfig {
     pub min_segment_size: u64,
@@ -73,10 +74,84 @@ impl TableSegmentState {
 pub struct SegmentManager {
     data_dir: PathBuf,
     tables: RwLock<HashMap<String, Arc<TableSegmentState>>>,
+    reader_cache: Mutex<ReaderCache>,
     flush_stop: Arc<AtomicBool>,
     flush_paused: Arc<AtomicBool>,
     next_txn_id: AtomicU64,
     config: SegmentConfig,
+}
+
+struct ReaderCache {
+    capacity: usize,
+    entries: HashMap<PathBuf, Arc<SegmentReader>>,
+    order: VecDeque<PathBuf>,
+}
+
+impl ReaderCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, path: &Path) -> Option<Arc<SegmentReader>> {
+        let key = path.to_path_buf();
+        let reader = self.entries.get(&key).cloned()?;
+        self.touch(&key);
+        Some(reader)
+    }
+
+    fn put(&mut self, path: PathBuf, reader: SegmentReader) -> Arc<SegmentReader> {
+        let reader = Arc::new(reader);
+        if self
+            .entries
+            .insert(path.clone(), Arc::clone(&reader))
+            .is_none()
+        {
+            self.order.push_back(path);
+        }
+        self.evict_if_needed();
+        reader
+    }
+
+    fn invalidate(&mut self, path: &Path) {
+        let key = path.to_path_buf();
+        self.entries.remove(&key);
+        if let Some(pos) = self.order.iter().position(|p| p == &key) {
+            self.order.remove(pos);
+        }
+    }
+
+    fn invalidate_under(&mut self, dir: &Path) {
+        let keys: Vec<PathBuf> = self
+            .entries
+            .keys()
+            .filter(|path| path.starts_with(dir))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.invalidate(&key);
+        }
+    }
+
+    fn touch(&mut self, path: &PathBuf) {
+        if let Some(pos) = self.order.iter().position(|p| p == path) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(path.clone());
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl SegmentManager {
@@ -119,6 +194,7 @@ impl SegmentManager {
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             tables: RwLock::new(tables),
+            reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
             flush_stop,
             flush_paused,
             next_txn_id: AtomicU64::new(0),
@@ -281,12 +357,34 @@ impl SegmentManager {
         SegmentReader::open(path)
     }
 
+    pub fn open_reader_cached(&self, path: &Path) -> Result<Arc<SegmentReader>> {
+        if let Some(reader) = self.reader_cache.lock().unwrap().get(path) {
+            return Ok(reader);
+        }
+
+        let reader = SegmentReader::open(path)?;
+        Ok(self
+            .reader_cache
+            .lock()
+            .unwrap()
+            .put(path.to_path_buf(), reader))
+    }
+
+    pub fn invalidate_reader(&self, path: &Path) {
+        self.reader_cache.lock().unwrap().invalidate(path);
+    }
+
+    pub fn invalidate_readers_under(&self, dir: &Path) {
+        self.reader_cache.lock().unwrap().invalidate_under(dir);
+    }
+
     pub fn rewrite_delete_footer(
         &self,
         path: &Path,
         bitmap: &[u8],
         deleted_count: u64,
     ) -> Result<()> {
+        self.invalidate_reader(path);
         SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)
     }
 
@@ -970,6 +1068,7 @@ impl SegmentManager {
 
         segment.current_size = segment.data_end + footer.len() as u64 + 8;
         segment.dirty_meta = false;
+        self.invalidate_reader(&segment.path);
 
         tracing::debug!(
             path = %segment.path.display(),
@@ -1213,5 +1312,16 @@ fn bulk_compression_level() -> i32 {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(1)
+    })
+}
+
+fn reader_cache_capacity() -> usize {
+    static CAPACITY: OnceLock<usize> = OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        std::env::var("MONAX_READER_CACHE_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_READER_CACHE_CAPACITY)
     })
 }
