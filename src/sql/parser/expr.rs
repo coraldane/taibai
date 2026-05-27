@@ -40,6 +40,10 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr> {
         let left = self.parse_addition()?;
+        self.parse_comparison_rest(left)
+    }
+
+    fn parse_comparison_rest(&mut self, left: Expr) -> Result<Expr> {
         let op = match self.peek() {
             Token::Eq => Some(BinOp::Eq),
             Token::Neq => Some(BinOp::Neq),
@@ -57,6 +61,92 @@ impl Parser {
                 op,
                 right: Box::new(right),
             })
+        } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "BETWEEN") {
+            self.advance();
+            let low = self.parse_addition()?;
+            self.expect(&Token::And)?;
+            let high = self.parse_addition()?;
+            Ok(Expr::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated: false,
+            })
+        } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "IN") {
+            self.advance();
+            self.expect(&Token::LeftParen)?;
+            let mut values = Vec::new();
+            if self.peek() != &Token::RightParen {
+                loop {
+                    values.push(self.parse_expr()?);
+                    if self.peek() == &Token::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Token::RightParen)?;
+            Ok(Expr::In {
+                expr: Box::new(left),
+                values,
+                negated: false,
+            })
+        } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "LIKE") {
+            self.advance();
+            let pattern = self.parse_addition()?;
+            Ok(Expr::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                negated: false,
+            })
+        } else if self.peek() == &Token::Not {
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "BETWEEN") {
+                self.advance();
+                let low = self.parse_addition()?;
+                self.expect(&Token::And)?;
+                let high = self.parse_addition()?;
+                Ok(Expr::Between {
+                    expr: Box::new(left),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated: true,
+                })
+            } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "IN") {
+                self.advance();
+                self.expect(&Token::LeftParen)?;
+                let mut values = Vec::new();
+                if self.peek() != &Token::RightParen {
+                    loop {
+                        values.push(self.parse_expr()?);
+                        if self.peek() == &Token::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Token::RightParen)?;
+                Ok(Expr::In {
+                    expr: Box::new(left),
+                    values,
+                    negated: true,
+                })
+            } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "LIKE") {
+                self.advance();
+                let pattern = self.parse_addition()?;
+                Ok(Expr::Like {
+                    expr: Box::new(left),
+                    pattern: Box::new(pattern),
+                    negated: true,
+                })
+            } else {
+                Err(MonaxError::Sql(format!(
+                    "expected BETWEEN, IN, or LIKE after NOT, got {}",
+                    self.peek()
+                )))
+            }
         } else {
             Ok(left)
         }
@@ -66,16 +156,16 @@ impl Parser {
         let mut left = self.parse_multiplication()?;
         loop {
             let op = match self.peek() {
-                t if *t == Token::Ident("+".into()) => Some(BinOp::Add),
-                t if *t == Token::Ident("-".into()) => Some(BinOp::Sub),
+                Token::Plus => Some(BinOp::Add),
+                Token::Minus => Some(BinOp::Sub),
                 _ => None,
             };
-            if let Some(_op) = op {
+            if let Some(op) = op {
                 self.advance();
                 let right = self.parse_multiplication()?;
                 left = Expr::BinaryOp {
                     left: Box::new(left),
-                    op: _op,
+                    op,
                     right: Box::new(right),
                 };
             } else {
@@ -86,17 +176,77 @@ impl Parser {
     }
 
     fn parse_multiplication(&mut self) -> Result<Expr> {
-        self.parse_unary()
+        let mut left = self.parse_unary()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star => Some(BinOp::Mul),
+                t if *t == Token::Ident("/".into()) => Some(BinOp::Div),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.advance();
+                let right = self.parse_unary()?;
+                left = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
         if self.peek() == &Token::Not {
             self.advance();
-            let expr = self.parse_primary()?;
+            let expr = self.parse_comparison()?;
             Ok(Expr::UnaryNot(Box::new(expr)))
+        } else if self.peek() == &Token::Minus {
+            self.advance();
+            let expr = self.parse_primary()?;
+            Ok(Expr::UnaryMinus(Box::new(expr)))
+        } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "CASE") {
+            self.advance();
+            self.parse_case()
         } else {
             self.parse_primary()
         }
+    }
+
+    fn parse_case(&mut self) -> Result<Expr> {
+        let operand = if !matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "WHEN") {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        let mut when_clauses = Vec::new();
+        while matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "WHEN") {
+            self.advance();
+            let condition = self.parse_expr()?;
+            match self.peek() {
+                Token::Ident(s) if s.to_uppercase() == "THEN" => { self.advance(); }
+                other => return Err(MonaxError::Sql(format!("expected 'THEN' in CASE, got {}", other))),
+            }
+            let result = self.parse_expr()?;
+            when_clauses.push((condition, result));
+        }
+        let else_clause = if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "ELSE") {
+            self.advance();
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        match self.peek() {
+            Token::Ident(s) if s.to_uppercase() == "END" => { self.advance(); }
+            other => return Err(MonaxError::Sql(format!("expected 'END' in CASE, got {}", other))),
+        }
+        Ok(Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        })
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {

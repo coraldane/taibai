@@ -188,14 +188,17 @@ fn exec_table_select(
         try_skip_sort_for_cluster_key(plan, &table_batches, &table_cluster_keys, &table_schemas);
 
     let mut pipeline = super::operators::build_pipeline(plan, &table_batches)?;
+    tracing::debug!("query: pipeline built, starting next_batch loop");
     let mut result_batches = Vec::new();
     let mut result_schema = None;
     while let Some(batch) = pipeline.next_batch()? {
+        tracing::debug!("query: got batch with {} rows, schema columns={:?}", batch.num_rows(), batch.schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
         if result_schema.is_none() {
             result_schema = Some(batch.schema.clone());
         }
         result_batches.push(batch);
     }
+    tracing::debug!("query: finished next_batch loop, {} batches", result_batches.len());
 
     let schema = result_schema.unwrap_or_else(|| Schema::empty());
     Ok(ExecResult::Query {

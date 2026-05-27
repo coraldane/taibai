@@ -309,6 +309,9 @@ impl<'a> Lexer<'a> {
                     if self.peek_byte() == Some(b'=') {
                         self.pos += 1;
                         Token::Lte
+                    } else if self.peek_byte() == Some(b'>') {
+                        self.pos += 1;
+                        Token::Neq
                     } else {
                         Token::Lt
                     }
@@ -330,6 +333,10 @@ impl<'a> Lexer<'a> {
                     } else {
                         return Err(MonaxError::Sql("unexpected character '!'".into()));
                     }
+                }
+                b'/' => {
+                    self.pos += 1;
+                    Token::Ident("/".into())
                 }
                 b'-' => {
                     self.pos += 1;

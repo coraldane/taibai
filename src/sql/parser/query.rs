@@ -50,6 +50,13 @@ impl Parser {
             Vec::new()
         };
 
+        let having = if self.peek() == &Token::Having {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
         let order_by = if self.peek() == &Token::Order {
             self.advance();
             self.expect(&Token::By)?;
@@ -96,7 +103,7 @@ impl Parser {
             from,
             where_clause,
             group_by,
-            having: None,
+            having,
             order_by,
             limit,
             offset,
@@ -223,7 +230,7 @@ impl Parser {
         loop {
             let is_join = matches!(
                 self.peek(),
-                Token::Join | Token::Inner | Token::Left | Token::Cross
+                Token::Join | Token::Inner | Token::Left | Token::Right | Token::Cross
             );
             if !is_join {
                 break;
@@ -282,6 +289,13 @@ impl Parser {
             }
             self.expect(&Token::Join)?;
             JoinType::Left
+        } else if self.peek() == &Token::Right {
+            self.advance();
+            if self.peek() == &Token::Outer {
+                self.advance();
+            }
+            self.expect(&Token::Join)?;
+            JoinType::Right
         } else if self.peek() == &Token::Cross {
             self.advance();
             self.expect(&Token::Join)?;

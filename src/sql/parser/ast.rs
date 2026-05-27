@@ -7,6 +7,7 @@ pub enum AlterOperation {
     AddColumn { column: ColumnDefAst },
     DropColumn { name: String },
     RenameColumn { old_name: String, new_name: String },
+    ModifyColumn { column: ColumnDefAst },
     RenameTable { new_name: String },
     DropPartition { partition_key: String },
     TruncatePartition { partition_key: String },

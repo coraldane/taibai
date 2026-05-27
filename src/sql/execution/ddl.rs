@@ -151,6 +151,9 @@ pub fn exec_alter_table(
             AlterOperation::RenameColumn { old_name, new_name } => {
                 catalog.rename_column(name, old_name, new_name)?;
             }
+            AlterOperation::ModifyColumn { column } => {
+                catalog.modify_column(name, &column.name, column.data_type, column.scale, column.precision)?;
+            }
             AlterOperation::RenameTable { new_name } => {
                 let old_table_dir = engine.data_dir().join(db).join(name);
                 let new_table_dir = engine.data_dir().join(db).join(new_name);

@@ -62,6 +62,8 @@ impl ExecutionOp for HashAggregateExec {
         let mut all_rows: Vec<Vec<ScalarValue>> = Vec::new();
         let mut physical_schema = None;
         while let Some(batch) = self.input.next_batch()? {
+            tracing::debug!("aggregate: input batch schema = {:?}", batch.schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
+            tracing::debug!("aggregate: input batch num_rows = {}", batch.num_rows());
             if physical_schema.is_none() {
                 physical_schema = Some(batch.schema.clone());
             }
@@ -73,16 +75,19 @@ impl ExecutionOp for HashAggregateExec {
             }
         }
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
+        tracing::debug!("aggregate: physical_schema = {:?}", physical_schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
         let group_by: Vec<LogicalExpr> = self
             .group_by
             .iter()
             .map(|expr| remap_expr_for_batch(expr, &self.input_schema, &physical_schema))
             .collect();
+        tracing::debug!("aggregate: remapped group_by = {:?}", group_by.len());
         let aggregates: Vec<AggregateExpr> = self
             .aggregates
             .iter()
             .map(|agg| remap_aggregate_for_batch(agg, &self.input_schema, &physical_schema))
             .collect();
+        tracing::debug!("aggregate: remapped aggregates = {:?}", aggregates.len());
 
         // Group by key
         let mut groups: HashMap<Vec<String>, Vec<Vec<ScalarValue>>> = HashMap::new();
@@ -97,6 +102,7 @@ impl ExecutionOp for HashAggregateExec {
             }
             groups.entry(key).or_default().push(row.clone());
         }
+        tracing::debug!("aggregate: all_rows count={}, groups count={}, group_order count={}", all_rows.len(), groups.len(), group_order.len());
 
         // Build output schema
         let mut col_defs = Vec::new();
@@ -111,17 +117,23 @@ impl ExecutionOp for HashAggregateExec {
                 }
             }
         }
-        for agg in &self.aggregates {
-            let name = format_aggregate_name(agg, &self.input_schema);
-            let dt = aggregate_result_type(agg, &self.input_schema);
+        for agg in &aggregates {
+            let name = format_aggregate_name(agg, &physical_schema);
+            let dt = aggregate_result_type(agg, &physical_schema);
+            tracing::debug!("aggregate result type: agg={:?}, name={}, dt={:?}", agg.func, name, dt);
             col_defs.push(ColumnDef::new(&name, dt));
         }
         let schema = Schema::new(col_defs.clone());
+        tracing::debug!("aggregate: result schema columns = {:?}", schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
 
         // Compute aggregations
+        tracing::debug!("aggregate: starting aggregation loop, group_order len={}", group_order.len());
         let mut result_batch = RecordBatch::new(schema);
+        tracing::debug!("aggregate: batch columns after new = {:?}", result_batch.columns.iter().map(|c| c.data_type()).collect::<Vec<_>>());
         for key in &group_order {
+            tracing::debug!("aggregate: processing group key={:?}", key);
             let rows = groups.get(key).unwrap();
+            tracing::debug!("aggregate: rows in this group={}", rows.len());
             let mut row_vals = Vec::new();
             for expr in &group_by {
                 if let LogicalExpr::Column(idx) = expr {
@@ -133,24 +145,41 @@ impl ExecutionOp for HashAggregateExec {
                     );
                 }
             }
+            tracing::debug!("aggregate: row_vals after group_by={}", row_vals.len());
             for agg in &aggregates {
-                row_vals.push(compute_aggregate(agg, rows, &physical_schema));
+                let val = compute_aggregate(agg, rows, &physical_schema);
+                tracing::debug!("aggregate: computed value for {:?}: type={:?}, val={}", agg.func, val.data_type(), val);
+                row_vals.push(val);
             }
+            tracing::debug!("aggregate: row_vals total={}", row_vals.len());
+            tracing::debug!("aggregate: result_batch.num_columns={}", result_batch.num_columns());
             for (col_idx, val) in row_vals.iter().enumerate() {
+                let col = result_batch.columns.get(col_idx);
+                tracing::debug!("aggregate push attempt: col_idx={}, val_type={:?}, col_type={:?}, val={}", col_idx, val.data_type(), col.map(|c| c.data_type()), val);
+                if let Some(col_arr) = col {
+                    tracing::debug!("aggregate push: column array type = {:?}", col_arr.data_type());
+                }
                 result_batch.column_mut(col_idx).unwrap().push(val)?;
             }
         }
 
+        tracing::debug!("aggregate: after push, batch columns = {:?}", result_batch.columns.iter().map(|c| c.data_type()).collect::<Vec<_>>());
+        tracing::debug!("aggregate: returning result_batch with {} rows", result_batch.num_rows());
+        tracing::debug!("aggregate: result_batch schema = {:?}", result_batch.schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
+
         // Apply DISTINCT if needed
         if self.distinct {
+            tracing::debug!("aggregate: applying DISTINCT");
             result_batch = apply_distinct(result_batch);
         }
 
         // Apply HAVING filter if present
         if let Some(ref having_pred) = self.having {
+            tracing::debug!("aggregate: applying HAVING filter");
             result_batch = apply_having(result_batch, having_pred)?;
         }
 
+        tracing::debug!("aggregate: final result_batch ready, returning");
         Ok(Some(result_batch))
     }
 }
@@ -173,7 +202,36 @@ pub fn format_aggregate_name(agg: &AggregateExpr, schema: &Schema) -> String {
         _ => "expr".to_string(),
     };
     let distinct_str = if agg.distinct { "DISTINCT " } else { "" };
-    format!("{:?}({}{})", agg.func, distinct_str, arg_name)
+    let func_name = match agg.func {
+        AggFunc::Count => "COUNT",
+        AggFunc::Sum => "SUM",
+        AggFunc::Avg => "AVG",
+        AggFunc::Min => "MIN",
+        AggFunc::Max => "MAX",
+    };
+    format!("{}({}{})", func_name, distinct_str, arg_name)
+}
+
+fn null_scalar_of_type(dt: DataType) -> ScalarValue {
+    match dt {
+        DataType::Int64 => ScalarValue::Int64(None),
+        DataType::Int32 => ScalarValue::Int32(None),
+        DataType::Int16 => ScalarValue::Int16(None),
+        DataType::Int8 => ScalarValue::Int8(None),
+        DataType::UInt64 => ScalarValue::UInt64(None),
+        DataType::UInt32 => ScalarValue::UInt32(None),
+        DataType::Float64 => ScalarValue::Float64(None),
+        DataType::Float32 => ScalarValue::Float32(None),
+        DataType::VarChar => ScalarValue::VarChar(None),
+        DataType::Bool => ScalarValue::Bool(None),
+        DataType::Date => ScalarValue::Date(None),
+        DataType::Timestamp => ScalarValue::Timestamp(None),
+        DataType::Decimal => ScalarValue::Decimal(None),
+        DataType::Interval => ScalarValue::Interval(None),
+        DataType::Blob => ScalarValue::Blob(None),
+        DataType::Vector => ScalarValue::Vector(None),
+        _ => ScalarValue::Int64(None),
+    }
 }
 
 fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
@@ -267,7 +325,17 @@ pub fn compute_aggregate(
                 .min_by(|a, b| compare_scalars(a, b))
             {
                 Some(v) => (*v).clone(),
-                None => ScalarValue::Int64(None),
+                None => {
+                    if let LogicalExpr::Column(idx) = &*agg.arg {
+                        if let Some(col) = _schema.columns.get(*idx) {
+                            null_scalar_of_type(col.data_type)
+                        } else {
+                            ScalarValue::Int64(None)
+                        }
+                    } else {
+                        ScalarValue::Int64(None)
+                    }
+                }
             }
         }
         AggFunc::Max => {
@@ -277,7 +345,17 @@ pub fn compute_aggregate(
                 .max_by(|a, b| compare_scalars(a, b))
             {
                 Some(v) => (*v).clone(),
-                None => ScalarValue::Int64(None),
+                None => {
+                    if let LogicalExpr::Column(idx) = &*agg.arg {
+                        if let Some(col) = _schema.columns.get(*idx) {
+                            null_scalar_of_type(col.data_type)
+                        } else {
+                            ScalarValue::Int64(None)
+                        }
+                    } else {
+                        ScalarValue::Int64(None)
+                    }
+                }
             }
         }
     }

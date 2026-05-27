@@ -312,6 +312,34 @@ impl DatabaseCatalog {
         col.name = new_name.to_string();
         Ok(())
     }
+
+    pub fn modify_column(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        data_type: crate::protocol::types::DataType,
+        scale: i32,
+        precision: i32,
+    ) -> Result<()> {
+        let table = self
+            .tables
+            .get_mut(table_name)
+            .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
+        let col = table
+            .columns
+            .iter_mut()
+            .find(|c| c.name == column_name)
+            .ok_or_else(|| {
+                MonaxError::Sql(format!(
+                    "column '{}' does not exist in table '{}'",
+                    column_name, table_name
+                ))
+            })?;
+        col.data_type = data_type;
+        col.scale = scale;
+        col.precision = precision;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

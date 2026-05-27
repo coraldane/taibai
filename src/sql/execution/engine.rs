@@ -258,6 +258,14 @@ impl Engine {
             } => super::dml_delete::exec_delete(self, &session.database, table, where_clause),
             Statement::Select { .. } => super::query::exec_select(self, &session.database, stmt),
             Statement::UseDatabase(database) => {
+                let catalogs = self.catalogs().read().unwrap();
+                if !catalogs.contains_key(database.as_str()) {
+                    return Err(MonaxError::Sql(format!(
+                        "database '{}' does not exist",
+                        database
+                    )));
+                }
+                drop(catalogs);
                 session.database = database.clone();
                 Ok(ExecResult::Ok { rows_affected: 0 })
             }

@@ -121,7 +121,17 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
         LogicalExpr::BinaryOp { .. } => DataType::Int64,
         LogicalExpr::Aggregate(agg) => match agg.func {
             crate::sql::planner::AggFunc::Count => DataType::Int64,
-            _ => DataType::Float64,
+            crate::sql::planner::AggFunc::Sum | crate::sql::planner::AggFunc::Avg => DataType::Float64,
+            crate::sql::planner::AggFunc::Min | crate::sql::planner::AggFunc::Max => {
+                match &*agg.arg {
+                    LogicalExpr::Column(idx) => schema
+                        .columns
+                        .get(*idx)
+                        .map(|c| c.data_type)
+                        .unwrap_or(DataType::Int64),
+                    _ => DataType::Int64,
+                }
+            }
         },
         _ => DataType::Int64,
     }

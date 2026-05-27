@@ -540,6 +540,7 @@ impl ExecutionOp for HashAggregateExec {
             return Ok(None);
         }
         self.done = true;
+        tracing::debug!("operators.rs HashAggregateExec: starting aggregation");
 
         // Collect all input
         let mut all_rows: Vec<Vec<ScalarValue>> = Vec::new();
@@ -568,6 +569,7 @@ impl ExecutionOp for HashAggregateExec {
 
         // Build output schema
         let mut col_defs = Vec::new();
+        tracing::debug!("HashAggregateExec: input_schema = {:?}", self.input_schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
         for expr in &self.group_by {
             match expr {
                 LogicalExpr::Column(idx) => {
@@ -591,11 +593,16 @@ impl ExecutionOp for HashAggregateExec {
                 AggFunc::Sum | AggFunc::Avg => DataType::Float64,
                 AggFunc::Min | AggFunc::Max => {
                     match &*agg.arg {
-                        LogicalExpr::Column(idx) => self.input_schema.columns.get(*idx).map(|c| c.data_type).unwrap_or(DataType::Int64),
+                        LogicalExpr::Column(idx) => {
+                            let col_dt = self.input_schema.columns.get(*idx).map(|c| c.data_type).unwrap_or(DataType::Int64);
+                            tracing::debug!("MIN/MAX: idx={}, col_dt={:?}, col_name={}", idx, col_dt, self.input_schema.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default());
+                            col_dt
+                        }
                         _ => DataType::Int64,
                     }
                 }
             };
+            tracing::debug!("aggregate column: agg={:?}, name={}, dt={:?}", agg.func, name, dt);
             col_defs.push(ColumnDef::new(&name, dt));
         }
         let schema = Schema::new(col_defs);

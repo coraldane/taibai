@@ -300,28 +300,28 @@ impl Parser {
     }
 
     fn parse_privileges(&mut self) -> Result<Vec<Privilege>> {
-        if self.peek() == &Token::Privileges || self.peek() == &Token::All {
-            if self.peek() == &Token::All {
-                self.advance();
-                return Ok(vec![Privilege::All]);
-            }
+        if self.peek() == &Token::All {
             self.advance();
+            if self.peek() == &Token::Privileges {
+                self.advance();
+            }
+            return Ok(vec![Privilege::All]);
         }
         let mut privileges = Vec::new();
         loop {
-            let priv_name = self.expect_ident()?.to_uppercase();
-            let privilege = match priv_name.as_str() {
-                "ALL" | "ALL_PRIVILEGES" => Privilege::All,
-                "SELECT" => Privilege::Select,
-                "INSERT" => Privilege::Insert,
-                "UPDATE" => Privilege::Update,
-                "DELETE" => Privilege::Delete,
-                "CREATE" => Privilege::Create,
-                "DROP" => Privilege::Drop,
-                "ALTER" => Privilege::Alter,
-                "TRUNCATE" => Privilege::Truncate,
-                _ => return Err(MonaxError::Sql(format!("unknown privilege: {}", priv_name))),
+            let privilege = match self.peek() {
+                Token::Select => Privilege::Select,
+                Token::Insert => Privilege::Insert,
+                Token::Update => Privilege::Update,
+                Token::Delete => Privilege::Delete,
+                Token::Create => Privilege::Create,
+                Token::Drop => Privilege::Drop,
+                Token::Alter => Privilege::Alter,
+                Token::Truncate => Privilege::Truncate,
+                Token::Ident(s) if s.to_uppercase() == "ALL" || s.to_uppercase() == "ALL_PRIVILEGES" => Privilege::All,
+                _ => return Err(MonaxError::Sql(format!("expected privilege name, got {}", self.peek()))),
             };
+            self.advance();
             privileges.push(privilege);
             if self.peek() == &Token::Comma {
                 self.advance();
@@ -469,7 +469,7 @@ impl Parser {
                 self.advance();
                 self.expect(&Token::Column)?;
                 let column = self.parse_column_def()?;
-                AlterOperation::AddColumn { column }
+                AlterOperation::ModifyColumn { column }
             } else {
                 break;
             };
@@ -530,7 +530,9 @@ impl Parser {
 
     pub fn parse_truncate(&mut self) -> Result<Statement> {
         self.expect(&Token::Truncate)?;
-        self.expect(&Token::Table)?;
+        if self.peek() == &Token::Table {
+            self.advance();
+        }
         let table = self.expect_ident()?;
         Ok(Statement::Truncate { table })
     }
