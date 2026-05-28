@@ -54,7 +54,7 @@ pub fn build_pipeline(
                 .get(&scan.table_name)
                 .cloned()
                 .unwrap_or_default();
-            Ok(Box::new(ScanExec::new(batches, scan.projection)))
+            Ok(Box::new(ScanExec::new(batches, scan.projection).with_table_schema(scan.schema)))
         }
         LogicalPlan::Filter(filter) => {
             let schema = get_scan_schema(&filter.input);

@@ -241,7 +241,9 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
         }
     }
 
-    engine.auto_increment_manager().reset(db, table, 1)?;
+    if engine.auto_increment_manager().get(db, table).is_some() {
+        engine.auto_increment_manager().reset(db, table, 1)?;
+    }
 
     if let Some(meta) = catalog.get_table_mut(table) {
         meta.row_count = 0;

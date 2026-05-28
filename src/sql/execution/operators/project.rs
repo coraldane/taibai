@@ -121,11 +121,11 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
         LogicalExpr::BinaryOp { .. } => DataType::Int64,
         LogicalExpr::Aggregate(agg) => {
             let agg_prefix = match agg.func {
-                crate::sql::planner::AggFunc::Count => "COUNT",
-                crate::sql::planner::AggFunc::Sum => "SUM",
-                crate::sql::planner::AggFunc::Avg => "AVG",
-                crate::sql::planner::AggFunc::Min => "MIN",
-                crate::sql::planner::AggFunc::Max => "MAX",
+                crate::sql::planner::AggFunc::Count => "count",
+                crate::sql::planner::AggFunc::Sum => "sum",
+                crate::sql::planner::AggFunc::Avg => "avg",
+                crate::sql::planner::AggFunc::Min => "min",
+                crate::sql::planner::AggFunc::Max => "max",
             };
             
             schema

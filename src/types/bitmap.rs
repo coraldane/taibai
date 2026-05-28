@@ -51,13 +51,14 @@ impl NullBitmap {
 
     #[inline]
     pub fn is_null(&self, idx: usize) -> bool {
-        debug_assert!(
-            idx < self.len,
-            "index {} out of bounds (len={})",
-            idx,
-            self.len
-        );
-        self.data[idx / 64] & (1u64 << (idx % 64)) != 0
+        if self.len == 0 || idx >= self.len || self.data.is_empty() {
+            return false;
+        }
+        let data_idx = idx / 64;
+        if data_idx >= self.data.len() {
+            return false;
+        }
+        self.data[data_idx] & (1u64 << (idx % 64)) != 0
     }
 
     #[inline]
@@ -67,14 +68,24 @@ impl NullBitmap {
 
     #[inline]
     pub fn set_null(&mut self, idx: usize) {
-        debug_assert!(idx < self.len);
-        self.data[idx / 64] |= 1u64 << (idx % 64);
+        if idx >= self.len || self.data.is_empty() {
+            return;
+        }
+        let data_idx = idx / 64;
+        if data_idx < self.data.len() {
+            self.data[data_idx] |= 1u64 << (idx % 64);
+        }
     }
 
     #[inline]
     pub fn set_valid(&mut self, idx: usize) {
-        debug_assert!(idx < self.len);
-        self.data[idx / 64] &= !(1u64 << (idx % 64));
+        if idx >= self.len || self.data.is_empty() {
+            return;
+        }
+        let data_idx = idx / 64;
+        if data_idx < self.data.len() {
+            self.data[data_idx] &= !(1u64 << (idx % 64));
+        }
     }
 
     #[inline]

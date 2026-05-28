@@ -203,11 +203,11 @@ pub fn format_aggregate_name(agg: &AggregateExpr, schema: &Schema) -> String {
     };
     let distinct_str = if agg.distinct { "DISTINCT " } else { "" };
     let func_name = match agg.func {
-        AggFunc::Count => "COUNT",
-        AggFunc::Sum => "SUM",
-        AggFunc::Avg => "AVG",
-        AggFunc::Min => "MIN",
-        AggFunc::Max => "MAX",
+        AggFunc::Count => "count",
+        AggFunc::Sum => "sum",
+        AggFunc::Avg => "avg",
+        AggFunc::Min => "min",
+        AggFunc::Max => "max",
     };
     format!("{}({}{})", func_name, distinct_str, arg_name)
 }

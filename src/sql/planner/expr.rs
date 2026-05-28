@@ -546,6 +546,45 @@ fn extract_aggs_from_expr(expr: &Expr, aggs: &mut Vec<(AggFunc, Option<Expr>, bo
     }
 }
 
+pub fn expr_to_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Column(name) => name.clone(),
+        Expr::Literal(v) => format!("{:?}", v),
+        Expr::QualifiedColumn { column, .. } => column.clone(),
+        Expr::BinaryOp { left, op, right } => {
+            let l = expr_to_name(left);
+            let r = expr_to_name(right);
+            let op_str = match op {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                _ => "?",
+            };
+            format!("{} {} {}", l, op_str, r)
+        }
+        Expr::Function { name, args, distinct } => {
+            let arg_str = if args.is_empty() {
+                "*".to_string()
+            } else if args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*") {
+                "*".to_string()
+            } else {
+                args.iter().map(|a| expr_to_name(a)).collect::<Vec<_>>().join(", ")
+            };
+            if *distinct {
+                format!("{}(distinct {})", name.to_lowercase(), arg_str)
+            } else {
+                format!("{}({})", name.to_lowercase(), arg_str)
+            }
+        }
+        Expr::UnaryNot(inner) => format!("not {}", expr_to_name(inner)),
+        Expr::UnaryMinus(inner) => format!("-{}", expr_to_name(inner)),
+        Expr::IsNull(inner) => format!("{} is null", expr_to_name(inner)),
+        Expr::IsNotNull(inner) => format!("{} is not null", expr_to_name(inner)),
+        _ => "expr".to_string(),
+    }
+}
+
 pub fn resolve_projection_with_alias(
     select_list: &[SelectItem],
     schema: &Schema,
@@ -566,7 +605,8 @@ pub fn resolve_projection_with_alias(
                 let logical =
                     ast_expr_to_logical(expr, schema, alias_map).unwrap_or(LogicalExpr::Wildcard);
                 exprs.push(logical);
-                aliases.push(alias.clone());
+                let auto_alias = alias.clone().or_else(|| Some(expr_to_name(expr)));
+                aliases.push(auto_alias);
             }
         }
     }

@@ -306,7 +306,7 @@ impl ExecutionOp for ProjectExec {
 
                 for (i, expr) in self.expressions.iter().enumerate() {
                     let vals = eval_expr_column(expr, &batch)?;
-                    let alias = self.aliases[i].as_deref().unwrap_or("expr");
+                    let alias = self.aliases[i].as_deref().unwrap_or_else(|| infer_expr_name(expr));
                     let dt = infer_type(expr, &batch.schema);
 
                     let mut col = ColumnArray::empty(dt);
@@ -338,6 +338,22 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
             }
         }
         _ => DataType::Int64,
+    }
+}
+
+pub fn infer_expr_name(expr: &LogicalExpr) -> &'static str {
+    match expr {
+        LogicalExpr::Column(_) => "col",
+        LogicalExpr::Literal(_) => "literal",
+        LogicalExpr::BinaryOp { .. } => "expr",
+        LogicalExpr::Aggregate(agg) => match agg.func {
+            AggFunc::Count => "count(*)",
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+        },
+        _ => "expr",
     }
 }
 
@@ -583,26 +599,35 @@ impl ExecutionOp for HashAggregateExec {
             }
         }
         for agg in &self.aggregates {
-            let name = format!("{:?}({})", agg.func, match &*agg.arg {
-                LogicalExpr::Wildcard => "*".into(),
+            let func_name = match agg.func {
+                AggFunc::Count => "count",
+                AggFunc::Sum => "sum",
+                AggFunc::Avg => "avg",
+                AggFunc::Min => "min",
+                AggFunc::Max => "max",
+            };
+            let arg_name = match &*agg.arg {
+                LogicalExpr::Wildcard => "*".to_string(),
                 LogicalExpr::Column(idx) => self.input_schema.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default(),
-                _ => "expr".into(),
-            });
+                _ => "expr".to_string(),
+            };
+            let name = if agg.distinct {
+                format!("{}(distinct {})", func_name, arg_name)
+            } else {
+                format!("{}({})", func_name, arg_name)
+            };
             let dt = match agg.func {
                 AggFunc::Count => DataType::Int64,
                 AggFunc::Sum | AggFunc::Avg => DataType::Float64,
                 AggFunc::Min | AggFunc::Max => {
                     match &*agg.arg {
                         LogicalExpr::Column(idx) => {
-                            let col_dt = self.input_schema.columns.get(*idx).map(|c| c.data_type).unwrap_or(DataType::Int64);
-                            tracing::debug!("MIN/MAX: idx={}, col_dt={:?}, col_name={}", idx, col_dt, self.input_schema.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default());
-                            col_dt
+                            self.input_schema.columns.get(*idx).map(|c| c.data_type).unwrap_or(DataType::Int64)
                         }
                         _ => DataType::Int64,
                     }
                 }
             };
-            tracing::debug!("aggregate column: agg={:?}, name={}, dt={:?}", agg.func, name, dt);
             col_defs.push(ColumnDef::new(&name, dt));
         }
         let schema = Schema::new(col_defs);
@@ -939,7 +964,7 @@ pub fn build_pipeline(
     match plan {
         LogicalPlan::Scan(scan) => {
             let batches = table_batches.get(&scan.table_name).cloned().unwrap_or_default();
-            Ok(Box::new(ScanExec::new(batches, scan.projection)))
+            Ok(Box::new(ScanExec::new(batches, scan.projection).with_table_schema(scan.schema.clone())))
         }
         LogicalPlan::Filter(filter) => {
             let schema = get_scan_schema(&filter.input);

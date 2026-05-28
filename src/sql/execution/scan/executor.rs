@@ -248,10 +248,61 @@ impl<'a> ScanExecutor<'a> {
         rg_idx: usize,
         projection_cols: &[usize],
     ) -> Result<RecordBatch> {
+        let segment_schema = reader.schema();
+        let segment_col_count = segment_schema.num_columns();
+
         let mut batch = if projection_cols.is_empty() {
             reader.read_row_group(rg_idx)?
         } else {
-            reader.read_row_group_with_projection(rg_idx, projection_cols)?
+            let valid_projection: Vec<usize> = projection_cols
+                .iter()
+                .filter(|&&idx| idx < segment_col_count)
+                .copied()
+                .collect();
+
+            if valid_projection.is_empty() {
+                let row_count = reader.row_group_rows(rg_idx) as usize;
+                let mut columns = Vec::with_capacity(projection_cols.len());
+                let mut col_defs = Vec::with_capacity(projection_cols.len());
+                for &col_idx in projection_cols {
+                    let col_def = &self.table_schema.columns[col_idx];
+                    let mut null_col = crate::types::array::ColumnArray::empty(col_def.data_type);
+                    for _ in 0..row_count {
+                        null_col.push(&crate::types::scalar::ScalarValue::null_for_type(col_def.data_type))?;
+                    }
+                    columns.push(null_col);
+                    col_defs.push(col_def.clone());
+                }
+                let schema = crate::types::batch::Schema::new(col_defs);
+                crate::types::batch::RecordBatch::try_new(schema, columns)?
+            } else if valid_projection.len() < projection_cols.len() {
+                let partial_batch =
+                    reader.read_row_group_with_projection(rg_idx, &valid_projection)?;
+                let row_count = partial_batch.num_rows();
+                let mut columns = Vec::with_capacity(projection_cols.len());
+                let mut col_defs = Vec::with_capacity(projection_cols.len());
+
+                let mut valid_idx = 0;
+                for &col_idx in projection_cols {
+                    let col_def = &self.table_schema.columns[col_idx];
+                    if col_idx < segment_col_count {
+                        columns.push(partial_batch.columns[valid_idx].clone());
+                        col_defs.push(col_def.clone());
+                        valid_idx += 1;
+                    } else {
+                        let mut null_col = crate::types::array::ColumnArray::empty(col_def.data_type);
+                        for _ in 0..row_count {
+                            null_col.push(&crate::types::scalar::ScalarValue::null_for_type(col_def.data_type))?;
+                        }
+                        columns.push(null_col);
+                        col_defs.push(col_def.clone());
+                    }
+                }
+                let schema = crate::types::batch::Schema::new(col_defs);
+                crate::types::batch::RecordBatch::try_new(schema, columns)?
+            } else {
+                reader.read_row_group_with_projection(rg_idx, projection_cols)?
+            }
         };
 
         let bitmap_active = !reader.delete_bitmap().is_empty();
