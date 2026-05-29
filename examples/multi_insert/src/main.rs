@@ -103,7 +103,7 @@ async fn main() {
     let mut client = Client::connect(host).await.expect("connect failed");
 
     client
-        .login("root", "pass", &database)
+        .login("root", "taibai", &database)
         .await
         .expect("login failed");
     log_msg!("Logged in to database '{}'.", database);

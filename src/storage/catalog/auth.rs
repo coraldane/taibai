@@ -146,7 +146,7 @@ impl AuthStore {
             users: HashMap::new(),
             roles: HashMap::new(),
         };
-        let root = UserInfo::new("root", "");
+        let root = UserInfo::new("root", "taibai");
         store.users.insert("root".to_string(), root);
         store
     }

@@ -18,7 +18,10 @@ use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
 const COMPACT_ROW_GROUP_SIZE: usize = 8192;
-const WRITE_GATHER_CHUNK_ROWS: usize = COMPACT_ROW_GROUP_SIZE;
+// Gather more rows than one output row group at a time. SegmentWriter still
+// splits the batch into COMPACT_ROW_GROUP_SIZE row groups, but this reduces
+// per-chunk source grouping and per-column dispatch overhead during optimize.
+const WRITE_GATHER_CHUNK_ROWS: usize = COMPACT_ROW_GROUP_SIZE * 8;
 const PARALLEL_SORT_THRESHOLD: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -188,6 +191,7 @@ impl Compactor {
             &tmp_path,
             schema,
             cluster_key_indices,
+            &key_batches,
             &source_row_groups,
             &row_refs,
         );
@@ -224,7 +228,8 @@ impl Compactor {
         &self,
         path: &Path,
         schema: &Schema,
-        bloom_column_indices: &[usize],
+        cluster_key_indices: &[usize],
+        key_batches: &[RecordBatch],
         source_row_groups: &[SourceRowGroup],
         row_refs: &[RowRef],
     ) -> Result<()> {
@@ -232,10 +237,14 @@ impl Compactor {
             path,
             schema.clone(),
             COMPACT_ROW_GROUP_SIZE,
-            bloom_column_indices,
+            cluster_key_indices,
         )?;
         let mut rows_written = 0usize;
-        let mut row_group_cache = RowGroupCache::new(source_row_groups.len());
+        let non_key_projection = non_key_projection(schema.num_columns(), cluster_key_indices);
+        let projected_positions =
+            projected_column_positions(schema.num_columns(), &non_key_projection);
+        let key_positions = key_column_positions(schema.num_columns(), cluster_key_indices);
+        let mut row_group_cache = RowGroupCache::new(source_row_groups.len(), non_key_projection);
 
         tracing::info!(
             source_row_groups = source_row_groups.len(),
@@ -245,8 +254,15 @@ impl Compactor {
         );
 
         for chunk in row_refs.chunks(WRITE_GATHER_CHUNK_ROWS) {
-            let batch =
-                self.gather_sorted_chunk(schema, source_row_groups, chunk, &mut row_group_cache)?;
+            let batch = self.gather_sorted_chunk(
+                schema,
+                key_batches,
+                &key_positions,
+                &projected_positions,
+                source_row_groups,
+                chunk,
+                &mut row_group_cache,
+            )?;
             rows_written += batch.num_rows();
             writer.write_batch(&batch)?;
             if rows_written % (WRITE_GATHER_CHUNK_ROWS * 16) == 0 {
@@ -272,6 +288,9 @@ impl Compactor {
     fn gather_sorted_chunk(
         &self,
         schema: &Schema,
+        key_batches: &[RecordBatch],
+        key_positions: &[Option<usize>],
+        projected_positions: &[Option<usize>],
         source_row_groups: &[SourceRowGroup],
         row_refs: &[RowRef],
         row_group_cache: &mut RowGroupCache,
@@ -297,12 +316,30 @@ impl Compactor {
             let src_batch = row_group_cache.get(source, &self.segment_mgr)?;
 
             for col_idx in 0..schema.columns.len() {
-                let src_col = src_batch.column(col_idx).ok_or_else(|| {
-                    MonaxError::Storage(format!(
-                        "missing source column {} in row group {}",
-                        col_idx, source_idx
-                    ))
-                })?;
+                let src_col = if let Some(key_pos) = key_positions[col_idx] {
+                    key_batches
+                        .get(source_idx)
+                        .and_then(|batch| batch.column(key_pos))
+                        .ok_or_else(|| {
+                            MonaxError::Storage(format!(
+                                "missing key column {} in row group {}",
+                                col_idx, source_idx
+                            ))
+                        })?
+                } else {
+                    let projected_pos = projected_positions[col_idx].ok_or_else(|| {
+                        MonaxError::Storage(format!(
+                            "missing projection for source column {}",
+                            col_idx
+                        ))
+                    })?;
+                    src_batch.column(projected_pos).ok_or_else(|| {
+                        MonaxError::Storage(format!(
+                            "missing source column {} in row group {}",
+                            col_idx, source_idx
+                        ))
+                    })?
+                };
                 gather_column_positions(&mut columns[col_idx], src_col, &positions)?;
             }
         }
@@ -328,6 +365,7 @@ impl Compactor {
 
 struct RowGroupCache {
     capacity: usize,
+    projection: Vec<usize>,
     batches: HashMap<(PathBuf, usize), RecordBatch>,
     order: VecDeque<(PathBuf, usize)>,
     hits: usize,
@@ -335,9 +373,10 @@ struct RowGroupCache {
 }
 
 impl RowGroupCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, projection: Vec<usize>) -> Self {
         Self {
             capacity: capacity.max(1),
+            projection,
             batches: HashMap::new(),
             order: VecDeque::new(),
             hits: 0,
@@ -375,7 +414,8 @@ impl RowGroupCache {
 
         self.misses += 1;
         let reader = segment_mgr.open_reader(&source.segment_path)?;
-        let batch = reader.read_row_group(source.row_group_idx)?;
+        let batch =
+            reader.read_row_group_with_projection(source.row_group_idx, &self.projection)?;
         self.batches.insert(key.clone(), batch);
         self.order.push_back(key.clone());
         self.evict_if_needed();
@@ -408,6 +448,32 @@ fn sort_row_refs(row_refs: &mut [RowRef], key_batches: &[RecordBatch]) {
     }
 }
 
+fn non_key_projection(num_columns: usize, cluster_key_indices: &[usize]) -> Vec<usize> {
+    (0..num_columns)
+        .filter(|idx| !cluster_key_indices.contains(idx))
+        .collect()
+}
+
+fn projected_column_positions(num_columns: usize, projection: &[usize]) -> Vec<Option<usize>> {
+    let mut positions = vec![None; num_columns];
+    for (projected_pos, &col_idx) in projection.iter().enumerate() {
+        if col_idx < num_columns {
+            positions[col_idx] = Some(projected_pos);
+        }
+    }
+    positions
+}
+
+fn key_column_positions(num_columns: usize, cluster_key_indices: &[usize]) -> Vec<Option<usize>> {
+    let mut positions = vec![None; num_columns];
+    for (key_pos, &col_idx) in cluster_key_indices.iter().enumerate() {
+        if col_idx < num_columns {
+            positions[col_idx] = Some(key_pos);
+        }
+    }
+    positions
+}
+
 fn compare_row_refs(
     left: &RowRef,
     right: &RowRef,
@@ -437,7 +503,7 @@ fn scalar_at(batches: &[RecordBatch], row_ref: RowRef, col_idx: usize) -> Scalar
 }
 
 fn empty_column_for_gather(data_type: DataType, len: usize) -> ColumnArray {
-    let bitmap = NullBitmap::new_all_null(len);
+    let bitmap = NullBitmap::new_valid(len);
     match data_type {
         DataType::Bool => ColumnArray::Bool {
             data: vec![0; len],
@@ -529,8 +595,6 @@ fn gather_column_positions(
                 $dst_data[output_pos] = $src_data[source_row_idx];
                 if $src_bitmap.is_null(source_row_idx) {
                     $dst_bitmap.set_null(output_pos);
-                } else {
-                    $dst_bitmap.set_valid(output_pos);
                 }
             }
         }};
@@ -542,8 +606,6 @@ fn gather_column_positions(
                 $dst_data[output_pos] = $src_data[source_row_idx].clone();
                 if $src_bitmap.is_null(source_row_idx) {
                     $dst_bitmap.set_null(output_pos);
-                } else {
-                    $dst_bitmap.set_valid(output_pos);
                 }
             }
         }};

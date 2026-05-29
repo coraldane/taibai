@@ -291,8 +291,15 @@ pub fn parse_decimal_bytes(bytes: &[u8], scale: u32) -> i64 {
         if b < b'0' || b > b'9' {
             break;
         }
-        result = result * 10 + (b - b'0') as i64;
-        if has_decimal {
+        if !has_decimal || decimals < scale {
+            result = result * 10 + (b - b'0') as i64;
+            if has_decimal {
+                decimals += 1;
+            }
+        } else if decimals == scale {
+            if b >= b'5' {
+                result += 1;
+            }
             decimals += 1;
         }
         idx += 1;
@@ -484,4 +491,23 @@ fn parse_2digits(bytes: &[u8], start: usize) -> u8 {
 #[inline]
 fn is_leap(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_decimal_bytes;
+
+    #[test]
+    fn decimal_parser_respects_target_scale() {
+        assert_eq!(parse_decimal_bytes(b"16235.9018", 2), 1_623_590);
+        assert_eq!(parse_decimal_bytes(b"1.6500", 2), 165);
+        assert_eq!(parse_decimal_bytes(b"123", 2), 12_300);
+    }
+
+    #[test]
+    fn decimal_parser_rounds_first_discarded_digit() {
+        assert_eq!(parse_decimal_bytes(b"1.235", 2), 124);
+        assert_eq!(parse_decimal_bytes(b"-1.235", 2), -124);
+        assert_eq!(parse_decimal_bytes(b"9.999", 2), 1_000);
+    }
 }

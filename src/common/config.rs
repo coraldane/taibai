@@ -179,7 +179,7 @@ enum Commands {
         #[arg(short, long, default_value = "root")]
         user: String,
 
-        #[arg(short, long, default_value = "")]
+        #[arg(short, long, default_value = "taibai")]
         password: String,
 
         #[arg(short, long, default_value = "main")]

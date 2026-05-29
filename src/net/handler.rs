@@ -659,7 +659,7 @@ mod tests {
 
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
-        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "taibai");
         write_len_prefixed_string(&mut payload, "test");
 
         let msg = Message::new(MSG_TYPE_LOGIN, Bytes::from(payload));
@@ -704,7 +704,7 @@ mod tests {
 
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
-        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "taibai");
         write_len_prefixed_string(&mut payload, "main");
         handler
             .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
@@ -746,7 +746,7 @@ mod tests {
 
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
-        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "taibai");
         write_len_prefixed_string(&mut payload, "main");
         handler
             .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
@@ -780,7 +780,7 @@ mod tests {
 
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
-        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "taibai");
         write_len_prefixed_string(&mut payload, "main");
         handler
             .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
@@ -806,7 +806,7 @@ mod tests {
 
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
-        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "taibai");
         write_len_prefixed_string(&mut payload, "main");
         handler
             .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
@@ -829,7 +829,7 @@ mod tests {
 
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
-        write_len_prefixed_string(&mut payload, "pass");
+        write_len_prefixed_string(&mut payload, "taibai");
         write_len_prefixed_string(&mut payload, "main");
         handler
             .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
