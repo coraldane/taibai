@@ -13,6 +13,7 @@ pub struct PreparedStatement {
     pub sql: String,
     pub stmt: Statement,
     pub param_types: Vec<crate::protocol::types::DataType>,
+    pub param_count: usize,
     pub params: Vec<ScalarValue>,
     pub cached_plan: Option<LogicalPlan>,
 }
@@ -53,11 +54,14 @@ impl PreparedStatementCache {
         let id = self.next_id;
         self.next_id += 1;
 
+        let param_count = count_placeholders(&stmts[0]);
+
         let prepared = PreparedStatement {
             id,
             sql: sql.to_string(),
             stmt: stmts.into_iter().next().unwrap(),
             param_types: Vec::new(),
+            param_count,
             params: Vec::new(),
             cached_plan: None,
         };
@@ -237,6 +241,135 @@ fn substitute_placeholders(expr: &mut Expr, params: &[ScalarValue]) -> Result<()
         _ => {}
     }
     Ok(())
+}
+
+pub fn count_placeholders(stmt: &Statement) -> usize {
+    let mut count = 0;
+    match stmt {
+        Statement::Select {
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            if let Some(ref e) = where_clause {
+                count_expr_placeholders(e, &mut count);
+            }
+            for e in group_by {
+                count_expr_placeholders(e, &mut count);
+            }
+            if let Some(ref e) = having {
+                count_expr_placeholders(e, &mut count);
+            }
+            for item in order_by {
+                count_expr_placeholders(&item.expr, &mut count);
+            }
+            if let Some(ref e) = limit {
+                count_expr_placeholders(e, &mut count);
+            }
+            if let Some(ref e) = offset {
+                count_expr_placeholders(e, &mut count);
+            }
+        }
+        Statement::Insert { values, .. } => {
+            for row in values {
+                for val in row {
+                    count_expr_placeholders(val, &mut count);
+                }
+            }
+        }
+        Statement::Update {
+            where_clause,
+            assignments,
+            ..
+        } => {
+            if let Some(ref e) = where_clause {
+                count_expr_placeholders(e, &mut count);
+            }
+            for assign in assignments {
+                count_expr_placeholders(&assign.value, &mut count);
+            }
+        }
+        Statement::Delete { where_clause, .. } => {
+            if let Some(ref e) = where_clause {
+                count_expr_placeholders(e, &mut count);
+            }
+        }
+        _ => {}
+    }
+    count
+}
+
+fn count_expr_placeholders(expr: &Expr, count: &mut usize) {
+    match expr {
+        Expr::Placeholder(_) => *count += 1,
+        Expr::BinaryOp { left, right, .. } => {
+            count_expr_placeholders(left, count);
+            count_expr_placeholders(right, count);
+        }
+        Expr::UnaryNot(inner)
+        | Expr::UnaryMinus(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner) => {
+            count_expr_placeholders(inner, count);
+        }
+        Expr::In {
+            expr: inner,
+            values,
+            ..
+        } => {
+            count_expr_placeholders(inner, count);
+            for v in values {
+                count_expr_placeholders(v, count);
+            }
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            count_expr_placeholders(inner, count);
+            count_expr_placeholders(low, count);
+            count_expr_placeholders(high, count);
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(ref op) = operand {
+                count_expr_placeholders(op, count);
+            }
+            for (when, then) in when_clauses {
+                count_expr_placeholders(when, count);
+                count_expr_placeholders(then, count);
+            }
+            if let Some(ref el) = else_clause {
+                count_expr_placeholders(el, count);
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            count_expr_placeholders(inner, count);
+            count_expr_placeholders(pattern, count);
+        }
+        Expr::Exists(inner) => {
+            count_expr_placeholders(inner, count);
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                count_expr_placeholders(arg, count);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Check if a statement contains any placeholder expressions.

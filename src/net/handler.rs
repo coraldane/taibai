@@ -3,10 +3,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common::config::ServerConfig;
-use crate::common::error::Result;
+use crate::common::error::{MonaxError, Result};
 use crate::net::session::Session;
 use crate::protocol::message::*;
+use crate::protocol::types::DataType;
 use crate::sql::execution::{Engine, ExecResult};
+use crate::types::scalar::ScalarValue;
 
 pub struct Handler {
     pub session: Option<Session>,
@@ -266,7 +268,7 @@ impl Handler {
             Ok(stmt) => {
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&stmt.id.to_le_bytes());
-                buf.extend_from_slice(&(stmt.param_types.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&(stmt.param_count as u32).to_le_bytes());
                 Ok(vec![Message::new(MSG_TYPE_PREPARE, Bytes::from(buf))])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
@@ -289,9 +291,45 @@ impl Handler {
         }
         let stmt_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
 
+        let mut offset = 4usize;
+        let mut params: Vec<ScalarValue> = Vec::new();
+
+        if payload.len() >= offset + 4 {
+            let param_count =
+                u32::from_le_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]]) as usize;
+            offset += 4;
+
+            for i in 0..param_count {
+                if offset >= payload.len() {
+                    return Ok(vec![build_error(&format!(
+                        "truncated parameters: expected {} params, got {}",
+                        param_count, i
+                    ))]);
+                }
+                let type_tag = payload[offset];
+                offset += 1;
+
+                if type_tag == 0 {
+                    params.push(ScalarValue::VarChar(None));
+                    continue;
+                }
+
+                let dt = match DataType::from_u8(type_tag) {
+                    Ok(dt) => dt,
+                    Err(e) => return Ok(vec![build_error(&format!("invalid param type tag {}: {}", type_tag, e))]),
+                };
+
+                let (val, consumed) = match Self::decode_param_value(&payload[offset..], dt) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(vec![build_error(&format!("param {} decode error: {}", i, e))]),
+                };
+                params.push(val);
+                offset += consumed;
+            }
+        }
+
         let use_binary = session.binary_results;
 
-        // Take prepared statement out of cache temporarily to allow mutation
         let mut stmt = match session.prepared_statements.remove(stmt_id) {
             Some(s) => s,
             None => {
@@ -302,11 +340,12 @@ impl Handler {
             }
         };
 
+        stmt.params = params;
+
         let execute_start = Instant::now();
         let result = self.engine.execute_prepared(session, &mut stmt);
         let execute_elapsed = execute_start.elapsed();
 
-        // Put it back into cache
         session.prepared_statements.insert(stmt);
 
         match result {
@@ -333,6 +372,177 @@ impl Handler {
                 Ok(vec![append_server_timings(msg, timings)])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
+        }
+    }
+
+    fn decode_param_value(data: &[u8], dt: DataType) -> Result<(ScalarValue, usize)> {
+        match dt {
+            DataType::Bool => {
+                if data.is_empty() {
+                    return Err(MonaxError::Protocol("no data for Bool param".into()));
+                }
+                Ok((ScalarValue::Bool(Some(data[0] != 0)), 1))
+            }
+            DataType::Int8 => {
+                if data.is_empty() {
+                    return Err(MonaxError::Protocol("no data for Int8 param".into()));
+                }
+                Ok((ScalarValue::Int8(Some(data[0] as i8)), 1))
+            }
+            DataType::Int16 => {
+                if data.len() < 2 {
+                    return Err(MonaxError::Protocol("no data for Int16 param".into()));
+                }
+                Ok((ScalarValue::Int16(Some(i16::from_le_bytes([data[0], data[1]]))), 2))
+            }
+            DataType::Int32 => {
+                if data.len() < 4 {
+                    return Err(MonaxError::Protocol("no data for Int32 param".into()));
+                }
+                let v = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                Ok((ScalarValue::Int32(Some(v)), 4))
+            }
+            DataType::Int64 => {
+                if data.len() < 8 {
+                    return Err(MonaxError::Protocol("no data for Int64 param".into()));
+                }
+                let v = i64::from_le_bytes([
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7],
+                ]);
+                Ok((ScalarValue::Int64(Some(v)), 8))
+            }
+            DataType::UInt8 => {
+                if data.is_empty() {
+                    return Err(MonaxError::Protocol("no data for UInt8 param".into()));
+                }
+                Ok((ScalarValue::UInt8(Some(data[0])), 1))
+            }
+            DataType::UInt16 => {
+                if data.len() < 2 {
+                    return Err(MonaxError::Protocol("no data for UInt16 param".into()));
+                }
+                Ok((ScalarValue::UInt16(Some(u16::from_le_bytes([data[0], data[1]]))), 2))
+            }
+            DataType::UInt32 => {
+                if data.len() < 4 {
+                    return Err(MonaxError::Protocol("no data for UInt32 param".into()));
+                }
+                let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                Ok((ScalarValue::UInt32(Some(v)), 4))
+            }
+            DataType::UInt64 => {
+                if data.len() < 8 {
+                    return Err(MonaxError::Protocol("no data for UInt64 param".into()));
+                }
+                let v = u64::from_le_bytes([
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7],
+                ]);
+                Ok((ScalarValue::UInt64(Some(v)), 8))
+            }
+            DataType::Float32 => {
+                if data.len() < 4 {
+                    return Err(MonaxError::Protocol("no data for Float32 param".into()));
+                }
+                let v = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                Ok((ScalarValue::Float32(Some(v)), 4))
+            }
+            DataType::Float64 => {
+                if data.len() < 8 {
+                    return Err(MonaxError::Protocol("no data for Float64 param".into()));
+                }
+                let v = f64::from_le_bytes([
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7],
+                ]);
+                Ok((ScalarValue::Float64(Some(v)), 8))
+            }
+            DataType::Decimal => {
+                if data.len() < 8 {
+                    return Err(MonaxError::Protocol("no data for Decimal param".into()));
+                }
+                let v = i64::from_le_bytes([
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7],
+                ]);
+                Ok((ScalarValue::Decimal(Some(v)), 8))
+            }
+            DataType::Date => {
+                if data.len() < 4 {
+                    return Err(MonaxError::Protocol("no data for Date param".into()));
+                }
+                let v = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                Ok((ScalarValue::Date(Some(v)), 4))
+            }
+            DataType::Time => {
+                if data.len() < 8 {
+                    return Err(MonaxError::Protocol("no data for Time param".into()));
+                }
+                let v = i64::from_le_bytes([
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7],
+                ]);
+                Ok((ScalarValue::Time(Some(v)), 8))
+            }
+            DataType::Timestamp => {
+                if data.len() < 8 {
+                    return Err(MonaxError::Protocol("no data for Timestamp param".into()));
+                }
+                let v = i64::from_le_bytes([
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7],
+                ]);
+                Ok((ScalarValue::Timestamp(Some(v)), 8))
+            }
+            DataType::Interval => {
+                if data.len() < 8 {
+                    return Err(MonaxError::Protocol("no data for Interval param".into()));
+                }
+                let v = i64::from_le_bytes([
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7],
+                ]);
+                Ok((ScalarValue::Interval(Some(v)), 8))
+            }
+            DataType::VarChar => {
+                if data.len() < 4 {
+                    return Err(MonaxError::Protocol("no data for VarChar param".into()));
+                }
+                let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                if data.len() < 4 + len {
+                    return Err(MonaxError::Protocol("VarChar param data truncated".into()));
+                }
+                let s = std::str::from_utf8(&data[4..4 + len])
+                    .map_err(|e| MonaxError::Protocol(format!("invalid UTF-8 in VarChar param: {}", e)))?;
+                Ok((ScalarValue::VarChar(Some(s.to_string())), 4 + len))
+            }
+            DataType::Blob => {
+                if data.len() < 4 {
+                    return Err(MonaxError::Protocol("no data for Blob param".into()));
+                }
+                let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                if data.len() < 4 + len {
+                    return Err(MonaxError::Protocol("Blob param data truncated".into()));
+                }
+                Ok((ScalarValue::Blob(Some(data[4..4 + len].to_vec())), 4 + len))
+            }
+            DataType::Vector => {
+                if data.len() < 4 {
+                    return Err(MonaxError::Protocol("no data for Vector param".into()));
+                }
+                let dim = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                let total = 4 + dim * 4;
+                if data.len() < total {
+                    return Err(MonaxError::Protocol("Vector param data truncated".into()));
+                }
+                let mut floats = Vec::with_capacity(dim);
+                for i in 0..dim {
+                    let off = 4 + i * 4;
+                    floats.push(f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]));
+                }
+                Ok((ScalarValue::Vector(Some(floats)), total))
+            }
         }
     }
 
@@ -733,6 +943,122 @@ mod tests {
         let close_payload = Bytes::copy_from_slice(&1u32.to_le_bytes());
         let resp = handler
             .handle_message(Message::new(MSG_TYPE_CLOSE_STMT, close_payload))
+            .unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
+    }
+
+    #[test]
+    fn test_prepare_execute_with_params() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+        let config = Arc::new(ServerConfig::default());
+        let mut handler = Handler::new(config, engine);
+
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, "root");
+        write_len_prefixed_string(&mut payload, "taibai");
+        write_len_prefixed_string(&mut payload, "main");
+        handler
+            .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+            .unwrap();
+
+        let mut sql_payload = Vec::new();
+        write_len_prefixed_string(&mut sql_payload, "main");
+        write_len_prefixed_string(&mut sql_payload, "CREATE TABLE t (id INT64, name VARCHAR, score FLOAT64)");
+        handler
+            .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+            .unwrap();
+
+        // Insert a row
+        let mut sql_payload = Vec::new();
+        write_len_prefixed_string(&mut sql_payload, "main");
+        write_len_prefixed_string(&mut sql_payload, "INSERT INTO t VALUES (1, 'alice', 95.5)");
+        handler
+            .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+            .unwrap();
+
+        // Prepare SELECT with placeholders
+        let mut prep_payload = Vec::new();
+        write_len_prefixed_string(&mut prep_payload, "SELECT * FROM t WHERE id = ?");
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+            .unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_PREPARE);
+        let stmt_id = u32::from_le_bytes(resp[0].payload[..4].try_into().unwrap());
+        let param_count = u32::from_le_bytes(resp[0].payload[4..8].try_into().unwrap());
+        assert_eq!(param_count, 1);
+
+        // Execute with Int64 param = 1
+        let mut exec_payload = Vec::new();
+        exec_payload.extend_from_slice(&stmt_id.to_le_bytes());
+        exec_payload.extend_from_slice(&1u32.to_le_bytes()); // param_count
+        exec_payload.push(DataType::Int64 as u8); // type_tag
+        exec_payload.extend_from_slice(&1i64.to_le_bytes()); // value
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_EXECUTE, Bytes::from(exec_payload)))
+            .unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_RESULT);
+
+        // Execute with Int64 param = 999 (should return 0 rows)
+        let mut exec_payload = Vec::new();
+        exec_payload.extend_from_slice(&stmt_id.to_le_bytes());
+        exec_payload.extend_from_slice(&1u32.to_le_bytes());
+        exec_payload.push(DataType::Int64 as u8);
+        exec_payload.extend_from_slice(&999i64.to_le_bytes());
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_EXECUTE, Bytes::from(exec_payload)))
+            .unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_RESULT);
+
+        // Close
+        let close_payload = Bytes::copy_from_slice(&stmt_id.to_le_bytes());
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_CLOSE_STMT, close_payload))
+            .unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
+    }
+
+    #[test]
+    fn test_prepare_execute_with_null_param() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+        let config = Arc::new(ServerConfig::default());
+        let mut handler = Handler::new(config, engine);
+
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, "root");
+        write_len_prefixed_string(&mut payload, "taibai");
+        write_len_prefixed_string(&mut payload, "main");
+        handler
+            .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+            .unwrap();
+
+        let mut sql_payload = Vec::new();
+        write_len_prefixed_string(&mut sql_payload, "main");
+        write_len_prefixed_string(&mut sql_payload, "CREATE TABLE t2 (id INT64, val VARCHAR)");
+        handler
+            .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+            .unwrap();
+
+        let mut prep_payload = Vec::new();
+        write_len_prefixed_string(&mut prep_payload, "INSERT INTO t2 VALUES (?, ?)");
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+            .unwrap();
+        assert_eq!(resp[0].msg_type, MSG_TYPE_PREPARE);
+        let stmt_id = u32::from_le_bytes(resp[0].payload[..4].try_into().unwrap());
+        let param_count = u32::from_le_bytes(resp[0].payload[4..8].try_into().unwrap());
+        assert_eq!(param_count, 2);
+
+        // Execute with Int64 + NULL VarChar
+        let mut exec_payload = Vec::new();
+        exec_payload.extend_from_slice(&stmt_id.to_le_bytes());
+        exec_payload.extend_from_slice(&2u32.to_le_bytes()); // param_count
+        exec_payload.push(DataType::Int64 as u8);
+        exec_payload.extend_from_slice(&42i64.to_le_bytes());
+        exec_payload.push(0u8); // NULL
+        let resp = handler
+            .handle_message(Message::new(MSG_TYPE_EXECUTE, Bytes::from(exec_payload)))
             .unwrap();
         assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
     }

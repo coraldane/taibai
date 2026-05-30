@@ -44,6 +44,13 @@ pub struct Client {
 }
 
 #[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    pub id: u32,
+    pub param_count: usize,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ServerTimings {
     pub total: Duration,
     pub execute: Option<Duration>,
@@ -411,6 +418,103 @@ impl Client {
 
     pub async fn recv_response(&mut self) -> Result<Message> {
         self.recv().await
+    }
+
+    pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
+        let sql_bytes = sql.as_bytes();
+        let mut payload = Vec::with_capacity(4 + sql_bytes.len());
+        payload.extend_from_slice(&(sql_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(sql_bytes);
+
+        self.send(Message::new(MSG_TYPE_PREPARE, Bytes::from(payload)))
+            .await?;
+
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_PREPARE => {
+                if resp.payload.len() < 8 {
+                    return Err(MonaxError::Protocol(
+                        "prepare response too short".into(),
+                    ));
+                }
+                let stmt_id = u32::from_le_bytes(resp.payload[..4].try_into().unwrap());
+                let param_count =
+                    u32::from_le_bytes(resp.payload[4..8].try_into().unwrap()) as usize;
+                Ok(PreparedStatement {
+                    id: stmt_id,
+                    param_count,
+                    sql: sql.to_string(),
+                })
+            }
+            MSG_TYPE_ERROR => {
+                let msg = String::from_utf8_lossy(&resp.payload).to_string();
+                Err(MonaxError::Sql(msg))
+            }
+            other => Err(MonaxError::Protocol(format!(
+                "unexpected prepare response type: {other:#04X}"
+            ))),
+        }
+    }
+
+    pub async fn execute_prepared(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &[ScalarValue],
+    ) -> Result<QueryResult> {
+        let mut payload = Vec::with_capacity(8 + params.len() * 12);
+        payload.extend_from_slice(&stmt.id.to_le_bytes());
+        payload.extend_from_slice(&(params.len() as u32).to_le_bytes());
+
+        for param in params {
+            encode_scalar_param(&mut payload, param);
+        }
+
+        self.send(Message::new(MSG_TYPE_EXECUTE, Bytes::from(payload)))
+            .await?;
+
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_OK => {
+                let rows_affected = if resp.payload.len() >= 8 {
+                    u64::from_le_bytes(resp.payload[..8].try_into().unwrap())
+                } else {
+                    0
+                };
+                Ok(QueryResult::Ok {
+                    rows_affected,
+                    server_elapsed: None,
+                    server_timings: None,
+                    client_timings: None,
+                })
+            }
+            MSG_TYPE_RESULT => Ok(parse_text_result(&resp.payload)?),
+            MSG_TYPE_BINARY_QUERY_RESULT => Ok(parse_binary_result(&resp.payload)?),
+            MSG_TYPE_ERROR => {
+                let msg = String::from_utf8_lossy(&resp.payload).to_string();
+                Ok(QueryResult::Error(msg))
+            }
+            other => Err(MonaxError::Protocol(format!(
+                "unexpected execute response type: {other:#04X}"
+            ))),
+        }
+    }
+
+    pub async fn close_stmt(&mut self, stmt: &PreparedStatement) -> Result<()> {
+        let payload = Bytes::copy_from_slice(&stmt.id.to_le_bytes());
+        self.send(Message::new(MSG_TYPE_CLOSE_STMT, payload))
+            .await?;
+
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_OK => Ok(()),
+            MSG_TYPE_ERROR => {
+                let msg = String::from_utf8_lossy(&resp.payload).to_string();
+                Err(MonaxError::Sql(msg))
+            }
+            other => Err(MonaxError::Protocol(format!(
+                "unexpected close_stmt response type: {other:#04X}"
+            ))),
+        }
     }
 
     async fn send(&mut self, msg: Message) -> Result<()> {
@@ -1025,5 +1129,129 @@ mod tests {
     fn write_decimal_cell(buf: &mut Vec<u8>, value: &str) {
         buf.push(0);
         write_len_prefixed_string(buf, value);
+    }
+}
+
+fn encode_scalar_param(buf: &mut Vec<u8>, val: &ScalarValue) {
+    match val {
+        ScalarValue::Bool(Some(v)) => {
+            buf.push(DataType::Bool as u8);
+            buf.push(if *v { 1 } else { 0 });
+        }
+        ScalarValue::Bool(None) => buf.push(0u8),
+
+        ScalarValue::Int8(Some(v)) => {
+            buf.push(DataType::Int8 as u8);
+            buf.push(*v as u8);
+        }
+        ScalarValue::Int8(None) => buf.push(0u8),
+
+        ScalarValue::Int16(Some(v)) => {
+            buf.push(DataType::Int16 as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Int16(None) => buf.push(0u8),
+
+        ScalarValue::Int32(Some(v)) => {
+            buf.push(DataType::Int32 as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Int32(None) => buf.push(0u8),
+
+        ScalarValue::Int64(Some(v)) => {
+            buf.push(DataType::Int64 as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Int64(None) => buf.push(0u8),
+
+        ScalarValue::UInt8(Some(v)) => {
+            buf.push(DataType::UInt8 as u8);
+            buf.push(*v);
+        }
+        ScalarValue::UInt8(None) => buf.push(0u8),
+
+        ScalarValue::UInt16(Some(v)) => {
+            buf.push(DataType::UInt16 as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::UInt16(None) => buf.push(0u8),
+
+        ScalarValue::UInt32(Some(v)) => {
+            buf.push(DataType::UInt32 as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::UInt32(None) => buf.push(0u8),
+
+        ScalarValue::UInt64(Some(v)) => {
+            buf.push(DataType::UInt64 as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::UInt64(None) => buf.push(0u8),
+
+        ScalarValue::Float32(Some(v)) => {
+            buf.push(DataType::Float32 as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Float32(None) => buf.push(0u8),
+
+        ScalarValue::Float64(Some(v)) => {
+            buf.push(DataType::Float64 as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Float64(None) => buf.push(0u8),
+
+        ScalarValue::Decimal(Some(v)) => {
+            buf.push(DataType::Decimal as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Decimal(None) => buf.push(0u8),
+
+        ScalarValue::Date(Some(v)) => {
+            buf.push(DataType::Date as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Date(None) => buf.push(0u8),
+
+        ScalarValue::Time(Some(v)) => {
+            buf.push(DataType::Time as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Time(None) => buf.push(0u8),
+
+        ScalarValue::Timestamp(Some(v)) => {
+            buf.push(DataType::Timestamp as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Timestamp(None) => buf.push(0u8),
+
+        ScalarValue::Interval(Some(v)) => {
+            buf.push(DataType::Interval as u8);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        ScalarValue::Interval(None) => buf.push(0u8),
+
+        ScalarValue::VarChar(Some(v)) => {
+            buf.push(DataType::VarChar as u8);
+            let bytes = v.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        ScalarValue::VarChar(None) => buf.push(0u8),
+
+        ScalarValue::Blob(Some(v)) => {
+            buf.push(DataType::Blob as u8);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+        ScalarValue::Blob(None) => buf.push(0u8),
+
+        ScalarValue::Vector(Some(v)) => {
+            buf.push(DataType::Vector as u8);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for f in v {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        ScalarValue::Vector(None) => buf.push(0u8),
     }
 }

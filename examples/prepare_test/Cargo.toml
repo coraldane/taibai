@@ -1,0 +1,13 @@
+[package]
+name = "prepare_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+monax = { path = "../.." }
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
+
+[[bin]]
+name = "prepare_test"
+path = "src/main.rs"
