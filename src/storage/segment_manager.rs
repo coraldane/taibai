@@ -463,6 +463,15 @@ impl SegmentManager {
         }
     }
 
+    pub fn rename_table_state(&self, db: &str, old_name: &str, new_name: &str) {
+        let old_key = table_key(db, old_name);
+        let new_key = table_key(db, new_name);
+        let mut tables = self.tables.write().unwrap();
+        if let Some(state) = tables.remove(&old_key) {
+            tables.insert(new_key, state);
+        }
+    }
+
     pub fn remove_database_state(&self, db: &str) {
         let prefix = format!("{}:", db);
         let mut tables = self.tables.write().unwrap();

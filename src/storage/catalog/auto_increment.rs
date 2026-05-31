@@ -108,6 +108,15 @@ impl AutoIncrementManager {
         }
     }
 
+    pub fn rename_table(&self, db: &str, old_name: &str, new_name: &str) {
+        let old_key = format!("{}:{}", db, old_name);
+        let new_key = format!("{}:{}", db, new_name);
+        let mut counters = self.counters.write().unwrap();
+        if let Some(counter) = counters.remove(&old_key) {
+            counters.insert(new_key, counter);
+        }
+    }
+
     pub fn unregister_database(&self, db: &str) {
         let prefix = format!("{}:", db);
         let mut counters = self.counters.write().unwrap();

@@ -138,6 +138,27 @@ impl IndexManager {
         }
     }
 
+    pub fn remove_index(&self, db: &str, table: &str) {
+        let mut indexes = self.indexes.write().unwrap();
+        if let Some(db_indexes) = indexes.get_mut(db) {
+            db_indexes.remove(table);
+        }
+    }
+
+    pub fn rename_index(&self, db: &str, old_name: &str, new_name: &str) {
+        let mut indexes = self.indexes.write().unwrap();
+        if let Some(db_indexes) = indexes.get_mut(db) {
+            if let Some(idx) = db_indexes.remove(old_name) {
+                db_indexes.insert(new_name.to_string(), idx);
+            }
+        }
+    }
+
+    pub fn remove_database_indexes(&self, db: &str) {
+        let mut indexes = self.indexes.write().unwrap();
+        indexes.remove(db);
+    }
+
     pub fn index_size(&self, db: &str, table: &str) -> i64 {
         if let Some(idx) = self.get_index(db, table) {
             idx.size()
