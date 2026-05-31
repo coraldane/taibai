@@ -173,7 +173,7 @@ struct Args {
 #[derive(Subcommand, Debug, Clone)]
 enum Commands {
     Client {
-        #[arg(short, long, default_value = "127.0.0.1:5151")]
+        #[arg(short = 'H', long, default_value = "127.0.0.1:5151")]
         host: String,
 
         #[arg(short, long, default_value = "root")]
