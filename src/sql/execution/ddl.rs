@@ -10,7 +10,7 @@ use crate::types::scalar::ScalarValue;
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{
     AlterOperation, ColumnDefAst, DefaultValue, GrantObject, PartitionDef, PartitionStrategy,
-    Privilege,
+    Privilege, TtlDef,
 };
 
 pub fn exec_create_table(
@@ -22,6 +22,7 @@ pub fn exec_create_table(
     primary_key: &[String],
     cluster_by: &Option<Vec<String>>,
     partition_by: &Option<PartitionDef>,
+    ttl: &Option<TtlDef>,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
@@ -55,6 +56,9 @@ pub fn exec_create_table(
 
     apply_table_primary_key(&mut col_defs, primary_key)?;
     validate_column_constraints(&mut col_defs)?;
+    if let Some(ttl_def) = ttl {
+        validate_ttl_columns(&col_defs, ttl_def)?;
+    }
 
     catalog.create_table(name, col_defs)?;
 
@@ -79,6 +83,9 @@ pub fn exec_create_table(
                 }
             };
             meta.update_partition_key_idx();
+        }
+        if let Some(ttl_def) = ttl {
+            meta.set_ttl(&ttl_def.column, ttl_def.duration_secs);
         }
     }
 
@@ -179,6 +186,10 @@ pub fn exec_alter_table(
             }
             AlterOperation::DropColumn { name: col_name } => {
                 catalog.drop_column(name, col_name)?;
+                if let Some(meta) = catalog.get_table_mut(name) {
+                    meta.update_partition_key_idx();
+                    meta.update_ttl_column_idx();
+                }
             }
             AlterOperation::RenameColumn { old_name, new_name } => {
                 catalog.rename_column(name, old_name, new_name)?;
@@ -265,6 +276,19 @@ pub fn exec_alter_table(
                 }
                 engine.index_manager().mark_index_stale(db, name);
             }
+            AlterOperation::SetTtl { ttl } => {
+                let meta = catalog.get_table_mut(name).ok_or_else(|| {
+                    MonaxError::Sql(format!("table '{}.{}' does not exist", db, name))
+                })?;
+                validate_ttl_definition(meta, ttl)?;
+                meta.set_ttl(&ttl.column, ttl.duration_secs);
+            }
+            AlterOperation::DropTtl => {
+                let meta = catalog.get_table_mut(name).ok_or_else(|| {
+                    MonaxError::Sql(format!("table '{}.{}' does not exist", db, name))
+                })?;
+                meta.clear_ttl();
+            }
         }
     }
 
@@ -272,6 +296,35 @@ pub fn exec_alter_table(
     catalog.save(&meta_dir)?;
 
     Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+fn validate_ttl_definition(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    ttl: &TtlDef,
+) -> Result<()> {
+    validate_ttl_columns(&table_meta.columns, ttl)
+}
+
+fn validate_ttl_columns(columns: &[ColumnDef], ttl: &TtlDef) -> Result<()> {
+    if ttl.duration_secs <= 0 {
+        return Err(MonaxError::Sql(
+            "TTL duration must be a positive number of seconds".into(),
+        ));
+    }
+
+    let column = columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&ttl.column))
+        .ok_or_else(|| MonaxError::Sql(format!("TTL column '{}' not found", ttl.column)))?;
+
+    if column.data_type != DataType::Timestamp {
+        return Err(MonaxError::Sql(format!(
+            "TTL column '{}' must be TIMESTAMP",
+            ttl.column
+        )));
+    }
+
+    Ok(())
 }
 
 fn apply_table_primary_key(columns: &mut [ColumnDef], primary_key: &[String]) -> Result<()> {
@@ -786,6 +839,10 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
             PartitionType::None => String::new(),
         };
         create_sql.push_str(&partition_str);
+    }
+
+    if let Some(ttl) = &table_meta.ttl {
+        create_sql.push_str(&format!(" TTL ({}, {})", ttl.column, ttl.duration_secs));
     }
 
     let schema = Schema::new(vec![

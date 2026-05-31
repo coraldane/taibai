@@ -46,6 +46,20 @@ fn default_partition_key_idx() -> i32 {
     -1
 }
 
+/// Time-to-live policy for a table. Rows are visible while
+/// `column + duration_secs` is greater than the current time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TtlInfo {
+    pub column: String,
+    pub duration_secs: i64,
+    #[serde(default = "default_ttl_column_idx")]
+    pub column_idx: i32,
+}
+
+fn default_ttl_column_idx() -> i32 {
+    -1
+}
+
 /// Table metadata stored in the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMeta {
@@ -69,6 +83,8 @@ pub struct TableMeta {
     pub partitions: Vec<PartitionInfo>,
     #[serde(default = "default_partition_key_idx")]
     pub partition_key_idx: i32,
+    #[serde(default)]
+    pub ttl: Option<TtlInfo>,
 }
 
 impl TableMeta {
@@ -91,6 +107,7 @@ impl TableMeta {
             partition_param: 0,
             partitions: Vec::new(),
             partition_key_idx: -1,
+            ttl: None,
         }
     }
 
@@ -105,6 +122,39 @@ impl TableMeta {
             .position(|c| c.name.eq_ignore_ascii_case(&self.partition_key))
             .map(|i| i as i32)
             .unwrap_or(-1);
+    }
+
+    pub fn update_ttl_column_idx(&mut self) {
+        let Some(ttl) = self.ttl.as_mut() else {
+            return;
+        };
+        ttl.column_idx = self
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&ttl.column))
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+    }
+
+    pub fn set_ttl(&mut self, column: &str, duration_secs: i64) {
+        self.ttl = Some(TtlInfo {
+            column: column.to_string(),
+            duration_secs,
+            column_idx: -1,
+        });
+        self.update_ttl_column_idx();
+    }
+
+    pub fn clear_ttl(&mut self) {
+        self.ttl = None;
+    }
+
+    pub fn get_ttl_column_index_cached(&self) -> Option<usize> {
+        let ttl = self.ttl.as_ref()?;
+        if ttl.column_idx < 0 {
+            return None;
+        }
+        Some(ttl.column_idx as usize)
     }
 
     pub fn get_partition_column_index_cached(&self) -> Option<usize> {
@@ -181,6 +231,7 @@ impl DatabaseCatalog {
             for table in catalog.tables.values_mut() {
                 table.database = db_name.to_string();
                 table.update_partition_key_idx();
+                table.update_ttl_column_idx();
             }
             Ok(catalog)
         } else if let Some(catalog) = Self::load_legacy_catalog(meta_dir, db_name)? {
@@ -235,6 +286,7 @@ impl DatabaseCatalog {
         for table in catalog.tables.values_mut() {
             table.database = db_name.to_string();
             table.update_partition_key_idx();
+            table.update_ttl_column_idx();
         }
         Ok(Some(catalog))
     }
@@ -317,6 +369,16 @@ impl DatabaseCatalog {
                 ))
             })?;
         table.columns.remove(idx);
+        if table
+            .ttl
+            .as_ref()
+            .map_or(false, |ttl| ttl.column.eq_ignore_ascii_case(column_name))
+        {
+            table.ttl = None;
+        } else {
+            table.update_ttl_column_idx();
+        }
+        table.update_partition_key_idx();
         Ok(())
     }
 
@@ -347,6 +409,7 @@ impl DatabaseCatalog {
                 ))
             })?;
         col.name = new_name.to_string();
+        table.update_ttl_column_idx();
         Ok(())
     }
 

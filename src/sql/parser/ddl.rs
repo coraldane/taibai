@@ -4,7 +4,7 @@ use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{
     AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, GrantObject, PartitionDef,
-    PartitionStrategy, Privilege, Statement,
+    PartitionStrategy, Privilege, Statement, TtlDef,
 };
 use crate::sql::parser::lexer::Token;
 use crate::sql::parser::parser::{parse_data_type, Parser};
@@ -114,6 +114,7 @@ impl Parser {
 
         let mut cluster_by: Option<Vec<String>> = None;
         let mut partition_by: Option<PartitionDef> = None;
+        let mut ttl: Option<TtlDef> = None;
 
         loop {
             if self.peek() == &Token::Cluster && cluster_by.is_none() {
@@ -186,6 +187,8 @@ impl Parser {
                     strategy,
                     param,
                 });
+            } else if is_ttl_token(self.peek()) && ttl.is_none() {
+                ttl = Some(self.parse_ttl_def()?);
             } else {
                 break;
             }
@@ -198,6 +201,49 @@ impl Parser {
             primary_key,
             cluster_by,
             partition_by,
+            ttl,
+        })
+    }
+
+    fn parse_ttl_def(&mut self) -> Result<TtlDef> {
+        match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("TTL") => {
+                self.advance();
+            }
+            other => {
+                return Err(MonaxError::Sql(format!(
+                    "expected TTL table option, got {}",
+                    other
+                )))
+            }
+        }
+
+        let parenthesized = self.peek() == &Token::LeftParen;
+        if parenthesized {
+            self.advance();
+        }
+
+        let column = self.expect_ident()?;
+        if self.peek() == &Token::Comma {
+            self.advance();
+        } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INTERVAL")) {
+            self.advance();
+        }
+        let duration_secs = self.expect_integer()? as i64;
+
+        if parenthesized {
+            self.expect(&Token::RightParen)?;
+        }
+
+        if duration_secs <= 0 {
+            return Err(MonaxError::Sql(
+                "TTL duration must be a positive number of seconds".into(),
+            ));
+        }
+
+        Ok(TtlDef {
+            column,
+            duration_secs,
         })
     }
 
@@ -550,10 +596,24 @@ impl Parser {
                     self.advance();
                     let partition_key = self.expect_ident()?;
                     AlterOperation::DropPartition { partition_key }
+                } else if is_ttl_token(self.peek()) {
+                    self.advance();
+                    AlterOperation::DropTtl
                 } else {
                     self.expect(&Token::Column)?;
                     let col_name = self.expect_ident()?;
                     AlterOperation::DropColumn { name: col_name }
+                }
+            } else if self.peek() == &Token::Set {
+                self.advance();
+                if is_ttl_token(self.peek()) {
+                    AlterOperation::SetTtl {
+                        ttl: self.parse_ttl_def()?,
+                    }
+                } else {
+                    return Err(MonaxError::Sql(
+                        "expected TTL after SET in ALTER TABLE".into(),
+                    ));
                 }
             } else if self.peek() == &Token::Truncate {
                 self.advance();
@@ -652,4 +712,8 @@ impl Parser {
         let table = self.parse_object_name()?;
         Ok(Statement::Truncate { table })
     }
+}
+
+fn is_ttl_token(token: &Token) -> bool {
+    matches!(token, Token::Ident(s) if s.eq_ignore_ascii_case("TTL"))
 }

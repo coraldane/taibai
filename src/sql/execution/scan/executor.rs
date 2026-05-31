@@ -51,6 +51,32 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_count_star(&mut self) -> Result<Vec<RecordBatch>> {
+        if self.table_meta.ttl.is_some() {
+            let mut ttl_spec = self.spec.clone();
+            ttl_spec.is_count_star = false;
+            ttl_spec.projection = self
+                .table_meta
+                .get_ttl_column_index_cached()
+                .map(|idx| vec![idx]);
+            let mut executor = ScanExecutor::new(
+                &ttl_spec,
+                self.engine,
+                self.table_schema.clone(),
+                self.table_meta.clone(),
+                self.db,
+            );
+            let count = executor
+                .execute_scan()?
+                .iter()
+                .map(|batch| batch.num_rows() as u64)
+                .sum();
+            let result = count::build_count_star_result(count);
+            return match result {
+                crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
+                _ => Ok(Vec::new()),
+            };
+        }
+
         let table_dir = self
             .engine
             .data_dir()
@@ -104,7 +130,8 @@ impl<'a> ScanExecutor<'a> {
             let use_predicate_first = self.should_use_predicate_first();
             let cluster_key_bounds = self.cluster_key_bounds();
             let predicate_cols = self.compute_predicate_columns();
-            let projection_cols = self.compute_projection_columns();
+            let mut projection_cols = self.compute_projection_columns();
+            let strip_ttl_column = self.extend_projection_for_ttl(&mut projection_cols);
 
             for seg_path in &filtered_segments {
                 let reader = match mgr.open_reader_cached(seg_path) {
@@ -175,7 +202,16 @@ impl<'a> ScanExecutor<'a> {
                             .or_default()
                             .rows_scanned += rows_scanned;
                     }
-                    batches.extend(rg_batches.into_iter().map(|(_, batch)| batch));
+                    for (_, batch) in rg_batches {
+                        let batch = self.apply_ttl_filter_and_projection(
+                            batch,
+                            &projection_cols,
+                            strip_ttl_column,
+                        )?;
+                        if batch.num_rows() > 0 {
+                            batches.push(batch);
+                        }
+                    }
                 } else if use_predicate_first
                     && !predicate_cols.is_empty()
                     && !projection_cols.is_empty()
@@ -213,7 +249,16 @@ impl<'a> ScanExecutor<'a> {
                             .or_default()
                             .rows_scanned += rows_scanned;
                     }
-                    batches.extend(rg_batches.into_iter().map(|(_, batch)| batch));
+                    for (_, batch) in rg_batches {
+                        let batch = self.apply_ttl_filter_and_projection(
+                            batch,
+                            &projection_cols,
+                            strip_ttl_column,
+                        )?;
+                        if batch.num_rows() > 0 {
+                            batches.push(batch);
+                        }
+                    }
                 } else {
                     for rg_idx in &prune_result.candidate_indices {
                         let batch = match self.read_and_filter_row_group(
@@ -224,6 +269,11 @@ impl<'a> ScanExecutor<'a> {
                             Ok(b) => b,
                             Err(_) => continue,
                         };
+                        let batch = self.apply_ttl_filter_and_projection(
+                            batch,
+                            &projection_cols,
+                            strip_ttl_column,
+                        )?;
                         if batch.num_rows() > 0 {
                             batches.push(batch);
                         }
@@ -232,12 +282,26 @@ impl<'a> ScanExecutor<'a> {
             }
         }
 
-        batches.extend(memtable::scan_memtables(
+        let mut memtable_spec = self.spec.clone();
+        let mut memtable_projection = self.compute_projection_columns();
+        let memtable_strip_ttl_column = self.extend_projection_for_ttl(&mut memtable_projection);
+        memtable_spec.projection = Some(memtable_projection.clone());
+
+        for batch in memtable::scan_memtables(
             self.engine.memtable_manager(),
             self.db,
             &self.spec.table_name,
-            self.spec,
-        ));
+            &memtable_spec,
+        ) {
+            let batch = self.apply_ttl_filter_and_projection(
+                batch,
+                &memtable_projection,
+                memtable_strip_ttl_column,
+            )?;
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
+        }
 
         Ok(batches)
     }
@@ -376,6 +440,71 @@ impl<'a> ScanExecutor<'a> {
         }
     }
 
+    fn extend_projection_for_ttl(&self, projection_cols: &mut Vec<usize>) -> bool {
+        let Some(ttl_idx) = self.table_meta.get_ttl_column_index_cached() else {
+            return false;
+        };
+        if projection_cols.contains(&ttl_idx) {
+            return false;
+        }
+        projection_cols.push(ttl_idx);
+        self.spec.projection.is_some()
+    }
+
+    fn apply_ttl_filter_and_projection(
+        &self,
+        batch: RecordBatch,
+        projection_cols: &[usize],
+        strip_ttl_column: bool,
+    ) -> Result<RecordBatch> {
+        let Some(ttl) = self.table_meta.ttl.as_ref() else {
+            return Ok(batch);
+        };
+        let Some(ttl_idx) = self.table_meta.get_ttl_column_index_cached() else {
+            return Ok(batch);
+        };
+        let Some(ttl_pos) = projection_cols.iter().position(|idx| *idx == ttl_idx) else {
+            return Ok(batch);
+        };
+        if batch.num_rows() == 0 || ttl_pos >= batch.num_columns() {
+            return Ok(batch);
+        }
+
+        let now = now_micros();
+        let ttl_micros = ttl.duration_secs.saturating_mul(1_000_000);
+        let ttl_col = batch.column(ttl_pos).unwrap();
+        let mut mask = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let keep = match ttl_col.scalar(row_idx) {
+                crate::types::scalar::ScalarValue::Timestamp(Some(ts)) => {
+                    ts.saturating_add(ttl_micros) > now
+                }
+                _ => false,
+            };
+            mask.push(keep);
+        }
+
+        let match_count = mask.iter().filter(|keep| **keep).count();
+        let filtered = if match_count == batch.num_rows() {
+            batch
+        } else if match_count == 0 {
+            RecordBatch::new(batch.schema.clone())
+        } else {
+            let columns = batch
+                .columns
+                .iter()
+                .map(|col| col.filter_by_mask_fast(&mask, match_count))
+                .collect();
+            RecordBatch::try_new(batch.schema.clone(), columns)?
+        };
+
+        if strip_ttl_column {
+            strip_projection_column(filtered, ttl_pos)
+        } else {
+            Ok(filtered)
+        }
+    }
+
     fn cluster_key_bounds(&self) -> Option<row_filter::ClusterKeyBounds> {
         let cluster_key = self.spec.cluster_key.as_ref()?;
         let key_col = cluster_key.first()?;
@@ -428,6 +557,35 @@ impl<'a> ScanExecutor<'a> {
             None
         }
     }
+}
+
+fn strip_projection_column(batch: RecordBatch, column_pos: usize) -> Result<RecordBatch> {
+    if column_pos >= batch.num_columns() {
+        return Ok(batch);
+    }
+    let schema = crate::types::batch::Schema::new(
+        batch
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| (idx != column_pos).then_some(col.clone()))
+            .collect(),
+    );
+    let columns = batch
+        .columns
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, col)| (idx != column_pos).then_some(col))
+        .collect();
+    RecordBatch::try_new(schema, columns)
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
 }
 
 fn set_tighter_lower(

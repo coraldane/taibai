@@ -9,6 +9,7 @@ use crate::net::session::Session;
 use crate::storage::catalog::auth::{AuthManager, PermissionObjectType, PermissionType};
 use crate::storage::catalog::auto_increment::AutoIncrementManager;
 use crate::storage::catalog::schema::DatabaseCatalog;
+use crate::storage::change_stream::{ChangeEvent, ChangeOperation, ChangeStream};
 use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
 use crate::storage::core::memtable::MemTableManager;
 use crate::storage::index::index_manager::IndexManager;
@@ -39,6 +40,7 @@ pub struct Engine {
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
+    change_stream: Arc<ChangeStream>,
 }
 
 impl Engine {
@@ -113,6 +115,7 @@ impl Engine {
             }
         }
         let index_manager = Arc::new(IndexManager::new(Arc::clone(&segment_mgr)));
+        let change_stream = Arc::new(ChangeStream::new());
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
@@ -123,6 +126,7 @@ impl Engine {
             auth_manager,
             auto_increment_mgr,
             index_manager,
+            change_stream,
         })
     }
 
@@ -219,6 +223,7 @@ impl Engine {
                 primary_key,
                 cluster_by,
                 partition_by,
+                ttl,
             } => super::ddl::exec_create_table(
                 self,
                 name.effective_database(&session.database),
@@ -228,6 +233,7 @@ impl Engine {
                 primary_key,
                 cluster_by,
                 partition_by,
+                ttl,
             ),
             Statement::DropTable { name, if_exists } => super::ddl::exec_drop_table(
                 self,
@@ -289,28 +295,51 @@ impl Engine {
                 if result.is_ok() && txn_id > 0 {
                     session.mark_txn_write();
                 }
+                if txn_id == 0 {
+                    self.publish_dml_change(
+                        table.effective_database(&session.database),
+                        &table.name,
+                        ChangeOperation::Insert,
+                        &result,
+                    );
+                } else if let Ok(ExecResult::Ok { rows_affected }) = &result {
+                    if *rows_affected > 0 {
+                        let db = table.effective_database(&session.database).to_string();
+                        session.record_pending_change(
+                            &db,
+                            &table.name,
+                            ChangeOperation::Insert,
+                            *rows_affected,
+                        );
+                    }
+                }
                 result
             }
             Statement::Update {
                 table,
                 assignments,
                 where_clause,
-            } => super::dml_update::exec_update(
-                self,
-                table.effective_database(&session.database),
-                &table.name,
-                assignments,
-                where_clause,
-            ),
+            } => {
+                let db = table.effective_database(&session.database);
+                let result = super::dml_update::exec_update(
+                    self,
+                    db,
+                    &table.name,
+                    assignments,
+                    where_clause,
+                );
+                self.publish_dml_change(db, &table.name, ChangeOperation::Update, &result);
+                result
+            }
             Statement::Delete {
                 table,
                 where_clause,
-            } => super::dml_delete::exec_delete(
-                self,
-                table.effective_database(&session.database),
-                &table.name,
-                where_clause,
-            ),
+            } => {
+                let db = table.effective_database(&session.database);
+                let result = super::dml_delete::exec_delete(self, db, &table.name, where_clause);
+                self.publish_dml_change(db, &table.name, ChangeOperation::Delete, &result);
+                result
+            }
             Statement::Select { .. } => super::query::exec_select(self, &session.database, stmt),
             Statement::UseDatabase(database) => {
                 let catalogs = self.catalogs().read().unwrap();
@@ -371,6 +400,14 @@ impl Engine {
                 if had_writes {
                     self.batch_writer().commit_txn(txn_id)?;
                 }
+                for event in session.take_pending_changes() {
+                    self.change_stream.publish(
+                        &event.database,
+                        &event.table,
+                        event.operation,
+                        event.rows_affected,
+                    );
+                }
                 session.commit_txn();
                 Ok(ExecResult::Ok { rows_affected: 0 })
             }
@@ -385,6 +422,7 @@ impl Engine {
                     rows_rolled_back = rolled_back,
                     "transaction rolled back"
                 );
+                session.pending_change_events.clear();
                 session.rollback_txn();
                 Ok(ExecResult::Ok {
                     rows_affected: rolled_back,
@@ -674,6 +712,35 @@ impl Engine {
 
     pub fn index_manager(&self) -> &Arc<IndexManager> {
         &self.index_manager
+    }
+
+    pub fn change_stream(&self) -> &Arc<ChangeStream> {
+        &self.change_stream
+    }
+
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<ChangeEvent> {
+        self.change_stream.subscribe()
+    }
+
+    pub fn recent_changes(&self, db: Option<&str>, table: Option<&str>) -> Vec<ChangeEvent> {
+        self.change_stream.recent(db, table)
+    }
+
+    fn publish_dml_change(
+        &self,
+        db: &str,
+        table: &str,
+        operation: ChangeOperation,
+        result: &Result<ExecResult>,
+    ) {
+        let Ok(ExecResult::Ok { rows_affected }) = result else {
+            return;
+        };
+        if *rows_affected == 0 {
+            return;
+        }
+        self.change_stream
+            .publish(db, table, operation, *rows_affected);
     }
 
     pub fn get_table_meta(

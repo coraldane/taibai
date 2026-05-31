@@ -4,7 +4,16 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::sql::execution::prepared::PreparedStatementCache;
+use crate::storage::change_stream::ChangeOperation;
 use crate::storage::txn::txn::{AccessMode, IsolationLevel, Transaction};
+
+#[derive(Debug, Clone)]
+pub struct PendingChangeEvent {
+    pub database: String,
+    pub table: String,
+    pub operation: ChangeOperation,
+    pub rows_affected: u64,
+}
 
 pub struct Session {
     pub id: Uuid,
@@ -22,6 +31,7 @@ pub struct Session {
     pub had_writes: bool,
     pub default_isolation_level: IsolationLevel,
     pub default_access_mode: AccessMode,
+    pub pending_change_events: Vec<PendingChangeEvent>,
 }
 
 impl Session {
@@ -43,6 +53,7 @@ impl Session {
             had_writes: false,
             default_isolation_level: IsolationLevel::default(),
             default_access_mode: AccessMode::default(),
+            pending_change_events: Vec::new(),
         }
     }
 
@@ -103,6 +114,7 @@ impl Session {
             txn.rollback();
         }
         self.active_txn = None;
+        self.pending_change_events.clear();
     }
 
     pub fn active_txn_id(&self) -> u64 {
@@ -117,6 +129,25 @@ impl Session {
         if let Some(ref mut txn) = self.active_txn {
             txn.mark_write();
         }
+    }
+
+    pub fn record_pending_change(
+        &mut self,
+        database: &str,
+        table: &str,
+        operation: ChangeOperation,
+        rows_affected: u64,
+    ) {
+        self.pending_change_events.push(PendingChangeEvent {
+            database: database.to_string(),
+            table: table.to_string(),
+            operation,
+            rows_affected,
+        });
+    }
+
+    pub fn take_pending_changes(&mut self) -> Vec<PendingChangeEvent> {
+        std::mem::take(&mut self.pending_change_events)
     }
 
     pub fn txn_isolation_level(&self) -> Option<IsolationLevel> {

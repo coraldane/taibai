@@ -44,6 +44,8 @@ pub enum AlterOperation {
     RenameTable { new_name: String },
     DropPartition { partition_key: String },
     TruncatePartition { partition_key: String },
+    SetTtl { ttl: TtlDef },
+    DropTtl,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +85,7 @@ pub enum Statement {
         primary_key: Vec<String>,
         cluster_by: Option<Vec<String>>,
         partition_by: Option<PartitionDef>,
+        ttl: Option<TtlDef>,
     },
     DropTable {
         name: ObjectName,
@@ -263,6 +266,12 @@ pub struct PartitionDef {
     pub column: String,
     pub strategy: PartitionStrategy,
     pub param: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TtlDef {
+    pub column: String,
+    pub duration_secs: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
