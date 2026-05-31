@@ -205,7 +205,12 @@ impl BatchWriter {
     }
 
     pub fn flush_all(&self) -> Result<()> {
-        Self::flush_pending_memtables(&self.segment_mgr, &self.memtable_mgr)
+        let mts = self.memtable_mgr.get_all_pending();
+        for mt in mts {
+            Self::flush_memtable(&self.segment_mgr, &mt)?;
+        }
+        self.memtable_mgr.remove_flushed();
+        Ok(())
     }
 
     pub fn clear_memtables(&self, db: &str, table: &str) -> u64 {

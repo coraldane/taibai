@@ -35,7 +35,7 @@ pub fn determine_write_dir(
         .schema
         .columns
         .iter()
-        .position(|c| c.name == table_meta.partition_key);
+        .position(|c| c.name.eq_ignore_ascii_case(&table_meta.partition_key));
 
     let Some(col_idx) = part_col_idx else {
         return Ok((default_dir.to_path_buf(), String::new()));
@@ -52,7 +52,13 @@ pub fn determine_write_dir(
             crate::storage::partition::PartitionStrategy::Month
         }
         crate::storage::catalog::schema::PartitionType::Value => {
-            crate::storage::partition::PartitionStrategy::Day
+            let first_val = batch
+                .scalar(0, col_idx)
+                .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
+            return Ok((
+                default_dir.to_path_buf(),
+                first_val.to_text().unwrap_or_default(),
+            ));
         }
         crate::storage::catalog::schema::PartitionType::Hash => {
             let first_val = batch

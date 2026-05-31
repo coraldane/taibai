@@ -979,8 +979,7 @@ pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult
 
 pub fn exec_flush_table(engine: &Engine, db: &str, table: &Option<String>) -> Result<ExecResult> {
     if let Some(table_name) = table {
-        let _table_dir = engine.data_dir().join(db).join(table_name);
-        engine.segment_mgr().flush_all_active()?;
+        engine.flush_all_buffers()?;
         tracing::info!(db, table = table_name, "FLUSH TABLE executed");
     } else {
         engine.flush_all_buffers()?;

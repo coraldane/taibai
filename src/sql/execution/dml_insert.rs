@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::common::error::{MonaxError, Result};
@@ -140,15 +140,7 @@ pub fn exec_insert(
     if engine.is_bulk_mode() {
         engine.exec_bulk_insert_with_wal_control(db, table, batch, false)?;
     } else {
-        let partition_key = determine_partition_key(&table_meta, &batch);
-        engine.batch_writer().write_columns_with_txn(
-            db,
-            table,
-            &partition_key,
-            batch,
-            schema,
-            txn_id,
-        )?;
+        write_batch_by_partition(engine, db, table, &table_meta, batch, schema, txn_id)?;
     }
 
     {
@@ -167,6 +159,92 @@ pub fn exec_insert(
     Ok(ExecResult::Ok {
         rows_affected: row_count,
     })
+}
+
+fn write_batch_by_partition(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    batch: RecordBatch,
+    schema: Schema,
+    txn_id: u64,
+) -> Result<()> {
+    let groups = partition_masks(table_meta, &batch);
+    if groups.len() <= 1 {
+        let partition_key = groups
+            .first()
+            .map(|(key, _)| key.clone())
+            .unwrap_or_default();
+        engine.batch_writer().write_columns_with_txn(
+            db,
+            table,
+            &partition_key,
+            batch,
+            schema,
+            txn_id,
+        )?;
+        return Ok(());
+    }
+
+    for (partition_key, mask) in groups {
+        let match_count = mask.iter().filter(|keep| **keep).count();
+        let part_batch = filter_batch_by_mask(&batch, &mask, match_count)?;
+        engine.batch_writer().write_columns_with_txn(
+            db,
+            table,
+            &partition_key,
+            part_batch,
+            schema.clone(),
+            txn_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn partition_masks(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    batch: &RecordBatch,
+) -> Vec<(String, Vec<bool>)> {
+    if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
+        return vec![(String::new(), vec![true; batch.num_rows()])];
+    }
+    let col_idx = match table_meta.get_partition_column_index_cached() {
+        Some(idx) => idx,
+        None => return vec![(String::new(), vec![true; batch.num_rows()])],
+    };
+    let mut key_order = Vec::new();
+    let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
+    for row_idx in 0..batch.num_rows() {
+        let val = batch
+            .scalar(row_idx, col_idx)
+            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
+        let key = compute_partition_key_for_value(table_meta, &val);
+        if !groups.contains_key(&key) {
+            key_order.push(key.clone());
+            groups.insert(key.clone(), vec![false; batch.num_rows()]);
+        }
+        if let Some(mask) = groups.get_mut(&key) {
+            mask[row_idx] = true;
+        }
+    }
+    key_order
+        .into_iter()
+        .filter_map(|key| groups.remove(&key).map(|mask| (key, mask)))
+        .collect()
+}
+
+fn filter_batch_by_mask(
+    batch: &RecordBatch,
+    mask: &[bool],
+    match_count: usize,
+) -> Result<RecordBatch> {
+    let columns = batch
+        .columns
+        .iter()
+        .map(|col| col.filter_by_mask_fast(mask, match_count))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
 fn resolve_insert_columns(
@@ -375,30 +453,19 @@ fn duplicate_primary_key_error(table: &str, key: &[ScalarValue]) -> MonaxError {
     ))
 }
 
-fn determine_partition_key(
+fn compute_partition_key_for_value(
     table_meta: &crate::storage::catalog::schema::TableMeta,
-    batch: &RecordBatch,
+    val: &ScalarValue,
 ) -> String {
     if table_meta.partition_key.is_empty() {
         return String::new();
     }
-    let col_idx = match table_meta.get_partition_column_index_cached() {
-        Some(idx) => idx,
-        None => return String::new(),
-    };
-    if batch.num_rows() == 0 {
-        return String::new();
-    }
-    let val = batch
-        .scalar(0, col_idx)
-        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-
     use crate::storage::catalog::schema::PartitionType;
     match table_meta.partition_type {
         PartitionType::Day | PartitionType::Year | PartitionType::Month | PartitionType::Hash => {
             crate::storage::partition::partition_function::compute_partition_key_from_scalar(
                 &table_meta.partition_strategy(),
-                &val,
+                val,
             )
         }
         PartitionType::Value => val.to_text().unwrap_or_default(),

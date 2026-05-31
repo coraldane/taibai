@@ -36,20 +36,15 @@ impl PartitionStrategy {
 /// For MONTH: returns "YYYYMM" (6 digits)
 /// For YEAR: returns "YYYY" (4 digits)
 pub fn compute_partition_key(value: &ScalarValue, strategy: PartitionStrategy) -> Result<String> {
-    let ts_millis = extract_timestamp_millis(value)?;
-
-    let secs = ts_millis / 1000;
-    let datetime = chrono_from_millis(secs);
-
-    let key = match strategy {
+    let func = match strategy {
         PartitionStrategy::Day => {
-            format!("{:04}{:02}{:02}", datetime.0, datetime.1, datetime.2)
+            crate::storage::partition::partition_function::PartitionFunction::Day
         }
         PartitionStrategy::Month => {
-            format!("{:04}{:02}", datetime.0, datetime.1)
+            crate::storage::partition::partition_function::PartitionFunction::Month
         }
         PartitionStrategy::Year => {
-            format!("{:04}", datetime.0)
+            crate::storage::partition::partition_function::PartitionFunction::Year
         }
         PartitionStrategy::None => {
             return Err(MonaxError::Internal(
@@ -57,40 +52,14 @@ pub fn compute_partition_key(value: &ScalarValue, strategy: PartitionStrategy) -
             ))
         }
     };
-
-    Ok(key)
-}
-
-fn extract_timestamp_millis(value: &ScalarValue) -> Result<i64> {
-    match value {
-        ScalarValue::Int64(Some(v)) => Ok(*v),
-        ScalarValue::Timestamp(Some(v)) => Ok(*v),
-        ScalarValue::Date(Some(v)) => Ok((*v as i64) * 86_400_000),
-        ScalarValue::Float64(Some(v)) => Ok(*v as i64),
-        _ => Err(MonaxError::Sql(format!(
-            "cannot extract timestamp for partition key from value: {:?}",
-            value
-        ))),
-    }
-}
-
-fn chrono_from_millis(secs: i64) -> (i32, u32, u32) {
-    let days = secs / 86400;
-    let z = days + 719468;
-    let era = if z >= 0 {
-        z / 146097
-    } else {
-        (z - 146096) / 146097
-    };
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as u32, d as u32)
+    crate::storage::partition::partition_function::temporal_partition_key(&func, value).ok_or_else(
+        || {
+            MonaxError::Sql(format!(
+                "cannot extract partition key from value: {:?}",
+                value
+            ))
+        },
+    )
 }
 
 /// Build a partitioned segment filename.
@@ -248,14 +217,6 @@ mod tests {
     fn test_is_regular_segment() {
         assert!(is_regular_segment("seg_00001.dat"));
         assert!(!is_regular_segment("p20260501_0001.dat"));
-    }
-
-    #[test]
-    fn test_chrono_from_millis() {
-        let (y, m, d) = chrono_from_millis(1767225600);
-        assert_eq!(y, 2026);
-        assert_eq!(m, 1);
-        assert_eq!(d, 1);
     }
 
     #[test]

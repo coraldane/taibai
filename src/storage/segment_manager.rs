@@ -8,15 +8,18 @@ use std::time::Instant;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::bulk_payload::parse_direct_bulk_payload;
+use crate::storage::bulk_payload::{
+    parse_direct_bulk_payload, DirectBulkColumn, DirectBulkRequest,
+};
 use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::core::wal::WalWriter;
-use crate::storage::partition::partition_function::compute_partition_key_from_bulk_payload;
+use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
 use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::{
     encode_segment_footer, encode_segment_header, RowGroupMeta, SegmentReader, SegmentWriter,
     SEGMENT_HEADER_SIZE,
 };
+use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
@@ -846,17 +849,12 @@ impl SegmentManager {
         let table_dir = self.data_dir.join(db).join(req.table_name);
         std::fs::create_dir_all(&table_dir)?;
 
-        let (schema, partition_key) = {
+        let (schema, table_meta) = {
             let table_meta = catalogs.get_table(req.table_name).ok_or_else(|| {
                 MonaxError::Sql(format!("table '{}.{}' does not exist", db, req.table_name))
             })?;
             let schema = Schema::new(table_meta.columns.clone());
-            let partition_key = if table_meta.is_partitioned() {
-                compute_partition_key_from_bulk_payload(&req, table_meta)?
-            } else {
-                String::new()
-            };
-            (schema, partition_key)
+            (schema, table_meta.clone())
         };
 
         if schema.num_columns() != req.columns.len() {
@@ -891,6 +889,23 @@ impl SegmentManager {
                 ));
             }
         }
+
+        if table_meta.is_partitioned() || !table_meta.cluster_key.is_empty() {
+            let mut batch = direct_bulk_request_to_batch(&req, &schema)?;
+            if !table_meta.cluster_key.is_empty() {
+                let key_indices: Vec<usize> = table_meta
+                    .cluster_key
+                    .iter()
+                    .filter_map(|key| schema.index_of(key))
+                    .collect();
+                if !key_indices.is_empty() {
+                    batch = sort_batch_by_key_indices(&batch, &key_indices)?;
+                }
+            }
+            return self.bulk_insert_batch_partitioned(db, req.table_name, &table_meta, batch);
+        }
+
+        let partition_key = String::new();
 
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
@@ -973,6 +988,50 @@ impl SegmentManager {
         }
 
         Ok(req.row_count as u64)
+    }
+
+    fn bulk_insert_batch_partitioned(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        if !table_meta.is_partitioned() {
+            return self.bulk_insert_batch_with_partition(db, table, "", batch);
+        }
+
+        let pk_idx = match table_meta.get_partition_column_index_cached() {
+            Some(idx) => idx,
+            None => return self.bulk_insert_batch_with_partition(db, table, "", batch),
+        };
+        let mut key_order = Vec::new();
+        let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            let val = batch
+                .scalar(row_idx, pk_idx)
+                .unwrap_or(ScalarValue::Int64(None));
+            let key = compute_partition_key_from_scalar(&table_meta.partition_strategy(), &val);
+            if !groups.contains_key(&key) {
+                key_order.push(key.clone());
+                groups.insert(key.clone(), vec![false; batch.num_rows()]);
+            }
+            if let Some(mask) = groups.get_mut(&key) {
+                mask[row_idx] = true;
+            }
+        }
+
+        let mut written = 0;
+        for partition_key in key_order {
+            let Some(mask) = groups.remove(&partition_key) else {
+                continue;
+            };
+            let match_count = mask.iter().filter(|keep| **keep).count();
+            let part_batch = filter_batch_by_mask(&batch, &mask, match_count)?;
+            written +=
+                self.bulk_insert_batch_with_partition(db, table, &partition_key, part_batch)?;
+        }
+        Ok(written)
     }
 
     pub fn flush_all_active(&self) -> Result<u64> {
@@ -1365,6 +1424,152 @@ fn compute_zone_maps_from_batch(
         zone_maps.push(zm);
     }
     zone_maps
+}
+
+fn direct_bulk_request_to_batch(
+    req: &DirectBulkRequest<'_>,
+    schema: &Schema,
+) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(req.columns.len());
+    for col in &req.columns {
+        let mut array = ColumnArray::empty(col.data_type);
+        for row_idx in 0..req.row_count {
+            let scalar = direct_bulk_column_scalar_at(col, row_idx)?;
+            array.push(&scalar)?;
+        }
+        columns.push(array);
+    }
+    RecordBatch::try_new(schema.clone(), columns)
+}
+
+fn direct_bulk_column_scalar_at(col: &DirectBulkColumn<'_>, row_idx: usize) -> Result<ScalarValue> {
+    if is_null_at(col.nulls, row_idx) {
+        return Ok(ScalarValue::null_for_type(col.data_type));
+    }
+
+    if let Some(width) = col.data_type.fixed_size() {
+        let offset = row_idx
+            .checked_mul(width)
+            .ok_or_else(|| MonaxError::Protocol("bulk column offset overflow".into()))?;
+        return read_fixed_scalar(col.data, offset, col.data_type).ok_or_else(|| {
+            MonaxError::Protocol(format!(
+                "bulk column '{}' row {} is truncated",
+                col.name, row_idx
+            ))
+        });
+    }
+
+    let (offset, len) = direct_bulk_variable_range_at(col, row_idx)?;
+    match col.data_type {
+        DataType::VarChar => {
+            let s = std::str::from_utf8(&col.data[offset..offset + len])
+                .map_err(|_| MonaxError::Protocol("invalid utf8 in bulk varchar".into()))?;
+            Ok(ScalarValue::VarChar(Some(s.to_string())))
+        }
+        DataType::Blob => Ok(ScalarValue::Blob(Some(
+            col.data[offset..offset + len].to_vec(),
+        ))),
+        DataType::Vector => {
+            if len % 4 != 0 {
+                return Err(MonaxError::Protocol(
+                    "bulk vector payload length must be a multiple of 4".into(),
+                ));
+            }
+            let mut values = Vec::with_capacity(len / 4);
+            for chunk in col.data[offset..offset + len].chunks_exact(4) {
+                values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            Ok(ScalarValue::Vector(Some(values)))
+        }
+        _ => Err(MonaxError::Protocol(format!(
+            "unsupported variable bulk type {}",
+            col.data_type.display_name()
+        ))),
+    }
+}
+
+fn direct_bulk_variable_range_at(
+    col: &DirectBulkColumn<'_>,
+    target_row: usize,
+) -> Result<(usize, usize)> {
+    let mut offset = 0usize;
+    for row_idx in 0..=target_row {
+        if is_null_at(col.nulls, row_idx) {
+            continue;
+        }
+        if offset + 4 > col.data.len() {
+            return Err(MonaxError::Protocol(format!(
+                "bulk column '{}' variable length prefix truncated",
+                col.name
+            )));
+        }
+        let len = u32::from_le_bytes(col.data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + len > col.data.len() {
+            return Err(MonaxError::Protocol(format!(
+                "bulk column '{}' variable data truncated",
+                col.name
+            )));
+        }
+        if row_idx == target_row {
+            return Ok((offset, len));
+        }
+        offset += len;
+    }
+    Err(MonaxError::Protocol(format!(
+        "bulk column '{}' row {} not found",
+        col.name, target_row
+    )))
+}
+
+fn sort_batch_by_key_indices(batch: &RecordBatch, key_indices: &[usize]) -> Result<RecordBatch> {
+    if batch.num_rows() <= 1 {
+        return Ok(batch.clone());
+    }
+
+    let mut rows: Vec<usize> = (0..batch.num_rows()).collect();
+    rows.sort_by(|left, right| {
+        for &col_idx in key_indices {
+            let left_value = batch.scalar(*left, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
+            });
+            let right_value = batch.scalar(*right, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
+            });
+            let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(
+                &left_value,
+                &right_value,
+            );
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    let mut sorted = RecordBatch::new(batch.schema.clone());
+    for row_idx in rows {
+        for col_idx in 0..batch.num_columns() {
+            let value = batch.scalar(row_idx, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
+            });
+            sorted.column_mut(col_idx).unwrap().push(&value)?;
+        }
+    }
+    Ok(sorted)
+}
+
+fn filter_batch_by_mask(
+    batch: &RecordBatch,
+    mask: &[bool],
+    match_count: usize,
+) -> Result<RecordBatch> {
+    let columns = batch
+        .columns
+        .iter()
+        .map(|col| col.filter_by_mask_fast(mask, match_count))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
 fn compute_zone_maps_from_bulk_columns(
