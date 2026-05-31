@@ -318,6 +318,11 @@ impl Parser {
             }
             Token::Ident(name) => {
                 self.advance();
+                match name.to_ascii_uppercase().as_str() {
+                    "TRUE" => return Ok(Expr::Literal(ScalarValue::Bool(Some(true)))),
+                    "FALSE" => return Ok(Expr::Literal(ScalarValue::Bool(Some(false)))),
+                    _ => {}
+                }
                 if self.peek() == &Token::Dot {
                     self.advance();
                     let mut table = name;

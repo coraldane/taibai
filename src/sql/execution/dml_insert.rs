@@ -462,7 +462,11 @@ fn compute_partition_key_for_value(
     }
     use crate::storage::catalog::schema::PartitionType;
     match table_meta.partition_type {
-        PartitionType::Day | PartitionType::Year | PartitionType::Month | PartitionType::Hash => {
+        PartitionType::Day
+        | PartitionType::Year
+        | PartitionType::Month
+        | PartitionType::Hash
+        | PartitionType::Mod => {
             crate::storage::partition::partition_function::compute_partition_key_from_scalar(
                 &table_meta.partition_strategy(),
                 val,

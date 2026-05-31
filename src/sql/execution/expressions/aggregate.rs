@@ -71,13 +71,7 @@ impl ColumnExpression for AggregateExpression {
 }
 
 fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
-    match v {
-        ScalarValue::Int64(Some(v)) => Some(*v as f64),
-        ScalarValue::Int32(Some(v)) => Some(*v as f64),
-        ScalarValue::Float64(Some(v)) => Some(*v),
-        ScalarValue::Float32(Some(v)) => Some(*v as f64),
-        _ => None,
-    }
+    v.numeric_f64()
 }
 
 fn find_min(col: &ColumnArray, num_rows: usize) -> ScalarValue {
@@ -98,6 +92,7 @@ fn find_max(col: &ColumnArray, num_rows: usize) -> ScalarValue {
 
 fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     match (a, b) {
+        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
             l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)

@@ -297,6 +297,8 @@ fn null_scalar_of_type(dt: DataType) -> ScalarValue {
         DataType::Int8 => ScalarValue::Int8(None),
         DataType::UInt64 => ScalarValue::UInt64(None),
         DataType::UInt32 => ScalarValue::UInt32(None),
+        DataType::UInt16 => ScalarValue::UInt16(None),
+        DataType::UInt8 => ScalarValue::UInt8(None),
         DataType::Float64 => ScalarValue::Float64(None),
         DataType::Float32 => ScalarValue::Float32(None),
         DataType::VarChar => ScalarValue::VarChar(None),
@@ -319,9 +321,14 @@ fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
                 .columns
                 .get(*idx)
                 .map(|c| match c.data_type {
-                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                        DataType::Int64
-                    }
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64 => DataType::Int64,
                     DataType::Float32 | DataType::Float64 => DataType::Float64,
                     other => other,
                 })
@@ -419,6 +426,10 @@ pub fn compute_aggregate(
                                 ScalarValue::Int16(Some(n)) => Some(*n as i64),
                                 ScalarValue::Int32(Some(n)) => Some(*n as i64),
                                 ScalarValue::Int64(Some(n)) => Some(*n),
+                                ScalarValue::UInt8(Some(n)) => Some(*n as i64),
+                                ScalarValue::UInt16(Some(n)) => Some(*n as i64),
+                                ScalarValue::UInt32(Some(n)) => Some(*n as i64),
+                                ScalarValue::UInt64(Some(n)) => i64::try_from(*n).ok(),
                                 _ => None,
                             })
                             .sum();
@@ -479,18 +490,7 @@ pub fn compute_aggregate(
 }
 
 pub fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
-    match v {
-        ScalarValue::Int64(Some(v)) => Some(*v as f64),
-        ScalarValue::Int32(Some(v)) => Some(*v as f64),
-        ScalarValue::Int16(Some(v)) => Some(*v as f64),
-        ScalarValue::Int8(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt64(Some(v)) => Some(*v as f64),
-        ScalarValue::UInt32(Some(v)) => Some(*v as f64),
-        ScalarValue::Float64(Some(v)) => Some(*v),
-        ScalarValue::Float32(Some(v)) => Some(*v as f64),
-        ScalarValue::Decimal(Some(v)) => Some(*v as f64),
-        _ => None,
-    }
+    v.numeric_f64()
 }
 
 pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
@@ -504,12 +504,15 @@ pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
         return std::cmp::Ordering::Greater;
     }
     match (a, b) {
+        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
         (ScalarValue::Int16(Some(l)), ScalarValue::Int16(Some(r))) => l.cmp(r),
         (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => l.cmp(r),
         (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => l.cmp(r),
         (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => l.cmp(r),
+        (ScalarValue::UInt16(Some(l)), ScalarValue::UInt16(Some(r))) => l.cmp(r),
+        (ScalarValue::UInt8(Some(l)), ScalarValue::UInt8(Some(r))) => l.cmp(r),
         (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
             l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
         }

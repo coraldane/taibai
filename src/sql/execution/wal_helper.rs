@@ -70,6 +70,16 @@ pub fn determine_write_dir(
             );
             return Ok((default_dir.to_path_buf(), format!("hash_{}", hash_val)));
         }
+        crate::storage::catalog::schema::PartitionType::Mod => {
+            let first_val = batch
+                .scalar(0, col_idx)
+                .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
+            let mod_val = crate::storage::partition::partition_function::mod_partition_value(
+                &first_val,
+                table_meta.partition_param as i64,
+            );
+            return Ok((default_dir.to_path_buf(), mod_val.to_string()));
+        }
         crate::storage::catalog::schema::PartitionType::None => {
             return Ok((default_dir.to_path_buf(), String::new()))
         }

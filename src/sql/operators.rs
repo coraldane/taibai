@@ -332,10 +332,23 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
         LogicalExpr::Literal(v) => v.data_type(),
         LogicalExpr::BinaryOp { .. } => DataType::Int64,
         LogicalExpr::Aggregate(agg) => {
-            match agg.func {
-                AggFunc::Count => DataType::Int64,
-                _ => DataType::Float64,
-            }
+            let agg_prefix = match agg.func {
+                AggFunc::Count => "count",
+                AggFunc::Sum => "sum",
+                AggFunc::Avg => "avg",
+                AggFunc::Min => "min",
+                AggFunc::Max => "max",
+            };
+            schema
+                .columns
+                .iter()
+                .find(|c| {
+                    let name = c.name.to_ascii_lowercase();
+                    name.starts_with(&format!("{}(", agg_prefix))
+                        || name == format!("{}(*)", agg_prefix)
+                })
+                .map(|c| c.data_type)
+                .unwrap_or_else(|| aggregate_result_type(agg, schema))
         }
         _ => DataType::Int64,
     }
@@ -445,6 +458,9 @@ fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     if b.is_null() { return std::cmp::Ordering::Greater; }
 
     match (a, b) {
+        _ if a.numeric_cmp(b).is_some() => a
+            .numeric_cmp(b)
+            .unwrap_or(std::cmp::Ordering::Equal),
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
         (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
@@ -616,18 +632,7 @@ impl ExecutionOp for HashAggregateExec {
             } else {
                 format!("{}({})", func_name, arg_name)
             };
-            let dt = match agg.func {
-                AggFunc::Count => DataType::Int64,
-                AggFunc::Sum | AggFunc::Avg => DataType::Float64,
-                AggFunc::Min | AggFunc::Max => {
-                    match &*agg.arg {
-                        LogicalExpr::Column(idx) => {
-                            self.input_schema.columns.get(*idx).map(|c| c.data_type).unwrap_or(DataType::Int64)
-                        }
-                        _ => DataType::Int64,
-                    }
-                }
-            };
+            let dt = aggregate_result_type(agg, &self.input_schema);
             col_defs.push(ColumnDef::new(&name, dt));
         }
         let schema = Schema::new(col_defs);
@@ -665,7 +670,7 @@ impl ExecutionOp for HashAggregateExec {
     }
 }
 
-pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], _schema: &Schema) -> ScalarValue {
+pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], schema: &Schema) -> ScalarValue {
     let col_idx = match &*agg.arg {
         LogicalExpr::Column(idx) => Some(*idx),
         LogicalExpr::Wildcard => None,
@@ -683,12 +688,21 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], _schema
         }
         AggFunc::Sum => {
             if let Some(idx) = col_idx {
-                let sum: f64 = rows.iter()
-                    .filter_map(|r| r.get(idx).and_then(|v| scalar_to_f64(v)))
-                    .sum();
-                ScalarValue::Float64(Some(sum))
+                let input_type = schema.columns.get(idx).map(|c| c.data_type).unwrap_or(DataType::Int64);
+                if matches!(input_type, DataType::Float32 | DataType::Float64) {
+                    let sum: f64 = rows.iter()
+                        .filter_map(|r| r.get(idx).and_then(|v| scalar_to_f64(v)))
+                        .sum();
+                    ScalarValue::Float64(Some(sum))
+                } else {
+                    let sum: i64 = rows.iter()
+                        .filter_map(|r| r.get(idx).and_then(|v| v.integer_i128()))
+                        .filter_map(|v| i64::try_from(v).ok())
+                        .sum();
+                    ScalarValue::Int64(Some(sum))
+                }
             } else {
-                ScalarValue::Float64(None)
+                ScalarValue::Int64(None)
             }
         }
         AggFunc::Avg => {
@@ -724,12 +738,40 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], _schema
 }
 
 fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
-    match v {
-        ScalarValue::Int64(Some(v)) => Some(*v as f64),
-        ScalarValue::Int32(Some(v)) => Some(*v as f64),
-        ScalarValue::Float64(Some(v)) => Some(*v),
-        ScalarValue::Float32(Some(v)) => Some(*v as f64),
-        _ => None,
+    v.numeric_f64()
+}
+
+fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
+    match agg.func {
+        AggFunc::Count => DataType::Int64,
+        AggFunc::Sum => match &*agg.arg {
+            LogicalExpr::Column(idx) => schema
+                .columns
+                .get(*idx)
+                .map(|c| match c.data_type {
+                    DataType::Float32 | DataType::Float64 => DataType::Float64,
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64 => DataType::Int64,
+                    other => other,
+                })
+                .unwrap_or(DataType::Int64),
+            _ => DataType::Int64,
+        },
+        AggFunc::Avg => DataType::Float64,
+        AggFunc::Min | AggFunc::Max => match &*agg.arg {
+            LogicalExpr::Column(idx) => schema
+                .columns
+                .get(*idx)
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::Int64),
+            _ => DataType::Int64,
+        },
     }
 }
 

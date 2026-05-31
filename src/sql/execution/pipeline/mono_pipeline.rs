@@ -171,7 +171,7 @@ fn schema_of(plan: &LogicalPlan) -> crate::types::batch::Schema {
                 let name = format!("{:?}", agg.func);
                 cols.push(crate::types::batch::ColumnDef::new(
                     &name,
-                    crate::protocol::types::DataType::Float64,
+                    aggregate_result_type(agg, &input_schema),
                 ));
             }
             crate::types::batch::Schema::new(cols)
@@ -184,5 +184,44 @@ fn schema_of(plan: &LogicalPlan) -> crate::types::batch::Schema {
         LogicalPlan::Distinct(d) => schema_of(&d.input),
         LogicalPlan::Window(w) => schema_of(&w.input),
         LogicalPlan::Empty => crate::types::batch::Schema::empty(),
+    }
+}
+
+fn aggregate_result_type(
+    agg: &crate::sql::planner::AggregateExpr,
+    schema: &crate::types::batch::Schema,
+) -> crate::protocol::types::DataType {
+    use crate::protocol::types::DataType;
+    use crate::sql::planner::{AggFunc, LogicalExpr};
+    match agg.func {
+        AggFunc::Count => DataType::Int64,
+        AggFunc::Sum => match &*agg.arg {
+            LogicalExpr::Column(idx) => schema
+                .columns
+                .get(*idx)
+                .map(|c| match c.data_type {
+                    DataType::Float32 | DataType::Float64 => DataType::Float64,
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64 => DataType::Int64,
+                    other => other,
+                })
+                .unwrap_or(DataType::Int64),
+            _ => DataType::Int64,
+        },
+        AggFunc::Avg => DataType::Float64,
+        AggFunc::Min | AggFunc::Max => match &*agg.arg {
+            LogicalExpr::Column(idx) => schema
+                .columns
+                .get(*idx)
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::Int64),
+            _ => DataType::Int64,
+        },
     }
 }

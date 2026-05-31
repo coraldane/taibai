@@ -73,6 +73,10 @@ pub fn exec_create_table(
                     meta.partition_param = buckets;
                     PartitionType::Hash
                 }
+                PartitionStrategy::Mod(divisor) => {
+                    meta.partition_param = divisor;
+                    PartitionType::Mod
+                }
             };
             meta.update_partition_key_idx();
         }
@@ -772,7 +776,11 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
             PartitionType::Month => format!(" PARTITION BY MONTH({})", table_meta.partition_key),
             PartitionType::Value => format!(" PARTITION BY {}", table_meta.partition_key),
             PartitionType::Hash => format!(
-                " PARTITION BY HASH({})({})",
+                " PARTITION BY HASH({}, {})",
+                table_meta.partition_key, table_meta.partition_param
+            ),
+            PartitionType::Mod => format!(
+                " PARTITION BY MOD({}, {})",
                 table_meta.partition_key, table_meta.partition_param
             ),
             PartitionType::None => String::new(),

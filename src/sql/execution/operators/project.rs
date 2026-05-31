@@ -136,8 +136,9 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
                 .columns
                 .iter()
                 .find(|c| {
-                    c.name.starts_with(&format!("{}(", agg_prefix))
-                        || c.name == format!("{}(*)", agg_prefix)
+                    let name = c.name.to_ascii_lowercase();
+                    name.starts_with(&format!("{}(", agg_prefix))
+                        || name == format!("{}(*)", agg_prefix)
                 })
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Int64)

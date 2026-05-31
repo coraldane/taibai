@@ -794,6 +794,9 @@ impl ColumnArray {
         let num_rows = self.len();
         let bitmap = self.bitmap();
         match (self, value) {
+            (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => (0..num_rows)
+                .map(|i| !bitmap.is_null(i) && (data[i] != 0) == *v)
+                .collect(),
             (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
                 .map(|i| !bitmap.is_null(i) && data[i] == *v)
                 .collect(),
@@ -802,6 +805,15 @@ impl ColumnArray {
                 .collect(),
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
                 .map(|i| !bitmap.is_null(i) && &data[i] == v)
+                .collect(),
+            _ if value.numeric_f64().is_some() => (0..num_rows)
+                .map(|i| {
+                    !bitmap.is_null(i)
+                        && self
+                            .scalar(i)
+                            .numeric_cmp(value)
+                            .map_or(false, |ord| ord == std::cmp::Ordering::Equal)
+                })
                 .collect(),
             _ => vec![false; num_rows],
         }
@@ -820,6 +832,15 @@ impl ColumnArray {
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
                 .map(|i| !bitmap.is_null(i) && &data[i] < v)
                 .collect(),
+            _ if value.numeric_f64().is_some() => (0..num_rows)
+                .map(|i| {
+                    !bitmap.is_null(i)
+                        && self
+                            .scalar(i)
+                            .numeric_cmp(value)
+                            .map_or(false, |ord| ord == std::cmp::Ordering::Less)
+                })
+                .collect(),
             _ => vec![false; num_rows],
         }
     }
@@ -836,6 +857,15 @@ impl ColumnArray {
                 .collect(),
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
                 .map(|i| !bitmap.is_null(i) && &data[i] <= v)
+                .collect(),
+            _ if value.numeric_f64().is_some() => (0..num_rows)
+                .map(|i| {
+                    !bitmap.is_null(i)
+                        && self
+                            .scalar(i)
+                            .numeric_cmp(value)
+                            .map_or(false, |ord| ord != std::cmp::Ordering::Greater)
+                })
                 .collect(),
             _ => vec![false; num_rows],
         }
@@ -854,6 +884,15 @@ impl ColumnArray {
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
                 .map(|i| !bitmap.is_null(i) && &data[i] > v)
                 .collect(),
+            _ if value.numeric_f64().is_some() => (0..num_rows)
+                .map(|i| {
+                    !bitmap.is_null(i)
+                        && self
+                            .scalar(i)
+                            .numeric_cmp(value)
+                            .map_or(false, |ord| ord == std::cmp::Ordering::Greater)
+                })
+                .collect(),
             _ => vec![false; num_rows],
         }
     }
@@ -870,6 +909,15 @@ impl ColumnArray {
                 .collect(),
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
                 .map(|i| !bitmap.is_null(i) && &data[i] >= v)
+                .collect(),
+            _ if value.numeric_f64().is_some() => (0..num_rows)
+                .map(|i| {
+                    !bitmap.is_null(i)
+                        && self
+                            .scalar(i)
+                            .numeric_cmp(value)
+                            .map_or(false, |ord| ord != std::cmp::Ordering::Less)
+                })
                 .collect(),
             _ => vec![false; num_rows],
         }

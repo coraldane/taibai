@@ -328,6 +328,7 @@ pub fn eval_expr_for_row(
 
 pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> Option<std::cmp::Ordering> {
     match (a, b) {
+        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b),
         (ScalarValue::Int32(Some(a)), ScalarValue::Int64(Some(b))) => (*a as i64).partial_cmp(b),
         (ScalarValue::Int64(Some(a)), ScalarValue::Int32(Some(b))) => a.partial_cmp(&(*b as i64)),
         (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => Some(a.cmp(b)),

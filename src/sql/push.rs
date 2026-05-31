@@ -14,6 +14,41 @@ pub trait PushOp {
     fn finalize(self: Box<Self>) -> Result<Option<RecordBatch>>;
 }
 
+fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> crate::protocol::types::DataType {
+    use crate::protocol::types::DataType;
+    match agg.func {
+        AggFunc::Count => DataType::Int64,
+        AggFunc::Sum => match &*agg.arg {
+            LogicalExpr::Column(idx) => schema
+                .columns
+                .get(*idx)
+                .map(|c| match c.data_type {
+                    DataType::Float32 | DataType::Float64 => DataType::Float64,
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64 => DataType::Int64,
+                    other => other,
+                })
+                .unwrap_or(DataType::Int64),
+            _ => DataType::Int64,
+        },
+        AggFunc::Avg => DataType::Float64,
+        AggFunc::Min | AggFunc::Max => match &*agg.arg {
+            LogicalExpr::Column(idx) => schema
+                .columns
+                .get(*idx)
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::Int64),
+            _ => DataType::Int64,
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PushFilter - filters rows as batches are pushed through
 // ---------------------------------------------------------------------------
@@ -259,10 +294,7 @@ impl PushOp for PushHashAggregate {
                 LogicalExpr::Column(idx) => self.input_schema.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default(),
                 _ => "expr".into(),
             });
-            let dt = match agg.func {
-                AggFunc::Count => crate::protocol::types::DataType::Int64,
-                _ => crate::protocol::types::DataType::Float64,
-            };
+            let dt = aggregate_result_type(agg, &self.input_schema);
             col_defs.push(ColumnDef::new(&name, dt));
         }
         let schema = Schema::new(col_defs);
@@ -454,10 +486,7 @@ impl MonoPipeline {
                         LogicalExpr::Column(idx) => input_schema.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default(),
                         _ => "expr".into(),
                     });
-                    let dt = match agg.func {
-                        AggFunc::Count => crate::protocol::types::DataType::Int64,
-                        _ => crate::protocol::types::DataType::Float64,
-                    };
+                    let dt = aggregate_result_type(agg, &input_schema);
                     col_defs.push(ColumnDef::new(&name, dt));
                 }
                 let schema = Schema::new(col_defs);

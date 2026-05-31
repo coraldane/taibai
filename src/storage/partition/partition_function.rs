@@ -7,6 +7,7 @@ pub enum PartitionFunction {
     Month,
     Value,
     Hash(i32),
+    Mod(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,13 @@ impl PartitionFunction {
             PartitionFunction::Year => value / (86400 * 365),
             PartitionFunction::Month => value / (86400 * 30),
             PartitionFunction::Value => value,
+            PartitionFunction::Mod(divisor) => {
+                if *divisor > 0 {
+                    value.rem_euclid(*divisor as i64)
+                } else {
+                    value
+                }
+            }
             PartitionFunction::Hash(buckets) => {
                 if *buckets > 0 {
                     (value.abs() % (*buckets as i64)) as i64
@@ -66,6 +74,7 @@ pub fn compute_partition_key_from_scalar(func: &PartitionFunction, val: &ScalarV
             },
         )
         .to_string(),
+        PartitionFunction::Mod(divisor) => mod_partition_value(val, *divisor as i64).to_string(),
         PartitionFunction::Value => val.to_text().unwrap_or_default(),
         PartitionFunction::Day | PartitionFunction::Month | PartitionFunction::Year => {
             temporal_partition_key(func, val).unwrap_or_default()
@@ -109,6 +118,27 @@ pub fn hash_partition_value(val: &ScalarValue, num_buckets: i64) -> i64 {
             }
         }
         ScalarValue::VarChar(Some(s)) => func.apply_str(s),
+        _ => 0,
+    }
+}
+
+pub fn mod_partition_value(val: &ScalarValue, divisor: i64) -> i64 {
+    if divisor <= 0 {
+        return 0;
+    }
+    match val {
+        ScalarValue::Int64(Some(v)) => v.rem_euclid(divisor),
+        ScalarValue::Int32(Some(v)) => (*v as i64).rem_euclid(divisor),
+        ScalarValue::Timestamp(Some(v)) => v.rem_euclid(divisor),
+        ScalarValue::Date(Some(v)) => (*v as i64).rem_euclid(divisor),
+        ScalarValue::Time(Some(v)) => v.rem_euclid(divisor),
+        ScalarValue::UInt64(Some(v)) => (*v % divisor as u64) as i64,
+        ScalarValue::UInt32(Some(v)) => (*v % divisor as u32) as i64,
+        ScalarValue::VarChar(Some(s)) => s
+            .trim()
+            .parse::<i64>()
+            .map(|v| v.rem_euclid(divisor))
+            .unwrap_or(0),
         _ => 0,
     }
 }

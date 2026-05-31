@@ -198,3 +198,125 @@ fn multi_value_insert_splits_rows_across_partitions() {
 
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn year_partition_supports_varchar_yyyy_mm_dd() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE date_text_ticks (deal_date VARCHAR, deal_time INT32) PARTITION BY YEAR(deal_date)",
+        )
+        .expect("create table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO date_text_ticks VALUES ('2024-01-01', 930), ('2025-01-01', 931)",
+        )
+        .expect("insert rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE date_text_ticks")
+        .expect("flush inserted rows");
+
+    let table_dir = temp_dir.path().join("main").join("date_text_ticks");
+    let mut files: Vec<String> = fs::read_dir(&table_dir)
+        .expect("read table dir")
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(|s| s.to_string()))
+        .filter(|name| name.ends_with(".dat"))
+        .collect();
+    files.sort();
+
+    assert!(
+        files.iter().any(|name| name.starts_with("p2024_")),
+        "files: {:?}",
+        files
+    );
+    assert!(
+        files.iter().any(|name| name.starts_with("p2025_")),
+        "files: {:?}",
+        files
+    );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn hash_and_mod_partition_syntax_create_expected_buckets() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE hash_ticks (user_id INT32, value INT32) PARTITION BY HASH(user_id, 10)",
+        )
+        .expect("create hash table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO hash_ticks VALUES (1, 10), (11, 20)",
+        )
+        .expect("insert hash rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE hash_ticks")
+        .expect("flush hash rows");
+
+    let hash_dir = temp_dir.path().join("main").join("hash_ticks");
+    let hash_files: Vec<String> = fs::read_dir(&hash_dir)
+        .expect("read hash table dir")
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(|s| s.to_string()))
+        .filter(|name| name.ends_with(".dat"))
+        .collect();
+    assert!(
+        hash_files.iter().any(|name| name.starts_with("p1_")),
+        "files: {:?}",
+        hash_files
+    );
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE mod_ticks (id INT32, value INT32) PARTITION BY MOD(id, 4)",
+        )
+        .expect("create mod table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO mod_ticks VALUES (1, 10), (4, 20), (-1, 30)",
+        )
+        .expect("insert mod rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE mod_ticks")
+        .expect("flush mod rows");
+
+    let mod_dir = temp_dir.path().join("main").join("mod_ticks");
+    let mod_files: Vec<String> = fs::read_dir(&mod_dir)
+        .expect("read mod table dir")
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(|s| s.to_string()))
+        .filter(|name| name.ends_with(".dat"))
+        .collect();
+    assert!(
+        mod_files.iter().any(|name| name.starts_with("p0_")),
+        "files: {:?}",
+        mod_files
+    );
+    assert!(
+        mod_files.iter().any(|name| name.starts_with("p1_")),
+        "files: {:?}",
+        mod_files
+    );
+    assert!(
+        mod_files.iter().any(|name| name.starts_with("p3_")),
+        "files: {:?}",
+        mod_files
+    );
+
+    engine.segment_mgr().shutdown();
+}

@@ -17,6 +17,7 @@ pub enum PartitionType {
     Year = 3,
     Month = 4,
     Hash = 5,
+    Mod = 6,
 }
 
 impl Default for PartitionType {
@@ -130,6 +131,7 @@ impl TableMeta {
             PartitionType::Year => PartitionFunction::Year,
             PartitionType::Month => PartitionFunction::Month,
             PartitionType::Hash => PartitionFunction::Hash(self.partition_param),
+            PartitionType::Mod => PartitionFunction::Mod(self.partition_param),
         }
     }
 
@@ -553,6 +555,13 @@ mod tests {
         assert_eq!(
             meta.partition_strategy(),
             crate::storage::partition::partition_function::PartitionFunction::Hash(32)
+        );
+
+        meta.partition_type = PartitionType::Mod;
+        meta.partition_param = 4;
+        assert_eq!(
+            meta.partition_strategy(),
+            crate::storage::partition::partition_function::PartitionFunction::Mod(4)
         );
     }
 

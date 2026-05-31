@@ -255,6 +255,7 @@ pub enum PartitionStrategy {
     Month,
     Value,
     Hash(i32),
+    Mod(i32),
 }
 
 #[derive(Debug, Clone, PartialEq)]

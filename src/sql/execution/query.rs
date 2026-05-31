@@ -618,11 +618,13 @@ fn sort_batches(batches: &[RecordBatch], order_by: &[OrderByItem]) -> Vec<Record
 
 fn compare_scalar_values(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
     match (a, b) {
+        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
         (ScalarValue::Int64(Some(va)), ScalarValue::Int64(Some(vb))) => va.cmp(&vb),
         (ScalarValue::Float64(Some(va)), ScalarValue::Float64(Some(vb))) => {
             va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
         }
         (ScalarValue::VarChar(Some(va)), ScalarValue::VarChar(Some(vb))) => va.cmp(&vb),
+        (ScalarValue::Bool(Some(va)), ScalarValue::Bool(Some(vb))) => va.cmp(&vb),
         (ScalarValue::Timestamp(Some(va)), ScalarValue::Timestamp(Some(vb))) => va.cmp(&vb),
         (a_val, b_val) if a_val.is_null() && !b_val.is_null() => std::cmp::Ordering::Less,
         (a_val, b_val) if !a_val.is_null() && b_val.is_null() => std::cmp::Ordering::Greater,

@@ -156,18 +156,26 @@ impl Parser {
                     self.expect(&Token::RightParen)?;
                     (PartitionStrategy::Hash(num_buckets), col, Some(num_buckets))
                 } else {
-                    let first_token = self.expect_ident()?.to_uppercase();
-                    if matches!(first_token.as_str(), "DAY" | "YEAR" | "MONTH") {
+                    let first_token = self.expect_ident()?;
+                    let function_name = first_token.to_uppercase();
+                    if matches!(function_name.as_str(), "DAY" | "YEAR" | "MONTH" | "MOD") {
                         self.expect(&Token::LeftParen)?;
                         let col = self.expect_ident()?;
+                        let param = if function_name == "MOD" {
+                            self.expect(&Token::Comma)?;
+                            Some(self.expect_integer()? as i32)
+                        } else {
+                            None
+                        };
                         self.expect(&Token::RightParen)?;
-                        let strategy = match first_token.as_str() {
+                        let strategy = match function_name.as_str() {
                             "DAY" => PartitionStrategy::Day,
                             "YEAR" => PartitionStrategy::Year,
                             "MONTH" => PartitionStrategy::Month,
+                            "MOD" => PartitionStrategy::Mod(param.unwrap_or_default()),
                             _ => PartitionStrategy::Value,
                         };
-                        (strategy, col, None)
+                        (strategy, col, param)
                     } else {
                         (PartitionStrategy::Value, first_token, None)
                     }

@@ -44,6 +44,7 @@ pub fn prune_segments_by_partition(
         crate::storage::catalog::schema::PartitionType::Month => PartitionStrategy::Month,
         crate::storage::catalog::schema::PartitionType::Value => PartitionStrategy::None,
         crate::storage::catalog::schema::PartitionType::Hash => return segment_files,
+        crate::storage::catalog::schema::PartitionType::Mod => return segment_files,
         crate::storage::catalog::schema::PartitionType::None => return segment_files,
     };
 

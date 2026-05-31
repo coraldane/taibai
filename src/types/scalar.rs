@@ -69,6 +69,50 @@ impl Hash for ScalarValue {
 impl Eq for ScalarValue {}
 
 impl ScalarValue {
+    pub fn integer_i128(&self) -> Option<i128> {
+        match self {
+            ScalarValue::Int8(Some(v)) => Some(*v as i128),
+            ScalarValue::Int16(Some(v)) => Some(*v as i128),
+            ScalarValue::Int32(Some(v)) => Some(*v as i128),
+            ScalarValue::Int64(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt8(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt16(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt32(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt64(Some(v)) => Some(*v as i128),
+            ScalarValue::Decimal(Some(v)) => Some(*v as i128),
+            _ => None,
+        }
+    }
+
+    pub fn numeric_f64(&self) -> Option<f64> {
+        match self {
+            ScalarValue::Int8(Some(v)) => Some(*v as f64),
+            ScalarValue::Int16(Some(v)) => Some(*v as f64),
+            ScalarValue::Int32(Some(v)) => Some(*v as f64),
+            ScalarValue::Int64(Some(v)) => Some(*v as f64),
+            ScalarValue::UInt8(Some(v)) => Some(*v as f64),
+            ScalarValue::UInt16(Some(v)) => Some(*v as f64),
+            ScalarValue::UInt32(Some(v)) => Some(*v as f64),
+            ScalarValue::UInt64(Some(v)) => Some(*v as f64),
+            ScalarValue::Float32(Some(v)) => Some(*v as f64),
+            ScalarValue::Float64(Some(v)) => Some(*v),
+            ScalarValue::Decimal(Some(v)) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    pub fn numeric_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => l.partial_cmp(r),
+            (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r),
+            (ScalarValue::Float32(Some(l)), r) => (*l as f64).partial_cmp(&r.numeric_f64()?),
+            (ScalarValue::Float64(Some(l)), r) => l.partial_cmp(&r.numeric_f64()?),
+            (l, ScalarValue::Float32(Some(r))) => l.numeric_f64()?.partial_cmp(&(*r as f64)),
+            (l, ScalarValue::Float64(Some(r))) => l.numeric_f64()?.partial_cmp(r),
+            _ => Some(self.integer_i128()?.cmp(&other.integer_i128()?)),
+        }
+    }
+
     /// Returns true if this value is NULL.
     pub fn is_null(&self) -> bool {
         match self {

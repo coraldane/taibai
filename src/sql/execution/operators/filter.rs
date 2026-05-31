@@ -200,7 +200,23 @@ fn eval_comparison(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> bool 
     if left.is_null() || right.is_null() {
         return false;
     }
+    if let Some(ordering) = left.numeric_cmp(right) {
+        return match op {
+            BinOp::Eq => ordering == std::cmp::Ordering::Equal,
+            BinOp::Neq => ordering != std::cmp::Ordering::Equal,
+            BinOp::Lt => ordering == std::cmp::Ordering::Less,
+            BinOp::Gt => ordering == std::cmp::Ordering::Greater,
+            BinOp::Lte => ordering != std::cmp::Ordering::Greater,
+            BinOp::Gte => ordering != std::cmp::Ordering::Less,
+            _ => false,
+        };
+    }
     match (left, right) {
+        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => match op {
+            BinOp::Eq => l == r,
+            BinOp::Neq => l != r,
+            _ => false,
+        },
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => cmp_i64(*l, op, *r),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => {
             cmp_i64(*l as i64, op, *r as i64)
@@ -213,6 +229,12 @@ fn eval_comparison(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> bool 
         }
         (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => cmp_u64(*l, op, *r),
         (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => {
+            cmp_u64(*l as u64, op, *r as u64)
+        }
+        (ScalarValue::UInt16(Some(l)), ScalarValue::UInt16(Some(r))) => {
+            cmp_u64(*l as u64, op, *r as u64)
+        }
+        (ScalarValue::UInt8(Some(l)), ScalarValue::UInt8(Some(r))) => {
             cmp_u64(*l as u64, op, *r as u64)
         }
         (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => cmp_f64(*l, op, *r),
@@ -296,8 +318,9 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             };
 
             let col_idx = batch.schema.columns.iter().position(|c| {
-                c.name.starts_with(&format!("{}(", agg_type_prefix))
-                    || c.name == format!("{}(*)", agg_type_prefix)
+                let name = c.name.to_ascii_uppercase();
+                name.starts_with(&format!("{}(", agg_type_prefix))
+                    || name == format!("{}(*)", agg_type_prefix)
             });
 
             if let Some(idx) = col_idx {
@@ -340,7 +363,45 @@ fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Sc
     if left.is_null() || right.is_null() {
         return ScalarValue::Int64(None);
     }
+    if let (Some(l), Some(r)) = (left.integer_i128(), right.integer_i128()) {
+        return match op {
+            BinOp::Add => i64::try_from(l + r)
+                .ok()
+                .map(|v| ScalarValue::Int64(Some(v)))
+                .unwrap_or(ScalarValue::Int64(None)),
+            BinOp::Sub => i64::try_from(l - r)
+                .ok()
+                .map(|v| ScalarValue::Int64(Some(v)))
+                .unwrap_or(ScalarValue::Int64(None)),
+            BinOp::Mul => i64::try_from(l * r)
+                .ok()
+                .map(|v| ScalarValue::Int64(Some(v)))
+                .unwrap_or(ScalarValue::Int64(None)),
+            BinOp::Div if r != 0 => i64::try_from(l / r)
+                .ok()
+                .map(|v| ScalarValue::Int64(Some(v)))
+                .unwrap_or(ScalarValue::Int64(None)),
+            BinOp::Mod if r != 0 => i64::try_from(l % r)
+                .ok()
+                .map(|v| ScalarValue::Int64(Some(v)))
+                .unwrap_or(ScalarValue::Int64(None)),
+            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
+            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
+            BinOp::Lt => ScalarValue::Bool(Some(l < r)),
+            BinOp::Gt => ScalarValue::Bool(Some(l > r)),
+            BinOp::Lte => ScalarValue::Bool(Some(l <= r)),
+            BinOp::Gte => ScalarValue::Bool(Some(l >= r)),
+            _ => ScalarValue::Bool(None),
+        };
+    }
     match (left, right) {
+        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => match op {
+            BinOp::And => ScalarValue::Bool(Some(*l && *r)),
+            BinOp::Or => ScalarValue::Bool(Some(*l || *r)),
+            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
+            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
+            _ => ScalarValue::Bool(None),
+        },
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => match op {
             BinOp::Add => ScalarValue::Int64(Some(l + r)),
             BinOp::Sub => ScalarValue::Int64(Some(l - r)),
