@@ -1,7 +1,9 @@
 use crate::common::error::{MonaxError, Result};
 use crate::types::scalar::ScalarValue;
 
-use crate::sql::parser::ast::{BinOp, Expr, FrameBound, FrameType, OrderByItem, WindowFrame, WindowFunc};
+use crate::sql::parser::ast::{
+    BinOp, Expr, FrameBound, FrameType, OrderByItem, WindowFrame, WindowFunc,
+};
 use crate::sql::parser::lexer::Token;
 use crate::sql::parser::parser::Parser;
 
@@ -246,8 +248,15 @@ impl Parser {
             self.advance();
             let condition = self.parse_expr()?;
             match self.peek() {
-                Token::Ident(s) if s.to_uppercase() == "THEN" => { self.advance(); }
-                other => return Err(MonaxError::Sql(format!("expected 'THEN' in CASE, got {}", other))),
+                Token::Ident(s) if s.to_uppercase() == "THEN" => {
+                    self.advance();
+                }
+                other => {
+                    return Err(MonaxError::Sql(format!(
+                        "expected 'THEN' in CASE, got {}",
+                        other
+                    )))
+                }
             }
             let result = self.parse_expr()?;
             when_clauses.push((condition, result));
@@ -259,8 +268,15 @@ impl Parser {
             None
         };
         match self.peek() {
-            Token::Ident(s) if s.to_uppercase() == "END" => { self.advance(); }
-            other => return Err(MonaxError::Sql(format!("expected 'END' in CASE, got {}", other))),
+            Token::Ident(s) if s.to_uppercase() == "END" => {
+                self.advance();
+            }
+            other => {
+                return Err(MonaxError::Sql(format!(
+                    "expected 'END' in CASE, got {}",
+                    other
+                )))
+            }
         }
         Ok(Expr::Case {
             operand,
@@ -334,7 +350,7 @@ impl Parser {
                         }
                     }
                     self.expect(&Token::RightParen)?;
-                    
+
                     // Check for OVER clause for window function
                     if self.peek() == &Token::Over {
                         self.advance();
@@ -395,7 +411,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RightParen)?;
-                
+
                 // Check for OVER clause for window function
                 if self.peek() == &Token::Over {
                     self.advance();
@@ -434,18 +450,13 @@ impl Parser {
     }
 
     /// Parse OVER clause for window functions
-    fn parse_window_over(
-        &mut self,
-        name: String,
-        args: Vec<Expr>,
-        distinct: bool,
-    ) -> Result<Expr> {
+    fn parse_window_over(&mut self, name: String, args: Vec<Expr>, distinct: bool) -> Result<Expr> {
         self.expect(&Token::LeftParen)?;
-        
+
         let mut partition_by = Vec::new();
         let mut order_by = Vec::new();
         let mut frame = None;
-        
+
         // Parse PARTITION BY
         if self.peek() == &Token::Partition {
             self.advance();
@@ -459,7 +470,7 @@ impl Parser {
                 }
             }
         }
-        
+
         // Parse ORDER BY
         if self.peek() == &Token::Order {
             self.advance();
@@ -483,7 +494,7 @@ impl Parser {
                 }
             }
         }
-        
+
         // Parse frame clause (ROWS/RANGE BETWEEN ...)
         if self.peek() == &Token::Rows || self.peek() == &Token::Range {
             let frame_type = if self.peek() == &Token::Rows {
@@ -492,9 +503,10 @@ impl Parser {
                 FrameType::Range
             };
             self.advance();
-            
+
             // Parse BETWEEN or single bound
-            let (start, end) = if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "BETWEEN") {
+            let (start, end) = if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "BETWEEN")
+            {
                 self.advance();
                 let start = self.parse_frame_bound()?;
                 self.expect(&Token::Ident("AND".into()))?;
@@ -504,42 +516,62 @@ impl Parser {
                 let start = self.parse_frame_bound()?;
                 (start, FrameBound::CurrentRow)
             };
-            
-            frame = Some(WindowFrame { frame_type, start, end });
+
+            frame = Some(WindowFrame {
+                frame_type,
+                start,
+                end,
+            });
         }
-        
+
         self.expect(&Token::RightParen)?;
-        
+
         // Determine the window function type
         let func = match name.to_uppercase().as_str() {
             "ROW_NUMBER" => WindowFunc::RowNumber,
             "RANK" => WindowFunc::Rank,
             "DENSE_RANK" => WindowFunc::DenseRank,
             "LEAD" => {
-                let offset = if args.is_empty() { 1 } else {
+                let offset = if args.is_empty() {
+                    1
+                } else {
                     match &args[0] {
                         Expr::Literal(ScalarValue::Int64(Some(v))) => *v as usize,
                         Expr::Literal(ScalarValue::Int32(Some(v))) => *v as usize,
                         _ => 1,
                     }
                 };
-                let default = if args.len() > 1 { Some(Box::new(args[1].clone())) } else { None };
+                let default = if args.len() > 1 {
+                    Some(Box::new(args[1].clone()))
+                } else {
+                    None
+                };
                 WindowFunc::Lead { offset, default }
             }
             "LAG" => {
-                let offset = if args.is_empty() { 1 } else {
+                let offset = if args.is_empty() {
+                    1
+                } else {
                     match &args[0] {
                         Expr::Literal(ScalarValue::Int64(Some(v))) => *v as usize,
                         Expr::Literal(ScalarValue::Int32(Some(v))) => *v as usize,
                         _ => 1,
                     }
                 };
-                let default = if args.len() > 1 { Some(Box::new(args[1].clone())) } else { None };
+                let default = if args.len() > 1 {
+                    Some(Box::new(args[1].clone()))
+                } else {
+                    None
+                };
                 WindowFunc::Lag { offset, default }
             }
-            _ => WindowFunc::Aggregate { func: name, args, distinct },
+            _ => WindowFunc::Aggregate {
+                func: name,
+                args,
+                distinct,
+            },
         };
-        
+
         Ok(Expr::WindowFunction {
             func,
             partition_by,
@@ -547,7 +579,7 @@ impl Parser {
             frame,
         })
     }
-    
+
     fn parse_frame_bound(&mut self) -> Result<FrameBound> {
         if self.peek() == &Token::Unbounded {
             self.advance();
@@ -558,7 +590,9 @@ impl Parser {
                 self.advance();
                 Ok(FrameBound::UnboundedFollowing)
             } else {
-                Err(MonaxError::Sql("expected PRECEDING or FOLLOWING after UNBOUNDED".into()))
+                Err(MonaxError::Sql(
+                    "expected PRECEDING or FOLLOWING after UNBOUNDED".into(),
+                ))
             }
         } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "CURRENT") {
             self.advance();
@@ -583,10 +617,15 @@ impl Parser {
                 self.advance();
                 Ok(FrameBound::Following(n))
             } else {
-                Err(MonaxError::Sql("expected PRECEDING or FOLLOWING after integer".into()))
+                Err(MonaxError::Sql(
+                    "expected PRECEDING or FOLLOWING after integer".into(),
+                ))
             }
         } else {
-            Err(MonaxError::Sql(format!("unexpected frame bound: {}", self.peek())))
+            Err(MonaxError::Sql(format!(
+                "unexpected frame bound: {}",
+                self.peek()
+            )))
         }
     }
 }

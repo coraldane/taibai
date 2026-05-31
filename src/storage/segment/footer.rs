@@ -2,8 +2,8 @@ use std::io::{Cursor, Read};
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::codec::scalar_tag::decode_scalar_with_tag;
 use crate::storage::codec::io_util::{read_len_prefixed_str, read_u32_le, read_u64_le, read_u8};
+use crate::storage::codec::scalar_tag::decode_scalar_with_tag;
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::ZoneMap;
 use crate::types::batch::{ColumnDef, Schema};
@@ -56,6 +56,8 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
             scale,
             precision,
             auto_increment: false,
+            primary_key: false,
+            default_value: None,
         });
     }
     let schema = Schema::new(columns);

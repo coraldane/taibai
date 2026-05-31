@@ -2,7 +2,7 @@ use std::io::Read;
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
-use crate::storage::codec::io_util::{read_u8, read_u32_le};
+use crate::storage::codec::io_util::{read_u32_le, read_u8};
 use crate::types::scalar::ScalarValue;
 
 pub fn null_for_dtype(dtype: DataType) -> ScalarValue {

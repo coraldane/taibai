@@ -91,6 +91,9 @@ pub enum Token {
     All,
     // AutoIncrement
     AutoIncrement,
+    // Default value
+    Default,
+    CurrentTimestamp,
     // New keywords for extended SQL commands
     Union,
     Flush,
@@ -218,6 +221,8 @@ impl std::fmt::Display for Token {
             Token::Privileges => write!(f, "PRIVILEGES"),
             Token::All => write!(f, "ALL"),
             Token::AutoIncrement => write!(f, "AUTOINCREMENT"),
+            Token::Default => write!(f, "DEFAULT"),
+            Token::CurrentTimestamp => write!(f, "CURRENT_TIMESTAMP"),
             Token::Union => write!(f, "UNION"),
             Token::Flush => write!(f, "FLUSH"),
             Token::Optimize => write!(f, "OPTIMIZE"),
@@ -588,6 +593,8 @@ impl<'a> Lexer<'a> {
             "PRIVILEGES" => Token::Privileges,
             "ALL" => Token::All,
             "AUTOINCREMENT" | "AUTO_INCREMENT" => Token::AutoIncrement,
+            "DEFAULT" => Token::Default,
+            "CURRENT_TIMESTAMP" => Token::CurrentTimestamp,
             "UNION" => Token::Union,
             "FLUSH" => Token::Flush,
             "OPTIMIZE" => Token::Optimize,

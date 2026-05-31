@@ -775,7 +775,11 @@ impl SegmentManager {
                 offset,
                 length: total_length,
                 row_count: req.row_count as u64,
-                zone_maps: compute_zone_maps_from_bulk_columns(&req.columns, &seg.schema, req.row_count as u64),
+                zone_maps: compute_zone_maps_from_bulk_columns(
+                    &req.columns,
+                    &seg.schema,
+                    req.row_count as u64,
+                ),
                 column_compressed_sizes,
                 compressed_sizes,
                 uncompressed_sizes,
@@ -917,7 +921,11 @@ impl SegmentManager {
                 offset,
                 length: total_length,
                 row_count: req.row_count as u64,
-                zone_maps: compute_zone_maps_from_bulk_columns(&req.columns, &seg.schema, req.row_count as u64),
+                zone_maps: compute_zone_maps_from_bulk_columns(
+                    &req.columns,
+                    &seg.schema,
+                    req.row_count as u64,
+                ),
                 column_compressed_sizes,
                 compressed_sizes,
                 uncompressed_sizes,
@@ -1334,7 +1342,7 @@ fn compute_zone_maps_from_batch(
 
 fn compute_zone_maps_from_bulk_columns(
     columns: &[crate::storage::bulk_payload::DirectBulkColumn<'_>],
-    schema: &Schema,
+    _schema: &Schema,
     row_count: u64,
 ) -> Vec<ZoneMap> {
     let mut zone_maps = Vec::with_capacity(columns.len());
@@ -1371,7 +1379,8 @@ fn compute_zone_maps_from_bulk_columns(
                     if offset + 4 > data.len() {
                         break;
                     }
-                    let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    let len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     if offset + len > data.len() {
                         break;
@@ -1385,14 +1394,16 @@ fn compute_zone_maps_from_bulk_columns(
                     if offset + 4 > data.len() {
                         break;
                     }
-                    let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    let len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     offset += len;
                 } else if dtype == DataType::Vector {
                     if offset + 4 > data.len() {
                         break;
                     }
-                    let dim = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    let dim =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     offset += dim * 4;
                 }
@@ -1418,72 +1429,134 @@ fn is_null_at(nulls: &[u8], idx: usize) -> bool {
     (nulls[byte_idx] & (1 << bit_idx)) != 0
 }
 
-fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<crate::types::scalar::ScalarValue> {
+fn read_fixed_scalar(
+    data: &[u8],
+    offset: usize,
+    dtype: DataType,
+) -> Option<crate::types::scalar::ScalarValue> {
     use crate::types::scalar::ScalarValue;
     match dtype {
         DataType::Bool => {
-            if offset >= data.len() { return None; }
+            if offset >= data.len() {
+                return None;
+            }
             Some(ScalarValue::Bool(Some(data[offset] != 0)))
         }
         DataType::Int8 => {
-            if offset >= data.len() { return None; }
+            if offset >= data.len() {
+                return None;
+            }
             Some(ScalarValue::Int8(Some(data[offset] as i8)))
         }
         DataType::Int16 => {
-            if offset + 2 > data.len() { return None; }
-            Some(ScalarValue::Int16(Some(i16::from_le_bytes(data[offset..offset + 2].try_into().ok()?))))
+            if offset + 2 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Int16(Some(i16::from_le_bytes(
+                data[offset..offset + 2].try_into().ok()?,
+            ))))
         }
         DataType::Int32 => {
-            if offset + 4 > data.len() { return None; }
-            Some(ScalarValue::Int32(Some(i32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))))
+            if offset + 4 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Int32(Some(i32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ))))
         }
         DataType::Int64 => {
-            if offset + 8 > data.len() { return None; }
-            Some(ScalarValue::Int64(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Int64(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
         }
         DataType::UInt8 => {
-            if offset >= data.len() { return None; }
+            if offset >= data.len() {
+                return None;
+            }
             Some(ScalarValue::UInt8(Some(data[offset])))
         }
         DataType::UInt16 => {
-            if offset + 2 > data.len() { return None; }
-            Some(ScalarValue::UInt16(Some(u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?))))
+            if offset + 2 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::UInt16(Some(u16::from_le_bytes(
+                data[offset..offset + 2].try_into().ok()?,
+            ))))
         }
         DataType::UInt32 => {
-            if offset + 4 > data.len() { return None; }
-            Some(ScalarValue::UInt32(Some(u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))))
+            if offset + 4 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::UInt32(Some(u32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ))))
         }
         DataType::UInt64 => {
-            if offset + 8 > data.len() { return None; }
-            Some(ScalarValue::UInt64(Some(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::UInt64(Some(u64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
         }
         DataType::Float32 => {
-            if offset + 4 > data.len() { return None; }
-            Some(ScalarValue::Float32(Some(f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))))
+            if offset + 4 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Float32(Some(f32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ))))
         }
         DataType::Float64 => {
-            if offset + 8 > data.len() { return None; }
-            Some(ScalarValue::Float64(Some(f64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Float64(Some(f64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
         }
         DataType::Decimal => {
-            if offset + 8 > data.len() { return None; }
-            Some(ScalarValue::Decimal(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Decimal(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
         }
         DataType::Date => {
-            if offset + 4 > data.len() { return None; }
-            Some(ScalarValue::Date(Some(i32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))))
+            if offset + 4 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Date(Some(i32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ))))
         }
         DataType::Time => {
-            if offset + 8 > data.len() { return None; }
-            Some(ScalarValue::Time(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Time(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
         }
         DataType::Timestamp => {
-            if offset + 8 > data.len() { return None; }
-            Some(ScalarValue::Timestamp(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Timestamp(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
         }
         DataType::Interval => {
-            if offset + 8 > data.len() { return None; }
-            Some(ScalarValue::Interval(Some(i64::from_le_bytes(data[offset..offset + 8].try_into().ok()?))))
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Interval(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
         }
         _ => None,
     }

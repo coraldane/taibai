@@ -264,7 +264,6 @@ async fn import_ticks_pipelined(
     if !batch.is_empty() {
         let sql = build_multi_insert_sql(TICK_TABLE, &batch);
         client.send_execute(&sql).await?;
-        sent_count += batch.len() as u64;
         in_flight += 1;
     }
 

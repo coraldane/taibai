@@ -433,9 +433,7 @@ impl Client {
         match resp.msg_type {
             MSG_TYPE_PREPARE => {
                 if resp.payload.len() < 8 {
-                    return Err(MonaxError::Protocol(
-                        "prepare response too short".into(),
-                    ));
+                    return Err(MonaxError::Protocol("prepare response too short".into()));
                 }
                 let stmt_id = u32::from_le_bytes(resp.payload[..4].try_into().unwrap());
                 let param_count =
@@ -517,6 +515,57 @@ impl Client {
         }
     }
 
+    pub async fn execute_prepared_batch(
+        &mut self,
+        stmt: &PreparedStatement,
+        params_batch: &[Vec<ScalarValue>],
+    ) -> Result<u64> {
+        if params_batch.is_empty() {
+            return Ok(0);
+        }
+
+        let param_count = stmt.param_count;
+        let batch_size = params_batch.len();
+
+        let mut payload = Vec::with_capacity(12 + batch_size * param_count * 12);
+        payload.extend_from_slice(&stmt.id.to_le_bytes());
+        payload.extend_from_slice(&(batch_size as u32).to_le_bytes());
+
+        for params in params_batch {
+            if params.len() != param_count {
+                return Err(MonaxError::Internal(format!(
+                    "param count mismatch: expected {}, got {}",
+                    param_count,
+                    params.len()
+                )));
+            }
+            for param in params {
+                encode_scalar_param(&mut payload, param);
+            }
+        }
+
+        self.send(Message::new(MSG_TYPE_BATCH_EXECUTE, Bytes::from(payload)))
+            .await?;
+
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_OK => {
+                if resp.payload.len() >= 8 {
+                    Ok(u64::from_le_bytes(resp.payload[..8].try_into().unwrap()))
+                } else {
+                    Ok(0)
+                }
+            }
+            MSG_TYPE_ERROR => {
+                let msg = String::from_utf8_lossy(&resp.payload).to_string();
+                Err(MonaxError::Sql(msg))
+            }
+            other => Err(MonaxError::Protocol(format!(
+                "unexpected batch_execute response type: {other:#04X}"
+            ))),
+        }
+    }
+
     async fn send(&mut self, msg: Message) -> Result<()> {
         timeout(self.default_timeout, self.framed.send(msg))
             .await
@@ -556,6 +605,8 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
             scale: scale as i32,
             precision: 0,
             auto_increment: false,
+            primary_key: false,
+            default_value: None,
         });
         offset += 4 + name.len() + 5;
     }
@@ -644,6 +695,8 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
             scale,
             precision: 0,
             auto_increment: false,
+            primary_key: false,
+            default_value: None,
         });
         offset += 4 + name.len() + 5;
     }

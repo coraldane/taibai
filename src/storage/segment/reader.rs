@@ -342,24 +342,24 @@ impl SegmentReader {
         let results: Vec<Option<(usize, ColumnArray)>> = column_indices
             .par_iter()
             .map(|&col_idx| -> Result<Option<(usize, ColumnArray)>> {
-            if col_idx >= col_offsets.len() {
-                return Ok(None);
-            }
+                if col_idx >= col_offsets.len() {
+                    return Ok(None);
+                }
 
-            let col_offset = col_offsets[col_idx];
-            let col_len = rg.column_compressed_sizes[col_idx] as usize;
-            let compressed = &all_data[col_offset..col_offset + col_len];
-            let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-                .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
+                let col_offset = col_offsets[col_idx];
+                let col_len = rg.column_compressed_sizes[col_idx] as usize;
+                let compressed = &all_data[col_offset..col_offset + col_len];
+                let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
+                    .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
 
-            let col_def = &self.footer.schema.columns[col_idx];
-            let col_array = decode_column_selected(
-                &decompressed,
-                rg.row_count as usize,
-                col_def,
-                selected_rows,
-            )?;
-            Ok(Some((col_idx, col_array)))
+                let col_def = &self.footer.schema.columns[col_idx];
+                let col_array = decode_column_selected(
+                    &decompressed,
+                    rg.row_count as usize,
+                    col_def,
+                    selected_rows,
+                )?;
+                Ok(Some((col_idx, col_array)))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -441,11 +441,13 @@ impl SegmentReader {
                 .zip(column_indices.iter())
                 .map(|(name, &idx)| crate::types::batch::ColumnDef {
                     name: name.clone(),
-                    data_type: self.footer.schema.columns[idx].data_type.clone(),
+                    data_type: self.footer.schema.columns[idx].data_type,
                     nullable: self.footer.schema.columns[idx].nullable,
                     scale: self.footer.schema.columns[idx].scale,
                     precision: self.footer.schema.columns[idx].precision,
                     auto_increment: self.footer.schema.columns[idx].auto_increment,
+                    primary_key: self.footer.schema.columns[idx].primary_key,
+                    default_value: self.footer.schema.columns[idx].default_value.clone(),
                 })
                 .collect(),
         );
@@ -647,7 +649,12 @@ impl SegmentReader {
         Ok(total_count)
     }
 
-    fn count_eq_raw(&self, row_group: usize, column_idx: usize, value: &ScalarValue) -> Result<u64> {
+    fn count_eq_raw(
+        &self,
+        row_group: usize,
+        column_idx: usize,
+        value: &ScalarValue,
+    ) -> Result<u64> {
         let rg = &self.footer.row_groups[row_group];
         let col_def = &self.footer.schema.columns[column_idx];
 

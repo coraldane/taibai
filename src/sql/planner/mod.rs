@@ -38,10 +38,7 @@ pub fn plan_select(
     plan_select_with_context(stmt, &ctx)
 }
 
-pub fn plan_select_with_context(
-    stmt: &Statement,
-    ctx: &PlannerContext,
-) -> Result<LogicalPlan> {
+pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Result<LogicalPlan> {
     let (select_list, from, where_clause, group_by, _having, order_by, limit, offset, _distinct) =
         match stmt {
             Statement::Select {
@@ -75,7 +72,12 @@ pub fn plan_select_with_context(
     let (base_plan, schema, alias_map, _table_info) = if let Some(from_clause) = from {
         plan_from_clause(from_clause, &ctx.table_schemas)?
     } else {
-        (LogicalPlan::Empty, Schema::empty(), AliasMap::new(), JoinTableInfo::default())
+        (
+            LogicalPlan::Empty,
+            Schema::empty(),
+            AliasMap::new(),
+            JoinTableInfo::default(),
+        )
     };
 
     let mut plan: LogicalPlan = base_plan;
@@ -141,7 +143,11 @@ pub fn plan_select_with_context(
                         .find(|(alias, _)| alias == &name.to_lowercase())
                         .map(|(_, idx)| LogicalExpr::Column(*idx))
                         .map_or_else(
-                            || expr::ast_expr_to_logical_with_context(&item.expr, &schema, &alias_map, ctx),
+                            || {
+                                expr::ast_expr_to_logical_with_context(
+                                    &item.expr, &schema, &alias_map, ctx,
+                                )
+                            },
                             Ok,
                         )?
                 } else {
@@ -190,34 +196,32 @@ fn plan_from_clause(
     table_schemas: &HashMap<String, Schema>,
 ) -> Result<(LogicalPlan, Schema, AliasMap, JoinTableInfo)> {
     match from {
-        FromClause::Table(table_ref) => {
-            match table_ref {
-                TableRef::Table { name, alias } => {
-                    let table_name = name;
-                    let schema = table_schemas
-                        .get(table_name)
-                        .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
-                        .clone();
-                    let plan = LogicalPlan::Scan(ScanPlan::new(table_name.clone(), schema.clone()));
+        FromClause::Table(table_ref) => match table_ref {
+            TableRef::Table { name, alias } => {
+                let table_name = name;
+                let schema = table_schemas
+                    .get(table_name)
+                    .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
+                    .clone();
+                let plan = LogicalPlan::Scan(ScanPlan::new(table_name.clone(), schema.clone()));
 
-                    let mut alias_map = AliasMap::new();
-                    if let Some(a) = alias {
-                        alias_map.insert(a.to_lowercase(), table_name.clone());
-                    }
-                    alias_map.insert(table_name.to_lowercase(), table_name.clone());
-
-                    let table_info = JoinTableInfo {
-                        left_tables: vec![table_name.clone()],
-                        right_tables: Vec::new(),
-                    };
-
-                    Ok((plan, schema, alias_map, table_info))
+                let mut alias_map = AliasMap::new();
+                if let Some(a) = alias {
+                    alias_map.insert(a.to_lowercase(), table_name.clone());
                 }
-                TableRef::Subquery { query: _, alias: _ } => {
-                    Err(MonaxError::Sql("subquery in FROM not yet supported in planner".into()))
-                }
+                alias_map.insert(table_name.to_lowercase(), table_name.clone());
+
+                let table_info = JoinTableInfo {
+                    left_tables: vec![table_name.clone()],
+                    right_tables: Vec::new(),
+                };
+
+                Ok((plan, schema, alias_map, table_info))
             }
-        }
+            TableRef::Subquery { query: _, alias: _ } => Err(MonaxError::Sql(
+                "subquery in FROM not yet supported in planner".into(),
+            )),
+        },
         FromClause::Join(join_expr) => {
             let (left_plan, left_schema, mut alias_map, mut table_info) =
                 plan_from_clause(&join_expr.left, table_schemas)?;
@@ -231,7 +235,9 @@ fn plan_from_clause(
                         let right_table = name;
                         let right_schema = table_schemas
                             .get(right_table)
-                            .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", right_table)))?
+                            .ok_or_else(|| {
+                                MonaxError::Sql(format!("table '{}' not found", right_table))
+                            })?
                             .clone();
 
                         if let Some(a) = alias {
@@ -240,8 +246,10 @@ fn plan_from_clause(
                         alias_map.insert(right_table.to_lowercase(), right_table.clone());
                         table_info.right_tables.push(right_table.clone());
 
-                        let right_plan =
-                            LogicalPlan::Scan(ScanPlan::new(right_table.clone(), right_schema.clone()));
+                        let right_plan = LogicalPlan::Scan(ScanPlan::new(
+                            right_table.clone(),
+                            right_schema.clone(),
+                        ));
 
                         let output_schema = types::merge_schemas(&current_schema, &right_schema);
 
@@ -269,7 +277,9 @@ fn plan_from_clause(
                         current_schema = output_schema;
                     }
                     TableRef::Subquery { query: _, alias: _ } => {
-                        return Err(MonaxError::Sql("subquery in JOIN not yet supported in planner".into()));
+                        return Err(MonaxError::Sql(
+                            "subquery in JOIN not yet supported in planner".into(),
+                        ));
                     }
                 }
             }

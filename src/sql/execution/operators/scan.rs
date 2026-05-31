@@ -1,6 +1,6 @@
 use crate::common::error::Result;
-use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::array::ColumnArray;
+use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::ExecutionOp;
@@ -41,16 +41,16 @@ impl ExecutionOp for ScanExec {
                 if is_already_projected(batch, indices) {
                     return Ok(Some(batch.clone()));
                 }
-                
+
                 let batch_col_count = batch.schema.columns.len();
                 let needs_null_fill = indices.iter().any(|&i| i >= batch_col_count);
-                
+
                 if needs_null_fill {
                     let table_schema = self.table_schema.as_ref().unwrap_or(&batch.schema);
                     let row_count = batch.num_rows();
                     let mut cols = Vec::with_capacity(indices.len());
                     let mut col_defs = Vec::with_capacity(indices.len());
-                    
+
                     for &idx in indices {
                         if idx < batch_col_count {
                             cols.push(batch.column(idx).unwrap().clone());
@@ -65,13 +65,14 @@ impl ExecutionOp for ScanExec {
                             col_defs.push(col_def.clone());
                         }
                     }
-                    
+
                     let new_schema = Schema::new(col_defs);
                     Ok(Some(RecordBatch::try_new(new_schema, cols)?))
                 } else {
                     let schema_cols: Vec<&ColumnDef> =
                         indices.iter().map(|&i| &batch.schema.columns[i]).collect();
-                    let new_schema = Schema::new(schema_cols.iter().map(|c| (*c).clone()).collect());
+                    let new_schema =
+                        Schema::new(schema_cols.iter().map(|c| (*c).clone()).collect());
                     let mut cols = Vec::with_capacity(indices.len());
                     for &idx in indices {
                         cols.push(batch.column(idx).unwrap().clone());

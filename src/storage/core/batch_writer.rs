@@ -287,8 +287,6 @@ impl BatchWriter {
         segment_mgr: &Arc<SegmentManager>,
         mt: &Arc<crate::storage::core::memtable::MemTable>,
     ) -> Result<()> {
-        
-
         if mt.state() != MemTableState::Pending {
             return Ok(());
         }

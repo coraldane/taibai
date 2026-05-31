@@ -451,66 +451,6 @@ fn escape_string_into(s: &str, sb: &mut String) {
     }
 }
 
-fn format_timestamp(micros: i64) -> String {
-    let secs = micros / 1_000_000;
-    let remainder = micros % 1_000_000;
-    let frac_millis = remainder / 1000;
-
-    let mut remaining_days = secs / 86400;
-    let time_secs = (secs % 86400) as u32;
-    let hour = time_secs / 3600;
-    let minute = (time_secs % 3600) / 60;
-    let second = time_secs % 60;
-
-    let mut year: i32 = 1970;
-    loop {
-        let days_in_year = if is_leap(year) { 366 } else { 365 };
-        if remaining_days < days_in_year as i64 {
-            break;
-        }
-        remaining_days -= days_in_year as i64;
-        year += 1;
-    }
-
-    let days_in_month = |m: u32, y: i32| -> i64 {
-        match m {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 => {
-                if is_leap(y) {
-                    29
-                } else {
-                    28
-                }
-            }
-            _ => 0,
-        }
-    };
-
-    let mut month = 1u32;
-    loop {
-        let dim = days_in_month(month, year);
-        if remaining_days < dim {
-            break;
-        }
-        remaining_days -= dim;
-        month += 1;
-    }
-    let day = (remaining_days + 1) as u32;
-
-    if frac_millis > 0 {
-        format!(
-            "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-            year, month, day, hour, minute, second, frac_millis
-        )
-    } else {
-        format!(
-            "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-            year, month, day, hour, minute, second
-        )
-    }
-}
-
 #[inline]
 fn parse_int32(s: &str) -> i32 {
     let s = s.trim();

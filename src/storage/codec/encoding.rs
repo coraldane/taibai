@@ -285,7 +285,9 @@ mod tests {
             .collect();
         let enc = select_encoding(&values);
         assert!(
-            enc == EncodingType::Plain || enc == EncodingType::Delta || enc == EncodingType::DeltaOfDelta,
+            enc == EncodingType::Plain
+                || enc == EncodingType::Delta
+                || enc == EncodingType::DeltaOfDelta,
             "expected non-RLE non-Dictionary, got {:?}",
             enc
         );
@@ -302,9 +304,7 @@ mod tests {
 
     #[test]
     fn test_select_encoding_delta_of_delta() {
-        let values: Vec<ScalarValue> = (1..=20)
-            .map(|i| ScalarValue::Int64(Some(i * i)))
-            .collect();
+        let values: Vec<ScalarValue> = (1..=20).map(|i| ScalarValue::Int64(Some(i * i))).collect();
         assert_eq!(select_encoding(&values), EncodingType::DeltaOfDelta);
     }
 }

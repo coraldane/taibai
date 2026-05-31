@@ -2,7 +2,6 @@
 /// Supports: Inner, Left, Right, Full, Cross, Semi, Anti, and Asof joins.
 /// Uses columnar data processing through RecordBatch for cache efficiency.
 use crate::common::error::Result;
-use crate::protocol::types::DataType;
 use crate::sql::execution::join_hashtable::{AsofJoinIndex, JoinHashTable, RowPointer};
 use crate::sql::parser::ast::JoinType;
 use crate::sql::planner::LogicalExpr;
@@ -534,8 +533,7 @@ impl HashJoinExec {
                         continue;
                     }
                     self.probe_state.left_batches.push(batch);
-                    self.probe_state.left_batch_idx =
-                        self.probe_state.left_batches.len() - 1;
+                    self.probe_state.left_batch_idx = self.probe_state.left_batches.len() - 1;
                     self.probe_state.left_row_idx = 0;
                 }
                 _ => return None,

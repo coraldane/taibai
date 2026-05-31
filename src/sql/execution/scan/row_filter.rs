@@ -1,10 +1,10 @@
 #![allow(dead_code)]
-use crate::storage::codec::predicate_scan::selected_eq_rows_from_raw;
 use crate::storage::codec::fastscan::{apply_filter_mask_fast, FastScanEQ};
+use crate::storage::codec::predicate_scan::selected_eq_rows_from_raw;
 use crate::storage::partition::pruning::RangeOp;
-use crate::types::bitmap::NullBitmap;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
+use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
 use super::spec::InPredicate;
@@ -592,7 +592,10 @@ fn cluster_key_eq_read(
         .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))
 }
 
-fn repeated_scalar_column(value: &ScalarValue, len: usize) -> crate::common::error::Result<ColumnArray> {
+fn repeated_scalar_column(
+    value: &ScalarValue,
+    len: usize,
+) -> crate::common::error::Result<ColumnArray> {
     let bitmap = NullBitmap::new_valid(len);
     let col = match value {
         ScalarValue::Bool(Some(v)) => ColumnArray::Bool {

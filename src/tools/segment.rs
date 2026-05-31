@@ -141,6 +141,8 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             scale,
             precision,
             auto_increment: false,
+            primary_key: false,
+            default_value: None,
         });
     }
     let schema = Schema::new(columns);

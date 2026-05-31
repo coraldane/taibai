@@ -369,7 +369,6 @@ fn decode_column_raw(
     num_rows: usize,
     null_bitmap: Option<&crate::types::bitmap::NullBitmap>,
 ) -> Result<()> {
-    
     use crate::types::scalar::ScalarValue;
 
     let col = batch.column_mut(col_idx).unwrap();

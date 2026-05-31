@@ -1,9 +1,10 @@
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
+use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{
-    AlterOperation, AlterUserOperation, ColumnDefAst, GrantObject, PartitionDef, PartitionStrategy,
-    Privilege, Statement,
+    AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, GrantObject, PartitionDef,
+    PartitionStrategy, Privilege, Statement,
 };
 use crate::sql::parser::lexer::Token;
 use crate::sql::parser::parser::{parse_data_type, Parser};
@@ -82,8 +83,24 @@ impl Parser {
 
         self.expect(&Token::LeftParen)?;
         let mut columns = Vec::new();
+        let mut primary_key = Vec::new();
         loop {
-            columns.push(self.parse_column_def()?);
+            if self.peek() == &Token::Primary {
+                self.advance();
+                self.expect(&Token::Key)?;
+                self.expect(&Token::LeftParen)?;
+                loop {
+                    primary_key.push(self.expect_ident()?);
+                    if self.peek() == &Token::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&Token::RightParen)?;
+            } else {
+                columns.push(self.parse_column_def()?);
+            }
             if self.peek() == &Token::Comma {
                 self.advance();
                 if self.peek() == &Token::RightParen {
@@ -170,6 +187,7 @@ impl Parser {
             name,
             columns,
             if_not_exists,
+            primary_key,
             cluster_by,
             partition_by,
         })
@@ -184,6 +202,8 @@ impl Parser {
         let mut scale = 0i32;
         let mut precision = 0i32;
         let mut auto_increment = false;
+        let mut primary_key = false;
+        let mut default_value: Option<DefaultValue> = None;
 
         if self.peek() == &Token::LeftParen {
             self.advance();
@@ -207,6 +227,52 @@ impl Parser {
             auto_increment = true;
         }
 
+        if self.peek() == &Token::Primary {
+            self.advance();
+            self.expect(&Token::Key)?;
+            primary_key = true;
+        }
+
+        if self.peek() == &Token::Default {
+            self.advance();
+            default_value = Some(match self.peek().clone() {
+                Token::CurrentTimestamp => {
+                    self.advance();
+                    DefaultValue::CurrentTimestamp
+                }
+                Token::StringLit(s) => {
+                    self.advance();
+                    DefaultValue::Literal(ScalarValue::VarChar(Some(s)))
+                }
+                Token::Integer(v) => {
+                    self.advance();
+                    DefaultValue::Literal(ScalarValue::Int64(Some(v)))
+                }
+                Token::Float(v) => {
+                    self.advance();
+                    DefaultValue::Literal(ScalarValue::Float64(Some(v)))
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("TRUE") => {
+                    self.advance();
+                    DefaultValue::Literal(ScalarValue::Bool(Some(true)))
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("FALSE") => {
+                    self.advance();
+                    DefaultValue::Literal(ScalarValue::Bool(Some(false)))
+                }
+                Token::Null => {
+                    self.advance();
+                    DefaultValue::Literal(ScalarValue::Int64(None))
+                }
+                other => {
+                    return Err(MonaxError::Sql(format!(
+                        "unexpected token after DEFAULT: {}",
+                        other
+                    )));
+                }
+            });
+        }
+
         if data_type == DataType::Decimal && scale < 0 {
             return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
         }
@@ -224,6 +290,8 @@ impl Parser {
             scale,
             precision,
             auto_increment,
+            primary_key,
+            default_value,
         })
     }
 
@@ -318,8 +386,17 @@ impl Parser {
                 Token::Drop => Privilege::Drop,
                 Token::Alter => Privilege::Alter,
                 Token::Truncate => Privilege::Truncate,
-                Token::Ident(s) if s.to_uppercase() == "ALL" || s.to_uppercase() == "ALL_PRIVILEGES" => Privilege::All,
-                _ => return Err(MonaxError::Sql(format!("expected privilege name, got {}", self.peek()))),
+                Token::Ident(s)
+                    if s.to_uppercase() == "ALL" || s.to_uppercase() == "ALL_PRIVILEGES" =>
+                {
+                    Privilege::All
+                }
+                _ => {
+                    return Err(MonaxError::Sql(format!(
+                        "expected privilege name, got {}",
+                        self.peek()
+                    )))
+                }
             };
             self.advance();
             privileges.push(privilege);

@@ -299,7 +299,7 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
                 c.name.starts_with(&format!("{}(", agg_type_prefix))
                     || c.name == format!("{}(*)", agg_type_prefix)
             });
-            
+
             if let Some(idx) = col_idx {
                 Ok((0..num_rows)
                     .map(|i| batch.scalar(i, idx).unwrap_or(ScalarValue::Int64(None)))

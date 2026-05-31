@@ -268,7 +268,9 @@ impl<'a> ScanExecutor<'a> {
                     let col_def = &self.table_schema.columns[col_idx];
                     let mut null_col = crate::types::array::ColumnArray::empty(col_def.data_type);
                     for _ in 0..row_count {
-                        null_col.push(&crate::types::scalar::ScalarValue::null_for_type(col_def.data_type))?;
+                        null_col.push(&crate::types::scalar::ScalarValue::null_for_type(
+                            col_def.data_type,
+                        ))?;
                     }
                     columns.push(null_col);
                     col_defs.push(col_def.clone());
@@ -290,9 +292,12 @@ impl<'a> ScanExecutor<'a> {
                         col_defs.push(col_def.clone());
                         valid_idx += 1;
                     } else {
-                        let mut null_col = crate::types::array::ColumnArray::empty(col_def.data_type);
+                        let mut null_col =
+                            crate::types::array::ColumnArray::empty(col_def.data_type);
                         for _ in 0..row_count {
-                            null_col.push(&crate::types::scalar::ScalarValue::null_for_type(col_def.data_type))?;
+                            null_col.push(&crate::types::scalar::ScalarValue::null_for_type(
+                                col_def.data_type,
+                            ))?;
                         }
                         columns.push(null_col);
                         col_defs.push(col_def.clone());

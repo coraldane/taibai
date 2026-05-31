@@ -118,16 +118,14 @@ pub fn ast_expr_to_logical_with_context(
             let subquery_plan = plan_select_with_context(subquery_stmt, ctx)?;
             Ok(LogicalExpr::ScalarSubquery(Box::new(subquery_plan)))
         }
-        Expr::Exists(inner) => {
-            match inner.as_ref() {
-                Expr::Subquery(subquery_stmt) => {
-                    use super::plan_select_with_context;
-                    let subquery_plan = plan_select_with_context(subquery_stmt, ctx)?;
-                    Ok(LogicalExpr::ExistsSubquery(Box::new(subquery_plan)))
-                }
-                _ => Err(MonaxError::Sql("EXISTS requires a subquery".into())),
+        Expr::Exists(inner) => match inner.as_ref() {
+            Expr::Subquery(subquery_stmt) => {
+                use super::plan_select_with_context;
+                let subquery_plan = plan_select_with_context(subquery_stmt, ctx)?;
+                Ok(LogicalExpr::ExistsSubquery(Box::new(subquery_plan)))
             }
-        }
+            _ => Err(MonaxError::Sql("EXISTS requires a subquery".into())),
+        },
         Expr::In {
             expr: inner_expr,
             values,
@@ -148,7 +146,9 @@ pub fn ast_expr_to_logical_with_context(
                     negated: *negated,
                 })
             } else {
-                Err(MonaxError::Sql("IN subquery not yet supported in execution".into()))
+                Err(MonaxError::Sql(
+                    "IN subquery not yet supported in execution".into(),
+                ))
             }
         }
         _ => Err(MonaxError::Sql(format!("unsupported expression type"))),
@@ -295,28 +295,36 @@ fn resolve_qualified_column_index(
         .filter(|(_, c)| c.name.eq_ignore_ascii_case(column))
         .map(|(i, _)| i)
         .collect();
-    
+
     if matching_indices.is_empty() {
         return Err(MonaxError::Sql(format!(
             "column '{}' not found in table '{}'",
             column, table
         )));
     }
-    
+
     if matching_indices.len() == 1 {
         return Ok(matching_indices[0]);
     }
-    
+
     let table_lower = table.to_lowercase();
-    
+
     if matching_indices.len() == 2 {
-        if table_lower.ends_with("1") || table_lower.starts_with("l") || table_lower.starts_with("a") || table_lower.starts_with("c") {
+        if table_lower.ends_with("1")
+            || table_lower.starts_with("l")
+            || table_lower.starts_with("a")
+            || table_lower.starts_with("c")
+        {
             return Ok(matching_indices[0]);
         }
-        if table_lower.ends_with("2") || table_lower.starts_with("r") || table_lower.starts_with("b") || table_lower.starts_with("p") {
+        if table_lower.ends_with("2")
+            || table_lower.starts_with("r")
+            || table_lower.starts_with("b")
+            || table_lower.starts_with("p")
+        {
             return Ok(matching_indices[1]);
         }
-        
+
         let resolved = alias_map.get(&table_lower);
         if let Some(real_table) = resolved {
             if real_table.ends_with("1") || real_table.starts_with("l") {
@@ -326,15 +334,17 @@ fn resolve_qualified_column_index(
                 return Ok(matching_indices[1]);
             }
         }
-        
-        let alias_pos = alias_map.iter().position(|(alias, _)| alias.eq_ignore_ascii_case(&table_lower));
+
+        let alias_pos = alias_map
+            .iter()
+            .position(|(alias, _)| alias.eq_ignore_ascii_case(&table_lower));
         if let Some(pos) = alias_pos {
             if pos < matching_indices.len() {
                 return Ok(matching_indices[pos % matching_indices.len()]);
             }
         }
     }
-    
+
     Ok(matching_indices[0])
 }
 
@@ -356,17 +366,23 @@ pub fn ast_expr_to_logical_join(
         }
         Expr::QualifiedColumn { table, column } => {
             let alias_lower = table.to_lowercase();
-            
+
             let left_idx = left_schema.index_of(column);
             let right_idx = right_schema.index_of(column);
 
             let is_left = table_info.left_tables.iter().any(|t| {
-                t.eq_ignore_ascii_case(&alias_lower) || 
-                alias_map.get(&alias_lower).map(|a| a.eq_ignore_ascii_case(t)).unwrap_or(false)
+                t.eq_ignore_ascii_case(&alias_lower)
+                    || alias_map
+                        .get(&alias_lower)
+                        .map(|a| a.eq_ignore_ascii_case(t))
+                        .unwrap_or(false)
             });
             let is_right = table_info.right_tables.iter().any(|t| {
-                t.eq_ignore_ascii_case(&alias_lower) ||
-                alias_map.get(&alias_lower).map(|a| a.eq_ignore_ascii_case(t)).unwrap_or(false)
+                t.eq_ignore_ascii_case(&alias_lower)
+                    || alias_map
+                        .get(&alias_lower)
+                        .map(|a| a.eq_ignore_ascii_case(t))
+                        .unwrap_or(false)
             });
 
             let idx = match (left_idx, right_idx, is_left, is_right) {
@@ -563,13 +579,20 @@ pub fn expr_to_name(expr: &Expr) -> String {
             };
             format!("{} {} {}", l, op_str, r)
         }
-        Expr::Function { name, args, distinct } => {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
             let arg_str = if args.is_empty() {
                 "*".to_string()
             } else if args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*") {
                 "*".to_string()
             } else {
-                args.iter().map(|a| expr_to_name(a)).collect::<Vec<_>>().join(", ")
+                args.iter()
+                    .map(|a| expr_to_name(a))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
             if *distinct {
                 format!("{}(distinct {})", name.to_lowercase(), arg_str)

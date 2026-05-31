@@ -62,7 +62,15 @@ impl ExecutionOp for HashAggregateExec {
         let mut all_rows: Vec<Vec<ScalarValue>> = Vec::new();
         let mut physical_schema = None;
         while let Some(batch) = self.input.next_batch()? {
-            tracing::debug!("aggregate: input batch schema = {:?}", batch.schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
+            tracing::debug!(
+                "aggregate: input batch schema = {:?}",
+                batch
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type))
+                    .collect::<Vec<_>>()
+            );
             tracing::debug!("aggregate: input batch num_rows = {}", batch.num_rows());
             if physical_schema.is_none() {
                 physical_schema = Some(batch.schema.clone());
@@ -75,7 +83,14 @@ impl ExecutionOp for HashAggregateExec {
             }
         }
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
-        tracing::debug!("aggregate: physical_schema = {:?}", physical_schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
+        tracing::debug!(
+            "aggregate: physical_schema = {:?}",
+            physical_schema
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.data_type))
+                .collect::<Vec<_>>()
+        );
         let group_by: Vec<LogicalExpr> = self
             .group_by
             .iter()
@@ -102,7 +117,12 @@ impl ExecutionOp for HashAggregateExec {
             }
             groups.entry(key).or_default().push(row.clone());
         }
-        tracing::debug!("aggregate: all_rows count={}, groups count={}, group_order count={}", all_rows.len(), groups.len(), group_order.len());
+        tracing::debug!(
+            "aggregate: all_rows count={}, groups count={}, group_order count={}",
+            all_rows.len(),
+            groups.len(),
+            group_order.len()
+        );
 
         // Build output schema
         let mut col_defs = Vec::new();
@@ -120,16 +140,38 @@ impl ExecutionOp for HashAggregateExec {
         for agg in &aggregates {
             let name = format_aggregate_name(agg, &physical_schema);
             let dt = aggregate_result_type(agg, &physical_schema);
-            tracing::debug!("aggregate result type: agg={:?}, name={}, dt={:?}", agg.func, name, dt);
+            tracing::debug!(
+                "aggregate result type: agg={:?}, name={}, dt={:?}",
+                agg.func,
+                name,
+                dt
+            );
             col_defs.push(ColumnDef::new(&name, dt));
         }
         let schema = Schema::new(col_defs.clone());
-        tracing::debug!("aggregate: result schema columns = {:?}", schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
+        tracing::debug!(
+            "aggregate: result schema columns = {:?}",
+            schema
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.data_type))
+                .collect::<Vec<_>>()
+        );
 
         // Compute aggregations
-        tracing::debug!("aggregate: starting aggregation loop, group_order len={}", group_order.len());
+        tracing::debug!(
+            "aggregate: starting aggregation loop, group_order len={}",
+            group_order.len()
+        );
         let mut result_batch = RecordBatch::new(schema);
-        tracing::debug!("aggregate: batch columns after new = {:?}", result_batch.columns.iter().map(|c| c.data_type()).collect::<Vec<_>>());
+        tracing::debug!(
+            "aggregate: batch columns after new = {:?}",
+            result_batch
+                .columns
+                .iter()
+                .map(|c| c.data_type())
+                .collect::<Vec<_>>()
+        );
         for key in &group_order {
             tracing::debug!("aggregate: processing group key={:?}", key);
             let rows = groups.get(key).unwrap();
@@ -148,24 +190,59 @@ impl ExecutionOp for HashAggregateExec {
             tracing::debug!("aggregate: row_vals after group_by={}", row_vals.len());
             for agg in &aggregates {
                 let val = compute_aggregate(agg, rows, &physical_schema);
-                tracing::debug!("aggregate: computed value for {:?}: type={:?}, val={}", agg.func, val.data_type(), val);
+                tracing::debug!(
+                    "aggregate: computed value for {:?}: type={:?}, val={}",
+                    agg.func,
+                    val.data_type(),
+                    val
+                );
                 row_vals.push(val);
             }
             tracing::debug!("aggregate: row_vals total={}", row_vals.len());
-            tracing::debug!("aggregate: result_batch.num_columns={}", result_batch.num_columns());
+            tracing::debug!(
+                "aggregate: result_batch.num_columns={}",
+                result_batch.num_columns()
+            );
             for (col_idx, val) in row_vals.iter().enumerate() {
                 let col = result_batch.columns.get(col_idx);
-                tracing::debug!("aggregate push attempt: col_idx={}, val_type={:?}, col_type={:?}, val={}", col_idx, val.data_type(), col.map(|c| c.data_type()), val);
+                tracing::debug!(
+                    "aggregate push attempt: col_idx={}, val_type={:?}, col_type={:?}, val={}",
+                    col_idx,
+                    val.data_type(),
+                    col.map(|c| c.data_type()),
+                    val
+                );
                 if let Some(col_arr) = col {
-                    tracing::debug!("aggregate push: column array type = {:?}", col_arr.data_type());
+                    tracing::debug!(
+                        "aggregate push: column array type = {:?}",
+                        col_arr.data_type()
+                    );
                 }
                 result_batch.column_mut(col_idx).unwrap().push(val)?;
             }
         }
 
-        tracing::debug!("aggregate: after push, batch columns = {:?}", result_batch.columns.iter().map(|c| c.data_type()).collect::<Vec<_>>());
-        tracing::debug!("aggregate: returning result_batch with {} rows", result_batch.num_rows());
-        tracing::debug!("aggregate: result_batch schema = {:?}", result_batch.schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
+        tracing::debug!(
+            "aggregate: after push, batch columns = {:?}",
+            result_batch
+                .columns
+                .iter()
+                .map(|c| c.data_type())
+                .collect::<Vec<_>>()
+        );
+        tracing::debug!(
+            "aggregate: returning result_batch with {} rows",
+            result_batch.num_rows()
+        );
+        tracing::debug!(
+            "aggregate: result_batch schema = {:?}",
+            result_batch
+                .schema
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.data_type))
+                .collect::<Vec<_>>()
+        );
 
         // Apply DISTINCT if needed
         if self.distinct {
@@ -242,7 +319,9 @@ fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
                 .columns
                 .get(*idx)
                 .map(|c| match c.data_type {
-                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                        DataType::Int64
+                    }
                     DataType::Float32 | DataType::Float64 => DataType::Float64,
                     other => other,
                 })
@@ -319,7 +398,7 @@ pub fn compute_aggregate(
                 .and_then(|idx| schema.columns.get(idx))
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Int64);
-            
+
             let has_non_null = values.iter().any(|v| !v.is_null());
             if !has_non_null {
                 match input_type {

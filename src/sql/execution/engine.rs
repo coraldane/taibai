@@ -176,6 +176,7 @@ impl Engine {
                 name,
                 columns,
                 if_not_exists,
+                primary_key,
                 cluster_by,
                 partition_by,
             } => super::ddl::exec_create_table(
@@ -184,6 +185,7 @@ impl Engine {
                 name,
                 columns,
                 *if_not_exists,
+                primary_key,
                 cluster_by,
                 partition_by,
             ),

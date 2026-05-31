@@ -342,14 +342,77 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
     match expr {
         Expr::Literal(v) if v.is_null() => Ok(ScalarValue::null_for_type(*dt)),
         Expr::Literal(v) => match (dt, v) {
-            (DataType::Int32, ScalarValue::Int64(Some(v))) => {
-                Ok(ScalarValue::Int32(Some(*v as i32)))
+            (target, value) if *target == value.data_type() => Ok(value.clone()),
+            (DataType::Bool, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Bool(Some(*v != 0))),
+            (DataType::Bool, ScalarValue::VarChar(Some(v))) => {
+                match v.to_ascii_lowercase().as_str() {
+                    "true" | "1" => Ok(ScalarValue::Bool(Some(true))),
+                    "false" | "0" => Ok(ScalarValue::Bool(Some(false))),
+                    _ => Err(MonaxError::Sql(format!("invalid bool '{}'", v))),
+                }
             }
-            (DataType::Int16, ScalarValue::Int64(Some(v))) => {
-                Ok(ScalarValue::Int16(Some(*v as i16)))
+            (DataType::Int64, ScalarValue::Int32(Some(v))) => {
+                Ok(ScalarValue::Int64(Some(*v as i64)))
             }
-            (DataType::Int8, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int8(Some(*v as i8))),
+            (DataType::Int32, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int32(Some(
+                i32::try_from(*v)
+                    .map_err(|_| MonaxError::Sql(format!("value '{}' overflows INT32", v)))?,
+            ))),
+            (DataType::Int16, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int16(Some(
+                i16::try_from(*v)
+                    .map_err(|_| MonaxError::Sql(format!("value '{}' overflows INT16", v)))?,
+            ))),
+            (DataType::Int8, ScalarValue::Int64(Some(v))) => {
+                Ok(ScalarValue::Int8(Some(i8::try_from(*v).map_err(|_| {
+                    MonaxError::Sql(format!("value '{}' overflows INT8", v))
+                })?)))
+            }
+            (DataType::UInt64, ScalarValue::Int64(Some(v))) => {
+                if *v < 0 {
+                    return Err(MonaxError::Sql(format!(
+                        "negative value '{}' for UINT64",
+                        v
+                    )));
+                }
+                Ok(ScalarValue::UInt64(Some(*v as u64)))
+            }
+            (DataType::UInt32, ScalarValue::Int64(Some(v))) => {
+                if *v < 0 {
+                    return Err(MonaxError::Sql(format!(
+                        "negative value '{}' for UINT32",
+                        v
+                    )));
+                }
+                Ok(ScalarValue::UInt32(Some(u32::try_from(*v).map_err(
+                    |_| MonaxError::Sql(format!("value '{}' overflows UINT32", v)),
+                )?)))
+            }
+            (DataType::UInt16, ScalarValue::Int64(Some(v))) => {
+                if *v < 0 {
+                    return Err(MonaxError::Sql(format!(
+                        "negative value '{}' for UINT16",
+                        v
+                    )));
+                }
+                Ok(ScalarValue::UInt16(Some(u16::try_from(*v).map_err(
+                    |_| MonaxError::Sql(format!("value '{}' overflows UINT16", v)),
+                )?)))
+            }
+            (DataType::UInt8, ScalarValue::Int64(Some(v))) => {
+                if *v < 0 {
+                    return Err(MonaxError::Sql(format!("negative value '{}' for UINT8", v)));
+                }
+                Ok(ScalarValue::UInt8(Some(u8::try_from(*v).map_err(
+                    |_| MonaxError::Sql(format!("value '{}' overflows UINT8", v)),
+                )?)))
+            }
+            (DataType::Float64, ScalarValue::Int64(Some(v))) => {
+                Ok(ScalarValue::Float64(Some(*v as f64)))
+            }
             (DataType::Float32, ScalarValue::Float64(Some(v))) => {
+                Ok(ScalarValue::Float32(Some(*v as f32)))
+            }
+            (DataType::Float32, ScalarValue::Int64(Some(v))) => {
                 Ok(ScalarValue::Float32(Some(*v as f32)))
             }
             (DataType::Decimal, ScalarValue::Float64(Some(v))) => {

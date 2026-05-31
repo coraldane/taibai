@@ -76,25 +76,25 @@ impl StatementBinder {
         table_schemas: &HashMap<String, Schema>,
     ) -> Result<(BindContext, Schema)> {
         match from {
-            FromClause::Table(table_ref) => {
-                match table_ref {
-                    TableRef::Table { name, alias } => {
-                        let table_name = name;
-                        let schema = table_schemas
-                            .get(table_name)
-                            .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
-                            .clone();
-                        let mut ctx = BindContext::with_table(table_name, schema.clone());
-                        if let Some(a) = alias {
-                            ctx.register_table_alias(a, table_name);
-                        }
-                        Ok((ctx, schema))
+            FromClause::Table(table_ref) => match table_ref {
+                TableRef::Table { name, alias } => {
+                    let table_name = name;
+                    let schema = table_schemas
+                        .get(table_name)
+                        .ok_or_else(|| {
+                            MonaxError::Sql(format!("table '{}' not found", table_name))
+                        })?
+                        .clone();
+                    let mut ctx = BindContext::with_table(table_name, schema.clone());
+                    if let Some(a) = alias {
+                        ctx.register_table_alias(a, table_name);
                     }
-                    TableRef::Subquery { query: _, alias: _ } => {
-                        Err(MonaxError::Sql("subquery in FROM not yet supported".into()))
-                    }
+                    Ok((ctx, schema))
                 }
-            }
+                TableRef::Subquery { query: _, alias: _ } => {
+                    Err(MonaxError::Sql("subquery in FROM not yet supported".into()))
+                }
+            },
             FromClause::Join(join_expr) => {
                 let (mut left_ctx, left_schema) = Self::bind_from(&join_expr.left, table_schemas)?;
                 let mut current_schema = left_schema;
@@ -129,7 +129,9 @@ impl StatementBinder {
                             }
                         }
                         TableRef::Subquery { query: _, alias: _ } => {
-                            return Err(MonaxError::Sql("subquery in JOIN not yet supported".into()));
+                            return Err(MonaxError::Sql(
+                                "subquery in JOIN not yet supported".into(),
+                            ));
                         }
                     }
                 }

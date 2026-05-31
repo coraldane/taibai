@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize};
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 use crate::types::array::ColumnArray;
+use crate::types::scalar::ScalarValue;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ColumnDefaultValue {
+    CurrentTimestamp,
+    Literal(ScalarValue),
+}
+
+impl Default for ColumnDefaultValue {
+    fn default() -> Self {
+        ColumnDefaultValue::Literal(ScalarValue::Int64(None))
+    }
+}
 
 /// Column definition within a table schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -13,6 +26,10 @@ pub struct ColumnDef {
     pub scale: i32,
     pub precision: i32,
     pub auto_increment: bool,
+    #[serde(default)]
+    pub primary_key: bool,
+    #[serde(default)]
+    pub default_value: Option<ColumnDefaultValue>,
 }
 
 impl ColumnDef {
@@ -24,6 +41,8 @@ impl ColumnDef {
             scale: 0,
             precision: 0,
             auto_increment: false,
+            primary_key: false,
+            default_value: None,
         }
     }
 
@@ -44,6 +63,16 @@ impl ColumnDef {
 
     pub fn with_auto_increment(mut self, auto_increment: bool) -> Self {
         self.auto_increment = auto_increment;
+        self
+    }
+
+    pub fn with_primary_key(mut self, primary_key: bool) -> Self {
+        self.primary_key = primary_key;
+        self
+    }
+
+    pub fn with_default_value(mut self, default_value: Option<ColumnDefaultValue>) -> Self {
+        self.default_value = default_value;
         self
     }
 }

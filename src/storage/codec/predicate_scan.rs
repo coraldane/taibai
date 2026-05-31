@@ -108,7 +108,9 @@ fn selected_eq_rows_adaptive(
     value: &ScalarValue,
 ) -> Result<Vec<usize>> {
     if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
-        return Err(MonaxError::Storage("adaptive column header truncated".into()));
+        return Err(MonaxError::Storage(
+            "adaptive column header truncated".into(),
+        ));
     }
     let encoding =
         crate::storage::codec::encoding::EncodingType::from_u8(data[COLUMN_ENCODING_MAGIC.len()])?;
@@ -449,7 +451,9 @@ fn count_eq_adaptive(
     value: &ScalarValue,
 ) -> Result<u64> {
     if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
-        return Err(MonaxError::Storage("adaptive column header truncated".into()));
+        return Err(MonaxError::Storage(
+            "adaptive column header truncated".into(),
+        ));
     }
     let encoding =
         crate::storage::codec::encoding::EncodingType::from_u8(data[COLUMN_ENCODING_MAGIC.len()])?;
@@ -460,8 +464,7 @@ fn count_eq_adaptive(
             count_eq_rle_raw(payload, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::Delta => {
-            let values =
-                crate::storage::codec::column_codec::decode_i64_delta_payload(payload)?;
+            let values = crate::storage::codec::column_codec::decode_i64_delta_payload(payload)?;
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::Dictionary
@@ -638,4 +641,3 @@ fn is_numeric_type(dt: &DataType) -> bool {
             | DataType::Interval
     )
 }
-

@@ -31,6 +31,7 @@ pub const MSG_TYPE_CURSOR_CLOSE: u8 = 0x42;
 pub const MSG_TYPE_PREPARE: u8 = 0x50;
 pub const MSG_TYPE_EXECUTE: u8 = 0x51;
 pub const MSG_TYPE_CLOSE_STMT: u8 = 0x52;
+pub const MSG_TYPE_BATCH_EXECUTE: u8 = 0x53;
 
 #[derive(Debug, Clone)]
 pub struct MessageHeader {

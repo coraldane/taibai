@@ -1,11 +1,12 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use serde::{Deserialize, Serialize};
+
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 
-/// A single scalar value, one variant per DataType.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScalarValue {
     Bool(Option<bool>),
     Int8(Option<i8>),

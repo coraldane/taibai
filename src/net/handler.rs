@@ -59,6 +59,7 @@ impl Handler {
 
             MSG_TYPE_PREPARE => self.handle_prepare(&msg.payload),
             MSG_TYPE_EXECUTE => self.handle_execute(&msg.payload),
+            MSG_TYPE_BATCH_EXECUTE => self.handle_batch_execute(&msg.payload),
             MSG_TYPE_CLOSE_STMT => self.handle_close_stmt(&msg.payload),
 
             MSG_TYPE_BEGIN_TXN => self.handle_begin_txn(),
@@ -103,7 +104,10 @@ impl Handler {
             0
         };
 
-        let auth_result = self.engine.auth_manager().authenticate(username, &password)?;
+        let auth_result = self
+            .engine
+            .auth_manager()
+            .authenticate(username, &password)?;
         if !auth_result {
             tracing::warn!(username, "login failed: invalid credentials");
             return Ok(vec![build_auth_fail("invalid username or password")]);
@@ -295,8 +299,12 @@ impl Handler {
         let mut params: Vec<ScalarValue> = Vec::new();
 
         if payload.len() >= offset + 4 {
-            let param_count =
-                u32::from_le_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]]) as usize;
+            let param_count = u32::from_le_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+            ]) as usize;
             offset += 4;
 
             for i in 0..param_count {
@@ -316,12 +324,22 @@ impl Handler {
 
                 let dt = match DataType::from_u8(type_tag) {
                     Ok(dt) => dt,
-                    Err(e) => return Ok(vec![build_error(&format!("invalid param type tag {}: {}", type_tag, e))]),
+                    Err(e) => {
+                        return Ok(vec![build_error(&format!(
+                            "invalid param type tag {}: {}",
+                            type_tag, e
+                        ))])
+                    }
                 };
 
                 let (val, consumed) = match Self::decode_param_value(&payload[offset..], dt) {
                     Ok(v) => v,
-                    Err(e) => return Ok(vec![build_error(&format!("param {} decode error: {}", i, e))]),
+                    Err(e) => {
+                        return Ok(vec![build_error(&format!(
+                            "param {} decode error: {}",
+                            i, e
+                        ))])
+                    }
                 };
                 params.push(val);
                 offset += consumed;
@@ -393,7 +411,10 @@ impl Handler {
                 if data.len() < 2 {
                     return Err(MonaxError::Protocol("no data for Int16 param".into()));
                 }
-                Ok((ScalarValue::Int16(Some(i16::from_le_bytes([data[0], data[1]]))), 2))
+                Ok((
+                    ScalarValue::Int16(Some(i16::from_le_bytes([data[0], data[1]]))),
+                    2,
+                ))
             }
             DataType::Int32 => {
                 if data.len() < 4 {
@@ -407,8 +428,7 @@ impl Handler {
                     return Err(MonaxError::Protocol("no data for Int64 param".into()));
                 }
                 let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 Ok((ScalarValue::Int64(Some(v)), 8))
             }
@@ -422,7 +442,10 @@ impl Handler {
                 if data.len() < 2 {
                     return Err(MonaxError::Protocol("no data for UInt16 param".into()));
                 }
-                Ok((ScalarValue::UInt16(Some(u16::from_le_bytes([data[0], data[1]]))), 2))
+                Ok((
+                    ScalarValue::UInt16(Some(u16::from_le_bytes([data[0], data[1]]))),
+                    2,
+                ))
             }
             DataType::UInt32 => {
                 if data.len() < 4 {
@@ -436,8 +459,7 @@ impl Handler {
                     return Err(MonaxError::Protocol("no data for UInt64 param".into()));
                 }
                 let v = u64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 Ok((ScalarValue::UInt64(Some(v)), 8))
             }
@@ -453,8 +475,7 @@ impl Handler {
                     return Err(MonaxError::Protocol("no data for Float64 param".into()));
                 }
                 let v = f64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 Ok((ScalarValue::Float64(Some(v)), 8))
             }
@@ -463,8 +484,7 @@ impl Handler {
                     return Err(MonaxError::Protocol("no data for Decimal param".into()));
                 }
                 let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 Ok((ScalarValue::Decimal(Some(v)), 8))
             }
@@ -480,8 +500,7 @@ impl Handler {
                     return Err(MonaxError::Protocol("no data for Time param".into()));
                 }
                 let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 Ok((ScalarValue::Time(Some(v)), 8))
             }
@@ -490,8 +509,7 @@ impl Handler {
                     return Err(MonaxError::Protocol("no data for Timestamp param".into()));
                 }
                 let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 Ok((ScalarValue::Timestamp(Some(v)), 8))
             }
@@ -500,8 +518,7 @@ impl Handler {
                     return Err(MonaxError::Protocol("no data for Interval param".into()));
                 }
                 let v = i64::from_le_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 Ok((ScalarValue::Interval(Some(v)), 8))
             }
@@ -513,8 +530,9 @@ impl Handler {
                 if data.len() < 4 + len {
                     return Err(MonaxError::Protocol("VarChar param data truncated".into()));
                 }
-                let s = std::str::from_utf8(&data[4..4 + len])
-                    .map_err(|e| MonaxError::Protocol(format!("invalid UTF-8 in VarChar param: {}", e)))?;
+                let s = std::str::from_utf8(&data[4..4 + len]).map_err(|e| {
+                    MonaxError::Protocol(format!("invalid UTF-8 in VarChar param: {}", e))
+                })?;
                 Ok((ScalarValue::VarChar(Some(s.to_string())), 4 + len))
             }
             DataType::Blob => {
@@ -539,11 +557,138 @@ impl Handler {
                 let mut floats = Vec::with_capacity(dim);
                 for i in 0..dim {
                     let off = 4 + i * 4;
-                    floats.push(f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]));
+                    floats.push(f32::from_le_bytes([
+                        data[off],
+                        data[off + 1],
+                        data[off + 2],
+                        data[off + 3],
+                    ]));
                 }
                 Ok((ScalarValue::Vector(Some(floats)), total))
             }
         }
+    }
+
+    fn handle_batch_execute(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let server_start = Instant::now();
+
+        let session = match &mut self.session {
+            Some(s) => s,
+            None => return Ok(vec![build_error("not logged in")]),
+        };
+        session.touch();
+
+        if payload.len() < 8 {
+            return Ok(vec![build_error(
+                "invalid batch execute message: missing statement ID or batch size",
+            )]);
+        }
+        let stmt_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let batch_size =
+            u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+
+        let mut offset = 8usize;
+
+        let mut stmt = match session.prepared_statements.remove(stmt_id) {
+            Some(s) => s,
+            None => {
+                return Ok(vec![build_error(&format!(
+                    "prepared statement {} not found",
+                    stmt_id
+                ))])
+            }
+        };
+
+        let param_count = stmt.param_count;
+        let mut total_rows_affected = 0u64;
+        let mut had_writes = false;
+
+        for row_idx in 0..batch_size {
+            let mut params: Vec<ScalarValue> = Vec::with_capacity(param_count);
+
+            for param_idx in 0..param_count {
+                if offset >= payload.len() {
+                    session.prepared_statements.insert(stmt);
+                    return Ok(vec![build_error(&format!(
+                        "truncated parameters: row {}, param {}",
+                        row_idx, param_idx
+                    ))]);
+                }
+                let type_tag = payload[offset];
+                offset += 1;
+
+                if type_tag == 0 {
+                    params.push(ScalarValue::VarChar(None));
+                    continue;
+                }
+
+                let dt = match DataType::from_u8(type_tag) {
+                    Ok(dt) => dt,
+                    Err(e) => {
+                        session.prepared_statements.insert(stmt);
+                        return Ok(vec![build_error(&format!(
+                            "invalid param type tag {}: {}",
+                            type_tag, e
+                        ))]);
+                    }
+                };
+
+                let (val, consumed) = match Self::decode_param_value(&payload[offset..], dt) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        session.prepared_statements.insert(stmt);
+                        return Ok(vec![build_error(&format!(
+                            "row {} param {} decode error: {}",
+                            row_idx, param_idx, e
+                        ))]);
+                    }
+                };
+                params.push(val);
+                offset += consumed;
+            }
+
+            stmt.params = params;
+
+            let result = self.engine.execute_prepared(session, &mut stmt);
+            match result {
+                Ok(ExecResult::Ok { rows_affected }) => {
+                    total_rows_affected += rows_affected;
+                    if rows_affected > 0 {
+                        had_writes = true;
+                    }
+                }
+                Ok(ExecResult::Query { .. }) => {
+                    session.prepared_statements.insert(stmt);
+                    return Ok(vec![build_error(
+                        "batch execute returned query result, expected Ok",
+                    )]);
+                }
+                Err(e) => {
+                    session.prepared_statements.insert(stmt);
+                    return Ok(vec![build_error(&format!(
+                        "row {} execute error: {}",
+                        row_idx, e
+                    ))]);
+                }
+            }
+        }
+
+        if had_writes {
+            session.had_writes = true;
+            session.mark_txn_write();
+        }
+
+        session.prepared_statements.insert(stmt);
+
+        let timings = ServerTimings {
+            total: server_start.elapsed(),
+            execute: server_start.elapsed(),
+            encode: Duration::ZERO,
+        };
+        Ok(vec![build_ok_with_server_timings(
+            total_rows_affected,
+            timings,
+        )])
     }
 
     fn handle_close_stmt(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -964,7 +1109,10 @@ mod tests {
 
         let mut sql_payload = Vec::new();
         write_len_prefixed_string(&mut sql_payload, "main");
-        write_len_prefixed_string(&mut sql_payload, "CREATE TABLE t (id INT64, name VARCHAR, score FLOAT64)");
+        write_len_prefixed_string(
+            &mut sql_payload,
+            "CREATE TABLE t (id INT64, name VARCHAR, score FLOAT64)",
+        );
         handler
             .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
             .unwrap();

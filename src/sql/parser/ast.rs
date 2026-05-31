@@ -47,6 +47,7 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDefAst>,
         if_not_exists: bool,
+        primary_key: Vec<String>,
         cluster_by: Option<Vec<String>>,
         partition_by: Option<PartitionDef>,
     },
@@ -187,6 +188,14 @@ pub struct ColumnDefAst {
     pub scale: i32,
     pub precision: i32,
     pub auto_increment: bool,
+    pub primary_key: bool,
+    pub default_value: Option<DefaultValue>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DefaultValue {
+    CurrentTimestamp,
+    Literal(ScalarValue),
 }
 
 impl ColumnDefAst {
@@ -198,6 +207,8 @@ impl ColumnDefAst {
             scale: 0,
             precision: 0,
             auto_increment: false,
+            primary_key: false,
+            default_value: None,
         }
     }
 }

@@ -127,11 +127,14 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
                 crate::sql::planner::AggFunc::Min => "min",
                 crate::sql::planner::AggFunc::Max => "max",
             };
-            
+
             schema
                 .columns
                 .iter()
-                .find(|c| c.name.starts_with(&format!("{}(", agg_prefix)) || c.name == format!("{}(*)", agg_prefix))
+                .find(|c| {
+                    c.name.starts_with(&format!("{}(", agg_prefix))
+                        || c.name == format!("{}(*)", agg_prefix)
+                })
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Int64)
         }

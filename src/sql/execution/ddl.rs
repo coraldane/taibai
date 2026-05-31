@@ -4,12 +4,13 @@ use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
 use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType};
-use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+use crate::types::batch::{ColumnDef, ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{
-    AlterOperation, ColumnDefAst, GrantObject, PartitionDef, PartitionStrategy, Privilege,
+    AlterOperation, ColumnDefAst, DefaultValue, GrantObject, PartitionDef, PartitionStrategy,
+    Privilege,
 };
 
 pub fn exec_create_table(
@@ -18,6 +19,7 @@ pub fn exec_create_table(
     name: &str,
     columns: &[ColumnDefAst],
     if_not_exists: bool,
+    primary_key: &[String],
     cluster_by: &Option<Vec<String>>,
     partition_by: &Option<PartitionDef>,
 ) -> Result<ExecResult> {
@@ -34,15 +36,25 @@ pub fn exec_create_table(
         )));
     }
 
-    let col_defs: Vec<ColumnDef> = columns
+    let mut col_defs: Vec<ColumnDef> = columns
         .iter()
         .map(|c| {
+            let default_value = c.default_value.as_ref().map(|dv| match dv {
+                DefaultValue::CurrentTimestamp => ColumnDefaultValue::CurrentTimestamp,
+                DefaultValue::Literal(s) => ColumnDefaultValue::Literal(s.clone()),
+            });
             ColumnDef::new(&c.name, c.data_type)
                 .with_nullable(c.nullable)
                 .with_scale(c.scale)
                 .with_precision(c.precision)
+                .with_auto_increment(c.auto_increment)
+                .with_primary_key(c.primary_key)
+                .with_default_value(default_value)
         })
         .collect();
+
+    apply_table_primary_key(&mut col_defs, primary_key)?;
+    validate_column_constraints(&mut col_defs)?;
 
     catalog.create_table(name, col_defs)?;
 
@@ -139,10 +151,18 @@ pub fn exec_alter_table(
     for op in operations {
         match op {
             AlterOperation::AddColumn { column } => {
-                let col_def = ColumnDef::new(&column.name, column.data_type)
+                let default_value = column.default_value.as_ref().map(|dv| match dv {
+                    DefaultValue::CurrentTimestamp => ColumnDefaultValue::CurrentTimestamp,
+                    DefaultValue::Literal(s) => ColumnDefaultValue::Literal(s.clone()),
+                });
+                let mut col_def = ColumnDef::new(&column.name, column.data_type)
                     .with_nullable(column.nullable)
                     .with_scale(column.scale)
-                    .with_precision(column.precision);
+                    .with_precision(column.precision)
+                    .with_auto_increment(column.auto_increment)
+                    .with_primary_key(column.primary_key)
+                    .with_default_value(default_value);
+                validate_column_constraints(std::slice::from_mut(&mut col_def))?;
                 catalog.add_column(name, col_def)?;
             }
             AlterOperation::DropColumn { name: col_name } => {
@@ -152,7 +172,13 @@ pub fn exec_alter_table(
                 catalog.rename_column(name, old_name, new_name)?;
             }
             AlterOperation::ModifyColumn { column } => {
-                catalog.modify_column(name, &column.name, column.data_type, column.scale, column.precision)?;
+                catalog.modify_column(
+                    name,
+                    &column.name,
+                    column.data_type,
+                    column.scale,
+                    column.precision,
+                )?;
             }
             AlterOperation::RenameTable { new_name } => {
                 let old_table_dir = engine.data_dir().join(db).join(name);
@@ -211,6 +237,81 @@ pub fn exec_alter_table(
     catalog.save(&meta_dir)?;
 
     Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+fn apply_table_primary_key(columns: &mut [ColumnDef], primary_key: &[String]) -> Result<()> {
+    for pk_col in primary_key {
+        let column = columns
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(pk_col))
+            .ok_or_else(|| MonaxError::Sql(format!("primary key column '{}' not found", pk_col)))?;
+        column.primary_key = true;
+    }
+    Ok(())
+}
+
+fn validate_column_constraints(columns: &mut [ColumnDef]) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    let mut seen_pk = std::collections::HashSet::new();
+
+    for col in columns {
+        let name_key = col.name.to_ascii_lowercase();
+        if !seen_names.insert(name_key.clone()) {
+            return Err(MonaxError::Sql(format!("duplicate column '{}'", col.name)));
+        }
+        if col.primary_key {
+            if !seen_pk.insert(name_key) {
+                return Err(MonaxError::Sql(format!(
+                    "duplicate primary key column '{}'",
+                    col.name
+                )));
+            }
+            col.nullable = false;
+        }
+        if let Some(default_value) = col.default_value.take() {
+            col.default_value = Some(normalize_default_value(
+                default_value,
+                col.data_type,
+                col.scale,
+                &col.name,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_default_value(
+    default_value: ColumnDefaultValue,
+    data_type: DataType,
+    scale: i32,
+    column_name: &str,
+) -> Result<ColumnDefaultValue> {
+    match default_value {
+        ColumnDefaultValue::CurrentTimestamp => {
+            if data_type != DataType::Timestamp {
+                return Err(MonaxError::Sql(format!(
+                    "CURRENT_TIMESTAMP default requires TIMESTAMP column '{}'",
+                    column_name
+                )));
+            }
+            Ok(ColumnDefaultValue::CurrentTimestamp)
+        }
+        ColumnDefaultValue::Literal(value) => {
+            let expr = crate::sql::parser::ast::Expr::Literal(value);
+            let scalar = super::helpers::eval_expr_to_scalar_with_scale_timezone(
+                &expr, &data_type, scale, 0,
+            )?;
+            if !scalar.is_null() && scalar.data_type() != data_type {
+                return Err(MonaxError::Sql(format!(
+                    "default value for column '{}' has type {}, expected {}",
+                    column_name,
+                    scalar.data_type().display_name(),
+                    data_type.display_name()
+                )));
+            }
+            Ok(ColumnDefaultValue::Literal(scalar))
+        }
+    }
 }
 
 pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
@@ -554,10 +655,33 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
     let mut create_sql = format!("CREATE TABLE {} (\n", table);
     for (i, col) in table_meta.columns.iter().enumerate() {
         let nullable = if col.nullable { "" } else { " NOT NULL" };
-        if i < table_meta.columns.len() - 1 {
-            create_sql.push_str(&format!("  {} {}{},\n", col.name, col.data_type, nullable));
+        let auto_inc = if col.auto_increment {
+            " AUTO_INCREMENT"
         } else {
-            create_sql.push_str(&format!("  {} {}{}\n", col.name, col.data_type, nullable));
+            ""
+        };
+        let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
+        let def_str = match &col.default_value {
+            Some(ColumnDefaultValue::CurrentTimestamp) => " DEFAULT CURRENT_TIMESTAMP".to_string(),
+            Some(ColumnDefaultValue::Literal(s)) => match s {
+                ScalarValue::VarChar(Some(v)) => format!(" DEFAULT '{}'", v),
+                ScalarValue::Int64(Some(v)) => format!(" DEFAULT {}", v),
+                ScalarValue::Float64(Some(v)) => format!(" DEFAULT {}", v),
+                ScalarValue::Int64(None) => " DEFAULT NULL".to_string(),
+                _ => "".to_string(),
+            },
+            None => "".to_string(),
+        };
+        if i < table_meta.columns.len() - 1 {
+            create_sql.push_str(&format!(
+                "  {} {}{}{}{}{},\n",
+                col.name, col.data_type, nullable, auto_inc, pk, def_str
+            ));
+        } else {
+            create_sql.push_str(&format!(
+                "  {} {}{}{}{}{}\n",
+                col.name, col.data_type, nullable, auto_inc, pk, def_str
+            ));
         }
     }
     create_sql.push_str(")");
