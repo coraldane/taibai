@@ -320,11 +320,14 @@ impl Parser {
                 self.advance();
                 if self.peek() == &Token::Dot {
                     self.advance();
-                    let column = self.expect_ident()?;
-                    Ok(Expr::QualifiedColumn {
-                        table: name,
-                        column,
-                    })
+                    let mut table = name;
+                    let mut column = self.expect_ident()?;
+                    if self.peek() == &Token::Dot {
+                        self.advance();
+                        table = format!("{}.{}", table, column);
+                        column = self.expect_ident()?;
+                    }
+                    Ok(Expr::QualifiedColumn { table, column })
                 } else if self.peek() == &Token::LeftParen {
                     self.advance();
                     let distinct = if self.peek() == &Token::Distinct {

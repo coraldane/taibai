@@ -16,6 +16,7 @@ pub struct PreparedStatement {
     pub param_count: usize,
     pub params: Vec<ScalarValue>,
     pub cached_plan: Option<LogicalPlan>,
+    pub planned_database: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +65,7 @@ impl PreparedStatementCache {
             param_count,
             params: Vec::new(),
             cached_plan: None,
+            planned_database: None,
         };
 
         self.statements.insert(id, prepared.clone());

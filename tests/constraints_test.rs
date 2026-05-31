@@ -7,7 +7,7 @@ use monax::types::scalar::ScalarValue;
 fn create_engine() -> (TempDir, Engine, Session) {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
-    let session = Session::new("test_user".to_string(), "main".to_string());
+    let session = Session::new("root".to_string(), "main".to_string());
     (temp_dir, engine, session)
 }
 

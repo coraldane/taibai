@@ -108,6 +108,12 @@ impl AutoIncrementManager {
         }
     }
 
+    pub fn unregister_database(&self, db: &str) {
+        let prefix = format!("{}:", db);
+        let mut counters = self.counters.write().unwrap();
+        counters.retain(|key, _| !key.starts_with(&prefix));
+    }
+
     pub fn reset(&self, db: &str, table: &str, value: u64) -> Result<()> {
         let counter = self.get(db, table).ok_or_else(|| {
             MonaxError::Internal(format!(

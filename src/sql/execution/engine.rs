@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::common::error::{MonaxError, Result};
 use crate::net::session::Session;
-use crate::storage::catalog::auth::AuthManager;
+use crate::storage::catalog::auth::{AuthManager, PermissionObjectType, PermissionType};
 use crate::storage::catalog::auto_increment::AutoIncrementManager;
 use crate::storage::catalog::schema::DatabaseCatalog;
 use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
@@ -45,9 +45,24 @@ impl Engine {
     pub fn new(data_dir: &Path, default_database: &str) -> Result<Self> {
         let mut catalogs = HashMap::new();
         let meta_dir = data_dir.join("meta");
+
         if meta_dir.exists() {
-            if let Ok(catalog) = DatabaseCatalog::load_or_create(&meta_dir, default_database) {
-                catalogs.insert(default_database.to_string(), catalog);
+            let catalog_dir = DatabaseCatalog::catalog_dir(&meta_dir);
+            if catalog_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&catalog_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                            continue;
+                        }
+                        if let Some(db_name) = path.file_stem().and_then(|s| s.to_str()) {
+                            if let Ok(catalog) = DatabaseCatalog::load_or_create(&meta_dir, db_name)
+                            {
+                                catalogs.insert(db_name.to_string(), catalog);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -71,6 +86,11 @@ impl Engine {
             }
         }
 
+        if !catalogs.contains_key(default_database) {
+            let catalog = DatabaseCatalog::load_or_create(&meta_dir, default_database)?;
+            catalogs.insert(default_database.to_string(), catalog);
+        }
+
         let segment_mgr = Arc::new(SegmentManager::new(data_dir)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
@@ -78,6 +98,20 @@ impl Engine {
 
         let auth_manager = Arc::new(AuthManager::new(data_dir)?);
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
+        for (db_name, catalog) in &catalogs {
+            for table_meta in catalog.tables.values() {
+                for col in &table_meta.columns {
+                    if col.auto_increment {
+                        auto_increment_mgr.register(
+                            db_name,
+                            &table_meta.name,
+                            &col.name,
+                            (table_meta.row_count.max(0) as u64) + 1,
+                        )?;
+                    }
+                }
+            }
+        }
         let index_manager = Arc::new(IndexManager::new(Arc::clone(&segment_mgr)));
 
         Ok(Self {
@@ -116,9 +150,13 @@ impl Engine {
         if !prepared.params.is_empty() {
             crate::sql::execution::prepared::bind_params(&mut stmt, &prepared.params)?;
         }
+        self.ensure_permissions(session, &stmt)?;
         match &stmt {
             Statement::Select { .. } => {
-                if let Some(ref plan) = prepared.cached_plan {
+                if prepared.planned_database.as_deref() == Some(session.database.as_str())
+                    && prepared.cached_plan.is_some()
+                {
+                    let plan = prepared.cached_plan.as_ref().unwrap();
                     super::query::exec_select_with_plan(
                         self,
                         &session.database,
@@ -136,6 +174,7 @@ impl Engine {
                                 crate::sql::planner::plan_select(&stmt, &table_schemas)
                             {
                                 prepared.cached_plan = Some(crate::sql::optimizer::optimize(plan));
+                                prepared.planned_database = Some(session.database.clone());
                             }
                         }
                     }
@@ -152,18 +191,18 @@ impl Engine {
         stmt: &Statement,
     ) -> Result<std::collections::HashMap<String, crate::types::batch::Schema>> {
         use crate::types::batch::Schema;
-        let mut table_names = Vec::new();
+        let mut table_refs = Vec::new();
         if let Statement::Select { from, .. } = stmt {
             if let Some(ref from_clause) = from {
-                table_names.extend(super::query::extract_table_names(from_clause));
+                table_refs.extend(super::query::extract_table_refs(from_clause, db));
             }
         }
         let mut table_schemas = std::collections::HashMap::new();
         let catalogs = self.catalogs().read().unwrap();
-        if let Some(catalog) = catalogs.get(db) {
-            for table_name in &table_names {
-                if let Some(meta) = catalog.get_table(table_name) {
-                    table_schemas.insert(table_name.clone(), Schema::new(meta.columns.clone()));
+        for table_ref in &table_refs {
+            if let Some(catalog) = catalogs.get(&table_ref.database) {
+                if let Some(meta) = catalog.get_table(&table_ref.table) {
+                    table_schemas.insert(table_ref.key.clone(), Schema::new(meta.columns.clone()));
                 }
             }
         }
@@ -171,6 +210,7 @@ impl Engine {
     }
 
     fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
+        self.ensure_permissions(session, stmt)?;
         match stmt {
             Statement::CreateTable {
                 name,
@@ -181,23 +221,31 @@ impl Engine {
                 partition_by,
             } => super::ddl::exec_create_table(
                 self,
-                &session.database,
-                name,
+                name.effective_database(&session.database),
+                &name.name,
                 columns,
                 *if_not_exists,
                 primary_key,
                 cluster_by,
                 partition_by,
             ),
-            Statement::DropTable { name, if_exists } => {
-                super::ddl::exec_drop_table(self, &session.database, name, *if_exists)
-            }
-            Statement::AlterTable { name, operations } => {
-                super::ddl::exec_alter_table(self, &session.database, name, operations)
-            }
-            Statement::Truncate { table } => {
-                super::ddl::exec_truncate_table(self, &session.database, table)
-            }
+            Statement::DropTable { name, if_exists } => super::ddl::exec_drop_table(
+                self,
+                name.effective_database(&session.database),
+                &name.name,
+                *if_exists,
+            ),
+            Statement::AlterTable { name, operations } => super::ddl::exec_alter_table(
+                self,
+                name.effective_database(&session.database),
+                &name.name,
+                operations,
+            ),
+            Statement::Truncate { table } => super::ddl::exec_truncate_table(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
             Statement::CreateDatabase {
                 name,
                 if_not_exists,
@@ -231,8 +279,8 @@ impl Engine {
                 let txn_id = session.active_txn_id();
                 let result = super::dml_insert::exec_insert(
                     self,
-                    &session.database,
-                    table,
+                    table.effective_database(&session.database),
+                    &table.name,
                     columns,
                     values,
                     session.timezone_offset_hours,
@@ -249,15 +297,20 @@ impl Engine {
                 where_clause,
             } => super::dml_update::exec_update(
                 self,
-                &session.database,
-                table,
+                table.effective_database(&session.database),
+                &table.name,
                 assignments,
                 where_clause,
             ),
             Statement::Delete {
                 table,
                 where_clause,
-            } => super::dml_delete::exec_delete(self, &session.database, table, where_clause),
+            } => super::dml_delete::exec_delete(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+                where_clause,
+            ),
             Statement::Select { .. } => super::query::exec_select(self, &session.database, stmt),
             Statement::UseDatabase(database) => {
                 let catalogs = self.catalogs().read().unwrap();
@@ -271,17 +324,26 @@ impl Engine {
                 session.database = database.clone();
                 Ok(ExecResult::Ok { rows_affected: 0 })
             }
-            Statement::ShowTables => super::ddl::exec_show_tables(self, &session.database),
+            Statement::ShowTables { database } => {
+                let db = database.as_deref().unwrap_or(&session.database);
+                super::ddl::exec_show_tables(self, db)
+            }
             Statement::ShowDatabases => super::ddl::exec_show_databases(self),
-            Statement::ShowColumns { table } => {
-                super::ddl::exec_show_columns(self, &session.database, table)
-            }
-            Statement::ShowIndexes { table } => {
-                super::ddl::exec_show_indexes(self, &session.database, table)
-            }
-            Statement::ShowCreateTable { table } => {
-                super::ddl::exec_show_create_table(self, &session.database, table)
-            }
+            Statement::ShowColumns { table } => super::ddl::exec_show_columns(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::ShowIndexes { table } => super::ddl::exec_show_indexes(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::ShowCreateTable { table } => super::ddl::exec_show_create_table(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
             Statement::Explain {
                 analyze,
                 stmt: inner,
@@ -351,18 +413,30 @@ impl Engine {
             Statement::ShowUsers => super::ddl::exec_show_users(self),
             Statement::ShowRoles => super::ddl::exec_show_roles(self),
             Statement::ShowGrants { user } => super::ddl::exec_show_grants(self, user),
-            Statement::ShowPartitions { table } => {
-                super::ddl::exec_show_partitions(self, &session.database, table)
-            }
+            Statement::ShowPartitions { table } => match table {
+                Some(table) => super::ddl::exec_show_partitions(
+                    self,
+                    table.effective_database(&session.database),
+                    &Some(table.name.clone()),
+                ),
+                None => super::ddl::exec_show_partitions(self, &session.database, &None),
+            },
             Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),
             Statement::ShowEngines => super::ddl::exec_show_engines(self),
             Statement::ShowProcesslist { full } => super::ddl::exec_show_processlist(self, *full),
-            Statement::FlushTable { table } => {
-                super::ddl::exec_flush_table(self, &session.database, table)
-            }
-            Statement::OptimizeTable { table } => {
-                super::ddl::exec_optimize_table(self, &session.database, table)
-            }
+            Statement::FlushTable { table } => match table {
+                Some(table) => super::ddl::exec_flush_table(
+                    self,
+                    table.effective_database(&session.database),
+                    &Some(table.name.clone()),
+                ),
+                None => super::ddl::exec_flush_table(self, &session.database, &None),
+            },
+            Statement::OptimizeTable { table } => super::ddl::exec_optimize_table(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
             Statement::PauseFlush => {
                 self.segment_mgr().pause_flush();
                 Ok(ExecResult::Ok { rows_affected: 0 })
@@ -372,6 +446,206 @@ impl Engine {
                 Ok(ExecResult::Ok { rows_affected: 0 })
             }
         }
+    }
+
+    fn ensure_permissions(&self, session: &Session, stmt: &Statement) -> Result<()> {
+        match stmt {
+            Statement::CreateTable { name, .. } => self.require_table_permission(
+                session,
+                PermissionType::Create,
+                name.effective_database(&session.database),
+                &name.name,
+            ),
+            Statement::DropTable { name, .. } => self.require_table_permission(
+                session,
+                PermissionType::Drop,
+                name.effective_database(&session.database),
+                &name.name,
+            ),
+            Statement::AlterTable { name, .. } => self.require_table_permission(
+                session,
+                PermissionType::Alter,
+                name.effective_database(&session.database),
+                &name.name,
+            ),
+            Statement::Truncate { table } => self.require_table_permission(
+                session,
+                PermissionType::Truncate,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::CreateDatabase { name, .. } => {
+                self.require_database_permission(session, PermissionType::Create, name)
+            }
+            Statement::DropDatabase { name, .. } => {
+                self.require_database_permission(session, PermissionType::Drop, name)
+            }
+            Statement::Insert { table, .. } => self.require_table_permission(
+                session,
+                PermissionType::Insert,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::Update { table, .. } => self.require_table_permission(
+                session,
+                PermissionType::Update,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::Delete { table, .. } => self.require_table_permission(
+                session,
+                PermissionType::Delete,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::Select { from, .. } => {
+                if let Some(from_clause) = from {
+                    for table_ref in
+                        super::query::extract_table_refs(from_clause, &session.database)
+                    {
+                        self.require_table_permission(
+                            session,
+                            PermissionType::Select,
+                            &table_ref.database,
+                            &table_ref.table,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            Statement::Union { left, right, .. } => {
+                self.ensure_permissions(session, left)?;
+                self.ensure_permissions(session, right)
+            }
+            Statement::ShowTables { database } => self.require_database_permission(
+                session,
+                PermissionType::Select,
+                database.as_deref().unwrap_or(&session.database),
+            ),
+            Statement::ShowColumns { table }
+            | Statement::ShowIndexes { table }
+            | Statement::ShowCreateTable { table } => self.require_table_permission(
+                session,
+                PermissionType::Select,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::ShowPartitions { table } => {
+                if let Some(table) = table {
+                    self.require_table_permission(
+                        session,
+                        PermissionType::Select,
+                        table.effective_database(&session.database),
+                        &table.name,
+                    )
+                } else {
+                    self.require_database_permission(
+                        session,
+                        PermissionType::Select,
+                        &session.database,
+                    )
+                }
+            }
+            Statement::ShowStats => {
+                self.require_database_permission(session, PermissionType::Select, &session.database)
+            }
+            Statement::FlushTable { table } => {
+                if let Some(table) = table {
+                    self.require_table_permission(
+                        session,
+                        PermissionType::Alter,
+                        table.effective_database(&session.database),
+                        &table.name,
+                    )
+                } else {
+                    self.require_database_permission(
+                        session,
+                        PermissionType::Alter,
+                        &session.database,
+                    )
+                }
+            }
+            Statement::OptimizeTable { table } => self.require_table_permission(
+                session,
+                PermissionType::Alter,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::Explain { stmt: inner, .. } => self.ensure_permissions(session, inner),
+            Statement::UseDatabase(_)
+            | Statement::ShowDatabases
+            | Statement::ShowEngines
+            | Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback => Ok(()),
+            Statement::CreateUser { .. }
+            | Statement::AlterUser { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropUser { .. }
+            | Statement::DropRole { .. }
+            | Statement::Grant { .. }
+            | Statement::Revoke { .. }
+            | Statement::ShowUsers
+            | Statement::ShowRoles
+            | Statement::ShowGrants { .. }
+            | Statement::ShowProcesslist { .. }
+            | Statement::PauseFlush
+            | Statement::ResumeFlush => self.require_global_admin(session),
+        }
+    }
+
+    fn require_table_permission(
+        &self,
+        session: &Session,
+        permission: PermissionType,
+        db: &str,
+        table: &str,
+    ) -> Result<()> {
+        self.require_permission(
+            session,
+            permission,
+            PermissionObjectType::Table,
+            &format!("{}.{}", db, table),
+        )
+    }
+
+    fn require_database_permission(
+        &self,
+        session: &Session,
+        permission: PermissionType,
+        db: &str,
+    ) -> Result<()> {
+        self.require_permission(session, permission, PermissionObjectType::Database, db)
+    }
+
+    fn require_global_admin(&self, session: &Session) -> Result<()> {
+        self.require_permission(
+            session,
+            PermissionType::All,
+            PermissionObjectType::Global,
+            "*",
+        )
+    }
+
+    fn require_permission(
+        &self,
+        session: &Session,
+        permission: PermissionType,
+        object_type: PermissionObjectType,
+        object_name: &str,
+    ) -> Result<()> {
+        if self.auth_manager.check_permission(
+            &session.username,
+            permission.clone(),
+            object_type.clone(),
+            object_name,
+        ) {
+            return Ok(());
+        }
+        Err(MonaxError::Sql(format!(
+            "access denied for user '{}' to {:?} on {:?} '{}'",
+            session.username, permission, object_type, object_name
+        )))
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -409,6 +683,10 @@ impl Engine {
     ) -> Option<crate::storage::catalog::schema::TableMeta> {
         let catalogs = self.catalogs.read().unwrap();
         catalogs.get(db).and_then(|c| c.get_table(table).cloned())
+    }
+
+    pub fn database_exists(&self, db: &str) -> bool {
+        self.catalogs.read().unwrap().contains_key(db)
     }
 
     pub fn set_bulk_mode(&self, enabled: bool) {

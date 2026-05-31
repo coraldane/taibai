@@ -33,7 +33,12 @@ pub fn try_fast_parse_insert(sql: &str) -> Option<Result<Statement>> {
     if pos == table_start {
         return None;
     }
-    let table = sql[table_start..pos].to_string();
+    let table_raw = &sql[table_start..pos];
+    let table = if let Some((db, name)) = table_raw.split_once('.') {
+        ObjectName::qualified(db.to_string(), name.to_string())
+    } else {
+        ObjectName::bare(table_raw.to_string())
+    };
 
     while pos < len && bytes[pos] == b' ' {
         pos += 1;
@@ -236,7 +241,7 @@ mod tests {
                 columns,
                 values,
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, ObjectName::bare("t".to_string()));
                 assert!(columns.is_empty());
                 assert_eq!(values.len(), 1);
                 assert_eq!(values[0].len(), 3);
@@ -255,7 +260,7 @@ mod tests {
                 columns,
                 values,
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(table, ObjectName::bare("t".to_string()));
                 assert_eq!(columns, vec!["a", "b"]);
                 assert_eq!(values.len(), 2);
             }

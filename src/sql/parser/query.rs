@@ -270,7 +270,7 @@ impl Parser {
                 return Err(MonaxError::Sql("expected SELECT in derived table".into()));
             }
         } else {
-            let name = self.expect_ident()?;
+            let name = self.parse_object_name()?;
             let alias = if self.peek() == &Token::As {
                 self.advance();
                 Some(self.expect_ident()?)

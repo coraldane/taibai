@@ -38,7 +38,7 @@ impl ExecutionOp for ScanExec {
 
         match &self.projection {
             Some(indices) => {
-                if is_already_projected(batch, indices) {
+                if is_already_projected(batch, indices, self.table_schema.as_ref()) {
                     return Ok(Some(batch.clone()));
                 }
 
@@ -85,10 +85,31 @@ impl ExecutionOp for ScanExec {
     }
 }
 
-fn is_already_projected(batch: &RecordBatch, indices: &[usize]) -> bool {
-    batch.schema.columns.len() == indices.len()
-        && indices
-            .iter()
-            .enumerate()
-            .all(|(idx, &source_idx)| idx == source_idx)
+fn is_already_projected(
+    batch: &RecordBatch,
+    indices: &[usize],
+    table_schema: Option<&Schema>,
+) -> bool {
+    if batch.schema.columns.len() != indices.len() {
+        return false;
+    }
+
+    if indices
+        .iter()
+        .enumerate()
+        .all(|(idx, &source_idx)| idx == source_idx)
+    {
+        return true;
+    }
+
+    let Some(table_schema) = table_schema else {
+        return false;
+    };
+
+    indices
+        .iter()
+        .enumerate()
+        .all(|(projected_idx, &source_idx)| {
+            batch.schema.columns.get(projected_idx) == table_schema.columns.get(source_idx)
+        })
 }

@@ -8,7 +8,7 @@ impl Parser {
     pub fn parse_insert(&mut self) -> Result<Statement> {
         self.expect(&Token::Insert)?;
         self.expect(&Token::Into)?;
-        let table = self.expect_ident()?;
+        let table = self.parse_object_name()?;
 
         let columns = if self.peek() == &Token::LeftParen {
             self.advance();
@@ -58,7 +58,7 @@ impl Parser {
 
     pub fn parse_update(&mut self) -> Result<Statement> {
         self.expect(&Token::Update)?;
-        let table = self.expect_ident()?;
+        let table = self.parse_object_name()?;
 
         self.expect(&Token::Set)?;
 
@@ -92,7 +92,7 @@ impl Parser {
     pub fn parse_delete(&mut self) -> Result<Statement> {
         self.expect(&Token::Delete)?;
         self.expect(&Token::From)?;
-        let table = self.expect_ident()?;
+        let table = self.parse_object_name()?;
 
         let where_clause = if self.peek() == &Token::Where {
             self.advance();

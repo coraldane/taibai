@@ -450,6 +450,33 @@ impl SegmentManager {
         }
     }
 
+    pub fn remove_table_state(&self, db: &str, table: &str) {
+        let key = table_key(db, table);
+        let mut tables = self.tables.write().unwrap();
+        if let Some(state) = tables.remove(&key) {
+            let mut wal_guard = state.wal_writer.lock().unwrap();
+            *wal_guard = None;
+            state.active_segments.lock().unwrap().clear();
+        }
+    }
+
+    pub fn remove_database_state(&self, db: &str) {
+        let prefix = format!("{}:", db);
+        let mut tables = self.tables.write().unwrap();
+        let keys: Vec<String> = tables
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(state) = tables.remove(&key) {
+                let mut wal_guard = state.wal_writer.lock().unwrap();
+                *wal_guard = None;
+                state.active_segments.lock().unwrap().clear();
+            }
+        }
+    }
+
     pub fn clear_all_wals(&self) {
         let tables = self.tables.read().unwrap();
         for state in tables.values() {

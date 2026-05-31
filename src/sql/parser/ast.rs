@@ -2,6 +2,39 @@
 use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectName {
+    pub database: Option<String>,
+    pub name: String,
+}
+
+impl ObjectName {
+    pub fn bare(name: String) -> Self {
+        Self {
+            database: None,
+            name,
+        }
+    }
+
+    pub fn qualified(database: String, name: String) -> Self {
+        Self {
+            database: Some(database),
+            name,
+        }
+    }
+
+    pub fn effective_database<'a>(&'a self, default_db: &'a str) -> &'a str {
+        self.database.as_deref().unwrap_or(default_db)
+    }
+
+    pub fn plan_key(&self) -> String {
+        match &self.database {
+            Some(db) => format!("{}.{}", db, self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterOperation {
     AddColumn { column: ColumnDefAst },
@@ -44,7 +77,7 @@ pub enum GrantObject {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
-        name: String,
+        name: ObjectName,
         columns: Vec<ColumnDefAst>,
         if_not_exists: bool,
         primary_key: Vec<String>,
@@ -52,15 +85,15 @@ pub enum Statement {
         partition_by: Option<PartitionDef>,
     },
     DropTable {
-        name: String,
+        name: ObjectName,
         if_exists: bool,
     },
     AlterTable {
-        name: String,
+        name: ObjectName,
         operations: Vec<AlterOperation>,
     },
     Truncate {
-        table: String,
+        table: ObjectName,
     },
     CreateDatabase {
         name: String,
@@ -100,17 +133,17 @@ pub enum Statement {
         from: String,
     },
     Insert {
-        table: String,
+        table: ObjectName,
         columns: Vec<String>,
         values: Vec<Vec<Expr>>,
     },
     Update {
-        table: String,
+        table: ObjectName,
         assignments: Vec<Assignment>,
         where_clause: Option<Expr>,
     },
     Delete {
-        table: String,
+        table: ObjectName,
         where_clause: Option<Expr>,
     },
     Select {
@@ -132,16 +165,18 @@ pub enum Statement {
         limit: Option<Expr>,
         offset: Option<Expr>,
     },
-    ShowTables,
+    ShowTables {
+        database: Option<String>,
+    },
     ShowDatabases,
     ShowColumns {
-        table: String,
+        table: ObjectName,
     },
     ShowIndexes {
-        table: String,
+        table: ObjectName,
     },
     ShowCreateTable {
-        table: String,
+        table: ObjectName,
     },
     ShowUsers,
     ShowRoles,
@@ -149,7 +184,7 @@ pub enum Statement {
         user: Option<String>,
     },
     ShowPartitions {
-        table: Option<String>,
+        table: Option<ObjectName>,
     },
     ShowStats,
     ShowEngines,
@@ -165,10 +200,10 @@ pub enum Statement {
     Commit,
     Rollback,
     FlushTable {
-        table: Option<String>,
+        table: Option<ObjectName>,
     },
     OptimizeTable {
-        table: String,
+        table: ObjectName,
     },
     PauseFlush,
     ResumeFlush,
@@ -269,7 +304,7 @@ pub enum SelectItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableRef {
     Table {
-        name: String,
+        name: ObjectName,
         alias: Option<String>,
     },
     Subquery {

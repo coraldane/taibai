@@ -11,7 +11,24 @@ use crate::types::scalar::ScalarValue;
 pub use expr::{collect_cols_from_expr, collect_column_refs};
 pub use types::*;
 
-pub type AliasMap = HashMap<String, String>;
+#[derive(Debug, Clone)]
+pub struct TableBinding {
+    pub table_name: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl TableBinding {
+    fn new(table_name: String, start: usize, end: usize) -> Self {
+        Self {
+            table_name,
+            start,
+            end,
+        }
+    }
+}
+
+pub type AliasMap = HashMap<String, TableBinding>;
 
 #[derive(Debug, Clone, Default)]
 pub struct JoinTableInfo {
@@ -181,7 +198,7 @@ pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Resul
     }
 
     let (proj_exprs, aliases) =
-        expr::resolve_projection_with_alias(select_list, &schema, &alias_map);
+        expr::resolve_projection_with_alias(select_list, &schema, &alias_map)?;
     plan = LogicalPlan::Project(ProjectPlan {
         expressions: proj_exprs,
         aliases,
@@ -198,18 +215,20 @@ fn plan_from_clause(
     match from {
         FromClause::Table(table_ref) => match table_ref {
             TableRef::Table { name, alias } => {
-                let table_name = name;
+                let table_name = name.plan_key();
                 let schema = table_schemas
-                    .get(table_name)
+                    .get(&table_name)
                     .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
                     .clone();
                 let plan = LogicalPlan::Scan(ScanPlan::new(table_name.clone(), schema.clone()));
 
                 let mut alias_map = AliasMap::new();
+                let binding = TableBinding::new(table_name.clone(), 0, schema.columns.len());
                 if let Some(a) = alias {
-                    alias_map.insert(a.to_lowercase(), table_name.clone());
+                    alias_map.insert(a.to_lowercase(), binding.clone());
                 }
-                alias_map.insert(table_name.to_lowercase(), table_name.clone());
+                alias_map.insert(name.name.to_lowercase(), binding.clone());
+                alias_map.insert(table_name.to_lowercase(), binding);
 
                 let table_info = JoinTableInfo {
                     left_tables: vec![table_name.clone()],
@@ -232,18 +251,23 @@ fn plan_from_clause(
             for join_clause in &join_expr.joins {
                 match &join_clause.right {
                     TableRef::Table { name, alias } => {
-                        let right_table = name;
+                        let right_table = name.plan_key();
                         let right_schema = table_schemas
-                            .get(right_table)
+                            .get(&right_table)
                             .ok_or_else(|| {
                                 MonaxError::Sql(format!("table '{}' not found", right_table))
                             })?
                             .clone();
 
+                        let right_start = current_schema.columns.len();
+                        let right_end = right_start + right_schema.columns.len();
+                        let binding =
+                            TableBinding::new(right_table.clone(), right_start, right_end);
                         if let Some(a) = alias {
-                            alias_map.insert(a.to_lowercase(), right_table.clone());
+                            alias_map.insert(a.to_lowercase(), binding.clone());
                         }
-                        alias_map.insert(right_table.to_lowercase(), right_table.clone());
+                        alias_map.insert(name.name.to_lowercase(), binding.clone());
+                        alias_map.insert(right_table.to_lowercase(), binding);
                         table_info.right_tables.push(right_table.clone());
 
                         let right_plan = LogicalPlan::Scan(ScanPlan::new(

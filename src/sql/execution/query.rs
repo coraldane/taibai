@@ -7,7 +7,7 @@ use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use crate::sql::parser::ast::{Expr, FromClause, SelectItem, Statement, TableRef};
+use crate::sql::parser::ast::{Expr, FromClause, ObjectName, SelectItem, Statement, TableRef};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
 use super::scan::spec::compile_scan_spec;
@@ -97,7 +97,8 @@ fn exec_table_select(
     mut stats: Option<&mut HashMap<String, ScanStats>>,
     cached_plan: Option<LogicalPlan>,
 ) -> Result<ExecResult> {
-    let table_names = extract_table_names(from_clause);
+    let table_refs = extract_table_refs(from_clause, db);
+    let table_names: Vec<String> = table_refs.iter().map(|t| t.key.clone()).collect();
 
     let mut table_schemas = HashMap::new();
     let mut table_cluster_keys: HashMap<String, Vec<String>> = HashMap::new();
@@ -105,21 +106,24 @@ fn exec_table_select(
         HashMap::new();
     {
         let catalogs = engine.catalogs().read().unwrap();
-        let catalog = catalogs
-            .get(db)
-            .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
 
-        for table_name in &table_names {
+        for table_ref in &table_refs {
+            let catalog = catalogs.get(&table_ref.database).ok_or_else(|| {
+                MonaxError::Sql(format!("database '{}' does not exist", table_ref.database))
+            })?;
             let meta = catalog
-                .get_table(table_name)
+                .get_table(&table_ref.table)
                 .ok_or_else(|| {
-                    MonaxError::Sql(format!("table '{}.{}' does not exist", db, table_name))
+                    MonaxError::Sql(format!(
+                        "table '{}.{}' does not exist",
+                        table_ref.database, table_ref.table
+                    ))
                 })?
                 .clone();
-            table_schemas.insert(table_name.clone(), Schema::new(meta.columns.clone()));
-            table_metas.insert(table_name.clone(), meta.clone());
+            table_schemas.insert(table_ref.key.clone(), Schema::new(meta.columns.clone()));
+            table_metas.insert(table_ref.key.clone(), meta.clone());
             if !meta.cluster_key.is_empty() {
-                table_cluster_keys.insert(table_name.clone(), meta.cluster_key.clone());
+                table_cluster_keys.insert(table_ref.key.clone(), meta.cluster_key.clone());
             }
         }
     }
@@ -137,17 +141,19 @@ fn exec_table_select(
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
 
-    for table_name in &table_names {
+    for table_ref in &table_refs {
+        let table_name = &table_ref.key;
         let schema = table_schemas.get(table_name).unwrap().clone();
         let meta = table_metas.get(table_name).unwrap().clone();
 
         let mut spec = compile_scan_spec(&plan, table_name, &schema, &meta);
+        spec.table_name = table_ref.table.clone();
 
         if is_count_star {
             spec.is_count_star = true;
         }
 
-        let mut executor = ScanExecutor::new(&spec, engine, schema, meta, db);
+        let mut executor = ScanExecutor::new(&spec, engine, schema, meta, &table_ref.database);
         if let Some(ref mut s) = stats {
             executor = executor.with_stats(s);
         }
@@ -346,35 +352,65 @@ fn try_skip_sort_for_cluster_key(
     }
 }
 
-pub fn extract_table_names(from: &FromClause) -> Vec<String> {
-    match from {
-        FromClause::Table(t) => match t {
-            TableRef::Table { name, .. } => vec![name.clone()],
-            TableRef::Subquery { alias, .. } => vec![alias.clone()],
-        },
-        FromClause::Join(join_expr) => {
-            let mut names = Vec::new();
-            collect_table_names_from_join(join_expr, &mut names);
-            names
+#[derive(Debug, Clone)]
+pub struct ResolvedTableRef {
+    pub key: String,
+    pub database: String,
+    pub table: String,
+}
+
+impl ResolvedTableRef {
+    fn new(object: &ObjectName, default_db: &str) -> Self {
+        Self {
+            key: object.plan_key(),
+            database: object.effective_database(default_db).to_string(),
+            table: object.name.clone(),
         }
     }
 }
 
-fn collect_table_names_from_join(
+pub fn extract_table_refs(from: &FromClause, default_db: &str) -> Vec<ResolvedTableRef> {
+    match from {
+        FromClause::Table(t) => match t {
+            TableRef::Table { name, .. } => vec![ResolvedTableRef::new(name, default_db)],
+            TableRef::Subquery { alias, .. } => vec![ResolvedTableRef {
+                key: alias.clone(),
+                database: default_db.to_string(),
+                table: alias.clone(),
+            }],
+        },
+        FromClause::Join(join_expr) => {
+            let mut refs = Vec::new();
+            collect_table_refs_from_join(join_expr, default_db, &mut refs);
+            refs
+        }
+    }
+}
+
+fn collect_table_refs_from_join(
     join_expr: &crate::sql::parser::ast::JoinExpr,
-    names: &mut Vec<String>,
+    default_db: &str,
+    refs: &mut Vec<ResolvedTableRef>,
 ) {
     match &*join_expr.left {
         FromClause::Table(t) => match t {
-            TableRef::Table { name, .. } => names.push(name.clone()),
-            TableRef::Subquery { alias, .. } => names.push(alias.clone()),
+            TableRef::Table { name, .. } => refs.push(ResolvedTableRef::new(name, default_db)),
+            TableRef::Subquery { alias, .. } => refs.push(ResolvedTableRef {
+                key: alias.clone(),
+                database: default_db.to_string(),
+                table: alias.clone(),
+            }),
         },
-        FromClause::Join(inner) => collect_table_names_from_join(inner, names),
+        FromClause::Join(inner) => collect_table_refs_from_join(inner, default_db, refs),
     }
     for jc in &join_expr.joins {
         match &jc.right {
-            TableRef::Table { name, .. } => names.push(name.clone()),
-            TableRef::Subquery { alias, .. } => names.push(alias.clone()),
+            TableRef::Table { name, .. } => refs.push(ResolvedTableRef::new(name, default_db)),
+            TableRef::Subquery { alias, .. } => refs.push(ResolvedTableRef {
+                key: alias.clone(),
+                database: default_db.to_string(),
+                table: alias.clone(),
+            }),
         }
     }
 }

@@ -78,16 +78,16 @@ impl StatementBinder {
         match from {
             FromClause::Table(table_ref) => match table_ref {
                 TableRef::Table { name, alias } => {
-                    let table_name = name;
+                    let table_name = name.plan_key();
                     let schema = table_schemas
-                        .get(table_name)
+                        .get(&table_name)
                         .ok_or_else(|| {
                             MonaxError::Sql(format!("table '{}' not found", table_name))
                         })?
                         .clone();
-                    let mut ctx = BindContext::with_table(table_name, schema.clone());
+                    let mut ctx = BindContext::with_table(&table_name, schema.clone());
                     if let Some(a) = alias {
-                        ctx.register_table_alias(a, table_name);
+                        ctx.register_table_alias(a, &table_name);
                     }
                     Ok((ctx, schema))
                 }
@@ -102,9 +102,9 @@ impl StatementBinder {
                 for join_clause in &join_expr.joins {
                     match &join_clause.right {
                         TableRef::Table { name, alias } => {
-                            let right_table = name;
+                            let right_table = name.plan_key();
                             let right_schema = table_schemas
-                                .get(right_table)
+                                .get(&right_table)
                                 .ok_or_else(|| {
                                     MonaxError::Sql(format!("table '{}' not found", right_table))
                                 })?
@@ -115,7 +115,7 @@ impl StatementBinder {
                                 .insert(right_table.clone(), right_schema.clone());
 
                             if let Some(a) = alias {
-                                left_ctx.register_table_alias(a, right_table);
+                                left_ctx.register_table_alias(a, &right_table);
                             }
 
                             current_schema = Self::merge_schemas(&current_schema, &right_schema);

@@ -79,7 +79,7 @@ impl Parser {
             false
         };
 
-        let name = self.expect_ident()?;
+        let name = self.parse_object_name()?;
 
         self.expect(&Token::LeftParen)?;
         let mut columns = Vec::new();
@@ -491,7 +491,7 @@ impl Parser {
             false
         };
 
-        let name = self.expect_ident()?;
+        let name = self.parse_object_name()?;
         Ok(Statement::DropTable { name, if_exists })
     }
 
@@ -514,7 +514,7 @@ impl Parser {
     }
 
     fn parse_alter_table_rest(&mut self) -> Result<Statement> {
-        let name = self.expect_ident()?;
+        let name = self.parse_object_name()?;
         let mut operations = Vec::new();
         loop {
             let op = if self.peek() == &Token::Add {
@@ -641,7 +641,7 @@ impl Parser {
         if self.peek() == &Token::Table {
             self.advance();
         }
-        let table = self.expect_ident()?;
+        let table = self.parse_object_name()?;
         Ok(Statement::Truncate { table })
     }
 }

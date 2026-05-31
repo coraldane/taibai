@@ -119,6 +119,14 @@ impl Handler {
             return Ok(vec![build_auth_fail("account is locked")]);
         }
 
+        if !self.engine.database_exists(&database) {
+            tracing::warn!(username, database, "login failed: database does not exist");
+            return Ok(vec![build_auth_fail(&format!(
+                "database '{}' does not exist",
+                database
+            ))]);
+        }
+
         let mut session = Session::new(username.to_string(), database);
         session.binary_results = binary_results;
         session.timezone_offset_hours = timezone_offset_hours;
@@ -136,7 +144,7 @@ impl Handler {
             session.touch();
         }
 
-        let (_database, rest) = match read_len_prefixed_string(payload) {
+        let (database, rest) = match read_len_prefixed_string(payload) {
             Ok(v) => v,
             Err(_) => ("", payload),
         };
@@ -163,10 +171,24 @@ impl Handler {
         }
 
         let use_binary = session.binary_results;
+        let original_database = session.database.clone();
+        let has_query_database = !database.is_empty();
+        if has_query_database {
+            if !self.engine.database_exists(database) {
+                return Ok(vec![build_error(&format!(
+                    "database '{}' does not exist",
+                    database
+                ))]);
+            }
+            session.database = database.to_string();
+        }
 
         let execute_start = Instant::now();
         let result = self.engine.execute(session, sql);
         let execute_elapsed = execute_start.elapsed();
+        if has_query_database && !sql.to_ascii_uppercase().starts_with("USE ") {
+            session.database = original_database;
+        }
 
         match result {
             Ok(ExecResult::Ok { rows_affected }) => {
@@ -1015,7 +1037,7 @@ mod tests {
         let mut payload = Vec::new();
         write_len_prefixed_string(&mut payload, "root");
         write_len_prefixed_string(&mut payload, "taibai");
-        write_len_prefixed_string(&mut payload, "test");
+        write_len_prefixed_string(&mut payload, "main");
 
         let msg = Message::new(MSG_TYPE_LOGIN, Bytes::from(payload));
         let responses = handler.handle_message(msg).unwrap();

@@ -169,37 +169,72 @@ impl DatabaseCatalog {
     }
 
     pub fn load_or_create(meta_dir: &Path, db_name: &str) -> Result<Self> {
-        let schema_path = meta_dir.join("schema.json");
+        let schema_path = Self::catalog_path(meta_dir, db_name);
         if schema_path.exists() {
             let data = fs::read_to_string(&schema_path)
-                .map_err(|e| MonaxError::Storage(format!("failed to read schema.json: {}", e)))?;
+                .map_err(|e| MonaxError::Storage(format!("failed to read catalog: {}", e)))?;
             let mut catalog: DatabaseCatalog = serde_json::from_str(&data)
-                .map_err(|e| MonaxError::Storage(format!("failed to parse schema.json: {}", e)))?;
+                .map_err(|e| MonaxError::Storage(format!("failed to parse catalog: {}", e)))?;
+            catalog.name = db_name.to_string();
             for table in catalog.tables.values_mut() {
+                table.database = db_name.to_string();
                 table.update_partition_key_idx();
             }
             Ok(catalog)
+        } else if let Some(catalog) = Self::load_legacy_catalog(meta_dir, db_name)? {
+            catalog.save(meta_dir)?;
+            Ok(catalog)
         } else {
             let catalog = DatabaseCatalog::new(db_name);
-            fs::create_dir_all(meta_dir)
-                .map_err(|e| MonaxError::Storage(format!("failed to create meta dir: {}", e)))?;
             catalog.save(meta_dir)?;
             Ok(catalog)
         }
     }
 
     pub fn save(&self, meta_dir: &Path) -> Result<()> {
-        fs::create_dir_all(meta_dir)
-            .map_err(|e| MonaxError::Storage(format!("failed to create meta dir: {}", e)))?;
-        let schema_path = meta_dir.join("schema.json");
+        let schema_path = Self::catalog_path(meta_dir, &self.name);
+        if let Some(parent) = schema_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| MonaxError::Storage(format!("failed to create catalog dir: {}", e)))?;
+        }
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| MonaxError::Storage(format!("failed to serialize catalog: {}", e)))?;
         let tmp_path = schema_path.with_extension("json.tmp");
         fs::write(&tmp_path, &data)
-            .map_err(|e| MonaxError::Storage(format!("failed to write schema.json.tmp: {}", e)))?;
+            .map_err(|e| MonaxError::Storage(format!("failed to write catalog tmp: {}", e)))?;
         fs::rename(&tmp_path, &schema_path)
-            .map_err(|e| MonaxError::Storage(format!("failed to rename schema.json: {}", e)))?;
+            .map_err(|e| MonaxError::Storage(format!("failed to rename catalog: {}", e)))?;
         Ok(())
+    }
+
+    pub fn catalog_path(meta_dir: &Path, db_name: &str) -> PathBuf {
+        meta_dir.join("catalogs").join(format!("{}.json", db_name))
+    }
+
+    pub fn catalog_dir(meta_dir: &Path) -> PathBuf {
+        meta_dir.join("catalogs")
+    }
+
+    fn load_legacy_catalog(meta_dir: &Path, db_name: &str) -> Result<Option<Self>> {
+        let legacy_path = meta_dir.join("schema.json");
+        if !legacy_path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read_to_string(&legacy_path).map_err(|e| {
+            MonaxError::Storage(format!("failed to read legacy schema.json: {}", e))
+        })?;
+        let mut catalog: DatabaseCatalog = serde_json::from_str(&data).map_err(|e| {
+            MonaxError::Storage(format!("failed to parse legacy schema.json: {}", e))
+        })?;
+        if catalog.name != db_name {
+            return Ok(None);
+        }
+        catalog.name = db_name.to_string();
+        for table in catalog.tables.values_mut() {
+            table.database = db_name.to_string();
+            table.update_partition_key_idx();
+        }
+        Ok(Some(catalog))
     }
 
     pub fn create_table(&mut self, name: &str, columns: Vec<ColumnDef>) -> Result<()> {
@@ -429,7 +464,31 @@ mod tests {
         assert_eq!(catalog.name, "newdb");
         assert!(catalog.tables.is_empty());
 
-        assert!(meta_dir.join("schema.json").exists());
+        assert!(DatabaseCatalog::catalog_path(&meta_dir, "newdb").exists());
+    }
+
+    #[test]
+    fn test_catalogs_are_isolated_per_database() {
+        let dir = TempDir::new().unwrap();
+        let meta_dir = dir.path().join("meta");
+
+        let mut db1 = DatabaseCatalog::new("db1");
+        db1.create_table("t1", vec![ColumnDef::new("id", DataType::Int64)])
+            .unwrap();
+        db1.save(&meta_dir).unwrap();
+
+        let mut db2 = DatabaseCatalog::new("db2");
+        db2.create_table("t2", vec![ColumnDef::new("id", DataType::Int64)])
+            .unwrap();
+        db2.save(&meta_dir).unwrap();
+
+        let loaded_db1 = DatabaseCatalog::load_or_create(&meta_dir, "db1").unwrap();
+        let loaded_db2 = DatabaseCatalog::load_or_create(&meta_dir, "db2").unwrap();
+
+        assert!(loaded_db1.get_table("t1").is_some());
+        assert!(loaded_db1.get_table("t2").is_none());
+        assert!(loaded_db2.get_table("t1").is_none());
+        assert!(loaded_db2.get_table("t2").is_some());
     }
 
     #[test]

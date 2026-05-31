@@ -21,6 +21,90 @@ pub enum PermissionType {
     Truncate,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_permission_matches_tables_in_that_database() {
+        let mut user = UserInfo::new("alice", "pw");
+        user.permissions.push(Permission {
+            permission_type: PermissionType::Select,
+            object_type: PermissionObjectType::Database,
+            object_name: "db1".to_string(),
+        });
+
+        assert!(user.has_permission(
+            PermissionType::Select,
+            PermissionObjectType::Table,
+            "db1.orders"
+        ));
+        assert!(!user.has_permission(
+            PermissionType::Select,
+            PermissionObjectType::Table,
+            "db2.orders"
+        ));
+    }
+
+    #[test]
+    fn table_permission_supports_database_qualified_wildcard() {
+        let mut user = UserInfo::new("alice", "pw");
+        user.permissions.push(Permission {
+            permission_type: PermissionType::Insert,
+            object_type: PermissionObjectType::Table,
+            object_name: "db1.*".to_string(),
+        });
+
+        assert!(user.has_permission(
+            PermissionType::Insert,
+            PermissionObjectType::Table,
+            "db1.orders"
+        ));
+        assert!(!user.has_permission(
+            PermissionType::Insert,
+            PermissionObjectType::Table,
+            "db2.orders"
+        ));
+    }
+
+    #[test]
+    fn revoke_only_removes_matching_type_and_object() {
+        let mut store = AuthStore::new();
+        store.create_user("alice", "pw").unwrap();
+        store
+            .grant_permission(
+                "alice",
+                vec![
+                    Permission {
+                        permission_type: PermissionType::Select,
+                        object_type: PermissionObjectType::Table,
+                        object_name: "db1.t".to_string(),
+                    },
+                    Permission {
+                        permission_type: PermissionType::Insert,
+                        object_type: PermissionObjectType::Table,
+                        object_name: "db1.t".to_string(),
+                    },
+                    Permission {
+                        permission_type: PermissionType::Select,
+                        object_type: PermissionObjectType::Table,
+                        object_name: "db2.t".to_string(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        store
+            .revoke_permission("alice", &[PermissionType::Select], Some("db1.t"))
+            .unwrap();
+        let user = store.get_user("alice").unwrap();
+
+        assert!(!user.has_permission(PermissionType::Select, PermissionObjectType::Table, "db1.t"));
+        assert!(user.has_permission(PermissionType::Insert, PermissionObjectType::Table, "db1.t"));
+        assert!(user.has_permission(PermissionType::Select, PermissionObjectType::Table, "db2.t"));
+    }
+}
+
 impl PermissionType {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -90,18 +174,56 @@ impl UserInfo {
         object_type: PermissionObjectType,
         object_name: &str,
     ) -> bool {
-        if self
-            .permissions
-            .iter()
-            .any(|p| p.permission_type == PermissionType::All)
-        {
-            return true;
-        }
         self.permissions.iter().any(|p| {
-            p.permission_type == perm_type
-                && (p.object_type == PermissionObjectType::Global
-                    || (p.object_type == object_type && p.object_name == object_name))
+            permission_type_matches(&p.permission_type, &perm_type)
+                && permission_object_matches(p, &object_type, object_name)
         }) || self.roles.iter().any(|_role_name| false)
+    }
+}
+
+fn is_admin_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "root" | "admin" | "administrator"
+    )
+}
+
+fn permission_type_matches(granted: &PermissionType, requested: &PermissionType) -> bool {
+    *granted == PermissionType::All || granted == requested
+}
+
+fn permission_object_matches(
+    permission: &Permission,
+    requested_type: &PermissionObjectType,
+    requested_name: &str,
+) -> bool {
+    if permission.object_type == PermissionObjectType::Global {
+        return true;
+    }
+
+    match (&permission.object_type, requested_type) {
+        (PermissionObjectType::Database, PermissionObjectType::Database) => {
+            permission.object_name == requested_name || permission.object_name == "*"
+        }
+        (PermissionObjectType::Database, PermissionObjectType::Table) => {
+            permission.object_name == "*"
+                || requested_name
+                    .strip_prefix(&format!("{}.", permission.object_name))
+                    .is_some()
+        }
+        (PermissionObjectType::Table, PermissionObjectType::Table) => {
+            permission.object_name == requested_name
+                || permission.object_name == "*"
+                || permission
+                    .object_name
+                    .strip_suffix(".*")
+                    .map(|db| requested_name.starts_with(&format!("{}.", db)))
+                    .unwrap_or(false)
+        }
+        (PermissionObjectType::Table, PermissionObjectType::Database) => {
+            permission.object_name == format!("{}.*", requested_name)
+        }
+        _ => false,
     }
 }
 
@@ -254,15 +376,17 @@ impl AuthStore {
         if is_user {
             let user = self.users.get_mut(target).unwrap();
             user.permissions.retain(|p| {
-                !permissions.contains(&p.permission_type)
-                    && object.map_or(true, |obj| p.object_name != obj)
+                let type_match = permissions.contains(&p.permission_type);
+                let object_match = object.map_or(true, |obj| p.object_name == obj);
+                !(type_match && object_match)
             });
         }
         if is_role {
             let role = self.roles.get_mut(target).unwrap();
             role.permissions.retain(|p| {
-                !permissions.contains(&p.permission_type)
-                    && object.map_or(true, |obj| p.object_name != obj)
+                let type_match = permissions.contains(&p.permission_type);
+                let object_match = object.map_or(true, |obj| p.object_name == obj);
+                !(type_match && object_match)
             });
         }
         Ok(())
@@ -274,6 +398,54 @@ impl AuthStore {
 
     pub fn get_role(&self, name: &str) -> Option<&RoleInfo> {
         self.roles.get(name)
+    }
+
+    pub fn is_admin_user(&self, name: &str) -> bool {
+        if is_admin_name(name) {
+            return true;
+        }
+        let Some(user) = self.users.get(name) else {
+            return false;
+        };
+        user.roles.iter().any(|role| is_admin_name(role))
+            || user.permissions.iter().any(|p| {
+                p.permission_type == PermissionType::All
+                    && p.object_type == PermissionObjectType::Global
+            })
+    }
+
+    pub fn has_permission(
+        &self,
+        username: &str,
+        perm_type: PermissionType,
+        object_type: PermissionObjectType,
+        object_name: &str,
+    ) -> bool {
+        if self.is_admin_user(username) {
+            return true;
+        }
+        let Some(user) = self.users.get(username) else {
+            return false;
+        };
+
+        if user.permissions.iter().any(|p| {
+            permission_type_matches(&p.permission_type, &perm_type)
+                && permission_object_matches(p, &object_type, object_name)
+        }) {
+            return true;
+        }
+
+        user.roles.iter().any(|role_name| {
+            self.roles
+                .get(role_name)
+                .map(|role| {
+                    role.permissions.iter().any(|p| {
+                        permission_type_matches(&p.permission_type, &perm_type)
+                            && permission_object_matches(p, &object_type, object_name)
+                    })
+                })
+                .unwrap_or(false)
+        })
     }
 
     pub fn alter_user_password(&mut self, name: &str, password: &str) -> Result<()> {
@@ -416,10 +588,7 @@ impl AuthManager {
         object_name: &str,
     ) -> bool {
         let store = self.store.read().unwrap();
-        match store.get_user(username) {
-            Some(user) => user.has_permission(perm_type, object_type, object_name),
-            None => false,
-        }
+        store.has_permission(username, perm_type, object_type, object_name)
     }
 
     pub fn alter_user_password(&self, name: &str, password: &str) -> Result<()> {

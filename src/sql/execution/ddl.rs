@@ -24,7 +24,7 @@ pub fn exec_create_table(
     partition_by: &Option<PartitionDef>,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_or_create_catalog(&mut catalogs, engine.data_dir(), db)?;
+    let catalog = get_existing_catalog(&mut catalogs, db)?;
 
     if catalog.get_table(name).is_some() {
         if if_not_exists {
@@ -101,7 +101,7 @@ pub fn exec_drop_table(
     if_exists: bool,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_or_create_catalog(&mut catalogs, engine.data_dir(), db)?;
+    let catalog = get_existing_catalog(&mut catalogs, db)?;
 
     if catalog.get_table(name).is_none() {
         if if_exists {
@@ -118,7 +118,9 @@ pub fn exec_drop_table(
 
     let table_dir = engine.data_dir().join(db).join(name);
     engine.segment_mgr().remove_wal(&table_dir);
+    engine.segment_mgr().remove_table_state(db, name);
     engine.segment_mgr().invalidate_readers_under(&table_dir);
+    engine.batch_writer().clear_memtables(db, name);
 
     if table_dir.exists() {
         let _ = std::fs::remove_dir_all(&table_dir);
@@ -377,7 +379,8 @@ pub fn exec_create_database(
     std::fs::create_dir_all(&db_dir)?;
 
     let meta_dir = engine.data_dir().join("meta");
-    let catalog = DatabaseCatalog::load_or_create(&meta_dir, name)?;
+    let catalog = DatabaseCatalog::new(name);
+    catalog.save(&meta_dir)?;
     catalogs.insert(name.to_string(), catalog);
 
     Ok(ExecResult::Ok { rows_affected: 0 })
@@ -400,15 +403,32 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
         return Err(MonaxError::Sql("cannot drop default database".into()));
     }
 
+    let table_names = catalogs
+        .get(name)
+        .map(|catalog| {
+            catalog
+                .table_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     catalogs.remove(name);
 
+    for table_name in &table_names {
+        engine.batch_writer().clear_memtables(name, table_name);
+    }
+    engine.auto_increment_manager().unregister_database(name);
+    engine.segment_mgr().remove_database_state(name);
+
     let db_dir = engine.data_dir().join(name);
+    engine.segment_mgr().invalidate_readers_under(&db_dir);
     if db_dir.exists() {
         let _ = std::fs::remove_dir_all(&db_dir);
     }
 
     let meta_dir = engine.data_dir().join("meta");
-    let catalog_file = meta_dir.join(format!("{}.json", name));
+    let catalog_file = DatabaseCatalog::catalog_path(&meta_dir, name);
     if catalog_file.exists() {
         let _ = std::fs::remove_file(&catalog_file);
     }
@@ -515,16 +535,17 @@ pub fn exec_revoke(
 
 pub fn exec_show_tables(engine: &Engine, db: &str) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs
+        .get(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
     let schema = Schema::new(vec![ColumnDef::new("table_name", DataType::VarChar)]);
 
     let mut batch = RecordBatch::new(schema.clone());
-    if let Some(catalog) = catalogs.get(db) {
-        for name in catalog.table_names() {
-            batch
-                .column_mut(0)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some(name.to_string())))?;
-        }
+    for name in catalog.table_names() {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(name.to_string())))?;
     }
 
     Ok(ExecResult::Query {
@@ -729,17 +750,13 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
     })
 }
 
-fn get_or_create_catalog<'a>(
+fn get_existing_catalog<'a>(
     catalogs: &'a mut HashMap<String, DatabaseCatalog>,
-    data_dir: &std::path::Path,
     db: &str,
 ) -> Result<&'a mut DatabaseCatalog> {
-    if !catalogs.contains_key(db) {
-        let meta_dir = data_dir.join("meta");
-        let catalog = DatabaseCatalog::load_or_create(&meta_dir, db)?;
-        catalogs.insert(db.to_string(), catalog);
-    }
-    Ok(catalogs.get_mut(db).unwrap())
+    catalogs
+        .get_mut(db)
+        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))
 }
 
 use crate::sql::parser::ast::AlterUserOperation;

@@ -110,6 +110,17 @@ impl Parser {
         }
     }
 
+    fn parse_object_name(&mut self) -> Result<ObjectName> {
+        let first = self.expect_ident()?;
+        if self.peek() == &Token::Dot {
+            self.advance();
+            let second = self.expect_ident()?;
+            Ok(ObjectName::qualified(first, second))
+        } else {
+            Ok(ObjectName::bare(first))
+        }
+    }
+
     fn expect_integer(&mut self) -> Result<i32> {
         match self.tokens.get(self.pos) {
             Some(Token::Integer(v)) => {

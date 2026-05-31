@@ -127,14 +127,14 @@ fn collect_tables_from_stmt<F: FnMut(&str)>(stmt: &Statement, mut f: F) {
     fn walk_from<F: FnMut(&str)>(fc: &FromClause, f: &mut F) {
         match fc {
             FromClause::Table(t) => match t {
-                TableRef::Table { name, .. } => f(name),
+                TableRef::Table { name, .. } => f(&name.plan_key()),
                 TableRef::Subquery { alias, .. } => f(alias),
             },
             FromClause::Join(je) => {
                 walk_from(&je.left, f);
                 for jc in &je.joins {
                     match &jc.right {
-                        TableRef::Table { name, .. } => f(name),
+                        TableRef::Table { name, .. } => f(&name.plan_key()),
                         TableRef::Subquery { alias, .. } => f(alias),
                     }
                 }

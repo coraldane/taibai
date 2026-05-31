@@ -10,7 +10,17 @@ impl Parser {
         match self.peek() {
             Token::Tables => {
                 self.advance();
-                Ok(Statement::ShowTables)
+                let database = if self.peek() == &Token::From {
+                    self.advance();
+                    Some(self.expect_ident()?)
+                } else if matches!(self.peek(), Token::Ident(word) if word.eq_ignore_ascii_case("IN"))
+                {
+                    self.advance();
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                Ok(Statement::ShowTables { database })
             }
             Token::Databases => {
                 self.advance();
@@ -19,7 +29,7 @@ impl Parser {
             Token::Columns => {
                 self.advance();
                 self.expect(&Token::From)?;
-                let table = self.expect_ident()?;
+                let table = self.parse_object_name()?;
                 Ok(Statement::ShowColumns { table })
             }
             Token::Ident(word)
@@ -27,13 +37,13 @@ impl Parser {
             {
                 self.advance();
                 self.expect(&Token::From)?;
-                let table = self.expect_ident()?;
+                let table = self.parse_object_name()?;
                 Ok(Statement::ShowIndexes { table })
             }
             Token::Create => {
                 self.advance();
                 self.expect(&Token::Table)?;
-                let table = self.expect_ident()?;
+                let table = self.parse_object_name()?;
                 Ok(Statement::ShowCreateTable { table })
             }
             Token::User => {
@@ -58,7 +68,7 @@ impl Parser {
                 self.advance();
                 let table = if self.peek() == &Token::From {
                     self.advance();
-                    Some(self.expect_ident()?)
+                    Some(self.parse_object_name()?)
                 } else {
                     None
                 };
@@ -122,7 +132,7 @@ impl Parser {
         if self.peek() == &Token::Table {
             self.advance();
             let table = if matches!(self.peek(), Token::Ident(_)) {
-                Some(self.expect_ident()?)
+                Some(self.parse_object_name()?)
             } else {
                 None
             };
@@ -135,7 +145,7 @@ impl Parser {
     pub fn parse_optimize(&mut self) -> Result<Statement> {
         self.expect(&Token::Optimize)?;
         self.expect(&Token::Table)?;
-        let table = self.expect_ident()?;
+        let table = self.parse_object_name()?;
         Ok(Statement::OptimizeTable { table })
     }
 

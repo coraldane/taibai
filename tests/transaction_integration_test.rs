@@ -11,7 +11,7 @@ fn create_test_engine() -> (TempDir, Engine) {
 }
 
 fn create_test_session() -> Session {
-    Session::new("test_user".to_string(), "main".to_string())
+    Session::new("root".to_string(), "main".to_string())
 }
 
 fn setup_test_table(engine: &Engine, session: &mut Session) {

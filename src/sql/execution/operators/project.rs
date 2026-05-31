@@ -74,7 +74,11 @@ fn resolve_plain_column_projection(
             return None;
         };
         let source_def = input_schema.columns.get(*logical_idx)?;
-        let batch_pos = batch.schema.index_of(&source_def.name)?;
+        let batch_pos = if batch.schema.columns.get(*logical_idx) == Some(source_def) {
+            *logical_idx
+        } else {
+            batch.schema.index_of(&source_def.name)?
+        };
 
         let mut out_def = batch.schema.columns[batch_pos].clone();
         if let Some(alias) = aliases.get(i).and_then(|a| a.as_deref()) {

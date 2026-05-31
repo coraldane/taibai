@@ -288,6 +288,24 @@ fn resolve_qualified_column_index(
     schema: &Schema,
     alias_map: &AliasMap,
 ) -> Result<usize> {
+    let table_lower = table.to_lowercase();
+    if let Some(binding) = alias_map.get(&table_lower) {
+        for idx in binding.start..binding.end {
+            if schema
+                .columns
+                .get(idx)
+                .map(|c| c.name.eq_ignore_ascii_case(column))
+                .unwrap_or(false)
+            {
+                return Ok(idx);
+            }
+        }
+        return Err(MonaxError::Sql(format!(
+            "column '{}' not found in table '{}'",
+            column, table
+        )));
+    }
+
     let matching_indices: Vec<usize> = schema
         .columns
         .iter()
@@ -296,56 +314,14 @@ fn resolve_qualified_column_index(
         .map(|(i, _)| i)
         .collect();
 
-    if matching_indices.is_empty() {
-        return Err(MonaxError::Sql(format!(
-            "column '{}' not found in table '{}'",
-            column, table
-        )));
-    }
-
     if matching_indices.len() == 1 {
         return Ok(matching_indices[0]);
     }
 
-    let table_lower = table.to_lowercase();
-
-    if matching_indices.len() == 2 {
-        if table_lower.ends_with("1")
-            || table_lower.starts_with("l")
-            || table_lower.starts_with("a")
-            || table_lower.starts_with("c")
-        {
-            return Ok(matching_indices[0]);
-        }
-        if table_lower.ends_with("2")
-            || table_lower.starts_with("r")
-            || table_lower.starts_with("b")
-            || table_lower.starts_with("p")
-        {
-            return Ok(matching_indices[1]);
-        }
-
-        let resolved = alias_map.get(&table_lower);
-        if let Some(real_table) = resolved {
-            if real_table.ends_with("1") || real_table.starts_with("l") {
-                return Ok(matching_indices[0]);
-            }
-            if real_table.ends_with("2") || real_table.starts_with("r") {
-                return Ok(matching_indices[1]);
-            }
-        }
-
-        let alias_pos = alias_map
-            .iter()
-            .position(|(alias, _)| alias.eq_ignore_ascii_case(&table_lower));
-        if let Some(pos) = alias_pos {
-            if pos < matching_indices.len() {
-                return Ok(matching_indices[pos % matching_indices.len()]);
-            }
-        }
-    }
-
-    Ok(matching_indices[0])
+    Err(MonaxError::Sql(format!(
+        "table '{}' not found or column '{}' is ambiguous",
+        table, column
+    )))
 }
 
 pub fn ast_expr_to_logical_join(
@@ -374,14 +350,14 @@ pub fn ast_expr_to_logical_join(
                 t.eq_ignore_ascii_case(&alias_lower)
                     || alias_map
                         .get(&alias_lower)
-                        .map(|a| a.eq_ignore_ascii_case(t))
+                        .map(|a| a.table_name.eq_ignore_ascii_case(t))
                         .unwrap_or(false)
             });
             let is_right = table_info.right_tables.iter().any(|t| {
                 t.eq_ignore_ascii_case(&alias_lower)
                     || alias_map
                         .get(&alias_lower)
-                        .map(|a| a.eq_ignore_ascii_case(t))
+                        .map(|a| a.table_name.eq_ignore_ascii_case(t))
                         .unwrap_or(false)
             });
 
@@ -612,7 +588,7 @@ pub fn resolve_projection_with_alias(
     select_list: &[SelectItem],
     schema: &Schema,
     alias_map: &AliasMap,
-) -> (Vec<LogicalExpr>, Vec<Option<String>>) {
+) -> Result<(Vec<LogicalExpr>, Vec<Option<String>>)> {
     let mut exprs = Vec::new();
     let mut aliases = Vec::new();
 
@@ -625,8 +601,7 @@ pub fn resolve_projection_with_alias(
                 }
             }
             SelectItem::Expr(expr, alias) => {
-                let logical =
-                    ast_expr_to_logical(expr, schema, alias_map).unwrap_or(LogicalExpr::Wildcard);
+                let logical = ast_expr_to_logical(expr, schema, alias_map)?;
                 exprs.push(logical);
                 let auto_alias = alias.clone().or_else(|| Some(expr_to_name(expr)));
                 aliases.push(auto_alias);
@@ -634,7 +609,7 @@ pub fn resolve_projection_with_alias(
         }
     }
 
-    (exprs, aliases)
+    Ok((exprs, aliases))
 }
 
 pub fn collect_column_refs(exprs: &[LogicalExpr]) -> Vec<usize> {
