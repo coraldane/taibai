@@ -44,13 +44,34 @@ impl From<ParsedSegmentFooter> for SegmentFooter {
 
 pub struct SegmentReader {
     path: PathBuf,
-    mmap: Mmap,
-    _file: fs::File,
+    data: SegmentData,
     footer: SegmentFooter,
+}
+
+enum SegmentData {
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl SegmentData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mmap(mmap) => mmap,
+            Self::Owned(data) => data,
+        }
+    }
 }
 
 impl SegmentReader {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, false)
+    }
+
+    pub fn open_owned(path: &Path) -> Result<Self> {
+        Self::open_inner(path, true)
+    }
+
+    fn open_inner(path: &Path, owned: bool) -> Result<Self> {
         let file = fs::File::open(path)?;
         let file_len = file.metadata()?.len();
 
@@ -90,23 +111,39 @@ impl SegmentReader {
         tmp_file.read_exact(&mut footer_offset_buf)?;
         let footer_offset = u64::from_le_bytes(footer_offset_buf) as usize;
 
-        if footer_offset < SEGMENT_HEADER_SIZE || footer_offset > file_len as usize {
+        if footer_offset < SEGMENT_HEADER_SIZE
+            || footer_offset >= (file_len as usize).saturating_sub(8)
+        {
             return Err(MonaxError::Storage(format!(
                 "invalid footer offset: {} (file size {}, header size {})",
                 footer_offset, file_len, SEGMENT_HEADER_SIZE
             )));
         }
 
-        let mmap = unsafe { Mmap::map(&tmp_file)? };
+        let data = if owned {
+            let mut buf = Vec::with_capacity(file_len as usize);
+            tmp_file.seek(SeekFrom::Start(0))?;
+            tmp_file.read_to_end(&mut buf)?;
+            if buf.len() != file_len as usize {
+                return Err(MonaxError::Storage(format!(
+                    "segment file changed while opening: expected {} bytes, read {} bytes ({})",
+                    file_len,
+                    buf.len(),
+                    path.display()
+                )));
+            }
+            SegmentData::Owned(buf)
+        } else {
+            SegmentData::Mmap(unsafe { Mmap::map(&tmp_file)? })
+        };
 
         let footer_end = file_len as usize - 8;
-        let footer_data = &mmap[footer_offset..footer_end];
+        let footer_data = &data.as_slice()[footer_offset..footer_end];
         let parsed = parse_segment_footer(footer_data)?;
 
         Ok(Self {
             path: path.to_path_buf(),
-            mmap,
-            _file: tmp_file,
+            data,
             footer: parsed.into(),
         })
     }
@@ -249,7 +286,8 @@ impl SegmentReader {
         }
         let col_len = rg.column_compressed_sizes[column_idx] as usize;
 
-        let compressed = &self.mmap[col_offset..col_offset + col_len];
+        let data = self.data.as_slice();
+        let compressed = &data[col_offset..col_offset + col_len];
 
         zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
             .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))
@@ -270,7 +308,8 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
 
-        let all_data = &self.mmap[rg.offset as usize..rg.offset as usize + total_size];
+        let data = self.data.as_slice();
+        let all_data = &data[rg.offset as usize..rg.offset as usize + total_size];
 
         let col_offsets: Vec<usize> = rg
             .column_compressed_sizes
@@ -326,7 +365,8 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
 
-        let all_data = &self.mmap[rg.offset as usize..rg.offset as usize + total_size];
+        let data = self.data.as_slice();
+        let all_data = &data[rg.offset as usize..rg.offset as usize + total_size];
 
         let col_offsets: Vec<usize> = rg
             .column_compressed_sizes
@@ -664,7 +704,8 @@ impl SegmentReader {
         }
         let col_len = rg.column_compressed_sizes[column_idx] as usize;
 
-        let compressed = &self.mmap[col_offset..col_offset + col_len];
+        let data = self.data.as_slice();
+        let compressed = &data[col_offset..col_offset + col_len];
 
         let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
             .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;

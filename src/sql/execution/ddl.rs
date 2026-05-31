@@ -118,14 +118,19 @@ pub fn exec_drop_table(
     engine.index_manager().remove_index(db, name);
 
     let table_dir = engine.data_dir().join(db).join(name);
-    engine.segment_mgr().remove_wal(&table_dir);
-    engine.segment_mgr().remove_table_state(db, name);
-    engine.segment_mgr().invalidate_readers_under(&table_dir);
-    engine.batch_writer().clear_memtables(db, name);
+    engine
+        .segment_mgr()
+        .with_table_mutation_lock(db, name, || {
+            engine.segment_mgr().remove_wal(&table_dir);
+            engine.segment_mgr().remove_table_state(db, name);
+            engine.segment_mgr().invalidate_readers_under(&table_dir);
+            engine.batch_writer().clear_memtables(db, name);
 
-    if table_dir.exists() {
-        let _ = std::fs::remove_dir_all(&table_dir);
-    }
+            if table_dir.exists() {
+                let _ = std::fs::remove_dir_all(&table_dir);
+            }
+            Ok(())
+        })?;
 
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
@@ -187,7 +192,9 @@ pub fn exec_alter_table(
                 let old_table_dir = engine.data_dir().join(db).join(name);
                 let new_table_dir = engine.data_dir().join(db).join(new_name);
                 catalog.rename_table(name, new_name)?;
-                engine.auto_increment_manager().rename_table(db, name, new_name);
+                engine
+                    .auto_increment_manager()
+                    .rename_table(db, name, new_name);
                 engine.index_manager().rename_index(db, name, new_name);
                 engine.segment_mgr().rename_table_state(db, name, new_name);
                 if old_table_dir.exists() && !new_table_dir.exists() {
@@ -196,19 +203,24 @@ pub fn exec_alter_table(
             }
             AlterOperation::DropPartition { partition_key } => {
                 let table_dir = engine.data_dir().join(db).join(name);
-                if table_dir.exists() {
-                    for entry in std::fs::read_dir(&table_dir)? {
-                        if let Ok(e) = entry {
-                            let file_name = e.file_name().to_string_lossy().to_string();
-                            if file_name.starts_with(&format!("p{}", partition_key))
-                                && file_name.ends_with(".dat")
-                            {
-                                engine.segment_mgr().invalidate_reader(&e.path());
-                                let _ = std::fs::remove_file(e.path());
+                engine
+                    .segment_mgr()
+                    .with_table_mutation_lock(db, name, || {
+                        if table_dir.exists() {
+                            for entry in std::fs::read_dir(&table_dir)? {
+                                if let Ok(e) = entry {
+                                    let file_name = e.file_name().to_string_lossy().to_string();
+                                    if file_name.starts_with(&format!("p{}", partition_key))
+                                        && file_name.ends_with(".dat")
+                                    {
+                                        engine.segment_mgr().invalidate_reader(&e.path());
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
+                                }
                             }
                         }
-                    }
-                }
+                        Ok(())
+                    })?;
                 if let Some(meta) = catalog.get_table_mut(name) {
                     if let Some(part) = meta.partitions.iter().find(|p| p.key == *partition_key) {
                         meta.row_count -= part.row_count;
@@ -220,19 +232,24 @@ pub fn exec_alter_table(
             }
             AlterOperation::TruncatePartition { partition_key } => {
                 let table_dir = engine.data_dir().join(db).join(name);
-                if table_dir.exists() {
-                    for entry in std::fs::read_dir(&table_dir)? {
-                        if let Ok(e) = entry {
-                            let file_name = e.file_name().to_string_lossy().to_string();
-                            if file_name.starts_with(&format!("p{}", partition_key))
-                                && file_name.ends_with(".dat")
-                            {
-                                engine.segment_mgr().invalidate_reader(&e.path());
-                                let _ = std::fs::remove_file(e.path());
+                engine
+                    .segment_mgr()
+                    .with_table_mutation_lock(db, name, || {
+                        if table_dir.exists() {
+                            for entry in std::fs::read_dir(&table_dir)? {
+                                if let Ok(e) = entry {
+                                    let file_name = e.file_name().to_string_lossy().to_string();
+                                    if file_name.starts_with(&format!("p{}", partition_key))
+                                        && file_name.ends_with(".dat")
+                                    {
+                                        engine.segment_mgr().invalidate_reader(&e.path());
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
+                                }
                             }
                         }
-                    }
-                }
+                        Ok(())
+                    })?;
                 if let Some(meta) = catalog.get_table_mut(name) {
                     if let Some(part) = meta.partitions.iter_mut().find(|p| p.key == *partition_key)
                     {
@@ -342,30 +359,35 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     }
 
     let table_dir = engine.data_dir().join(db).join(table);
-    engine.segment_mgr().remove_wal(&table_dir);
-    engine.batch_writer().clear_memtables(db, table);
-    engine.segment_mgr().remove_table_state(db, table);
-    engine.segment_mgr().invalidate_readers_under(&table_dir);
-    engine.index_manager().clear_index(db, table);
+    engine
+        .segment_mgr()
+        .with_table_mutation_lock(db, table, || {
+            engine.segment_mgr().remove_wal(&table_dir);
+            engine.batch_writer().clear_memtables(db, table);
+            engine.segment_mgr().remove_table_state(db, table);
+            engine.segment_mgr().invalidate_readers_under(&table_dir);
+            engine.index_manager().clear_index(db, table);
 
-    let wal_dir = table_dir.join("wal");
-    if wal_dir.exists() {
-        let _ = std::fs::remove_dir_all(&wal_dir);
-    }
+            let wal_dir = table_dir.join("wal");
+            if wal_dir.exists() {
+                let _ = std::fs::remove_dir_all(&wal_dir);
+            }
 
-    if table_dir.exists() {
-        for entry in std::fs::read_dir(&table_dir)? {
-            if let Ok(e) = entry {
-                let path = e.path();
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if (file_name.starts_with("seg_") || file_name.starts_with("p"))
-                    && file_name.ends_with(".dat")
-                {
-                    let _ = std::fs::remove_file(&path);
+            if table_dir.exists() {
+                for entry in std::fs::read_dir(&table_dir)? {
+                    if let Ok(e) = entry {
+                        let path = e.path();
+                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if (file_name.starts_with("seg_") || file_name.starts_with("p"))
+                            && file_name.ends_with(".dat")
+                        {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
                 }
             }
-        }
-    }
+            Ok(())
+        })?;
 
     if engine.auto_increment_manager().get(db, table).is_some() {
         engine.auto_increment_manager().reset(db, table, 1)?;

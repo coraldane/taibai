@@ -64,6 +64,8 @@ struct TableSegmentState {
     seq: AtomicU32,
     active_segments: Mutex<HashMap<String, ActiveSegment>>,
     wal_writer: Mutex<Option<WalWriter>>,
+    mutation_lock: Mutex<()>,
+    retired: AtomicBool,
 }
 
 impl TableSegmentState {
@@ -72,6 +74,8 @@ impl TableSegmentState {
             seq: AtomicU32::new(initial_seq),
             active_segments: Mutex::new(HashMap::new()),
             wal_writer: Mutex::new(None),
+            mutation_lock: Mutex::new(()),
+            retired: AtomicBool::new(false),
         }
     }
 }
@@ -359,15 +363,32 @@ impl SegmentManager {
     }
 
     pub fn open_reader(&self, path: &Path) -> Result<SegmentReader> {
-        SegmentReader::open(path)
+        if self.is_mutable_segment_path(path) {
+            return self.open_mutable_reader_owned(path);
+        }
+
+        match SegmentReader::open(path) {
+            Ok(reader) => Ok(reader),
+            Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn open_reader_cached(&self, path: &Path) -> Result<Arc<SegmentReader>> {
+        if self.is_mutable_segment_path(path) {
+            self.invalidate_reader(path);
+            return Ok(Arc::new(self.open_mutable_reader_owned(path)?));
+        }
+
         if let Some(reader) = self.reader_cache.lock().unwrap().get(path) {
             return Ok(reader);
         }
 
-        let reader = SegmentReader::open(path)?;
+        let reader = match SegmentReader::open(path) {
+            Ok(reader) => reader,
+            Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path)?,
+            Err(err) => return Err(err),
+        };
         Ok(self
             .reader_cache
             .lock()
@@ -391,6 +412,70 @@ impl SegmentManager {
     ) -> Result<()> {
         self.invalidate_reader(path);
         SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)
+    }
+
+    pub fn with_table_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _guard = state.mutation_lock.lock().unwrap();
+        f()
+    }
+
+    fn open_mutable_reader_owned(&self, path: &Path) -> Result<SegmentReader> {
+        let Some(state) = self.state_for_segment_path(path) else {
+            return SegmentReader::open_owned(path);
+        };
+
+        let mut active_guard = state.active_segments.lock().unwrap();
+        for segment in active_guard.values_mut() {
+            if segment.path == path {
+                if segment.dirty_meta {
+                    self.flush_meta(segment)?;
+                }
+                return SegmentReader::open_owned(path);
+            }
+        }
+        SegmentReader::open_owned(path)
+    }
+
+    fn is_mutable_segment_path(&self, path: &Path) -> bool {
+        if self.is_active_segment_path(path) {
+            return true;
+        }
+        std::fs::metadata(path)
+            .map(|meta| meta.len() < self.min_segment_seal_size())
+            .unwrap_or(false)
+    }
+
+    fn is_active_segment_path(&self, path: &Path) -> bool {
+        let Some(state) = self.state_for_segment_path(path) else {
+            return false;
+        };
+
+        let active_guard = state.active_segments.lock().unwrap();
+        active_guard.values().any(|segment| segment.path == path)
+    }
+
+    fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
+        let tables = self.tables.read().unwrap();
+
+        if let Ok(relative) = path.strip_prefix(&self.data_dir) {
+            let mut components = relative.components();
+            let db = components.next()?.as_os_str().to_string_lossy();
+            let table = components.next()?.as_os_str().to_string_lossy();
+            let key = table_key(&db, &table);
+            if let Some(state) = tables.get(&key) {
+                return Some(Arc::clone(state));
+            }
+        }
+
+        let table_dir_key = path.parent()?.to_string_lossy().to_string();
+        tables.get(&table_dir_key).cloned()
     }
 
     pub fn write_new_segment(
@@ -444,6 +529,14 @@ impl SegmentManager {
         Ok(())
     }
 
+    pub fn clear_active_segments(&self, db: &str, table: &str) {
+        let key = table_key(db, table);
+        let tables = self.tables.read().unwrap();
+        if let Some(state) = tables.get(&key) {
+            state.active_segments.lock().unwrap().clear();
+        }
+    }
+
     pub fn remove_wal(&self, table_dir: &Path) {
         let key = table_dir.to_string_lossy().to_string();
         let tables = self.tables.write().unwrap();
@@ -457,6 +550,7 @@ impl SegmentManager {
         let key = table_key(db, table);
         let mut tables = self.tables.write().unwrap();
         if let Some(state) = tables.remove(&key) {
+            state.retired.store(true, Ordering::Release);
             let mut wal_guard = state.wal_writer.lock().unwrap();
             *wal_guard = None;
             state.active_segments.lock().unwrap().clear();
@@ -482,6 +576,7 @@ impl SegmentManager {
             .collect();
         for key in keys {
             if let Some(state) = tables.remove(&key) {
+                state.retired.store(true, Ordering::Release);
                 let mut wal_guard = state.wal_writer.lock().unwrap();
                 *wal_guard = None;
                 state.active_segments.lock().unwrap().clear();
@@ -524,6 +619,8 @@ impl SegmentManager {
         std::fs::create_dir_all(&table_dir)?;
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, table)?;
 
         {
             let mut active_guard = state.active_segments.lock().unwrap();
@@ -760,6 +857,8 @@ impl SegmentManager {
 
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, req.table_name)?;
 
         let compression_level = bulk_compression_level();
         let compressed_columns: Vec<(Vec<u8>, u64)> = req
@@ -918,6 +1017,8 @@ impl SegmentManager {
 
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, req.table_name)?;
 
         let compression_level = bulk_compression_level();
         let compressed_columns: Vec<(Vec<u8>, u64)> = req
@@ -1374,6 +1475,20 @@ impl SegmentManager {
 
 pub fn table_key(db: &str, table: &str) -> String {
     format!("{}:{}", db, table)
+}
+
+fn is_transient_footer_error(err: &MonaxError) -> bool {
+    matches!(err, MonaxError::Storage(msg) if msg.contains("invalid footer offset"))
+}
+
+fn ensure_state_not_retired(state: &TableSegmentState, db: &str, table: &str) -> Result<()> {
+    if state.retired.load(Ordering::Acquire) {
+        return Err(MonaxError::Storage(format!(
+            "table '{}.{}' was removed while a write was waiting",
+            db, table
+        )));
+    }
+    Ok(())
 }
 
 fn discover_max_seq(table_dir: &Path) -> u32 {

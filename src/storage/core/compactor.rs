@@ -83,36 +83,40 @@ impl Compactor {
 
         let schema = Schema::new(table_meta.columns.clone());
         let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
-        let segment_files = SegmentManager::discover_segments(&table_dir)?;
-        if segment_files.is_empty() {
-            return Ok(CompactStats::default());
-        }
+        let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+            let segment_files = SegmentManager::discover_segments(&table_dir)?;
+            if segment_files.is_empty() {
+                return Ok(CompactStats::default());
+            }
 
-        tracing::info!(
-            db,
-            table,
-            cluster_key = ?table_meta.cluster_key,
-            segments = segment_files.len(),
-            "starting table optimization"
-        );
+            tracing::info!(
+                db,
+                table,
+                cluster_key = ?table_meta.cluster_key,
+                segments = segment_files.len(),
+                "starting table optimization"
+            );
 
-        let mut stats = CompactStats {
-            segments_read: segment_files.len(),
-            ..CompactStats::default()
-        };
+            let mut stats = CompactStats {
+                segments_read: segment_files.len(),
+                ..CompactStats::default()
+            };
 
-        for (partition_key, files) in group_segments_by_partition(segment_files) {
-            let part_stats = self.compact_segment_group(
-                &table_dir,
-                partition_key.as_deref(),
-                &files,
-                &schema,
-                &cluster_key_indices,
-            )?;
-            stats.segments_written += part_stats.segments_written;
-            stats.rows_written += part_stats.rows_written;
-            stats.rows_dropped += part_stats.rows_dropped;
-        }
+            for (partition_key, files) in group_segments_by_partition(segment_files) {
+                let part_stats = self.compact_segment_group(
+                    &table_dir,
+                    partition_key.as_deref(),
+                    &files,
+                    &schema,
+                    &cluster_key_indices,
+                )?;
+                stats.segments_written += part_stats.segments_written;
+                stats.rows_written += part_stats.rows_written;
+                stats.rows_dropped += part_stats.rows_dropped;
+            }
+
+            Ok(stats)
+        })?;
 
         tracing::info!(
             db,
