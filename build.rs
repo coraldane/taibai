@@ -4,21 +4,21 @@ use std::path::Path;
 
 fn main() {
     let version = env::var("MONAX_VERSION")
-        .or_else(|| env::var("CARGO_PKG_VERSION"))
-        .unwrap_or_else(|| "unknown".to_string());
+        .or_else(|_| env::var("CARGO_PKG_VERSION"))
+        .unwrap_or_else(|_| "unknown".to_string());
     
     let build_time = env::var("MONAX_BUILD_TIME")
-        .unwrap_or_else(|| {
+        .unwrap_or_else(|_| {
             let now = chrono::Local::now();
             now.format("%Y-%m-%dT%H:%M:%S%:z").to_string()
         });
     
     let git_commit = env::var("MONAX_GIT_COMMIT")
-        .or_else(|| get_git_commit())
-        .unwrap_or_else(|| "unknown".to_string());
+        .or_else(|_| get_git_commit())
+        .unwrap_or_else(|_| "unknown".to_string());
     
-    let target = env::var("TARGET").unwrap_or_else(|| "unknown".to_string());
-    let profile = env::var("PROFILE").unwrap_or_else(|| "unknown".to_string());
+    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
     
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("version_info.rs");
