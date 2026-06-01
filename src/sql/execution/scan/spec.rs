@@ -211,6 +211,9 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut Vec<usize>) {
 fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
     match plan {
         LogicalPlan::Scan(scan) => {
+            if let Some(limit) = scan.pushed_limit {
+                set_scan_limit(spec, limit);
+            }
             if let Some(filter) = &scan.pushed_filter {
                 extract_predicates(filter, schema, spec);
             }
@@ -243,12 +246,12 @@ fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
             collect_from_plan(&s.input, schema, spec);
         }
         LogicalPlan::Limit(l) => {
-            spec.limit = Some(l.limit);
+            set_scan_limit(spec, l.limit.saturating_add(l.offset));
             collect_from_plan(&l.input, schema, spec);
         }
         LogicalPlan::TopN(t) => {
             spec.has_order_by = true;
-            spec.limit = Some(t.limit);
+            set_scan_limit(spec, t.limit.saturating_add(t.offset));
             collect_from_plan(&t.input, schema, spec);
         }
         LogicalPlan::Distinct(d) => collect_from_plan(&d.input, schema, spec),
@@ -265,6 +268,10 @@ fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
         }
         LogicalPlan::Empty => {}
     }
+}
+
+fn set_scan_limit(spec: &mut ScanSpec, limit: usize) {
+    spec.limit = Some(spec.limit.map_or(limit, |current| current.min(limit)));
 }
 
 fn plain_projection_columns(expressions: &[LogicalExpr]) -> Option<Vec<usize>> {

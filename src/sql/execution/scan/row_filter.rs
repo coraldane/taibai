@@ -65,6 +65,34 @@ pub fn apply_predicates(
     apply_filter_mask_fast(batch, &mask)
 }
 
+pub fn apply_predicates_with_column_map(
+    batch: &RecordBatch,
+    source_columns: &[usize],
+    eq_predicates: &[(usize, ScalarValue)],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
+    in_predicates: &[InPredicate],
+    remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
+) -> crate::common::error::Result<RecordBatch> {
+    let col_pos_by_original: std::collections::HashMap<usize, usize> = source_columns
+        .iter()
+        .enumerate()
+        .map(|(pos, &idx)| (idx, pos))
+        .collect();
+    let remapped_eq = remap_eq_predicates(eq_predicates, &col_pos_by_original)?;
+    let remapped_range = remap_range_predicates(range_predicates, &col_pos_by_original)?;
+    let remapped_in = remap_in_predicates(in_predicates, &col_pos_by_original)?;
+    let remapped_remaining = remaining_predicate
+        .map(|expr| remap_expr(expr, &col_pos_by_original))
+        .transpose()?;
+    Ok(apply_predicates(
+        batch,
+        &remapped_eq,
+        &remapped_range,
+        &remapped_in,
+        remapped_remaining.as_ref(),
+    ))
+}
+
 pub fn apply_eq_mask(
     batch: &RecordBatch,
     col_idx: usize,
@@ -311,7 +339,8 @@ pub fn predicate_first_read(
     }
 
     if let Some(expr) = remaining_predicate {
-        apply_remaining_mask(&pred_batch, expr, &mut mask);
+        let remapped_expr = remap_expr(expr, &pred_to_batch_pos)?;
+        apply_remaining_mask(&pred_batch, &remapped_expr, &mut mask);
     }
 
     let match_count = mask.iter().filter(|&&m| m).count();

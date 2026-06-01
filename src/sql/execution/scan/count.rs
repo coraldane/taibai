@@ -165,13 +165,14 @@ fn count_with_predicates(
                 batch = delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
             }
 
-            let filtered = row_filter::apply_predicates(
+            let filtered = row_filter::apply_predicates_with_column_map(
                 &batch,
+                &filter_columns,
                 &spec.eq_predicates,
                 &spec.range_predicates,
                 &spec.in_predicates,
                 spec.remaining_predicate.as_ref(),
-            );
+            )?;
             *total_rows += filtered.num_rows() as u64;
         }
 

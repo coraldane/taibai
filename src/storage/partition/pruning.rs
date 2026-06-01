@@ -121,6 +121,7 @@ pub struct RangeClause {
 #[derive(Debug, Default, Clone)]
 pub struct ScanStats {
     pub segments_opened: u64,
+    pub segments_pruned_by_cluster_key: u64,
     pub row_groups_total: u64,
     pub row_groups_read: u64,
     pub row_groups_pruned: u64,
@@ -132,6 +133,7 @@ pub struct ScanStats {
 impl ScanStats {
     pub fn merge(&mut self, other: &ScanStats) {
         self.segments_opened += other.segments_opened;
+        self.segments_pruned_by_cluster_key += other.segments_pruned_by_cluster_key;
         self.row_groups_total += other.row_groups_total;
         self.row_groups_read += other.row_groups_read;
         self.row_groups_pruned += other.row_groups_pruned;

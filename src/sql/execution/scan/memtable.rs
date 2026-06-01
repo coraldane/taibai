@@ -18,23 +18,23 @@ pub fn scan_memtables(
                 continue;
             }
 
-            let mt_batch = if let Some(proj) = &spec.projection {
-                apply_projection(&mt_batch, proj)
-            } else {
-                mt_batch.clone()
-            };
-
-            if spec.has_predicates() {
-                let filtered = super::row_filter::apply_predicates(
+            let mt_batch = if spec.has_predicates() {
+                super::row_filter::apply_predicates(
                     &mt_batch,
                     &spec.eq_predicates,
                     &spec.range_predicates,
                     &spec.in_predicates,
                     spec.remaining_predicate.as_ref(),
-                );
-                if filtered.num_rows() > 0 {
-                    batches.push(filtered);
-                }
+                )
+            } else {
+                mt_batch.clone()
+            };
+            if mt_batch.num_rows() == 0 {
+                continue;
+            }
+
+            if let Some(proj) = &spec.projection {
+                batches.push(apply_projection(&mt_batch, proj));
             } else {
                 batches.push(mt_batch);
             }

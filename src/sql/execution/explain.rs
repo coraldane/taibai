@@ -63,6 +63,12 @@ pub fn exec_explain(
             let s = &stats[t];
             out.push_str(&format!("Scan {}:\n", t));
             out.push_str(&format!("  segments      : {}\n", s.segments_opened));
+            if s.segments_pruned_by_cluster_key > 0 {
+                out.push_str(&format!(
+                    "  segment_prune : {} by cluster key\n",
+                    s.segments_pruned_by_cluster_key
+                ));
+            }
             let pruned_pct = if s.row_groups_total > 0 {
                 (s.row_groups_pruned as f64 / s.row_groups_total as f64) * 100.0
             } else {

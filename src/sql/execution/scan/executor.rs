@@ -4,6 +4,7 @@ use crate::storage::segment::ScanStats;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::RecordBatch;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use super::count;
 use super::memtable;
@@ -112,6 +113,8 @@ impl<'a> ScanExecutor<'a> {
             .join(self.db)
             .join(&self.spec.table_name);
         let mut batches = Vec::new();
+        let scan_limit = self.effective_scan_limit();
+        let mut rows_emitted = 0usize;
 
         if table_dir.exists() {
             let all_segments = SegmentManager::discover_segments(&table_dir)?;
@@ -130,6 +133,8 @@ impl<'a> ScanExecutor<'a> {
 
             let use_predicate_first = self.should_use_predicate_first();
             let cluster_key_bounds = self.cluster_key_bounds();
+            let filtered_segments =
+                self.prune_segments_by_cluster_key(filtered_segments, cluster_key_bounds.as_ref());
             let predicate_cols = self.compute_predicate_columns();
             let mut projection_cols = self.compute_projection_columns();
             let strip_ttl_column = self.extend_projection_for_ttl(&mut projection_cols);
@@ -165,10 +170,47 @@ impl<'a> ScanExecutor<'a> {
                     stats_entry.row_groups_total += reader.num_row_groups() as u64;
                     stats_entry.row_groups_pruned +=
                         (reader.num_row_groups() - prune_result.candidate_indices.len()) as u64;
-                    stats_entry.row_groups_read += prune_result.candidate_indices.len() as u64;
+                    if scan_limit.is_none() {
+                        stats_entry.row_groups_read += prune_result.candidate_indices.len() as u64;
+                    }
                 }
 
                 if let Some(bounds) = cluster_key_bounds.as_ref() {
+                    if scan_limit.is_some() {
+                        for rg_idx in &prune_result.candidate_indices {
+                            self.record_row_group_read();
+                            let batch = match row_filter::cluster_key_range_read(
+                                &reader,
+                                *rg_idx,
+                                bounds,
+                                &projection_cols,
+                                &predicate_cols,
+                                &self.spec.eq_predicates,
+                                &self.spec.range_predicates,
+                                &self.spec.in_predicates,
+                                self.spec.remaining_predicate.as_ref(),
+                            ) {
+                                Ok(b) => b,
+                                Err(_) => continue,
+                            };
+                            self.record_rows_scanned(batch.num_rows() as u64);
+                            let batch = self.apply_ttl_filter_and_projection(
+                                batch,
+                                &projection_cols,
+                                strip_ttl_column,
+                            )?;
+                            if !append_limited_batch(
+                                &mut batches,
+                                batch,
+                                scan_limit,
+                                &mut rows_emitted,
+                            ) {
+                                return Ok(batches);
+                            }
+                        }
+                        continue;
+                    }
+
                     use rayon::prelude::*;
 
                     let mut rg_batches: Vec<(usize, RecordBatch)> = prune_result
@@ -209,14 +251,49 @@ impl<'a> ScanExecutor<'a> {
                             &projection_cols,
                             strip_ttl_column,
                         )?;
-                        if batch.num_rows() > 0 {
-                            batches.push(batch);
+                        if !append_limited_batch(&mut batches, batch, scan_limit, &mut rows_emitted)
+                        {
+                            return Ok(batches);
                         }
                     }
                 } else if use_predicate_first
                     && !predicate_cols.is_empty()
                     && !projection_cols.is_empty()
                 {
+                    if scan_limit.is_some() {
+                        for rg_idx in &prune_result.candidate_indices {
+                            self.record_row_group_read();
+                            let batch = match row_filter::predicate_first_read(
+                                &reader,
+                                *rg_idx,
+                                &predicate_cols,
+                                &projection_cols,
+                                &self.spec.eq_predicates,
+                                &self.spec.range_predicates,
+                                &self.spec.in_predicates,
+                                self.spec.remaining_predicate.as_ref(),
+                            ) {
+                                Ok(b) => b,
+                                Err(_) => continue,
+                            };
+                            self.record_rows_scanned(batch.num_rows() as u64);
+                            let batch = self.apply_ttl_filter_and_projection(
+                                batch,
+                                &projection_cols,
+                                strip_ttl_column,
+                            )?;
+                            if !append_limited_batch(
+                                &mut batches,
+                                batch,
+                                scan_limit,
+                                &mut rows_emitted,
+                            ) {
+                                return Ok(batches);
+                            }
+                        }
+                        continue;
+                    }
+
                     use rayon::prelude::*;
 
                     let mut rg_batches: Vec<(usize, RecordBatch)> = prune_result
@@ -256,12 +333,16 @@ impl<'a> ScanExecutor<'a> {
                             &projection_cols,
                             strip_ttl_column,
                         )?;
-                        if batch.num_rows() > 0 {
-                            batches.push(batch);
+                        if !append_limited_batch(&mut batches, batch, scan_limit, &mut rows_emitted)
+                        {
+                            return Ok(batches);
                         }
                     }
                 } else {
                     for rg_idx in &prune_result.candidate_indices {
+                        if scan_limit.is_some() {
+                            self.record_row_group_read();
+                        }
                         let batch = match self.read_and_filter_row_group(
                             &reader,
                             *rg_idx,
@@ -275,8 +356,9 @@ impl<'a> ScanExecutor<'a> {
                             &projection_cols,
                             strip_ttl_column,
                         )?;
-                        if batch.num_rows() > 0 {
-                            batches.push(batch);
+                        if !append_limited_batch(&mut batches, batch, scan_limit, &mut rows_emitted)
+                        {
+                            return Ok(batches);
                         }
                     }
                 }
@@ -299,8 +381,8 @@ impl<'a> ScanExecutor<'a> {
                 &memtable_projection,
                 memtable_strip_ttl_column,
             )?;
-            if batch.num_rows() > 0 {
-                batches.push(batch);
+            if !append_limited_batch(&mut batches, batch, scan_limit, &mut rows_emitted) {
+                return Ok(batches);
             }
         }
 
@@ -428,6 +510,177 @@ impl<'a> ScanExecutor<'a> {
             return false;
         }
         true
+    }
+
+    fn effective_scan_limit(&self) -> Option<usize> {
+        let limit = self.spec.limit?;
+        if self.spec.has_order_by
+            || self.spec.has_aggregate
+            || self.spec.has_group_by
+            || self.spec.has_join
+            || self.spec.remaining_predicate.is_some()
+        {
+            return None;
+        }
+        Some(limit)
+    }
+
+    fn prune_segments_by_cluster_key(
+        &mut self,
+        segments: Vec<PathBuf>,
+        bounds: Option<&row_filter::ClusterKeyBounds>,
+    ) -> Vec<PathBuf> {
+        if segments.len() <= 1 {
+            return segments;
+        }
+        let Some(bounds) = bounds else {
+            return segments;
+        };
+
+        let Some((start, end)) = self.cluster_segment_range(&segments, bounds) else {
+            return segments;
+        };
+        if start > end {
+            self.record_cluster_key_segments_pruned(segments.len() as u64);
+            return Vec::new();
+        }
+
+        let pruned = start + (segments.len() - end - 1);
+        if pruned > 0 {
+            self.record_cluster_key_segments_pruned(pruned as u64);
+        }
+        segments[start..=end].to_vec()
+    }
+
+    fn cluster_segment_range(
+        &self,
+        segments: &[PathBuf],
+        bounds: &row_filter::ClusterKeyBounds,
+    ) -> Option<(usize, usize)> {
+        let start = match &bounds.lower {
+            Some((value, inclusive)) => self.first_segment_with_max_at_least(
+                segments,
+                bounds.column_index,
+                value,
+                *inclusive,
+            )?,
+            None => 0,
+        };
+        let end = match &bounds.upper {
+            Some((value, inclusive)) => {
+                let end = self.last_segment_with_min_at_most(
+                    segments,
+                    bounds.column_index,
+                    value,
+                    *inclusive,
+                )?;
+                if end < 0 {
+                    return Some((1, 0));
+                }
+                end as usize
+            }
+            None => segments.len().saturating_sub(1),
+        };
+        Some((start, end))
+    }
+
+    fn first_segment_with_max_at_least(
+        &self,
+        segments: &[PathBuf],
+        col_idx: usize,
+        value: &crate::types::scalar::ScalarValue,
+        inclusive: bool,
+    ) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = segments.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let zm = self.segment_cluster_zone_map(&segments[mid], col_idx)?;
+            let cmp =
+                crate::storage::index::sort_key::compare_scalars_for_sort(&zm.max_value, value);
+            let before = if inclusive {
+                cmp == std::cmp::Ordering::Less
+            } else {
+                cmp != std::cmp::Ordering::Greater
+            };
+            if before {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(lo)
+    }
+
+    fn last_segment_with_min_at_most(
+        &self,
+        segments: &[PathBuf],
+        col_idx: usize,
+        value: &crate::types::scalar::ScalarValue,
+        inclusive: bool,
+    ) -> Option<isize> {
+        let mut lo = 0usize;
+        let mut hi = segments.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let zm = self.segment_cluster_zone_map(&segments[mid], col_idx)?;
+            let cmp =
+                crate::storage::index::sort_key::compare_scalars_for_sort(&zm.min_value, value);
+            let at_or_before = if inclusive {
+                cmp != std::cmp::Ordering::Greater
+            } else {
+                cmp == std::cmp::Ordering::Less
+            };
+            if at_or_before {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(lo as isize - 1)
+    }
+
+    fn segment_cluster_zone_map(
+        &self,
+        segment: &PathBuf,
+        col_idx: usize,
+    ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        let reader = self.engine.segment_mgr().open_reader_cached(segment).ok()?;
+        let zm = reader.segment_zone_maps().get(col_idx)?;
+        if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
+            return None;
+        }
+        Some(zm.clone())
+    }
+
+    fn record_row_group_read(&mut self) {
+        if let Some(s) = self.stats.as_deref_mut() {
+            s.entry(self.spec.table_name.clone())
+                .or_default()
+                .row_groups_read += 1;
+        }
+    }
+
+    fn record_rows_scanned(&mut self, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        if let Some(s) = self.stats.as_deref_mut() {
+            s.entry(self.spec.table_name.clone())
+                .or_default()
+                .rows_scanned += rows;
+        }
+    }
+
+    fn record_cluster_key_segments_pruned(&mut self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Some(s) = self.stats.as_deref_mut() {
+            s.entry(self.spec.table_name.clone())
+                .or_default()
+                .segments_pruned_by_cluster_key += count;
+        }
     }
 
     fn compute_predicate_columns(&self) -> Vec<usize> {
@@ -580,6 +833,40 @@ fn strip_projection_column(batch: RecordBatch, column_pos: usize) -> Result<Reco
         .filter_map(|(idx, col)| (idx != column_pos).then_some(col))
         .collect();
     RecordBatch::try_new(schema, columns)
+}
+
+fn append_limited_batch(
+    batches: &mut Vec<RecordBatch>,
+    batch: RecordBatch,
+    limit: Option<usize>,
+    rows_emitted: &mut usize,
+) -> bool {
+    if batch.num_rows() == 0 {
+        return true;
+    }
+
+    let Some(limit) = limit else {
+        batches.push(batch);
+        return true;
+    };
+
+    if *rows_emitted >= limit {
+        return false;
+    }
+
+    let remaining = limit - *rows_emitted;
+    if batch.num_rows() > remaining {
+        let trimmed = crate::sql::execution::operators::limit::trim_batch(&batch, 0, remaining);
+        *rows_emitted += trimmed.num_rows();
+        if trimmed.num_rows() > 0 {
+            batches.push(trimmed);
+        }
+        return false;
+    }
+
+    *rows_emitted += batch.num_rows();
+    batches.push(batch);
+    *rows_emitted < limit
 }
 
 fn now_micros() -> i64 {

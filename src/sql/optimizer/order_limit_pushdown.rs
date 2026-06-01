@@ -26,7 +26,7 @@ fn push_order_limit_to_scan(plan: LogicalPlan) -> (LogicalPlan, bool) {
                 {
                     let mut new_scan = scan.clone();
                     new_scan.pushed_order = Some(topn.sort_keys.clone());
-                    new_scan.pushed_limit = Some(topn.limit);
+                    new_scan.pushed_limit = Some(topn.limit.saturating_add(topn.offset));
                     return (
                         LogicalPlan::TopN(TopNPlan {
                             sort_keys: topn.sort_keys,
@@ -48,30 +48,8 @@ fn push_order_limit_to_scan(plan: LogicalPlan) -> (LogicalPlan, bool) {
             if let LogicalPlan::Scan(scan) = &new_input {
                 if scan.pushed_limit.is_none() {
                     let mut new_scan = scan.clone();
-                    new_scan.pushed_limit = Some(limit.limit);
-                    let remaining_limit = if new_scan.pushed_filter.is_some() {
-                        None
-                    } else {
-                        Some(limit.limit)
-                    };
+                    new_scan.pushed_limit = Some(limit.limit.saturating_add(limit.offset));
                     limit.input = Box::new(LogicalPlan::Scan(new_scan));
-                    if remaining_limit.is_none() {
-                        return (
-                            LogicalPlan::Project(crate::sql::planner::ProjectPlan {
-                                expressions: (0..scan.schema.columns.len())
-                                    .map(crate::sql::planner::LogicalExpr::Column)
-                                    .collect(),
-                                aliases: scan
-                                    .schema
-                                    .columns
-                                    .iter()
-                                    .map(|c| Some(c.name.clone()))
-                                    .collect(),
-                                input: limit.input,
-                            }),
-                            true,
-                        );
-                    }
                     return (LogicalPlan::Limit(limit), true);
                 }
             }
