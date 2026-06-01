@@ -211,25 +211,25 @@ fn compute_window_func(
             }
         }
         WindowFunc::Lead { offset, default } => {
-            for i in 0..n {
+            for (i, r) in result.iter_mut().enumerate().take(n) {
                 if i + offset < n {
-                    result[i] = rows[row_indices[i + offset]][0].clone(); // simplified
+                    *r = rows[row_indices[i + offset]][0].clone();
                 } else {
-                    result[i] = default
+                    *r = default
                         .as_ref()
-                        .and_then(|_d| Some(ScalarValue::Int64(None)))
+                        .map(|_d| ScalarValue::Int64(None))
                         .unwrap_or(ScalarValue::Int64(None));
                 }
             }
         }
         WindowFunc::Lag { offset, default } => {
-            for i in 0..n {
+            for (i, r) in result.iter_mut().enumerate().take(n) {
                 if i >= *offset {
-                    result[i] = rows[row_indices[i - offset]][0].clone(); // simplified
+                    *r = rows[row_indices[i - offset]][0].clone();
                 } else {
-                    result[i] = default
+                    *r = default
                         .as_ref()
-                        .and_then(|_d| Some(ScalarValue::Int64(None)))
+                        .map(|_d| ScalarValue::Int64(None))
                         .unwrap_or(ScalarValue::Int64(None));
                 }
             }
@@ -243,15 +243,14 @@ fn compute_window_func(
             let values: Vec<ScalarValue> = row_indices
                 .iter()
                 .map(|&idx| {
-                    rows[idx]
-                        .get(0)
+                    rows[idx].first()
                         .cloned()
                         .unwrap_or(ScalarValue::Int64(None))
                 })
                 .collect();
             let agg_val = compute_simple_aggregate(agg_name, &values);
-            for i in 0..n {
-                result[i] = agg_val.clone();
+            for r in result.iter_mut().take(n) {
+                *r = agg_val.clone();
             }
         }
     }

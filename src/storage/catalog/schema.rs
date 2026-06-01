@@ -10,7 +10,9 @@ use crate::types::batch::ColumnDef;
 
 /// Partition type for a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum PartitionType {
+    #[default]
     None = 0,
     Value = 1,
     Day = 2,
@@ -20,11 +22,6 @@ pub enum PartitionType {
     Mod = 6,
 }
 
-impl Default for PartitionType {
-    fn default() -> Self {
-        PartitionType::None
-    }
-}
 
 /// Partition info for a table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -372,7 +369,7 @@ impl DatabaseCatalog {
         if table
             .ttl
             .as_ref()
-            .map_or(false, |ttl| ttl.column.eq_ignore_ascii_case(column_name))
+            .is_some_and(|ttl| ttl.column.eq_ignore_ascii_case(column_name))
         {
             table.ttl = None;
         } else {

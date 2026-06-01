@@ -97,7 +97,7 @@ pub fn apply_eq_mask(
     batch: &RecordBatch,
     col_idx: usize,
     value: &ScalarValue,
-    mask: &mut Vec<bool>,
+    mask: &mut [bool],
 ) {
     if let Some(col) = batch.column(col_idx) {
         let col_mask = col.eq_vec(value);
@@ -114,7 +114,7 @@ pub fn apply_eq_mask(
 fn apply_range_mask(
     batch: &RecordBatch,
     clause: &crate::storage::partition::pruning::RangeClause,
-    mask: &mut Vec<bool>,
+    mask: &mut [bool],
 ) {
     if let Some(col) = batch.column(clause.column_index) {
         let col_mask = match clause.op {
@@ -130,7 +130,7 @@ fn apply_range_mask(
     }
 }
 
-fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut Vec<bool>) {
+fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut [bool]) {
     if let Some(col) = batch.column(pred.column_index) {
         for (i, m) in mask.iter_mut().enumerate() {
             if !*m {
@@ -150,7 +150,7 @@ fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut Vec<bool>) 
 fn apply_remaining_mask(
     batch: &RecordBatch,
     expr: &crate::sql::planner::LogicalExpr,
-    mask: &mut Vec<bool>,
+    mask: &mut [bool],
 ) {
     if let Ok(row_mask) = eval_logical_expr_batch(expr, batch) {
         for (i, m) in row_mask.iter().enumerate() {

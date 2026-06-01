@@ -96,10 +96,7 @@ fn count_with_single_eq(
     let pred = spec.to_row_group_predicate();
 
     for seg_path in segment_files {
-        let reader = match segment_mgr.open_reader_cached(seg_path) {
-            Ok(r) => r,
-            Err(e) => return Err(e),
-        };
+        let reader = segment_mgr.open_reader_cached(seg_path)?;
 
         if !row_group::prune_segment_by_zone_map(&pred, reader.segment_zone_maps()) {
             continue;
@@ -135,10 +132,7 @@ fn count_with_predicates(
     };
 
     for seg_path in segment_files {
-        let reader = match segment_mgr.open_reader_cached(seg_path) {
-            Ok(r) => r,
-            Err(e) => return Err(e),
-        };
+        let reader = segment_mgr.open_reader_cached(seg_path)?;
 
         if !row_group::prune_segment_by_zone_map(pred, reader.segment_zone_maps()) {
             continue;

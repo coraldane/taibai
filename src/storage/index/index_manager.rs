@@ -37,7 +37,7 @@ impl IndexManager {
 
         indexes
             .entry(db.to_string())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(table.to_string(), new_index.clone());
 
         new_index
@@ -55,7 +55,7 @@ impl IndexManager {
         let mut current_row_id: i64 = 0;
         let mut block_data = Vec::new();
 
-        for (_seg_idx, seg_path) in segments.iter().enumerate() {
+        for seg_path in segments.iter() {
             let reader = self.segment_mgr.open_reader(Path::new(seg_path))?;
 
             let num_row_groups = reader.num_row_groups();

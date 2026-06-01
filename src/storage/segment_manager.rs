@@ -224,7 +224,7 @@ impl ActiveSegmentWriter {
 
         let footer = self.encode_footer()?;
         self.file.write_all(&footer)?;
-        self.file.write_all(&(self.data_end as u64).to_le_bytes())?;
+        self.file.write_all(&self.data_end.to_le_bytes())?;
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
 
@@ -243,7 +243,7 @@ impl ActiveSegmentWriter {
     }
 
     fn seal(&mut self, invalidate_reader: &dyn Fn(&Path)) -> Result<()> {
-        if let Some(_) = self.flush_buffer(invalidate_reader)? {}
+        self.flush_buffer(invalidate_reader)?;
         self.flush_meta(invalidate_reader)?;
         self.finalize()?;
 
@@ -934,7 +934,7 @@ impl SegmentManager {
                 seg.seal(&|path| self.invalidate_reader(path))?;
                 active_guard.remove(partition_key);
             } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
-                if let Some(_) = seg.flush_buffer(&|path| self.invalidate_reader(path))? {}
+                seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
             }
         }
@@ -1116,7 +1116,7 @@ impl SegmentManager {
             file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
             path: seg_path.to_path_buf(),
             schema: schema.clone(),
-            row_groups: row_groups,
+            row_groups,
             current_size: footer_offset,
             total_rows: reader.row_count(),
             buffered_batch: None,
@@ -1417,7 +1417,7 @@ impl SegmentManager {
 
             for key in keys_to_seal {
                 if let Some(seg) = active_guard.get_mut(&key) {
-                    if let Some(_) = seg.flush_buffer(&|path| self.invalidate_reader(path))? {}
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                     seg.flush_meta(&|path| self.invalidate_reader(path))?;
                     tracing::info!(
                         path = %seg.path.display(),
@@ -1434,7 +1434,7 @@ impl SegmentManager {
 
             for (_, seg) in active_guard.iter_mut() {
                 if seg.total_rows > 0 || seg.buffered_rows > 0 {
-                    if let Some(_) = seg.flush_buffer(&|path| self.invalidate_reader(path))? {}
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                     seg.flush_meta(&|path| self.invalidate_reader(path))?;
                     total += seg.total_rows;
                     tracing::info!(
@@ -1469,7 +1469,7 @@ impl SegmentManager {
                     continue;
                 }
                 if seg.buffered_rows > 0 {
-                    if let Some(_) = seg.flush_buffer(&|path| self.invalidate_reader(path))? {}
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                 }
                 if seg.dirty_meta {
                     seg.flush_meta(&|path| self.invalidate_reader(path))?;
@@ -1766,7 +1766,7 @@ fn compute_zone_maps_from_bulk_columns(
     row_count: u64,
 ) -> Vec<ZoneMap> {
     let mut zone_maps = Vec::with_capacity(columns.len());
-    for (_col_idx, col) in columns.iter().enumerate() {
+    for col in columns.iter() {
         let mut zm = ZoneMap::default();
         let dtype = col.data_type;
         let data = col.data;

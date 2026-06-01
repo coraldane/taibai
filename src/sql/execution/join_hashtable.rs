@@ -202,6 +202,12 @@ pub struct AsofJoinIndex {
     entries: Vec<(ScalarValue, RowPointer)>,
 }
 
+impl Default for AsofJoinIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AsofJoinIndex {
     pub fn new() -> Self {
         Self {

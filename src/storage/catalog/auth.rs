@@ -262,6 +262,12 @@ pub struct AuthStore {
     pub roles: HashMap<String, RoleInfo>,
 }
 
+impl Default for AuthStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuthStore {
     pub fn new() -> Self {
         let mut store = Self {
@@ -377,7 +383,7 @@ impl AuthStore {
             let user = self.users.get_mut(target).unwrap();
             user.permissions.retain(|p| {
                 let type_match = permissions.contains(&p.permission_type);
-                let object_match = object.map_or(true, |obj| p.object_name == obj);
+                let object_match = object.is_none_or(|obj| p.object_name == obj);
                 !(type_match && object_match)
             });
         }
@@ -385,7 +391,7 @@ impl AuthStore {
             let role = self.roles.get_mut(target).unwrap();
             role.permissions.retain(|p| {
                 let type_match = permissions.contains(&p.permission_type);
-                let object_match = object.map_or(true, |obj| p.object_name == obj);
+                let object_match = object.is_none_or(|obj| p.object_name == obj);
                 !(type_match && object_match)
             });
         }

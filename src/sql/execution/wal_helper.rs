@@ -391,7 +391,7 @@ fn decode_column_raw(
     let mut pos = 0;
 
     for row in 0..num_rows {
-        let is_null = null_bitmap.map_or(false, |bm| bm.is_null(row));
+        let is_null = null_bitmap.is_some_and(|bm| bm.is_null(row));
         if is_null {
             col.push(&ScalarValue::null_for_type(dt))?;
         } else {

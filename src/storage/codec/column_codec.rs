@@ -127,11 +127,11 @@ where
     F: Fn(&T) -> u64,
 {
     let mut values = Vec::new();
-    for i in offset..offset + count {
+    for (i, item) in data.iter().enumerate().skip(offset).take(count) {
         if bitmap.is_null(i) {
             continue;
         }
-        let v = to_u64(&data[i]);
+        let v = to_u64(item);
         if v > i64::MAX as u64 {
             return None;
         }
@@ -154,15 +154,14 @@ fn choose_numeric_encoding(values: &[i64], plain_width: usize) -> Option<(Encodi
 
     if values.windows(2).all(|w| w[0] <= w[1]) {
         let delta = encode_i64_delta_payload(values);
-        if delta.len() + 5 < plain_size || plain_width == 8 && delta.len() < plain_size {
-            if best
+        if (delta.len() + 5 < plain_size || plain_width == 8 && delta.len() < plain_size)
+            && best
                 .as_ref()
                 .map(|(_, payload)| delta.len() < payload.len())
                 .unwrap_or(true)
             {
                 best = Some((EncodingType::Delta, delta));
             }
-        }
     }
 
     best
@@ -215,11 +214,11 @@ fn encode_varchar_dictionary_adaptive(
     let mut indices = Vec::new();
     let mut plain_size = 0usize;
 
-    for i in offset..offset + count {
+    for (i, item) in data.iter().enumerate().skip(offset).take(count) {
         if bitmap.is_null(i) {
             continue;
         }
-        let value = data[i].as_str();
+        let value = item.as_str();
         plain_size += 4 + value.len();
         let idx = if let Some(&idx) = index_map.get(value) {
             idx
@@ -495,7 +494,7 @@ pub(crate) fn decode_i64_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
         cursor.read_exact(&mut value_buf)?;
         let value = i64::from_le_bytes(value_buf);
         let len = read_u32_le(&mut cursor)? as usize;
-        values.extend(std::iter::repeat(value).take(len));
+        values.extend(std::iter::repeat_n(value, len));
     }
     Ok(values)
 }

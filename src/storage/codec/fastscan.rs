@@ -173,7 +173,7 @@ pub struct InMatcher {
 impl InMatcher {
     pub fn new(column_index: usize, values: Vec<ScalarValue>) -> Self {
         let mut sorted = values.clone();
-        sorted.sort_by(|a, b| compare_scalars_for_sort(a, b));
+        sorted.sort_by(compare_scalars_for_sort);
         Self {
             column_index,
             values,

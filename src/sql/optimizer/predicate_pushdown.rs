@@ -28,7 +28,7 @@ fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
                         input: Box::new(sort_input),
                     }));
                     let (result, child_changed) = push_predicates(LogicalPlan::Sort(sort));
-                    (result, true || child_changed)
+                    (result, child_changed)
                 }
                 LogicalPlan::Scan(mut scan) => {
                     if scan.pushed_filter.is_none() {

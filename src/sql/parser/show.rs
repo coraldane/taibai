@@ -10,10 +10,8 @@ impl Parser {
         match self.peek() {
             Token::Tables => {
                 self.advance();
-                let database = if self.peek() == &Token::From {
-                    self.advance();
-                    Some(self.expect_ident()?)
-                } else if matches!(self.peek(), Token::Ident(word) if word.eq_ignore_ascii_case("IN"))
+                let database = if self.peek() == &Token::From
+                    || matches!(self.peek(), Token::Ident(word) if word.eq_ignore_ascii_case("IN"))
                 {
                     self.advance();
                     Some(self.expect_ident()?)

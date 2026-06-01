@@ -637,18 +637,18 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
         .collect();
 
     for _ in 0..row_count {
-        for col_idx in 0..schema.columns.len() {
+        for (col_idx, col) in schema.columns.iter().enumerate() {
             if offset >= payload.len() {
                 return Err(MonaxError::Protocol("truncated row data".into()));
             }
             let is_null = payload[offset] != 0;
             offset += 1;
 
-            let dt = schema.columns[col_idx].data_type;
+            let dt = col.data_type;
             let value = if is_null {
                 ScalarValue::null_for_type(dt)
             } else {
-                let scale = schema.columns[col_idx].scale;
+                let scale = col.scale;
                 let (val, consumed) = read_scalar_value(&payload[offset..], dt, scale)?;
                 offset += consumed;
                 val

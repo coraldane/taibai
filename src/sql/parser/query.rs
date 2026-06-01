@@ -267,7 +267,7 @@ impl Parser {
                     alias,
                 })
             } else {
-                return Err(MonaxError::Sql("expected SELECT in derived table".into()));
+                Err(MonaxError::Sql("expected SELECT in derived table".into()))
             }
         } else {
             let name = self.parse_object_name()?;

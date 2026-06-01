@@ -249,15 +249,12 @@ impl RunMode {
             config.storage.default_database = database;
         }
 
-        match (args.tls_cert, args.tls_key) {
-            (Some(cert), Some(key)) => {
-                config.tls = TlsConfigYaml {
-                    enabled: true,
-                    cert_path: cert,
-                    key_path: key,
-                };
-            }
-            _ => {}
+        if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
+            config.tls = TlsConfigYaml {
+                enabled: true,
+                cert_path: cert,
+                key_path: key,
+            };
         }
 
         if args.no_compression {

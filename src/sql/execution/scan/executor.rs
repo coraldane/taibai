@@ -4,7 +4,7 @@ use crate::storage::segment::ScanStats;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::RecordBatch;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::count;
 use super::memtable;
@@ -153,7 +153,7 @@ impl<'a> ScanExecutor<'a> {
 
                 let segment_zone_maps = reader.segment_zone_maps();
 
-                if !row_group::prune_segment_by_zone_map(&pred, &segment_zone_maps) {
+                if !row_group::prune_segment_by_zone_map(&pred, segment_zone_maps) {
                     continue;
                 }
 
@@ -162,7 +162,7 @@ impl<'a> ScanExecutor<'a> {
                     &pred,
                     &bloom_checks,
                     &in_checks,
-                    &segment_zone_maps,
+                    segment_zone_maps,
                 );
 
                 if let Some(s) = self.stats.as_deref_mut() {
@@ -642,7 +642,7 @@ impl<'a> ScanExecutor<'a> {
 
     fn segment_cluster_zone_map(
         &self,
-        segment: &PathBuf,
+        segment: &Path,
         col_idx: usize,
     ) -> Option<crate::storage::partition::pruning::ZoneMap> {
         let reader = self.engine.segment_mgr().open_reader_cached(segment).ok()?;

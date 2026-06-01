@@ -813,7 +813,7 @@ impl ColumnArray {
             ) => {
                 data.extend(other_data.iter().cloned());
                 bitmap.extend(other_bitmap);
-                return Ok(());
+                Ok(())
             }
             (
                 ColumnArray::Blob { data, bitmap },
@@ -824,7 +824,7 @@ impl ColumnArray {
             ) => {
                 data.extend(other_data.iter().cloned());
                 bitmap.extend(other_bitmap);
-                return Ok(());
+                Ok(())
             }
             (
                 ColumnArray::Vector { data, bitmap },
@@ -835,7 +835,7 @@ impl ColumnArray {
             ) => {
                 data.extend(other_data.iter().cloned());
                 bitmap.extend(other_bitmap);
-                return Ok(());
+                Ok(())
             }
             _ => unreachable!("column type checked before extend"),
         }
@@ -976,14 +976,14 @@ impl ColumnArray {
         let mut deleted_count: u64 = 0;
         match (self, value) {
             (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => {
-                for i in 0..num_rows {
-                    if !bitmap.is_null(i) && data[i] == *v {
+                for (i, item) in data.iter().enumerate().take(num_rows) {
+                    if !bitmap.is_null(i) && *item == *v {
                         let row_id = rg_start_row + i as u64;
                         let byte = (row_id / 8) as usize;
                         let bit = (row_id % 8) as u8;
                         if delete_bitmap
                             .get(byte)
-                            .map_or(false, |b| (b & (1u8 << bit)) != 0)
+                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
                         {
                             deleted_count += 1;
                         }
@@ -991,14 +991,14 @@ impl ColumnArray {
                 }
             }
             (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => {
-                for i in 0..num_rows {
-                    if !bitmap.is_null(i) && data[i] == *v {
+                for (i, item) in data.iter().enumerate().take(num_rows) {
+                    if !bitmap.is_null(i) && *item == *v {
                         let row_id = rg_start_row + i as u64;
                         let byte = (row_id / 8) as usize;
                         let bit = (row_id % 8) as u8;
                         if delete_bitmap
                             .get(byte)
-                            .map_or(false, |b| (b & (1u8 << bit)) != 0)
+                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
                         {
                             deleted_count += 1;
                         }
@@ -1006,14 +1006,14 @@ impl ColumnArray {
                 }
             }
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
-                for i in 0..num_rows {
-                    if !bitmap.is_null(i) && data[i] == *v {
+                for (i, item) in data.iter().enumerate().take(num_rows) {
+                    if !bitmap.is_null(i) && *item == *v {
                         let row_id = rg_start_row + i as u64;
                         let byte = (row_id / 8) as usize;
                         let bit = (row_id % 8) as u8;
                         if delete_bitmap
                             .get(byte)
-                            .map_or(false, |b| (b & (1u8 << bit)) != 0)
+                            .is_some_and(|b| (b & (1u8 << bit)) != 0)
                         {
                             deleted_count += 1;
                         }
@@ -1044,10 +1044,9 @@ impl ColumnArray {
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && self
+                        && (self
                             .scalar(i)
-                            .numeric_cmp(value)
-                            .map_or(false, |ord| ord == std::cmp::Ordering::Equal)
+                            .numeric_cmp(value) == Some(std::cmp::Ordering::Equal))
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -1070,10 +1069,9 @@ impl ColumnArray {
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && self
+                        && (self
                             .scalar(i)
-                            .numeric_cmp(value)
-                            .map_or(false, |ord| ord == std::cmp::Ordering::Less)
+                            .numeric_cmp(value) == Some(std::cmp::Ordering::Less))
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -1099,7 +1097,7 @@ impl ColumnArray {
                         && self
                             .scalar(i)
                             .numeric_cmp(value)
-                            .map_or(false, |ord| ord != std::cmp::Ordering::Greater)
+                            .is_some_and(|ord| ord != std::cmp::Ordering::Greater)
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -1122,10 +1120,9 @@ impl ColumnArray {
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && self
+                        && (self
                             .scalar(i)
-                            .numeric_cmp(value)
-                            .map_or(false, |ord| ord == std::cmp::Ordering::Greater)
+                            .numeric_cmp(value) == Some(std::cmp::Ordering::Greater))
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -1151,7 +1148,7 @@ impl ColumnArray {
                         && self
                             .scalar(i)
                             .numeric_cmp(value)
-                            .map_or(false, |ord| ord != std::cmp::Ordering::Less)
+                            .is_some_and(|ord| ord != std::cmp::Ordering::Less)
                 })
                 .collect(),
             _ => vec![false; num_rows],

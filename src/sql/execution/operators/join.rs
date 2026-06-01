@@ -84,8 +84,7 @@ impl HashJoinExec {
         match self.join_type {
             JoinType::Right | JoinType::Full => {
                 // For RIGHT/FULL join, build hash table from right side
-                let right_key_cols: Vec<usize> =
-                    self.right_key_cols.iter().map(|&idx| idx).collect();
+                let right_key_cols = self.right_key_cols.to_vec();
                 let mut ht = JoinHashTable::new(right_key_cols);
                 while let Some(batch) = self.right.next_batch()? {
                     ht.insert_batch(batch);
@@ -444,35 +443,33 @@ impl HashJoinExec {
 
     /// Asof join: for each left row, find closest right row by timestamp.
     fn probe_asof(&mut self) -> Result<Option<RecordBatch>> {
-        loop {
-            if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
-                return self.drain_buffer();
-            }
-            let left_row = match self.get_next_left_row() {
-                Some(row) => row,
-                None => return Ok(None),
-            };
-            let ts_col = self.left_key_cols.first().copied().unwrap_or(0);
-            let probe_ts = left_row[ts_col].clone();
-            let found = {
-                let asof = self.asof_index.as_ref().unwrap();
-                asof.find_asof(&probe_ts)
-            };
-            if let Some(_ptr) = found {
-                let right_row: Vec<ScalarValue> = (0..self.right_schema.columns.len())
-                    .map(|_| ScalarValue::Int64(None))
-                    .collect();
-                self.probe_state
-                    .output_buffer
-                    .push((left_row, Some(right_row)));
-            } else {
-                let null_right = self.make_null_right_row();
-                self.probe_state
-                    .output_buffer
-                    .push((left_row, Some(null_right)));
-            }
+        if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
             return self.drain_buffer();
         }
+        let left_row = match self.get_next_left_row() {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+        let ts_col = self.left_key_cols.first().copied().unwrap_or(0);
+        let probe_ts = left_row[ts_col].clone();
+        let found = {
+            let asof = self.asof_index.as_ref().unwrap();
+            asof.find_asof(&probe_ts)
+        };
+        if let Some(_ptr) = found {
+            let right_row: Vec<ScalarValue> = (0..self.right_schema.columns.len())
+                .map(|_| ScalarValue::Int64(None))
+                .collect();
+            self.probe_state
+                .output_buffer
+                .push((left_row, Some(right_row)));
+        } else {
+            let null_right = self.make_null_right_row();
+            self.probe_state
+                .output_buffer
+                .push((left_row, Some(null_right)));
+        }
+        self.drain_buffer()
     }
 
     // --- Helper methods ---

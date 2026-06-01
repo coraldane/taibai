@@ -263,8 +263,8 @@ mod tests {
         bf.add(&ScalarValue::Int16(Some(1000)));
         bf.add(&ScalarValue::Int32(Some(100000)));
         bf.add(&ScalarValue::Int64(Some(10000000000)));
-        bf.add(&ScalarValue::Float32(Some(3.14)));
-        bf.add(&ScalarValue::Float64(Some(3.14159265358979)));
+        bf.add(&ScalarValue::Float32(Some(2.71)));
+        bf.add(&ScalarValue::Float64(Some(1.23456789)));
         bf.add(&ScalarValue::VarChar(Some("hello world".to_string())));
         bf.add(&ScalarValue::Date(Some(18628))); // 2021-01-01
 
@@ -273,8 +273,8 @@ mod tests {
         assert!(bf.might_contain(&ScalarValue::Int16(Some(1000))));
         assert!(bf.might_contain(&ScalarValue::Int32(Some(100000))));
         assert!(bf.might_contain(&ScalarValue::Int64(Some(10000000000))));
-        assert!(bf.might_contain(&ScalarValue::Float32(Some(3.14))));
-        assert!(bf.might_contain(&ScalarValue::Float64(Some(3.14159265358979))));
+        assert!(bf.might_contain(&ScalarValue::Float32(Some(2.71))));
+        assert!(bf.might_contain(&ScalarValue::Float64(Some(1.23456789))));
         assert!(bf.might_contain(&ScalarValue::VarChar(Some("hello world".to_string()))));
         assert!(bf.might_contain(&ScalarValue::Date(Some(18628))));
     }

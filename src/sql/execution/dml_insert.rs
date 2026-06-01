@@ -74,8 +74,8 @@ pub fn exec_insert(
 
     if can_direct_materialize(&schema, &provided_by_col, &is_missing_auto_inc) {
         for row in values {
-            for col_idx in 0..schema.columns.len() {
-                let val_idx = provided_by_col[col_idx].unwrap();
+            for (col_idx, provided) in provided_by_col.iter().enumerate() {
+                let val_idx = provided.unwrap();
                 push_literal_fast(
                     batch.column_mut(col_idx).unwrap(),
                     &row[val_idx],
@@ -86,11 +86,10 @@ pub fn exec_insert(
         }
     } else {
         for row in values {
-            for col_idx in 0..schema.columns.len() {
-                let is_auto_inc = is_missing_auto_inc[col_idx];
+            for (col_idx, is_auto_inc) in is_missing_auto_inc.iter().enumerate() {
                 let provided_idx = provided_by_col[col_idx];
 
-                if is_auto_inc && provided_idx.is_none() {
+                if *is_auto_inc && provided_idx.is_none() {
                     let next_val = match &auto_inc_counter {
                         Some(counter) => counter.next_value(),
                         None => engine.auto_increment_manager().next_value(db, table)?,
@@ -402,7 +401,7 @@ fn push_literal_fast(
 }
 
 fn decimal_multiplier(scale: i32) -> Result<i64> {
-    if scale < 0 || scale > 18 {
+    if !(0..=18).contains(&scale) {
         return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
     }
     10_i64

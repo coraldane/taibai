@@ -173,7 +173,7 @@ impl SegmentWriter {
         let footer = self.encode_footer_with_deletes(delete_bitmap, deleted_row_count)?;
         self.file.write_all(&footer)?;
 
-        self.file.write_all(&(footer_offset as u64).to_le_bytes())?;
+        self.file.write_all(&footer_offset.to_le_bytes())?;
 
         self.file.sync_all()?;
 
@@ -441,8 +441,8 @@ fn compute_segment_zone_maps(
         }
 
         segment_maps.push(ZoneMap {
-            min_value: seg_min.unwrap_or_else(|| ScalarValue::Int64(None)),
-            max_value: seg_max.unwrap_or_else(|| ScalarValue::Int64(None)),
+            min_value: seg_min.unwrap_or(ScalarValue::Int64(None)),
+            max_value: seg_max.unwrap_or(ScalarValue::Int64(None)),
             null_count: total_null_count,
             row_count: total_row_count,
         });

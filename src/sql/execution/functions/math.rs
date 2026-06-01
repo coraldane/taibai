@@ -121,14 +121,14 @@ pub fn tan(args: &[ScalarValue]) -> Result<ScalarValue> {
 
 pub fn asin(args: &[ScalarValue]) -> Result<ScalarValue> {
     match args_to_f64(args, 0) {
-        Some(v) if v >= -1.0 && v <= 1.0 => Ok(ScalarValue::Float64(Some(v.asin()))),
+        Some(v) if (-1.0..=1.0).contains(&v) => Ok(ScalarValue::Float64(Some(v.asin()))),
         _ => Ok(ScalarValue::Float64(None)),
     }
 }
 
 pub fn acos(args: &[ScalarValue]) -> Result<ScalarValue> {
     match args_to_f64(args, 0) {
-        Some(v) if v >= -1.0 && v <= 1.0 => Ok(ScalarValue::Float64(Some(v.acos()))),
+        Some(v) if (-1.0..=1.0).contains(&v) => Ok(ScalarValue::Float64(Some(v.acos()))),
         _ => Ok(ScalarValue::Float64(None)),
     }
 }

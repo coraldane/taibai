@@ -113,6 +113,6 @@ pub fn build_bloom_check_list(spec: &super::spec::ScanSpec) -> Vec<(usize, Scala
     spec.eq_predicates.clone()
 }
 
-pub fn build_in_check_list<'a>(spec: &'a super::spec::ScanSpec) -> Vec<&'a InPredicate> {
+pub fn build_in_check_list(spec: &super::spec::ScanSpec) -> Vec<&InPredicate> {
     spec.in_predicates.iter().collect()
 }

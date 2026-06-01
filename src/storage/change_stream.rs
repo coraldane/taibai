@@ -84,8 +84,8 @@ impl ChangeStream {
             .unwrap()
             .iter()
             .filter(|event| {
-                database.map_or(true, |db| event.database == db)
-                    && table.map_or(true, |table_name| event.table == table_name)
+                database.is_none_or(|db| event.database == db)
+                    && table.is_none_or(|table_name| event.table == table_name)
             })
             .cloned()
             .collect()

@@ -150,7 +150,7 @@ impl Parser {
                     let col = self.expect_ident()?;
                     let num_buckets = if self.peek() == &Token::Comma {
                         self.advance();
-                        self.expect_integer()? as i32
+                        self.expect_integer()?
                     } else {
                         10
                     };
@@ -164,7 +164,7 @@ impl Parser {
                         let col = self.expect_ident()?;
                         let param = if function_name == "MOD" {
                             self.expect(&Token::Comma)?;
-                            Some(self.expect_integer()? as i32)
+                            Some(self.expect_integer()?)
                         } else {
                             None
                         };
@@ -224,9 +224,9 @@ impl Parser {
         }
 
         let column = self.expect_ident()?;
-        if self.peek() == &Token::Comma {
-            self.advance();
-        } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INTERVAL")) {
+        if self.peek() == &Token::Comma
+            || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INTERVAL"))
+        {
             self.advance();
         }
         let duration_secs = self.expect_integer()? as i64;
