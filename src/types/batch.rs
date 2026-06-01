@@ -140,6 +140,15 @@ impl RecordBatch {
         Self { schema, columns }
     }
 
+    pub fn with_capacity(schema: Schema, capacity: usize) -> Self {
+        let columns = schema
+            .columns
+            .iter()
+            .map(|c| ColumnArray::with_capacity(c.data_type, capacity))
+            .collect();
+        Self { schema, columns }
+    }
+
     /// Create a RecordBatch from pre-built column arrays.
     /// Validates that the column count matches the schema.
     pub fn try_new(schema: Schema, columns: Vec<ColumnArray>) -> Result<Self> {

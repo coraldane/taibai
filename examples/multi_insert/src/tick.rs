@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const TICK_CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS {table} ( \
     security_id VARCHAR, \
     deal_date INT32, \
@@ -33,7 +35,7 @@ pub const TICK_CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS {table} ( \
     bid_vol4 INT32, \
     bid_vol5 INT32, \
     local_time TIMESTAMP \
-) PARTITION BY deal_date CLUSTER BY security_id";
+) PARTITION BY deal_date";
 
 pub struct TickElement {
     pub security_id: String,
@@ -209,9 +211,7 @@ pub fn parse_tick_csv_line(line: &str) -> Option<TickElement> {
 
 pub fn build_multi_insert_sql(table: &str, batch: &[TickElement]) -> String {
     let mut sb = String::with_capacity(batch.len() * 300);
-    sb.push_str("INSERT INTO ");
-    sb.push_str(table);
-    sb.push_str(" (security_id, deal_date, deal_time, pre_close, open_px, high_px, low_px, close_px, high_limit, low_limit, total_num_trade, trans_volume, trans_value, ask_px1, ask_px2, ask_px3, ask_px4, ask_px5, ask_vol1, ask_vol2, ask_vol3, ask_vol4, ask_vol5, bid_px1, bid_px2, bid_px3, bid_px4, bid_px5, bid_vol1, bid_vol2, bid_vol3, bid_vol4, bid_vol5, local_time) VALUES ");
+    append_insert_prefix(table, &mut sb);
 
     let mut dec_buf = DecBuf::new();
     let mut int_buf = IntBuf::new();
@@ -298,6 +298,127 @@ pub fn build_multi_insert_sql(table: &str, batch: &[TickElement]) -> String {
     }
 
     sb
+}
+
+pub fn append_insert_prefix(table: &str, sb: &mut String) {
+    sb.push_str("INSERT INTO ");
+    sb.push_str(table);
+    sb.push_str(" (security_id, deal_date, deal_time, pre_close, open_px, high_px, low_px, close_px, high_limit, low_limit, total_num_trade, trans_volume, trans_value, ask_px1, ask_px2, ask_px3, ask_px4, ask_px5, ask_vol1, ask_vol2, ask_vol3, ask_vol4, ask_vol5, bid_px1, bid_px2, bid_px3, bid_px4, bid_px5, bid_vol1, bid_vol2, bid_vol3, bid_vol4, bid_vol5, local_time) VALUES ");
+}
+
+pub fn append_tick_csv_values(line: &str, sb: &mut String) -> bool {
+    let args: Vec<&str> = line.split(',').collect();
+    if args.len() < 13 {
+        return false;
+    }
+
+    let deal_date = parse_int32(args[1]);
+    if deal_date == 0 {
+        return false;
+    }
+
+    let mut int_buf = IntBuf::new();
+    sb.push('(');
+    sb.push('\'');
+    escape_string_into(args[0].trim(), sb);
+    sb.push('\'');
+    sb.push(',');
+    write_i32(&mut int_buf, sb, deal_date);
+    sb.push(',');
+    append_i32_field(&args, 2, &mut int_buf, sb);
+    sb.push(',');
+    append_decimal_field(&args, 3, sb);
+    sb.push(',');
+    append_decimal_field(&args, 4, sb);
+    sb.push(',');
+    append_decimal_field(&args, 5, sb);
+    sb.push(',');
+    append_decimal_field(&args, 6, sb);
+    sb.push(',');
+    append_decimal_field(&args, 7, sb);
+    sb.push(',');
+    append_decimal_field(&args, 8, sb);
+    sb.push(',');
+    append_decimal_field(&args, 9, sb);
+    sb.push(',');
+    append_i32_field(&args, 10, &mut int_buf, sb);
+    sb.push(',');
+    append_i64_field(&args, 11, &mut int_buf, sb);
+    sb.push(',');
+    append_decimal_field(&args, 12, sb);
+    sb.push(',');
+    append_decimal_field(&args, 13, sb);
+    sb.push(',');
+    append_decimal_field(&args, 14, sb);
+    sb.push(',');
+    append_decimal_field(&args, 15, sb);
+    sb.push(',');
+    append_decimal_field(&args, 16, sb);
+    sb.push(',');
+    append_decimal_field(&args, 17, sb);
+    sb.push(',');
+    append_i32_field(&args, 18, &mut int_buf, sb);
+    sb.push(',');
+    append_i32_field(&args, 19, &mut int_buf, sb);
+    sb.push(',');
+    append_i32_field(&args, 20, &mut int_buf, sb);
+    sb.push(',');
+    append_i32_field(&args, 21, &mut int_buf, sb);
+    sb.push(',');
+    append_i32_field(&args, 22, &mut int_buf, sb);
+    sb.push(',');
+    append_decimal_field(&args, 23, sb);
+    sb.push(',');
+    append_decimal_field(&args, 24, sb);
+    sb.push(',');
+    append_decimal_field(&args, 25, sb);
+    sb.push(',');
+    append_decimal_field(&args, 26, sb);
+    sb.push(',');
+    append_decimal_field(&args, 27, sb);
+    sb.push(',');
+    append_i32_field(&args, 28, &mut int_buf, sb);
+    sb.push(',');
+    append_i32_field(&args, 29, &mut int_buf, sb);
+    sb.push(',');
+    append_i32_field(&args, 30, &mut int_buf, sb);
+    sb.push(',');
+    append_i32_field(&args, 31, &mut int_buf, sb);
+    sb.push(',');
+    append_i32_field(&args, 32, &mut int_buf, sb);
+    sb.push(',');
+    if args.len() > 33 && !args[33].trim().is_empty() {
+        write_i64(&mut int_buf, sb, parse_timestamp(args[33].trim()));
+    } else {
+        sb.push_str("NULL");
+    }
+    sb.push(')');
+    true
+}
+
+fn append_decimal_field(args: &[&str], idx: usize, sb: &mut String) {
+    let value = args.get(idx).map(|s| s.trim()).unwrap_or("");
+    if value.is_empty() {
+        sb.push('0');
+    } else {
+        sb.push_str(value);
+    }
+}
+
+fn append_i32_field(args: &[&str], idx: usize, int_buf: &mut IntBuf, sb: &mut String) {
+    write_i32(
+        int_buf,
+        sb,
+        args.get(idx).map(|s| parse_int32(s)).unwrap_or(0),
+    );
+}
+
+fn append_i64_field(args: &[&str], idx: usize, int_buf: &mut IntBuf, sb: &mut String) {
+    write_i64(
+        int_buf,
+        sb,
+        args.get(idx).map(|s| parse_int64(s)).unwrap_or(0),
+    );
 }
 
 struct DecBuf {

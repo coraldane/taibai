@@ -5,11 +5,12 @@ use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
 use monax::net::client::{BulkImportConfig, Client};
-use tick::{build_multi_insert_sql, parse_tick_csv_line, TICK_CREATE_TABLE_SQL};
+use tick::{append_insert_prefix, append_tick_csv_values, TICK_CREATE_TABLE_SQL};
 
 const TICK_TABLE: &str = "stock_tick_multi";
 const DEFAULT_BATCH_SIZE: usize = 5000;
-const PIPELINE_DEPTH: usize = 4;
+const PIPELINE_DEPTH: usize = 8;
+const DEFAULT_CLIENTS: usize = 4;
 
 macro_rules! log_msg {
     ($($arg:tt)*) => {
@@ -45,7 +46,12 @@ fn print_usage() {
         "  --pipeline=<n>    Pipeline depth (default: {})",
         PIPELINE_DEPTH
     );
+    eprintln!(
+        "  --clients=<n>     Parallel client connections (default: {})",
+        DEFAULT_CLIENTS
+    );
     eprintln!("  --bulk            Use START/STOP BULK IMPORT mode");
+    eprintln!("  --no-bulk         Use ordinary INSERT visibility/durability path (default)");
     eprintln!();
     eprintln!(
         "This tool tests regular SQL INSERT performance (INSERT ... VALUES (...), (...), ...)."
@@ -98,6 +104,13 @@ async fn main() {
         .unwrap_or(PIPELINE_DEPTH);
 
     let use_bulk = args.iter().any(|a| a == "--bulk");
+    let client_count = args
+        .iter()
+        .find(|a| a.starts_with("--clients="))
+        .and_then(|a| a.split('=').nth(1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CLIENTS)
+        .clamp(1, 16);
 
     log_msg!("Connecting to {} ...", host);
     let mut client = Client::connect(host).await.expect("connect failed");
@@ -123,20 +136,33 @@ async fn main() {
         .expect("create table failed");
     log_msg!("Created table {}.", TICK_TABLE);
 
+    let mut clients = vec![client];
+    for _ in 1..client_count {
+        let mut extra = Client::connect(host).await.expect("connect failed");
+        extra
+            .login("root", "taibai", &database)
+            .await
+            .expect("login failed");
+        clients.push(extra);
+    }
+
     if use_bulk {
         log_msg!("Starting bulk import mode (WAL deferred sync, delayed catalog save)...");
-        client
-            .start_bulk_import(&BulkImportConfig { disable_wal: false })
-            .await
-            .expect("start bulk import failed");
+        for client in &mut clients {
+            client
+                .start_bulk_import(&BulkImportConfig { disable_wal: false })
+                .await
+                .expect("start bulk import failed");
+        }
     }
 
     log_msg!("Starting pipelined multi-value INSERT mode...");
     log_msg!(
-        "Importing from '{}' (batch_size={}, pipeline_depth={})",
+        "Importing from '{}' (batch_size={}, pipeline_depth={}, clients={})",
         csv_path,
         batch_size,
-        pipeline_depth
+        pipeline_depth,
+        clients.len()
     );
 
     let start_time = Instant::now();
@@ -147,7 +173,7 @@ async fn main() {
         skip_header,
         max_rows,
         pipeline_depth,
-        &mut client,
+        &mut clients,
     )
     .await;
 
@@ -165,24 +191,34 @@ async fn main() {
         Err(e) => {
             eprintln!("Import failed: {}", e);
             if use_bulk {
-                let _ = client.stop_bulk_import().await;
+                for client in &mut clients {
+                    let _ = client.stop_bulk_import().await;
+                }
             }
-            let _ = client.logout().await;
-            let _ = client.close().await;
+            for mut client in clients {
+                let _ = client.logout().await;
+                let _ = client.close().await;
+            }
             std::process::exit(1);
         }
     }
 
     if use_bulk {
         log_msg!("Stopping bulk import (flushing buffers + WAL sync + catalog save)...");
-        match client.stop_bulk_import().await {
-            Ok(rows) => log_msg!("Flushed {} buffered rows.", rows),
-            Err(e) => eprintln!("Stop bulk import warning: {}", e),
+        let mut flushed = 0u64;
+        for client in &mut clients {
+            match client.stop_bulk_import().await {
+                Ok(rows) => flushed += rows,
+                Err(e) => eprintln!("Stop bulk import warning: {}", e),
+            }
         }
+        log_msg!("Flushed {} buffered rows.", flushed);
     }
 
-    let _ = client.logout().await;
-    let _ = client.close().await;
+    for mut client in clients {
+        let _ = client.logout().await;
+        let _ = client.close().await;
+    }
     log_msg!("Done.");
 }
 
@@ -192,17 +228,20 @@ async fn import_ticks_pipelined(
     skip_header: bool,
     max_rows: u64,
     pipeline_depth: usize,
-    client: &mut Client,
+    clients: &mut [Client],
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(csv_path)?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
 
-    let mut batch: Vec<tick::TickElement> = Vec::with_capacity(batch_size);
+    let mut sql = String::with_capacity(batch_size * 300);
+    append_insert_prefix(TICK_TABLE, &mut sql);
+    let mut batch_rows: usize = 0;
     let mut read_count: u64 = 0;
     let mut parsed_count: u64 = 0;
     let mut sent_count: u64 = 0;
     let mut line_num: u64 = 0;
-    let mut in_flight: usize = 0;
+    let mut in_flight = vec![0usize; clients.len()];
+    let mut next_client = 0usize;
 
     let start_time = Instant::now();
     let mut last_progress_time = Instant::now();
@@ -226,24 +265,32 @@ async fn import_ticks_pipelined(
             break;
         }
 
-        let elem = match parse_tick_csv_line(trimmed) {
-            Some(e) => e,
-            None => continue,
-        };
+        if batch_rows > 0 {
+            sql.push_str(", ");
+        }
+        if !append_tick_csv_values(trimmed, &mut sql) {
+            if batch_rows > 0 {
+                sql.truncate(sql.len() - 2);
+            }
+            continue;
+        }
 
         parsed_count += 1;
-        batch.push(elem);
+        batch_rows += 1;
 
-        if batch.len() >= batch_size {
-            let sql = build_multi_insert_sql(TICK_TABLE, &batch);
-            client.send_execute(&sql).await?;
-            sent_count += batch.len() as u64;
-            in_flight += 1;
-            batch.clear();
+        if batch_rows >= batch_size {
+            let client_idx = next_client;
+            next_client = (next_client + 1) % clients.len();
+            clients[client_idx].send_execute(&sql).await?;
+            sent_count += batch_rows as u64;
+            in_flight[client_idx] += 1;
+            sql.clear();
+            append_insert_prefix(TICK_TABLE, &mut sql);
+            batch_rows = 0;
 
-            if in_flight >= pipeline_depth {
-                client.recv_execute_result().await?;
-                in_flight -= 1;
+            if in_flight[client_idx] >= pipeline_depth {
+                clients[client_idx].recv_execute_result().await?;
+                in_flight[client_idx] -= 1;
             }
 
             let now = Instant::now();
@@ -261,14 +308,16 @@ async fn import_ticks_pipelined(
         }
     }
 
-    if !batch.is_empty() {
-        let sql = build_multi_insert_sql(TICK_TABLE, &batch);
-        client.send_execute(&sql).await?;
-        in_flight += 1;
+    if batch_rows > 0 {
+        let client_idx = next_client;
+        clients[client_idx].send_execute(&sql).await?;
+        in_flight[client_idx] += 1;
     }
 
-    for _ in 0..in_flight {
-        client.recv_execute_result().await?;
+    for client_idx in 0..clients.len() {
+        for _ in 0..in_flight[client_idx] {
+            clients[client_idx].recv_execute_result().await?;
+        }
     }
 
     Ok(parsed_count)

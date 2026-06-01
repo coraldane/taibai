@@ -5,6 +5,7 @@ use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::index::sort_key::SortKeyInserter;
 use crate::storage::segment_manager::SegmentManager;
+use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -48,11 +49,20 @@ pub fn exec_insert(
 
     let col_indices = resolve_insert_columns(&schema, columns, values)?;
 
+    let mut provided_by_col = vec![None; schema.columns.len()];
+    for (value_idx, &col_idx) in col_indices.iter().enumerate() {
+        provided_by_col[col_idx] = Some(value_idx);
+    }
+
     let missing_auto_inc: Vec<usize> = auto_inc_cols
         .iter()
-        .filter(|&idx| !col_indices.contains(idx))
+        .filter(|&idx| provided_by_col[*idx].is_none())
         .cloned()
         .collect();
+    let mut is_missing_auto_inc = vec![false; schema.columns.len()];
+    for &idx in &missing_auto_inc {
+        is_missing_auto_inc[idx] = true;
+    }
 
     let auto_inc_counter = if !missing_auto_inc.is_empty() {
         engine.auto_increment_manager().get(db, table)
@@ -60,50 +70,70 @@ pub fn exec_insert(
         None
     };
 
-    let mut batch = RecordBatch::new(schema.clone());
+    let mut batch = RecordBatch::with_capacity(schema.clone(), values.len());
 
-    for row in values {
-        for col_idx in 0..schema.columns.len() {
-            let is_auto_inc = missing_auto_inc.contains(&col_idx);
-            let provided_idx = col_indices.iter().position(|&i| i == col_idx);
-
-            if is_auto_inc && provided_idx.is_none() {
-                let next_val = match &auto_inc_counter {
-                    Some(counter) => counter.next_value(),
-                    None => engine.auto_increment_manager().next_value(db, table)?,
-                };
-                let scalar = match schema.columns[col_idx].data_type {
-                    crate::protocol::types::DataType::Int32 => {
-                        ScalarValue::Int32(Some(next_val as i32))
-                    }
-                    crate::protocol::types::DataType::Int64 => {
-                        ScalarValue::Int64(Some(next_val as i64))
-                    }
-                    crate::protocol::types::DataType::UInt32 => {
-                        ScalarValue::UInt32(Some(next_val as u32))
-                    }
-                    crate::protocol::types::DataType::UInt64 => ScalarValue::UInt64(Some(next_val)),
-                    _ => ScalarValue::Int64(Some(next_val as i64)),
-                };
-                batch.column_mut(col_idx).unwrap().push(&scalar)?;
-            } else if let Some(val_idx) = provided_idx {
-                let scalar = eval_expr_to_scalar_with_scale_timezone(
+    if can_direct_materialize(&schema, &provided_by_col, &is_missing_auto_inc) {
+        for row in values {
+            for col_idx in 0..schema.columns.len() {
+                let val_idx = provided_by_col[col_idx].unwrap();
+                push_literal_fast(
+                    batch.column_mut(col_idx).unwrap(),
                     &row[val_idx],
-                    &schema.columns[col_idx].data_type,
                     schema.columns[col_idx].scale,
                     timezone_offset_hours,
                 )?;
-                validate_nullable(&schema, col_idx, &scalar)?;
-                batch.column_mut(col_idx).unwrap().push(&scalar)?;
-            } else if let Some(default) = &schema.columns[col_idx].default_value {
-                let scalar =
-                    materialize_default_value(default, &schema, col_idx, timezone_offset_hours)?;
-                validate_nullable(&schema, col_idx, &scalar)?;
-                batch.column_mut(col_idx).unwrap().push(&scalar)?;
-            } else {
-                let scalar = ScalarValue::null_for_type(schema.columns[col_idx].data_type);
-                validate_nullable(&schema, col_idx, &scalar)?;
-                batch.column_mut(col_idx).unwrap().push(&scalar)?;
+            }
+        }
+    } else {
+        for row in values {
+            for col_idx in 0..schema.columns.len() {
+                let is_auto_inc = is_missing_auto_inc[col_idx];
+                let provided_idx = provided_by_col[col_idx];
+
+                if is_auto_inc && provided_idx.is_none() {
+                    let next_val = match &auto_inc_counter {
+                        Some(counter) => counter.next_value(),
+                        None => engine.auto_increment_manager().next_value(db, table)?,
+                    };
+                    let scalar = match schema.columns[col_idx].data_type {
+                        crate::protocol::types::DataType::Int32 => {
+                            ScalarValue::Int32(Some(next_val as i32))
+                        }
+                        crate::protocol::types::DataType::Int64 => {
+                            ScalarValue::Int64(Some(next_val as i64))
+                        }
+                        crate::protocol::types::DataType::UInt32 => {
+                            ScalarValue::UInt32(Some(next_val as u32))
+                        }
+                        crate::protocol::types::DataType::UInt64 => {
+                            ScalarValue::UInt64(Some(next_val))
+                        }
+                        _ => ScalarValue::Int64(Some(next_val as i64)),
+                    };
+                    batch.column_mut(col_idx).unwrap().push(&scalar)?;
+                } else if let Some(val_idx) = provided_idx {
+                    let scalar = eval_expr_to_scalar_with_scale_timezone(
+                        &row[val_idx],
+                        &schema.columns[col_idx].data_type,
+                        schema.columns[col_idx].scale,
+                        timezone_offset_hours,
+                    )?;
+                    validate_nullable(&schema, col_idx, &scalar)?;
+                    batch.column_mut(col_idx).unwrap().push(&scalar)?;
+                } else if let Some(default) = &schema.columns[col_idx].default_value {
+                    let scalar = materialize_default_value(
+                        default,
+                        &schema,
+                        col_idx,
+                        timezone_offset_hours,
+                    )?;
+                    validate_nullable(&schema, col_idx, &scalar)?;
+                    batch.column_mut(col_idx).unwrap().push(&scalar)?;
+                } else {
+                    let scalar = ScalarValue::null_for_type(schema.columns[col_idx].data_type);
+                    validate_nullable(&schema, col_idx, &scalar)?;
+                    batch.column_mut(col_idx).unwrap().push(&scalar)?;
+                }
             }
         }
     }
@@ -139,23 +169,24 @@ pub fn exec_insert(
     }
 
     if bulk_import_mode {
-        engine.exec_bulk_insert_with_wal_control(db, table, batch, false)?;
+        engine.exec_bulk_insert_partitioned_with_wal_control(
+            db,
+            table,
+            &table_meta,
+            batch,
+            false,
+        )?;
     } else {
         write_batch_by_partition(engine, db, table, &table_meta, batch, schema, txn_id)?;
     }
 
-    {
-        let mut catalogs = engine.catalogs().write().unwrap();
-        if let Some(catalog) = catalogs.get_mut(db) {
-            if let Some(meta) = catalog.get_table_mut(table) {
-                meta.row_count += values.len() as i64;
-            }
-            if !bulk_import_mode {
-                let meta_dir = engine.data_dir().join("meta");
-                catalog.save(&meta_dir)?;
-            }
-        }
-    }
+    engine.record_inserted_rows(
+        db,
+        table,
+        values.len() as i64,
+        !bulk_import_mode && (txn_id > 0 || !auto_inc_cols.is_empty()),
+        !bulk_import_mode && txn_id == 0 && auto_inc_cols.is_empty(),
+    )?;
 
     Ok(ExecResult::Ok {
         rows_affected: row_count,
@@ -171,6 +202,25 @@ fn write_batch_by_partition(
     schema: Schema,
     txn_id: u64,
 ) -> Result<()> {
+    if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
+        engine
+            .batch_writer()
+            .write_columns_with_txn(db, table, "", batch, schema, txn_id)?;
+        return Ok(());
+    }
+
+    if let Some(partition_key) = single_partition_key(table_meta, &batch) {
+        engine.batch_writer().write_columns_with_txn(
+            db,
+            table,
+            &partition_key,
+            batch,
+            schema,
+            txn_id,
+        )?;
+        return Ok(());
+    }
+
     let groups = partition_masks(table_meta, &batch);
     if groups.len() <= 1 {
         let partition_key = groups
@@ -201,6 +251,28 @@ fn write_batch_by_partition(
         )?;
     }
     Ok(())
+}
+
+fn single_partition_key(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    batch: &RecordBatch,
+) -> Option<String> {
+    let col_idx = table_meta.get_partition_column_index_cached()?;
+    let first = batch
+        .scalar(0, col_idx)
+        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
+    let first_key = compute_partition_key_for_value(table_meta, &first);
+
+    for row_idx in 1..batch.num_rows() {
+        let val = batch
+            .scalar(row_idx, col_idx)
+            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
+        if compute_partition_key_for_value(table_meta, &val) != first_key {
+            return None;
+        }
+    }
+
+    Some(first_key)
 }
 
 fn partition_masks(
@@ -246,6 +318,96 @@ fn filter_batch_by_mask(
         .map(|col| col.filter_by_mask_fast(mask, match_count))
         .collect();
     RecordBatch::try_new(batch.schema.clone(), columns)
+}
+
+fn can_direct_materialize(
+    schema: &Schema,
+    provided_by_col: &[Option<usize>],
+    is_missing_auto_inc: &[bool],
+) -> bool {
+    schema.columns.iter().enumerate().all(|(idx, col)| {
+        provided_by_col[idx].is_some()
+            && !is_missing_auto_inc[idx]
+            && col.default_value.is_none()
+            && col.nullable
+            && !col.primary_key
+    })
+}
+
+fn push_literal_fast(
+    col: &mut ColumnArray,
+    expr: &Expr,
+    scale: i32,
+    timezone_offset_hours: i32,
+) -> Result<()> {
+    let Expr::Literal(value) = expr else {
+        return col.push(&eval_expr_to_scalar_with_scale_timezone(
+            expr,
+            &col.data_type(),
+            scale,
+            timezone_offset_hours,
+        )?);
+    };
+
+    if value.is_null() {
+        return col.push(&ScalarValue::null_for_type(col.data_type()));
+    }
+
+    match (col, value) {
+        (ColumnArray::Int32 { data, bitmap }, ScalarValue::Int64(Some(v))) => {
+            data.push(
+                i32::try_from(*v)
+                    .map_err(|_| MonaxError::Sql(format!("value '{}' overflows INT32", v)))?,
+            );
+            bitmap.push_valid();
+            Ok(())
+        }
+        (ColumnArray::Int64 { data, bitmap }, ScalarValue::Int64(Some(v))) => {
+            data.push(*v);
+            bitmap.push_valid();
+            Ok(())
+        }
+        (ColumnArray::Timestamp { data, bitmap }, ScalarValue::Int64(Some(v))) => {
+            data.push(*v);
+            bitmap.push_valid();
+            Ok(())
+        }
+        (ColumnArray::Decimal { data, bitmap }, ScalarValue::Float64(Some(v))) => {
+            let multiplier = decimal_multiplier(scale)?;
+            data.push((*v * multiplier as f64).round() as i64);
+            bitmap.push_valid();
+            Ok(())
+        }
+        (ColumnArray::Decimal { data, bitmap }, ScalarValue::Int64(Some(v))) => {
+            let multiplier = decimal_multiplier(scale)?;
+            data.push(v.checked_mul(multiplier).ok_or_else(|| {
+                MonaxError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
+            })?);
+            bitmap.push_valid();
+            Ok(())
+        }
+        (ColumnArray::VarChar { data, bitmap }, ScalarValue::VarChar(Some(v))) => {
+            data.push(v.clone());
+            bitmap.push_valid();
+            Ok(())
+        }
+        (col, value) if col.data_type() == value.data_type() => col.push(value),
+        (col, value) => col.push(&eval_expr_to_scalar_with_scale_timezone(
+            &Expr::Literal(value.clone()),
+            &col.data_type(),
+            scale,
+            timezone_offset_hours,
+        )?),
+    }
+}
+
+fn decimal_multiplier(scale: i32) -> Result<i64> {
+    if scale < 0 || scale > 18 {
+        return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
+    }
+    10_i64
+        .checked_pow(scale as u32)
+        .ok_or_else(|| MonaxError::Sql(format!("invalid decimal scale {}", scale)))
 }
 
 fn resolve_insert_columns(

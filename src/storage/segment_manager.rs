@@ -866,7 +866,17 @@ impl SegmentManager {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition(db, table, "", batch)
+        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
+    }
+
+    pub fn bulk_insert_batch_deferred(
+        &self,
+        db: &str,
+        table: &str,
+        batch: RecordBatch,
+        _disable_wal: bool,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, false)
     }
 
     pub fn bulk_insert_batch_with_partition(
@@ -875,6 +885,27 @@ impl SegmentManager {
         table: &str,
         partition_key: &str,
         batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, true)
+    }
+
+    pub fn bulk_insert_batch_with_partition_deferred(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, false)
+    }
+
+    fn bulk_insert_batch_with_partition_inner(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+        flush_immediately: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
@@ -902,7 +933,7 @@ impl SegmentManager {
             if seg.current_size >= self.max_segment_size() {
                 seg.seal(&|path| self.invalidate_reader(path))?;
                 active_guard.remove(partition_key);
-            } else if seg.buffered_rows > 0 || seg.total_rows > 0 {
+            } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
                 if let Some(_) = seg.flush_buffer(&|path| self.invalidate_reader(path))? {}
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
             }
@@ -1285,20 +1316,55 @@ impl SegmentManager {
         Ok(req.row_count as u64)
     }
 
-    fn bulk_insert_batch_partitioned(
+    pub fn bulk_insert_batch_partitioned(
         &self,
         db: &str,
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: RecordBatch,
     ) -> Result<u64> {
+        self.bulk_insert_batch_partitioned_inner(db, table, table_meta, batch, true)
+    }
+
+    pub fn bulk_insert_batch_partitioned_deferred(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_partitioned_inner(db, table, table_meta, batch, false)
+    }
+
+    fn bulk_insert_batch_partitioned_inner(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: RecordBatch,
+        flush_immediately: bool,
+    ) -> Result<u64> {
         if !table_meta.is_partitioned() {
-            return self.bulk_insert_batch_with_partition(db, table, "", batch);
+            return self.bulk_insert_batch_with_partition_inner(
+                db,
+                table,
+                "",
+                batch,
+                flush_immediately,
+            );
         }
 
         let pk_idx = match table_meta.get_partition_column_index_cached() {
             Some(idx) => idx,
-            None => return self.bulk_insert_batch_with_partition(db, table, "", batch),
+            None => {
+                return self.bulk_insert_batch_with_partition_inner(
+                    db,
+                    table,
+                    "",
+                    batch,
+                    flush_immediately,
+                )
+            }
         };
         let mut key_order = Vec::new();
         let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
@@ -1323,8 +1389,13 @@ impl SegmentManager {
             };
             let match_count = mask.iter().filter(|keep| **keep).count();
             let part_batch = filter_batch_by_mask(&batch, &mask, match_count)?;
-            written +=
-                self.bulk_insert_batch_with_partition(db, table, &partition_key, part_batch)?;
+            written += self.bulk_insert_batch_with_partition_inner(
+                db,
+                table,
+                &partition_key,
+                part_batch,
+                flush_immediately,
+            )?;
         }
         Ok(written)
     }

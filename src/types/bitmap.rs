@@ -13,6 +13,13 @@ impl NullBitmap {
         }
     }
 
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(Self::u64_count(capacity)),
+            len: 0,
+        }
+    }
+
     pub fn new_all_null(len: usize) -> Self {
         let u64_count = Self::u64_count(len);
         let mut data = vec![u64::MAX; u64_count];

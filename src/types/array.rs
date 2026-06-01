@@ -170,6 +170,88 @@ impl ColumnArray {
         }
     }
 
+    pub fn with_capacity(dt: DataType, capacity: usize) -> Self {
+        let bitmap = || NullBitmap::with_capacity(capacity);
+        match dt {
+            DataType::Bool => ColumnArray::Bool {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Int8 => ColumnArray::Int8 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Int16 => ColumnArray::Int16 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Int32 => ColumnArray::Int32 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Int64 => ColumnArray::Int64 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::UInt8 => ColumnArray::UInt8 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::UInt16 => ColumnArray::UInt16 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::UInt32 => ColumnArray::UInt32 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::UInt64 => ColumnArray::UInt64 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Float32 => ColumnArray::Float32 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Float64 => ColumnArray::Float64 {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Decimal => ColumnArray::Decimal {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Date => ColumnArray::Date {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Time => ColumnArray::Time {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Timestamp => ColumnArray::Timestamp {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Interval => ColumnArray::Interval {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::VarChar => ColumnArray::VarChar {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Blob => ColumnArray::Blob {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+            DataType::Vector => ColumnArray::Vector {
+                data: Vec::with_capacity(capacity),
+                bitmap: bitmap(),
+            },
+        }
+    }
+
     /// Returns the DataType of this column.
     pub fn data_type(&self) -> DataType {
         match self {
@@ -600,10 +682,163 @@ impl ColumnArray {
                 other.data_type().display_name(),
             )));
         }
-        for i in 0..other.len() {
-            self.push(&other.scalar(i))?;
+
+        macro_rules! extend_copy_column {
+            ($data:expr, $bitmap:expr, $other_data:expr, $other_bitmap:expr) => {{
+                $data.extend_from_slice($other_data);
+                $bitmap.extend($other_bitmap);
+                return Ok(());
+            }};
         }
-        Ok(())
+
+        match (self, other) {
+            (
+                ColumnArray::Bool { data, bitmap },
+                ColumnArray::Bool {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Int8 { data, bitmap },
+                ColumnArray::Int8 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Int16 { data, bitmap },
+                ColumnArray::Int16 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Int32 { data, bitmap },
+                ColumnArray::Int32 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Int64 { data, bitmap },
+                ColumnArray::Int64 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::UInt8 { data, bitmap },
+                ColumnArray::UInt8 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::UInt16 { data, bitmap },
+                ColumnArray::UInt16 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::UInt32 { data, bitmap },
+                ColumnArray::UInt32 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::UInt64 { data, bitmap },
+                ColumnArray::UInt64 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Float32 { data, bitmap },
+                ColumnArray::Float32 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Float64 { data, bitmap },
+                ColumnArray::Float64 {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Decimal { data, bitmap },
+                ColumnArray::Decimal {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Date { data, bitmap },
+                ColumnArray::Date {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Time { data, bitmap },
+                ColumnArray::Time {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Timestamp { data, bitmap },
+                ColumnArray::Timestamp {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::Interval { data, bitmap },
+                ColumnArray::Interval {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => extend_copy_column!(data, bitmap, other_data, other_bitmap),
+            (
+                ColumnArray::VarChar { data, bitmap },
+                ColumnArray::VarChar {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => {
+                data.extend(other_data.iter().cloned());
+                bitmap.extend(other_bitmap);
+                return Ok(());
+            }
+            (
+                ColumnArray::Blob { data, bitmap },
+                ColumnArray::Blob {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => {
+                data.extend(other_data.iter().cloned());
+                bitmap.extend(other_bitmap);
+                return Ok(());
+            }
+            (
+                ColumnArray::Vector { data, bitmap },
+                ColumnArray::Vector {
+                    data: other_data,
+                    bitmap: other_bitmap,
+                },
+            ) => {
+                data.extend(other_data.iter().cloned());
+                bitmap.extend(other_bitmap);
+                return Ok(());
+            }
+            _ => unreachable!("column type checked before extend"),
+        }
     }
 }
 

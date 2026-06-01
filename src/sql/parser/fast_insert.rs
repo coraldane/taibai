@@ -199,31 +199,49 @@ pub fn try_fast_parse_insert(sql: &str) -> Option<Result<Statement>> {
 }
 
 #[inline]
-fn parse_number(sql: &str, bytes: &[u8], start: usize, len: usize) -> Option<(ScalarValue, usize)> {
+fn parse_number(
+    _sql: &str,
+    bytes: &[u8],
+    start: usize,
+    len: usize,
+) -> Option<(ScalarValue, usize)> {
     let mut pos = start;
+    let negative = bytes[pos] == b'-';
     if bytes[pos] == b'-' {
         pos += 1;
     }
+    let mut int_value: i64 = 0;
     while pos < len && bytes[pos].is_ascii_digit() {
+        int_value = int_value
+            .checked_mul(10)?
+            .checked_add((bytes[pos] - b'0') as i64)?;
         pos += 1;
     }
     let mut has_fraction = false;
+    let mut frac_value: f64 = 0.0;
+    let mut frac_divisor: f64 = 1.0;
     if pos < len && bytes[pos] == b'.' {
         has_fraction = true;
         pos += 1;
         let fraction_start = pos;
         while pos < len && bytes[pos].is_ascii_digit() {
+            frac_value = frac_value * 10.0 + f64::from(bytes[pos] - b'0');
+            frac_divisor *= 10.0;
             pos += 1;
         }
         if pos == fraction_start {
             return None;
         }
     }
-    let s = &sql[start..pos];
     if has_fraction {
-        Some((ScalarValue::Float64(Some(s.parse::<f64>().ok()?)), pos))
+        let mut value = int_value as f64 + frac_value / frac_divisor;
+        if negative {
+            value = -value;
+        }
+        Some((ScalarValue::Float64(Some(value)), pos))
     } else {
-        Some((ScalarValue::Int64(Some(s.parse::<i64>().ok()?)), pos))
+        let value = if negative { -int_value } else { int_value };
+        Some((ScalarValue::Int64(Some(value)), pos))
     }
 }
 

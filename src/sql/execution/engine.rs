@@ -2,7 +2,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::common::error::{MonaxError, Result};
 use crate::net::session::Session;
@@ -34,6 +35,7 @@ pub enum ExecResult {
 pub struct Engine {
     data_dir: PathBuf,
     catalogs: RwLock<HashMap<String, DatabaseCatalog>>,
+    catalog_save_state: Mutex<CatalogSaveState>,
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
     bulk_mode: AtomicBool,
@@ -42,6 +44,14 @@ pub struct Engine {
     index_manager: Arc<IndexManager>,
     change_stream: Arc<ChangeStream>,
 }
+
+struct CatalogSaveState {
+    pending_insert_rows: u64,
+    last_save_at: Instant,
+}
+
+const CATALOG_SAVE_INSERT_ROWS: u64 = 500_000;
+const CATALOG_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Engine {
     pub fn new(data_dir: &Path, default_database: &str) -> Result<Self> {
@@ -120,6 +130,10 @@ impl Engine {
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             catalogs: RwLock::new(catalogs),
+            catalog_save_state: Mutex::new(CatalogSaveState {
+                pending_insert_rows: 0,
+                last_save_at: Instant::now(),
+            }),
             segment_mgr,
             batch_writer,
             bulk_mode: AtomicBool::new(false),
@@ -783,12 +797,52 @@ impl Engine {
                 let _ = catalog.save(&meta_dir);
             }
         }
+        {
+            let mut state = self.catalog_save_state.lock().unwrap();
+            state.pending_insert_rows = 0;
+            state.last_save_at = Instant::now();
+        }
 
         Ok(0)
     }
 
     pub(crate) fn catalogs(&self) -> &RwLock<HashMap<String, DatabaseCatalog>> {
         &self.catalogs
+    }
+
+    pub(crate) fn record_inserted_rows(
+        &self,
+        db: &str,
+        table: &str,
+        rows: i64,
+        save_immediately: bool,
+        save_deferred: bool,
+    ) -> Result<()> {
+        let mut should_save = save_immediately;
+        if save_deferred && !save_immediately {
+            let mut state = self.catalog_save_state.lock().unwrap();
+            state.pending_insert_rows =
+                state.pending_insert_rows.saturating_add(rows.max(0) as u64);
+            if state.pending_insert_rows >= CATALOG_SAVE_INSERT_ROWS
+                || state.last_save_at.elapsed() >= CATALOG_SAVE_INTERVAL
+            {
+                state.pending_insert_rows = 0;
+                state.last_save_at = Instant::now();
+                should_save = true;
+            }
+        }
+
+        let mut catalogs = self.catalogs.write().unwrap();
+        if let Some(catalog) = catalogs.get_mut(db) {
+            if let Some(meta) = catalog.get_table_mut(table) {
+                meta.row_count += rows;
+            }
+            if should_save {
+                let meta_dir = self.data_dir.join("meta");
+                catalog.save(&meta_dir)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn exec_bulk_insert_with_wal_control(
@@ -798,8 +852,33 @@ impl Engine {
         batch: RecordBatch,
         disable_wal: bool,
     ) -> Result<u64> {
-        self.segment_mgr
-            .bulk_insert_batch(db, table, batch, disable_wal)
+        if self.is_bulk_mode() {
+            self.segment_mgr
+                .bulk_insert_batch_deferred(db, table, batch, disable_wal)
+        } else {
+            self.segment_mgr
+                .bulk_insert_batch(db, table, batch, disable_wal)
+        }
+    }
+
+    pub fn exec_bulk_insert_partitioned_with_wal_control(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: RecordBatch,
+        disable_wal: bool,
+    ) -> Result<u64> {
+        if self.is_bulk_mode() {
+            self.segment_mgr
+                .bulk_insert_batch_partitioned_deferred(db, table, table_meta, batch)
+        } else if table_meta.is_partitioned() {
+            self.segment_mgr
+                .bulk_insert_batch_partitioned(db, table, table_meta, batch)
+        } else {
+            self.segment_mgr
+                .bulk_insert_batch(db, table, batch, disable_wal)
+        }
     }
 
     pub fn exec_bulk_insert_payload_with_wal_control(
