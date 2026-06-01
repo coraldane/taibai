@@ -331,7 +331,7 @@ fn execute_simple_plan(plan: &LogicalPlan) -> Result<RecordBatch> {
             let mut result_batch = RecordBatch::new(input_batch.schema.clone());
             for agg_expr in &agg.aggregates {
                 let val = compute_simple_aggregate(agg_expr, &input_batch);
-                if result_batch.schema.columns.len() > 0 {
+                if !result_batch.schema.columns.is_empty() {
                     result_batch.column_mut(0).unwrap().push(&val)?;
                 }
             }

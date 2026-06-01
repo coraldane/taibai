@@ -15,7 +15,7 @@ pub fn nullif(args: &[ScalarValue]) -> Result<ScalarValue> {
     if args.len() < 2 {
         return Ok(ScalarValue::Int64(None));
     }
-    if &args[0] == &args[1] {
+    if args[0] == args[1] {
         Ok(ScalarValue::Int64(None))
     } else {
         Ok(args[0].clone())

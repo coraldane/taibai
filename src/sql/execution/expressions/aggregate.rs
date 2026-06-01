@@ -78,7 +78,7 @@ fn find_min(col: &ColumnArray, num_rows: usize) -> ScalarValue {
     (0..num_rows)
         .map(|i| col.scalar(i))
         .filter(|v| !v.is_null())
-        .min_by(|a, b| compare_scalars(a, b))
+        .min_by(compare_scalars)
         .unwrap_or(ScalarValue::Int64(None))
 }
 
@@ -86,7 +86,7 @@ fn find_max(col: &ColumnArray, num_rows: usize) -> ScalarValue {
     (0..num_rows)
         .map(|i| col.scalar(i))
         .filter(|v| !v.is_null())
-        .max_by(|a, b| compare_scalars(a, b))
+        .max_by(compare_scalars)
         .unwrap_or(ScalarValue::Int64(None))
 }
 

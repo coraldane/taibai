@@ -381,8 +381,8 @@ mod tests {
         let v = ScalarValue::parse_from_str("42", DataType::Int64).unwrap();
         assert_eq!(v, ScalarValue::Int64(Some(42)));
 
-        let v = ScalarValue::parse_from_str("3.14", DataType::Float64).unwrap();
-        assert_eq!(v, ScalarValue::Float64(Some(3.14)));
+        let v = ScalarValue::parse_from_str("2.71", DataType::Float64).unwrap();
+        assert_eq!(v, ScalarValue::Float64(Some(2.71)));
 
         let v = ScalarValue::parse_from_str("hello", DataType::VarChar).unwrap();
         assert_eq!(v, ScalarValue::VarChar(Some("hello".into())));

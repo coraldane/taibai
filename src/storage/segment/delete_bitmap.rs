@@ -4,7 +4,7 @@ use crate::types::batch::RecordBatch;
 pub fn is_deleted(bitmap: &[u8], row_id: u64) -> bool {
     let byte = (row_id / 8) as usize;
     let bit = (row_id % 8) as u8;
-    bitmap.get(byte).map_or(false, |b| (b & (1u8 << bit)) != 0)
+    bitmap.get(byte).is_some_and(|b| (b & (1u8 << bit)) != 0)
 }
 
 pub fn row_range_all_deleted(bitmap: &[u8], start_row: u64, row_count: u64) -> bool {

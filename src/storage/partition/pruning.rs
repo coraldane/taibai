@@ -233,8 +233,8 @@ pub fn compute_segment_zone_maps_from_row_groups(
         }
 
         segment_maps.push(ZoneMap {
-            min_value: seg_min.unwrap_or_else(|| ScalarValue::Int64(None)),
-            max_value: seg_max.unwrap_or_else(|| ScalarValue::Int64(None)),
+            min_value: seg_min.unwrap_or(ScalarValue::Int64(None)),
+            max_value: seg_max.unwrap_or(ScalarValue::Int64(None)),
             null_count: total_null_count,
             row_count: total_row_count,
         });

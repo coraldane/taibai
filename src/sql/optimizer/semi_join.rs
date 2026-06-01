@@ -380,7 +380,7 @@ fn apply_projection_to_input(
             let current_proj = scan
                 .projection
                 .as_ref()
-                .map(|p| p.iter().cloned().collect::<Vec<_>>())
+                .map(|p| p.to_vec())
                 .unwrap_or_else(|| (0..schema.columns.len()).collect());
 
             let has_all = needed_cols.iter().all(|c| current_proj.contains(c));

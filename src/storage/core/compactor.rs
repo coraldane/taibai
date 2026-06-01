@@ -257,7 +257,7 @@ impl Compactor {
             )?;
             rows_written += batch.num_rows();
             writer.write_batch(&batch)?;
-            if rows_written % (WRITE_GATHER_CHUNK_ROWS * 16) == 0 {
+            if rows_written.is_multiple_of(WRITE_GATHER_CHUNK_ROWS * 16) {
                 tracing::info!(
                     rows_written,
                     total_rows = row_refs.len(),

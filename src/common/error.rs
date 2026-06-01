@@ -54,7 +54,7 @@ impl From<MonaxError> for std::io::Error {
     fn from(e: MonaxError) -> Self {
         match e {
             MonaxError::Io(io) => io,
-            other => std::io::Error::new(std::io::ErrorKind::Other, other.to_string()),
+            other => std::io::Error::other(other.to_string()),
         }
     }
 }

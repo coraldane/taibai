@@ -222,15 +222,13 @@ pub fn exec_alter_table(
                     .segment_mgr()
                     .with_table_mutation_lock(db, name, || {
                         if table_dir.exists() {
-                            for entry in std::fs::read_dir(&table_dir)? {
-                                if let Ok(e) = entry {
-                                    let file_name = e.file_name().to_string_lossy().to_string();
-                                    if file_name.starts_with(&format!("p{}", partition_key))
-                                        && file_name.ends_with(".dat")
-                                    {
-                                        engine.segment_mgr().invalidate_reader(&e.path());
-                                        let _ = std::fs::remove_file(e.path());
-                                    }
+                            for e in std::fs::read_dir(&table_dir)?.flatten() {
+                                let file_name = e.file_name().to_string_lossy().to_string();
+                                if file_name.starts_with(&format!("p{}", partition_key))
+                                    && file_name.ends_with(".dat")
+                                {
+                                    engine.segment_mgr().invalidate_reader(&e.path());
+                                    let _ = std::fs::remove_file(e.path());
                                 }
                             }
                         }
@@ -251,15 +249,13 @@ pub fn exec_alter_table(
                     .segment_mgr()
                     .with_table_mutation_lock(db, name, || {
                         if table_dir.exists() {
-                            for entry in std::fs::read_dir(&table_dir)? {
-                                if let Ok(e) = entry {
-                                    let file_name = e.file_name().to_string_lossy().to_string();
-                                    if file_name.starts_with(&format!("p{}", partition_key))
-                                        && file_name.ends_with(".dat")
-                                    {
-                                        engine.segment_mgr().invalidate_reader(&e.path());
-                                        let _ = std::fs::remove_file(e.path());
-                                    }
+                            for e in std::fs::read_dir(&table_dir)?.flatten() {
+                                let file_name = e.file_name().to_string_lossy().to_string();
+                                if file_name.starts_with(&format!("p{}", partition_key))
+                                    && file_name.ends_with(".dat")
+                                {
+                                    engine.segment_mgr().invalidate_reader(&e.path());
+                                    let _ = std::fs::remove_file(e.path());
                                 }
                             }
                         }
@@ -431,15 +427,13 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             }
 
             if table_dir.exists() {
-                for entry in std::fs::read_dir(&table_dir)? {
-                    if let Ok(e) = entry {
-                        let path = e.path();
-                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if (file_name.starts_with("seg_") || file_name.starts_with("p"))
-                            && file_name.ends_with(".dat")
-                        {
-                            let _ = std::fs::remove_file(&path);
-                        }
+                for e in std::fs::read_dir(&table_dir)?.flatten() {
+                    let path = e.path();
+                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if (file_name.starts_with("seg_") || file_name.starts_with("p"))
+                        && file_name.ends_with(".dat")
+                    {
+                        let _ = std::fs::remove_file(&path);
                     }
                 }
             }
@@ -813,7 +807,7 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
             ));
         }
     }
-    create_sql.push_str(")");
+    create_sql.push(')');
 
     if !table_meta.cluster_key.is_empty() {
         create_sql.push_str(&format!(
@@ -1023,7 +1017,7 @@ pub fn exec_show_stats(engine: &Engine, db: &str) -> Result<ExecResult> {
     let mut batch = RecordBatch::new(schema.clone());
     if let Some(catalog) = catalogs.get(db) {
         for table_name in catalog.table_names() {
-            if let Some(meta) = catalog.get_table(&table_name) {
+            if let Some(meta) = catalog.get_table(table_name) {
                 batch
                     .column_mut(0)
                     .unwrap()

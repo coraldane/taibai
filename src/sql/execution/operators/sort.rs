@@ -96,7 +96,7 @@ impl ExecutionOp for SortExec {
 
 /// TopN sort using partial_sort approach.
 /// Only keeps the top N rows, avoiding full sort of large datasets.
-fn topn_sort(rows: &mut Vec<Vec<ScalarValue>>, sort_key_indices: &[(usize, bool)], limit: usize) {
+fn topn_sort(rows: &mut [Vec<ScalarValue>], sort_key_indices: &[(usize, bool)], limit: usize) {
     if rows.len() <= limit {
         rows.sort_by(|a, b| compare_rows(a, b, sort_key_indices));
         return;

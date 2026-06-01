@@ -107,7 +107,7 @@ impl Handler {
         let auth_result = self
             .engine
             .auth_manager()
-            .authenticate(username, &password)?;
+            .authenticate(username, password)?;
         if !auth_result {
             tracing::warn!(username, "login failed: invalid credentials");
             return Ok(vec![build_auth_fail("invalid username or password")]);

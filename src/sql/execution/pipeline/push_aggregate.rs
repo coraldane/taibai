@@ -88,7 +88,7 @@ impl PushOp for PushHashAggregate {
         }
         let schema = Schema::new(col_defs);
         let mut batch = RecordBatch::new(schema);
-        for (_key, rows) in &self.groups {
+        for rows in self.groups.values() {
             let mut row_vals = Vec::new();
             for expr in &self.group_by {
                 if let LogicalExpr::Column(idx) = expr {

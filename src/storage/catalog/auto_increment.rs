@@ -173,8 +173,8 @@ mod tests {
         let mut sorted = results.clone();
         sorted.sort();
 
-        for i in 0..10 {
-            assert_eq!(sorted[i], (i + 1) as u64);
+        for (i, item) in sorted.iter().enumerate().take(10) {
+            assert_eq!(*item, (i + 1) as u64);
         }
         assert_eq!(counter.current_value(), 11);
     }

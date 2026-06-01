@@ -53,46 +53,46 @@ pub fn count_eq_from_raw(
 
     let count = match (&col_def.data_type, value) {
         (DataType::Int64, ScalarValue::Int64(Some(v))) => {
-            count_eq_fixed_le8(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le8(remaining, &bitmap, row_count, *v)
         }
         (DataType::Int32, ScalarValue::Int32(Some(v))) => {
-            count_eq_fixed_le4(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le4(remaining, &bitmap, row_count, *v)
         }
         (DataType::Int16, ScalarValue::Int16(Some(v))) => {
-            count_eq_fixed_le2(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le2(remaining, &bitmap, row_count, *v)
         }
         (DataType::Int8, ScalarValue::Int8(Some(v))) => {
-            count_eq_fixed_le1(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le1(remaining, &bitmap, row_count, *v)
         }
         (DataType::UInt64, ScalarValue::UInt64(Some(v))) => {
-            count_eq_fixed_le8(&remaining, &bitmap, row_count, *v as i64)
+            count_eq_fixed_le8(remaining, &bitmap, row_count, *v as i64)
         }
         (DataType::UInt32, ScalarValue::UInt32(Some(v))) => {
-            count_eq_fixed_le4(&remaining, &bitmap, row_count, *v as i32)
+            count_eq_fixed_le4(remaining, &bitmap, row_count, *v as i32)
         }
         (DataType::UInt16, ScalarValue::UInt16(Some(v))) => {
-            count_eq_fixed_le2(&remaining, &bitmap, row_count, *v as i16)
+            count_eq_fixed_le2(remaining, &bitmap, row_count, *v as i16)
         }
         (DataType::UInt8, ScalarValue::UInt8(Some(v))) => {
-            count_eq_fixed_le1(&remaining, &bitmap, row_count, *v as i8)
+            count_eq_fixed_le1(remaining, &bitmap, row_count, *v as i8)
         }
         (DataType::Float64, ScalarValue::Float64(Some(v))) => {
-            count_eq_fixed_le8f(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le8f(remaining, &bitmap, row_count, *v)
         }
         (DataType::Float32, ScalarValue::Float32(Some(v))) => {
-            count_eq_fixed_le4f(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le4f(remaining, &bitmap, row_count, *v)
         }
         (DataType::Decimal, ScalarValue::Decimal(Some(v))) => {
-            count_eq_fixed_le8(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le8(remaining, &bitmap, row_count, *v)
         }
         (DataType::Date, ScalarValue::Date(Some(v))) => {
-            count_eq_fixed_le4(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le4(remaining, &bitmap, row_count, *v)
         }
         (DataType::Timestamp, ScalarValue::Timestamp(Some(v))) => {
-            count_eq_fixed_le8(&remaining, &bitmap, row_count, *v)
+            count_eq_fixed_le8(remaining, &bitmap, row_count, *v)
         }
         (DataType::VarChar, ScalarValue::VarChar(Some(v))) => {
-            count_eq_varchar(&remaining, &bitmap, row_count, v)
+            count_eq_varchar(remaining, &bitmap, row_count, v)
         }
         _ => return Ok(0),
     };

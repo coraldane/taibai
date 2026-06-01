@@ -294,8 +294,7 @@ fn is_partition_filename(name: &str) -> bool {
 pub fn parse_partition_filename(filename: &str) -> (String, u32) {
     let base = filename.trim_end_matches(".dat");
 
-    if base.starts_with("seg_") {
-        let seq_str = &base[4..];
+    if let Some(seq_str) = base.strip_prefix("seg_") {
         if let Ok(seq) = seq_str.parse::<u32>() {
             return (String::new(), seq);
         }
@@ -406,7 +405,7 @@ pub fn format_system_time(time: Option<SystemTime>) -> String {
 }
 
 fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8> {

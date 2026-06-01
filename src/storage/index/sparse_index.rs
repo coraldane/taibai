@@ -313,9 +313,8 @@ impl SparseIndexImpl {
             };
             offset += 1;
             let bloom_filter = if has_bf && offset < data.len() {
-                BloomFilter::deserialize(&data[offset..]).map(|bf| {
+                BloomFilter::deserialize(&data[offset..]).inspect(|bf| {
                     offset += bf.size_in_bytes() + 16;
-                    bf
                 })
             } else {
                 None

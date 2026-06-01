@@ -493,10 +493,10 @@ impl SegmentReader {
                 .collect(),
         );
 
-        Ok(crate::types::batch::RecordBatch::try_new(
+        crate::types::batch::RecordBatch::try_new(
             result_schema,
             selected_columns,
-        )?)
+        )
     }
 
     pub fn read_row_group(&self, row_group: usize) -> Result<crate::types::batch::RecordBatch> {

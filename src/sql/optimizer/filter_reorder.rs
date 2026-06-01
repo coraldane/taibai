@@ -70,7 +70,7 @@ fn reorder_predicate(expr: LogicalExpr) -> (LogicalExpr, bool) {
 
     // Sort by selectivity (lower = more selective = first)
     let original: Vec<_> = conditions.clone();
-    conditions.sort_by_key(|c| estimate_selectivity(c));
+    conditions.sort_by_key(estimate_selectivity);
 
     let changed = conditions != original;
     (rebuild_and(conditions), changed)

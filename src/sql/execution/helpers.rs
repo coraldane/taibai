@@ -506,7 +506,7 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
 }
 
 fn decimal_multiplier(scale: i32) -> Result<i64> {
-    if scale < 0 || scale > 18 {
+    if !(0..=18).contains(&scale) {
         return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
     }
     10_i64
@@ -616,11 +616,11 @@ fn eval_range_clause(val: &ScalarValue, clause: &crate::storage::segment::RangeC
         RangeOp::Eq => val == &clause.value,
         RangeOp::Lt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Less),
         RangeOp::Le => {
-            compare_scalars(val, &clause.value).map_or(false, |o| o != std::cmp::Ordering::Greater)
+            compare_scalars(val, &clause.value).is_some_and(|o| o != std::cmp::Ordering::Greater)
         }
         RangeOp::Gt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Greater),
         RangeOp::Ge => {
-            compare_scalars(val, &clause.value).map_or(false, |o| o != std::cmp::Ordering::Less)
+            compare_scalars(val, &clause.value).is_some_and(|o| o != std::cmp::Ordering::Less)
         }
     }
 }

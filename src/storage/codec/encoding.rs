@@ -79,12 +79,12 @@ pub fn rle_encode(values: &[ScalarValue]) -> Vec<(ScalarValue, u32)> {
     let mut current = values[0].clone();
     let mut count = 1u32;
 
-    for i in 1..values.len() {
-        if values_equal(&current, &values[i]) {
+    for val in values.iter().skip(1) {
+        if values_equal(&current, val) {
             count += 1;
         } else {
             result.push((current, count));
-            current = values[i].clone();
+            current = val.clone();
             count = 1;
         }
     }

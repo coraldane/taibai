@@ -51,7 +51,7 @@ pub fn exec_delete(
                 }
                 let prev_bitmap = reader.delete_bitmap().to_vec();
                 let prev_deleted = reader.deleted_row_count();
-                let bitmap_bytes = ((total_rows + 7) / 8) as usize;
+                let bitmap_bytes = total_rows.div_ceil(8) as usize;
                 let mut new_bitmap = vec![0u8; bitmap_bytes];
                 if !prev_bitmap.is_empty() {
                     let copy_len = prev_bitmap.len().min(bitmap_bytes);

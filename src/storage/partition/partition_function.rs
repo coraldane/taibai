@@ -33,7 +33,7 @@ impl PartitionFunction {
             }
             PartitionFunction::Hash(buckets) => {
                 if *buckets > 0 {
-                    (value.abs() % (*buckets as i64)) as i64
+                    value.abs() % (*buckets as i64) 
                 } else {
                     value
                 }
@@ -43,14 +43,11 @@ impl PartitionFunction {
 
     pub fn apply_str(&self, s: &str) -> i64 {
         match self {
-            PartitionFunction::Hash(buckets) => {
-                if *buckets > 0 {
+            PartitionFunction::Hash(buckets)
+                if *buckets > 0 => {
                     let hash = compute_string_hash(s);
                     hash % (*buckets as i64)
-                } else {
-                    0
                 }
-            }
             _ => 0,
         }
     }
@@ -103,20 +100,14 @@ pub fn hash_partition_value(val: &ScalarValue, num_buckets: i64) -> i64 {
         ScalarValue::Timestamp(Some(v)) => func.apply(*v),
         ScalarValue::Date(Some(v)) => func.apply(*v as i64),
         ScalarValue::Time(Some(v)) => func.apply(*v),
-        ScalarValue::UInt64(Some(v)) => {
-            if num_buckets > 0 {
+        ScalarValue::UInt64(Some(v))
+            if num_buckets > 0 => {
                 (*v % num_buckets as u64) as i64
-            } else {
-                0
             }
-        }
-        ScalarValue::UInt32(Some(v)) => {
-            if num_buckets > 0 {
+        ScalarValue::UInt32(Some(v))
+            if num_buckets > 0 => {
                 (*v % num_buckets as u32) as i64
-            } else {
-                0
             }
-        }
         ScalarValue::VarChar(Some(s)) => func.apply_str(s),
         _ => 0,
     }
@@ -185,7 +176,7 @@ fn date_parts_from_str(s: &str) -> Option<DateParts> {
 
 fn date_parts_from_date_number(v: i64) -> Option<DateParts> {
     let abs = v.abs();
-    if (10_001_01..=99_991_231).contains(&abs) {
+    if (1_000_101..=99_991_231).contains(&abs) {
         let year = (abs / 10_000) as i32;
         let month = ((abs / 100) % 100) as u32;
         let day = (abs % 100) as u32;

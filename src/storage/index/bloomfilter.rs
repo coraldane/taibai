@@ -20,7 +20,7 @@ impl BloomFilter {
         let num_hashes = Self::optimal_num_hashes(expected_items, num_bits);
 
         Self {
-            bits: vec![0u8; (num_bits + 7) / 8],
+            bits: vec![0u8; num_bits.div_ceil(8)],
             num_bits,
             num_hashes,
         }
@@ -216,7 +216,7 @@ impl BloomFilter {
 
         let num_bits = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
         let num_hashes = u64::from_le_bytes(data[8..16].try_into().ok()?) as usize;
-        let bits_len = (num_bits + 7) / 8;
+        let bits_len = num_bits.div_ceil(8);
 
         if data.len() < 16 + bits_len {
             return None;

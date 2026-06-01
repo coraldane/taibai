@@ -112,6 +112,12 @@ pub struct UserCatalog {
     pub created_at: i64,
 }
 
+impl Default for UserCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UserCatalog {
     pub fn new() -> Self {
         let now = std::time::SystemTime::now()
@@ -311,16 +317,13 @@ fn role_has_permission(role: &Role, scope: &PermissionScope, permission: &Permis
         }
     }
 
-    match scope {
-        PermissionScope::Table(db, _) => {
-            let db_key = format!("db:{}", db);
-            if let Some(perms) = role.privileges.get(&db_key) {
-                if perms.contains(&Permission::All) || perms.contains(permission) {
-                    return true;
-                }
+    if let PermissionScope::Table(db, _) = scope {
+        let db_key = format!("db:{}", db);
+        if let Some(perms) = role.privileges.get(&db_key) {
+            if perms.contains(&Permission::All) || perms.contains(permission) {
+                return true;
             }
         }
-        _ => {}
     }
 
     false

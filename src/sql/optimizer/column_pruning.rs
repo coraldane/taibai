@@ -20,7 +20,7 @@ fn prune_columns(plan: LogicalPlan) -> (LogicalPlan, bool) {
             let used_cols = collect_column_refs(&proj.expressions);
 
             let mut filter_cols = Vec::new();
-            collect_filter_cols(&*proj.input, &mut filter_cols);
+            collect_filter_cols(&proj.input, &mut filter_cols);
             let mut all_used = used_cols;
             all_used.extend(filter_cols);
             all_used.sort();
@@ -29,7 +29,7 @@ fn prune_columns(plan: LogicalPlan) -> (LogicalPlan, bool) {
             let (optimized_input, input_changed) = if let LogicalPlan::Scan(mut scan) = *proj.input
             {
                 if !all_used.is_empty() {
-                    let changed = scan.projection.as_ref().map_or(true, |p| *p != all_used);
+                    let changed = scan.projection.as_ref().is_none_or(|p| *p != all_used);
                     scan.projection = Some(all_used);
                     (LogicalPlan::Scan(scan), changed)
                 } else {

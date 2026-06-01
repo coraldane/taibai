@@ -107,7 +107,7 @@ impl MemTable {
 
     pub fn visibility(&self) -> TxnVisibility {
         let guard = self.visibility.read().unwrap();
-        guard.clone()
+        *guard
     }
 
     pub fn mark_committed(&self) {

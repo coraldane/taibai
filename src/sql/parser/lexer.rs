@@ -674,9 +674,9 @@ mod tests {
 
     #[test]
     fn test_float() {
-        let mut lexer = Lexer::new("3.14");
+        let mut lexer = Lexer::new("2.71");
         let tokens = lexer.tokenize().unwrap();
-        assert_eq!(tokens[0], Token::Float(3.14));
+        assert_eq!(tokens[0], Token::Float(2.71));
     }
 
     #[test]
@@ -699,9 +699,9 @@ mod tests {
 
     #[test]
     fn test_negative_float() {
-        let mut lexer = Lexer::new("-3.14");
+        let mut lexer = Lexer::new("-2.71");
         let tokens = lexer.tokenize().unwrap();
-        assert_eq!(tokens[0], Token::Float(-3.14));
+        assert_eq!(tokens[0], Token::Float(-2.71));
     }
 
     #[test]

@@ -164,7 +164,7 @@ impl NullBitmap {
 
     #[inline]
     fn u64_count(len: usize) -> usize {
-        (len + 63) / 64
+        len.div_ceil(64)
     }
 }
 

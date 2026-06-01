@@ -27,6 +27,12 @@ pub struct PreparedStatementCache {
     max_size: usize,
 }
 
+impl Default for PreparedStatementCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PreparedStatementCache {
     pub fn new() -> Self {
         Self {
@@ -132,10 +138,8 @@ impl PreparedStatementCache {
 
 pub fn bind_params(stmt: &mut Statement, params: &[ScalarValue]) -> Result<()> {
     match stmt {
-        Statement::Select { where_clause, .. } => {
-            if let Some(ref mut expr) = where_clause {
-                substitute_placeholders(expr, params)?;
-            }
+        Statement::Select { where_clause: Some(ref mut expr), .. } => {
+            substitute_placeholders(expr, params)?;
         }
         Statement::Insert { values, .. } => {
             for row in values.iter_mut() {
@@ -145,21 +149,26 @@ pub fn bind_params(stmt: &mut Statement, params: &[ScalarValue]) -> Result<()> {
             }
         }
         Statement::Update {
-            where_clause,
+            where_clause: Some(ref mut expr),
             assignments,
             ..
         } => {
-            if let Some(ref mut expr) = where_clause {
-                substitute_placeholders(expr, params)?;
-            }
+            substitute_placeholders(expr, params)?;
             for assign in assignments.iter_mut() {
                 substitute_placeholders(&mut assign.value, params)?;
             }
         }
-        Statement::Delete { where_clause, .. } => {
-            if let Some(ref mut expr) = where_clause {
-                substitute_placeholders(expr, params)?;
+        Statement::Update {
+            where_clause: None,
+            assignments,
+            ..
+        } => {
+            for assign in assignments.iter_mut() {
+                substitute_placeholders(&mut assign.value, params)?;
             }
+        }
+        Statement::Delete { where_clause: Some(ref mut expr), .. } => {
+            substitute_placeholders(expr, params)?;
         }
         _ => {}
     }
@@ -295,10 +304,8 @@ pub fn count_placeholders(stmt: &Statement) -> usize {
                 count_expr_placeholders(&assign.value, &mut count);
             }
         }
-        Statement::Delete { where_clause, .. } => {
-            if let Some(ref e) = where_clause {
-                count_expr_placeholders(e, &mut count);
-            }
+        Statement::Delete { where_clause: Some(ref e), .. } => {
+            count_expr_placeholders(e, &mut count);
         }
         _ => {}
     }
@@ -425,10 +432,8 @@ pub fn has_placeholders(stmt: &Statement) -> bool {
                 check_expr_for_placeholders(&assign.value, &mut found);
             }
         }
-        Statement::Delete { where_clause, .. } => {
-            if let Some(ref e) = where_clause {
-                check_expr_for_placeholders(e, &mut found);
-            }
+        Statement::Delete { where_clause: Some(ref e), .. } => {
+            check_expr_for_placeholders(e, &mut found);
         }
         _ => {}
     }

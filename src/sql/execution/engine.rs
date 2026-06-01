@@ -86,11 +86,11 @@ impl Engine {
                         if db_name == "meta" || db_name == "wal" {
                             continue;
                         }
-                        if !catalogs.contains_key(&db_name) {
+                        if let std::collections::hash_map::Entry::Vacant(e) = catalogs.entry(db_name.clone()) {
                             if let Ok(catalog) =
                                 DatabaseCatalog::load_or_create(&meta_dir, &db_name)
                             {
-                                catalogs.insert(db_name, catalog);
+                                e.insert(catalog);
                             }
                         }
                     }
@@ -145,7 +145,7 @@ impl Engine {
     }
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
-        if sql.as_bytes().get(0).map(|b| b.to_ascii_uppercase()) == Some(b'I') {
+        if sql.as_bytes().first().map(|b| b.to_ascii_uppercase()) == Some(b'I') {
             if let Some(result) = crate::sql::parser::fast_insert::try_fast_parse_insert(sql) {
                 let stmt = result?;
                 return self.execute_stmt(session, &stmt);
@@ -171,10 +171,7 @@ impl Engine {
         self.ensure_permissions(session, &stmt)?;
         match &stmt {
             Statement::Select { .. } => {
-                if prepared.planned_database.as_deref() == Some(session.database.as_str())
-                    && prepared.cached_plan.is_some()
-                {
-                    let plan = prepared.cached_plan.as_ref().unwrap();
+                if let Some(plan) = prepared.cached_plan.as_ref() {
                     super::query::exec_select_with_plan(
                         self,
                         &session.database,
@@ -210,10 +207,8 @@ impl Engine {
     ) -> Result<std::collections::HashMap<String, crate::types::batch::Schema>> {
         use crate::types::batch::Schema;
         let mut table_refs = Vec::new();
-        if let Statement::Select { from, .. } = stmt {
-            if let Some(ref from_clause) = from {
-                table_refs.extend(super::query::extract_table_refs(from_clause, db));
-            }
+        if let Statement::Select { from: Some(ref from_clause), .. } = stmt {
+            table_refs.extend(super::query::extract_table_refs(from_clause, db));
         }
         let mut table_schemas = std::collections::HashMap::new();
         let catalogs = self.catalogs().read().unwrap();
@@ -907,45 +902,43 @@ impl Engine {
                 .bulk_insert_payload_with_catalog(db, payload, disable_wal, catalog)?;
         drop(catalogs);
 
-        if !disable_wal {
-            if !bulk_import_mode {
-                let req = {
-                    let catalogs = self.catalogs.read().unwrap();
-                    let catalog = catalogs.get(db).ok_or_else(|| {
-                        MonaxError::Sql(format!("database '{}' does not exist", db))
-                    })?;
-                    let table_name = {
-                        let mut pos = 0usize;
-                        let payload_bytes = payload;
-                        if payload_bytes.len() < 2 {
-                            return Err(MonaxError::Protocol("bulk payload too short".into()));
-                        }
-                        let table_len =
-                            u16::from_le_bytes(payload_bytes[0..2].try_into().unwrap()) as usize;
-                        pos += 2;
-                        if pos + table_len > payload_bytes.len() {
-                            return Err(MonaxError::Protocol("bulk payload truncated".into()));
-                        }
-                        std::str::from_utf8(&payload_bytes[pos..pos + table_len])
-                            .map_err(|e| MonaxError::Protocol(format!("invalid utf8: {}", e)))?
-                            .to_string()
-                    };
-                    if catalog.get_table(&table_name).is_some() {
-                        let row_count = result as i64;
-                        drop(catalogs);
-                        let mut catalogs_mut = self.catalogs.write().unwrap();
-                        if let Some(catalog) = catalogs_mut.get_mut(db) {
-                            if let Some(meta) = catalog.get_table_mut(&table_name) {
-                                meta.row_count += row_count;
-                            }
-                            let meta_dir = self.data_dir.join("meta");
-                            catalog.save(&meta_dir)?;
-                        }
+        if !disable_wal && !bulk_import_mode {
+            let req = {
+                let catalogs = self.catalogs.read().unwrap();
+                let catalog = catalogs.get(db).ok_or_else(|| {
+                    MonaxError::Sql(format!("database '{}' does not exist", db))
+                })?;
+                let table_name = {
+                    let mut pos = 0usize;
+                    let payload_bytes = payload;
+                    if payload_bytes.len() < 2 {
+                        return Err(MonaxError::Protocol("bulk payload too short".into()));
                     }
-                    result
+                    let table_len =
+                        u16::from_le_bytes(payload_bytes[0..2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    if pos + table_len > payload_bytes.len() {
+                        return Err(MonaxError::Protocol("bulk payload truncated".into()));
+                    }
+                    std::str::from_utf8(&payload_bytes[pos..pos + table_len])
+                        .map_err(|e| MonaxError::Protocol(format!("invalid utf8: {}", e)))?
+                        .to_string()
                 };
-                return Ok(req);
-            }
+                if catalog.get_table(&table_name).is_some() {
+                    let row_count = result as i64;
+                    drop(catalogs);
+                    let mut catalogs_mut = self.catalogs.write().unwrap();
+                    if let Some(catalog) = catalogs_mut.get_mut(db) {
+                        if let Some(meta) = catalog.get_table_mut(&table_name) {
+                            meta.row_count += row_count;
+                        }
+                        let meta_dir = self.data_dir.join("meta");
+                        catalog.save(&meta_dir)?;
+                    }
+                }
+                result
+            };
+            return Ok(req);
         }
 
         Ok(result)

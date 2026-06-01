@@ -176,19 +176,19 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
         }
         LogicalExpr::IsNotNull(inner) => {
             let vals = eval_expr_column(inner, batch)?;
-            for i in 0..num_rows {
-                mask[i] = !vals[i].is_null();
+            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
+                *m = !vals[i].is_null();
             }
         }
         LogicalExpr::Literal(v) => {
-            for i in 0..num_rows {
-                mask[i] = !v.is_null();
+            for m in mask.iter_mut().take(num_rows) {
+                *m = !v.is_null();
             }
         }
         _ => {
             let vals = eval_expr_column(expr, batch)?;
-            for i in 0..num_rows {
-                mask[i] = !vals[i].is_null();
+            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
+                *m = !vals[i].is_null();
             }
         }
     }

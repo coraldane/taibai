@@ -69,23 +69,19 @@ impl SortKeyInserter {
         let num_rows = batch.num_rows();
         let mut new_columns = Vec::with_capacity(num_cols);
 
-        for col_idx in 0..num_cols {
-            let col = batch.column(col_idx).unwrap();
+        for (col_idx, col) in batch.columns.iter().enumerate() {
             let mut new_col = crate::types::array::ColumnArray::empty(col.data_type());
-            // Copy rows before insertion point
             for i in 0..pos {
                 new_col.push(&col.scalar(i))?;
             }
-            // Insert the new value
             new_col.push(&values[col_idx])?;
-            // Copy rows after insertion point
             for i in pos..num_rows {
                 new_col.push(&col.scalar(i))?;
             }
             new_columns.push(new_col);
         }
 
-        Ok(RecordBatch::try_new(batch.schema.clone(), new_columns)?)
+        RecordBatch::try_new(batch.schema.clone(), new_columns)
     }
 
     /// Compare a row in the batch to the given key values using the sort key columns.

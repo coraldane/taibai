@@ -66,21 +66,18 @@ fn extract_indexable_columns(expr: &LogicalExpr, schema: &Schema) -> Vec<String>
 }
 
 fn extract_indexable_recursive(expr: &LogicalExpr, schema: &Schema, cols: &mut Vec<String>) {
-    match expr {
-        LogicalExpr::BinaryOp { left, op, right } => match op {
-            BinOp::Eq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => {
-                if let LogicalExpr::Column(idx) = **left {
-                    if let Some(col_def) = schema.columns.get(idx) {
-                        cols.push(col_def.name.clone());
-                    }
+    if let LogicalExpr::BinaryOp { left, op, right } = expr { match op {
+        BinOp::Eq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => {
+            if let LogicalExpr::Column(idx) = **left {
+                if let Some(col_def) = schema.columns.get(idx) {
+                    cols.push(col_def.name.clone());
                 }
             }
-            BinOp::And => {
-                extract_indexable_recursive(left, schema, cols);
-                extract_indexable_recursive(right, schema, cols);
-            }
-            _ => {}
-        },
+        }
+        BinOp::And => {
+            extract_indexable_recursive(left, schema, cols);
+            extract_indexable_recursive(right, schema, cols);
+        }
         _ => {}
-    }
+    } }
 }
