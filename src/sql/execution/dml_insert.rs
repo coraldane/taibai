@@ -24,6 +24,7 @@ pub fn exec_insert(
     values: &[Vec<Expr>],
     timezone_offset_hours: i32,
     txn_id: u64,
+    bulk_import_mode: bool,
 ) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
@@ -137,7 +138,7 @@ pub fn exec_insert(
         validate_primary_key_uniqueness(engine, db, table, &batch, &schema, &primary_key_indices)?;
     }
 
-    if engine.is_bulk_mode() {
+    if bulk_import_mode {
         engine.exec_bulk_insert_with_wal_control(db, table, batch, false)?;
     } else {
         write_batch_by_partition(engine, db, table, &table_meta, batch, schema, txn_id)?;
@@ -149,7 +150,7 @@ pub fn exec_insert(
             if let Some(meta) = catalog.get_table_mut(table) {
                 meta.row_count += values.len() as i64;
             }
-            if !engine.is_bulk_mode() {
+            if !bulk_import_mode {
                 let meta_dir = engine.data_dir().join("meta");
                 catalog.save(&meta_dir)?;
             }

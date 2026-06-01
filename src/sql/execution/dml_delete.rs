@@ -1,4 +1,5 @@
 use crate::common::error::{MonaxError, Result};
+use crate::storage::segment::delete_bitmap;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::Schema;
 
@@ -61,7 +62,7 @@ pub fn exec_delete(
                 let mut row_id: u64 = 0;
                 for rg_idx in 0..reader.num_row_groups() {
                     let rg_rows = reader.row_group_rows(rg_idx);
-                    if row_range_all_deleted(&new_bitmap, row_id, rg_rows) {
+                    if delete_bitmap::row_range_all_deleted(&new_bitmap, row_id, rg_rows) {
                         row_id += rg_rows;
                         continue;
                     }
@@ -81,14 +82,16 @@ pub fn exec_delete(
                         };
                         let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
                         for (i, matches) in mask.into_iter().enumerate() {
-                            if matches && mark_deleted(&mut new_bitmap, row_id + i as u64) {
+                            if matches
+                                && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
+                            {
                                 newly_deleted += 1;
                             }
                         }
                         row_id += batch.num_rows() as u64;
                     } else {
                         for i in 0..rg_rows {
-                            if mark_deleted(&mut new_bitmap, row_id + i) {
+                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
                                 newly_deleted += 1;
                             }
                         }
@@ -124,28 +127,4 @@ pub fn exec_delete(
     Ok(ExecResult::Ok {
         rows_affected: total_deleted,
     })
-}
-
-fn row_range_all_deleted(bitmap: &[u8], start_row: u64, row_count: u64) -> bool {
-    (0..row_count).all(|i| is_deleted(bitmap, start_row + i))
-}
-
-fn is_deleted(bitmap: &[u8], row_id: u64) -> bool {
-    let byte = (row_id / 8) as usize;
-    let bit = (row_id % 8) as u8;
-    bitmap.get(byte).map_or(false, |b| (b & (1u8 << bit)) != 0)
-}
-
-fn mark_deleted(bitmap: &mut [u8], row_id: u64) -> bool {
-    let byte = (row_id / 8) as usize;
-    let bit = (row_id % 8) as u8;
-    let Some(slot) = bitmap.get_mut(byte) else {
-        return false;
-    };
-    let mask = 1u8 << bit;
-    if (*slot & mask) != 0 {
-        return false;
-    }
-    *slot |= mask;
-    true
 }

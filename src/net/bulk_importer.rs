@@ -1,10 +1,8 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
-use tokio::sync::Semaphore;
 
 use crate::common::error::{MonaxError, Result};
 use crate::net::client::{BulkImportConfig, Client};
@@ -52,7 +50,6 @@ pub struct BulkImporter {
     total_batches: AtomicU64,
     start_time: Instant,
     batch_queue: ArrayQueue<Bytes>,
-    pending_responses: Arc<Semaphore>,
 }
 
 impl BulkImporter {
@@ -67,8 +64,6 @@ impl BulkImporter {
             let _ = batch_queue.push(Bytes::new());
         }
 
-        let pending_responses = Arc::new(Semaphore::new(config.pipeline_depth));
-
         Ok(Self {
             client,
             config,
@@ -80,7 +75,6 @@ impl BulkImporter {
             total_batches: AtomicU64::new(0),
             start_time: Instant::now(),
             batch_queue,
-            pending_responses,
         })
     }
 
@@ -108,7 +102,11 @@ impl BulkImporter {
 
         let payload = self.encode_batch(&batch)?;
 
-        let _permit = self.pending_responses.acquire().await?;
+        while self.sent_count.load(Ordering::Relaxed) - self.completed_count.load(Ordering::Relaxed)
+            >= self.config.pipeline_depth as i64
+        {
+            self.drain_one_response().await?;
+        }
 
         self.client.pipeline_bulk_insert_columnar(payload).await?;
 
@@ -125,20 +123,28 @@ impl BulkImporter {
     }
 
     pub async fn drain_responses(&mut self) -> Result<()> {
-        let sent = self.sent_count.load(Ordering::Relaxed);
-        let completed = self.completed_count.load(Ordering::Relaxed);
-
-        while completed < sent {
-            let resp = self.client.recv_response().await?;
-            self.completed_count.fetch_add(1, Ordering::Relaxed);
-
-            if resp.msg_type == crate::protocol::message::MSG_TYPE_ERROR {
-                let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                return Err(MonaxError::Storage(msg));
-            }
+        while self.completed_count.load(Ordering::Relaxed) < self.sent_count.load(Ordering::Relaxed)
+        {
+            self.drain_one_response().await?;
         }
 
         Ok(())
+    }
+
+    async fn drain_one_response(&mut self) -> Result<()> {
+        let resp = self.client.recv_response().await?;
+        self.completed_count.fetch_add(1, Ordering::Relaxed);
+
+        match resp.msg_type {
+            crate::protocol::message::MSG_TYPE_OK => Ok(()),
+            crate::protocol::message::MSG_TYPE_ERROR => {
+                let msg = String::from_utf8_lossy(&resp.payload).to_string();
+                Err(MonaxError::Storage(msg))
+            }
+            other => Err(MonaxError::Protocol(format!(
+                "unexpected bulk import response type: {other:#04X}"
+            ))),
+        }
     }
 
     pub async fn finish(&mut self) -> Result<BulkImporterStats> {
@@ -202,7 +208,7 @@ pub fn encode_columnar_bulk_insert(table_name: &str, batch: &RecordBatch) -> Res
 
         let (data, nulls) = encode_column_data(col)?;
 
-        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(batch.num_rows() as u32).to_le_bytes());
         buf.extend_from_slice(&(nulls.len() as u32).to_le_bytes());
         buf.extend_from_slice(&data);
         buf.extend_from_slice(&nulls);
@@ -325,4 +331,55 @@ fn encode_column_data(col: &ColumnArray) -> Result<(Vec<u8>, Vec<u8>)> {
     }
 
     Ok((data, nulls))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::storage::bulk_payload::parse_direct_bulk_payload;
+    use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+    use crate::types::scalar::ScalarValue;
+
+    #[test]
+    fn encoded_bulk_payload_uses_row_count_for_each_column() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("id", DataType::Int32),
+            ColumnDef::new("name", DataType::VarChar),
+        ]);
+        let mut batch = RecordBatch::new(schema);
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int32(Some(1)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("alice".into())))
+            .unwrap();
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int32(Some(2)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("bob".into())))
+            .unwrap();
+
+        let payload = encode_columnar_bulk_insert("users", &batch).unwrap();
+        let parsed = parse_direct_bulk_payload(&payload).unwrap();
+
+        assert_eq!(parsed.table_name, "users");
+        assert_eq!(parsed.row_count, 2);
+        assert_eq!(parsed.columns.len(), 2);
+        assert_eq!(parsed.columns[0].data.len(), 8);
+        assert_eq!(parsed.columns[1].data.len(), 16);
+        assert_eq!(
+            parsed.columns[1].variable_ranges.as_deref(),
+            Some(&[(4, 5), (13, 3)][..])
+        );
+    }
 }

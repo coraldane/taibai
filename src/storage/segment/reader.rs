@@ -10,6 +10,7 @@ use crate::common::error::{MonaxError, Result};
 use crate::storage::codec::column_codec::{decode_column, decode_column_selected};
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
+use crate::storage::segment::delete_bitmap;
 use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
@@ -607,7 +608,7 @@ impl SegmentReader {
             if bitmap_active {
                 let before = batch.num_rows();
                 batch =
-                    filter_batch_by_delete_bitmap(&batch, rg_first_row, &self.footer.delete_bitmap);
+                    delete_bitmap::filter_batch(&batch, rg_first_row, &self.footer.delete_bitmap)?;
                 if let Some(s) = stats.as_deref_mut() {
                     s.rows_filtered_by_delete_bitmap += (before - batch.num_rows()) as u64;
                 }
@@ -727,38 +728,6 @@ fn split_batch(
     let mut columns = Vec::with_capacity(batch.num_columns());
     for i in 0..batch.num_columns() {
         columns.push(split_column(batch.column(i).unwrap(), start, end));
-    }
-    crate::types::batch::RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
-}
-
-fn filter_batch_by_delete_bitmap(
-    batch: &crate::types::batch::RecordBatch,
-    first_row_id: u64,
-    delete_bitmap: &[u8],
-) -> crate::types::batch::RecordBatch {
-    let mut keep = Vec::with_capacity(batch.num_rows());
-    for i in 0..batch.num_rows() {
-        let row_id = first_row_id + i as u64;
-        let byte = (row_id / 8) as usize;
-        let bit = (row_id % 8) as u8;
-        let deleted = delete_bitmap
-            .get(byte)
-            .map_or(false, |b| (b & (1u8 << bit)) != 0);
-        if !deleted {
-            keep.push(i);
-        }
-    }
-    if keep.len() == batch.num_rows() {
-        return batch.clone();
-    }
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for c in 0..batch.num_columns() {
-        let src = batch.column(c).unwrap();
-        let mut new_col = ColumnArray::empty(src.data_type());
-        for &i in &keep {
-            new_col.push(&src.scalar(i)).unwrap();
-        }
-        columns.push(new_col);
     }
     crate::types::batch::RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
 }

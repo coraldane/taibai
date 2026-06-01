@@ -229,28 +229,32 @@ impl Handler {
     }
 
     fn handle_start_bulk_import(&mut self, sql: &str) -> Result<Vec<Message>> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(vec![build_error("not logged in")]);
+        };
+
         let disable_wal =
             sql.contains("\"disable_wal\":true") || sql.contains("\"disable_wal\": true");
 
         self.engine.set_bulk_mode(true);
 
-        if let Some(session) = &mut self.session {
-            session.bulk_import_mode = true;
-            session.disable_wal = disable_wal;
-        }
+        session.bulk_import_mode = true;
+        session.disable_wal = disable_wal;
 
         tracing::info!(disable_wal, "bulk import mode started");
         Ok(vec![build_ok(0)])
     }
 
     fn handle_stop_bulk_import(&mut self) -> Result<Vec<Message>> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(vec![build_error("not logged in")]);
+        };
+
         self.engine.set_bulk_mode(false);
         let flushed = self.engine.flush_all_buffers()?;
 
-        if let Some(session) = &mut self.session {
-            session.bulk_import_mode = false;
-            session.disable_wal = false;
-        }
+        session.bulk_import_mode = false;
+        session.disable_wal = false;
 
         tracing::info!(rows_flushed = flushed, "bulk import mode stopped");
         Ok(vec![build_ok(flushed)])
@@ -266,10 +270,15 @@ impl Handler {
             session.had_writes = true;
         }
 
-        match self
-            .engine
-            .exec_bulk_insert_payload_with_wal_control(&db, payload, disable_wal)
-        {
+        match self.engine.exec_bulk_insert_payload_with_options(
+            &db,
+            payload,
+            disable_wal,
+            self.session
+                .as_ref()
+                .map(|s| s.bulk_import_mode)
+                .unwrap_or(false),
+        ) {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
             Err(e) => {
                 tracing::warn!(error = %e, "bulk insert error");

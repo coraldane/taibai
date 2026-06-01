@@ -1,0 +1,233 @@
+# Monax 工程主要功能总结
+
+本文基于当前代码结构、配置、测试与示例整理，用于快速理解 Monax 的定位、核心能力和主要模块。
+
+## 项目定位
+
+Monax 是一个使用 Rust 实现的列式数据库服务器，目标是提供面向分析型场景的高吞吐写入、列式查询和可优化的 SQL 执行能力，同时保留事务、权限、网络协议和客户端交互等数据库服务端基础能力。
+
+从 `Cargo.toml` 与主入口可以看出，工程提供：
+
+- `monax` 服务端二进制：启动数据库服务。
+- `monax client` 命令行客户端：连接服务端、登录、执行 SQL 或进入交互模式。
+- `segment` 工具：用于检查和调试 segment 存储文件。
+- 示例工程：批量导入、多行插入、预处理语句等使用场景。
+
+## 整体架构
+
+工程按数据库系统的典型链路分层：
+
+- `src/net/`：异步 TCP/TLS 网络层，负责连接、登录、会话、消息分发和客户端实现。
+- `src/protocol/`：二进制协议层，定义消息类型、帧格式、压缩与查询结果编码。
+- `src/sql/`：SQL 解析、绑定、逻辑计划、优化和执行。
+- `src/storage/`：目录元数据、列式 segment、WAL、MemTable、事务、索引、分区与压缩合并。
+- `src/types/`：标量值、列数组、RecordBatch 和 NULL 位图等内部数据表示。
+- `src/common/`：配置、错误类型等公共设施。
+- `src/tools/` 与 `src/bin/`：segment 相关辅助工具。
+
+请求的大致路径是：
+
+```text
+TCP/TLS 连接
+  -> protocol message 解码
+  -> Session 权限与状态检查
+  -> SQL Parser / Fast Insert Parser
+  -> Planner / Optimizer
+  -> Execution Engine
+  -> Storage Engine
+  -> RecordBatch / OK / Error 编码返回
+```
+
+## 服务端与客户端能力
+
+Monax 可以读取 YAML 配置并启动数据库服务，主要配置包括监听地址、最大消息大小、数据目录、默认数据库、查询批大小、协议压缩和 TLS 证书。
+
+服务端支持：
+
+- TCP 异步连接处理。
+- 可选 TLS。
+- 登录认证与会话管理。
+- 普通 SQL 查询。
+- 二进制查询结果。
+- Ping/Pong。
+- Flush。
+- 事务消息。
+- Cursor 打开、拉取和关闭。
+- Prepare / Execute / Close Statement。
+- Batch Execute。
+- 列式批量导入消息。
+
+客户端支持连接、登录、登出、Ping、执行查询、交互式 SQL、二进制结果接收、批量导入和 pipeline 模式。
+
+## SQL 功能
+
+SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行器。当前语句覆盖面较广：
+
+- DDL：`CREATE/DROP DATABASE`、`CREATE/DROP/ALTER/TRUNCATE TABLE`。
+- 表结构能力：主键、默认值、`AUTO_INCREMENT`、`CLUSTER BY`、`PARTITION BY`、`TTL`。
+- 分区策略：`VALUE`、`DAY`、`MONTH`、`YEAR`、`HASH`、`MOD`。
+- DML：`INSERT`、多行插入、`UPDATE`、`DELETE`。
+- 查询：`SELECT`、`WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT/OFFSET`、`DISTINCT`。
+- Join：Inner、Left、Right、Full、Cross、Semi、Anti、Asof 等 AST/计划层类型。
+- 子查询：`IN`、`EXISTS`、标量子查询等。
+- 集合查询：`UNION` / `UNION ALL`。
+- 窗口函数：`ROW_NUMBER`、`RANK`、`DENSE_RANK`、`LEAD`、`LAG`，以及窗口聚合。
+- 管理语句：`USE`、`SHOW TABLES/DATABASES/COLUMNS/INDEXES/CREATE TABLE/USERS/ROLES/GRANTS/PARTITIONS/STATS/ENGINES/PROCESSLIST`。
+- 诊断语句：`EXPLAIN`、`EXPLAIN ANALYZE`。
+- 运维语句：`FLUSH TABLE`、`OPTIMIZE TABLE`、`PAUSE FLUSH`、`RESUME FLUSH`。
+- 事务语句：`BEGIN`、`COMMIT`、`ROLLBACK`。
+
+内置函数注册表支持数学、字符串、日期时间、控制流、类型转换和向量函数，例如 `abs`、`sqrt`、`upper`、`substring`、`now`、`coalesce`、`to_int`、`vector_distance`、`vector_norm`、`vector_dot` 等。
+
+## 查询优化与执行
+
+优化器是规则驱动的迭代式优化器，当前包含：
+
+- 表达式化简。
+- 谓词下推。
+- 列裁剪。
+- Zone Map 裁剪。
+- Bloom Filter 优化。
+- Limit 下推。
+- Order + Limit 下推。
+- TopN 优化。
+- 过滤条件重排。
+- 索引选择。
+- 分区裁剪。
+- Join 重排。
+- Semi Join 转换与列裁剪。
+- 子查询重写。
+
+执行层以批处理的 `RecordBatch` 为核心数据单位，包含扫描、过滤、投影、聚合、排序、Limit、Join、Semi Join、窗口函数、DML、DDL、Explain 和 prepared statement 执行路径。
+
+针对扫描与分析场景，工程还提供：
+
+- `COUNT(*)` 快速路径。
+- MemTable 与 segment 合并扫描。
+- 分区裁剪。
+- 行组裁剪。
+- 行过滤。
+- 基于聚簇键和统计信息的扫描优化。
+
+## 存储引擎
+
+存储层是 Monax 的核心。它使用自定义列式 segment 文件格式，并围绕写入缓冲、WAL、目录元数据和优化合并构建。
+
+主要能力包括：
+
+- 多数据库 catalog，元数据以 JSON 形式保存在 `meta/catalogs` 下。
+- 表元数据：列定义、行数、segment 数、创建时间、聚簇键、分区信息、TTL 信息。
+- MemTable 写入缓冲。
+- BatchWriter 批写入队列。
+- WAL 用于写前日志、事务提交和恢复相关记录。
+- SegmentManager 管理表数据文件、活跃 segment、flush 与读取。
+- Segment 文件包含 header、压缩列数据、row group 元数据、footer 和 footer offset。
+- Row Group 默认大小为 8192 行。
+- 列数据使用 zstd 压缩。
+- Footer 记录 schema、row group offset/length、列压缩大小、Zone Map、Bloom Filter、删除位图等。
+- 支持删除标记和逻辑删除。
+- 支持 `OPTIMIZE TABLE` 触发 segment 合并、排序和清理。
+- Reader cache、buffer pool、列编码和快速扫描相关模块用于提升读取性能。
+
+## 数据类型
+
+协议层定义 19 种数据类型：
+
+- Bool。
+- Int8、Int16、Int32、Int64。
+- UInt8、UInt16、UInt32、UInt64。
+- Float32、Float64。
+- Decimal。
+- Date、Time、Timestamp、Interval。
+- VarChar。
+- Blob。
+- Vector。
+
+内部类型系统围绕 `ScalarValue`、`ColumnArray`、`RecordBatch` 和 `NullBitmap` 构建，适合列式批处理和二进制结果编码。
+
+## 事务、权限与变更流
+
+事务相关能力：
+
+- SQL 事务：`BEGIN`、`COMMIT`、`ROLLBACK`。
+- 协议事务消息：Begin、Commit、Rollback。
+- Session 维护当前事务 ID 与写入状态。
+- 写入事务在提交时通过 BatchWriter 提交，回滚时清理未提交写入。
+- 存储层包含 MVCC 与事务管理模块。
+
+权限相关能力：
+
+- 用户：`CREATE USER`、`DROP USER`、`ALTER USER`。
+- 角色：`CREATE ROLE`、`DROP ROLE`。
+- 授权：`GRANT`、`REVOKE`、`SHOW GRANTS`。
+- 权限类型：Select、Insert、Update、Delete、Create、Drop、Alter、Truncate、All。
+- 权限对象：全局、数据库、表。
+- 默认 root 用户使用 `taibai` 口令。
+
+变更流能力：
+
+- DML 成功后发布 Insert、Update、Delete 变更事件。
+- 最近事件保存在内存队列中。
+- 事务内插入在提交后才发布变更事件。
+- 可按数据库和表过滤最近变更。
+
+## 批量导入与性能方向
+
+工程对高吞吐写入做了专门设计：
+
+- 协议支持列式批量插入消息。
+- 服务端支持 `START BULK IMPORT` / `STOP BULK IMPORT` 模式。
+- 可在批量导入时关闭 WAL，以换取更高导入速度。
+- 客户端支持 pipeline，在多个批次请求未完成时继续发送后续批次。
+- `examples/batch_import` 针对股票 tick CSV 数据实现了高性能导入示例，包括块读取、字符串池化、列式编码、批大小控制和进度输出。
+
+## 测试覆盖重点
+
+`tests/` 目录覆盖了多个关键功能：
+
+- 数据类型读写。
+- 约束、主键、默认值、自增列。
+- 删除、更新。
+- 多数据库隔离。
+- 分区与聚簇。
+- 事务集成。
+- TTL 与变更流。
+- 并发稳定性。
+
+这些测试说明工程关注的不只是 SQL 语法，而是端到端的数据写入、查询、元数据、事务和存储行为。
+
+## 运行方式
+
+构建：
+
+```bash
+cargo build --release
+```
+
+启动服务端：
+
+```bash
+cargo run -- --config conf/example.yaml
+```
+
+使用默认配置启动：
+
+```bash
+cargo run
+```
+
+启动客户端并执行查询：
+
+```bash
+cargo run -- client --host 127.0.0.1:5151 --user root --password taibai --database main --query "SHOW TABLES"
+```
+
+运行测试：
+
+```bash
+cargo test
+```
+
+## 一句话总结
+
+Monax 是一个面向列式存储和分析查询的 Rust 数据库服务端工程，已经具备网络协议、SQL 引擎、规则优化器、列式 segment 存储、事务、权限、分区、TTL、变更流和批量导入等完整数据库系统雏形。

@@ -129,8 +129,7 @@ pub fn exec_update(
 
         mgr.clear_active_segments(db, table);
         for (old_seg, batches) in rewritten_segments {
-            mgr.invalidate_reader(&old_seg);
-            std::fs::remove_file(&old_seg)?;
+            mgr.remove_segment_file(&old_seg)?;
             for batch in batches {
                 let seg_path = mgr.next_segment_path(&table_dir, "")?;
                 mgr.write_new_segment(&seg_path, batch.schema.clone(), 8192, &batch)?;

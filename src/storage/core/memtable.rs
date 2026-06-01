@@ -139,9 +139,7 @@ impl MemTable {
                 for col_idx in 0..batch.num_columns() {
                     if let Some(src) = batch.column(col_idx) {
                         if let Some(dst) = existing.column_mut(col_idx) {
-                            for i in 0..batch.num_rows() {
-                                dst.push(&src.scalar(i))?;
-                            }
+                            dst.extend(src)?;
                         }
                     }
                 }

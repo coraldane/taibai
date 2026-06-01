@@ -2,8 +2,10 @@
 use crate::storage::index::bloomfilter::BloomFilter;
 
 pub mod constants;
+pub mod delete_bitmap;
 pub mod footer;
 pub mod reader;
+pub mod store;
 pub mod writer;
 
 #[derive(Debug, Clone)]

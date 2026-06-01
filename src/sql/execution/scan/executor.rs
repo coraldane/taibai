@@ -1,4 +1,5 @@
 use crate::common::error::Result;
+use crate::storage::segment::delete_bitmap;
 use crate::storage::segment::ScanStats;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::RecordBatch;
@@ -383,7 +384,7 @@ impl<'a> ScanExecutor<'a> {
                 .map(|r| r.row_count)
                 .sum();
             let before = batch.num_rows();
-            batch = filter_batch_by_delete_bitmap(&batch, rg_start_row, reader.delete_bitmap());
+            batch = delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
             if let Some(s) = self.stats.as_deref_mut() {
                 s.entry(self.spec.table_name.clone())
                     .or_default()
@@ -626,37 +627,4 @@ fn set_tighter_upper(
     if replace {
         *current = Some((candidate, inclusive));
     }
-}
-
-fn filter_batch_by_delete_bitmap(
-    batch: &RecordBatch,
-    first_row_id: u64,
-    delete_bitmap: &[u8],
-) -> RecordBatch {
-    let num_rows = batch.num_rows();
-    let mut keep = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
-        let row_id = first_row_id + i as u64;
-        let byte = (row_id / 8) as usize;
-        let bit = (row_id % 8) as u8;
-        let deleted = delete_bitmap
-            .get(byte)
-            .map_or(false, |b| (b & (1u8 << bit)) != 0);
-        if !deleted {
-            keep.push(i);
-        }
-    }
-    if keep.len() == num_rows {
-        return batch.clone();
-    }
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for c in 0..batch.num_columns() {
-        let src = batch.column(c).unwrap();
-        let mut new_col = crate::types::array::ColumnArray::empty(src.data_type());
-        for &i in &keep {
-            new_col.push(&src.scalar(i)).unwrap();
-        }
-        columns.push(new_col);
-    }
-    RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
 }

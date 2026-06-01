@@ -291,6 +291,7 @@ impl Engine {
                     values,
                     session.timezone_offset_hours,
                     txn_id,
+                    session.bulk_import_mode,
                 );
                 if result.is_ok() && txn_id > 0 {
                     session.mark_txn_write();
@@ -807,6 +808,16 @@ impl Engine {
         payload: &[u8],
         disable_wal: bool,
     ) -> Result<u64> {
+        self.exec_bulk_insert_payload_with_options(db, payload, disable_wal, false)
+    }
+
+    pub fn exec_bulk_insert_payload_with_options(
+        &self,
+        db: &str,
+        payload: &[u8],
+        disable_wal: bool,
+        bulk_import_mode: bool,
+    ) -> Result<u64> {
         let catalogs = self.catalogs.read().unwrap();
         let catalog = catalogs
             .get(db)
@@ -818,8 +829,7 @@ impl Engine {
         drop(catalogs);
 
         if !disable_wal {
-            let bulk_mode = self.bulk_mode.load(Ordering::Acquire);
-            if !bulk_mode {
+            if !bulk_import_mode {
                 let req = {
                     let catalogs = self.catalogs.read().unwrap();
                     let catalog = catalogs.get(db).ok_or_else(|| {

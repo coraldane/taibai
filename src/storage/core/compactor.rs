@@ -10,7 +10,7 @@ use crate::protocol::types::DataType;
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::partition::parse_partition_key;
-use crate::storage::segment::SegmentWriter;
+use crate::storage::segment::{store, SegmentWriter};
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
@@ -176,8 +176,7 @@ impl Compactor {
 
         if row_refs.is_empty() {
             for old_seg in segment_files {
-                self.segment_mgr.invalidate_reader(old_seg);
-                std::fs::remove_file(old_seg)?;
+                self.segment_mgr.remove_segment_file(old_seg)?;
             }
             return Ok(CompactStats {
                 segments_read: segment_files.len(),
@@ -188,8 +187,10 @@ impl Compactor {
 
         sort_row_refs(&mut row_refs, &key_batches);
 
-        let final_path = next_compact_segment_path(table_dir, partition_key)?;
-        let tmp_path = compact_tmp_path(&final_path);
+        let final_path = self
+            .segment_mgr
+            .next_replacement_segment_path(table_dir, partition_key)?;
+        let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
 
         let write_result = self.write_sorted_segment(
             &tmp_path,
@@ -204,21 +205,8 @@ impl Compactor {
             return Err(err);
         }
 
-        if final_path.exists() {
-            return Err(MonaxError::Storage(format!(
-                "compact target segment already exists: {}",
-                final_path.display()
-            )));
-        }
-        std::fs::rename(&tmp_path, &final_path)?;
-
-        for old_seg in segment_files {
-            if old_seg != &final_path {
-                self.segment_mgr.invalidate_reader(old_seg);
-                std::fs::remove_file(old_seg)?;
-            }
-        }
-        let _ = self.segment_mgr.open_reader_cached(&final_path);
+        self.segment_mgr
+            .replace_segments_with_tmp(&tmp_path, &final_path, segment_files)?;
 
         Ok(CompactStats {
             segments_read: segment_files.len(),
@@ -831,48 +819,6 @@ fn group_segments_by_partition(
             .push(path);
     }
     groups
-}
-
-fn compact_tmp_path(final_path: &Path) -> PathBuf {
-    let file_name = final_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "segment.dat".to_string());
-    final_path.with_file_name(format!("{}.compact_tmp", file_name))
-}
-
-fn next_compact_segment_path(table_dir: &Path, partition_key: Option<&str>) -> Result<PathBuf> {
-    let mut max_seq = 0u32;
-    if table_dir.exists() {
-        for entry in std::fs::read_dir(table_dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let seq = match partition_key {
-                Some(pk) => parse_partition_seq(&name, pk),
-                None => parse_regular_seq(&name),
-            };
-            if let Some(seq) = seq {
-                max_seq = max_seq.max(seq);
-            }
-        }
-    }
-
-    let next_seq = max_seq + 1;
-    Ok(match partition_key {
-        Some(pk) => table_dir.join(format!("p{}_{:04}.dat", pk, next_seq)),
-        None => table_dir.join(format!("seg_{:05}.dat", next_seq)),
-    })
-}
-
-fn parse_regular_seq(name: &str) -> Option<u32> {
-    let seq = name.strip_prefix("seg_")?.strip_suffix(".dat")?;
-    seq.parse().ok()
-}
-
-fn parse_partition_seq(name: &str, partition_key: &str) -> Option<u32> {
-    let prefix = format!("p{}_", partition_key);
-    let seq = name.strip_prefix(&prefix)?.strip_suffix(".dat")?;
-    seq.parse().ok()
 }
 
 #[cfg(test)]
