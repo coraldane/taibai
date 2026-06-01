@@ -4,6 +4,7 @@ mod protocol;
 mod sql;
 mod storage;
 mod types;
+mod version;
 
 use std::sync::Arc;
 
@@ -19,6 +20,8 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    tracing::info!("Monax {}", version::get_full_version());
 
     match RunMode::from_args() {
         RunMode::Server(config) => run_server(config).await,

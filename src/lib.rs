@@ -5,3 +5,4 @@ pub mod sql;
 pub mod storage;
 pub mod tools;
 pub mod types;
+pub mod version;

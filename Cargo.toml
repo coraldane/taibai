@@ -62,3 +62,6 @@ twox-hash = "1"
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"
+
+[build-dependencies]
+chrono = "0.4"
