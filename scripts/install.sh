@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 
+BINARY_NAME="monax"
 PREFIX="/usr/local/monax"
 INSTALL_SERVICE=true
 CONFIG_FILE=""
@@ -14,9 +15,9 @@ Usage: sudo ./scripts/install.sh [options]
 
 Options:
   -prefix=PATH      Installation prefix (default: /usr/local/monax)
-  -config=PATH      Path to existing config file (optional)
-  -data-dir=PATH    Data directory path (default: PREFIX/data)
-  -no-service       Skip systemd/launchd service installation
+  -config=PATH     Path to existing config file (optional)
+  -data-dir=PATH   Data directory path (default: PREFIX/data)
+  -no-service      Skip systemd/launchd service installation
 
 Examples:
   sudo ./scripts/install.sh
