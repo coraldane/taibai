@@ -138,7 +138,10 @@ impl PreparedStatementCache {
 
 pub fn bind_params(stmt: &mut Statement, params: &[ScalarValue]) -> Result<()> {
     match stmt {
-        Statement::Select { where_clause: Some(ref mut expr), .. } => {
+        Statement::Select {
+            where_clause: Some(ref mut expr),
+            ..
+        } => {
             substitute_placeholders(expr, params)?;
         }
         Statement::Insert { values, .. } => {
@@ -167,7 +170,10 @@ pub fn bind_params(stmt: &mut Statement, params: &[ScalarValue]) -> Result<()> {
                 substitute_placeholders(&mut assign.value, params)?;
             }
         }
-        Statement::Delete { where_clause: Some(ref mut expr), .. } => {
+        Statement::Delete {
+            where_clause: Some(ref mut expr),
+            ..
+        } => {
             substitute_placeholders(expr, params)?;
         }
         _ => {}
@@ -304,7 +310,10 @@ pub fn count_placeholders(stmt: &Statement) -> usize {
                 count_expr_placeholders(&assign.value, &mut count);
             }
         }
-        Statement::Delete { where_clause: Some(ref e), .. } => {
+        Statement::Delete {
+            where_clause: Some(ref e),
+            ..
+        } => {
             count_expr_placeholders(e, &mut count);
         }
         _ => {}
@@ -432,7 +441,10 @@ pub fn has_placeholders(stmt: &Statement) -> bool {
                 check_expr_for_placeholders(&assign.value, &mut found);
             }
         }
-        Statement::Delete { where_clause: Some(ref e), .. } => {
+        Statement::Delete {
+            where_clause: Some(ref e),
+            ..
+        } => {
             check_expr_for_placeholders(e, &mut found);
         }
         _ => {}

@@ -9,8 +9,7 @@ use crate::common::error::{MonaxError, Result};
 use crate::types::batch::ColumnDef;
 
 /// Partition type for a table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PartitionType {
     #[default]
     None = 0,
@@ -21,7 +20,6 @@ pub enum PartitionType {
     Hash = 5,
     Mod = 6,
 }
-
 
 /// Partition info for a table.
 #[derive(Debug, Clone, Serialize, Deserialize)]

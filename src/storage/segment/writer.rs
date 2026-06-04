@@ -13,6 +13,7 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::constants::{FOOTER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use super::meta::remove_sidecar_meta;
 
 struct BuildingRowGroup {
     columns: Vec<Vec<u8>>,
@@ -64,6 +65,7 @@ impl SegmentWriter {
         row_group_size: usize,
         bloom_column_indices: &[usize],
     ) -> Result<Self> {
+        remove_sidecar_meta(path)?;
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)

@@ -1044,9 +1044,7 @@ impl ColumnArray {
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && (self
-                            .scalar(i)
-                            .numeric_cmp(value) == Some(std::cmp::Ordering::Equal))
+                        && (self.scalar(i).numeric_cmp(value) == Some(std::cmp::Ordering::Equal))
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -1069,9 +1067,7 @@ impl ColumnArray {
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && (self
-                            .scalar(i)
-                            .numeric_cmp(value) == Some(std::cmp::Ordering::Less))
+                        && (self.scalar(i).numeric_cmp(value) == Some(std::cmp::Ordering::Less))
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -1120,9 +1116,7 @@ impl ColumnArray {
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && (self
-                            .scalar(i)
-                            .numeric_cmp(value) == Some(std::cmp::Ordering::Greater))
+                        && (self.scalar(i).numeric_cmp(value) == Some(std::cmp::Ordering::Greater))
                 })
                 .collect(),
             _ => vec![false; num_rows],

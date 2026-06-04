@@ -53,14 +53,7 @@ fn exec_select_inner(
 
     match from {
         None => exec_literal_select(stmt),
-        Some(from_clause) => exec_table_select(
-            engine,
-            db,
-            stmt,
-            from_clause,
-            stats,
-            cached_plan,
-        ),
+        Some(from_clause) => exec_table_select(engine, db, stmt, from_clause, stats, cached_plan),
     }
 }
 

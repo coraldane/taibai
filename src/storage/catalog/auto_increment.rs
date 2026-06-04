@@ -34,6 +34,20 @@ impl AutoIncrementCounter {
         self.current.store(value, Ordering::SeqCst);
     }
 
+    pub fn advance_past(&self, value: u64) {
+        let next = value.saturating_add(1);
+        let mut current = self.current.load(Ordering::SeqCst);
+        while current < next {
+            match self
+                .current
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     pub fn table(&self) -> &str {
         &self.table
     }
@@ -134,6 +148,17 @@ impl AutoIncrementManager {
         Ok(())
     }
 
+    pub fn advance_past(&self, db: &str, table: &str, value: u64) -> Result<()> {
+        let counter = self.get(db, table).ok_or_else(|| {
+            MonaxError::Internal(format!(
+                "no auto_increment counter for table {}.{}",
+                db, table
+            ))
+        })?;
+        counter.advance_past(value);
+        Ok(())
+    }
+
     pub fn counters(&self) -> &RwLock<HashMap<String, Arc<AutoIncrementCounter>>> {
         &self.counters
     }
@@ -156,6 +181,10 @@ mod tests {
         assert_eq!(counter.next_value(), 2);
         assert_eq!(counter.next_value(), 3);
         assert_eq!(counter.current_value(), 4);
+        counter.advance_past(10);
+        assert_eq!(counter.next_value(), 11);
+        counter.advance_past(5);
+        assert_eq!(counter.next_value(), 12);
     }
 
     #[test]

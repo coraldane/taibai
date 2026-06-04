@@ -15,6 +15,10 @@ use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
 use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
+use crate::storage::segment::meta::{
+    append_sidecar_footer, append_sidecar_row_groups, compact_sidecar_footer_if_needed,
+    remove_sidecar_meta,
+};
 use crate::storage::segment::{
     encode_segment_footer, encode_segment_header, store, RowGroupMeta, SegmentReader,
     SegmentWriter, SEGMENT_HEADER_SIZE,
@@ -26,7 +30,9 @@ const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
 const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 500_000;
 const FLUSH_CHECK_INTERVAL_SECS: u64 = 10;
 const FLUSH_IDLE_THRESHOLD_SECS: u64 = 5;
-const FLUSH_META_AFTER_ROW_GROUP: bool = true;
+const FLUSH_META_AFTER_ROW_GROUP: bool = false;
+const SIDECAR_COMPACT_MIN_RECORDS: usize = 256;
+const SIDECAR_COMPACT_MIN_BYTES: u64 = 4 * 1024 * 1024;
 
 const DEFAULT_MIN_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
@@ -57,6 +63,7 @@ struct ActiveSegmentWriter {
     buffered_rows: usize,
     dirty_meta: bool,
     data_end: u64,
+    sidecar_row_groups_flushed: usize,
     last_write_at: Instant,
 }
 
@@ -221,14 +228,43 @@ impl ActiveSegmentWriter {
         self.file.flush()?;
         self.file.get_ref().set_len(self.data_end)?;
         self.file.seek(SeekFrom::Start(self.data_end))?;
-
-        let footer = self.encode_footer()?;
-        self.file.write_all(&footer)?;
-        self.file.write_all(&self.data_end.to_le_bytes())?;
-        self.file.flush()?;
         self.file.get_ref().sync_all()?;
 
-        self.current_size = self.data_end + footer.len() as u64 + 8;
+        let footer = self.encode_footer()?;
+        if self.sidecar_row_groups_flushed == 0
+            || self.sidecar_row_groups_flushed > self.row_groups.len()
+        {
+            append_sidecar_footer(&self.path, self.data_end, &footer)?;
+        } else if self.sidecar_row_groups_flushed < self.row_groups.len() {
+            let table_name = self.table_name();
+            append_sidecar_row_groups(
+                &self.path,
+                self.data_end,
+                &self.schema,
+                self.total_rows,
+                &self.row_groups[self.sidecar_row_groups_flushed..],
+                &table_name,
+            )?;
+        } else {
+            append_sidecar_footer(&self.path, self.data_end, &footer)?;
+        }
+        if compact_sidecar_footer_if_needed(
+            &self.path,
+            self.data_end,
+            &footer,
+            SIDECAR_COMPACT_MIN_RECORDS,
+            SIDECAR_COMPACT_MIN_BYTES,
+        )? {
+            tracing::debug!(
+                path = %self.path.display(),
+                rows = self.total_rows,
+                row_groups = self.row_groups.len(),
+                "segment sidecar meta compacted"
+            );
+        }
+
+        self.current_size = self.data_end;
+        self.sidecar_row_groups_flushed = self.row_groups.len();
         self.dirty_meta = false;
         invalidate_reader(&self.path);
 
@@ -244,8 +280,10 @@ impl ActiveSegmentWriter {
 
     fn seal(&mut self, invalidate_reader: &dyn Fn(&Path)) -> Result<()> {
         self.flush_buffer(invalidate_reader)?;
-        self.flush_meta(invalidate_reader)?;
+        self.write_final_footer()?;
         self.finalize()?;
+        remove_sidecar_meta(&self.path)?;
+        invalidate_reader(&self.path);
 
         tracing::info!(
             path = %self.path.display(),
@@ -255,6 +293,23 @@ impl ActiveSegmentWriter {
             "segment sealed"
         );
 
+        Ok(())
+    }
+
+    fn write_final_footer(&mut self) -> Result<()> {
+        self.file.flush()?;
+        self.file.get_ref().set_len(self.data_end)?;
+        self.file.seek(SeekFrom::Start(self.data_end))?;
+
+        let footer = self.encode_footer()?;
+        self.file.write_all(&footer)?;
+        self.file.write_all(&self.data_end.to_le_bytes())?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+
+        self.current_size = self.data_end + footer.len() as u64 + 8;
+        self.sidecar_row_groups_flushed = self.row_groups.len();
+        self.dirty_meta = false;
         Ok(())
     }
 
@@ -283,12 +338,7 @@ impl ActiveSegmentWriter {
     }
 
     fn encode_footer(&self) -> Result<Vec<u8>> {
-        let table_name = self
-            .path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let table_name = self.table_name();
         let segment_zone_maps =
             compute_segment_zone_maps_from_row_groups(&self.row_groups, self.schema.num_columns());
         Ok(encode_segment_footer(
@@ -300,6 +350,14 @@ impl ActiveSegmentWriter {
             &table_name,
             &segment_zone_maps,
         ))
+    }
+
+    fn table_name(&self) -> String {
+        self.path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -537,6 +595,37 @@ impl SegmentManager {
             .clone()
     }
 
+    fn table_state_key_from_dir(&self, table_dir: &Path) -> Result<String> {
+        let relative = table_dir.strip_prefix(&self.data_dir).map_err(|_| {
+            MonaxError::Storage(format!(
+                "table dir '{}' is outside data dir '{}'",
+                table_dir.display(),
+                self.data_dir.display()
+            ))
+        })?;
+
+        let mut components = relative.components();
+        let db = components
+            .next()
+            .ok_or_else(|| MonaxError::Storage("table dir is missing database name".into()))?;
+        let table = components
+            .next()
+            .ok_or_else(|| MonaxError::Storage("table dir is missing table name".into()))?;
+
+        Ok(table_key(
+            &db.as_os_str().to_string_lossy(),
+            &table.as_os_str().to_string_lossy(),
+        ))
+    }
+
+    fn get_or_create_state_for_table_dir(
+        &self,
+        table_dir: &Path,
+    ) -> Result<Arc<TableSegmentState>> {
+        let key = self.table_state_key_from_dir(table_dir)?;
+        Ok(self.get_or_create_state(&key))
+    }
+
     pub fn discover_segments(table_dir: &Path) -> Result<Vec<PathBuf>> {
         store::discover_segments(table_dir)
     }
@@ -553,7 +642,7 @@ impl SegmentManager {
                 Err(_) => continue,
             };
 
-            if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
+            if file_len < SEGMENT_HEADER_SIZE as u64 {
                 continue;
             }
 
@@ -573,8 +662,7 @@ impl SegmentManager {
     }
 
     pub fn next_segment_path(&self, table_dir: &Path, _partition_key: &str) -> Result<PathBuf> {
-        let key = table_dir.to_string_lossy().to_string();
-        let state = self.get_or_create_state(&key);
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
         let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(table_dir.join(store::regular_segment_filename(seq)))
     }
@@ -584,8 +672,7 @@ impl SegmentManager {
         table_dir: &Path,
         partition_key: &str,
     ) -> Result<PathBuf> {
-        let key = table_dir.to_string_lossy().to_string();
-        let state = self.get_or_create_state(&key);
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
         let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(table_dir.join(store::partition_segment_filename(partition_key, seq)))
     }
@@ -643,6 +730,7 @@ impl SegmentManager {
     pub fn remove_segment_file(&self, path: &Path) -> Result<()> {
         self.invalidate_reader(path);
         std::fs::remove_file(path)?;
+        remove_sidecar_meta(path)?;
         Ok(())
     }
 
@@ -728,19 +816,9 @@ impl SegmentManager {
 
     fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
         let tables = self.tables.read().unwrap();
-
-        if let Ok(relative) = path.strip_prefix(&self.data_dir) {
-            let mut components = relative.components();
-            let db = components.next()?.as_os_str().to_string_lossy();
-            let table = components.next()?.as_os_str().to_string_lossy();
-            let key = table_key(&db, &table);
-            if let Some(state) = tables.get(&key) {
-                return Some(Arc::clone(state));
-            }
-        }
-
-        let table_dir_key = path.parent()?.to_string_lossy().to_string();
-        tables.get(&table_dir_key).cloned()
+        let table_dir = path.parent()?;
+        let key = self.table_state_key_from_dir(table_dir).ok()?;
+        tables.get(&key).cloned()
     }
 
     pub fn write_new_segment(
@@ -757,8 +835,7 @@ impl SegmentManager {
     }
 
     pub fn write_wal(&self, table_dir: &Path, batch: &RecordBatch) -> Result<()> {
-        let key = table_dir.to_string_lossy().to_string();
-        let state = self.get_or_create_state(&key);
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
 
         let wal_data = crate::sql::execution::wal_helper::serialize_batch_for_wal(batch);
         let txn_id = self.alloc_txn_id();
@@ -785,8 +862,7 @@ impl SegmentManager {
     }
 
     pub fn clear_wal(&self, table_dir: &Path) -> Result<()> {
-        let key = table_dir.to_string_lossy().to_string();
-        let state = self.get_or_create_state(&key);
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
         let mut wal_guard = state.wal_writer.lock().unwrap();
         if let Some(ref mut w) = *wal_guard {
             w.clear()?;
@@ -803,7 +879,9 @@ impl SegmentManager {
     }
 
     pub fn remove_wal(&self, table_dir: &Path) {
-        let key = table_dir.to_string_lossy().to_string();
+        let Ok(key) = self.table_state_key_from_dir(table_dir) else {
+            return;
+        };
         let tables = self.tables.write().unwrap();
         if let Some(state) = tables.get(&key) {
             let mut wal_guard = state.wal_writer.lock().unwrap();
@@ -999,6 +1077,7 @@ impl SegmentManager {
             self.next_partition_segment_path(table_dir, partition_key)?
         };
 
+        remove_sidecar_meta(&seg_path)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -1023,6 +1102,7 @@ impl SegmentManager {
             buffered_rows: 0,
             dirty_meta: false,
             data_end: SEGMENT_HEADER_SIZE as u64,
+            sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
         })
     }
@@ -1055,7 +1135,7 @@ impl SegmentManager {
                 Err(_) => continue,
             };
 
-            if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
+            if file_len < SEGMENT_HEADER_SIZE as u64 {
                 continue;
             }
 
@@ -1080,19 +1160,12 @@ impl SegmentManager {
     ) -> Result<Option<ActiveSegmentWriter>> {
         let file_len = std::fs::metadata(seg_path)?.len();
 
-        if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
+        if file_len < SEGMENT_HEADER_SIZE as u64 {
             return Ok(None);
         }
 
         let reader = SegmentReader::open(seg_path)?;
-        let footer_offset = {
-            let mut file = std::fs::File::open(seg_path)?;
-            use std::io::Read;
-            file.seek(SeekFrom::End(-8))?;
-            let mut buf = [0u8; 8];
-            file.read_exact(&mut buf)?;
-            u64::from_le_bytes(buf)
-        };
+        let data_end = reader.data_end();
 
         let row_groups = reader.footer_row_groups_info();
 
@@ -1101,12 +1174,12 @@ impl SegmentManager {
             .read(true)
             .open(seg_path)?;
 
-        file.set_len(footer_offset)?;
-        file.seek(SeekFrom::Start(footer_offset))?;
+        file.set_len(data_end)?;
+        file.seek(SeekFrom::Start(data_end))?;
 
         tracing::info!(
             path = %seg_path.display(),
-            data_end = footer_offset,
+            data_end,
             existing_rows = reader.row_count(),
             row_groups = row_groups.len(),
             "recovered active segment from unsealed file"
@@ -1117,12 +1190,13 @@ impl SegmentManager {
             path: seg_path.to_path_buf(),
             schema: schema.clone(),
             row_groups,
-            current_size: footer_offset,
+            current_size: data_end,
             total_rows: reader.row_count(),
             buffered_batch: None,
             buffered_rows: 0,
             dirty_meta: true,
-            data_end: footer_offset,
+            data_end,
+            sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
         }))
     }
@@ -1202,6 +1276,7 @@ impl SegmentManager {
         payload: &[u8],
         _disable_wal: bool,
         catalogs: &crate::storage::catalog::schema::DatabaseCatalog,
+        flush_immediately: bool,
     ) -> Result<u64> {
         use rayon::prelude::*;
 
@@ -1266,7 +1341,11 @@ impl SegmentManager {
                     batch = sort_batch_by_key_indices(&batch, &key_indices)?;
                 }
             }
-            return self.bulk_insert_batch_partitioned(db, req.table_name, &table_meta, batch);
+            return if flush_immediately {
+                self.bulk_insert_batch_partitioned(db, req.table_name, &table_meta, batch)
+            } else {
+                self.bulk_insert_batch_partitioned_deferred(db, req.table_name, &table_meta, batch)
+            };
         }
 
         let partition_key = String::new();
@@ -1308,7 +1387,7 @@ impl SegmentManager {
             if seg.current_size >= self.max_segment_size() {
                 seg.seal(&|path| self.invalidate_reader(path))?;
                 active_guard.remove(&partition_key);
-            } else {
+            } else if flush_immediately {
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
             }
         }
@@ -1418,7 +1497,9 @@ impl SegmentManager {
             for key in keys_to_seal {
                 if let Some(seg) = active_guard.get_mut(&key) {
                     seg.flush_buffer(&|path| self.invalidate_reader(path))?;
-                    seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                    seg.write_final_footer()?;
+                    remove_sidecar_meta(&seg.path)?;
+                    self.invalidate_reader(&seg.path);
                     tracing::info!(
                         path = %seg.path.display(),
                         size_mb = seg.current_size / (1024 * 1024),
@@ -1496,8 +1577,7 @@ impl SegmentManager {
     }
 
     pub fn write_txn_wal(&self, table_dir: &Path, txn_id: u64, batch: &RecordBatch) -> Result<()> {
-        let key = table_dir.to_string_lossy().to_string();
-        let state = self.get_or_create_state(&key);
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
 
         let wal_data = crate::sql::execution::wal_helper::serialize_batch_for_wal(batch);
 
@@ -1513,8 +1593,7 @@ impl SegmentManager {
     }
 
     pub fn clear_txn_wal(&self, table_dir: &Path, txn_id: u64) -> Result<()> {
-        let key = table_dir.to_string_lossy().to_string();
-        let state = self.get_or_create_state(&key);
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
         let mut wal_guard = state.wal_writer.lock().unwrap();
         if let Some(ref mut w) = *wal_guard {
             w.clear_entries_for_txn(txn_id)?;
@@ -1523,8 +1602,7 @@ impl SegmentManager {
     }
 
     pub fn sync_table_wal(&self, table_dir: &Path) -> Result<()> {
-        let key = table_dir.to_string_lossy().to_string();
-        let state = self.get_or_create_state(&key);
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
         let mut wal_guard = state.wal_writer.lock().unwrap();
         if let Some(ref mut w) = *wal_guard {
             w.sync()?;

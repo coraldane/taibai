@@ -17,6 +17,7 @@ use crate::types::scalar::ScalarValue;
 
 use super::constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use super::footer::{parse_segment_footer, reserved_section_offset, ParsedSegmentFooter};
+use super::meta::{append_sidecar_footer, read_latest_sidecar_footer};
 use super::RowGroupMeta;
 
 struct SegmentFooter {
@@ -47,6 +48,13 @@ pub struct SegmentReader {
     path: PathBuf,
     data: SegmentData,
     footer: SegmentFooter,
+    data_end: u64,
+}
+
+struct FooterSource {
+    data_end: u64,
+    footer: Vec<u8>,
+    is_sidecar: bool,
 }
 
 enum SegmentData {
@@ -76,11 +84,10 @@ impl SegmentReader {
         let file = fs::File::open(path)?;
         let file_len = file.metadata()?.len();
 
-        if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
+        if file_len < SEGMENT_HEADER_SIZE as u64 {
             return Err(MonaxError::Storage(format!(
                 "segment file too small: {} bytes (need >= {})",
-                file_len,
-                SEGMENT_HEADER_SIZE + 8
+                file_len, SEGMENT_HEADER_SIZE
             )));
         }
 
@@ -107,17 +114,12 @@ impl SegmentReader {
             )));
         }
 
-        let mut footer_offset_buf = [0u8; 8];
-        tmp_file.seek(SeekFrom::End(-8))?;
-        tmp_file.read_exact(&mut footer_offset_buf)?;
-        let footer_offset = u64::from_le_bytes(footer_offset_buf) as usize;
-
-        if footer_offset < SEGMENT_HEADER_SIZE
-            || footer_offset >= (file_len as usize).saturating_sub(8)
+        let footer_source = Self::read_footer_source(path, Some(file_len))?;
+        if footer_source.data_end < SEGMENT_HEADER_SIZE as u64 || footer_source.data_end > file_len
         {
             return Err(MonaxError::Storage(format!(
-                "invalid footer offset: {} (file size {}, header size {})",
-                footer_offset, file_len, SEGMENT_HEADER_SIZE
+                "invalid footer data_end: {} (file size {}, header size {})",
+                footer_source.data_end, file_len, SEGMENT_HEADER_SIZE
             )));
         }
 
@@ -138,14 +140,13 @@ impl SegmentReader {
             SegmentData::Mmap(unsafe { Mmap::map(&tmp_file)? })
         };
 
-        let footer_end = file_len as usize - 8;
-        let footer_data = &data.as_slice()[footer_offset..footer_end];
-        let parsed = parse_segment_footer(footer_data)?;
+        let parsed = parse_segment_footer(&footer_source.footer)?;
 
         Ok(Self {
             path: path.to_path_buf(),
             data,
             footer: parsed.into(),
+            data_end: footer_source.data_end,
         })
     }
 
@@ -155,6 +156,10 @@ impl SegmentReader {
 
     pub fn row_count(&self) -> u64 {
         self.footer.row_count
+    }
+
+    pub fn data_end(&self) -> u64 {
+        self.data_end
     }
 
     pub fn num_row_groups(&self) -> usize {
@@ -216,15 +221,20 @@ impl SegmentReader {
         delete_bitmap: &[u8],
         deleted_row_count: u64,
     ) -> Result<()> {
-        let footer_bytes = Self::read_footer_bytes(path)?;
-        let res_offset = reserved_section_offset(&footer_bytes)?;
+        let source = Self::read_footer_source(path, None)?;
+        let res_offset = reserved_section_offset(&source.footer)?;
 
         let mut new_footer = Vec::with_capacity(res_offset + 12 + delete_bitmap.len());
-        new_footer.extend_from_slice(&footer_bytes[..res_offset]);
+        new_footer.extend_from_slice(&source.footer[..res_offset]);
         new_footer.extend_from_slice(&deleted_row_count.to_le_bytes());
         new_footer.extend_from_slice(&(delete_bitmap.len() as u32).to_le_bytes());
         if !delete_bitmap.is_empty() {
             new_footer.extend_from_slice(delete_bitmap);
+        }
+
+        if source.is_sidecar {
+            append_sidecar_footer(path, source.data_end, &new_footer)?;
+            return Ok(());
         }
 
         let mut file = fs::OpenOptions::new().write(true).read(true).open(path)?;
@@ -246,8 +256,23 @@ impl SegmentReader {
     }
 
     fn read_footer_bytes(path: &Path) -> Result<Vec<u8>> {
+        Ok(Self::read_footer_source(path, None)?.footer)
+    }
+
+    fn read_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {
+        if let Some(sidecar) = read_latest_sidecar_footer(path)? {
+            return Ok(FooterSource {
+                data_end: sidecar.data_end,
+                footer: sidecar.footer,
+                is_sidecar: true,
+            });
+        }
+
         let mut file = fs::File::open(path)?;
-        let file_len = file.metadata()?.len();
+        let file_len = match file_len_hint {
+            Some(len) => len,
+            None => file.metadata()?.len(),
+        };
         if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
             return Err(MonaxError::Storage(format!(
                 "segment file too small: {}",
@@ -268,7 +293,11 @@ impl SegmentReader {
         let mut buf = vec![0u8; footer_len];
         file.seek(SeekFrom::Start(footer_offset))?;
         file.read_exact(&mut buf)?;
-        Ok(buf)
+        Ok(FooterSource {
+            data_end: footer_offset,
+            footer: buf,
+            is_sidecar: false,
+        })
     }
 
     pub fn read_column(&self, row_group: usize, column_idx: usize) -> Result<ColumnArray> {
@@ -493,10 +522,7 @@ impl SegmentReader {
                 .collect(),
         );
 
-        crate::types::batch::RecordBatch::try_new(
-            result_schema,
-            selected_columns,
-        )
+        crate::types::batch::RecordBatch::try_new(result_schema, selected_columns)
     }
 
     pub fn read_row_group(&self, row_group: usize) -> Result<crate::types::batch::RecordBatch> {

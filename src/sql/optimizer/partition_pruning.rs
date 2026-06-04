@@ -87,47 +87,49 @@ fn apply_partition_pruning(plan: LogicalPlan) -> (LogicalPlan, bool) {
 }
 
 fn extract_time_range(expr: &LogicalExpr, schema: &Schema) -> Option<TimeRange> {
-    if let LogicalExpr::BinaryOp { left, op, right } = expr { match op {
-        BinOp::Gte | BinOp::Gt => {
-            if let LogicalExpr::Column(idx) = **left {
-                if let LogicalExpr::Literal(ref val) = **right {
-                    let col_name = schema.columns.get(idx)?.name.clone();
-                    return Some(TimeRange {
-                        column: col_name,
-                        start: Some(val.clone()),
-                        end: None,
-                    });
+    if let LogicalExpr::BinaryOp { left, op, right } = expr {
+        match op {
+            BinOp::Gte | BinOp::Gt => {
+                if let LogicalExpr::Column(idx) = **left {
+                    if let LogicalExpr::Literal(ref val) = **right {
+                        let col_name = schema.columns.get(idx)?.name.clone();
+                        return Some(TimeRange {
+                            column: col_name,
+                            start: Some(val.clone()),
+                            end: None,
+                        });
+                    }
                 }
             }
-        }
-        BinOp::Lte | BinOp::Lt => {
-            if let LogicalExpr::Column(idx) = **left {
-                if let LogicalExpr::Literal(ref val) = **right {
-                    let col_name = schema.columns.get(idx)?.name.clone();
-                    return Some(TimeRange {
-                        column: col_name,
-                        start: None,
-                        end: Some(val.clone()),
-                    });
+            BinOp::Lte | BinOp::Lt => {
+                if let LogicalExpr::Column(idx) = **left {
+                    if let LogicalExpr::Literal(ref val) = **right {
+                        let col_name = schema.columns.get(idx)?.name.clone();
+                        return Some(TimeRange {
+                            column: col_name,
+                            start: None,
+                            end: Some(val.clone()),
+                        });
+                    }
                 }
             }
-        }
-        BinOp::And => {
-            let left_range = extract_time_range(left, schema);
-            let right_range = extract_time_range(right, schema);
-            if let (Some(l), Some(r)) = (&left_range, &right_range) {
-                if l.column == r.column {
-                    return Some(TimeRange {
-                        column: l.column.clone(),
-                        start: l.start.as_ref().or(r.start.as_ref()).cloned(),
-                        end: r.end.as_ref().or(l.end.as_ref()).cloned(),
-                    });
+            BinOp::And => {
+                let left_range = extract_time_range(left, schema);
+                let right_range = extract_time_range(right, schema);
+                if let (Some(l), Some(r)) = (&left_range, &right_range) {
+                    if l.column == r.column {
+                        return Some(TimeRange {
+                            column: l.column.clone(),
+                            start: l.start.as_ref().or(r.start.as_ref()).cloned(),
+                            end: r.end.as_ref().or(l.end.as_ref()).cloned(),
+                        });
+                    }
                 }
+                return left_range.or(right_range);
             }
-            return left_range.or(right_range);
+            _ => {}
         }
-        _ => {}
-    } }
+    }
     None
 }
 

@@ -164,8 +164,30 @@ pub fn exec_insert(
     };
 
     if !primary_key_indices.is_empty() {
-        validate_primary_key_uniqueness(engine, db, table, &batch, &schema, &primary_key_indices)?;
+        if generated_auto_increment_key_guarantees_uniqueness(
+            &primary_key_indices,
+            &is_missing_auto_inc,
+        ) {
+            validate_primary_key_values_present(&batch, &schema, &primary_key_indices)?;
+        } else {
+            validate_primary_key_uniqueness(
+                engine,
+                db,
+                table,
+                &batch,
+                &schema,
+                &primary_key_indices,
+            )?;
+        }
     }
+    advance_explicit_auto_increment_counters(
+        engine,
+        db,
+        table,
+        &batch,
+        &auto_inc_cols,
+        &missing_auto_inc,
+    )?;
 
     if bulk_import_mode {
         engine.exec_bulk_insert_partitioned_with_wal_control(
@@ -183,8 +205,8 @@ pub fn exec_insert(
         db,
         table,
         values.len() as i64,
-        !bulk_import_mode && (txn_id > 0 || !auto_inc_cols.is_empty()),
-        !bulk_import_mode && txn_id == 0 && auto_inc_cols.is_empty(),
+        !bulk_import_mode && txn_id > 0,
+        !bulk_import_mode && txn_id == 0,
     )?;
 
     Ok(ExecResult::Ok {
@@ -508,6 +530,26 @@ fn primary_key_indices(schema: &Schema) -> Vec<usize> {
         .collect()
 }
 
+fn generated_auto_increment_key_guarantees_uniqueness(
+    primary_key_indices: &[usize],
+    is_missing_auto_inc: &[bool],
+) -> bool {
+    primary_key_indices
+        .iter()
+        .any(|&idx| is_missing_auto_inc.get(idx).copied().unwrap_or(false))
+}
+
+fn validate_primary_key_values_present(
+    batch: &RecordBatch,
+    schema: &Schema,
+    primary_key_indices: &[usize],
+) -> Result<()> {
+    for row_idx in 0..batch.num_rows() {
+        primary_key_for_row(batch, row_idx, primary_key_indices, schema)?;
+    }
+    Ok(())
+}
+
 fn validate_primary_key_uniqueness(
     engine: &Engine,
     db: &str,
@@ -525,6 +567,42 @@ fn validate_primary_key_uniqueness(
     }
 
     load_existing_primary_keys(engine, db, table, primary_key_indices, &mut keys)?;
+    Ok(())
+}
+
+fn advance_explicit_auto_increment_counters(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    batch: &RecordBatch,
+    auto_inc_cols: &[usize],
+    missing_auto_inc: &[usize],
+) -> Result<()> {
+    for &col_idx in auto_inc_cols {
+        if missing_auto_inc.contains(&col_idx) {
+            continue;
+        }
+
+        let mut max_value = None;
+        for row_idx in 0..batch.num_rows() {
+            let Some(value) = batch.scalar(row_idx, col_idx) else {
+                continue;
+            };
+            let Some(int_value) = value.integer_i128() else {
+                continue;
+            };
+            let Ok(unsigned) = u64::try_from(int_value) else {
+                continue;
+            };
+            max_value = Some(max_value.map_or(unsigned, |current: u64| current.max(unsigned)));
+        }
+
+        if let Some(value) = max_value {
+            engine
+                .auto_increment_manager()
+                .advance_past(db, table, value)?;
+        }
+    }
     Ok(())
 }
 

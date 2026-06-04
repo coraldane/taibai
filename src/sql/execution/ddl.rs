@@ -4,6 +4,7 @@ use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
 use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType};
+use crate::storage::segment::meta::remove_sidecar_meta;
 use crate::types::batch::{ColumnDef, ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -228,6 +229,7 @@ pub fn exec_alter_table(
                                     && file_name.ends_with(".dat")
                                 {
                                     engine.segment_mgr().invalidate_reader(&e.path());
+                                    let _ = remove_sidecar_meta(&e.path());
                                     let _ = std::fs::remove_file(e.path());
                                 }
                             }
@@ -255,6 +257,7 @@ pub fn exec_alter_table(
                                     && file_name.ends_with(".dat")
                                 {
                                     engine.segment_mgr().invalidate_reader(&e.path());
+                                    let _ = remove_sidecar_meta(&e.path());
                                     let _ = std::fs::remove_file(e.path());
                                 }
                             }
@@ -433,6 +436,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
                     if (file_name.starts_with("seg_") || file_name.starts_with("p"))
                         && file_name.ends_with(".dat")
                     {
+                        let _ = remove_sidecar_meta(&path);
                         let _ = std::fs::remove_file(&path);
                     }
                 }

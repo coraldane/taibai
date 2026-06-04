@@ -243,7 +243,8 @@ fn compute_window_func(
             let values: Vec<ScalarValue> = row_indices
                 .iter()
                 .map(|&idx| {
-                    rows[idx].first()
+                    rows[idx]
+                        .first()
                         .cloned()
                         .unwrap_or(ScalarValue::Int64(None))
                 })

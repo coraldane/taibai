@@ -76,24 +76,26 @@ fn extract_zone_maps_recursive(
     schema: &crate::types::batch::Schema,
     filters: &mut Vec<ZoneMapFilter>,
 ) {
-    if let LogicalExpr::BinaryOp { left, op, right } = expr { match op {
-        BinOp::Eq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => {
-            if let LogicalExpr::Column(idx) = **left {
-                if let LogicalExpr::Literal(ref val) = **right {
-                    if let Some(col_def) = schema.columns.get(idx) {
-                        filters.push(ZoneMapFilter {
-                            column: col_def.name.clone(),
-                            min_value: val.clone(),
-                            max_value: val.clone(),
-                        });
+    if let LogicalExpr::BinaryOp { left, op, right } = expr {
+        match op {
+            BinOp::Eq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => {
+                if let LogicalExpr::Column(idx) = **left {
+                    if let LogicalExpr::Literal(ref val) = **right {
+                        if let Some(col_def) = schema.columns.get(idx) {
+                            filters.push(ZoneMapFilter {
+                                column: col_def.name.clone(),
+                                min_value: val.clone(),
+                                max_value: val.clone(),
+                            });
+                        }
                     }
                 }
             }
+            BinOp::And => {
+                extract_zone_maps_recursive(left, schema, filters);
+                extract_zone_maps_recursive(right, schema, filters);
+            }
+            _ => {}
         }
-        BinOp::And => {
-            extract_zone_maps_recursive(left, schema, filters);
-            extract_zone_maps_recursive(right, schema, filters);
-        }
-        _ => {}
-    } }
+    }
 }

@@ -258,6 +258,7 @@ fn auto_increment_counters_are_restored_per_database() {
         engine
             .execute(&mut session, "INSERT INTO db1.t (value) VALUES (10)")
             .expect("insert auto increment row");
+        engine.flush_all_buffers().expect("flush inserted row");
         engine.segment_mgr().shutdown();
     }
 

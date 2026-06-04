@@ -494,7 +494,9 @@ pub fn ast_expr_to_logical_join(
                 distinct: *distinct,
             }))
         }
-        _ => Err(MonaxError::Sql("unsupported expression type in join context".to_string())),
+        _ => Err(MonaxError::Sql(
+            "unsupported expression type in join context".to_string(),
+        )),
     }
 }
 
@@ -563,10 +565,7 @@ pub fn expr_to_name(expr: &Expr) -> String {
             } else if args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*") {
                 "*".to_string()
             } else {
-                args.iter()
-                    .map(expr_to_name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                args.iter().map(expr_to_name).collect::<Vec<_>>().join(", ")
             };
             if *distinct {
                 format!("{}(distinct {})", name.to_lowercase(), arg_str)

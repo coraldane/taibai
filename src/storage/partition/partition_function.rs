@@ -33,7 +33,7 @@ impl PartitionFunction {
             }
             PartitionFunction::Hash(buckets) => {
                 if *buckets > 0 {
-                    value.abs() % (*buckets as i64) 
+                    value.abs() % (*buckets as i64)
                 } else {
                     value
                 }
@@ -43,11 +43,10 @@ impl PartitionFunction {
 
     pub fn apply_str(&self, s: &str) -> i64 {
         match self {
-            PartitionFunction::Hash(buckets)
-                if *buckets > 0 => {
-                    let hash = compute_string_hash(s);
-                    hash % (*buckets as i64)
-                }
+            PartitionFunction::Hash(buckets) if *buckets > 0 => {
+                let hash = compute_string_hash(s);
+                hash % (*buckets as i64)
+            }
             _ => 0,
         }
     }
@@ -100,14 +99,8 @@ pub fn hash_partition_value(val: &ScalarValue, num_buckets: i64) -> i64 {
         ScalarValue::Timestamp(Some(v)) => func.apply(*v),
         ScalarValue::Date(Some(v)) => func.apply(*v as i64),
         ScalarValue::Time(Some(v)) => func.apply(*v),
-        ScalarValue::UInt64(Some(v))
-            if num_buckets > 0 => {
-                (*v % num_buckets as u64) as i64
-            }
-        ScalarValue::UInt32(Some(v))
-            if num_buckets > 0 => {
-                (*v % num_buckets as u32) as i64
-            }
+        ScalarValue::UInt64(Some(v)) if num_buckets > 0 => (*v % num_buckets as u64) as i64,
+        ScalarValue::UInt32(Some(v)) if num_buckets > 0 => (*v % num_buckets as u32) as i64,
         ScalarValue::VarChar(Some(s)) => func.apply_str(s),
         _ => 0,
     }

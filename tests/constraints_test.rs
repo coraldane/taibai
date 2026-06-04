@@ -114,3 +114,121 @@ fn primary_key_cannot_be_null() {
         "omitted primary key without default should fail"
     );
 }
+
+#[test]
+fn omitted_auto_increment_primary_key_generates_unique_values() {
+    let (_temp_dir, engine, mut session) = create_engine();
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE users (id INT64 AUTO_INCREMENT PRIMARY KEY, score INT64)",
+        )
+        .expect("create table should succeed");
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO users (score) VALUES (10), (20), (30)",
+        )
+        .expect("auto increment insert should succeed");
+
+    let duplicate = engine.execute(&mut session, "INSERT INTO users (id, score) VALUES (2, 99)");
+    assert!(
+        duplicate.is_err(),
+        "explicit duplicate primary key should still fail"
+    );
+
+    let result = engine
+        .execute(&mut session, "SELECT id, score FROM users ORDER BY id")
+        .expect("select should succeed");
+    match result {
+        ExecResult::Query { batches, .. } => {
+            assert_eq!(batches[0].num_rows(), 3);
+            assert_eq!(batches[0].scalar(0, 0), Some(ScalarValue::Int64(Some(1))));
+            assert_eq!(batches[0].scalar(1, 0), Some(ScalarValue::Int64(Some(2))));
+            assert_eq!(batches[0].scalar(2, 0), Some(ScalarValue::Int64(Some(3))));
+        }
+        other => panic!("expected query result, got {:?}", other),
+    }
+}
+
+#[test]
+fn explicit_auto_increment_value_advances_counter() {
+    let (_temp_dir, engine, mut session) = create_engine();
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE users (id INT64 AUTO_INCREMENT PRIMARY KEY, score INT64)",
+        )
+        .expect("create table should succeed");
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO users (id, score) VALUES (10, 100)",
+        )
+        .expect("explicit auto increment value should insert");
+    engine
+        .execute(&mut session, "INSERT INTO users (score) VALUES (200)")
+        .expect("generated value should follow explicit max");
+
+    let result = engine
+        .execute(&mut session, "SELECT id FROM users ORDER BY id")
+        .expect("select should succeed");
+    match result {
+        ExecResult::Query { batches, .. } => {
+            assert_eq!(batches[0].num_rows(), 2);
+            assert_eq!(batches[0].scalar(0, 0), Some(ScalarValue::Int64(Some(10))));
+            assert_eq!(batches[0].scalar(1, 0), Some(ScalarValue::Int64(Some(11))));
+        }
+        other => panic!("expected query result, got {:?}", other),
+    }
+}
+
+#[test]
+fn explicit_auto_increment_value_restores_counter_after_restart() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+
+    {
+        let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE users (id INT64 AUTO_INCREMENT PRIMARY KEY, score INT64)",
+            )
+            .expect("create table should succeed");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO users (id, score) VALUES (10, 100)",
+            )
+            .expect("explicit auto increment value should insert");
+        engine.flush_all_buffers().expect("flush should succeed");
+        engine.segment_mgr().shutdown();
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(&mut session, "INSERT INTO users (score) VALUES (200)")
+        .expect("generated value should follow restored explicit max");
+
+    let result = engine
+        .execute(&mut session, "SELECT id FROM users ORDER BY id")
+        .expect("select should succeed");
+    match result {
+        ExecResult::Query { batches, .. } => {
+            assert_eq!(batches[0].num_rows(), 2);
+            assert_eq!(batches[0].scalar(0, 0), Some(ScalarValue::Int64(Some(10))));
+            assert_eq!(batches[0].scalar(1, 0), Some(ScalarValue::Int64(Some(11))));
+        }
+        other => panic!("expected query result, got {:?}", other),
+    }
+
+    engine.segment_mgr().shutdown();
+}

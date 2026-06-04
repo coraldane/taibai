@@ -159,9 +159,9 @@ fn choose_numeric_encoding(values: &[i64], plain_width: usize) -> Option<(Encodi
                 .as_ref()
                 .map(|(_, payload)| delta.len() < payload.len())
                 .unwrap_or(true)
-            {
-                best = Some((EncodingType::Delta, delta));
-            }
+        {
+            best = Some((EncodingType::Delta, delta));
+        }
     }
 
     best

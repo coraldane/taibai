@@ -93,12 +93,7 @@ pub fn apply_predicates_with_column_map(
     ))
 }
 
-pub fn apply_eq_mask(
-    batch: &RecordBatch,
-    col_idx: usize,
-    value: &ScalarValue,
-    mask: &mut [bool],
-) {
+pub fn apply_eq_mask(batch: &RecordBatch, col_idx: usize, value: &ScalarValue, mask: &mut [bool]) {
     if let Some(col) = batch.column(col_idx) {
         let col_mask = col.eq_vec(value);
         for (i, m) in col_mask.iter().enumerate() {

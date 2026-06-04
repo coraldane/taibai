@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ pub struct Engine {
     catalog_save_state: Mutex<CatalogSaveState>,
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
-    bulk_mode: AtomicBool,
+    bulk_mode_sessions: AtomicUsize,
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
@@ -86,7 +86,9 @@ impl Engine {
                         if db_name == "meta" || db_name == "wal" {
                             continue;
                         }
-                        if let std::collections::hash_map::Entry::Vacant(e) = catalogs.entry(db_name.clone()) {
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            catalogs.entry(db_name.clone())
+                        {
                             if let Ok(catalog) =
                                 DatabaseCatalog::load_or_create(&meta_dir, &db_name)
                             {
@@ -112,13 +114,33 @@ impl Engine {
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
         for (db_name, catalog) in &catalogs {
             for table_meta in catalog.tables.values() {
-                for col in &table_meta.columns {
+                for (col_idx, col) in table_meta.columns.iter().enumerate() {
                     if col.auto_increment {
+                        let catalog_start = (table_meta.row_count.max(0) as u64) + 1;
+                        let start_value = match restored_auto_increment_start(
+                            &segment_mgr,
+                            data_dir,
+                            db_name,
+                            &table_meta.name,
+                            col_idx,
+                            catalog_start,
+                        ) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    table = %table_meta.name,
+                                    column = %col.name,
+                                    "failed to scan auto_increment max value, using catalog row count"
+                                );
+                                catalog_start
+                            }
+                        };
                         auto_increment_mgr.register(
                             db_name,
                             &table_meta.name,
                             &col.name,
-                            (table_meta.row_count.max(0) as u64) + 1,
+                            start_value,
                         )?;
                     }
                 }
@@ -136,7 +158,7 @@ impl Engine {
             }),
             segment_mgr,
             batch_writer,
-            bulk_mode: AtomicBool::new(false),
+            bulk_mode_sessions: AtomicUsize::new(0),
             auth_manager,
             auto_increment_mgr,
             index_manager,
@@ -207,7 +229,11 @@ impl Engine {
     ) -> Result<std::collections::HashMap<String, crate::types::batch::Schema>> {
         use crate::types::batch::Schema;
         let mut table_refs = Vec::new();
-        if let Statement::Select { from: Some(ref from_clause), .. } = stmt {
+        if let Statement::Select {
+            from: Some(ref from_clause),
+            ..
+        } = stmt
+        {
             table_refs.extend(super::query::extract_table_refs(from_clause, db));
         }
         let mut table_schemas = std::collections::HashMap::new();
@@ -766,12 +792,25 @@ impl Engine {
         self.catalogs.read().unwrap().contains_key(db)
     }
 
-    pub fn set_bulk_mode(&self, enabled: bool) {
-        self.bulk_mode.store(enabled, Ordering::Release);
+    pub fn begin_bulk_import(&self) -> usize {
+        self.bulk_mode_sessions.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn end_bulk_import(&self) -> usize {
+        self.bulk_mode_sessions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(1))
+            })
+            .unwrap_or(0)
+            .saturating_sub(1)
     }
 
     pub fn is_bulk_mode(&self) -> bool {
-        self.bulk_mode.load(Ordering::Acquire)
+        self.bulk_mode_sessions.load(Ordering::Acquire) > 0
+    }
+
+    pub fn bulk_mode_session_count(&self) -> usize {
+        self.bulk_mode_sessions.load(Ordering::Acquire)
     }
 
     pub fn alloc_txn_id(&self) -> u64 {
@@ -897,17 +936,21 @@ impl Engine {
             .get(db)
             .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
 
-        let result =
-            self.segment_mgr
-                .bulk_insert_payload_with_catalog(db, payload, disable_wal, catalog)?;
+        let result = self.segment_mgr.bulk_insert_payload_with_catalog(
+            db,
+            payload,
+            disable_wal,
+            catalog,
+            !bulk_import_mode,
+        )?;
         drop(catalogs);
 
         if !disable_wal && !bulk_import_mode {
             let req = {
                 let catalogs = self.catalogs.read().unwrap();
-                let catalog = catalogs.get(db).ok_or_else(|| {
-                    MonaxError::Sql(format!("database '{}' does not exist", db))
-                })?;
+                let catalog = catalogs
+                    .get(db)
+                    .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
                 let table_name = {
                     let mut pos = 0usize;
                     let payload_bytes = payload;
@@ -943,4 +986,40 @@ impl Engine {
 
         Ok(result)
     }
+}
+
+fn restored_auto_increment_start(
+    segment_mgr: &Arc<SegmentManager>,
+    data_dir: &Path,
+    db: &str,
+    table: &str,
+    col_idx: usize,
+    catalog_start: u64,
+) -> Result<u64> {
+    let table_dir = data_dir.join(db).join(table);
+    if !table_dir.exists() {
+        return Ok(catalog_start);
+    }
+
+    let mut max_value = catalog_start.saturating_sub(1);
+    for seg_path in SegmentManager::discover_segments(&table_dir)? {
+        let reader = segment_mgr.open_reader_cached(&seg_path)?;
+        for rg_idx in 0..reader.num_row_groups() {
+            let batch = reader.read_row_group_with_projection(rg_idx, &[col_idx])?;
+            for row_idx in 0..batch.num_rows() {
+                let Some(value) = batch.scalar(row_idx, 0) else {
+                    continue;
+                };
+                let Some(int_value) = value.integer_i128() else {
+                    continue;
+                };
+                let Ok(unsigned) = u64::try_from(int_value) else {
+                    continue;
+                };
+                max_value = max_value.max(unsigned);
+            }
+        }
+    }
+
+    Ok(max_value.saturating_add(1).max(catalog_start))
 }

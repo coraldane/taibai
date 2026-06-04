@@ -186,6 +186,10 @@ fn segment_may_match(
     let Some(predicate) = predicate else {
         return true;
     };
+    let segment_zone_maps = reader.segment_zone_maps();
+    if !segment_zone_maps.is_empty() {
+        return predicate.matches_row_group(segment_zone_maps);
+    }
     (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
 }
 

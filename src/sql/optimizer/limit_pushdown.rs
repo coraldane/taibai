@@ -21,12 +21,13 @@ fn apply_limit_pushdown(plan: LogicalPlan) -> (LogicalPlan, bool) {
 
             match &input {
                 LogicalPlan::Scan(scan)
-                    if scan.pushed_filter.is_none() && scan.pushed_limit.is_none() => {
-                        let mut new_scan = scan.clone();
-                        new_scan.pushed_limit = Some(limit.limit.saturating_add(limit.offset));
-                        limit.input = Box::new(LogicalPlan::Scan(new_scan));
-                        return (LogicalPlan::Limit(limit), true);
-                    }
+                    if scan.pushed_filter.is_none() && scan.pushed_limit.is_none() =>
+                {
+                    let mut new_scan = scan.clone();
+                    new_scan.pushed_limit = Some(limit.limit.saturating_add(limit.offset));
+                    limit.input = Box::new(LogicalPlan::Scan(new_scan));
+                    return (LogicalPlan::Limit(limit), true);
+                }
                 LogicalPlan::Sort(_) => {}
                 _ => {}
             }

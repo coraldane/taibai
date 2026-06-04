@@ -5,6 +5,8 @@ use tempfile::TempDir;
 use monax::net::session::Session;
 use monax::protocol::types::DataType;
 use monax::sql::execution::engine::{Engine, ExecResult};
+use monax::storage::segment::meta::sidecar_meta_path;
+use monax::storage::segment_manager::SegmentManager;
 use monax::types::scalar::ScalarValue;
 
 fn bulk_payload(table: &str, row_count: u32, columns: Vec<(&str, DataType, Vec<u8>)>) -> Vec<u8> {
@@ -150,6 +152,87 @@ fn bulk_import_honors_year_partition_on_int32_yyyymmdd() {
             vec![20250102, 930],
         ]
     );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn bulk_import_mode_defers_direct_payload_metadata_flush() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE bulk_ticks (id INT32, price INT32)",
+        )
+        .expect("create table");
+
+    let payload = bulk_payload(
+        "bulk_ticks",
+        2,
+        vec![
+            ("id", DataType::Int32, int32_col(&[1, 2])),
+            ("price", DataType::Int32, int32_col(&[10, 20])),
+        ],
+    );
+
+    assert_eq!(
+        engine
+            .exec_bulk_insert_payload_with_options("main", &payload, true, true)
+            .expect("bulk insert"),
+        2
+    );
+
+    let table_dir = temp_dir.path().join("main").join("bulk_ticks");
+    let segments = SegmentManager::discover_segments(&table_dir).expect("discover segments");
+    assert_eq!(segments.len(), 1);
+    assert!(
+        !sidecar_meta_path(&segments[0]).exists(),
+        "bulk import mode should defer sidecar metadata flush"
+    );
+
+    engine.flush_all_buffers().expect("flush bulk rows");
+    assert!(sidecar_meta_path(&segments[0]).exists());
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn bulk_import_mode_defers_sql_insert_metadata_flush() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE sql_bulk_ticks (id INT32, price INT32)",
+        )
+        .expect("create table");
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO sql_bulk_ticks VALUES (1, 10), (2, 20)",
+        )
+        .expect("insert rows");
+
+    let table_dir = temp_dir.path().join("main").join("sql_bulk_ticks");
+    let segments = SegmentManager::discover_segments(&table_dir).expect("discover segments");
+    assert_eq!(segments.len(), 1);
+    assert!(
+        !sidecar_meta_path(&segments[0]).exists(),
+        "SQL bulk import mode should defer sidecar metadata flush"
+    );
+
+    session.bulk_import_mode = false;
+    assert_eq!(engine.end_bulk_import(), 0);
+    engine.flush_all_buffers().expect("flush bulk rows");
+    assert!(sidecar_meta_path(&segments[0]).exists());
 
     engine.segment_mgr().shutdown();
 }

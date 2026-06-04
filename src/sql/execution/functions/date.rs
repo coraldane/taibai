@@ -217,6 +217,5 @@ fn extract_datetime(args: &[ScalarValue]) -> Option<NaiveDateTime> {
 }
 
 fn sql_to_chrono_format(fmt: &str) -> String {
-    fmt.replace("%i", "%M")
-        .replace("%s", "%S")
+    fmt.replace("%i", "%M").replace("%s", "%S")
 }

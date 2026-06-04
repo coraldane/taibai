@@ -32,14 +32,34 @@ impl Handler {
         }
     }
 
-    pub fn flush_on_disconnect(&self) {
-        if let Some(ref session) = self.session {
+    pub fn flush_on_disconnect(&mut self) {
+        if let Some(ref mut session) = self.session {
+            if session.bulk_import_mode {
+                let remaining = self.engine.end_bulk_import();
+                session.bulk_import_mode = false;
+                session.disable_wal = false;
+                tracing::info!(
+                    remaining_bulk_sessions = remaining,
+                    session_id = %session.session_id_string(),
+                    "bulk import session ended on disconnect"
+                );
+            }
             if session.had_writes {
-                match self.engine.flush_all_buffers() {
-                    Ok(n) => {
-                        tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed buffers on disconnect")
+                if self.engine.is_bulk_mode() {
+                    tracing::info!(
+                        session_id = %session.session_id_string(),
+                        active_bulk_sessions = self.engine.bulk_mode_session_count(),
+                        "deferred disconnect flush while bulk import sessions remain active"
+                    );
+                } else {
+                    match self.engine.flush_all_buffers() {
+                        Ok(n) => {
+                            tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed buffers on disconnect")
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to flush buffers on disconnect")
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "failed to flush buffers on disconnect"),
                 }
             }
         }
@@ -236,12 +256,20 @@ impl Handler {
         let disable_wal =
             sql.contains("\"disable_wal\":true") || sql.contains("\"disable_wal\": true");
 
-        self.engine.set_bulk_mode(true);
+        let active_sessions = if session.bulk_import_mode {
+            self.engine.bulk_mode_session_count()
+        } else {
+            self.engine.begin_bulk_import()
+        };
 
         session.bulk_import_mode = true;
         session.disable_wal = disable_wal;
 
-        tracing::info!(disable_wal, "bulk import mode started");
+        tracing::info!(
+            disable_wal,
+            active_bulk_sessions = active_sessions,
+            "bulk import mode started"
+        );
         Ok(vec![build_ok(0)])
     }
 
@@ -250,13 +278,26 @@ impl Handler {
             return Ok(vec![build_error("not logged in")]);
         };
 
-        self.engine.set_bulk_mode(false);
-        let flushed = self.engine.flush_all_buffers()?;
+        let remaining_sessions = if session.bulk_import_mode {
+            self.engine.end_bulk_import()
+        } else {
+            self.engine.bulk_mode_session_count()
+        };
+
+        let flushed = if remaining_sessions == 0 {
+            self.engine.flush_all_buffers()?
+        } else {
+            0
+        };
 
         session.bulk_import_mode = false;
         session.disable_wal = false;
 
-        tracing::info!(rows_flushed = flushed, "bulk import mode stopped");
+        tracing::info!(
+            rows_flushed = flushed,
+            remaining_bulk_sessions = remaining_sessions,
+            "bulk import mode stopped"
+        );
         Ok(vec![build_ok(flushed)])
     }
 
@@ -1054,6 +1095,92 @@ mod tests {
         assert_eq!(responses[0].msg_type, MSG_TYPE_AUTH_OK);
         assert!(handler.session.is_some());
         assert_eq!(handler.session.as_ref().unwrap().username, "root");
+    }
+
+    fn logged_in_handler(
+        config: Arc<ServerConfig>,
+        engine: Arc<Engine>,
+        username: &str,
+    ) -> Handler {
+        let mut handler = Handler::new(config, engine);
+        handler.session = Some(Session::new(username.to_string(), "main".to_string()));
+        handler
+    }
+
+    fn ok_rows(resp: &[Message]) -> u64 {
+        assert_eq!(resp.len(), 1);
+        assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
+        u64::from_le_bytes(resp[0].payload[..8].try_into().unwrap())
+    }
+
+    #[test]
+    fn bulk_import_mode_is_reference_counted_across_connections() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+        let config = Arc::new(ServerConfig::default());
+        let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "first");
+        let mut second = logged_in_handler(config, Arc::clone(&engine), "second");
+
+        ok_rows(
+            &first
+                .handle_start_bulk_import("START BULK IMPORT {\"disable_wal\": true}")
+                .unwrap(),
+        );
+        assert!(engine.is_bulk_mode());
+        assert_eq!(engine.bulk_mode_session_count(), 1);
+
+        ok_rows(
+            &second
+                .handle_start_bulk_import("START BULK IMPORT {\"disable_wal\": true}")
+                .unwrap(),
+        );
+        assert!(engine.is_bulk_mode());
+        assert_eq!(engine.bulk_mode_session_count(), 2);
+
+        assert_eq!(ok_rows(&first.handle_stop_bulk_import().unwrap()), 0);
+        assert!(engine.is_bulk_mode());
+        assert_eq!(engine.bulk_mode_session_count(), 1);
+
+        first.session.as_mut().unwrap().had_writes = true;
+        first.flush_on_disconnect();
+        assert!(engine.is_bulk_mode());
+        assert_eq!(engine.bulk_mode_session_count(), 1);
+
+        ok_rows(&second.handle_stop_bulk_import().unwrap());
+        assert!(!engine.is_bulk_mode());
+        assert_eq!(engine.bulk_mode_session_count(), 0);
+    }
+
+    #[test]
+    fn bulk_import_disconnect_releases_only_that_connection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+        let config = Arc::new(ServerConfig::default());
+        let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "first");
+        let mut second = logged_in_handler(config, Arc::clone(&engine), "second");
+
+        ok_rows(
+            &first
+                .handle_start_bulk_import("START BULK IMPORT {\"disable_wal\": true}")
+                .unwrap(),
+        );
+        ok_rows(
+            &second
+                .handle_start_bulk_import("START BULK IMPORT {\"disable_wal\": true}")
+                .unwrap(),
+        );
+
+        first.flush_on_disconnect();
+        assert!(engine.is_bulk_mode());
+        assert_eq!(engine.bulk_mode_session_count(), 1);
+        assert!(!first.session.as_ref().unwrap().bulk_import_mode);
+
+        first.flush_on_disconnect();
+        assert_eq!(engine.bulk_mode_session_count(), 1);
+
+        ok_rows(&second.handle_stop_bulk_import().unwrap());
+        assert!(!engine.is_bulk_mode());
+        assert_eq!(engine.bulk_mode_session_count(), 0);
     }
 
     #[test]
