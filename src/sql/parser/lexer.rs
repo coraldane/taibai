@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::common::error::{MonaxError, Result};
 
 /// SQL token types.
@@ -17,6 +18,8 @@ pub enum Token {
     Tables,
     Databases,
     Use,
+    Explain,
+    Analyze,
     Not,
     Null,
     As,
@@ -40,12 +43,27 @@ pub enum Token {
     Exists,
     Sort,
     Key,
+    Cluster,
+    Hash,
     Partition,
     ByKW,
     Update,
     Set,
     Delete,
     Primary,
+    Begin,
+    Commit,
+    Rollback,
+    Transaction,
+    Alter,
+    Truncate,
+    Database,
+    Column,
+    Columns,
+    Add,
+    Rename,
+    Modify,
+    To,
     // Join keywords
     Join,
     Inner,
@@ -54,6 +72,43 @@ pub enum Token {
     Outer,
     Cross,
     On,
+    // Window function keywords
+    Over,
+    Rows,
+    Range,
+    Unbounded,
+    Preceding,
+    Following,
+    Current,
+    // User/Role/Permission keywords
+    User,
+    Role,
+    Grant,
+    Revoke,
+    Identified,
+    Password,
+    Privileges,
+    All,
+    // AutoIncrement
+    AutoIncrement,
+    // Default value
+    Default,
+    CurrentTimestamp,
+    // New keywords for extended SQL commands
+    Union,
+    Flush,
+    Optimize,
+    Pause,
+    Resume,
+    Processlist,
+    Engines,
+    Stats,
+    Partitions,
+    Grants,
+    Full,
+    Lock,
+    Unlock,
+    For,
     // Literals
     Integer(i64),
     Float(f64),
@@ -73,6 +128,10 @@ pub enum Token {
     Gt,
     Lte,
     Gte,
+    Minus,
+    Plus,
+    // Parameter placeholder
+    Placeholder,
     // Special
     Eof,
 }
@@ -93,6 +152,8 @@ impl std::fmt::Display for Token {
             Token::Tables => write!(f, "TABLES"),
             Token::Databases => write!(f, "DATABASES"),
             Token::Use => write!(f, "USE"),
+            Token::Explain => write!(f, "EXPLAIN"),
+            Token::Analyze => write!(f, "ANALYZE"),
             Token::Not => write!(f, "NOT"),
             Token::Null => write!(f, "NULL"),
             Token::As => write!(f, "AS"),
@@ -116,12 +177,27 @@ impl std::fmt::Display for Token {
             Token::Exists => write!(f, "EXISTS"),
             Token::Sort => write!(f, "SORT"),
             Token::Key => write!(f, "KEY"),
+            Token::Cluster => write!(f, "CLUSTER"),
+            Token::Hash => write!(f, "HASH"),
             Token::Partition => write!(f, "PARTITION"),
             Token::ByKW => write!(f, "BY"),
             Token::Update => write!(f, "UPDATE"),
             Token::Set => write!(f, "SET"),
             Token::Delete => write!(f, "DELETE"),
             Token::Primary => write!(f, "PRIMARY"),
+            Token::Begin => write!(f, "BEGIN"),
+            Token::Commit => write!(f, "COMMIT"),
+            Token::Rollback => write!(f, "ROLLBACK"),
+            Token::Transaction => write!(f, "TRANSACTION"),
+            Token::Alter => write!(f, "ALTER"),
+            Token::Truncate => write!(f, "TRUNCATE"),
+            Token::Database => write!(f, "DATABASE"),
+            Token::Column => write!(f, "COLUMN"),
+            Token::Columns => write!(f, "COLUMNS"),
+            Token::Add => write!(f, "ADD"),
+            Token::Rename => write!(f, "RENAME"),
+            Token::Modify => write!(f, "MODIFY"),
+            Token::To => write!(f, "TO"),
             Token::Join => write!(f, "JOIN"),
             Token::Inner => write!(f, "INNER"),
             Token::Left => write!(f, "LEFT"),
@@ -129,11 +205,44 @@ impl std::fmt::Display for Token {
             Token::Outer => write!(f, "OUTER"),
             Token::Cross => write!(f, "CROSS"),
             Token::On => write!(f, "ON"),
+            Token::Over => write!(f, "OVER"),
+            Token::Rows => write!(f, "ROWS"),
+            Token::Range => write!(f, "RANGE"),
+            Token::Unbounded => write!(f, "UNBOUNDED"),
+            Token::Preceding => write!(f, "PRECEDING"),
+            Token::Following => write!(f, "FOLLOWING"),
+            Token::Current => write!(f, "CURRENT"),
+            Token::User => write!(f, "USER"),
+            Token::Role => write!(f, "ROLE"),
+            Token::Grant => write!(f, "GRANT"),
+            Token::Revoke => write!(f, "REVOKE"),
+            Token::Identified => write!(f, "IDENTIFIED"),
+            Token::Password => write!(f, "PASSWORD"),
+            Token::Privileges => write!(f, "PRIVILEGES"),
+            Token::All => write!(f, "ALL"),
+            Token::AutoIncrement => write!(f, "AUTOINCREMENT"),
+            Token::Default => write!(f, "DEFAULT"),
+            Token::CurrentTimestamp => write!(f, "CURRENT_TIMESTAMP"),
+            Token::Union => write!(f, "UNION"),
+            Token::Flush => write!(f, "FLUSH"),
+            Token::Optimize => write!(f, "OPTIMIZE"),
+            Token::Pause => write!(f, "PAUSE"),
+            Token::Resume => write!(f, "RESUME"),
+            Token::Processlist => write!(f, "PROCESSLIST"),
+            Token::Engines => write!(f, "ENGINES"),
+            Token::Stats => write!(f, "STATS"),
+            Token::Partitions => write!(f, "PARTITIONS"),
+            Token::Grants => write!(f, "GRANTS"),
+            Token::Full => write!(f, "FULL"),
+            Token::Lock => write!(f, "LOCK"),
+            Token::Unlock => write!(f, "UNLOCK"),
+            Token::For => write!(f, "FOR"),
             Token::Integer(v) => write!(f, "{}", v),
             Token::Float(v) => write!(f, "{}", v),
             Token::StringLit(v) => write!(f, "'{}'", v),
             Token::Ident(v) => write!(f, "{}", v),
             Token::Star => write!(f, "*"),
+            Token::Placeholder => write!(f, "?"),
             Token::Comma => write!(f, ","),
             Token::LeftParen => write!(f, "("),
             Token::RightParen => write!(f, ")"),
@@ -145,21 +254,24 @@ impl std::fmt::Display for Token {
             Token::Gt => write!(f, ">"),
             Token::Lte => write!(f, "<="),
             Token::Gte => write!(f, ">="),
+            Token::Minus => write!(f, "-"),
+            Token::Plus => write!(f, "+"),
             Token::Eof => write!(f, "EOF"),
         }
     }
 }
 
-/// SQL lexer: tokenizes SQL input.
-pub struct Lexer {
-    input: Vec<char>,
+pub struct Lexer<'a> {
+    input: &'a str,
     pos: usize,
+    bytes: &'a [u8],
 }
 
-impl Lexer {
-    pub fn new(input: &str) -> Self {
+impl<'a> Lexer<'a> {
+    pub fn new(input: &'a str) -> Self {
         Self {
-            input: input.chars().collect(),
+            input,
+            bytes: input.as_bytes(),
             pos: 0,
         }
     }
@@ -169,39 +281,105 @@ impl Lexer {
         let mut tokens = Vec::new();
         loop {
             self.skip_whitespace();
-            if self.pos >= self.input.len() {
+            if self.pos >= self.bytes.len() {
                 tokens.push(Token::Eof);
                 break;
             }
 
-            let ch = self.input[self.pos];
+            let ch = self.bytes[self.pos];
             let token = match ch {
-                '(' => { self.pos += 1; Token::LeftParen }
-                ')' => { self.pos += 1; Token::RightParen }
-                ',' => { self.pos += 1; Token::Comma }
-                ';' => { self.pos += 1; Token::Semicolon }
-                '.' => { self.pos += 1; Token::Dot }
-                '*' => { self.pos += 1; Token::Star }
-                '=' => { self.pos += 1; Token::Eq }
-                '<' => {
+                b'(' => {
                     self.pos += 1;
-                    if self.peek_char() == Some('=') { self.pos += 1; Token::Lte }
-                    else { Token::Lt }
+                    Token::LeftParen
                 }
-                '>' => {
+                b')' => {
                     self.pos += 1;
-                    if self.peek_char() == Some('=') { self.pos += 1; Token::Gte }
-                    else { Token::Gt }
+                    Token::RightParen
                 }
-                '!' => {
+                b',' => {
                     self.pos += 1;
-                    if self.peek_char() == Some('=') { self.pos += 1; Token::Neq }
-                    else { return Err(MonaxError::Sql("unexpected character '!'".into())); }
+                    Token::Comma
                 }
-                '\'' => self.read_string()?,
+                b';' => {
+                    self.pos += 1;
+                    Token::Semicolon
+                }
+                b'.' => {
+                    self.pos += 1;
+                    Token::Dot
+                }
+                b'*' => {
+                    self.pos += 1;
+                    Token::Star
+                }
+                b'?' => {
+                    self.pos += 1;
+                    Token::Placeholder
+                }
+                b'+' => {
+                    self.pos += 1;
+                    Token::Plus
+                }
+                b'=' => {
+                    self.pos += 1;
+                    Token::Eq
+                }
+                b'<' => {
+                    self.pos += 1;
+                    if self.peek_byte() == Some(b'=') {
+                        self.pos += 1;
+                        Token::Lte
+                    } else if self.peek_byte() == Some(b'>') {
+                        self.pos += 1;
+                        Token::Neq
+                    } else {
+                        Token::Lt
+                    }
+                }
+                b'>' => {
+                    self.pos += 1;
+                    if self.peek_byte() == Some(b'=') {
+                        self.pos += 1;
+                        Token::Gte
+                    } else {
+                        Token::Gt
+                    }
+                }
+                b'!' => {
+                    self.pos += 1;
+                    if self.peek_byte() == Some(b'=') {
+                        self.pos += 1;
+                        Token::Neq
+                    } else {
+                        return Err(MonaxError::Sql("unexpected character '!'".into()));
+                    }
+                }
+                b'/' => {
+                    self.pos += 1;
+                    Token::Ident("/".into())
+                }
+                b'-' => {
+                    self.pos += 1;
+                    if self
+                        .peek_byte()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
+                        self.read_negative_number()?
+                    } else {
+                        Token::Minus
+                    }
+                }
+                b'\'' => self.read_string()?,
                 c if c.is_ascii_digit() => self.read_number()?,
-                c if c.is_ascii_alphabetic() || c == '_' => self.read_ident_or_keyword()?,
-                c => return Err(MonaxError::Sql(format!("unexpected character '{}'", c))),
+                c if c.is_ascii_alphabetic() || c == b'_' => self.read_ident_or_keyword()?,
+                c => {
+                    let ch = c as char;
+                    if ch.is_whitespace() {
+                        continue;
+                    }
+                    return Err(MonaxError::Sql(format!("unexpected character '{}'", ch)));
+                }
             };
             tokens.push(token);
         }
@@ -209,67 +387,124 @@ impl Lexer {
     }
 
     fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len() && self.input[self.pos].is_whitespace() {
+        while self.pos < self.bytes.len() && {
+            let b = self.bytes[self.pos];
+            b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
+        } {
             self.pos += 1;
         }
     }
 
-    fn peek_char(&self) -> Option<char> {
-        self.input.get(self.pos).copied()
+    fn peek_byte(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
     }
 
     fn read_string(&mut self) -> Result<Token> {
-        self.pos += 1; // skip opening quote
-        let mut s = String::new();
-        while self.pos < self.input.len() {
-            let ch = self.input[self.pos];
-            if ch == '\'' {
-                self.pos += 1;
-                // Check for escaped quote ''
-                if self.pos < self.input.len() && self.input[self.pos] == '\'' {
-                    s.push('\'');
-                    self.pos += 1;
-                    continue;
+        let start = self.pos + 1;
+        let mut end = start;
+        let mut has_escape = false;
+        while end < self.bytes.len() {
+            if self.bytes[end] == b'\'' {
+                if end + 1 < self.bytes.len() && self.bytes[end + 1] == b'\'' {
+                    has_escape = true;
+                    end += 2;
+                } else {
+                    break;
                 }
-                return Ok(Token::StringLit(s));
+            } else {
+                end += 1;
             }
-            s.push(ch);
-            self.pos += 1;
         }
-        Err(MonaxError::Sql("unterminated string literal".into()))
+        if end >= self.bytes.len() {
+            self.pos = end;
+            return Err(MonaxError::Sql("unterminated string literal".into()));
+        }
+        let s = if has_escape {
+            let mut result = String::with_capacity(end - start);
+            let mut i = start;
+            while i < end {
+                if self.bytes[i] == b'\'' && i + 1 < end && self.bytes[i + 1] == b'\'' {
+                    result.push('\'');
+                    i += 2;
+                } else {
+                    let c = unsafe { self.input.as_bytes().get_unchecked(i) };
+                    if *c < 128 {
+                        result.push(*c as char);
+                        i += 1;
+                    } else {
+                        let ch = self.input[i..].chars().next().unwrap();
+                        result.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+            result
+        } else {
+            self.input[start..end].to_string()
+        };
+        self.pos = end + 1;
+        Ok(Token::StringLit(s))
     }
 
     fn read_number(&mut self) -> Result<Token> {
         let start = self.pos;
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
             self.pos += 1;
         }
-        if self.pos < self.input.len() && self.input[self.pos] == '.' {
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == b'.' {
             self.pos += 1;
-            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
-            let s: String = self.input[start..self.pos].iter().collect();
-            let v = s.parse::<f64>().map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
+            let s = &self.input[start..self.pos];
+            let v = s
+                .parse::<f64>()
+                .map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
             Ok(Token::Float(v))
         } else {
-            let s: String = self.input[start..self.pos].iter().collect();
-            let v = s.parse::<i64>().map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
+            let s = &self.input[start..self.pos];
+            let v = s
+                .parse::<i64>()
+                .map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
             Ok(Token::Integer(v))
+        }
+    }
+
+    fn read_negative_number(&mut self) -> Result<Token> {
+        let start = self.pos;
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == b'.' {
+            self.pos += 1;
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+            let s = &self.input[start..self.pos];
+            let v = s
+                .parse::<f64>()
+                .map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
+            Ok(Token::Float(-v))
+        } else {
+            let s = &self.input[start..self.pos];
+            let v = s
+                .parse::<i64>()
+                .map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
+            Ok(Token::Integer(-v))
         }
     }
 
     fn read_ident_or_keyword(&mut self) -> Result<Token> {
         let start = self.pos;
-        while self.pos < self.input.len() {
-            let ch = self.input[self.pos];
-            if ch.is_ascii_alphanumeric() || ch == '_' {
+        while self.pos < self.bytes.len() {
+            let ch = self.bytes[self.pos];
+            if ch.is_ascii_alphanumeric() || ch == b'_' {
                 self.pos += 1;
             } else {
                 break;
             }
         }
-        let word: String = self.input[start..self.pos].iter().collect();
+        let word = &self.input[start..self.pos];
         Ok(match word.to_uppercase().as_str() {
             "SELECT" => Token::Select,
             "FROM" => Token::From,
@@ -284,6 +519,8 @@ impl Lexer {
             "TABLES" => Token::Tables,
             "DATABASES" => Token::Databases,
             "USE" => Token::Use,
+            "EXPLAIN" => Token::Explain,
+            "ANALYZE" => Token::Analyze,
             "NOT" => Token::Not,
             "NULL" => Token::Null,
             "AS" => Token::As,
@@ -307,11 +544,26 @@ impl Lexer {
             "EXISTS" => Token::Exists,
             "SORT" => Token::Sort,
             "KEY" => Token::Key,
+            "CLUSTER" => Token::Cluster,
+            "HASH" => Token::Hash,
             "PARTITION" => Token::Partition,
             "UPDATE" => Token::Update,
             "SET" => Token::Set,
             "DELETE" => Token::Delete,
             "PRIMARY" => Token::Primary,
+            "BEGIN" => Token::Begin,
+            "COMMIT" => Token::Commit,
+            "ROLLBACK" => Token::Rollback,
+            "TRANSACTION" | "TXN" => Token::Transaction,
+            "ALTER" => Token::Alter,
+            "TRUNCATE" => Token::Truncate,
+            "DATABASE" => Token::Database,
+            "COLUMN" => Token::Column,
+            "COLUMNS" => Token::Columns,
+            "ADD" => Token::Add,
+            "RENAME" => Token::Rename,
+            "MODIFY" => Token::Modify,
+            "TO" => Token::To,
             // Join keywords
             "JOIN" => Token::Join,
             "INNER" => Token::Inner,
@@ -320,6 +572,43 @@ impl Lexer {
             "OUTER" => Token::Outer,
             "CROSS" => Token::Cross,
             "ON" => Token::On,
+            "OVER" => Token::Over,
+            "ROWS" => Token::Rows,
+            "RANGE" => Token::Range,
+            "UNBOUNDED" => Token::Unbounded,
+            "PRECEDING" => Token::Preceding,
+            "FOLLOWING" => Token::Following,
+            "CURRENT" => Token::Current,
+            "ROW_NUMBER" => Token::Ident("ROW_NUMBER".into()),
+            "RANK" => Token::Ident("RANK".into()),
+            "DENSE_RANK" => Token::Ident("DENSE_RANK".into()),
+            "LEAD" => Token::Ident("LEAD".into()),
+            "LAG" => Token::Ident("LAG".into()),
+            "USER" => Token::User,
+            "ROLE" => Token::Role,
+            "GRANT" => Token::Grant,
+            "REVOKE" => Token::Revoke,
+            "IDENTIFIED" => Token::Identified,
+            "PASSWORD" => Token::Password,
+            "PRIVILEGES" => Token::Privileges,
+            "ALL" => Token::All,
+            "AUTOINCREMENT" | "AUTO_INCREMENT" => Token::AutoIncrement,
+            "DEFAULT" => Token::Default,
+            "CURRENT_TIMESTAMP" => Token::CurrentTimestamp,
+            "UNION" => Token::Union,
+            "FLUSH" => Token::Flush,
+            "OPTIMIZE" => Token::Optimize,
+            "PAUSE" => Token::Pause,
+            "RESUME" => Token::Resume,
+            "PROCESSLIST" => Token::Processlist,
+            "ENGINES" => Token::Engines,
+            "STATS" => Token::Stats,
+            "PARTITIONS" => Token::Partitions,
+            "GRANTS" => Token::Grants,
+            "FULL" => Token::Full,
+            "LOCK" => Token::Lock,
+            "UNLOCK" => Token::Unlock,
+            "FOR" => Token::For,
             // Data types as identifiers
             "BOOL" | "BOOLEAN" => Token::Ident("BOOL".into()),
             "INT8" | "TINYINT" => Token::Ident("INT8".into()),
@@ -341,8 +630,9 @@ impl Lexer {
             "BLOB" | "BYTES" => Token::Ident("BLOB".into()),
             "VECTOR" => Token::Ident("VECTOR".into()),
             "DAY" => Token::Ident("DAY".into()),
+            "MONTH" => Token::Ident("MONTH".into()),
             "YEAR" => Token::Ident("YEAR".into()),
-            _ => Token::Ident(word),
+            _ => Token::Ident(word.to_string()),
         })
     }
 }
@@ -377,8 +667,6 @@ mod tests {
     fn test_operators() {
         let mut lexer = Lexer::new("a <= b AND c != d OR e > f");
         let tokens = lexer.tokenize().unwrap();
-        // 0:Ident("a") 1:Lte 2:Ident("b") 3:And 4:Ident("c")
-        // 5:Neq 6:Ident("d") 7:Or 8:Ident("e") 9:Gt 10:Ident("f")
         assert_eq!(tokens[1], Token::Lte);
         assert_eq!(tokens[5], Token::Neq);
         assert_eq!(tokens[9], Token::Gt);
@@ -386,9 +674,9 @@ mod tests {
 
     #[test]
     fn test_float() {
-        let mut lexer = Lexer::new("3.14");
+        let mut lexer = Lexer::new("2.71");
         let tokens = lexer.tokenize().unwrap();
-        assert_eq!(tokens[0], Token::Float(3.14));
+        assert_eq!(tokens[0], Token::Float(2.71));
     }
 
     #[test]
@@ -400,5 +688,55 @@ mod tests {
         assert_eq!(tokens[2], Token::If);
         assert_eq!(tokens[3], Token::Not);
         assert_eq!(tokens[4], Token::Exists);
+    }
+
+    #[test]
+    fn test_negative_integer() {
+        let mut lexer = Lexer::new("-42");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Integer(-42));
+    }
+
+    #[test]
+    fn test_negative_float() {
+        let mut lexer = Lexer::new("-2.71");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Float(-2.71));
+    }
+
+    #[test]
+    fn test_minus_operator() {
+        let mut lexer = Lexer::new("a - b");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Ident("a".into()));
+        assert_eq!(tokens[1], Token::Minus);
+        assert_eq!(tokens[2], Token::Ident("b".into()));
+    }
+
+    #[test]
+    fn test_negative_in_values() {
+        let mut lexer = Lexer::new("VALUES (-1, -2.5, 'test')");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[2], Token::Integer(-1));
+        assert_eq!(tokens[4], Token::Float(-2.5));
+        assert_eq!(tokens[6], Token::StringLit("test".into()));
+    }
+
+    #[test]
+    fn test_transaction_keywords() {
+        let mut lexer = Lexer::new("BEGIN TRANSACTION COMMIT ROLLBACK");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Begin);
+        assert_eq!(tokens[1], Token::Transaction);
+        assert_eq!(tokens[2], Token::Commit);
+        assert_eq!(tokens[3], Token::Rollback);
+    }
+
+    #[test]
+    fn test_txn_keyword() {
+        let mut lexer = Lexer::new("BEGIN TXN");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Begin);
+        assert_eq!(tokens[1], Token::Transaction);
     }
 }

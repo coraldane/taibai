@@ -1,10 +1,12 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
+
+use serde::{Deserialize, Serialize};
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 
-/// A single scalar value, one variant per DataType.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScalarValue {
     Bool(Option<bool>),
     Int8(Option<i8>),
@@ -27,7 +29,90 @@ pub enum ScalarValue {
     Vector(Option<Vec<f32>>),
 }
 
+impl Hash for ScalarValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            ScalarValue::Bool(v) => v.hash(state),
+            ScalarValue::Int8(v) => v.hash(state),
+            ScalarValue::Int16(v) => v.hash(state),
+            ScalarValue::Int32(v) => v.hash(state),
+            ScalarValue::Int64(v) => v.hash(state),
+            ScalarValue::UInt8(v) => v.hash(state),
+            ScalarValue::UInt16(v) => v.hash(state),
+            ScalarValue::UInt32(v) => v.hash(state),
+            ScalarValue::UInt64(v) => v.hash(state),
+            ScalarValue::Float32(v) => {
+                v.map(|f| f.to_bits()).hash(state);
+            }
+            ScalarValue::Float64(v) => {
+                v.map(|f| f.to_bits()).hash(state);
+            }
+            ScalarValue::Decimal(v) => v.hash(state),
+            ScalarValue::Date(v) => v.hash(state),
+            ScalarValue::Time(v) => v.hash(state),
+            ScalarValue::Timestamp(v) => v.hash(state),
+            ScalarValue::Interval(v) => v.hash(state),
+            ScalarValue::VarChar(v) => v.hash(state),
+            ScalarValue::Blob(v) => v.hash(state),
+            ScalarValue::Vector(v) => {
+                if let Some(vec) = v {
+                    for f in vec {
+                        f.to_bits().hash(state);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Eq for ScalarValue {}
+
 impl ScalarValue {
+    pub fn integer_i128(&self) -> Option<i128> {
+        match self {
+            ScalarValue::Int8(Some(v)) => Some(*v as i128),
+            ScalarValue::Int16(Some(v)) => Some(*v as i128),
+            ScalarValue::Int32(Some(v)) => Some(*v as i128),
+            ScalarValue::Int64(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt8(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt16(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt32(Some(v)) => Some(*v as i128),
+            ScalarValue::UInt64(Some(v)) => Some(*v as i128),
+            ScalarValue::Decimal(Some(v)) => Some(*v as i128),
+            _ => None,
+        }
+    }
+
+    pub fn numeric_f64(&self) -> Option<f64> {
+        match self {
+            ScalarValue::Int8(Some(v)) => Some(*v as f64),
+            ScalarValue::Int16(Some(v)) => Some(*v as f64),
+            ScalarValue::Int32(Some(v)) => Some(*v as f64),
+            ScalarValue::Int64(Some(v)) => Some(*v as f64),
+            ScalarValue::UInt8(Some(v)) => Some(*v as f64),
+            ScalarValue::UInt16(Some(v)) => Some(*v as f64),
+            ScalarValue::UInt32(Some(v)) => Some(*v as f64),
+            ScalarValue::UInt64(Some(v)) => Some(*v as f64),
+            ScalarValue::Float32(Some(v)) => Some(*v as f64),
+            ScalarValue::Float64(Some(v)) => Some(*v),
+            ScalarValue::Decimal(Some(v)) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    pub fn numeric_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => l.partial_cmp(r),
+            (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r),
+            (ScalarValue::Float32(Some(l)), r) => (*l as f64).partial_cmp(&r.numeric_f64()?),
+            (ScalarValue::Float64(Some(l)), r) => l.partial_cmp(&r.numeric_f64()?),
+            (l, ScalarValue::Float32(Some(r))) => l.numeric_f64()?.partial_cmp(&(*r as f64)),
+            (l, ScalarValue::Float64(Some(r))) => l.numeric_f64()?.partial_cmp(r),
+            _ => Some(self.integer_i128()?.cmp(&other.integer_i128()?)),
+        }
+    }
+
     /// Returns true if this value is NULL.
     pub fn is_null(&self) -> bool {
         match self {
@@ -135,61 +220,88 @@ impl ScalarValue {
             return Ok(Self::null_for_type(dt));
         }
         match dt {
-            DataType::Bool => Ok(ScalarValue::Bool(Some(s.parse::<bool>().map_err(|e| {
-                MonaxError::Sql(format!("invalid bool '{}': {}", s, e))
-            })?))),
-            DataType::Int8 => Ok(ScalarValue::Int8(Some(s.parse::<i8>().map_err(|e| {
-                MonaxError::Sql(format!("invalid int8 '{}': {}", s, e))
-            })?))),
-            DataType::Int16 => Ok(ScalarValue::Int16(Some(s.parse::<i16>().map_err(|e| {
-                MonaxError::Sql(format!("invalid int16 '{}': {}", s, e))
-            })?))),
-            DataType::Int32 => Ok(ScalarValue::Int32(Some(s.parse::<i32>().map_err(|e| {
-                MonaxError::Sql(format!("invalid int32 '{}': {}", s, e))
-            })?))),
-            DataType::Int64 => Ok(ScalarValue::Int64(Some(s.parse::<i64>().map_err(|e| {
-                MonaxError::Sql(format!("invalid int64 '{}': {}", s, e))
-            })?))),
-            DataType::UInt8 => Ok(ScalarValue::UInt8(Some(s.parse::<u8>().map_err(|e| {
-                MonaxError::Sql(format!("invalid uint8 '{}': {}", s, e))
-            })?))),
-            DataType::UInt16 => Ok(ScalarValue::UInt16(Some(s.parse::<u16>().map_err(|e| {
-                MonaxError::Sql(format!("invalid uint16 '{}': {}", s, e))
-            })?))),
-            DataType::UInt32 => Ok(ScalarValue::UInt32(Some(s.parse::<u32>().map_err(|e| {
-                MonaxError::Sql(format!("invalid uint32 '{}': {}", s, e))
-            })?))),
-            DataType::UInt64 => Ok(ScalarValue::UInt64(Some(s.parse::<u64>().map_err(|e| {
-                MonaxError::Sql(format!("invalid uint64 '{}': {}", s, e))
-            })?))),
-            DataType::Float32 => Ok(ScalarValue::Float32(Some(s.parse::<f32>().map_err(|e| {
-                MonaxError::Sql(format!("invalid float32 '{}': {}", s, e))
-            })?))),
-            DataType::Float64 => Ok(ScalarValue::Float64(Some(s.parse::<f64>().map_err(|e| {
-                MonaxError::Sql(format!("invalid float64 '{}': {}", s, e))
-            })?))),
-            DataType::Decimal => Ok(ScalarValue::Decimal(Some(s.parse::<i64>().map_err(|e| {
-                MonaxError::Sql(format!("invalid decimal '{}': {}", s, e))
-            })?))),
-            DataType::Date => Ok(ScalarValue::Date(Some(s.parse::<i32>().map_err(|e| {
-                MonaxError::Sql(format!("invalid date '{}': {}", s, e))
-            })?))),
+            DataType::Bool => {
+                Ok(ScalarValue::Bool(Some(s.parse::<bool>().map_err(|e| {
+                    MonaxError::Sql(format!("invalid bool '{}': {}", s, e))
+                })?)))
+            }
+            DataType::Int8 => {
+                Ok(ScalarValue::Int8(Some(s.parse::<i8>().map_err(|e| {
+                    MonaxError::Sql(format!("invalid int8 '{}': {}", s, e))
+                })?)))
+            }
+            DataType::Int16 => {
+                Ok(ScalarValue::Int16(Some(s.parse::<i16>().map_err(|e| {
+                    MonaxError::Sql(format!("invalid int16 '{}': {}", s, e))
+                })?)))
+            }
+            DataType::Int32 => {
+                Ok(ScalarValue::Int32(Some(s.parse::<i32>().map_err(|e| {
+                    MonaxError::Sql(format!("invalid int32 '{}': {}", s, e))
+                })?)))
+            }
+            DataType::Int64 => {
+                Ok(ScalarValue::Int64(Some(s.parse::<i64>().map_err(|e| {
+                    MonaxError::Sql(format!("invalid int64 '{}': {}", s, e))
+                })?)))
+            }
+            DataType::UInt8 => {
+                Ok(ScalarValue::UInt8(Some(s.parse::<u8>().map_err(|e| {
+                    MonaxError::Sql(format!("invalid uint8 '{}': {}", s, e))
+                })?)))
+            }
+            DataType::UInt16 => Ok(ScalarValue::UInt16(Some(
+                s.parse::<u16>()
+                    .map_err(|e| MonaxError::Sql(format!("invalid uint16 '{}': {}", s, e)))?,
+            ))),
+            DataType::UInt32 => Ok(ScalarValue::UInt32(Some(
+                s.parse::<u32>()
+                    .map_err(|e| MonaxError::Sql(format!("invalid uint32 '{}': {}", s, e)))?,
+            ))),
+            DataType::UInt64 => Ok(ScalarValue::UInt64(Some(
+                s.parse::<u64>()
+                    .map_err(|e| MonaxError::Sql(format!("invalid uint64 '{}': {}", s, e)))?,
+            ))),
+            DataType::Float32 => Ok(ScalarValue::Float32(Some(
+                s.parse::<f32>()
+                    .map_err(|e| MonaxError::Sql(format!("invalid float32 '{}': {}", s, e)))?,
+            ))),
+            DataType::Float64 => Ok(ScalarValue::Float64(Some(
+                s.parse::<f64>()
+                    .map_err(|e| MonaxError::Sql(format!("invalid float64 '{}': {}", s, e)))?,
+            ))),
+            DataType::Decimal => Ok(ScalarValue::Decimal(Some(
+                s.parse::<i64>()
+                    .map_err(|e| MonaxError::Sql(format!("invalid decimal '{}': {}", s, e)))?,
+            ))),
+            DataType::Date => {
+                Ok(ScalarValue::Date(Some(s.parse::<i32>().map_err(|e| {
+                    MonaxError::Sql(format!("invalid date '{}': {}", s, e))
+                })?)))
+            }
             DataType::VarChar => Ok(ScalarValue::VarChar(Some(s.to_string()))),
-            DataType::Timestamp => Ok(ScalarValue::Timestamp(Some(s.parse::<i64>().map_err(|e| {
-                MonaxError::Sql(format!("invalid timestamp '{}': {}", s, e))
-            })?))),
-            DataType::Time => Ok(ScalarValue::Time(Some(s.parse::<i64>().map_err(|e| {
-                MonaxError::Sql(format!("invalid time '{}': {}", s, e))
-            })?))),
-            DataType::Interval => Ok(ScalarValue::Interval(Some(s.parse::<i64>().map_err(|e| {
-                MonaxError::Sql(format!("invalid interval '{}': {}", s, e))
-            })?))),
+            DataType::Timestamp => Ok(ScalarValue::Timestamp(Some(
+                s.parse::<i64>()
+                    .map_err(|e| MonaxError::Sql(format!("invalid timestamp '{}': {}", s, e)))?,
+            ))),
+            DataType::Time => {
+                Ok(ScalarValue::Time(Some(s.parse::<i64>().map_err(|e| {
+                    MonaxError::Sql(format!("invalid time '{}': {}", s, e))
+                })?)))
+            }
+            DataType::Interval => Ok(ScalarValue::Interval(Some(
+                s.parse::<i64>()
+                    .map_err(|e| MonaxError::Sql(format!("invalid interval '{}': {}", s, e)))?,
+            ))),
             DataType::Blob => Ok(ScalarValue::Blob(Some(s.as_bytes().to_vec()))),
             DataType::Vector => {
-                let floats: Result<Vec<f32>> = s.split(',')
-                    .map(|p| p.trim().parse::<f32>().map_err(|e| {
-                        MonaxError::Sql(format!("invalid vector element '{}': {}", p, e))
-                    }))
+                let floats: Result<Vec<f32>> = s
+                    .split(',')
+                    .map(|p| {
+                        p.trim().parse::<f32>().map_err(|e| {
+                            MonaxError::Sql(format!("invalid vector element '{}': {}", p, e))
+                        })
+                    })
                     .collect();
                 Ok(ScalarValue::Vector(Some(floats?)))
             }
@@ -257,7 +369,10 @@ mod tests {
     #[test]
     fn test_data_type_roundtrip() {
         assert_eq!(ScalarValue::Int64(Some(1)).data_type(), DataType::Int64);
-        assert_eq!(ScalarValue::VarChar(Some("x".into())).data_type(), DataType::VarChar);
+        assert_eq!(
+            ScalarValue::VarChar(Some("x".into())).data_type(),
+            DataType::VarChar
+        );
         assert_eq!(ScalarValue::Bool(Some(true)).data_type(), DataType::Bool);
     }
 
@@ -266,8 +381,8 @@ mod tests {
         let v = ScalarValue::parse_from_str("42", DataType::Int64).unwrap();
         assert_eq!(v, ScalarValue::Int64(Some(42)));
 
-        let v = ScalarValue::parse_from_str("3.14", DataType::Float64).unwrap();
-        assert_eq!(v, ScalarValue::Float64(Some(3.14)));
+        let v = ScalarValue::parse_from_str("2.71", DataType::Float64).unwrap();
+        assert_eq!(v, ScalarValue::Float64(Some(2.71)));
 
         let v = ScalarValue::parse_from_str("hello", DataType::VarChar).unwrap();
         assert_eq!(v, ScalarValue::VarChar(Some("hello".into())));

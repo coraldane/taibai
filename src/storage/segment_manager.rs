@@ -1,0 +1,2062 @@
+#![allow(dead_code)]
+use std::collections::{HashMap, VecDeque};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Instant;
+
+use crate::common::error::{MonaxError, Result};
+use crate::protocol::types::DataType;
+use crate::storage::bulk_payload::{
+    parse_direct_bulk_payload, DirectBulkColumn, DirectBulkRequest,
+};
+use crate::storage::column_encoding::encode_column_direct_range;
+use crate::storage::core::wal::WalWriter;
+use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
+use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
+use crate::storage::segment::meta::{
+    append_sidecar_footer, append_sidecar_row_groups, compact_sidecar_footer_if_needed,
+    remove_sidecar_meta,
+};
+use crate::storage::segment::{
+    encode_segment_footer, encode_segment_header, store, RowGroupMeta, SegmentReader,
+    SegmentWriter, SEGMENT_HEADER_SIZE,
+};
+use crate::types::array::ColumnArray;
+use crate::types::batch::{RecordBatch, Schema};
+use crate::types::scalar::ScalarValue;
+const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
+const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 500_000;
+const FLUSH_CHECK_INTERVAL_SECS: u64 = 10;
+const FLUSH_IDLE_THRESHOLD_SECS: u64 = 5;
+const FLUSH_META_AFTER_ROW_GROUP: bool = false;
+const SIDECAR_COMPACT_MIN_RECORDS: usize = 256;
+const SIDECAR_COMPACT_MIN_BYTES: u64 = 4 * 1024 * 1024;
+
+const DEFAULT_MIN_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
+const DEFAULT_READER_CACHE_CAPACITY: usize = 1024;
+
+pub struct SegmentConfig {
+    pub min_segment_size: u64,
+    pub max_segment_size: u64,
+}
+
+impl Default for SegmentConfig {
+    fn default() -> Self {
+        Self {
+            min_segment_size: DEFAULT_MIN_SEGMENT_SIZE,
+            max_segment_size: DEFAULT_MAX_SEGMENT_SIZE,
+        }
+    }
+}
+
+struct ActiveSegmentWriter {
+    file: std::io::BufWriter<std::fs::File>,
+    path: PathBuf,
+    schema: Schema,
+    row_groups: Vec<RowGroupMeta>,
+    current_size: u64,
+    total_rows: u64,
+    buffered_batch: Option<RecordBatch>,
+    buffered_rows: usize,
+    dirty_meta: bool,
+    data_end: u64,
+    sidecar_row_groups_flushed: usize,
+    last_write_at: Instant,
+}
+
+impl ActiveSegmentWriter {
+    fn append_batch(
+        &mut self,
+        batch: &RecordBatch,
+        invalidate_reader: &dyn Fn(&Path),
+    ) -> Result<Vec<String>> {
+        let mut wal_keys_to_clear = Vec::new();
+        if let Some(ref mut buffered) = self.buffered_batch {
+            for col_idx in 0..batch.num_columns() {
+                let src = batch.column(col_idx).unwrap();
+                let dst = buffered.column_mut(col_idx).unwrap();
+                dst.extend(src)?;
+            }
+            self.buffered_rows += batch.num_rows();
+        } else {
+            self.buffered_batch = Some(batch.clone());
+            self.buffered_rows = batch.num_rows();
+        }
+
+        while self.buffered_rows >= SQL_INSERT_ROW_GROUP_TARGET_ROWS {
+            if let Some(wk) = self.flush_buffer(invalidate_reader)? {
+                wal_keys_to_clear.push(wk);
+            }
+        }
+        Ok(wal_keys_to_clear)
+    }
+
+    fn append_direct_row_group(
+        &mut self,
+        columns: &[DirectBulkColumn<'_>],
+        compressed_columns: &[(Vec<u8>, u64)],
+        row_count: u64,
+    ) -> Result<()> {
+        self.ensure_data_write_position()?;
+
+        let offset = self.current_size;
+        let mut column_compressed_sizes = Vec::with_capacity(compressed_columns.len());
+        let mut compressed_sizes = Vec::with_capacity(compressed_columns.len());
+        let mut uncompressed_sizes = Vec::with_capacity(compressed_columns.len());
+        let mut total_length = 0u64;
+        let mut write_buf = Vec::new();
+
+        for (compressed, uncompressed_size) in compressed_columns {
+            let n = compressed.len() as u64;
+            column_compressed_sizes.push(n);
+            compressed_sizes.push(n);
+            uncompressed_sizes.push(*uncompressed_size);
+            total_length += n;
+            write_buf.extend_from_slice(compressed);
+        }
+        self.file.write_all(&write_buf)?;
+
+        self.row_groups.push(RowGroupMeta {
+            offset,
+            length: total_length,
+            row_count,
+            zone_maps: compute_zone_maps_from_bulk_columns(columns, &self.schema, row_count),
+            column_compressed_sizes,
+            compressed_sizes,
+            uncompressed_sizes,
+            bloom_filters: vec![None; self.schema.num_columns()],
+        });
+        self.current_size += total_length;
+        self.total_rows += row_count;
+        self.dirty_meta = true;
+        self.data_end = self.current_size;
+        self.last_write_at = Instant::now();
+
+        Ok(())
+    }
+
+    fn flush_buffer(&mut self, invalidate_reader: &dyn Fn(&Path)) -> Result<Option<String>> {
+        use rayon::prelude::*;
+
+        let buffered = match self.buffered_batch.take() {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let total_buffered = self.buffered_rows;
+        self.buffered_rows = 0;
+
+        let compression_level = bulk_compression_level();
+        let num_cols = buffered.num_columns();
+
+        let rows_to_flush = SQL_INSERT_ROW_GROUP_TARGET_ROWS.min(total_buffered);
+
+        let compressed_columns: Vec<(Vec<u8>, u64)> = (0..num_cols)
+            .into_par_iter()
+            .map(|col_idx| {
+                let col = buffered.column(col_idx).unwrap();
+                let encoded = encode_column_direct_range(col, 0, rows_to_flush);
+                let orig_len = encoded.len() as u64;
+                let compressed = zstd::bulk::compress(&encoded, compression_level)
+                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
+                Ok((compressed, orig_len))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.ensure_data_write_position()?;
+
+        let offset = self.current_size;
+        let mut column_compressed_sizes = Vec::with_capacity(num_cols);
+        let mut compressed_sizes = Vec::with_capacity(num_cols);
+        let mut uncompressed_sizes = Vec::with_capacity(num_cols);
+        let mut total_length = 0u64;
+        let mut write_buf = Vec::new();
+        for (compressed, uncompressed_size) in &compressed_columns {
+            let n = compressed.len() as u64;
+            column_compressed_sizes.push(n);
+            compressed_sizes.push(n);
+            uncompressed_sizes.push(*uncompressed_size);
+            total_length += n;
+            write_buf.extend_from_slice(compressed);
+        }
+        self.file.write_all(&write_buf)?;
+        self.row_groups.push(RowGroupMeta {
+            offset,
+            length: total_length,
+            row_count: rows_to_flush as u64,
+            zone_maps: compute_zone_maps_from_batch(&buffered, 0, rows_to_flush),
+            column_compressed_sizes,
+            compressed_sizes,
+            uncompressed_sizes,
+            bloom_filters: vec![None; self.schema.num_columns()],
+        });
+        self.current_size += total_length;
+        self.total_rows += rows_to_flush as u64;
+        self.dirty_meta = true;
+        self.data_end = self.current_size;
+        self.last_write_at = Instant::now();
+
+        if FLUSH_META_AFTER_ROW_GROUP {
+            self.flush_meta(invalidate_reader)?;
+        }
+
+        let remaining = total_buffered - rows_to_flush;
+        if remaining > 0 {
+            let mut remainder = RecordBatch::new(buffered.schema.clone());
+            for col_idx in 0..num_cols {
+                let col = buffered.column(col_idx).unwrap();
+                let dst = remainder.column_mut(col_idx).unwrap();
+                for row_idx in rows_to_flush..total_buffered {
+                    let val = col.scalar(row_idx);
+                    dst.push(&val)?;
+                }
+            }
+            self.buffered_batch = Some(remainder);
+            self.buffered_rows = remaining;
+        }
+
+        Ok(Some(self.path.to_string_lossy().to_string()))
+    }
+
+    fn flush_meta(&mut self, invalidate_reader: &dyn Fn(&Path)) -> Result<()> {
+        if !self.dirty_meta {
+            return Ok(());
+        }
+
+        self.file.flush()?;
+        self.file.get_ref().set_len(self.data_end)?;
+        self.file.seek(SeekFrom::Start(self.data_end))?;
+        self.file.get_ref().sync_all()?;
+
+        let footer = self.encode_footer()?;
+        if self.sidecar_row_groups_flushed == 0
+            || self.sidecar_row_groups_flushed > self.row_groups.len()
+        {
+            append_sidecar_footer(&self.path, self.data_end, &footer)?;
+        } else if self.sidecar_row_groups_flushed < self.row_groups.len() {
+            let table_name = self.table_name();
+            append_sidecar_row_groups(
+                &self.path,
+                self.data_end,
+                &self.schema,
+                self.total_rows,
+                &self.row_groups[self.sidecar_row_groups_flushed..],
+                &table_name,
+            )?;
+        } else {
+            append_sidecar_footer(&self.path, self.data_end, &footer)?;
+        }
+        if compact_sidecar_footer_if_needed(
+            &self.path,
+            self.data_end,
+            &footer,
+            SIDECAR_COMPACT_MIN_RECORDS,
+            SIDECAR_COMPACT_MIN_BYTES,
+        )? {
+            tracing::debug!(
+                path = %self.path.display(),
+                rows = self.total_rows,
+                row_groups = self.row_groups.len(),
+                "segment sidecar meta compacted"
+            );
+        }
+
+        self.current_size = self.data_end;
+        self.sidecar_row_groups_flushed = self.row_groups.len();
+        self.dirty_meta = false;
+        invalidate_reader(&self.path);
+
+        tracing::debug!(
+            path = %self.path.display(),
+            rows = self.total_rows,
+            row_groups = self.row_groups.len(),
+            "segment meta flushed"
+        );
+
+        Ok(())
+    }
+
+    fn seal(&mut self, invalidate_reader: &dyn Fn(&Path)) -> Result<()> {
+        self.flush_buffer(invalidate_reader)?;
+        self.write_final_footer()?;
+        self.finalize()?;
+        remove_sidecar_meta(&self.path)?;
+        invalidate_reader(&self.path);
+
+        tracing::info!(
+            path = %self.path.display(),
+            size_mb = self.current_size / (1024 * 1024),
+            rows = self.total_rows,
+            row_groups = self.row_groups.len(),
+            "segment sealed"
+        );
+
+        Ok(())
+    }
+
+    fn write_final_footer(&mut self) -> Result<()> {
+        self.file.flush()?;
+        self.file.get_ref().set_len(self.data_end)?;
+        self.file.seek(SeekFrom::Start(self.data_end))?;
+
+        let footer = self.encode_footer()?;
+        self.file.write_all(&footer)?;
+        self.file.write_all(&self.data_end.to_le_bytes())?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+
+        self.current_size = self.data_end + footer.len() as u64 + 8;
+        self.sidecar_row_groups_flushed = self.row_groups.len();
+        self.dirty_meta = false;
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+
+        tracing::info!(
+            path = %self.path.display(),
+            size_mb = self.current_size / (1024 * 1024),
+            rows = self.total_rows,
+            row_groups = self.row_groups.len(),
+            "segment finalized and closed"
+        );
+
+        Ok(())
+    }
+
+    fn ensure_data_write_position(&mut self) -> Result<()> {
+        if self.current_size != self.data_end {
+            self.file.get_ref().set_len(self.data_end)?;
+            self.file.seek(SeekFrom::Start(self.data_end))?;
+            self.current_size = self.data_end;
+        }
+        Ok(())
+    }
+
+    fn encode_footer(&self) -> Result<Vec<u8>> {
+        let table_name = self.table_name();
+        let segment_zone_maps =
+            compute_segment_zone_maps_from_row_groups(&self.row_groups, self.schema.num_columns());
+        Ok(encode_segment_footer(
+            &self.schema,
+            self.total_rows,
+            &self.row_groups,
+            &[],
+            0,
+            &table_name,
+            &segment_zone_maps,
+        ))
+    }
+
+    fn table_name(&self) -> String {
+        self.path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+}
+
+struct TableSegmentState {
+    seq: AtomicU32,
+    active_segments: Mutex<HashMap<String, ActiveSegmentWriter>>,
+    wal_writer: Mutex<Option<WalWriter>>,
+    mutation_lock: Mutex<()>,
+    retired: AtomicBool,
+}
+
+impl TableSegmentState {
+    fn new(initial_seq: u32) -> Self {
+        Self {
+            seq: AtomicU32::new(initial_seq),
+            active_segments: Mutex::new(HashMap::new()),
+            wal_writer: Mutex::new(None),
+            mutation_lock: Mutex::new(()),
+            retired: AtomicBool::new(false),
+        }
+    }
+}
+
+pub struct SegmentManager {
+    data_dir: PathBuf,
+    tables: RwLock<HashMap<String, Arc<TableSegmentState>>>,
+    reader_cache: Mutex<ReaderCache>,
+    flush_stop: Arc<AtomicBool>,
+    flush_paused: Arc<AtomicBool>,
+    next_txn_id: AtomicU64,
+    config: SegmentConfig,
+}
+
+struct ReaderCache {
+    capacity: usize,
+    entries: HashMap<PathBuf, Arc<SegmentReader>>,
+    order: VecDeque<PathBuf>,
+}
+
+impl ReaderCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, path: &Path) -> Option<Arc<SegmentReader>> {
+        let key = path.to_path_buf();
+        let reader = self.entries.get(&key).cloned()?;
+        self.touch(&key);
+        Some(reader)
+    }
+
+    fn put(&mut self, path: PathBuf, reader: SegmentReader) -> Arc<SegmentReader> {
+        let reader = Arc::new(reader);
+        if self
+            .entries
+            .insert(path.clone(), Arc::clone(&reader))
+            .is_none()
+        {
+            self.order.push_back(path);
+        }
+        self.evict_if_needed();
+        reader
+    }
+
+    fn invalidate(&mut self, path: &Path) {
+        let key = path.to_path_buf();
+        self.entries.remove(&key);
+        if let Some(pos) = self.order.iter().position(|p| p == &key) {
+            self.order.remove(pos);
+        }
+    }
+
+    fn invalidate_under(&mut self, dir: &Path) {
+        let keys: Vec<PathBuf> = self
+            .entries
+            .keys()
+            .filter(|path| path.starts_with(dir))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.invalidate(&key);
+        }
+    }
+
+    fn touch(&mut self, path: &PathBuf) {
+        if let Some(pos) = self.order.iter().position(|p| p == path) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(path.clone());
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+impl SegmentManager {
+    pub fn new(data_dir: &Path) -> Result<Self> {
+        Self::with_config(data_dir, SegmentConfig::default())
+    }
+
+    pub fn with_config(data_dir: &Path, config: SegmentConfig) -> Result<Self> {
+        let mut tables = HashMap::new();
+
+        if data_dir.exists() {
+            if let Ok(dbs) = std::fs::read_dir(data_dir) {
+                for db_entry in dbs.flatten() {
+                    if !db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let db_name = db_entry.file_name().to_string_lossy().to_string();
+                    if db_name == "meta" || db_name == "wal" {
+                        continue;
+                    }
+                    let db_dir = data_dir.join(&db_name);
+                    if let Ok(tables_dir) = std::fs::read_dir(&db_dir) {
+                        for tbl_entry in tables_dir.flatten() {
+                            if !tbl_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                continue;
+                            }
+                            let tbl_dir = tbl_entry.path();
+                            let max_seq = discover_max_seq(&tbl_dir);
+                            let key = table_key(&db_name, &tbl_entry.file_name().to_string_lossy());
+                            tables.insert(key, Arc::new(TableSegmentState::new(max_seq)));
+                        }
+                    }
+                }
+            }
+        }
+
+        let flush_stop = Arc::new(AtomicBool::new(false));
+        let flush_paused = Arc::new(AtomicBool::new(false));
+
+        Ok(Self {
+            data_dir: data_dir.to_path_buf(),
+            tables: RwLock::new(tables),
+            reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
+            flush_stop,
+            flush_paused,
+            next_txn_id: AtomicU64::new(1),
+            config,
+        })
+    }
+
+    pub fn set_config(&mut self, config: SegmentConfig) {
+        self.config = config;
+    }
+
+    fn min_segment_seal_size(&self) -> u64 {
+        self.config.min_segment_size
+    }
+
+    fn max_segment_size(&self) -> u64 {
+        self.config.max_segment_size
+    }
+
+    pub fn start_flush_thread(mgr: &Arc<Self>) {
+        let mgr_clone = Arc::clone(mgr);
+        let stop = mgr.flush_stop.clone();
+        let paused = mgr.flush_paused.clone();
+        std::thread::Builder::new()
+            .name("monax-flush".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_secs(FLUSH_CHECK_INTERVAL_SECS));
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if paused.load(Ordering::Acquire) {
+                        tracing::debug!("flush thread paused, skipping periodic check");
+                        continue;
+                    }
+                    if let Err(e) = mgr_clone.periodic_flush_check() {
+                        tracing::warn!(error = %e, "periodic flush check failed");
+                    }
+                }
+            })
+            .expect("failed to spawn flush thread");
+    }
+
+    pub fn shutdown(&self) {
+        self.flush_stop.store(true, Ordering::Release);
+        if let Err(e) = self.flush_all_active() {
+            tracing::warn!(error = %e, "failed to flush all active segments during shutdown");
+        }
+    }
+
+    pub fn pause_flush(&self) {
+        self.flush_paused.store(true, Ordering::Release);
+        tracing::info!("flush thread paused");
+    }
+
+    pub fn resume_flush(&self) {
+        self.flush_paused.store(false, Ordering::Release);
+        tracing::info!("flush thread resumed");
+    }
+
+    pub fn is_flush_paused(&self) -> bool {
+        self.flush_paused.load(Ordering::Acquire)
+    }
+
+    pub fn alloc_txn_id(&self) -> u64 {
+        self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn table_dir(&self, db: &str, table: &str) -> PathBuf {
+        self.data_dir.join(db).join(table)
+    }
+
+    fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {
+        {
+            let tables = self.tables.read().unwrap();
+            if let Some(state) = tables.get(key) {
+                return Arc::clone(state);
+            }
+        }
+        let mut tables = self.tables.write().unwrap();
+        tables
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(TableSegmentState::new(0)))
+            .clone()
+    }
+
+    fn table_state_key_from_dir(&self, table_dir: &Path) -> Result<String> {
+        let relative = table_dir.strip_prefix(&self.data_dir).map_err(|_| {
+            MonaxError::Storage(format!(
+                "table dir '{}' is outside data dir '{}'",
+                table_dir.display(),
+                self.data_dir.display()
+            ))
+        })?;
+
+        let mut components = relative.components();
+        let db = components
+            .next()
+            .ok_or_else(|| MonaxError::Storage("table dir is missing database name".into()))?;
+        let table = components
+            .next()
+            .ok_or_else(|| MonaxError::Storage("table dir is missing table name".into()))?;
+
+        Ok(table_key(
+            &db.as_os_str().to_string_lossy(),
+            &table.as_os_str().to_string_lossy(),
+        ))
+    }
+
+    fn get_or_create_state_for_table_dir(
+        &self,
+        table_dir: &Path,
+    ) -> Result<Arc<TableSegmentState>> {
+        let key = self.table_state_key_from_dir(table_dir)?;
+        Ok(self.get_or_create_state(&key))
+    }
+
+    pub fn discover_segments(table_dir: &Path) -> Result<Vec<PathBuf>> {
+        store::discover_segments(table_dir)
+    }
+
+    pub fn find_unsealed_segment(
+        table_dir: &Path,
+        min_seal_size: u64,
+    ) -> Result<Option<(PathBuf, Schema, u64)>> {
+        let segments = Self::discover_segments(table_dir)?;
+
+        for seg_path in segments.iter().rev() {
+            let file_len = match std::fs::metadata(seg_path) {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+
+            if file_len < SEGMENT_HEADER_SIZE as u64 {
+                continue;
+            }
+
+            if let Ok(reader) = SegmentReader::open(seg_path) {
+                let seg_size = file_len;
+                if seg_size < min_seal_size && reader.row_count() > 0 {
+                    return Ok(Some((
+                        seg_path.clone(),
+                        reader.schema().clone(),
+                        reader.row_count(),
+                    )));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn next_segment_path(&self, table_dir: &Path, _partition_key: &str) -> Result<PathBuf> {
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
+        let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(table_dir.join(store::regular_segment_filename(seq)))
+    }
+
+    pub fn next_partition_segment_path(
+        &self,
+        table_dir: &Path,
+        partition_key: &str,
+    ) -> Result<PathBuf> {
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
+        let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(table_dir.join(store::partition_segment_filename(partition_key, seq)))
+    }
+
+    pub fn next_replacement_segment_path(
+        &self,
+        table_dir: &Path,
+        partition_key: Option<&str>,
+    ) -> Result<PathBuf> {
+        store::next_segment_path_by_scan(table_dir, partition_key)
+    }
+
+    pub fn open_reader(&self, path: &Path) -> Result<SegmentReader> {
+        if self.is_mutable_segment_path(path) {
+            return self.open_mutable_reader_owned(path);
+        }
+
+        match SegmentReader::open(path) {
+            Ok(reader) => Ok(reader),
+            Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn open_reader_cached(&self, path: &Path) -> Result<Arc<SegmentReader>> {
+        if self.is_mutable_segment_path(path) {
+            self.invalidate_reader(path);
+            return Ok(Arc::new(self.open_mutable_reader_owned(path)?));
+        }
+
+        if let Some(reader) = self.reader_cache.lock().unwrap().get(path) {
+            return Ok(reader);
+        }
+
+        let reader = match SegmentReader::open(path) {
+            Ok(reader) => reader,
+            Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path)?,
+            Err(err) => return Err(err),
+        };
+        Ok(self
+            .reader_cache
+            .lock()
+            .unwrap()
+            .put(path.to_path_buf(), reader))
+    }
+
+    pub fn invalidate_reader(&self, path: &Path) {
+        self.reader_cache.lock().unwrap().invalidate(path);
+    }
+
+    pub fn invalidate_readers_under(&self, dir: &Path) {
+        self.reader_cache.lock().unwrap().invalidate_under(dir);
+    }
+
+    pub fn remove_segment_file(&self, path: &Path) -> Result<()> {
+        self.invalidate_reader(path);
+        std::fs::remove_file(path)?;
+        remove_sidecar_meta(path)?;
+        Ok(())
+    }
+
+    pub fn replace_segments_with_tmp(
+        &self,
+        tmp_path: &Path,
+        final_path: &Path,
+        old_segments: &[PathBuf],
+    ) -> Result<()> {
+        if final_path.exists() {
+            return Err(MonaxError::Storage(format!(
+                "segment target already exists: {}",
+                final_path.display()
+            )));
+        }
+
+        std::fs::rename(tmp_path, final_path)?;
+        for old_seg in old_segments {
+            if old_seg != final_path {
+                self.remove_segment_file(old_seg)?;
+            }
+        }
+        let _ = self.open_reader_cached(final_path);
+        Ok(())
+    }
+
+    pub fn rewrite_delete_footer(
+        &self,
+        path: &Path,
+        bitmap: &[u8],
+        deleted_count: u64,
+    ) -> Result<()> {
+        self.invalidate_reader(path);
+        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)
+    }
+
+    pub fn with_table_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _guard = state.mutation_lock.lock().unwrap();
+        f()
+    }
+
+    fn open_mutable_reader_owned(&self, path: &Path) -> Result<SegmentReader> {
+        let Some(state) = self.state_for_segment_path(path) else {
+            return SegmentReader::open_owned(path);
+        };
+
+        let mut active_guard = state.active_segments.lock().unwrap();
+        for segment in active_guard.values_mut() {
+            if segment.path == path {
+                if segment.dirty_meta {
+                    segment.flush_meta(&|path| self.invalidate_reader(path))?;
+                }
+                return SegmentReader::open_owned(path);
+            }
+        }
+        SegmentReader::open_owned(path)
+    }
+
+    fn is_mutable_segment_path(&self, path: &Path) -> bool {
+        if self.is_active_segment_path(path) {
+            return true;
+        }
+        std::fs::metadata(path)
+            .map(|meta| meta.len() < self.min_segment_seal_size())
+            .unwrap_or(false)
+    }
+
+    fn is_active_segment_path(&self, path: &Path) -> bool {
+        let Some(state) = self.state_for_segment_path(path) else {
+            return false;
+        };
+
+        let active_guard = state.active_segments.lock().unwrap();
+        active_guard.values().any(|segment| segment.path == path)
+    }
+
+    fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
+        let tables = self.tables.read().unwrap();
+        let table_dir = path.parent()?;
+        let key = self.table_state_key_from_dir(table_dir).ok()?;
+        tables.get(&key).cloned()
+    }
+
+    pub fn write_new_segment(
+        &self,
+        path: &Path,
+        schema: Schema,
+        row_group_size: usize,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let mut writer = SegmentWriter::create(path, schema, row_group_size)?;
+        writer.write_batch(batch)?;
+        writer.seal()?;
+        Ok(())
+    }
+
+    pub fn write_wal(&self, table_dir: &Path, batch: &RecordBatch) -> Result<()> {
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
+
+        let wal_data = crate::sql::execution::wal_helper::serialize_batch_for_wal(batch);
+        let txn_id = self.alloc_txn_id();
+
+        let mut wal_guard = state.wal_writer.lock().unwrap();
+        if wal_guard.is_none() {
+            let wal_dir = table_dir.join("wal");
+            let writer = WalWriter::open(&wal_dir, 64 * 1024 * 1024)?;
+            *wal_guard = Some(writer);
+        }
+        let wal_writer = wal_guard.as_mut().unwrap();
+        wal_writer.write_compact(txn_id, &wal_data, false)?;
+        Ok(())
+    }
+
+    pub fn sync_all_wals(&self) {
+        let tables = self.tables.read().unwrap();
+        for state in tables.values() {
+            let mut wal_guard = state.wal_writer.lock().unwrap();
+            if let Some(ref mut w) = *wal_guard {
+                let _ = w.sync();
+            }
+        }
+    }
+
+    pub fn clear_wal(&self, table_dir: &Path) -> Result<()> {
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
+        let mut wal_guard = state.wal_writer.lock().unwrap();
+        if let Some(ref mut w) = *wal_guard {
+            w.clear()?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_active_segments(&self, db: &str, table: &str) {
+        let key = table_key(db, table);
+        let tables = self.tables.read().unwrap();
+        if let Some(state) = tables.get(&key) {
+            state.active_segments.lock().unwrap().clear();
+        }
+    }
+
+    pub fn remove_wal(&self, table_dir: &Path) {
+        let Ok(key) = self.table_state_key_from_dir(table_dir) else {
+            return;
+        };
+        let tables = self.tables.write().unwrap();
+        if let Some(state) = tables.get(&key) {
+            let mut wal_guard = state.wal_writer.lock().unwrap();
+            *wal_guard = None;
+        }
+    }
+
+    pub fn remove_table_state(&self, db: &str, table: &str) {
+        let key = table_key(db, table);
+        let mut tables = self.tables.write().unwrap();
+        if let Some(state) = tables.remove(&key) {
+            state.retired.store(true, Ordering::Release);
+            let mut wal_guard = state.wal_writer.lock().unwrap();
+            *wal_guard = None;
+            state.active_segments.lock().unwrap().clear();
+        }
+    }
+
+    pub fn rename_table_state(&self, db: &str, old_name: &str, new_name: &str) {
+        let old_key = table_key(db, old_name);
+        let new_key = table_key(db, new_name);
+        let mut tables = self.tables.write().unwrap();
+        if let Some(state) = tables.remove(&old_key) {
+            tables.insert(new_key, state);
+        }
+    }
+
+    pub fn remove_database_state(&self, db: &str) {
+        let prefix = format!("{}:", db);
+        let mut tables = self.tables.write().unwrap();
+        let keys: Vec<String> = tables
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(state) = tables.remove(&key) {
+                state.retired.store(true, Ordering::Release);
+                let mut wal_guard = state.wal_writer.lock().unwrap();
+                *wal_guard = None;
+                state.active_segments.lock().unwrap().clear();
+            }
+        }
+    }
+
+    pub fn clear_all_wals(&self) {
+        let tables = self.tables.read().unwrap();
+        for state in tables.values() {
+            let mut wal_guard = state.wal_writer.lock().unwrap();
+            if let Some(ref mut w) = *wal_guard {
+                let _ = w.clear();
+            }
+        }
+    }
+
+    pub fn bulk_insert_batch(
+        &self,
+        db: &str,
+        table: &str,
+        batch: RecordBatch,
+        _disable_wal: bool,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
+    }
+
+    pub fn bulk_insert_batch_deferred(
+        &self,
+        db: &str,
+        table: &str,
+        batch: RecordBatch,
+        _disable_wal: bool,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, false)
+    }
+
+    pub fn bulk_insert_batch_with_partition(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, true)
+    }
+
+    pub fn bulk_insert_batch_with_partition_deferred(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, false)
+    }
+
+    fn bulk_insert_batch_with_partition_inner(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+        flush_immediately: bool,
+    ) -> Result<u64> {
+        let row_count = batch.num_rows() as u64;
+        if row_count == 0 {
+            return Ok(0);
+        }
+        let table_dir = self.data_dir.join(db).join(table);
+        std::fs::create_dir_all(&table_dir)?;
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, table)?;
+
+        {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            self.get_or_create_active_segment_for_partition_locked(
+                &table_dir,
+                &batch.schema,
+                partition_key,
+                &mut active_guard,
+            )?;
+
+            let seg = active_guard.get_mut(partition_key).unwrap();
+            seg.append_batch(&batch, &|path| self.invalidate_reader(path))?;
+
+            if seg.current_size >= self.max_segment_size() {
+                seg.seal(&|path| self.invalidate_reader(path))?;
+                active_guard.remove(partition_key);
+            } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
+                seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            }
+        }
+
+        Ok(row_count)
+    }
+
+    fn get_or_create_active_segment_for_partition_locked(
+        &self,
+        table_dir: &Path,
+        schema: &Schema,
+        partition_key: &str,
+        active_guard: &mut std::sync::MutexGuard<HashMap<String, ActiveSegmentWriter>>,
+    ) -> Result<()> {
+        if active_guard.contains_key(partition_key) {
+            return Ok(());
+        }
+
+        let unsealed = if partition_key.is_empty() {
+            Self::find_unsealed_segment(table_dir, self.min_segment_seal_size())?
+        } else {
+            Self::find_unsealed_partition_segment(
+                table_dir,
+                partition_key,
+                self.min_segment_seal_size(),
+            )?
+        };
+
+        let active = if let Some((seg_path, existing_schema, existing_rows)) = unsealed {
+            if existing_schema.columns.len() == schema.columns.len() {
+                tracing::info!(
+                    path = %seg_path.display(),
+                    partition_key,
+                    existing_rows,
+                    "resuming unsealed segment for append"
+                );
+                if let Some(recovered) = self.recover_active_segment(&seg_path, &existing_schema)? {
+                    recovered
+                } else {
+                    self.create_new_active_segment(table_dir, schema, partition_key)?
+                }
+            } else {
+                self.create_new_active_segment(table_dir, schema, partition_key)?
+            }
+        } else {
+            self.create_new_active_segment(table_dir, schema, partition_key)?
+        };
+
+        active_guard.insert(partition_key.to_string(), active);
+        Ok(())
+    }
+
+    fn create_new_active_segment(
+        &self,
+        table_dir: &Path,
+        schema: &Schema,
+        partition_key: &str,
+    ) -> Result<ActiveSegmentWriter> {
+        let seg_path = if partition_key.is_empty() {
+            self.next_segment_path(table_dir, "")?
+        } else {
+            self.next_partition_segment_path(table_dir, partition_key)?
+        };
+
+        remove_sidecar_meta(&seg_path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&seg_path)?;
+        file.write_all(&encode_segment_header())?;
+
+        tracing::info!(
+            path = %seg_path.display(),
+            partition_key,
+            "created new active segment"
+        );
+
+        Ok(ActiveSegmentWriter {
+            file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
+            path: seg_path,
+            schema: schema.clone(),
+            row_groups: Vec::new(),
+            current_size: SEGMENT_HEADER_SIZE as u64,
+            total_rows: 0,
+            buffered_batch: None,
+            buffered_rows: 0,
+            dirty_meta: false,
+            data_end: SEGMENT_HEADER_SIZE as u64,
+            sidecar_row_groups_flushed: 0,
+            last_write_at: Instant::now(),
+        })
+    }
+
+    pub fn find_unsealed_partition_segment(
+        table_dir: &Path,
+        partition_key: &str,
+        min_seal_size: u64,
+    ) -> Result<Option<(PathBuf, Schema, u64)>> {
+        let _pattern = format!("p{}_*", partition_key);
+        let segments: Vec<PathBuf> = if let Ok(entries) = std::fs::read_dir(table_dir) {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let file_name = e.file_name();
+                    let name = file_name.to_string_lossy();
+                    name.starts_with(&format!("p{}", partition_key))
+                        && name.ends_with(".dat")
+                        && name.contains('_')
+                })
+                .map(|e| e.path())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        for seg_path in segments.iter().rev() {
+            let file_len = match std::fs::metadata(seg_path) {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+
+            if file_len < SEGMENT_HEADER_SIZE as u64 {
+                continue;
+            }
+
+            if let Ok(reader) = SegmentReader::open(seg_path) {
+                if file_len < min_seal_size && reader.row_count() > 0 {
+                    return Ok(Some((
+                        seg_path.clone(),
+                        reader.schema().clone(),
+                        reader.row_count(),
+                    )));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn recover_active_segment(
+        &self,
+        seg_path: &Path,
+        schema: &Schema,
+    ) -> Result<Option<ActiveSegmentWriter>> {
+        let file_len = std::fs::metadata(seg_path)?.len();
+
+        if file_len < SEGMENT_HEADER_SIZE as u64 {
+            return Ok(None);
+        }
+
+        let reader = SegmentReader::open(seg_path)?;
+        let data_end = reader.data_end();
+
+        let row_groups = reader.footer_row_groups_info();
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(seg_path)?;
+
+        file.set_len(data_end)?;
+        file.seek(SeekFrom::Start(data_end))?;
+
+        tracing::info!(
+            path = %seg_path.display(),
+            data_end,
+            existing_rows = reader.row_count(),
+            row_groups = row_groups.len(),
+            "recovered active segment from unsealed file"
+        );
+
+        Ok(Some(ActiveSegmentWriter {
+            file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
+            path: seg_path.to_path_buf(),
+            schema: schema.clone(),
+            row_groups,
+            current_size: data_end,
+            total_rows: reader.row_count(),
+            buffered_batch: None,
+            buffered_rows: 0,
+            dirty_meta: true,
+            data_end,
+            sidecar_row_groups_flushed: 0,
+            last_write_at: Instant::now(),
+        }))
+    }
+
+    pub fn bulk_insert_payload(&self, db: &str, payload: &[u8], _disable_wal: bool) -> Result<u64> {
+        use rayon::prelude::*;
+
+        let req = parse_direct_bulk_payload(payload)?;
+        if req.row_count == 0 {
+            return Ok(0);
+        }
+
+        let table_dir = self.data_dir.join(db).join(req.table_name);
+        std::fs::create_dir_all(&table_dir)?;
+
+        let schema = {
+            let col_defs: Vec<crate::types::batch::ColumnDef> = req
+                .columns
+                .iter()
+                .map(|c| {
+                    crate::types::batch::ColumnDef::new(c.name, c.data_type)
+                        .with_scale(c.scale)
+                        .with_precision(c.precision)
+                })
+                .collect();
+            Schema::new(col_defs)
+        };
+
+        let key = table_key(db, req.table_name);
+        let state = self.get_or_create_state(&key);
+
+        let compression_level = bulk_compression_level();
+        let compressed_columns: Vec<(Vec<u8>, u64)> = req
+            .columns
+            .par_iter()
+            .map(|col| {
+                let mut encoded = Vec::with_capacity(4 + col.data.len());
+                encoded.extend_from_slice(&0u32.to_le_bytes());
+                encoded.extend_from_slice(col.data);
+                let orig_len = encoded.len() as u64;
+                let compressed = zstd::bulk::compress(&encoded, compression_level)
+                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
+                Ok((compressed, orig_len))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        {
+            let _mutation_guard = state.mutation_lock.lock().unwrap();
+            ensure_state_not_retired(&state, db, req.table_name)?;
+
+            let mut active_guard = state.active_segments.lock().unwrap();
+            self.get_or_create_active_segment_for_partition_locked(
+                &table_dir,
+                &schema,
+                "",
+                &mut active_guard,
+            )?;
+
+            let seg = active_guard.get_mut("").unwrap();
+
+            seg.append_direct_row_group(&req.columns, &compressed_columns, req.row_count as u64)?;
+
+            if seg.current_size >= self.max_segment_size() {
+                seg.seal(&|path| self.invalidate_reader(path))?;
+                active_guard.remove("");
+            } else {
+                seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            }
+        }
+
+        Ok(req.row_count as u64)
+    }
+
+    pub fn bulk_insert_payload_with_catalog(
+        &self,
+        db: &str,
+        payload: &[u8],
+        _disable_wal: bool,
+        catalogs: &crate::storage::catalog::schema::DatabaseCatalog,
+        flush_immediately: bool,
+    ) -> Result<u64> {
+        use rayon::prelude::*;
+
+        let req = parse_direct_bulk_payload(payload)?;
+        if req.row_count == 0 {
+            return Ok(0);
+        }
+
+        let table_dir = self.data_dir.join(db).join(req.table_name);
+        std::fs::create_dir_all(&table_dir)?;
+
+        let (schema, table_meta) = {
+            let table_meta = catalogs.get_table(req.table_name).ok_or_else(|| {
+                MonaxError::Sql(format!("table '{}.{}' does not exist", db, req.table_name))
+            })?;
+            let schema = Schema::new(table_meta.columns.clone());
+            (schema, table_meta.clone())
+        };
+
+        if schema.num_columns() != req.columns.len() {
+            return Err(MonaxError::Protocol(format!(
+                "bulk column count mismatch: schema has {} columns but payload has {}",
+                schema.num_columns(),
+                req.columns.len()
+            )));
+        }
+
+        for (idx, (col_def, payload_col)) in
+            schema.columns.iter().zip(req.columns.iter()).enumerate()
+        {
+            if col_def.data_type != payload_col.data_type {
+                return Err(MonaxError::Protocol(format!(
+                    "bulk column {} type mismatch for '{}': schema={} payload={}",
+                    idx,
+                    col_def.name,
+                    col_def.data_type.display_name(),
+                    payload_col.data_type.display_name()
+                )));
+            }
+            if !col_def.name.eq_ignore_ascii_case(payload_col.name) {
+                return Err(MonaxError::Protocol(format!(
+                    "bulk column {} name mismatch: schema='{}' payload='{}'",
+                    idx, col_def.name, payload_col.name
+                )));
+            }
+            if !payload_col.nulls.is_empty() {
+                return Err(MonaxError::Protocol(
+                    "direct bulk path currently supports all-valid columns only".into(),
+                ));
+            }
+        }
+
+        if table_meta.is_partitioned() || !table_meta.cluster_key.is_empty() {
+            let mut batch = direct_bulk_request_to_batch(&req, &schema)?;
+            if !table_meta.cluster_key.is_empty() {
+                let key_indices: Vec<usize> = table_meta
+                    .cluster_key
+                    .iter()
+                    .filter_map(|key| schema.index_of(key))
+                    .collect();
+                if !key_indices.is_empty() {
+                    batch = sort_batch_by_key_indices(&batch, &key_indices)?;
+                }
+            }
+            return if flush_immediately {
+                self.bulk_insert_batch_partitioned(db, req.table_name, &table_meta, batch)
+            } else {
+                self.bulk_insert_batch_partitioned_deferred(db, req.table_name, &table_meta, batch)
+            };
+        }
+
+        let partition_key = String::new();
+
+        let key = table_key(db, req.table_name);
+        let state = self.get_or_create_state(&key);
+
+        let compression_level = bulk_compression_level();
+        let compressed_columns: Vec<(Vec<u8>, u64)> = req
+            .columns
+            .par_iter()
+            .map(|col| {
+                let mut encoded = Vec::with_capacity(4 + col.data.len());
+                encoded.extend_from_slice(&0u32.to_le_bytes());
+                encoded.extend_from_slice(col.data);
+                let orig_len = encoded.len() as u64;
+                let compressed = zstd::bulk::compress(&encoded, compression_level)
+                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
+                Ok((compressed, orig_len))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        {
+            let _mutation_guard = state.mutation_lock.lock().unwrap();
+            ensure_state_not_retired(&state, db, req.table_name)?;
+
+            let mut active_guard = state.active_segments.lock().unwrap();
+            self.get_or_create_active_segment_for_partition_locked(
+                &table_dir,
+                &schema,
+                &partition_key,
+                &mut active_guard,
+            )?;
+
+            let seg = active_guard.get_mut(&partition_key).unwrap();
+
+            seg.append_direct_row_group(&req.columns, &compressed_columns, req.row_count as u64)?;
+
+            if seg.current_size >= self.max_segment_size() {
+                seg.seal(&|path| self.invalidate_reader(path))?;
+                active_guard.remove(&partition_key);
+            } else if flush_immediately {
+                seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            }
+        }
+
+        Ok(req.row_count as u64)
+    }
+
+    pub fn bulk_insert_batch_partitioned(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_partitioned_inner(db, table, table_meta, batch, true)
+    }
+
+    pub fn bulk_insert_batch_partitioned_deferred(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_partitioned_inner(db, table, table_meta, batch, false)
+    }
+
+    fn bulk_insert_batch_partitioned_inner(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: RecordBatch,
+        flush_immediately: bool,
+    ) -> Result<u64> {
+        if !table_meta.is_partitioned() {
+            return self.bulk_insert_batch_with_partition_inner(
+                db,
+                table,
+                "",
+                batch,
+                flush_immediately,
+            );
+        }
+
+        let pk_idx = match table_meta.get_partition_column_index_cached() {
+            Some(idx) => idx,
+            None => {
+                return self.bulk_insert_batch_with_partition_inner(
+                    db,
+                    table,
+                    "",
+                    batch,
+                    flush_immediately,
+                )
+            }
+        };
+        let mut key_order = Vec::new();
+        let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            let val = batch
+                .scalar(row_idx, pk_idx)
+                .unwrap_or(ScalarValue::Int64(None));
+            let key = compute_partition_key_from_scalar(&table_meta.partition_strategy(), &val);
+            if !groups.contains_key(&key) {
+                key_order.push(key.clone());
+                groups.insert(key.clone(), vec![false; batch.num_rows()]);
+            }
+            if let Some(mask) = groups.get_mut(&key) {
+                mask[row_idx] = true;
+            }
+        }
+
+        let mut written = 0;
+        for partition_key in key_order {
+            let Some(mask) = groups.remove(&partition_key) else {
+                continue;
+            };
+            let match_count = mask.iter().filter(|keep| **keep).count();
+            let part_batch = filter_batch_by_mask(&batch, &mask, match_count)?;
+            written += self.bulk_insert_batch_with_partition_inner(
+                db,
+                table,
+                &partition_key,
+                part_batch,
+                flush_immediately,
+            )?;
+        }
+        Ok(written)
+    }
+
+    pub fn flush_all_active(&self) -> Result<u64> {
+        self.sync_all_wals();
+
+        let mut total = 0u64;
+        let tables = self.tables.read().unwrap();
+        for state in tables.values() {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            let keys_to_seal: Vec<String> = active_guard
+                .iter()
+                .filter(|(_, seg)| {
+                    seg.total_rows > 0 && seg.current_size >= self.min_segment_seal_size()
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            for key in keys_to_seal {
+                if let Some(seg) = active_guard.get_mut(&key) {
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                    seg.write_final_footer()?;
+                    remove_sidecar_meta(&seg.path)?;
+                    self.invalidate_reader(&seg.path);
+                    tracing::info!(
+                        path = %seg.path.display(),
+                        size_mb = seg.current_size / (1024 * 1024),
+                        rows = seg.total_rows,
+                        partition_key = key,
+                        "sealing segment on flush (meets minimum size threshold)"
+                    );
+                    seg.finalize()?;
+                    total += seg.total_rows;
+                }
+                active_guard.remove(&key);
+            }
+
+            for (_, seg) in active_guard.iter_mut() {
+                if seg.total_rows > 0 || seg.buffered_rows > 0 {
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                    seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                    total += seg.total_rows;
+                    tracing::info!(
+                        path = %seg.path.display(),
+                        size_mb = seg.current_size / (1024 * 1024),
+                        rows = seg.total_rows,
+                        buffered = seg.buffered_rows,
+                        "active segment flushed but kept open (below minimum seal size)"
+                    );
+                }
+            }
+        }
+        drop(tables);
+
+        self.clear_all_wals();
+
+        Ok(total)
+    }
+
+    fn periodic_flush_check(&self) -> Result<u64> {
+        let now = Instant::now();
+        let mut total = 0u64;
+        let tables = self.tables.read().unwrap();
+        for state in tables.values() {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            for (_, seg) in active_guard.iter_mut() {
+                if !seg.dirty_meta && seg.buffered_rows == 0 {
+                    continue;
+                }
+                let idle = now.duration_since(seg.last_write_at).as_secs();
+                if idle < FLUSH_IDLE_THRESHOLD_SECS {
+                    continue;
+                }
+                if seg.buffered_rows > 0 {
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                }
+                if seg.dirty_meta {
+                    seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                }
+                total += seg.total_rows;
+            }
+        }
+        Ok(total)
+    }
+
+    pub fn begin_txn(&self) -> u64 {
+        self.alloc_txn_id()
+    }
+
+    pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
+        self.sync_all_wals();
+        tracing::debug!(txn_id, "transaction committed in storage layer");
+        Ok(())
+    }
+
+    pub fn rollback_txn(&self, txn_id: u64) -> Result<()> {
+        tracing::debug!(txn_id, "transaction rolled back in storage layer");
+        Ok(())
+    }
+
+    pub fn write_txn_wal(&self, table_dir: &Path, txn_id: u64, batch: &RecordBatch) -> Result<()> {
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
+
+        let wal_data = crate::sql::execution::wal_helper::serialize_batch_for_wal(batch);
+
+        let mut wal_guard = state.wal_writer.lock().unwrap();
+        if wal_guard.is_none() {
+            let wal_dir = table_dir.join("wal");
+            let writer = WalWriter::open(&wal_dir, 64 * 1024 * 1024)?;
+            *wal_guard = Some(writer);
+        }
+        let wal_writer = wal_guard.as_mut().unwrap();
+        wal_writer.write_compact(txn_id, &wal_data, false)?;
+        Ok(())
+    }
+
+    pub fn clear_txn_wal(&self, table_dir: &Path, txn_id: u64) -> Result<()> {
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
+        let mut wal_guard = state.wal_writer.lock().unwrap();
+        if let Some(ref mut w) = *wal_guard {
+            w.clear_entries_for_txn(txn_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn sync_table_wal(&self, table_dir: &Path) -> Result<()> {
+        let state = self.get_or_create_state_for_table_dir(table_dir)?;
+        let mut wal_guard = state.wal_writer.lock().unwrap();
+        if let Some(ref mut w) = *wal_guard {
+            w.sync()?;
+        }
+        Ok(())
+    }
+}
+
+pub fn table_key(db: &str, table: &str) -> String {
+    format!("{}:{}", db, table)
+}
+
+fn is_transient_footer_error(err: &MonaxError) -> bool {
+    matches!(err, MonaxError::Storage(msg) if msg.contains("invalid footer offset"))
+}
+
+fn ensure_state_not_retired(state: &TableSegmentState, db: &str, table: &str) -> Result<()> {
+    if state.retired.load(Ordering::Acquire) {
+        return Err(MonaxError::Storage(format!(
+            "table '{}.{}' was removed while a write was waiting",
+            db, table
+        )));
+    }
+    Ok(())
+}
+
+fn discover_max_seq(table_dir: &Path) -> u32 {
+    let mut max_seq = 0u32;
+    if let Ok(entries) = std::fs::read_dir(table_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(seq) = store::parse_segment_seq(&name) {
+                max_seq = max_seq.max(seq);
+            }
+        }
+    }
+    max_seq
+}
+
+fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
+    schema
+        .columns
+        .iter()
+        .map(|col| {
+            let null = crate::storage::codec::scalar_tag::null_for_dtype(col.data_type);
+            ZoneMap {
+                min_value: null.clone(),
+                max_value: null,
+                null_count: 0,
+                row_count,
+            }
+        })
+        .collect()
+}
+
+fn compute_zone_maps_from_batch(
+    batch: &RecordBatch,
+    start_row: usize,
+    row_count: usize,
+) -> Vec<ZoneMap> {
+    let num_cols = batch.num_columns();
+    let mut zone_maps = Vec::with_capacity(num_cols);
+    for col_idx in 0..num_cols {
+        let mut zm = ZoneMap::default();
+        if let Some(col) = batch.column(col_idx) {
+            for row in start_row..start_row + row_count {
+                if col.bitmap().is_null(row) {
+                    zm.null_count += 1;
+                } else {
+                    let val = col.scalar(row);
+                    zm.update(&val);
+                }
+            }
+        }
+        zm.row_count = row_count as u64;
+        zone_maps.push(zm);
+    }
+    zone_maps
+}
+
+fn direct_bulk_request_to_batch(
+    req: &DirectBulkRequest<'_>,
+    schema: &Schema,
+) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(req.columns.len());
+    for col in &req.columns {
+        let mut array = ColumnArray::empty(col.data_type);
+        for row_idx in 0..req.row_count {
+            let scalar = direct_bulk_column_scalar_at(col, row_idx)?;
+            array.push(&scalar)?;
+        }
+        columns.push(array);
+    }
+    RecordBatch::try_new(schema.clone(), columns)
+}
+
+fn direct_bulk_column_scalar_at(col: &DirectBulkColumn<'_>, row_idx: usize) -> Result<ScalarValue> {
+    if is_null_at(col.nulls, row_idx) {
+        return Ok(ScalarValue::null_for_type(col.data_type));
+    }
+
+    if let Some(width) = col.data_type.fixed_size() {
+        let offset = row_idx
+            .checked_mul(width)
+            .ok_or_else(|| MonaxError::Protocol("bulk column offset overflow".into()))?;
+        return read_fixed_scalar(col.data, offset, col.data_type).ok_or_else(|| {
+            MonaxError::Protocol(format!(
+                "bulk column '{}' row {} is truncated",
+                col.name, row_idx
+            ))
+        });
+    }
+
+    let (offset, len) = direct_bulk_variable_range_at(col, row_idx)?;
+    match col.data_type {
+        DataType::VarChar => {
+            let s = std::str::from_utf8(&col.data[offset..offset + len])
+                .map_err(|_| MonaxError::Protocol("invalid utf8 in bulk varchar".into()))?;
+            Ok(ScalarValue::VarChar(Some(s.to_string())))
+        }
+        DataType::Blob => Ok(ScalarValue::Blob(Some(
+            col.data[offset..offset + len].to_vec(),
+        ))),
+        DataType::Vector => {
+            if len % 4 != 0 {
+                return Err(MonaxError::Protocol(
+                    "bulk vector payload length must be a multiple of 4".into(),
+                ));
+            }
+            let mut values = Vec::with_capacity(len / 4);
+            for chunk in col.data[offset..offset + len].chunks_exact(4) {
+                values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            Ok(ScalarValue::Vector(Some(values)))
+        }
+        _ => Err(MonaxError::Protocol(format!(
+            "unsupported variable bulk type {}",
+            col.data_type.display_name()
+        ))),
+    }
+}
+
+fn direct_bulk_variable_range_at(
+    col: &DirectBulkColumn<'_>,
+    target_row: usize,
+) -> Result<(usize, usize)> {
+    if let Some(ranges) = &col.variable_ranges {
+        return ranges.get(target_row).copied().ok_or_else(|| {
+            MonaxError::Protocol(format!(
+                "bulk column '{}' row {} not found",
+                col.name, target_row
+            ))
+        });
+    }
+
+    let mut offset = 0usize;
+    for row_idx in 0..=target_row {
+        if is_null_at(col.nulls, row_idx) {
+            continue;
+        }
+        if offset + 4 > col.data.len() {
+            return Err(MonaxError::Protocol(format!(
+                "bulk column '{}' variable length prefix truncated",
+                col.name
+            )));
+        }
+        let len = u32::from_le_bytes(col.data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + len > col.data.len() {
+            return Err(MonaxError::Protocol(format!(
+                "bulk column '{}' variable data truncated",
+                col.name
+            )));
+        }
+        if row_idx == target_row {
+            return Ok((offset, len));
+        }
+        offset += len;
+    }
+    Err(MonaxError::Protocol(format!(
+        "bulk column '{}' row {} not found",
+        col.name, target_row
+    )))
+}
+
+fn sort_batch_by_key_indices(batch: &RecordBatch, key_indices: &[usize]) -> Result<RecordBatch> {
+    if batch.num_rows() <= 1 {
+        return Ok(batch.clone());
+    }
+
+    let mut rows: Vec<usize> = (0..batch.num_rows()).collect();
+    rows.sort_by(|left, right| {
+        for &col_idx in key_indices {
+            let left_value = batch.scalar(*left, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
+            });
+            let right_value = batch.scalar(*right, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
+            });
+            let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(
+                &left_value,
+                &right_value,
+            );
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    let mut sorted = RecordBatch::new(batch.schema.clone());
+    for row_idx in rows {
+        for col_idx in 0..batch.num_columns() {
+            let value = batch.scalar(row_idx, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
+            });
+            sorted.column_mut(col_idx).unwrap().push(&value)?;
+        }
+    }
+    Ok(sorted)
+}
+
+fn filter_batch_by_mask(
+    batch: &RecordBatch,
+    mask: &[bool],
+    match_count: usize,
+) -> Result<RecordBatch> {
+    let columns = batch
+        .columns
+        .iter()
+        .map(|col| col.filter_by_mask_fast(mask, match_count))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
+}
+
+fn compute_zone_maps_from_bulk_columns(
+    columns: &[crate::storage::bulk_payload::DirectBulkColumn<'_>],
+    _schema: &Schema,
+    row_count: u64,
+) -> Vec<ZoneMap> {
+    let mut zone_maps = Vec::with_capacity(columns.len());
+    for col in columns.iter() {
+        let mut zm = ZoneMap::default();
+        let dtype = col.data_type;
+        let data = col.data;
+        let nulls = col.nulls;
+        let elem_count = row_count as usize;
+
+        let mut null_count = 0u64;
+        if let Some(width) = dtype.fixed_size() {
+            for i in 0..elem_count {
+                if is_null_at(nulls, i) {
+                    null_count += 1;
+                    continue;
+                }
+                let offset = i * width;
+                if let Some(val) = read_fixed_scalar(data, offset, dtype) {
+                    zm.update(&val);
+                }
+            }
+        } else {
+            for i in 0..elem_count {
+                if is_null_at(nulls, i) {
+                    null_count += 1;
+                    continue;
+                }
+                let Some((offset, len)) = col
+                    .variable_ranges
+                    .as_ref()
+                    .and_then(|ranges| ranges.get(i).copied())
+                else {
+                    break;
+                };
+                if offset + len > data.len() {
+                    break;
+                }
+                if dtype == DataType::VarChar {
+                    let s = std::str::from_utf8(&data[offset..offset + len])
+                        .unwrap_or("")
+                        .to_string();
+                    zm.update(&ScalarValue::VarChar(Some(s)));
+                }
+            }
+        }
+
+        zm.null_count = null_count;
+        zm.row_count = row_count;
+        zone_maps.push(zm);
+    }
+    zone_maps
+}
+
+fn is_null_at(nulls: &[u8], idx: usize) -> bool {
+    if nulls.is_empty() {
+        return false;
+    }
+    let byte_idx = idx / 8;
+    let bit_idx = idx % 8;
+    if byte_idx >= nulls.len() {
+        return false;
+    }
+    (nulls[byte_idx] & (1 << bit_idx)) != 0
+}
+
+fn read_fixed_scalar(
+    data: &[u8],
+    offset: usize,
+    dtype: DataType,
+) -> Option<crate::types::scalar::ScalarValue> {
+    use crate::types::scalar::ScalarValue;
+    match dtype {
+        DataType::Bool => {
+            if offset >= data.len() {
+                return None;
+            }
+            Some(ScalarValue::Bool(Some(data[offset] != 0)))
+        }
+        DataType::Int8 => {
+            if offset >= data.len() {
+                return None;
+            }
+            Some(ScalarValue::Int8(Some(data[offset] as i8)))
+        }
+        DataType::Int16 => {
+            if offset + 2 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Int16(Some(i16::from_le_bytes(
+                data[offset..offset + 2].try_into().ok()?,
+            ))))
+        }
+        DataType::Int32 => {
+            if offset + 4 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Int32(Some(i32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ))))
+        }
+        DataType::Int64 => {
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Int64(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
+        }
+        DataType::UInt8 => {
+            if offset >= data.len() {
+                return None;
+            }
+            Some(ScalarValue::UInt8(Some(data[offset])))
+        }
+        DataType::UInt16 => {
+            if offset + 2 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::UInt16(Some(u16::from_le_bytes(
+                data[offset..offset + 2].try_into().ok()?,
+            ))))
+        }
+        DataType::UInt32 => {
+            if offset + 4 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::UInt32(Some(u32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ))))
+        }
+        DataType::UInt64 => {
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::UInt64(Some(u64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
+        }
+        DataType::Float32 => {
+            if offset + 4 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Float32(Some(f32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ))))
+        }
+        DataType::Float64 => {
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Float64(Some(f64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
+        }
+        DataType::Decimal => {
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Decimal(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
+        }
+        DataType::Date => {
+            if offset + 4 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Date(Some(i32::from_le_bytes(
+                data[offset..offset + 4].try_into().ok()?,
+            ))))
+        }
+        DataType::Time => {
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Time(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
+        }
+        DataType::Timestamp => {
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Timestamp(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
+        }
+        DataType::Interval => {
+            if offset + 8 > data.len() {
+                return None;
+            }
+            Some(ScalarValue::Interval(Some(i64::from_le_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ))))
+        }
+        _ => None,
+    }
+}
+
+fn bulk_compression_level() -> i32 {
+    static LEVEL: OnceLock<i32> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("MONAX_BULK_ZSTD_LEVEL")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(1)
+    })
+}
+
+fn reader_cache_capacity() -> usize {
+    static CAPACITY: OnceLock<usize> = OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        std::env::var("MONAX_READER_CACHE_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_READER_CACHE_CAPACITY)
+    })
+}

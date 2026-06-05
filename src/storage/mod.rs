@@ -1,12 +1,15 @@
-pub mod schema;
-pub mod wal;
-pub mod segment;
-pub mod sort_key;
+pub mod bulk_payload;
+pub mod catalog;
+pub mod change_stream;
+pub mod codec;
+pub mod column_encoding;
+pub mod core;
+pub mod index;
+pub mod metrics;
 pub mod partition;
-pub mod encoding;
-pub mod writer;
-pub mod reader;
-pub mod buffer_pool;
-pub mod memtable;
-pub mod column_encoder;
-pub mod async_segment;
+pub mod segment;
+pub mod segment_manager;
+pub mod txn;
+
+#[cfg(test)]
+mod optimization_tests;

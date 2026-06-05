@@ -1,3 +1,11 @@
+[workspace]
+members = [
+    ".",
+    "examples/batch_import",
+    "examples/multi_insert",
+    "examples/prepare_test",
+]
+
 [package]
 name = "monax"
 version = "0.1.0"
@@ -15,6 +23,8 @@ path = "src/main.rs"
 [[bin]]
 name = "segment"
 path = "src/bin/segment_checker.rs"
+
+
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -37,15 +47,21 @@ bumpalo = "3"
 flate2 = "1"
 rustls-pemfile = "2"
 crossbeam-queue = "0.3"
+crossbeam-channel = "0.5"
 lazy_static = "1.4"
 rayon = "1.10"
 parking_lot = "0.12"
+chrono = "0.4"
+ordered-float = "4"
+fnv = "1"
+regex = "1"
+md-5 = "0.10"
+hex = "0.4"
+twox-hash = "1"
 
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"
 
-[[bench]]
-name = "scan_bench"
-harness = false
-path = "benches/scan_bench.rs"
+[build-dependencies]
+chrono = "0.4"

@@ -156,11 +156,12 @@ monax/
 │   ├── storage/              # 存储引擎: Segment, WAL, Schema
 │   │   ├── mod.rs
 │   │   ├── schema.rs
-│   │   ├── segment.rs
-│   │   ├── writer.rs
-│   │   ├── reader.rs
+│   │   ├── segment.rs        # SegmentWriter/SegmentReader + .dat
 │   │   ├── wal.rs
-│   │   └── encoding.rs
+│   │   ├── encoding.rs
+│   │   ├── sort_key.rs
+│   │   ├── partition.rs
+│   │   └── buffer_pool.rs
 │   ├── sql/                  # SQL引擎: Parser, Planner, Optimizer, Executor
 │   │   ├── mod.rs
 │   │   ├── parser/

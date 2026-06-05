@@ -24,12 +24,14 @@ impl TlsConfig {
     pub fn validate(&self) -> Result<()> {
         if !self.cert_path.exists() {
             return Err(MonaxError::Config(format!(
-                "TLS certificate file not found: {:?}", self.cert_path
+                "TLS certificate file not found: {:?}",
+                self.cert_path
             )));
         }
         if !self.key_path.exists() {
             return Err(MonaxError::Config(format!(
-                "TLS private key file not found: {:?}", self.key_path
+                "TLS private key file not found: {:?}",
+                self.key_path
             )));
         }
         Ok(())
@@ -49,7 +51,9 @@ impl TlsConfig {
             .map_err(|e| MonaxError::Config(format!("Failed to read certificates: {}", e)))?;
 
         if cert_chain.is_empty() {
-            return Err(MonaxError::Config("No certificates found in cert file".into()));
+            return Err(MonaxError::Config(
+                "No certificates found in cert file".into(),
+            ));
         }
 
         // Load private key

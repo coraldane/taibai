@@ -5,11 +5,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
+use crate::storage::segment::{
+    decode_scalar_with_tag, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION,
+};
 use crate::types::batch::{ColumnDef, Schema};
+#[allow(unused_imports)]
+use crate::types::scalar::ScalarValue;
 
 #[derive(Debug, Clone)]
 pub struct SegmentInspectInfo {
     pub path: PathBuf,
+    pub header_magic: u32,
+    pub header_version: u32,
+    pub header_created_at: u64,
+    pub header_flags: u64,
     pub version: u32,
     pub generation: u64,
     pub row_count: u64,
@@ -28,6 +37,8 @@ pub struct SegmentInspectInfo {
     pub row_groups: Vec<RowGroupInfo>,
     pub partition_key: String,
     pub sequence: u32,
+    pub deleted_row_count: u64,
+    pub delete_bitmap_len: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -37,13 +48,11 @@ pub struct RowGroupInfo {
     pub row_count: u64,
     pub compressed_sizes: Vec<u64>,
     pub uncompressed_sizes: Vec<u64>,
+    pub zone_maps: Vec<ZoneMap>,
 }
 
 pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let (partition_key, sequence) = parse_partition_filename(filename);
 
     let file = fs::File::open(path)?;
@@ -52,24 +61,44 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
     let file_created = metadata.created().ok();
     let file_modified = metadata.modified().ok();
 
-    if file_size < 8 {
+    if file_size < (SEGMENT_HEADER_SIZE as u64) + 8 {
         return Err(MonaxError::Storage(format!(
-            "segment file too small: {} bytes",
-            file_size
+            "segment file too small: {} bytes (need >= {})",
+            file_size,
+            SEGMENT_HEADER_SIZE + 8
         )));
     }
 
     let mut tmp_file = file;
+    tmp_file.seek(SeekFrom::Start(0))?;
+    let mut header_buf = [0u8; SEGMENT_HEADER_SIZE];
+    tmp_file.read_exact(&mut header_buf)?;
+    let header_magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+    let header_version = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+    let header_created_at = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+    let header_flags = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
+    if header_magic != SEGMENT_MAGIC {
+        return Err(MonaxError::Storage(format!(
+            "invalid segment header magic: {:08X} (expected {:08X})",
+            header_magic, SEGMENT_MAGIC
+        )));
+    }
+    if header_version != SEGMENT_VERSION {
+        return Err(MonaxError::Storage(format!(
+            "unsupported segment header version: {} (expected {})",
+            header_version, SEGMENT_VERSION
+        )));
+    }
+
     let mut footer_offset_buf = [0u8; 8];
     tmp_file.seek(SeekFrom::End(-8))?;
     tmp_file.read_exact(&mut footer_offset_buf)?;
     let footer_offset = u64::from_le_bytes(footer_offset_buf);
 
-    if footer_offset >= file_size - 8 {
+    if footer_offset < SEGMENT_HEADER_SIZE as u64 || footer_offset >= file_size - 8 {
         return Err(MonaxError::Storage(format!(
-            "invalid footer offset: {} >= file size {}",
-            footer_offset,
-            file_size
+            "invalid footer offset: {} (file size {}, header size {})",
+            footer_offset, file_size, SEGMENT_HEADER_SIZE
         )));
     }
 
@@ -111,11 +140,25 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             nullable,
             scale,
             precision,
+            auto_increment: false,
+            primary_key: false,
+            default_value: None,
         });
     }
     let schema = Schema::new(columns);
 
     let col_count = schema.num_columns();
+    let has_segment_zone_maps = read_u8(&mut cursor).unwrap_or(0);
+    if has_segment_zone_maps != 0 {
+        let segment_zone_map_count = read_u32_le(&mut cursor).unwrap_or(0) as usize;
+        for _ in 0..segment_zone_map_count {
+            let _min_v = decode_scalar_with_tag(&mut cursor)?;
+            let _max_v = decode_scalar_with_tag(&mut cursor)?;
+            let _null_count = read_u64_le(&mut cursor)?;
+            let _row_count = read_u64_le(&mut cursor)?;
+        }
+    }
+
     let mut row_groups = Vec::with_capacity(row_group_count as usize);
     let mut footer_row_count: u64 = 0;
     let mut compressed_size: u64 = 0;
@@ -146,14 +189,37 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             uncomp_sizes.push(s);
         }
 
+        let mut zone_maps = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            let min_v = decode_scalar_with_tag(&mut cursor)?;
+            let max_v = decode_scalar_with_tag(&mut cursor)?;
+            let null_count = read_u64_le(&mut cursor)?;
+            let zm_row_count = read_u64_le(&mut cursor)?;
+            zone_maps.push(ZoneMap {
+                min_value: min_v,
+                max_value: max_v,
+                null_count,
+                row_count: zm_row_count,
+            });
+        }
+
+        // Footer v5 stores one bloom-filter slot per column after ZoneMaps.
+        // The inspector does not print these, but it must advance past them
+        // before reading the next row group or the delete-bitmap section.
+        skip_bloom_filters(&mut cursor, footer_data.as_slice(), col_count)?;
+
         row_groups.push(RowGroupInfo {
             offset: rg_offset,
             length: rg_length,
             row_count: rg_row_count,
             compressed_sizes: comp_sizes,
             uncompressed_sizes: uncomp_sizes,
+            zone_maps,
         });
     }
+
+    let deleted_row_count = read_u64_le(&mut cursor).unwrap_or(0);
+    let delete_bitmap_len = read_u32_le(&mut cursor).unwrap_or(0);
 
     let row_count = if footer_row_count > 0 {
         footer_row_count
@@ -169,6 +235,10 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
 
     Ok(SegmentInspectInfo {
         path: path.to_path_buf(),
+        header_magic,
+        header_version,
+        header_created_at,
+        header_flags,
         version,
         generation,
         row_count,
@@ -187,6 +257,8 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         row_groups,
         partition_key,
         sequence,
+        deleted_row_count,
+        delete_bitmap_len,
     })
 }
 
@@ -222,8 +294,7 @@ fn is_partition_filename(name: &str) -> bool {
 pub fn parse_partition_filename(filename: &str) -> (String, u32) {
     let base = filename.trim_end_matches(".dat");
 
-    if base.starts_with("seg_") {
-        let seq_str = &base[4..];
+    if let Some(seq_str) = base.strip_prefix("seg_") {
         if let Ok(seq) = seq_str.parse::<u32>() {
             return (String::new(), seq);
         }
@@ -258,7 +329,11 @@ pub fn format_size(size: u64) -> String {
         exp += 1;
         n /= UNIT;
     }
-    format!("{:.2} {}B", size as f64 / div as f64, b"KMGTPE"[exp] as char)
+    format!(
+        "{:.2} {}B",
+        size as f64 / div as f64,
+        b"KMGTPE"[exp] as char
+    )
 }
 
 pub fn format_timestamp(ts: u64) -> String {
@@ -272,17 +347,17 @@ fn format_datetime_from_timestamp(secs: u64) -> String {
     const SECONDS_PER_DAY: u64 = 86400;
     const SECONDS_PER_HOUR: u64 = 3600;
     const SECONDS_PER_MINUTE: u64 = 60;
-    
+
     let days_since_epoch = secs / SECONDS_PER_DAY;
     let remaining_secs = secs % SECONDS_PER_DAY;
-    
+
     let hour = remaining_secs / SECONDS_PER_HOUR;
     let minute = (remaining_secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
     let second = remaining_secs % SECONDS_PER_MINUTE;
-    
+
     let mut year = 1970u64;
     let mut days_left = days_since_epoch;
-    
+
     loop {
         let days_in_year = if is_leap_year(year) { 366u64 } else { 365u64 };
         if days_left >= days_in_year {
@@ -292,13 +367,13 @@ fn format_datetime_from_timestamp(secs: u64) -> String {
             break;
         }
     }
-    
+
     let month_days = if is_leap_year(year) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
         [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
-    
+
     let mut month = 1u64;
     let mut day = days_left + 1;
     for &days_in_month in &month_days {
@@ -308,7 +383,7 @@ fn format_datetime_from_timestamp(secs: u64) -> String {
         day -= days_in_month as u64;
         month += 1;
     }
-    
+
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         year, month, day, hour, minute, second
@@ -320,19 +395,17 @@ pub fn format_system_time(time: Option<SystemTime>) -> String {
         Some(t) => t,
         None => return "N/A".to_string(),
     };
-    
+
     let duration = match time.duration_since(UNIX_EPOCH) {
         Ok(d) => d,
         Err(_) => return "N/A".to_string(),
     };
-    
+
     format_datetime_from_timestamp(duration.as_secs())
 }
 
-
-
 fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8> {
@@ -359,6 +432,29 @@ fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
+fn skip_bloom_filters(cursor: &mut Cursor<&[u8]>, data: &[u8], col_count: usize) -> Result<()> {
+    for _ in 0..col_count {
+        let has_bf = read_u8(cursor)?;
+        if has_bf != 0 {
+            let bf_len = read_u32_le(cursor)? as usize;
+            let start = cursor.position() as usize;
+            let end = start
+                .checked_add(bf_len)
+                .ok_or_else(|| MonaxError::Storage("invalid bloom filter length".to_string()))?;
+            if end > data.len() {
+                return Err(MonaxError::Storage(format!(
+                    "invalid bloom filter length: {} at footer offset {} (footer size {})",
+                    bf_len,
+                    start,
+                    data.len()
+                )));
+            }
+            cursor.set_position(end as u64);
+        }
+    }
+    Ok(())
+}
+
 fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     let len = read_u32_le(cursor)? as usize;
     let mut buf = vec![0u8; len];
@@ -366,4 +462,47 @@ fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> Result<String> {
         .read_exact(&mut buf)
         .map_err(|e| MonaxError::Storage(format!("read_str error: {}", e)))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::storage::segment::SegmentWriter;
+    use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+    use crate::types::scalar::ScalarValue;
+    use tempfile::TempDir;
+
+    #[test]
+    fn inspect_segment_skips_segment_zone_maps() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seg_00001.dat");
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+
+        {
+            let mut writer = SegmentWriter::create(&path, schema.clone(), 4).unwrap();
+            let mut batch = RecordBatch::new(schema);
+            for value in 0..10i64 {
+                batch
+                    .column_mut(0)
+                    .unwrap()
+                    .push(&ScalarValue::Int64(Some(value)))
+                    .unwrap();
+            }
+            writer.write_batch(&batch).unwrap();
+            writer.seal().unwrap();
+        }
+
+        let info = inspect_segment(&path).unwrap();
+        assert_eq!(info.row_group_count, 3);
+        assert_eq!(info.footer_row_count, 10);
+        assert_eq!(
+            info.row_groups
+                .iter()
+                .map(|rg| rg.row_count)
+                .collect::<Vec<_>>(),
+            vec![4, 4, 2]
+        );
+        assert_eq!(info.row_groups[0].offset, SEGMENT_HEADER_SIZE as u64);
+    }
 }

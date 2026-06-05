@@ -3,15 +3,33 @@ use serde::{Deserialize, Serialize};
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
 use crate::types::array::ColumnArray;
+use crate::types::scalar::ScalarValue;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ColumnDefaultValue {
+    CurrentTimestamp,
+    Literal(ScalarValue),
+}
+
+impl Default for ColumnDefaultValue {
+    fn default() -> Self {
+        ColumnDefaultValue::Literal(ScalarValue::Int64(None))
+    }
+}
 
 /// Column definition within a table schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
     pub scale: i32,
     pub precision: i32,
+    pub auto_increment: bool,
+    #[serde(default)]
+    pub primary_key: bool,
+    #[serde(default)]
+    pub default_value: Option<ColumnDefaultValue>,
 }
 
 impl ColumnDef {
@@ -22,6 +40,9 @@ impl ColumnDef {
             nullable: true,
             scale: 0,
             precision: 0,
+            auto_increment: false,
+            primary_key: false,
+            default_value: None,
         }
     }
 
@@ -39,10 +60,25 @@ impl ColumnDef {
         self.precision = precision;
         self
     }
+
+    pub fn with_auto_increment(mut self, auto_increment: bool) -> Self {
+        self.auto_increment = auto_increment;
+        self
+    }
+
+    pub fn with_primary_key(mut self, primary_key: bool) -> Self {
+        self.primary_key = primary_key;
+        self
+    }
+
+    pub fn with_default_value(mut self, default_value: Option<ColumnDefaultValue>) -> Self {
+        self.default_value = default_value;
+        self
+    }
 }
 
 /// Schema for a table: column names + types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
     pub columns: Vec<ColumnDef>,
 }
@@ -53,7 +89,9 @@ impl Schema {
     }
 
     pub fn empty() -> Self {
-        Self { columns: Vec::new() }
+        Self {
+            columns: Vec::new(),
+        }
     }
 
     /// Returns the number of columns.
@@ -63,7 +101,9 @@ impl Schema {
 
     /// Find the index of a column by name (case-insensitive).
     pub fn index_of(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Get a column definition by index.
@@ -92,8 +132,19 @@ pub struct RecordBatch {
 impl RecordBatch {
     /// Create a new empty RecordBatch with the given schema.
     pub fn new(schema: Schema) -> Self {
-        let columns = schema.columns.iter()
+        let columns = schema
+            .columns
+            .iter()
             .map(|c| ColumnArray::empty(c.data_type))
+            .collect();
+        Self { schema, columns }
+    }
+
+    pub fn with_capacity(schema: Schema, capacity: usize) -> Self {
+        let columns = schema
+            .columns
+            .iter()
+            .map(|c| ColumnArray::with_capacity(c.data_type, capacity))
             .collect();
         Self { schema, columns }
     }
@@ -171,9 +222,7 @@ mod tests {
 
     #[test]
     fn test_empty_batch() {
-        let schema = Schema::new(vec![
-            ColumnDef::new("id", DataType::Int64),
-        ]);
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
         let batch = RecordBatch::new(schema);
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 1);
@@ -182,9 +231,7 @@ mod tests {
 
     #[test]
     fn test_batch_type_mismatch() {
-        let schema = Schema::new(vec![
-            ColumnDef::new("id", DataType::Int64),
-        ]);
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
         let columns = vec![ColumnArray::empty(DataType::VarChar)];
         let result = RecordBatch::try_new(schema, columns);
         assert!(result.is_err());

@@ -1,7 +1,7 @@
-pub mod message;
-pub mod types;
+#![allow(dead_code)]
+
 pub mod codec;
-pub mod bulk;
 pub mod compress;
+pub mod message;
 pub mod result;
-pub mod fast_bulk;
+pub mod types;
