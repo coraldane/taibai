@@ -131,7 +131,7 @@ pub fn build_pipeline(
             let schema = get_scan_schema(&topn.input);
             let input = build_pipeline(*topn.input, table_batches)?;
             Ok(Box::new(
-                SortExec::new(topn.sort_keys, input, schema).with_limit(topn.limit),
+                SortExec::new(topn.sort_keys, input, schema).with_limit(topn.limit + topn.offset),
             ))
         }
         LogicalPlan::Distinct(distinct) => {
