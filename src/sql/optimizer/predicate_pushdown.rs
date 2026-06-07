@@ -70,9 +70,8 @@ fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
             }
 
             if join_parts.is_empty() {
-                join.condition = LogicalExpr::Literal(crate::types::scalar::ScalarValue::Bool(Some(
-                    true,
-                )));
+                join.condition =
+                    LogicalExpr::Literal(crate::types::scalar::ScalarValue::Bool(Some(true)));
             } else {
                 join.condition = combine_conjuncts(join_parts).unwrap();
             }
@@ -83,7 +82,10 @@ fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
             let (right_input, right_changed) = push_predicates(right_input);
             join.left = Box::new(left_input);
             join.right = Box::new(right_input);
-            (LogicalPlan::Join(join), changed || left_changed || right_changed)
+            (
+                LogicalPlan::Join(join),
+                changed || left_changed || right_changed,
+            )
         }
         LogicalPlan::SemiJoin(mut semi) => {
             let (left, lc) = push_predicates(*semi.left);
@@ -109,6 +111,19 @@ fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
 fn push_filter(input: LogicalPlan, predicate: LogicalExpr) -> (LogicalPlan, bool) {
     match input {
         LogicalPlan::Scan(mut scan) => {
+            if scan
+                .pushed_filter
+                .as_ref()
+                .is_some_and(|existing| contains_conjunct(existing, &predicate))
+            {
+                return (
+                    LogicalPlan::Filter(FilterPlan {
+                        predicate,
+                        input: Box::new(LogicalPlan::Scan(scan)),
+                    }),
+                    false,
+                );
+            }
             scan.pushed_filter = Some(match scan.pushed_filter.take() {
                 Some(existing) => and_expr(existing, predicate.clone()),
                 None => predicate.clone(),
@@ -192,17 +207,26 @@ fn push_filter(input: LogicalPlan, predicate: LogicalExpr) -> (LogicalPlan, bool
 
 fn add_filter(plan: LogicalPlan, filters: Vec<LogicalExpr>) -> LogicalPlan {
     match combine_conjuncts(filters) {
-        Some(predicate) => LogicalPlan::Filter(FilterPlan {
-            predicate,
-            input: Box::new(plan),
-        }),
+        Some(predicate) => match plan {
+            LogicalPlan::Filter(filter) if filter.predicate == predicate => {
+                LogicalPlan::Filter(filter)
+            }
+            other => LogicalPlan::Filter(FilterPlan {
+                predicate,
+                input: Box::new(other),
+            }),
+        },
         None => plan,
     }
 }
 
 fn split_conjuncts(expr: LogicalExpr) -> Vec<LogicalExpr> {
     match expr {
-        LogicalExpr::BinaryOp { left, op: BinOp::And, right } => {
+        LogicalExpr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
             let mut parts = split_conjuncts(*left);
             parts.extend(split_conjuncts(*right));
             parts
@@ -227,6 +251,27 @@ fn and_expr(left: LogicalExpr, right: LogicalExpr) -> LogicalExpr {
     }
 }
 
+fn contains_conjunct(existing: &LogicalExpr, predicate: &LogicalExpr) -> bool {
+    split_conjunct_refs(existing)
+        .iter()
+        .any(|part| *part == predicate)
+}
+
+fn split_conjunct_refs(expr: &LogicalExpr) -> Vec<&LogicalExpr> {
+    match expr {
+        LogicalExpr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let mut parts = split_conjunct_refs(left);
+            parts.extend(split_conjunct_refs(right));
+            parts
+        }
+        other => vec![other],
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExprSide {
     Left,
@@ -244,7 +289,9 @@ fn expr_side(expr: &LogicalExpr, left_ncols: usize, total_cols: usize) -> ExprSi
         return ExprSide::None;
     }
     let has_left = cols.iter().any(|idx| *idx < left_ncols);
-    let has_right = cols.iter().any(|idx| *idx >= left_ncols && *idx < total_cols);
+    let has_right = cols
+        .iter()
+        .any(|idx| *idx >= left_ncols && *idx < total_cols);
     match (has_left, has_right) {
         (true, false) => ExprSide::Left,
         (false, true) => ExprSide::Right,
@@ -282,21 +329,40 @@ fn remap_right_expr(expr: &LogicalExpr, left_ncols: usize) -> Option<LogicalExpr
             op: *op,
             right: Box::new(remap_right_expr(right, left_ncols)?),
         }),
-        LogicalExpr::Not(inner) => Some(LogicalExpr::Not(Box::new(remap_right_expr(inner, left_ncols)?))),
-        LogicalExpr::IsNull(inner) => Some(LogicalExpr::IsNull(Box::new(remap_right_expr(inner, left_ncols)?))),
-        LogicalExpr::IsNotNull(inner) => Some(LogicalExpr::IsNotNull(Box::new(remap_right_expr(inner, left_ncols)?))),
-        LogicalExpr::In { expr, values, negated } => Some(LogicalExpr::In {
+        LogicalExpr::Not(inner) => Some(LogicalExpr::Not(Box::new(remap_right_expr(
+            inner, left_ncols,
+        )?))),
+        LogicalExpr::IsNull(inner) => Some(LogicalExpr::IsNull(Box::new(remap_right_expr(
+            inner, left_ncols,
+        )?))),
+        LogicalExpr::IsNotNull(inner) => Some(LogicalExpr::IsNotNull(Box::new(remap_right_expr(
+            inner, left_ncols,
+        )?))),
+        LogicalExpr::In {
+            expr,
+            values,
+            negated,
+        } => Some(LogicalExpr::In {
             expr: Box::new(remap_right_expr(expr, left_ncols)?),
             values: values.clone(),
             negated: *negated,
         }),
-        LogicalExpr::Between { expr, low, high, negated } => Some(LogicalExpr::Between {
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Some(LogicalExpr::Between {
             expr: Box::new(remap_right_expr(expr, left_ncols)?),
             low: Box::new(remap_right_expr(low, left_ncols)?),
             high: Box::new(remap_right_expr(high, left_ncols)?),
             negated: *negated,
         }),
-        LogicalExpr::Case { operand, when_clauses, else_clause } => {
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
             let operand = match operand {
                 Some(e) => Some(Box::new(remap_right_expr(e, left_ncols)?)),
                 None => None,
@@ -319,7 +385,11 @@ fn remap_right_expr(expr: &LogicalExpr, left_ncols: usize) -> Option<LogicalExpr
                 else_clause,
             })
         }
-        LogicalExpr::Like { expr, pattern, negated } => Some(LogicalExpr::Like {
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Some(LogicalExpr::Like {
             expr: Box::new(remap_right_expr(expr, left_ncols)?),
             pattern: pattern.clone(),
             negated: *negated,
@@ -409,8 +479,14 @@ mod tests {
         let mut scans = Vec::new();
         collect_scans(&optimized, &mut scans);
         assert_eq!(scans.len(), 2);
-        let daily_scan = scans.iter().find(|s| s.table_name == "t_stock_daily").unwrap();
-        let valuation_scan = scans.iter().find(|s| s.table_name == "t_valuation").unwrap();
+        let daily_scan = scans
+            .iter()
+            .find(|s| s.table_name == "t_stock_daily")
+            .unwrap();
+        let valuation_scan = scans
+            .iter()
+            .find(|s| s.table_name == "t_valuation")
+            .unwrap();
         assert!(daily_scan.pushed_filter.is_some());
         assert!(valuation_scan.pushed_filter.is_some());
     }

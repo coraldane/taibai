@@ -40,7 +40,11 @@ async fn main() {
         total_ms += elapsed.as_secs_f64() * 1000.0;
         print!("run {}: {:.2} ms", i + 1, elapsed.as_secs_f64() * 1000.0);
         match &result {
-            Ok(QueryResult::Rows { batches, server_elapsed, .. }) => {
+            Ok(QueryResult::Rows {
+                batches,
+                server_elapsed,
+                ..
+            }) => {
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 println!(", rows={}, server_elapsed={:?}", rows, server_elapsed);
             }
@@ -62,8 +66,13 @@ async fn main() {
 
 fn print_result(result: monax::common::error::Result<QueryResult>) {
     match result {
-        Ok(QueryResult::Rows { schema, batches, .. }) => {
-            println!("schema: {:?}", schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
+        Ok(QueryResult::Rows {
+            schema, batches, ..
+        }) => {
+            println!(
+                "schema: {:?}",
+                schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
             for batch in batches.iter().take(1) {
                 for row in 0..batch.num_rows().min(20) {
                     let values: Vec<_> = (0..batch.num_columns())

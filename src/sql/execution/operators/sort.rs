@@ -75,7 +75,10 @@ impl ExecutionOp for SortExec {
                 let values: Vec<ScalarValue> = (0..batch.num_columns())
                     .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
                     .collect();
-                let keys = evaluated_keys.iter().map(|vals| vals[row].clone()).collect();
+                let keys = evaluated_keys
+                    .iter()
+                    .map(|vals| vals[row].clone())
+                    .collect();
                 rows.push(SortRow { values, keys });
             }
         }
@@ -117,7 +120,11 @@ fn topn_sort(rows: &mut [SortRow], sort_exprs: &[(LogicalExpr, bool)], limit: us
     rows[..limit].sort_by(|a, b| compare_rows(a, b, sort_exprs));
 }
 
-fn compare_rows(a: &SortRow, b: &SortRow, sort_exprs: &[(LogicalExpr, bool)]) -> std::cmp::Ordering {
+fn compare_rows(
+    a: &SortRow,
+    b: &SortRow,
+    sort_exprs: &[(LogicalExpr, bool)],
+) -> std::cmp::Ordering {
     for (idx, (_, desc)) in sort_exprs.iter().enumerate() {
         let cmp = compare_scalars(&a.keys[idx], &b.keys[idx]);
         let cmp = if *desc { cmp.reverse() } else { cmp };
