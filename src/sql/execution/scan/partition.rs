@@ -34,7 +34,7 @@ pub fn prune_segments_by_partition(
 
     if let Some(pf) = &pi.partition_filter {
         if pf.column.eq_ignore_ascii_case(&meta.partition_key) {
-            return filter_by_partition_values(segment_files, pf);
+            return filter_by_partition_values(segment_files, pf, meta);
         }
     }
 
@@ -95,20 +95,26 @@ pub fn prune_segments_by_partition(
 fn extract_partition_eq_value(
     spec: &ScanSpec,
     pi: &PartitionScanInfo,
-    _meta: &TableMeta,
+    meta: &TableMeta,
 ) -> Option<String> {
     let pk_idx = pi.partition_key_col_idx?;
     let val = spec.eq_value_for_column(pk_idx)?;
-    Some(scalar_to_partition_key(val))
+    scalar_to_partition_key(val, meta)
 }
 
-fn scalar_to_partition_key(value: &ScalarValue) -> String {
-    match value {
-        ScalarValue::VarChar(Some(s)) => s.clone(),
-        ScalarValue::Int32(Some(v)) => v.to_string(),
-        ScalarValue::Int64(Some(v)) => v.to_string(),
-        ScalarValue::Date(Some(v)) => v.to_string(),
-        _ => String::new(),
+fn scalar_to_partition_key(value: &ScalarValue, meta: &TableMeta) -> Option<String> {
+    match meta.partition_type {
+        crate::storage::catalog::schema::PartitionType::Day => {
+            crate::storage::partition::compute_partition_key(value, PartitionStrategy::Day).ok()
+        }
+        crate::storage::catalog::schema::PartitionType::Month => {
+            crate::storage::partition::compute_partition_key(value, PartitionStrategy::Month).ok()
+        }
+        crate::storage::catalog::schema::PartitionType::Year => {
+            crate::storage::partition::compute_partition_key(value, PartitionStrategy::Year).ok()
+        }
+        crate::storage::catalog::schema::PartitionType::Value => value.to_text(),
+        _ => None,
     }
 }
 
@@ -132,14 +138,12 @@ fn filter_by_partition_key(segment_files: Vec<PathBuf>, target_key: &str) -> Vec
 fn filter_by_partition_values(
     segment_files: Vec<PathBuf>,
     pf: &crate::sql::optimizer::partition_pruning::PartitionFilter,
+    meta: &TableMeta,
 ) -> Vec<PathBuf> {
     let target_keys: Vec<String> = pf
         .values
         .iter()
-        .filter_map(|v| match v {
-            ScalarValue::VarChar(Some(s)) => Some(s.clone()),
-            _ => None,
-        })
+        .filter_map(|v| scalar_to_partition_key(v, meta))
         .collect();
 
     if target_keys.is_empty() {
@@ -172,8 +176,7 @@ pub fn extract_partition_key_from_in_predicate(
             return pred
                 .values
                 .iter()
-                .map(scalar_to_partition_key)
-                .filter(|k| !k.is_empty())
+                .filter_map(ScalarValue::to_text)
                 .collect();
         }
     }
@@ -185,7 +188,6 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::protocol::types::DataType;
-    use crate::sql::optimizer::partition_pruning::PartitionFilter;
     use crate::storage::catalog::schema::{PartitionType, TableMeta};
     use crate::types::batch::ColumnDef;
     use crate::types::scalar::ScalarValue;
@@ -193,35 +195,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ignores_partition_filter_for_non_partition_column() {
+    fn year_partition_eq_uses_year_key_from_date_int() {
         let files = vec![
-            PathBuf::from("p20251111_0001.dat"),
-            PathBuf::from("p20251112_0001.dat"),
+            PathBuf::from("p2025_0001.dat"),
+            PathBuf::from("p2026_0001.dat"),
         ];
         let mut meta = TableMeta::new(
             "main",
             "test_table",
-            vec![
-                ColumnDef::new("name", DataType::VarChar),
-                ColumnDef::new("region_id", DataType::Int32),
-            ],
+            vec![ColumnDef::new("deal_date", DataType::Int64)],
         );
-        meta.partition_type = PartitionType::Value;
-        meta.partition_key = "DEAL_DATE".to_string();
+        meta.partition_type = PartitionType::Year;
+        meta.partition_key = "deal_date".to_string();
+        meta.update_partition_key_idx();
 
         let mut spec = ScanSpec::new("test_table");
+        spec.eq_predicates
+            .push((0, ScalarValue::Int64(Some(20260605))));
         spec.partition_info = Some(PartitionScanInfo {
             time_range: None,
-            partition_filter: Some(PartitionFilter {
-                column: "name".to_string(),
-                values: vec![ScalarValue::VarChar(Some("alice".to_string()))],
-            }),
+            partition_filter: None,
             partition_key_col_idx: meta.get_partition_column_index(),
             is_partitioned: true,
         });
 
-        let pruned = prune_segments_by_partition(files.clone(), &spec, Some(&meta));
+        let pruned = prune_segments_by_partition(files, &spec, Some(&meta));
 
-        assert_eq!(pruned, files);
+        assert_eq!(pruned, vec![PathBuf::from("p2026_0001.dat")]);
     }
 }

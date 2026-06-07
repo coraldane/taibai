@@ -149,6 +149,11 @@ pub fn compile_scan_spec(
 
     collect_from_plan(plan, table_schema, &mut spec);
 
+    if spec.has_join {
+        spec.projection = None;
+        spec.limit = None;
+    }
+
     spec
 }
 

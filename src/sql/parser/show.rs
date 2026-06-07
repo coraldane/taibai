@@ -95,6 +95,13 @@ impl Parser {
         }
     }
 
+    pub fn parse_describe(&mut self) -> Result<Statement> {
+        self.expect(&Token::Describe)?;
+        self.expect(&Token::Table)?;
+        let table = self.parse_object_name()?;
+        Ok(Statement::ShowColumns { table })
+    }
+
     pub fn parse_use(&mut self) -> Result<Statement> {
         self.expect(&Token::Use)?;
         let name = self.expect_ident()?;

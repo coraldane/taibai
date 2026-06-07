@@ -57,6 +57,7 @@ impl Parser {
             Token::Delete => self.parse_delete(),
             Token::Select => self.parse_select(),
             Token::Show => self.parse_show(),
+            Token::Describe => self.parse_describe(),
             Token::Use => self.parse_use(),
             Token::Explain => self.parse_explain(),
             Token::Begin => self.parse_begin(),
