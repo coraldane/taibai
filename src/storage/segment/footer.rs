@@ -47,8 +47,8 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
         let name = read_len_prefixed_str(&mut cursor)?;
         let dtype_byte = read_u8(&mut cursor)?;
         let nullable = read_u8(&mut cursor)? != 0;
-        let scale = read_u32_le(&mut cursor)? as i32;
-        let precision = read_u32_le(&mut cursor)? as i32;
+        let scale = read_u8(&mut cursor)? as i32;
+        let precision = read_u8(&mut cursor)? as i32;
         columns.push(ColumnDef {
             name,
             data_type: DataType::from_u8(dtype_byte)?,
@@ -158,6 +158,14 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
         cursor.read_exact(&mut delete_bitmap)?;
     }
 
+    if cursor.position() as usize != buf.len() {
+        return Err(MonaxError::Storage(format!(
+            "trailing bytes after segment footer: parsed {}, footer size {}",
+            cursor.position(),
+            buf.len()
+        )));
+    }
+
     Ok(ParsedSegmentFooter {
         version,
         row_count,
@@ -184,8 +192,8 @@ pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
         let _name = read_len_prefixed_str(&mut cursor)?;
         let _dt = read_u8(&mut cursor)?;
         let _nullable = read_u8(&mut cursor)?;
-        let _scale = read_u32_le(&mut cursor)?;
-        let _precision = read_u32_le(&mut cursor)?;
+        let _scale = read_u8(&mut cursor)?;
+        let _precision = read_u8(&mut cursor)?;
     }
 
     let has_seg_zm = read_u8(&mut cursor).unwrap_or(0);
@@ -239,4 +247,59 @@ pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
         }
     }
     Ok(cursor.position() as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::codec::io_util::encode_len_prefixed_str;
+    use crate::storage::codec::scalar_tag::encode_scalar_with_tag;
+
+    #[test]
+    fn parses_footer_with_u8_decimal_meta() {
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&SEGMENT_MAGIC.to_le_bytes());
+        footer.extend_from_slice(&1u32.to_le_bytes());
+        footer.extend_from_slice(&0u64.to_le_bytes());
+        footer.extend_from_slice(&1u64.to_le_bytes());
+        footer.extend_from_slice(&1u32.to_le_bytes());
+        footer.extend_from_slice(&0u64.to_le_bytes());
+        footer.extend_from_slice(&0u64.to_le_bytes());
+
+        encode_len_prefixed_str(&mut footer, "t");
+        footer.extend_from_slice(&1u32.to_le_bytes());
+        encode_len_prefixed_str(&mut footer, "id");
+        footer.push(DataType::Int64 as u8);
+        footer.push(1);
+        footer.push(0);
+        footer.push(0);
+        footer.push(0);
+
+        footer.extend_from_slice(&32u64.to_le_bytes());
+        footer.extend_from_slice(&8u64.to_le_bytes());
+        footer.extend_from_slice(&1u64.to_le_bytes());
+        footer.extend_from_slice(&8u64.to_le_bytes());
+        footer.extend_from_slice(&8u64.to_le_bytes());
+        footer.extend_from_slice(&8u64.to_le_bytes());
+        encode_scalar_with_tag(&mut footer, &ScalarValue::Int64(Some(1)));
+        encode_scalar_with_tag(&mut footer, &ScalarValue::Int64(Some(1)));
+        footer.extend_from_slice(&0u64.to_le_bytes());
+        footer.extend_from_slice(&1u64.to_le_bytes());
+        footer.push(0);
+
+        footer.extend_from_slice(&0u64.to_le_bytes());
+        footer.extend_from_slice(&0u32.to_le_bytes());
+
+        let parsed = parse_segment_footer(&footer).unwrap();
+
+        assert_eq!(parsed.row_count, 1);
+        assert_eq!(parsed.row_groups.len(), 1);
+        assert_eq!(parsed.schema.columns[0].name, "id");
+        assert_eq!(parsed.schema.columns[0].scale, 0);
+        assert_eq!(
+            reserved_section_offset(&footer).unwrap(),
+            footer.len() - std::mem::size_of::<u64>() - std::mem::size_of::<u32>()
+        );
+    }
+
 }

@@ -20,8 +20,8 @@ fn bulk_payload(table: &str, row_count: u32, columns: Vec<(&str, DataType, Vec<u
         payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
         payload.extend_from_slice(name.as_bytes());
         payload.push(dtype as u8);
-        payload.extend_from_slice(&0u32.to_le_bytes());
-        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.push(0);
+        payload.push(0);
         payload.extend_from_slice(&row_count.to_le_bytes());
         payload.extend_from_slice(&0u32.to_le_bytes());
         payload.extend_from_slice(&data);

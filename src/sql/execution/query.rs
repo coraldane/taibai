@@ -90,6 +90,20 @@ fn exec_table_select(
     mut stats: Option<&mut HashMap<String, ScanStats>>,
     cached_plan: Option<LogicalPlan>,
 ) -> Result<ExecResult> {
+    let resolved_stmt;
+    let (stmt, from_clause) = if cached_plan.is_none() {
+        resolved_stmt = resolve_in_subqueries(engine, db, stmt)?;
+        let resolved_from = match &resolved_stmt {
+            Statement::Select {
+                from: Some(from), ..
+            } => from,
+            _ => from_clause,
+        };
+        (&resolved_stmt, resolved_from)
+    } else {
+        (stmt, from_clause)
+    };
+
     let table_refs = extract_table_refs(from_clause, db);
     let table_names: Vec<String> = table_refs.iter().map(|t| t.key.clone()).collect();
 
@@ -216,6 +230,169 @@ fn exec_table_select(
         schema,
         batches: result_batches,
     })
+}
+
+fn resolve_in_subqueries(engine: &Engine, db: &str, stmt: &Statement) -> Result<Statement> {
+    let mut stmt = stmt.clone();
+    resolve_stmt_in_subqueries(engine, db, &mut stmt)?;
+    Ok(stmt)
+}
+
+fn resolve_stmt_in_subqueries(engine: &Engine, db: &str, stmt: &mut Statement) -> Result<()> {
+    match stmt {
+        Statement::Select {
+            select_list,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            for item in select_list {
+                if let SelectItem::Expr(expr, _) = item {
+                    resolve_expr_in_subqueries(engine, db, expr)?;
+                }
+            }
+            if let Some(expr) = where_clause {
+                resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+            for expr in group_by {
+                resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+            if let Some(expr) = having {
+                resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+            for item in order_by {
+                resolve_expr_in_subqueries(engine, db, &mut item.expr)?;
+            }
+            if let Some(expr) = limit {
+                resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+            if let Some(expr) = offset {
+                resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+        }
+        Statement::Union {
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            resolve_stmt_in_subqueries(engine, db, left)?;
+            resolve_stmt_in_subqueries(engine, db, right)?;
+            for item in order_by {
+                resolve_expr_in_subqueries(engine, db, &mut item.expr)?;
+            }
+            if let Some(expr) = limit {
+                resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+            if let Some(expr) = offset {
+                resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &mut Expr) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            resolve_expr_in_subqueries(engine, db, left)?;
+            resolve_expr_in_subqueries(engine, db, right)?;
+        }
+        Expr::UnaryNot(inner)
+        | Expr::UnaryMinus(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Exists(inner) => resolve_expr_in_subqueries(engine, db, inner)?,
+        Expr::In {
+            expr: inner,
+            values,
+            ..
+        } => {
+            resolve_expr_in_subqueries(engine, db, inner)?;
+            if let [Expr::Subquery(subquery)] = values.as_mut_slice() {
+                let literals = execute_in_subquery(engine, db, subquery)?;
+                *values = literals.into_iter().map(Expr::Literal).collect();
+            } else {
+                for value in values {
+                    resolve_expr_in_subqueries(engine, db, value)?;
+                }
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            resolve_expr_in_subqueries(engine, db, expr)?;
+            resolve_expr_in_subqueries(engine, db, low)?;
+            resolve_expr_in_subqueries(engine, db, high)?;
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                resolve_expr_in_subqueries(engine, db, operand)?;
+            }
+            for (when_expr, then_expr) in when_clauses {
+                resolve_expr_in_subqueries(engine, db, when_expr)?;
+                resolve_expr_in_subqueries(engine, db, then_expr)?;
+            }
+            if let Some(else_clause) = else_clause {
+                resolve_expr_in_subqueries(engine, db, else_clause)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            resolve_expr_in_subqueries(engine, db, expr)?;
+            resolve_expr_in_subqueries(engine, db, pattern)?;
+        }
+        Expr::Subquery(subquery) => resolve_stmt_in_subqueries(engine, db, subquery)?,
+        Expr::Function { args, .. } => {
+            for arg in args {
+                resolve_expr_in_subqueries(engine, db, arg)?;
+            }
+        }
+        Expr::WindowFunction {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in partition_by {
+                resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+            for item in order_by {
+                resolve_expr_in_subqueries(engine, db, &mut item.expr)?;
+            }
+        }
+        Expr::Literal(_)
+        | Expr::Placeholder(_)
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. } => {}
+    }
+    Ok(())
+}
+
+fn execute_in_subquery(engine: &Engine, db: &str, subquery: &Statement) -> Result<Vec<ScalarValue>> {
+    let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
+        return Err(MonaxError::Sql("IN subquery must be a SELECT".into()));
+    };
+
+    let mut values = Vec::new();
+    for batch in batches {
+        if batch.num_columns() == 0 {
+            continue;
+        }
+        for row_idx in 0..batch.num_rows() {
+            values.push(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
+        }
+    }
+    Ok(values)
 }
 
 fn remove_redundant_pushed_filter(plan: LogicalPlan, table_name: &str) -> LogicalPlan {

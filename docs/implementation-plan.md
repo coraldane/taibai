@@ -14,7 +14,7 @@ monax is a greenfield Rust columnar database server, wire-compatible with the ex
   - Query: `[u32 len][db][u32 len][sql]`
   - OK: `[u64 LE rows_affected]` (8 bytes)
   - Error: UTF-8 string (entire payload)
-  - Text Result: `u32 num_cols | per col: u32 name_len+name+u8 dtype+u32 scale | u32 num_rows | per cell: u8 null_flag + value`
+  - Text Result: `u32 num_cols | per col: u32 name_len+name+u8 dtype+u8 scale+u8 precision | u32 num_rows | per cell: u8 null_flag + value`
 
 ---
 

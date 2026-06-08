@@ -1,6 +1,7 @@
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
 use crate::sql::execution::operators::filter::{eval_expr_column, remap_expr_for_batch};
+use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::LogicalExpr;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
@@ -122,6 +123,7 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
             .map(|c| c.data_type)
             .unwrap_or(DataType::Int64),
         LogicalExpr::Literal(v) => v.data_type(),
+        LogicalExpr::BinaryOp { op: BinOp::Div, .. } => DataType::Float64,
         LogicalExpr::BinaryOp { .. } => DataType::Int64,
         LogicalExpr::Aggregate(agg) => {
             let agg_prefix = match agg.func {

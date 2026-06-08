@@ -47,7 +47,23 @@ fn compare(l: &ScalarValue, op: &BinOp, r: &ScalarValue) -> bool {
     if l.is_null() || r.is_null() {
         return false;
     }
+    if let Some(ordering) = l.numeric_cmp(r) {
+        return match op {
+            BinOp::Eq => ordering == std::cmp::Ordering::Equal,
+            BinOp::Neq => ordering != std::cmp::Ordering::Equal,
+            BinOp::Lt => ordering == std::cmp::Ordering::Less,
+            BinOp::Gt => ordering == std::cmp::Ordering::Greater,
+            BinOp::Lte => ordering != std::cmp::Ordering::Greater,
+            BinOp::Gte => ordering != std::cmp::Ordering::Less,
+            _ => false,
+        };
+    }
     match (l, r) {
+        (ScalarValue::Bool(Some(a)), ScalarValue::Bool(Some(b))) => match op {
+            BinOp::Eq => a == b,
+            BinOp::Neq => a != b,
+            _ => false,
+        },
         (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => num_cmp(*a, op, *b),
         (ScalarValue::Int32(Some(a)), ScalarValue::Int32(Some(b))) => num_cmp(*a, op, *b),
         (ScalarValue::Float64(Some(a)), ScalarValue::Float64(Some(b))) => num_cmp(*a, op, *b),

@@ -290,3 +290,152 @@ fn bool_accepts_numeric_and_string_literals() {
         ]]
     );
 }
+
+#[test]
+fn decimal_dimension_survives_metadata_insert_query_and_filters() {
+    let (_temp_dir, engine, mut session) = create_engine();
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE decimal_dimension (
+                id INT,
+                price DECIMAL(9,2),
+                amount DECIMAL(18,4)
+            )",
+        )
+        .expect("create decimal table");
+
+    let (_, show_tables) = collect_rows(
+        engine
+            .execute(&mut session, "SHOW TABLES")
+            .expect("show tables"),
+    );
+    assert!(show_tables.contains(&vec![ScalarValue::VarChar(Some(
+        "decimal_dimension".to_string()
+    ))]));
+
+    let (_, show_columns) = collect_rows(
+        engine
+            .execute(&mut session, "SHOW COLUMNS FROM decimal_dimension")
+            .expect("show columns"),
+    );
+    assert_eq!(
+        show_columns,
+        vec![
+            vec![
+                ScalarValue::VarChar(Some("id".to_string())),
+                ScalarValue::VarChar(Some("INT32".to_string())),
+                ScalarValue::Bool(Some(true)),
+            ],
+            vec![
+                ScalarValue::VarChar(Some("price".to_string())),
+                ScalarValue::VarChar(Some("DECIMAL(9,2)".to_string())),
+                ScalarValue::Bool(Some(true)),
+            ],
+            vec![
+                ScalarValue::VarChar(Some("amount".to_string())),
+                ScalarValue::VarChar(Some("DECIMAL(18,4)".to_string())),
+                ScalarValue::Bool(Some(true)),
+            ],
+        ]
+    );
+
+    let (_, describe_columns) = collect_rows(
+        engine
+            .execute(&mut session, "DESCRIBE TABLE decimal_dimension")
+            .expect("describe table"),
+    );
+    assert_eq!(describe_columns, show_columns);
+
+    let (_, show_create) = collect_rows(
+        engine
+            .execute(&mut session, "SHOW CREATE TABLE decimal_dimension")
+            .expect("show create"),
+    );
+    let ScalarValue::VarChar(Some(create_sql)) = &show_create[0][1] else {
+        panic!("show create should return SQL text");
+    };
+    assert!(create_sql.contains("price DECIMAL(9,2)"));
+    assert!(create_sql.contains("amount DECIMAL(18,4)"));
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO decimal_dimension VALUES
+                (1, 12.34, 1234.5678),
+                (2, 56.78, 8765.4321)",
+        )
+        .expect("insert decimal rows");
+
+    let (types, selected) = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT price, amount FROM decimal_dimension WHERE price >= 12.34 AND amount < 2000.0000",
+            )
+            .expect("select with decimal filters"),
+    );
+    assert_eq!(types, vec![DataType::Decimal, DataType::Decimal]);
+    assert_eq!(
+        selected,
+        vec![vec![
+            ScalarValue::Decimal(Some(1234)),
+            ScalarValue::Decimal(Some(12_345_678)),
+        ]]
+    );
+
+    let (_, mirrored_filter) = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT id FROM decimal_dimension WHERE 56.78 = price",
+            )
+            .expect("select with mirrored decimal predicate"),
+    );
+    assert_eq!(mirrored_filter, vec![vec![ScalarValue::Int32(Some(2))]]);
+}
+
+#[test]
+fn decimal_division_order_by_uses_fractional_numeric_value() {
+    let (_temp_dir, engine, mut session) = create_engine();
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE stock_returns (
+                security_id VARCHAR,
+                close_px DECIMAL(12,4),
+                pre_close DECIMAL(12,4)
+            )",
+        )
+        .expect("create stock_returns");
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO stock_returns VALUES
+                ('flat', 10.0000, 10.0000),
+                ('up_big', 11.0000, 10.0000),
+                ('up_small', 10.1000, 10.0000)",
+        )
+        .expect("insert stock_returns");
+
+    let (types, rows) = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT security_id, (close_px - pre_close) / pre_close AS pct
+                 FROM stock_returns
+                 ORDER BY (close_px - pre_close) / pre_close DESC
+                 LIMIT 2",
+            )
+            .expect("select ordered returns"),
+    );
+
+    assert_eq!(types, vec![DataType::VarChar, DataType::Float64]);
+    assert_eq!(rows[0][0], ScalarValue::VarChar(Some("up_big".to_string())));
+    assert_eq!(rows[1][0], ScalarValue::VarChar(Some("up_small".to_string())));
+    assert_eq!(rows[0][1], ScalarValue::Float64(Some(0.1)));
+    assert_eq!(rows[1][1], ScalarValue::Float64(Some(0.01)));
+}

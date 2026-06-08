@@ -92,8 +92,11 @@ impl ExecutionOp for SortExec {
 
         let mut batch = RecordBatch::new(output_schema);
         for row in &rows {
-            for (col_idx, val) in row.values.iter().enumerate() {
-                batch.column_mut(col_idx).unwrap().push(val)?;
+            for col_idx in 0..batch.num_columns() {
+                let val = row.values.get(col_idx).cloned().unwrap_or_else(|| {
+                    ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
+                });
+                batch.column_mut(col_idx).unwrap().push(&val)?;
             }
         }
         Ok(Some(batch))

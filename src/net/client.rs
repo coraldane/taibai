@@ -592,23 +592,24 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     let mut columns = Vec::with_capacity(col_count);
     for _ in 0..col_count {
         let (name, rest) = read_len_prefixed_string(&payload[offset..])?;
-        if rest.len() < 5 {
+        if rest.len() < 3 {
             return Err(MonaxError::Protocol("truncated column metadata".into()));
         }
         let dtype_byte = rest[0];
-        let scale = u32::from_le_bytes(rest[1..5].try_into().unwrap());
+        let scale = rest[1] as i32;
+        let precision = rest[2] as i32;
         let data_type = DataType::from_u8(dtype_byte)?;
         columns.push(ColumnDef {
             name: name.to_string(),
             data_type,
             nullable: true,
-            scale: scale as i32,
-            precision: 0,
+            scale,
+            precision,
             auto_increment: false,
             primary_key: false,
             default_value: None,
         });
-        offset += 4 + name.len() + 5;
+        offset += 4 + name.len() + 3;
     }
 
     if payload.len() < offset + 4 {
@@ -681,24 +682,25 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
     let mut columns = Vec::with_capacity(col_count);
     for _ in 0..col_count {
         let (name, rest) = read_len_prefixed_string(&payload[offset..])?;
-        if rest.len() < 5 {
+        if rest.len() < 3 {
             return Err(MonaxError::Protocol(
                 "truncated binary column metadata".into(),
             ));
         }
         let data_type = DataType::from_u8(rest[0])?;
-        let scale = u32::from_le_bytes(rest[1..5].try_into().unwrap()) as i32;
+        let scale = rest[1] as i32;
+        let precision = rest[2] as i32;
         columns.push(ColumnDef {
             name: name.to_string(),
             data_type,
             nullable: true,
             scale,
-            precision: 0,
+            precision,
             auto_increment: false,
             primary_key: false,
             default_value: None,
         });
-        offset += 4 + name.len() + 5;
+        offset += 4 + name.len() + 3;
     }
 
     if payload.len() < offset + 4 {
@@ -1085,8 +1087,8 @@ mod tests {
     fn parses_scaled_decimal_without_misaligning_following_varchar() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&2u32.to_le_bytes());
-        write_column_meta(&mut payload, "name", DataType::VarChar, 0);
-        write_column_meta(&mut payload, "score", DataType::Decimal, 2);
+        write_column_meta(&mut payload, "name", DataType::VarChar, 0, 0);
+        write_column_meta(&mut payload, "score", DataType::Decimal, 2, 9);
         payload.extend_from_slice(&2u32.to_le_bytes());
 
         write_varchar_cell(&mut payload, "alice");
@@ -1103,6 +1105,7 @@ mod tests {
         };
 
         assert_eq!(schema.columns[1].scale, 2);
+        assert_eq!(schema.columns[1].precision, 9);
         assert_eq!(
             batches[0].scalar(0, 0).unwrap(),
             ScalarValue::VarChar(Some("alice".into()))
@@ -1133,7 +1136,9 @@ mod tests {
     fn parses_binary_decimal_result() {
         let schema = Schema::new(vec![
             ColumnDef::new("symbol", DataType::VarChar),
-            ColumnDef::new("price", DataType::Decimal).with_scale(2),
+            ColumnDef::new("price", DataType::Decimal)
+                .with_scale(2)
+                .with_precision(9),
         ]);
         let mut batch = RecordBatch::new(schema.clone());
         batch
@@ -1158,6 +1163,7 @@ mod tests {
         };
 
         assert_eq!(parsed_schema.columns[1].scale, 2);
+        assert_eq!(parsed_schema.columns[1].precision, 9);
         assert_eq!(
             batches[0].scalar(0, 0).unwrap(),
             ScalarValue::VarChar(Some("688256.SH".into()))
@@ -1168,10 +1174,17 @@ mod tests {
         );
     }
 
-    fn write_column_meta(buf: &mut Vec<u8>, name: &str, data_type: DataType, scale: i32) {
+    fn write_column_meta(
+        buf: &mut Vec<u8>,
+        name: &str,
+        data_type: DataType,
+        scale: i32,
+        precision: i32,
+    ) {
         write_len_prefixed_string(buf, name);
         buf.push(data_type as u8);
-        buf.extend_from_slice(&(scale as u32).to_le_bytes());
+        buf.push(scale as u8);
+        buf.push(precision as u8);
     }
 
     fn write_varchar_cell(buf: &mut Vec<u8>, value: &str) {

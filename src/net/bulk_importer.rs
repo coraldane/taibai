@@ -203,8 +203,20 @@ pub fn encode_columnar_bulk_insert(table_name: &str, batch: &RecordBatch) -> Res
         buf.extend_from_slice(&(col_def.name.len() as u16).to_le_bytes());
         buf.extend_from_slice(col_def.name.as_bytes());
         buf.push(col_def.data_type as u8);
-        buf.extend_from_slice(&(col_def.scale as u32).to_le_bytes());
-        buf.extend_from_slice(&(col_def.precision as u32).to_le_bytes());
+        let scale = u8::try_from(col_def.scale).map_err(|_| {
+            MonaxError::Protocol(format!(
+                "column '{}' scale {} exceeds u8 bulk metadata range",
+                col_def.name, col_def.scale
+            ))
+        })?;
+        let precision = u8::try_from(col_def.precision).map_err(|_| {
+            MonaxError::Protocol(format!(
+                "column '{}' precision {} exceeds u8 bulk metadata range",
+                col_def.name, col_def.precision
+            ))
+        })?;
+        buf.push(scale);
+        buf.push(precision);
 
         let (data, nulls) = encode_column_data(col)?;
 

@@ -180,6 +180,19 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                 *m = !vals[i].is_null();
             }
         }
+        LogicalExpr::In {
+            expr,
+            values,
+            negated,
+        } => {
+            let vals = eval_expr_column(expr, batch)?;
+            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
+                let found = values
+                    .iter()
+                    .any(|candidate| eval_comparison(&vals[i], &BinOp::Eq, candidate));
+                *m = if *negated { !found } else { found };
+            }
+        }
         LogicalExpr::Literal(v) => {
             for m in mask.iter_mut().take(num_rows) {
                 *m = !v.is_null();
@@ -355,6 +368,22 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
                 })
                 .collect())
         }
+        LogicalExpr::In {
+            expr,
+            values,
+            negated,
+        } => {
+            let vals = eval_expr_column(expr, batch)?;
+            Ok(vals
+                .iter()
+                .map(|val| {
+                    let found = values
+                        .iter()
+                        .any(|candidate| eval_comparison(val, &BinOp::Eq, candidate));
+                    ScalarValue::Bool(Some(if *negated { !found } else { found }))
+                })
+                .collect())
+        }
         _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
     }
 }
@@ -362,6 +391,18 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
 fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> ScalarValue {
     if left.is_null() || right.is_null() {
         return ScalarValue::Int64(None);
+    }
+    if matches!(op, BinOp::Div) {
+        let Some(l) = left.numeric_f64() else {
+            return ScalarValue::Float64(None);
+        };
+        let Some(r) = right.numeric_f64() else {
+            return ScalarValue::Float64(None);
+        };
+        if r == 0.0 {
+            return ScalarValue::Float64(None);
+        }
+        return ScalarValue::Float64(Some(l / r));
     }
     if let (Some(l), Some(r)) = (left.integer_i128(), right.integer_i128()) {
         return match op {
@@ -377,10 +418,7 @@ fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Sc
                 .ok()
                 .map(|v| ScalarValue::Int64(Some(v)))
                 .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Div if r != 0 => i64::try_from(l / r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
+            BinOp::Div => unreachable!("division is handled before integer arithmetic"),
             BinOp::Mod if r != 0 => i64::try_from(l % r)
                 .ok()
                 .map(|v| ScalarValue::Int64(Some(v)))
@@ -406,8 +444,7 @@ fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Sc
             BinOp::Add => ScalarValue::Int64(Some(l + r)),
             BinOp::Sub => ScalarValue::Int64(Some(l - r)),
             BinOp::Mul => ScalarValue::Int64(Some(l * r)),
-            BinOp::Div if *r != 0 => ScalarValue::Int64(Some(l / r)),
-            BinOp::Div => ScalarValue::Int64(None),
+            BinOp::Div => unreachable!("division is handled before integer arithmetic"),
             BinOp::Mod if *r != 0 => ScalarValue::Int64(Some(l % r)),
             BinOp::Mod => ScalarValue::Int64(None),
             BinOp::Eq => ScalarValue::Bool(Some(l == r)),
