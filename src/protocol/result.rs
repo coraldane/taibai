@@ -8,7 +8,7 @@ use crate::types::batch::{RecordBatch, Schema};
 /// ```text
 /// [u32 num_cols]
 /// per column:
-///   [u32 name_len] [name bytes] [u8 dtype] [u32 scale]
+///   [u32 name_len] [name bytes] [u8 dtype] [u8 scale] [u8 precision]
 /// [u32 num_rows]
 /// per column:
 ///   [u32 null_bitmap_len] [null_bitmap bytes]
@@ -32,7 +32,8 @@ pub fn encode_binary_result_batches(schema: &Schema, batches: &[RecordBatch]) ->
         buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(name_bytes);
         buf.push(col_def.data_type as u8);
-        buf.extend_from_slice(&(col_def.scale as u32).to_le_bytes());
+        buf.push(col_def.scale as u8);
+        buf.push(col_def.precision as u8);
     }
 
     // Number of rows

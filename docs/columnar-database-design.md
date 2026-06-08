@@ -589,7 +589,8 @@ for each column:
     name_len: u32 LE
     name: UTF-8 bytes
     data_type: u8       (DataType 枚举值 1-19)
-    scale: u32 LE       (DECIMAL 的小数位，其他为 0)
+    scale: u8           (DECIMAL 的小数位，其他为 0)
+    precision: u8       (DECIMAL 的总位数，其他为 0)
 num_rows: u32 LE
 for each row:
     for each column:
@@ -734,9 +735,9 @@ Header (13 bytes):
     row_count: u32 LE
     col_count: u32 LE
 
-Column Metadata × col_count (每列 13 bytes):
+Column Metadata × col_count (每列 10 bytes):
     storage_type: u8      (StorageType 枚举值 0-18)
-    decimal_scale: u32 LE
+    decimal_scale: u8
     data_offset: u32 LE   (在 data region 内的偏移)
     data_length: u32 LE
 

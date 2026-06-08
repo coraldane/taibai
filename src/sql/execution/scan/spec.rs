@@ -147,7 +147,12 @@ pub fn compile_scan_spec(
         });
     }
 
-    collect_from_plan(plan, table_schema, &mut spec);
+    collect_from_plan(plan, table_name, table_schema, &mut spec);
+
+    if spec.has_join {
+        spec.projection = None;
+        spec.limit = None;
+    }
 
     spec
 }
@@ -208,9 +213,17 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut Vec<usize>) {
     }
 }
 
-fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
+fn collect_from_plan(
+    plan: &LogicalPlan,
+    table_name: &str,
+    schema: &Schema,
+    spec: &mut ScanSpec,
+) {
     match plan {
         LogicalPlan::Scan(scan) => {
+            if !scan.table_name.eq_ignore_ascii_case(table_name) {
+                return;
+            }
             if let Some(limit) = scan.pushed_limit {
                 set_scan_limit(spec, limit);
             }
@@ -227,9 +240,9 @@ fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
                 }
             }
         }
-        LogicalPlan::Filter(f) => collect_from_plan(&f.input, schema, spec),
+        LogicalPlan::Filter(f) => collect_from_plan(&f.input, table_name, schema, spec),
         LogicalPlan::Project(p) => {
-            collect_from_plan(&p.input, schema, spec);
+            collect_from_plan(&p.input, table_name, schema, spec);
             if spec.remaining_predicate.is_none() && !spec.has_join {
                 if let Some(cols) = plain_projection_columns(&p.expressions) {
                     spec.projection = Some(cols);
@@ -239,32 +252,32 @@ fn collect_from_plan(plan: &LogicalPlan, schema: &Schema, spec: &mut ScanSpec) {
         LogicalPlan::Aggregate(a) => {
             spec.has_aggregate = true;
             spec.has_group_by = !a.group_by.is_empty();
-            collect_from_plan(&a.input, schema, spec);
+            collect_from_plan(&a.input, table_name, schema, spec);
         }
         LogicalPlan::Sort(s) => {
             spec.has_order_by = true;
-            collect_from_plan(&s.input, schema, spec);
+            collect_from_plan(&s.input, table_name, schema, spec);
         }
         LogicalPlan::Limit(l) => {
             set_scan_limit(spec, l.limit.saturating_add(l.offset));
-            collect_from_plan(&l.input, schema, spec);
+            collect_from_plan(&l.input, table_name, schema, spec);
         }
         LogicalPlan::TopN(t) => {
             spec.has_order_by = true;
             set_scan_limit(spec, t.limit.saturating_add(t.offset));
-            collect_from_plan(&t.input, schema, spec);
+            collect_from_plan(&t.input, table_name, schema, spec);
         }
-        LogicalPlan::Distinct(d) => collect_from_plan(&d.input, schema, spec),
-        LogicalPlan::Window(w) => collect_from_plan(&w.input, schema, spec),
+        LogicalPlan::Distinct(d) => collect_from_plan(&d.input, table_name, schema, spec),
+        LogicalPlan::Window(w) => collect_from_plan(&w.input, table_name, schema, spec),
         LogicalPlan::Join(j) => {
             spec.has_join = true;
-            collect_from_plan(&j.left, schema, spec);
-            collect_from_plan(&j.right, schema, spec);
+            collect_from_plan(&j.left, table_name, schema, spec);
+            collect_from_plan(&j.right, table_name, schema, spec);
         }
         LogicalPlan::SemiJoin(s) => {
             spec.has_join = true;
-            collect_from_plan(&s.left, schema, spec);
-            collect_from_plan(&s.right, schema, spec);
+            collect_from_plan(&s.left, table_name, schema, spec);
+            collect_from_plan(&s.right, table_name, schema, spec);
         }
         LogicalPlan::Empty => {}
     }

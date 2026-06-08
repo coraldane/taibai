@@ -254,7 +254,36 @@ fn eval_logical_expr_batch(
             }
             Ok(vec![true; num_rows])
         }
+        LogicalExpr::In {
+            expr,
+            values,
+            negated,
+        } => {
+            let vals = eval_logical_value_batch(expr, batch)?;
+            Ok(vals
+                .iter()
+                .map(|val| {
+                    let found = values.iter().any(|candidate| scalar_eq(val, candidate));
+                    if *negated { !found } else { found }
+                })
+                .collect())
+        }
         _ => Ok(vec![true; num_rows]),
+    }
+}
+
+fn eval_logical_value_batch(
+    expr: &crate::sql::planner::LogicalExpr,
+    batch: &RecordBatch,
+) -> crate::common::error::Result<Vec<ScalarValue>> {
+    use crate::sql::planner::LogicalExpr;
+    let num_rows = batch.num_rows();
+    match expr {
+        LogicalExpr::Column(idx) => Ok((0..num_rows)
+            .map(|row| batch.scalar(row, *idx).unwrap_or(ScalarValue::Int64(None)))
+            .collect()),
+        LogicalExpr::Literal(value) => Ok(vec![value.clone(); num_rows]),
+        _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
     }
 }
 

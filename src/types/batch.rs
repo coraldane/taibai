@@ -151,6 +151,7 @@ impl RecordBatch {
 
     /// Create a RecordBatch from pre-built column arrays.
     /// Validates that the column count matches the schema.
+    #[track_caller]
     pub fn try_new(schema: Schema, columns: Vec<ColumnArray>) -> Result<Self> {
         if columns.len() != schema.num_columns() {
             return Err(MonaxError::Internal(format!(
@@ -168,6 +169,22 @@ impl RecordBatch {
                     col_def.data_type.display_name(),
                     col_arr.data_type().display_name(),
                 )));
+            }
+        }
+        if let Some(first) = columns.first() {
+            let expected_len = first.len();
+            for (i, col_arr) in columns.iter().enumerate().skip(1) {
+                if col_arr.len() != expected_len {
+                    let caller = std::panic::Location::caller();
+                    return Err(MonaxError::Internal(format!(
+                        "column length mismatch at {}:{}: column 0 has {} rows but column {} has {} rows",
+                        caller.file(),
+                        caller.line(),
+                        expected_len,
+                        i,
+                        col_arr.len()
+                    )));
+                }
             }
         }
         Ok(Self { schema, columns })

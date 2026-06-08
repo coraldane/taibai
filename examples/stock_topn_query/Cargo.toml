@@ -1,0 +1,12 @@
+[package]
+name = "stock_topn_query"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+monax = { path = "../.." }
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "stock_topn_query"
+path = "src/main.rs"

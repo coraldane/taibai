@@ -152,8 +152,8 @@ repeat column_count:
   name_len: u16
   name: [u8; name_len]
   data_type: u8
-  scale: u32
-  precision: u32
+  scale: u8
+  precision: u8
   elem_count: u32
   nulls_size: u32
   data: [u8; computed_data_len]

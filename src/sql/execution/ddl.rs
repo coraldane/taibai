@@ -703,7 +703,7 @@ pub fn exec_show_columns(engine: &Engine, db: &str, table: &str) -> Result<ExecR
         batch
             .column_mut(1)
             .unwrap()
-            .push(&ScalarValue::VarChar(Some(col.data_type.to_string())))?;
+            .push(&ScalarValue::VarChar(Some(column_type_display(col))))?;
         batch
             .column_mut(2)
             .unwrap()
@@ -714,6 +714,18 @@ pub fn exec_show_columns(engine: &Engine, db: &str, table: &str) -> Result<ExecR
         schema,
         batches: vec![batch],
     })
+}
+
+fn column_type_display(col: &ColumnDef) -> String {
+    if col.data_type == DataType::Decimal && col.precision > 0 {
+        if col.scale > 0 {
+            format!("DECIMAL({},{})", col.precision, col.scale)
+        } else {
+            format!("DECIMAL({})", col.precision)
+        }
+    } else {
+        col.data_type.to_string()
+    }
 }
 
 pub fn exec_show_indexes(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
@@ -802,12 +814,22 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
         if i < table_meta.columns.len() - 1 {
             create_sql.push_str(&format!(
                 "  {} {}{}{}{}{},\n",
-                col.name, col.data_type, nullable, auto_inc, pk, def_str
+                col.name,
+                column_type_display(col),
+                nullable,
+                auto_inc,
+                pk,
+                def_str
             ));
         } else {
             create_sql.push_str(&format!(
                 "  {} {}{}{}{}{}\n",
-                col.name, col.data_type, nullable, auto_inc, pk, def_str
+                col.name,
+                column_type_display(col),
+                nullable,
+                auto_inc,
+                pk,
+                def_str
             ));
         }
     }

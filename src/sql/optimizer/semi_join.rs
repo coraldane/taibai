@@ -165,37 +165,10 @@ fn build_semi_join_from_in(
     values: &[ScalarValue],
     negated: bool,
 ) -> Option<LogicalPlan> {
-    if values.is_empty() {
-        return None;
-    }
-
-    let col_idx = 0;
-    let condition = LogicalExpr::BinaryOp {
-        left: Box::new(LogicalExpr::Column(col_idx)),
-        op: BinOp::Eq,
-        right: Box::new(LogicalExpr::Literal(values[0].clone())),
-    };
-
-    Some(LogicalPlan::SemiJoin(SemiJoinPlan {
-        left: Box::new(LogicalPlan::Scan(scan.clone())),
-        right: Box::new(build_values_scan(values)),
-        condition,
-        left_schema: scan.schema.clone(),
-        right_schema: build_values_schema(values),
-        is_anti: negated,
-    }))
-}
-
-fn build_values_scan(_values: &[ScalarValue]) -> LogicalPlan {
-    LogicalPlan::Empty
-}
-
-fn build_values_schema(values: &[ScalarValue]) -> crate::types::batch::Schema {
-    if values.is_empty() {
-        return crate::types::batch::Schema::empty();
-    }
-    let dtype = values[0].data_type();
-    crate::types::batch::Schema::new(vec![crate::types::batch::ColumnDef::new("value", dtype)])
+    // Literal IN is already handled by scan/filter predicates. The previous
+    // rewrite used an empty values scan and only compared the first value.
+    let _ = (scan, values, negated);
+    None
 }
 
 fn extract_schema(plan: &LogicalPlan) -> crate::types::batch::Schema {

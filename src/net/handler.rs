@@ -914,7 +914,8 @@ fn build_query_result(
     for col in &schema.columns {
         write_len_prefixed_string(&mut buf, &col.name);
         buf.push(col.data_type as u8);
-        buf.extend_from_slice(&(col.scale as u32).to_le_bytes());
+        buf.push(col.scale as u8);
+        buf.push(col.precision as u8);
     }
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1016,14 +1017,16 @@ fn write_column_value_with_scale(
 
 fn write_decimal_value_with_scale(buf: &mut Vec<u8>, value: i64, scale: i32) {
     if scale > 0 {
-        let divisor = 10_i64.pow(scale as u32);
-        let int_part = value / divisor;
-        let frac_part = (value.abs() % divisor) as u32;
+        let divisor = 10_i128.pow(scale as u32);
+        let sign = if value < 0 { "-" } else { "" };
+        let abs = (value as i128).abs();
+        let int_part = abs / divisor;
+        let frac_part = abs % divisor;
         let s = if frac_part == 0 {
-            format!("{}", int_part)
+            format!("{}{}", sign, int_part)
         } else {
             let width = scale as usize;
-            format!("{}.{:0width$}", int_part, frac_part)
+            format!("{}{}.{:0width$}", sign, int_part, frac_part)
         };
         buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
         buf.extend_from_slice(s.as_bytes());

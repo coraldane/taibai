@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::error::{MonaxError, Result};
 use crate::protocol::types::DataType;
+use crate::storage::segment::meta::read_latest_sidecar_footer;
 use crate::storage::segment::{
     decode_scalar_with_tag, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION,
 };
@@ -90,22 +91,27 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         )));
     }
 
-    let mut footer_offset_buf = [0u8; 8];
-    tmp_file.seek(SeekFrom::End(-8))?;
-    tmp_file.read_exact(&mut footer_offset_buf)?;
-    let footer_offset = u64::from_le_bytes(footer_offset_buf);
+    let footer_data = if let Some(sidecar) = read_latest_sidecar_footer(path)? {
+        sidecar.footer
+    } else {
+        let mut footer_offset_buf = [0u8; 8];
+        tmp_file.seek(SeekFrom::End(-8))?;
+        tmp_file.read_exact(&mut footer_offset_buf)?;
+        let footer_offset = u64::from_le_bytes(footer_offset_buf);
 
-    if footer_offset < SEGMENT_HEADER_SIZE as u64 || footer_offset >= file_size - 8 {
-        return Err(MonaxError::Storage(format!(
-            "invalid footer offset: {} (file size {}, header size {})",
-            footer_offset, file_size, SEGMENT_HEADER_SIZE
-        )));
-    }
+        if footer_offset < SEGMENT_HEADER_SIZE as u64 || footer_offset >= file_size - 8 {
+            return Err(MonaxError::Storage(format!(
+                "invalid footer offset: {} (file size {}, header size {})",
+                footer_offset, file_size, SEGMENT_HEADER_SIZE
+            )));
+        }
 
-    let footer_size = (file_size - footer_offset - 8) as usize;
-    let mut footer_data = vec![0u8; footer_size];
-    tmp_file.seek(SeekFrom::Start(footer_offset))?;
-    tmp_file.read_exact(&mut footer_data)?;
+        let footer_size = (file_size - footer_offset - 8) as usize;
+        let mut footer_data = vec![0u8; footer_size];
+        tmp_file.seek(SeekFrom::Start(footer_offset))?;
+        tmp_file.read_exact(&mut footer_data)?;
+        footer_data
+    };
 
     let mut cursor = Cursor::new(footer_data.as_slice());
 
@@ -132,8 +138,8 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         let name = read_len_prefixed_str(&mut cursor)?;
         let dtype_byte = read_u8(&mut cursor)?;
         let nullable = read_u8(&mut cursor)? != 0;
-        let scale = read_u32_le(&mut cursor)? as i32;
-        let precision = read_u32_le(&mut cursor)? as i32;
+        let scale = read_u8(&mut cursor)? as i32;
+        let precision = read_u8(&mut cursor)? as i32;
         columns.push(ColumnDef {
             name,
             data_type: DataType::from_u8(dtype_byte)?,

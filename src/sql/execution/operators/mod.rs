@@ -130,9 +130,18 @@ pub fn build_pipeline(
         LogicalPlan::TopN(topn) => {
             let schema = get_scan_schema(&topn.input);
             let input = build_pipeline(*topn.input, table_batches)?;
-            Ok(Box::new(
-                SortExec::new(topn.sort_keys, input, schema).with_limit(topn.limit),
-            ))
+            let sorted = SortExec::new(topn.sort_keys, input, schema.clone())
+                .with_limit(topn.limit.saturating_add(topn.offset));
+            if topn.offset == 0 {
+                Ok(Box::new(sorted))
+            } else {
+                Ok(Box::new(LimitExec::new(
+                    topn.limit,
+                    topn.offset,
+                    Box::new(sorted),
+                    schema,
+                )))
+            }
         }
         LogicalPlan::Distinct(distinct) => {
             let input = build_pipeline(*distinct.input, table_batches)?;

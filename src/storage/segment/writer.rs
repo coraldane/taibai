@@ -307,8 +307,8 @@ pub fn encode_segment_footer(
         encode_len_prefixed_str(&mut buf, &col.name);
         buf.push(col.data_type as u8);
         buf.push(if col.nullable { 1 } else { 0 });
-        buf.extend_from_slice(&(col.scale as u32).to_le_bytes());
-        buf.extend_from_slice(&(col.precision as u32).to_le_bytes());
+        buf.push(col.scale as u8);
+        buf.push(col.precision as u8);
     }
 
     if !segment_zone_maps.is_empty() {

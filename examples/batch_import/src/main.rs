@@ -577,24 +577,24 @@ fn estimate_payload_size(n: usize, avg_sec_id_len: usize) -> usize {
     let batch_header = 4 + 4;
 
     let varchar_data = n * (4 + avg_sec_id_len);
-    let varchar_col = 2 + 11 + 1 + 4 + 4 + 4 + 4 + varchar_data;
+    let varchar_col = 2 + 11 + 1 + 1 + 1 + 4 + 4 + varchar_data;
 
     let int32_cols = 11usize;
     let int32_data = n * 4;
-    let int32_col = int32_cols * (2 + 17 + 1 + 4 + 4 + 4 + 4) + int32_cols * int32_data;
+    let int32_col = int32_cols * (2 + 17 + 1 + 1 + 1 + 4 + 4) + int32_cols * int32_data;
 
     let int64_cols = 1usize;
     let int64_data = n * 8;
-    let int64_col = int64_cols * (2 + 14 + 1 + 4 + 4 + 4 + 4) + int64_cols * int64_data;
+    let int64_col = int64_cols * (2 + 14 + 1 + 1 + 1 + 4 + 4) + int64_cols * int64_data;
 
     let decimal_cols = 7usize + 10usize;
     let decimal_data = n * 8;
-    let decimal_col = decimal_cols * (2 + 10 + 1 + 4 + 4 + 4 + 4) + decimal_cols * decimal_data;
+    let decimal_col = decimal_cols * (2 + 10 + 1 + 1 + 1 + 4 + 4) + decimal_cols * decimal_data;
 
     let timestamp_cols = 1usize;
     let timestamp_data = n * 8;
     let timestamp_col =
-        timestamp_cols * (2 + 11 + 1 + 4 + 4 + 4 + 4) + timestamp_cols * timestamp_data;
+        timestamp_cols * (2 + 11 + 1 + 1 + 1 + 4 + 4) + timestamp_cols * timestamp_data;
 
     table_header + batch_header + varchar_col + int32_col + int64_col + decimal_col + timestamp_col
 }
@@ -677,8 +677,8 @@ fn write_column_header(
     buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
     buf.extend_from_slice(name.as_bytes());
     buf.push(dtype);
-    buf.extend_from_slice(&(scale as u32).to_le_bytes());
-    buf.extend_from_slice(&(precision as u32).to_le_bytes());
+    buf.push(scale as u8);
+    buf.push(precision as u8);
     buf.extend_from_slice(&data_len.to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes());
 }
