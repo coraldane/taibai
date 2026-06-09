@@ -88,8 +88,45 @@ impl Parser {
                 }
                 Ok(Statement::ShowProcesslist { full })
             }
+            Token::Ident(word) if word.eq_ignore_ascii_case("CHANGE") => {
+                self.advance();
+                let kind = self.expect_ident()?;
+                if kind.eq_ignore_ascii_case("CONSUMERS") {
+                    Ok(Statement::ShowChangeConsumers)
+                } else if kind.eq_ignore_ascii_case("STATUS") {
+                    Ok(Statement::ShowChangeStatus)
+                } else if kind.eq_ignore_ascii_case("EVENTS") {
+                    let mut table = None;
+                    let mut from_sequence = None;
+                    let mut limit = None;
+                    loop {
+                        if self.peek() == &Token::For {
+                            self.advance();
+                            table = Some(self.parse_object_name()?);
+                        } else if self.peek() == &Token::From {
+                            self.advance();
+                            from_sequence = Some(self.expect_u64()?);
+                        } else if self.peek() == &Token::Limit {
+                            self.advance();
+                            limit = Some(self.expect_u64()? as usize);
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(Statement::ShowChangeEvents {
+                        table,
+                        from_sequence,
+                        limit,
+                    })
+                } else {
+                    Err(MonaxError::Sql(format!(
+                        "expected CONSUMERS, STATUS, or EVENTS after SHOW CHANGE, got {}",
+                        kind
+                    )))
+                }
+            }
             other => Err(MonaxError::Sql(format!(
-                "expected TABLES, DATABASES, COLUMNS, INDEXES, CREATE, USER, ROLE, GRANTS, PARTITIONS, STATS, ENGINES, or PROCESSLIST after SHOW, got {}",
+                "expected TABLES, DATABASES, COLUMNS, INDEXES, CREATE, USER, ROLE, GRANTS, PARTITIONS, STATS, ENGINES, PROCESSLIST, or CHANGE after SHOW, got {}",
                 other
             ))),
         }
@@ -177,5 +214,55 @@ impl Parser {
             analyze,
             stmt: Box::new(inner),
         })
+    }
+
+    pub fn parse_reset(&mut self) -> Result<Statement> {
+        let reset = self.expect_ident()?;
+        if !reset.eq_ignore_ascii_case("RESET") {
+            return Err(MonaxError::Sql(format!("expected RESET, got {}", reset)));
+        }
+        let change = self.expect_ident()?;
+        if !change.eq_ignore_ascii_case("CHANGE") {
+            return Err(MonaxError::Sql(format!(
+                "expected CHANGE after RESET, got {}",
+                change
+            )));
+        }
+        let consumer = self.expect_ident()?;
+        if !consumer.eq_ignore_ascii_case("CONSUMER") {
+            return Err(MonaxError::Sql(format!(
+                "expected CONSUMER after RESET CHANGE, got {}",
+                consumer
+            )));
+        }
+        let group = self.expect_ident_or_string()?;
+        self.expect(&Token::To)?;
+        let sequence = self.expect_u64()?;
+        Ok(Statement::ResetChangeConsumer { group, sequence })
+    }
+
+    pub fn parse_ack(&mut self) -> Result<Statement> {
+        let ack = self.expect_ident()?;
+        if !ack.eq_ignore_ascii_case("ACK") {
+            return Err(MonaxError::Sql(format!("expected ACK, got {}", ack)));
+        }
+        let change = self.expect_ident()?;
+        if !change.eq_ignore_ascii_case("CHANGE") {
+            return Err(MonaxError::Sql(format!(
+                "expected CHANGE after ACK, got {}",
+                change
+            )));
+        }
+        let consumer = self.expect_ident()?;
+        if !consumer.eq_ignore_ascii_case("CONSUMER") {
+            return Err(MonaxError::Sql(format!(
+                "expected CONSUMER after ACK CHANGE, got {}",
+                consumer
+            )));
+        }
+        let group = self.expect_ident_or_string()?;
+        self.expect(&Token::To)?;
+        let sequence = self.expect_u64()?;
+        Ok(Statement::AckChangeConsumer { group, sequence })
     }
 }

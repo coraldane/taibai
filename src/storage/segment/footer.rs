@@ -301,5 +301,4 @@ mod tests {
             footer.len() - std::mem::size_of::<u64>() - std::mem::size_of::<u32>()
         );
     }
-
 }

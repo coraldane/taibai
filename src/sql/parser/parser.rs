@@ -67,6 +67,8 @@ impl Parser {
             Token::Optimize => self.parse_optimize(),
             Token::Pause => self.parse_pause(),
             Token::Resume => self.parse_resume(),
+            Token::Ident(word) if word.eq_ignore_ascii_case("RESET") => self.parse_reset(),
+            Token::Ident(word) if word.eq_ignore_ascii_case("ACK") => self.parse_ack(),
             other => Err(MonaxError::Sql(format!("unexpected token: {}", other))),
         }
     }
@@ -103,6 +105,40 @@ impl Parser {
             }
             other => Err(MonaxError::Sql(format!(
                 "expected identifier, got '{}'",
+                other
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or("EOF".into())
+            ))),
+        }
+    }
+
+    fn expect_ident_or_string(&mut self) -> Result<String> {
+        match self.tokens.get(self.pos) {
+            Some(Token::Ident(s)) | Some(Token::StringLit(s)) => {
+                let s = s.clone();
+                self.pos += 1;
+                Ok(s)
+            }
+            other => Err(MonaxError::Sql(format!(
+                "expected identifier or string, got '{}'",
+                other
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or("EOF".into())
+            ))),
+        }
+    }
+
+    fn expect_u64(&mut self) -> Result<u64> {
+        match self.tokens.get(self.pos) {
+            Some(Token::Integer(v)) if *v >= 0 => {
+                let v = *v as u64;
+                self.pos += 1;
+                Ok(v)
+            }
+            other => Err(MonaxError::Sql(format!(
+                "expected non-negative integer, got '{}'",
                 other
                     .as_ref()
                     .map(|t| t.to_string())

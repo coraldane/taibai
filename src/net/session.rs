@@ -4,15 +4,13 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::sql::execution::prepared::PreparedStatementCache;
-use crate::storage::change_stream::ChangeOperation;
+use crate::storage::change_stream::{ChangeOperation, ChangePublishRequest, ChangeRow};
 use crate::storage::txn::txn::{AccessMode, IsolationLevel, Transaction};
 
 #[derive(Debug, Clone)]
-pub struct PendingChangeEvent {
-    pub database: String,
-    pub table: String,
-    pub operation: ChangeOperation,
-    pub rows_affected: u64,
+pub struct PendingChangeAck {
+    pub group: String,
+    pub sequence: u64,
 }
 
 pub struct Session {
@@ -31,7 +29,8 @@ pub struct Session {
     pub had_writes: bool,
     pub default_isolation_level: IsolationLevel,
     pub default_access_mode: AccessMode,
-    pub pending_change_events: Vec<PendingChangeEvent>,
+    pub pending_change_events: Vec<ChangePublishRequest>,
+    pub pending_change_acks: Vec<PendingChangeAck>,
 }
 
 impl Session {
@@ -54,6 +53,7 @@ impl Session {
             default_isolation_level: IsolationLevel::default(),
             default_access_mode: AccessMode::default(),
             pending_change_events: Vec::new(),
+            pending_change_acks: Vec::new(),
         }
     }
 
@@ -115,6 +115,7 @@ impl Session {
         }
         self.active_txn = None;
         self.pending_change_events.clear();
+        self.pending_change_acks.clear();
     }
 
     pub fn active_txn_id(&self) -> u64 {
@@ -137,17 +138,47 @@ impl Session {
         table: &str,
         operation: ChangeOperation,
         rows_affected: u64,
+        rows: Vec<ChangeRow>,
+        row_images_truncated: bool,
     ) {
-        self.pending_change_events.push(PendingChangeEvent {
+        self.pending_change_events.push(ChangePublishRequest {
             database: database.to_string(),
             table: table.to_string(),
             operation,
             rows_affected,
+            rows,
+            row_images_truncated,
         });
     }
 
-    pub fn take_pending_changes(&mut self) -> Vec<PendingChangeEvent> {
+    pub fn take_pending_changes(&mut self) -> Vec<ChangePublishRequest> {
         std::mem::take(&mut self.pending_change_events)
+    }
+
+    pub fn record_pending_change_ack(&mut self, group: &str, sequence: u64) {
+        if let Some(existing) = self
+            .pending_change_acks
+            .iter_mut()
+            .find(|ack| ack.group == group)
+        {
+            existing.sequence = existing.sequence.max(sequence);
+            return;
+        }
+        self.pending_change_acks.push(PendingChangeAck {
+            group: group.to_string(),
+            sequence,
+        });
+    }
+
+    pub fn take_pending_change_acks(&mut self) -> Vec<PendingChangeAck> {
+        std::mem::take(&mut self.pending_change_acks)
+    }
+
+    pub fn pending_change_ack_sequence(&self, group: &str) -> Option<u64> {
+        self.pending_change_acks
+            .iter()
+            .find(|ack| ack.group == group)
+            .map(|ack| ack.sequence)
     }
 
     pub fn txn_isolation_level(&self) -> Option<IsolationLevel> {

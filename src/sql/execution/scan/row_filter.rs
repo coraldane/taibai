@@ -264,7 +264,11 @@ fn eval_logical_expr_batch(
                 .iter()
                 .map(|val| {
                     let found = values.iter().any(|candidate| scalar_eq(val, candidate));
-                    if *negated { !found } else { found }
+                    if *negated {
+                        !found
+                    } else {
+                        found
+                    }
                 })
                 .collect())
         }

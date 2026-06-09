@@ -14,6 +14,7 @@ use crate::common::error::{MonaxError, Result};
 use crate::protocol::codec::MessageCodec;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;
+use crate::storage::change_stream::ChangeEvent;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -562,6 +563,102 @@ impl Client {
             }
             other => Err(MonaxError::Protocol(format!(
                 "unexpected batch_execute response type: {other:#04X}"
+            ))),
+        }
+    }
+
+    pub async fn subscribe_changes(
+        &mut self,
+        database: Option<&str>,
+        table: Option<&str>,
+        include_recent: bool,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "database": database,
+            "table": table,
+            "include_recent": include_recent,
+        });
+        self.send_change_subscription(payload).await
+    }
+
+    pub async fn subscribe_changes_from(
+        &mut self,
+        database: Option<&str>,
+        table: Option<&str>,
+        from_sequence: u64,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "database": database,
+            "table": table,
+            "from_sequence": from_sequence,
+        });
+        self.send_change_subscription(payload).await
+    }
+
+    pub async fn subscribe_changes_group(
+        &mut self,
+        database: Option<&str>,
+        table: Option<&str>,
+        consumer_group: &str,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "database": database,
+            "table": table,
+            "consumer_group": consumer_group,
+        });
+        self.send_change_subscription(payload).await
+    }
+
+    async fn send_change_subscription(&mut self, payload: serde_json::Value) -> Result<()> {
+        let payload = serde_json::to_vec(&payload).map_err(|e| {
+            MonaxError::Protocol(format!("failed to encode change subscription: {}", e))
+        })?;
+        self.send(Message::new(
+            MSG_TYPE_CHANGE_SUBSCRIBE,
+            Bytes::from(payload),
+        ))
+        .await
+    }
+
+    pub async fn recv_change_event(&mut self) -> Result<ChangeEvent> {
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_CHANGE_EVENT => serde_json::from_slice(&resp.payload)
+                .map_err(|e| MonaxError::Protocol(format!("invalid change event: {}", e))),
+            MSG_TYPE_ERROR => {
+                let msg = String::from_utf8_lossy(&resp.payload).to_string();
+                Err(MonaxError::Sql(msg))
+            }
+            other => Err(MonaxError::Protocol(format!(
+                "unexpected change stream response type: {other:#04X}"
+            ))),
+        }
+    }
+
+    pub async fn ack_change_consumer(&mut self, group: &str, sequence: u64) -> Result<u64> {
+        let payload = serde_json::json!({
+            "group": group,
+            "sequence": sequence,
+        });
+        let payload = serde_json::to_vec(&payload)
+            .map_err(|e| MonaxError::Protocol(format!("failed to encode change ack: {}", e)))?;
+        self.send(Message::new(MSG_TYPE_CHANGE_ACK, Bytes::from(payload)))
+            .await?;
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_CHANGE_ACK_STATE => {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&resp.payload).map_err(|e| {
+                        MonaxError::Protocol(format!("invalid change ack state: {}", e))
+                    })?;
+                Ok(value.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0))
+            }
+            MSG_TYPE_ERROR => {
+                let msg = String::from_utf8_lossy(&resp.payload).to_string();
+                Err(MonaxError::Sql(msg))
+            }
+            other => Err(MonaxError::Protocol(format!(
+                "unexpected change ack response type: {other:#04X}"
             ))),
         }
     }

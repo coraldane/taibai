@@ -16,9 +16,6 @@ fn main() {
         .or_else(|_| get_git_commit())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
-    let profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
-
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("version_info.rs");
 
@@ -26,10 +23,8 @@ fn main() {
         r#"pub const VERSION: &str = "{}";
 pub const BUILD_TIME: &str = "{}";
 pub const GIT_COMMIT: &str = "{}";
-pub const TARGET: &str = "{}";
-pub const PROFILE: &str = "{}";
 "#,
-        version, build_time, git_commit, target, profile
+        version, build_time, git_commit
     );
 
     fs::write(&dest_path, content).unwrap();

@@ -435,7 +435,10 @@ fn decimal_division_order_by_uses_fractional_numeric_value() {
 
     assert_eq!(types, vec![DataType::VarChar, DataType::Float64]);
     assert_eq!(rows[0][0], ScalarValue::VarChar(Some("up_big".to_string())));
-    assert_eq!(rows[1][0], ScalarValue::VarChar(Some("up_small".to_string())));
+    assert_eq!(
+        rows[1][0],
+        ScalarValue::VarChar(Some("up_small".to_string()))
+    );
     assert_eq!(rows[0][1], ScalarValue::Float64(Some(0.1)));
     assert_eq!(rows[1][1], ScalarValue::Float64(Some(0.01)));
 }

@@ -585,6 +585,7 @@ pub fn exec_grant(
                 Privilege::Drop => PermissionType::Drop,
                 Privilege::Alter => PermissionType::Alter,
                 Privilege::Truncate => PermissionType::Truncate,
+                Privilege::Subscribe => PermissionType::Subscribe,
             };
             let (obj_type, obj_name) = match on {
                 Some(GrantObject::Table(t)) => (PermissionObjectType::Table, t.clone()),
@@ -625,6 +626,7 @@ pub fn exec_revoke(
             Privilege::Drop => PermissionType::Drop,
             Privilege::Alter => PermissionType::Alter,
             Privilege::Truncate => PermissionType::Truncate,
+            Privilege::Subscribe => PermissionType::Subscribe,
         })
         .collect();
     let obj_name = match on {
@@ -1110,6 +1112,172 @@ pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult
     Ok(ExecResult::Query {
         schema,
         batches: vec![batch],
+    })
+}
+
+pub fn exec_show_change_consumers(engine: &Engine) -> Result<ExecResult> {
+    let schema = Schema::new(vec![
+        ColumnDef::new("consumer_group", DataType::VarChar),
+        ColumnDef::new("sequence", DataType::UInt64),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+
+    for (group, sequence) in engine.change_stream().consumers() {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(group)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::UInt64(Some(sequence)))?;
+    }
+
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
+
+pub fn exec_show_change_status(engine: &Engine) -> Result<ExecResult> {
+    let status = engine.change_stream_status()?;
+    let schema = Schema::new(vec![
+        ColumnDef::new("next_sequence", DataType::UInt64),
+        ColumnDef::new("earliest_sequence", DataType::UInt64),
+        ColumnDef::new("latest_sequence", DataType::UInt64),
+        ColumnDef::new("retained_events", DataType::UInt64),
+        ColumnDef::new("retention_events", DataType::UInt64),
+        ColumnDef::new("recent_capacity", DataType::UInt64),
+        ColumnDef::new("consumer_count", DataType::UInt64),
+        ColumnDef::new("persistent", DataType::Bool),
+        ColumnDef::new("log_path", DataType::VarChar),
+        ColumnDef::new("outbox_prepared", DataType::UInt64),
+        ColumnDef::new("outbox_committed", DataType::UInt64),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+
+    batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.next_sequence)))?;
+    batch
+        .column_mut(1)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.earliest_sequence)))?;
+    batch
+        .column_mut(2)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.latest_sequence)))?;
+    batch
+        .column_mut(3)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.retained_events as u64)))?;
+    batch
+        .column_mut(4)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.retention_events as u64)))?;
+    batch
+        .column_mut(5)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.recent_capacity as u64)))?;
+    batch
+        .column_mut(6)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.consumer_count as u64)))?;
+    batch
+        .column_mut(7)
+        .unwrap()
+        .push(&ScalarValue::Bool(Some(status.persistent)))?;
+    batch
+        .column_mut(8)
+        .unwrap()
+        .push(&ScalarValue::VarChar(Some(
+            status
+                .log_path
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        )))?;
+    batch
+        .column_mut(9)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.outbox_prepared as u64)))?;
+    batch
+        .column_mut(10)
+        .unwrap()
+        .push(&ScalarValue::UInt64(Some(status.outbox_committed as u64)))?;
+
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
+
+pub fn exec_show_change_events(
+    engine: &Engine,
+    from_sequence: Option<u64>,
+    limit: Option<usize>,
+    database: Option<&str>,
+    table: Option<&str>,
+) -> Result<ExecResult> {
+    let schema = Schema::new(vec![
+        ColumnDef::new("sequence", DataType::UInt64),
+        ColumnDef::new("timestamp_micros", DataType::Int64),
+        ColumnDef::new("database", DataType::VarChar),
+        ColumnDef::new("table", DataType::VarChar),
+        ColumnDef::new("operation", DataType::VarChar),
+        ColumnDef::new("rows_affected", DataType::UInt64),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+
+    for event in engine.change_events(from_sequence, limit, database, table)? {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::UInt64(Some(event.sequence)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(event.timestamp_micros)))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(event.database)))?;
+        batch
+            .column_mut(3)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(event.table)))?;
+        batch
+            .column_mut(4)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(format!(
+                "{:?}",
+                event.operation
+            ))))?;
+        batch
+            .column_mut(5)
+            .unwrap()
+            .push(&ScalarValue::UInt64(Some(event.rows_affected)))?;
+    }
+
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
+
+pub fn exec_reset_change_consumer(
+    engine: &Engine,
+    group: &str,
+    sequence: u64,
+) -> Result<ExecResult> {
+    engine.reset_change_consumer(group, sequence)?;
+    Ok(ExecResult::Ok { rows_affected: 1 })
+}
+
+pub fn exec_drop_change_consumer(engine: &Engine, group: &str) -> Result<ExecResult> {
+    let removed = engine.drop_change_consumer(group)?;
+    Ok(ExecResult::Ok {
+        rows_affected: if removed { 1 } else { 0 },
     })
 }
 

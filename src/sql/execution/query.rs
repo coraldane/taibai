@@ -378,7 +378,11 @@ fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &mut Expr) -> Res
     Ok(())
 }
 
-fn execute_in_subquery(engine: &Engine, db: &str, subquery: &Statement) -> Result<Vec<ScalarValue>> {
+fn execute_in_subquery(
+    engine: &Engine,
+    db: &str,
+    subquery: &Statement,
+) -> Result<Vec<ScalarValue>> {
     let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
         return Err(MonaxError::Sql("IN subquery must be a SELECT".into()));
     };

@@ -207,7 +207,7 @@ async fn import_ticks_prepared(
                 .execute_prepared_batch(stmt, &batch)
                 .await
                 .expect("execute_prepared_batch failed");
-            sent_count += batch.len() as u64;
+            sent_count += rows_affected;
 
             batch.clear();
 
@@ -231,8 +231,8 @@ async fn import_ticks_prepared(
             .execute_prepared_batch(stmt, &batch)
             .await
             .expect("execute_prepared_batch failed");
-        sent_count += batch.len() as u64;
+        sent_count += rows_affected;
     }
 
-    Ok(parsed_count)
+    Ok(sent_count)
 }

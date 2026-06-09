@@ -213,12 +213,7 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut Vec<usize>) {
     }
 }
 
-fn collect_from_plan(
-    plan: &LogicalPlan,
-    table_name: &str,
-    schema: &Schema,
-    spec: &mut ScanSpec,
-) {
+fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec: &mut ScanSpec) {
     match plan {
         LogicalPlan::Scan(scan) => {
             if !scan.table_name.eq_ignore_ascii_case(table_name) {
