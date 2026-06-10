@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::collections::{HashMap, VecDeque};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::sql::parser::ast::{Expr, Statement};
 use crate::sql::parser::parser::Parser;
 use crate::sql::planner::LogicalPlan;
@@ -55,7 +55,7 @@ impl PreparedStatementCache {
     pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         let stmts = Parser::parse(sql)?;
         if stmts.is_empty() {
-            return Err(MonaxError::Sql("empty query".into()));
+            return Err(TaibaiError::Sql("empty query".into()));
         }
 
         let id = self.next_id;
@@ -185,7 +185,7 @@ fn substitute_placeholders(expr: &mut Expr, params: &[ScalarValue]) -> Result<()
     match expr {
         Expr::Placeholder(idx) => {
             if *idx >= params.len() {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "parameter index {} out of bounds (only {} parameters provided)",
                     idx,
                     params.len()

@@ -1,7 +1,7 @@
 use std::fmt;
 
 #[derive(Debug)]
-pub enum MonaxError {
+pub enum TaibaiError {
     Io(std::io::Error),
     Protocol(String),
     Auth(String),
@@ -12,48 +12,48 @@ pub enum MonaxError {
     Network(String),
 }
 
-pub type Result<T> = std::result::Result<T, MonaxError>;
+pub type Result<T> = std::result::Result<T, TaibaiError>;
 
-impl fmt::Display for MonaxError {
+impl fmt::Display for TaibaiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MonaxError::Io(e) => write!(f, "I/O error: {e}"),
-            MonaxError::Protocol(msg) => write!(f, "protocol error: {msg}"),
-            MonaxError::Auth(msg) => write!(f, "auth error: {msg}"),
-            MonaxError::Config(msg) => write!(f, "config error: {msg}"),
-            MonaxError::Storage(msg) => write!(f, "storage error: {msg}"),
-            MonaxError::Sql(msg) => write!(f, "SQL error: {msg}"),
-            MonaxError::Internal(msg) => write!(f, "internal error: {msg}"),
-            MonaxError::Network(msg) => write!(f, "network error: {msg}"),
+            TaibaiError::Io(e) => write!(f, "I/O error: {e}"),
+            TaibaiError::Protocol(msg) => write!(f, "protocol error: {msg}"),
+            TaibaiError::Auth(msg) => write!(f, "auth error: {msg}"),
+            TaibaiError::Config(msg) => write!(f, "config error: {msg}"),
+            TaibaiError::Storage(msg) => write!(f, "storage error: {msg}"),
+            TaibaiError::Sql(msg) => write!(f, "SQL error: {msg}"),
+            TaibaiError::Internal(msg) => write!(f, "internal error: {msg}"),
+            TaibaiError::Network(msg) => write!(f, "network error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for MonaxError {
+impl std::error::Error for TaibaiError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            MonaxError::Io(e) => Some(e),
+            TaibaiError::Io(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<std::io::Error> for MonaxError {
+impl From<std::io::Error> for TaibaiError {
     fn from(e: std::io::Error) -> Self {
-        MonaxError::Io(e)
+        TaibaiError::Io(e)
     }
 }
 
-impl From<tokio::sync::AcquireError> for MonaxError {
+impl From<tokio::sync::AcquireError> for TaibaiError {
     fn from(e: tokio::sync::AcquireError) -> Self {
-        MonaxError::Internal(format!("semaphore error: {}", e))
+        TaibaiError::Internal(format!("semaphore error: {}", e))
     }
 }
 
-impl From<MonaxError> for std::io::Error {
-    fn from(e: MonaxError) -> Self {
+impl From<TaibaiError> for std::io::Error {
+    fn from(e: TaibaiError) -> Self {
         match e {
-            MonaxError::Io(io) => io,
+            TaibaiError::Io(io) => io,
             other => std::io::Error::other(other.to_string()),
         }
     }

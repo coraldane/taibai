@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::storage::catalog::schema::{PartitionType, TableMeta};
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::pruning::ZoneMap;
@@ -32,10 +32,10 @@ pub fn exec_delete(
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs
             .get(db)
-            .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
         let meta = catalog
             .get_table(table)
-            .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
             .clone();
         (Schema::new(meta.columns.clone()), meta)
     };

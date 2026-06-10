@@ -2,12 +2,12 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
-use monax::tools::segment::{self, SegmentInspectInfo};
+use taibai::tools::segment::{self, SegmentInspectInfo};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "segment",
-    about = "Inspect segment (.dat) files for monax/taibai columnar database",
+    about = "Inspect segment (.dat) files for taibai/taibai columnar database",
     version
 )]
 struct Args {
@@ -148,7 +148,7 @@ fn main() {
                         let schema = &info.schema;
                         println!("    schema:");
                         for col in &schema.columns {
-                            if col.data_type == monax::protocol::types::DataType::Decimal
+                            if col.data_type == taibai::protocol::types::DataType::Decimal
                                 && col.precision > 0
                             {
                                 println!(
@@ -391,8 +391,8 @@ fn inspect_with_filter(
     path: &std::path::Path,
     filter_column: &str,
     filter_value: &str,
-) -> monax::common::error::Result<(SegmentInspectInfo, u64)> {
-    use monax::storage::segment::SegmentReader;
+) -> taibai::common::error::Result<(SegmentInspectInfo, u64)> {
+    use taibai::storage::segment::SegmentReader;
 
     let info = segment::inspect_segment(path)?;
 
@@ -428,52 +428,52 @@ fn inspect_with_filter(
 
 fn parse_scalar_value(
     s: &str,
-    dt: monax::protocol::types::DataType,
-) -> monax::types::scalar::ScalarValue {
-    use monax::types::scalar::ScalarValue;
+    dt: taibai::protocol::types::DataType,
+) -> taibai::types::scalar::ScalarValue {
+    use taibai::types::scalar::ScalarValue;
 
     match dt {
-        monax::protocol::types::DataType::Bool => {
+        taibai::protocol::types::DataType::Bool => {
             ScalarValue::Bool(Some(s.eq_ignore_ascii_case("true") || s == "1"))
         }
-        monax::protocol::types::DataType::Int8 => {
+        taibai::protocol::types::DataType::Int8 => {
             ScalarValue::Int8(Some(s.parse::<i8>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::Int16 => {
+        taibai::protocol::types::DataType::Int16 => {
             ScalarValue::Int16(Some(s.parse::<i16>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::Int32 => {
+        taibai::protocol::types::DataType::Int32 => {
             ScalarValue::Int32(Some(s.parse::<i32>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::Int64 => {
+        taibai::protocol::types::DataType::Int64 => {
             ScalarValue::Int64(Some(s.parse::<i64>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::UInt8 => {
+        taibai::protocol::types::DataType::UInt8 => {
             ScalarValue::UInt8(Some(s.parse::<u8>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::UInt16 => {
+        taibai::protocol::types::DataType::UInt16 => {
             ScalarValue::UInt16(Some(s.parse::<u16>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::UInt32 => {
+        taibai::protocol::types::DataType::UInt32 => {
             ScalarValue::UInt32(Some(s.parse::<u32>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::UInt64 => {
+        taibai::protocol::types::DataType::UInt64 => {
             ScalarValue::UInt64(Some(s.parse::<u64>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::Float32 => {
+        taibai::protocol::types::DataType::Float32 => {
             ScalarValue::Float32(Some(s.parse::<f32>().unwrap_or(0.0)))
         }
-        monax::protocol::types::DataType::Float64 => {
+        taibai::protocol::types::DataType::Float64 => {
             ScalarValue::Float64(Some(s.parse::<f64>().unwrap_or(0.0)))
         }
-        monax::protocol::types::DataType::VarChar => ScalarValue::VarChar(Some(s.to_string())),
-        monax::protocol::types::DataType::Timestamp => {
+        taibai::protocol::types::DataType::VarChar => ScalarValue::VarChar(Some(s.to_string())),
+        taibai::protocol::types::DataType::Timestamp => {
             ScalarValue::Timestamp(Some(s.parse::<i64>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::Date => {
+        taibai::protocol::types::DataType::Date => {
             ScalarValue::Date(Some(s.parse::<i32>().unwrap_or(0)))
         }
-        monax::protocol::types::DataType::Decimal => {
+        taibai::protocol::types::DataType::Decimal => {
             ScalarValue::Decimal(Some(s.parse::<i64>().unwrap_or(0)))
         }
         _ => ScalarValue::VarChar(Some(s.to_string())),
@@ -481,10 +481,10 @@ fn parse_scalar_value(
 }
 
 fn scalar_matches(
-    actual: &monax::types::scalar::ScalarValue,
-    expected: &monax::types::scalar::ScalarValue,
+    actual: &taibai::types::scalar::ScalarValue,
+    expected: &taibai::types::scalar::ScalarValue,
 ) -> bool {
-    use monax::types::scalar::ScalarValue;
+    use taibai::types::scalar::ScalarValue;
 
     match (actual, expected) {
         (ScalarValue::Bool(Some(a)), ScalarValue::Bool(Some(b))) => a == b,

@@ -8,7 +8,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
 
 use crate::common::config::ServerConfig;
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::net::handler::{build_error, Handler};
 use crate::net::tls::TlsMode;
 use crate::protocol::codec::MessageCodec;
@@ -79,7 +79,7 @@ impl Server {
 
     pub async fn run(&self) -> Result<()> {
         let listener = TcpListener::bind(&self.config.listen_addr()).await?;
-        tracing::info!("monax listening on {}", self.config.listen_addr());
+        tracing::info!("taibai listening on {}", self.config.listen_addr());
 
         if self.tls_acceptor.is_some() {
             tracing::info!("TLS handshake will be performed for incoming connections");
@@ -106,7 +106,7 @@ fn parse_change_subscribe_request(payload: &[u8]) -> Result<ChangeSubscribeReque
         return Ok(ChangeSubscribeRequest::default());
     }
     serde_json::from_slice(payload)
-        .map_err(|e| MonaxError::Protocol(format!("invalid change subscribe request: {}", e)))
+        .map_err(|e| TaibaiError::Protocol(format!("invalid change subscribe request: {}", e)))
 }
 
 fn change_event_matches(event: &ChangeEvent, database: Option<&str>, table: Option<&str>) -> bool {
@@ -116,7 +116,7 @@ fn change_event_matches(event: &ChangeEvent, database: Option<&str>, table: Opti
 
 fn build_change_event(event: &ChangeEvent) -> Result<Message> {
     let payload = serde_json::to_vec(event)
-        .map_err(|e| MonaxError::Protocol(format!("failed to encode change event: {}", e)))?;
+        .map_err(|e| TaibaiError::Protocol(format!("failed to encode change event: {}", e)))?;
     Ok(Message::new(
         MSG_TYPE_CHANGE_EVENT,
         bytes::Bytes::from(payload),
@@ -125,7 +125,7 @@ fn build_change_event(event: &ChangeEvent) -> Result<Message> {
 
 fn parse_change_ack_request(payload: &[u8]) -> Result<ChangeAckRequest> {
     serde_json::from_slice(payload)
-        .map_err(|e| MonaxError::Protocol(format!("invalid change ack request: {}", e)))
+        .map_err(|e| TaibaiError::Protocol(format!("invalid change ack request: {}", e)))
 }
 
 fn build_change_ack_state(group: &str, sequence: u64) -> Result<Message> {
@@ -134,7 +134,7 @@ fn build_change_ack_state(group: &str, sequence: u64) -> Result<Message> {
         "sequence": sequence,
     });
     let payload = serde_json::to_vec(&payload)
-        .map_err(|e| MonaxError::Protocol(format!("failed to encode change ack state: {}", e)))?;
+        .map_err(|e| TaibaiError::Protocol(format!("failed to encode change ack state: {}", e)))?;
     Ok(Message::new(
         MSG_TYPE_CHANGE_ACK_STATE,
         bytes::Bytes::from(payload),
@@ -189,7 +189,7 @@ fn require_change_permission(
     ) {
         return Ok(());
     }
-    Err(MonaxError::Sql(format!(
+    Err(TaibaiError::Sql(format!(
         "access denied for user '{}' to subscribe changes on {:?} '{}'",
         session.username, object_type, object_name
     )))
@@ -266,7 +266,7 @@ async fn handle_connection(
         let tls_stream = acceptor
             .accept(stream)
             .await
-            .map_err(|e| MonaxError::Network(format!("TLS handshake failed: {}", e)))?;
+            .map_err(|e| TaibaiError::Network(format!("TLS handshake failed: {}", e)))?;
         tracing::debug!("TLS handshake completed");
         handle_framed(tls_stream, config, engine).await
     } else {

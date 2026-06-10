@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use bytes::Bytes;
 
 pub const MAGIC: [u8; 2] = [0x01, 0xDB];
@@ -56,7 +56,7 @@ impl MessageHeader {
 
     pub fn decode(buf: &[u8; HEADER_SIZE]) -> Result<Self> {
         if buf[0] != MAGIC[0] || buf[1] != MAGIC[1] {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "invalid magic: expected [{:#04X}, {:#04X}], got [{:#04X}, {:#04X}]",
                 MAGIC[0], MAGIC[1], buf[0], buf[1]
             )));
@@ -91,19 +91,19 @@ impl Message {
 
 pub fn read_len_prefixed_string(data: &[u8]) -> Result<(&str, &[u8])> {
     if data.len() < 4 {
-        return Err(MonaxError::Protocol(
+        return Err(TaibaiError::Protocol(
             "insufficient data for length prefix".into(),
         ));
     }
     let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if data.len() < 4 + len {
-        return Err(MonaxError::Protocol(format!(
+        return Err(TaibaiError::Protocol(format!(
             "string length {len} exceeds remaining data {}",
             data.len() - 4
         )));
     }
     let s = std::str::from_utf8(&data[4..4 + len])
-        .map_err(|e| MonaxError::Protocol(format!("invalid UTF-8 in string: {e}")))?;
+        .map_err(|e| TaibaiError::Protocol(format!("invalid UTF-8 in string: {e}")))?;
     Ok((s, &data[4 + len..]))
 }
 

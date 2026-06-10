@@ -409,7 +409,7 @@ pub fn predicate_first_read(
     let mut columns = Vec::with_capacity(projection_cols.len());
     for &col_idx in projection_cols {
         let col = columns_by_idx.get(&col_idx).cloned().ok_or_else(|| {
-            crate::common::error::MonaxError::Internal(format!(
+            crate::common::error::TaibaiError::Internal(format!(
                 "projected column {} was not read",
                 col_idx
             ))
@@ -423,7 +423,7 @@ pub fn predicate_first_read(
             .collect(),
     );
     crate::types::batch::RecordBatch::try_new(proj_schema, columns)
-        .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))
+        .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
 
 pub fn cluster_key_range_read(
@@ -515,7 +515,7 @@ pub fn cluster_key_range_read(
     let mut union_columns_data = Vec::with_capacity(union_cols.len());
     for &col_idx in &union_cols {
         let col = columns_by_idx.get(&col_idx).cloned().ok_or_else(|| {
-            crate::common::error::MonaxError::Internal(format!(
+            crate::common::error::TaibaiError::Internal(format!(
                 "candidate column {} was not read",
                 col_idx
             ))
@@ -529,7 +529,7 @@ pub fn cluster_key_range_read(
             .collect(),
     );
     let union_batch = RecordBatch::try_new(union_schema, union_columns_data)
-        .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))?;
+        .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))?;
 
     let col_pos_by_original: std::collections::HashMap<usize, usize> = union_cols
         .iter()
@@ -631,7 +631,7 @@ fn cluster_key_eq_read(
     let mut columns = Vec::with_capacity(projection_cols.len());
     for &col_idx in projection_cols {
         let col = columns_by_idx.remove(&col_idx).ok_or_else(|| {
-            crate::common::error::MonaxError::Internal(format!(
+            crate::common::error::TaibaiError::Internal(format!(
                 "projected column {} was not read",
                 col_idx
             ))
@@ -646,7 +646,7 @@ fn cluster_key_eq_read(
             .collect(),
     );
     RecordBatch::try_new(schema, columns)
-        .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))
+        .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
 
 fn repeated_scalar_column(
@@ -724,7 +724,7 @@ fn repeated_scalar_column(
             bitmap,
         },
         _ => {
-            return Err(crate::common::error::MonaxError::Internal(
+            return Err(crate::common::error::TaibaiError::Internal(
                 "cluster key equality value cannot be NULL".into(),
             ))
         }
@@ -814,7 +814,7 @@ fn remap_eq_predicates(
         .map(|(idx, value)| {
             Ok((
                 *col_pos_by_original.get(idx).ok_or_else(|| {
-                    crate::common::error::MonaxError::Internal(format!(
+                    crate::common::error::TaibaiError::Internal(format!(
                         "predicate column {} was not read",
                         idx
                     ))
@@ -835,7 +835,7 @@ fn remap_range_predicates(
             let column_index = *col_pos_by_original
                 .get(&clause.column_index)
                 .ok_or_else(|| {
-                    crate::common::error::MonaxError::Internal(format!(
+                    crate::common::error::TaibaiError::Internal(format!(
                         "predicate column {} was not read",
                         clause.column_index
                     ))
@@ -857,7 +857,7 @@ fn remap_in_predicates(
         .iter()
         .map(|pred| {
             let column_index = *col_pos_by_original.get(&pred.column_index).ok_or_else(|| {
-                crate::common::error::MonaxError::Internal(format!(
+                crate::common::error::TaibaiError::Internal(format!(
                     "predicate column {} was not read",
                     pred.column_index
                 ))
@@ -878,7 +878,7 @@ fn remap_expr(
     match expr {
         LogicalExpr::Column(idx) => {
             let pos = *col_pos_by_original.get(idx).ok_or_else(|| {
-                crate::common::error::MonaxError::Internal(format!(
+                crate::common::error::TaibaiError::Internal(format!(
                     "predicate column {} was not read",
                     idx
                 ))
@@ -994,13 +994,13 @@ fn project_filtered_union(
             .iter()
             .position(|idx| *idx == col_idx)
             .ok_or_else(|| {
-                crate::common::error::MonaxError::Internal(format!(
+                crate::common::error::TaibaiError::Internal(format!(
                     "projected column {} was not read",
                     col_idx
                 ))
             })?;
         columns.push(batch.column(pos).cloned().ok_or_else(|| {
-            crate::common::error::MonaxError::Internal(format!(
+            crate::common::error::TaibaiError::Internal(format!(
                 "projected column {} missing from candidate batch",
                 col_idx
             ))
@@ -1008,7 +1008,7 @@ fn project_filtered_union(
         col_defs.push(batch.schema.columns[pos].clone());
     }
     RecordBatch::try_new(Schema::new(col_defs), columns)
-        .map_err(|e| crate::common::error::MonaxError::Internal(e.to_string()))
+        .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
 
 fn empty_like(batch: &RecordBatch) -> RecordBatch {

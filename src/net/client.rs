@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::codec::MessageCodec;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;
@@ -138,9 +138,9 @@ impl Client {
             }
             MSG_TYPE_AUTH_FAIL => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Auth(msg))
+                Err(TaibaiError::Auth(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected login response type: {other:#04X}"
             ))),
         }
@@ -151,7 +151,7 @@ impl Client {
         self.send(Message::empty(MSG_TYPE_PING)).await?;
         let resp = self.recv().await?;
         if resp.msg_type != MSG_TYPE_PONG {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "expected PONG, got {:#04X}",
                 resp.msg_type
             )));
@@ -177,7 +177,7 @@ impl Client {
         let mut result = match resp.msg_type {
             MSG_TYPE_OK => {
                 if resp.payload.len() < 8 {
-                    return Err(MonaxError::Protocol("OK payload too short".into()));
+                    return Err(TaibaiError::Protocol("OK payload too short".into()));
                 }
                 let rows_affected = u64::from_le_bytes(resp.payload[..8].try_into().unwrap());
                 let server_timings = parse_server_timing_trailer(&resp.payload, 8);
@@ -194,7 +194,7 @@ impl Client {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
                 Ok(QueryResult::Error(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected query response type: {other:#04X}"
             ))),
         }?;
@@ -213,7 +213,7 @@ impl Client {
     pub async fn execute(&mut self, sql: &str) -> Result<u64> {
         match self.query(sql).await? {
             QueryResult::Ok { rows_affected, .. } => Ok(rows_affected),
-            QueryResult::Error(msg) => Err(MonaxError::Sql(msg)),
+            QueryResult::Error(msg) => Err(TaibaiError::Sql(msg)),
             QueryResult::Rows { .. } => Ok(0),
         }
     }
@@ -231,14 +231,14 @@ impl Client {
         match resp.msg_type {
             MSG_TYPE_OK => {
                 if resp.payload.len() < 8 {
-                    return Err(MonaxError::Protocol("OK payload too short".into()));
+                    return Err(TaibaiError::Protocol("OK payload too short".into()));
                 }
                 Ok(u64::from_le_bytes(resp.payload[..8].try_into().unwrap()))
             }
-            MSG_TYPE_ERROR => Err(MonaxError::Sql(
+            MSG_TYPE_ERROR => Err(TaibaiError::Sql(
                 String::from_utf8_lossy(&resp.payload).to_string(),
             )),
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected execute response type: {other:#04X}"
             ))),
         }
@@ -280,14 +280,14 @@ impl Client {
         match resp.msg_type {
             MSG_TYPE_OK => {
                 if resp.payload.len() < 8 {
-                    return Err(MonaxError::Protocol("OK payload too short".into()));
+                    return Err(TaibaiError::Protocol("OK payload too short".into()));
                 }
                 Ok(u64::from_le_bytes(resp.payload[..8].try_into().unwrap()))
             }
-            MSG_TYPE_ERROR => Err(MonaxError::Storage(
+            MSG_TYPE_ERROR => Err(TaibaiError::Storage(
                 String::from_utf8_lossy(&resp.payload).to_string(),
             )),
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected bulk insert response type: {other:#04X}"
             ))),
         }
@@ -299,14 +299,14 @@ impl Client {
         match resp.msg_type {
             MSG_TYPE_OK => {
                 if resp.payload.len() < 8 {
-                    return Err(MonaxError::Protocol("OK payload too short".into()));
+                    return Err(TaibaiError::Protocol("OK payload too short".into()));
                 }
                 Ok(u64::from_le_bytes(resp.payload[..8].try_into().unwrap()))
             }
-            MSG_TYPE_ERROR => Err(MonaxError::Storage(
+            MSG_TYPE_ERROR => Err(TaibaiError::Storage(
                 String::from_utf8_lossy(&resp.payload).to_string(),
             )),
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected flush response type: {other:#04X}"
             ))),
         }
@@ -314,7 +314,7 @@ impl Client {
 
     pub async fn start_pipeline(&mut self, depth: usize) -> Result<()> {
         if self.pipeline_mode.load(Ordering::Acquire) {
-            return Err(MonaxError::Internal("pipeline already started".into()));
+            return Err(TaibaiError::Internal("pipeline already started".into()));
         }
 
         let depth = if depth < 1 {
@@ -335,7 +335,7 @@ impl Client {
 
     pub async fn pipeline_bulk_insert_columnar(&mut self, payload: Bytes) -> Result<()> {
         if !self.pipeline_mode.load(Ordering::Acquire) {
-            return Err(MonaxError::Internal("pipeline not started".into()));
+            return Err(TaibaiError::Internal("pipeline not started".into()));
         }
 
         self.pending_count.fetch_add(1, Ordering::Relaxed);
@@ -392,10 +392,10 @@ impl Client {
         self.response_handled.fetch_add(1, Ordering::Relaxed);
         match resp.msg_type {
             MSG_TYPE_OK => Ok(()),
-            MSG_TYPE_ERROR => Err(MonaxError::Storage(
+            MSG_TYPE_ERROR => Err(TaibaiError::Storage(
                 String::from_utf8_lossy(&resp.payload).to_string(),
             )),
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected pipeline response type: {other:#04X}"
             ))),
         }
@@ -434,7 +434,7 @@ impl Client {
         match resp.msg_type {
             MSG_TYPE_PREPARE => {
                 if resp.payload.len() < 8 {
-                    return Err(MonaxError::Protocol("prepare response too short".into()));
+                    return Err(TaibaiError::Protocol("prepare response too short".into()));
                 }
                 let stmt_id = u32::from_le_bytes(resp.payload[..4].try_into().unwrap());
                 let param_count =
@@ -447,9 +447,9 @@ impl Client {
             }
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Sql(msg))
+                Err(TaibaiError::Sql(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected prepare response type: {other:#04X}"
             ))),
         }
@@ -492,7 +492,7 @@ impl Client {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
                 Ok(QueryResult::Error(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected execute response type: {other:#04X}"
             ))),
         }
@@ -508,9 +508,9 @@ impl Client {
             MSG_TYPE_OK => Ok(()),
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Sql(msg))
+                Err(TaibaiError::Sql(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected close_stmt response type: {other:#04X}"
             ))),
         }
@@ -534,7 +534,7 @@ impl Client {
 
         for params in params_batch {
             if params.len() != param_count {
-                return Err(MonaxError::Internal(format!(
+                return Err(TaibaiError::Internal(format!(
                     "param count mismatch: expected {}, got {}",
                     param_count,
                     params.len()
@@ -559,9 +559,9 @@ impl Client {
             }
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Sql(msg))
+                Err(TaibaiError::Sql(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected batch_execute response type: {other:#04X}"
             ))),
         }
@@ -611,7 +611,7 @@ impl Client {
 
     async fn send_change_subscription(&mut self, payload: serde_json::Value) -> Result<()> {
         let payload = serde_json::to_vec(&payload).map_err(|e| {
-            MonaxError::Protocol(format!("failed to encode change subscription: {}", e))
+            TaibaiError::Protocol(format!("failed to encode change subscription: {}", e))
         })?;
         self.send(Message::new(
             MSG_TYPE_CHANGE_SUBSCRIBE,
@@ -624,12 +624,12 @@ impl Client {
         let resp = self.recv().await?;
         match resp.msg_type {
             MSG_TYPE_CHANGE_EVENT => serde_json::from_slice(&resp.payload)
-                .map_err(|e| MonaxError::Protocol(format!("invalid change event: {}", e))),
+                .map_err(|e| TaibaiError::Protocol(format!("invalid change event: {}", e))),
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Sql(msg))
+                Err(TaibaiError::Sql(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected change stream response type: {other:#04X}"
             ))),
         }
@@ -641,7 +641,7 @@ impl Client {
             "sequence": sequence,
         });
         let payload = serde_json::to_vec(&payload)
-            .map_err(|e| MonaxError::Protocol(format!("failed to encode change ack: {}", e)))?;
+            .map_err(|e| TaibaiError::Protocol(format!("failed to encode change ack: {}", e)))?;
         self.send(Message::new(MSG_TYPE_CHANGE_ACK, Bytes::from(payload)))
             .await?;
         let resp = self.recv().await?;
@@ -649,15 +649,15 @@ impl Client {
             MSG_TYPE_CHANGE_ACK_STATE => {
                 let value: serde_json::Value =
                     serde_json::from_slice(&resp.payload).map_err(|e| {
-                        MonaxError::Protocol(format!("invalid change ack state: {}", e))
+                        TaibaiError::Protocol(format!("invalid change ack state: {}", e))
                     })?;
                 Ok(value.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0))
             }
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Sql(msg))
+                Err(TaibaiError::Sql(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected change ack response type: {other:#04X}"
             ))),
         }
@@ -666,20 +666,20 @@ impl Client {
     async fn send(&mut self, msg: Message) -> Result<()> {
         timeout(self.default_timeout, self.framed.send(msg))
             .await
-            .map_err(|_| MonaxError::Network("send timeout".into()))?
+            .map_err(|_| TaibaiError::Network("send timeout".into()))?
     }
 
     async fn recv(&mut self) -> Result<Message> {
         timeout(self.default_timeout, self.framed.next())
             .await
-            .map_err(|_| MonaxError::Network("recv timeout".into()))?
-            .ok_or_else(|| MonaxError::Network("connection closed".into()))?
+            .map_err(|_| TaibaiError::Network("recv timeout".into()))?
+            .ok_or_else(|| TaibaiError::Network("connection closed".into()))?
     }
 }
 
 fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     if payload.len() < 4 {
-        return Err(MonaxError::Protocol("result payload too short".into()));
+        return Err(TaibaiError::Protocol("result payload too short".into()));
     }
     let mut offset = 0usize;
 
@@ -690,7 +690,7 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     for _ in 0..col_count {
         let (name, rest) = read_len_prefixed_string(&payload[offset..])?;
         if rest.len() < 3 {
-            return Err(MonaxError::Protocol("truncated column metadata".into()));
+            return Err(TaibaiError::Protocol("truncated column metadata".into()));
         }
         let dtype_byte = rest[0];
         let scale = rest[1] as i32;
@@ -710,7 +710,7 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     }
 
     if payload.len() < offset + 4 {
-        return Err(MonaxError::Protocol("result missing row count".into()));
+        return Err(TaibaiError::Protocol("result missing row count".into()));
     }
     let row_count = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
     offset += 4;
@@ -737,7 +737,7 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
     for _ in 0..row_count {
         for (col_idx, col) in schema.columns.iter().enumerate() {
             if offset >= payload.len() {
-                return Err(MonaxError::Protocol("truncated row data".into()));
+                return Err(TaibaiError::Protocol("truncated row data".into()));
             }
             let is_null = payload[offset] != 0;
             offset += 1;
@@ -768,7 +768,7 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
 
 fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
     if payload.len() < 4 {
-        return Err(MonaxError::Protocol(
+        return Err(TaibaiError::Protocol(
             "binary result payload too short".into(),
         ));
     }
@@ -780,7 +780,7 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
     for _ in 0..col_count {
         let (name, rest) = read_len_prefixed_string(&payload[offset..])?;
         if rest.len() < 3 {
-            return Err(MonaxError::Protocol(
+            return Err(TaibaiError::Protocol(
                 "truncated binary column metadata".into(),
             ));
         }
@@ -801,7 +801,7 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
     }
 
     if payload.len() < offset + 4 {
-        return Err(MonaxError::Protocol(
+        return Err(TaibaiError::Protocol(
             "binary result missing row count".into(),
         ));
     }
@@ -812,7 +812,7 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
     let mut arrays = Vec::with_capacity(schema.num_columns());
     for col_def in &schema.columns {
         if payload.len() < offset + 4 {
-            return Err(MonaxError::Protocol(
+            return Err(TaibaiError::Protocol(
                 "binary result missing null bitmap length".into(),
             ));
         }
@@ -820,7 +820,7 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
             u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if payload.len() < offset + bitmap_len + 4 {
-            return Err(MonaxError::Protocol(
+            return Err(TaibaiError::Protocol(
                 "binary result null bitmap truncated".into(),
             ));
         }
@@ -830,7 +830,7 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
         let data_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if payload.len() < offset + data_len {
-            return Err(MonaxError::Protocol(
+            return Err(TaibaiError::Protocol(
                 "binary result column data truncated".into(),
             ));
         }
@@ -924,19 +924,19 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
     match dt {
         DataType::Bool => {
             if data.is_empty() {
-                return Err(MonaxError::Protocol("no data for Bool".into()));
+                return Err(TaibaiError::Protocol("no data for Bool".into()));
             }
             Ok((ScalarValue::Bool(Some(data[0] != 0)), 1))
         }
         DataType::Int8 => {
             if data.is_empty() {
-                return Err(MonaxError::Protocol("no data for Int8".into()));
+                return Err(TaibaiError::Protocol("no data for Int8".into()));
             }
             Ok((ScalarValue::Int8(Some(data[0] as i8)), 1))
         }
         DataType::Int16 => {
             if data.len() < 2 {
-                return Err(MonaxError::Protocol("no data for Int16".into()));
+                return Err(TaibaiError::Protocol("no data for Int16".into()));
             }
             Ok((
                 ScalarValue::Int16(Some(i16::from_le_bytes(data[..2].try_into().unwrap()))),
@@ -945,7 +945,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::Int32 => {
             if data.len() < 4 {
-                return Err(MonaxError::Protocol("no data for Int32".into()));
+                return Err(TaibaiError::Protocol("no data for Int32".into()));
             }
             Ok((
                 ScalarValue::Int32(Some(i32::from_le_bytes(data[..4].try_into().unwrap()))),
@@ -954,7 +954,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::Int64 => {
             if data.len() < 8 {
-                return Err(MonaxError::Protocol("no data for Int64".into()));
+                return Err(TaibaiError::Protocol("no data for Int64".into()));
             }
             Ok((
                 ScalarValue::Int64(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
@@ -963,13 +963,13 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::UInt8 => {
             if data.is_empty() {
-                return Err(MonaxError::Protocol("no data for UInt8".into()));
+                return Err(TaibaiError::Protocol("no data for UInt8".into()));
             }
             Ok((ScalarValue::UInt8(Some(data[0])), 1))
         }
         DataType::UInt16 => {
             if data.len() < 2 {
-                return Err(MonaxError::Protocol("no data for UInt16".into()));
+                return Err(TaibaiError::Protocol("no data for UInt16".into()));
             }
             Ok((
                 ScalarValue::UInt16(Some(u16::from_le_bytes(data[..2].try_into().unwrap()))),
@@ -978,7 +978,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::UInt32 => {
             if data.len() < 4 {
-                return Err(MonaxError::Protocol("no data for UInt32".into()));
+                return Err(TaibaiError::Protocol("no data for UInt32".into()));
             }
             Ok((
                 ScalarValue::UInt32(Some(u32::from_le_bytes(data[..4].try_into().unwrap()))),
@@ -987,7 +987,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::UInt64 => {
             if data.len() < 8 {
-                return Err(MonaxError::Protocol("no data for UInt64".into()));
+                return Err(TaibaiError::Protocol("no data for UInt64".into()));
             }
             Ok((
                 ScalarValue::UInt64(Some(u64::from_le_bytes(data[..8].try_into().unwrap()))),
@@ -996,7 +996,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::Float32 => {
             if data.len() < 4 {
-                return Err(MonaxError::Protocol("no data for Float32".into()));
+                return Err(TaibaiError::Protocol("no data for Float32".into()));
             }
             Ok((
                 ScalarValue::Float32(Some(f32::from_le_bytes(data[..4].try_into().unwrap()))),
@@ -1005,7 +1005,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::Float64 => {
             if data.len() < 8 {
-                return Err(MonaxError::Protocol("no data for Float64".into()));
+                return Err(TaibaiError::Protocol("no data for Float64".into()));
             }
             Ok((
                 ScalarValue::Float64(Some(f64::from_le_bytes(data[..8].try_into().unwrap()))),
@@ -1015,20 +1015,20 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         DataType::Decimal => {
             if scale > 0 {
                 if data.len() < 4 {
-                    return Err(MonaxError::Protocol("no data for Decimal".into()));
+                    return Err(TaibaiError::Protocol("no data for Decimal".into()));
                 }
                 let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
                 if data.len() < 4 + len {
-                    return Err(MonaxError::Protocol("Decimal data truncated".into()));
+                    return Err(TaibaiError::Protocol("Decimal data truncated".into()));
                 }
                 let s = std::str::from_utf8(&data[4..4 + len]).map_err(|e| {
-                    MonaxError::Protocol(format!("invalid UTF-8 in Decimal: {}", e))
+                    TaibaiError::Protocol(format!("invalid UTF-8 in Decimal: {}", e))
                 })?;
                 let value = parse_scaled_decimal_text(s, scale)?;
                 return Ok((ScalarValue::Decimal(Some(value)), 4 + len));
             }
             if data.len() < 8 {
-                return Err(MonaxError::Protocol("no data for Decimal".into()));
+                return Err(TaibaiError::Protocol("no data for Decimal".into()));
             }
             Ok((
                 ScalarValue::Decimal(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
@@ -1037,7 +1037,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::Date => {
             if data.len() < 4 {
-                return Err(MonaxError::Protocol("no data for Date".into()));
+                return Err(TaibaiError::Protocol("no data for Date".into()));
             }
             Ok((
                 ScalarValue::Date(Some(i32::from_le_bytes(data[..4].try_into().unwrap()))),
@@ -1046,7 +1046,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::Time => {
             if data.len() < 8 {
-                return Err(MonaxError::Protocol("no data for Time".into()));
+                return Err(TaibaiError::Protocol("no data for Time".into()));
             }
             Ok((
                 ScalarValue::Time(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
@@ -1055,7 +1055,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::Timestamp => {
             if data.len() < 8 {
-                return Err(MonaxError::Protocol("no data for Timestamp".into()));
+                return Err(TaibaiError::Protocol("no data for Timestamp".into()));
             }
             Ok((
                 ScalarValue::Timestamp(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
@@ -1064,7 +1064,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::Interval => {
             if data.len() < 8 {
-                return Err(MonaxError::Protocol("no data for Interval".into()));
+                return Err(TaibaiError::Protocol("no data for Interval".into()));
             }
             Ok((
                 ScalarValue::Interval(Some(i64::from_le_bytes(data[..8].try_into().unwrap()))),
@@ -1073,34 +1073,34 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
         }
         DataType::VarChar => {
             if data.len() < 4 {
-                return Err(MonaxError::Protocol("no data for VarChar".into()));
+                return Err(TaibaiError::Protocol("no data for VarChar".into()));
             }
             let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
             if data.len() < 4 + len {
-                return Err(MonaxError::Protocol("VarChar data truncated".into()));
+                return Err(TaibaiError::Protocol("VarChar data truncated".into()));
             }
             let s = String::from_utf8_lossy(&data[4..4 + len]).to_string();
             Ok((ScalarValue::VarChar(Some(s)), 4 + len))
         }
         DataType::Blob => {
             if data.len() < 4 {
-                return Err(MonaxError::Protocol("no data for Blob".into()));
+                return Err(TaibaiError::Protocol("no data for Blob".into()));
             }
             let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
             if data.len() < 4 + len {
-                return Err(MonaxError::Protocol("Blob data truncated".into()));
+                return Err(TaibaiError::Protocol("Blob data truncated".into()));
             }
             let b = data[4..4 + len].to_vec();
             Ok((ScalarValue::Blob(Some(b)), 4 + len))
         }
         DataType::Vector => {
             if data.len() < 4 {
-                return Err(MonaxError::Protocol("no data for Vector".into()));
+                return Err(TaibaiError::Protocol("no data for Vector".into()));
             }
             let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
             let total_bytes = 4 + len * 4;
             if data.len() < total_bytes {
-                return Err(MonaxError::Protocol("Vector data truncated".into()));
+                return Err(TaibaiError::Protocol("Vector data truncated".into()));
             }
             let mut floats = Vec::with_capacity(len);
             for i in 0..len {
@@ -1117,7 +1117,7 @@ fn read_scalar_value(data: &[u8], dt: DataType, scale: i32) -> Result<(ScalarVal
 fn parse_scaled_decimal_text(s: &str, scale: i32) -> Result<i64> {
     let s = s.trim();
     if s.is_empty() {
-        return Err(MonaxError::Protocol("empty Decimal value".into()));
+        return Err(TaibaiError::Protocol("empty Decimal value".into()));
     }
 
     let negative = s.starts_with('-');
@@ -1131,29 +1131,29 @@ fn parse_scaled_decimal_text(s: &str, scale: i32) -> Result<i64> {
     let frac_part = parts.next().unwrap_or("");
 
     if int_part.is_empty() && frac_part.is_empty() {
-        return Err(MonaxError::Protocol(format!("invalid Decimal '{}'", s)));
+        return Err(TaibaiError::Protocol(format!("invalid Decimal '{}'", s)));
     }
     if !int_part.chars().all(|c| c.is_ascii_digit())
         || !frac_part.chars().all(|c| c.is_ascii_digit())
     {
-        return Err(MonaxError::Protocol(format!("invalid Decimal '{}'", s)));
+        return Err(TaibaiError::Protocol(format!("invalid Decimal '{}'", s)));
     }
 
     let multiplier = 10_i64
         .checked_pow(scale as u32)
-        .ok_or_else(|| MonaxError::Protocol(format!("Decimal scale {} overflows", scale)))?;
+        .ok_or_else(|| TaibaiError::Protocol(format!("Decimal scale {} overflows", scale)))?;
     let int_value = if int_part.is_empty() {
         0
     } else {
         int_part
             .parse::<i64>()
-            .map_err(|e| MonaxError::Protocol(format!("invalid Decimal '{}': {}", s, e)))?
+            .map_err(|e| TaibaiError::Protocol(format!("invalid Decimal '{}': {}", s, e)))?
     };
 
     let mut frac = frac_part.to_string();
     let scale_usize = scale as usize;
     if frac.len() > scale_usize {
-        return Err(MonaxError::Protocol(format!(
+        return Err(TaibaiError::Protocol(format!(
             "Decimal '{}' exceeds scale {}",
             s, scale
         )));
@@ -1165,13 +1165,13 @@ fn parse_scaled_decimal_text(s: &str, scale: i32) -> Result<i64> {
         0
     } else {
         frac.parse::<i64>()
-            .map_err(|e| MonaxError::Protocol(format!("invalid Decimal '{}': {}", s, e)))?
+            .map_err(|e| TaibaiError::Protocol(format!("invalid Decimal '{}': {}", s, e)))?
     };
 
     let magnitude = int_value
         .checked_mul(multiplier)
         .and_then(|v| v.checked_add(frac_value))
-        .ok_or_else(|| MonaxError::Protocol(format!("Decimal '{}' overflows", s)))?;
+        .ok_or_else(|| TaibaiError::Protocol(format!("Decimal '{}' overflows", s)))?;
     Ok(if negative { -magnitude } else { magnitude })
 }
 

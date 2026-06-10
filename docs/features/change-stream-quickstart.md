@@ -1,10 +1,10 @@
 # 变更流快速入门
 
-本快速入门展示外部消费者如何订阅 Monax 变更流、持久化处理事件以及 ACK 消费者偏移量。
+本快速入门展示外部消费者如何订阅 Taibai 变更流、持久化处理事件以及 ACK 消费者偏移量。
 
-协议级详情请参阅 `docs/change-stream.md`。
+协议级详情请参阅 `change-stream.md`。
 
-## 1. 启动 Monax
+## 1. 启动 Taibai
 
 使用常规的服务器启动流程。默认监听地址为：
 
@@ -55,11 +55,11 @@ GRANT SUBSCRIBE ON DATABASE main TO app_user;
 使用一个连接用于流式传输，另一个连接用于 ACK。流连接在调用 `subscribe_changes_*` 后专门用于变更事件。
 
 ```rust
-use monax::net::client::Client;
-use monax::storage::change_stream::ChangeOperation;
+use taibai::net::client::Client;
+use taibai::storage::change_stream::ChangeOperation;
 
 #[tokio::main]
-async fn main() -> monax::common::error::Result<()> {
+async fn main() -> taibai::common::error::Result<()> {
     let mut stream = Client::connect("127.0.0.1:5151").await?;
     stream.login("app_user", "app_pw", "main").await?;
 
@@ -561,7 +561,7 @@ ack(event.sequence)
 
 ## 7. 事务性 ACK 模式
 
-如果消费者将其处理结果或幂等表存储在 Monax 中，将工作和 ACK 放在同一个 SQL 事务中：
+如果消费者将其处理结果或幂等表存储在 Taibai 中，将工作和 ACK 放在同一个 SQL 事务中：
 
 ```sql
 BEGIN;
@@ -574,7 +574,7 @@ ACK CHANGE CONSUMER 'order-indexer' TO 1288;
 COMMIT;
 ```
 
-如果事务回滚，ACK 也会回滚。这为存储在 Monax 中的副作用提供有效一次的行为。
+如果事务回滚，ACK 也会回滚。这为存储在 Taibai 中的副作用提供有效一次的行为。
 
 对于外部系统，这不是分布式事务。继续使用接收器端的幂等性。
 
@@ -666,7 +666,7 @@ DROP CHANGE CONSUMER 'order-indexer';
 change stream lagged, skipped N events
 ```
 
-说明消费者落后于实时广播缓冲区。使用相同的 `consumer_group` 重新连接；当 ACK 的序列号仍然保留时，Monax 将从持久化的变更日志重放。
+说明消费者落后于实时广播缓冲区。使用相同的 `consumer_group` 重新连接；当 ACK 的序列号仍然保留时，Taibai 将从持久化的变更日志重放。
 
 如果请求的序列早于 `earliest_sequence`，从全表快照重建消费者，然后将消费者组重置到快照边界。
 

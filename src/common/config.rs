@@ -164,7 +164,7 @@ impl ServerConfig {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "monax", about = "A columnar database server", version)]
+#[command(name = "taibai", about = "A columnar database server", version)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,

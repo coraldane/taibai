@@ -1,9 +1,9 @@
-use monax::protocol::types::DataType;
-use monax::storage::segment::meta::{compact_sidecar_footer_if_needed, sidecar_meta_path};
-use monax::storage::segment::{encode_segment_footer, SegmentReader};
-use monax::storage::segment_manager::{SegmentConfig, SegmentManager};
-use monax::types::batch::{ColumnDef, RecordBatch, Schema};
-use monax::types::scalar::ScalarValue;
+use taibai::protocol::types::DataType;
+use taibai::storage::segment::meta::{compact_sidecar_footer_if_needed, sidecar_meta_path};
+use taibai::storage::segment::{encode_segment_footer, SegmentReader};
+use taibai::storage::segment_manager::{SegmentConfig, SegmentManager};
+use taibai::types::batch::{ColumnDef, RecordBatch, Schema};
+use taibai::types::scalar::ScalarValue;
 use tempfile::TempDir;
 
 fn schema() -> Schema {

@@ -234,7 +234,7 @@ pub fn eval_const_usize(expr: &Expr) -> crate::common::error::Result<usize> {
     match expr {
         Expr::Literal(ScalarValue::Int64(Some(v))) => Ok(*v as usize),
         Expr::Literal(ScalarValue::Int32(Some(v))) => Ok(*v as usize),
-        _ => Err(crate::common::error::MonaxError::Sql(
+        _ => Err(crate::common::error::TaibaiError::Sql(
             "expected integer literal for LIMIT/OFFSET".into(),
         )),
     }

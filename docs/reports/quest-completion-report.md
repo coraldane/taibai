@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This report documents the completion of P0-P1 optimization tasks for the Monax columnar database. All critical performance optimizations have been successfully implemented and integrated.
+This report documents the completion of P0-P1 optimization tasks for the Taibai columnar database. All critical performance optimizations have been successfully implemented and integrated.
 
 ---
 

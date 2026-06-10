@@ -5,9 +5,9 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
-use monax::common::error::{MonaxError, Result};
-use monax::protocol::codec::MessageCodec;
-use monax::protocol::message::*;
+use taibai::common::error::{TaibaiError, Result};
+use taibai::protocol::codec::MessageCodec;
+use taibai::protocol::message::*;
 
 pub struct BulkClient {
     framed: Framed<TcpStream, MessageCodec>,
@@ -42,9 +42,9 @@ impl BulkClient {
             MSG_TYPE_AUTH_OK => Ok(()),
             MSG_TYPE_AUTH_FAIL => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Auth(msg))
+                Err(TaibaiError::Auth(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected login response type: {other:#04X}"
             ))),
         }
@@ -73,9 +73,9 @@ impl BulkClient {
             }
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Protocol(msg))
+                Err(TaibaiError::Protocol(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected flush response type: {other:#04X}"
             ))),
         }
@@ -94,9 +94,9 @@ impl BulkClient {
             }
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Protocol(msg))
+                Err(TaibaiError::Protocol(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected response type: {other:#04X}"
             ))),
         }
@@ -112,16 +112,16 @@ impl BulkClient {
         use tokio::time::timeout;
         timeout(self.default_timeout, self.framed.send(msg))
             .await
-            .map_err(|_| MonaxError::Network("send timeout".into()))?
-            .map_err(|e| MonaxError::Network(format!("send error: {}", e)))
+            .map_err(|_| TaibaiError::Network("send timeout".into()))?
+            .map_err(|e| TaibaiError::Network(format!("send error: {}", e)))
     }
 
     async fn recv(&mut self) -> Result<Message> {
         use tokio::time::timeout;
         timeout(self.default_timeout, self.framed.next())
             .await
-            .map_err(|_| MonaxError::Network("recv timeout".into()))?
-            .ok_or_else(|| MonaxError::Network("connection closed".into()))?
-            .map_err(|e| MonaxError::Network(format!("recv error: {}", e)))
+            .map_err(|_| TaibaiError::Network("recv timeout".into()))?
+            .ok_or_else(|| TaibaiError::Network("connection closed".into()))?
+            .map_err(|e| TaibaiError::Network(format!("recv error: {}", e)))
     }
 }

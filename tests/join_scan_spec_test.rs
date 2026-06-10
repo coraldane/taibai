@@ -1,8 +1,8 @@
 use tempfile::TempDir;
 
-use monax::net::session::Session;
-use monax::sql::execution::engine::{Engine, ExecResult};
-use monax::types::scalar::ScalarValue;
+use taibai::net::session::Session;
+use taibai::sql::execution::engine::{Engine, ExecResult};
+use taibai::types::scalar::ScalarValue;
 
 #[test]
 fn join_scan_spec_only_collects_filters_for_the_target_table() {

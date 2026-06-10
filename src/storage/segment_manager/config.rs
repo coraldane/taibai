@@ -29,7 +29,7 @@ impl Default for SegmentConfig {
 pub(super) fn bulk_compression_level() -> i32 {
     static LEVEL: OnceLock<i32> = OnceLock::new();
     *LEVEL.get_or_init(|| {
-        std::env::var("MONAX_BULK_ZSTD_LEVEL")
+        std::env::var("TAIBAI_BULK_ZSTD_LEVEL")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(1)
@@ -39,7 +39,7 @@ pub(super) fn bulk_compression_level() -> i32 {
 pub(super) fn reader_cache_capacity() -> usize {
     static CAPACITY: OnceLock<usize> = OnceLock::new();
     *CAPACITY.get_or_init(|| {
-        std::env::var("MONAX_READER_CACHE_CAPACITY")
+        std::env::var("TAIBAI_READER_CACHE_CAPACITY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)

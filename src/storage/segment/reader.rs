@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::storage::codec::column_codec::{decode_column, decode_column_selected};
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
@@ -85,7 +85,7 @@ impl SegmentReader {
         let file_len = file.metadata()?.len();
 
         if file_len < SEGMENT_HEADER_SIZE as u64 {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "segment file too small: {} bytes (need >= {})",
                 file_len, SEGMENT_HEADER_SIZE
             )));
@@ -98,7 +98,7 @@ impl SegmentReader {
         let hdr_magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
         let hdr_version = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
         if hdr_magic != SEGMENT_MAGIC {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "invalid segment header magic: {:08X}, expected {:08X} ({})",
                 hdr_magic,
                 SEGMENT_MAGIC,
@@ -106,7 +106,7 @@ impl SegmentReader {
             )));
         }
         if hdr_version != SEGMENT_VERSION {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "unsupported segment version: {} (expected {}, file: {})",
                 hdr_version,
                 SEGMENT_VERSION,
@@ -117,7 +117,7 @@ impl SegmentReader {
         let footer_source = Self::read_footer_source(path, Some(file_len))?;
         if footer_source.data_end < SEGMENT_HEADER_SIZE as u64 || footer_source.data_end > file_len
         {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "invalid footer data_end: {} (file size {}, header size {})",
                 footer_source.data_end, file_len, SEGMENT_HEADER_SIZE
             )));
@@ -128,7 +128,7 @@ impl SegmentReader {
             tmp_file.seek(SeekFrom::Start(0))?;
             tmp_file.read_to_end(&mut buf)?;
             if buf.len() != file_len as usize {
-                return Err(MonaxError::Storage(format!(
+                return Err(TaibaiError::Storage(format!(
                     "segment file changed while opening: expected {} bytes, read {} bytes ({})",
                     file_len,
                     buf.len(),
@@ -274,7 +274,7 @@ impl SegmentReader {
             None => file.metadata()?.len(),
         };
         if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "segment file too small: {}",
                 file_len
             )));
@@ -284,7 +284,7 @@ impl SegmentReader {
         file.read_exact(&mut tail)?;
         let footer_offset = u64::from_le_bytes(tail);
         if footer_offset >= file_len - 8 {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "invalid footer offset {}",
                 footer_offset
             )));
@@ -320,7 +320,7 @@ impl SegmentReader {
         let compressed = &data[col_offset..col_offset + col_len];
 
         zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-            .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))
+            .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))
     }
 
     pub fn read_row_group_batch(
@@ -367,7 +367,7 @@ impl SegmentReader {
             buf.reserve(col_len * 3);
 
             let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-                .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
 
             pool.release(buf);
 
@@ -420,7 +420,7 @@ impl SegmentReader {
                 let col_len = rg.column_compressed_sizes[col_idx] as usize;
                 let compressed = &all_data[col_offset..col_offset + col_len];
                 let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-                    .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
+                    .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
 
                 let col_def = &self.footer.schema.columns[col_idx];
                 let col_array = decode_column_selected(
@@ -461,7 +461,7 @@ impl SegmentReader {
         column_names: &[String],
     ) -> Result<crate::types::batch::RecordBatch> {
         if global_row_idx >= self.row_count() as usize {
-            return Err(crate::common::error::MonaxError::Internal(format!(
+            return Err(crate::common::error::TaibaiError::Internal(format!(
                 "row index {} out of bounds for segment with {} rows",
                 global_row_idx,
                 self.row_count()
@@ -735,7 +735,7 @@ impl SegmentReader {
         let compressed = &data[col_offset..col_offset + col_len];
 
         let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-            .map_err(|e| MonaxError::Storage(format!("zstd decompress error: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
 
         crate::storage::codec::predicate_scan::count_eq_from_raw(
             &decompressed,

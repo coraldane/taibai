@@ -1,6 +1,6 @@
-# Monax
+# Taibai
 
-Monax 是一个使用 Rust 实现的列式数据库服务器，线协议兼容 taibai-go。
+Taibai 是一个使用 Rust 实现的列式数据库服务器，线协议兼容 taibai-go。
 
 ## 功能特性
 
@@ -39,11 +39,11 @@ make package-all
 ### 安装
 
 ```bash
-# 安装到默认位置（/usr/local/monax）
+# 安装到默认位置（/usr/local/taibai）
 sudo make install
 
 # 安装到自定义位置
-sudo make install PREFIX=/opt/monax
+sudo make install PREFIX=/opt/taibai
 ```
 
 ### 运行
@@ -53,7 +53,7 @@ sudo make install PREFIX=/opt/monax
 make start
 
 # 或直接运行
-./target/release/monax --config conf/example.yaml
+./target/release/taibai --config conf/example.yaml
 
 # 查看服务状态
 make status
@@ -65,7 +65,7 @@ make stop
 ## 项目结构
 
 ```
-monax/
+taibai/
 ├── Makefile              # 构建系统入口
 ├── Cargo.toml            # Rust 包清单
 ├── build.rs              # 构建脚本（嵌入版本信息）
@@ -114,16 +114,16 @@ monax/
 安装完成后会创建以下目录：
 
 ```
-/usr/local/monax/
+/usr/local/taibai/
 ├── bin/                  # 二进制文件
-│   └── monax
+│   └── taibai
 ├── conf/                 # 配置文件
-│   └── monax.yaml
+│   └── taibai.yaml
 ├── data/                 # 数据库文件
 ├── log/                  # 日志文件
-│   └── monax.log
+│   └── taibai.log
 └── run/                  # PID 文件
-    └── monax.pid
+    └── taibai.pid
 ```
 
 ## 服务管理
@@ -131,25 +131,25 @@ monax/
 ### Linux（systemd）
 
 ```bash
-sudo systemctl start monax    # 启动服务
-sudo systemctl stop monax     # 停止服务
-sudo systemctl status monax   # 查看状态
-sudo systemctl enable monax   # 设置开机自启
-sudo journalctl -u monax -f   # 查看日志
+sudo systemctl start taibai    # 启动服务
+sudo systemctl stop taibai     # 停止服务
+sudo systemctl status taibai   # 查看状态
+sudo systemctl enable taibai   # 设置开机自启
+sudo journalctl -u taibai -f   # 查看日志
 ```
 
 ### macOS（launchd）
 
 ```bash
-sudo launchctl load /Library/LaunchDaemons/com.monax.server.plist    # 启动
-sudo launchctl unload /Library/LaunchDaemons/com.monax.server.plist  # 停止
-sudo launchctl list | grep monax                                      # 查看状态
-tail -f /usr/local/monax/log/stdout.log                               # 查看日志
+sudo launchctl load /Library/LaunchDaemons/com.taibai.server.plist    # 启动
+sudo launchctl unload /Library/LaunchDaemons/com.taibai.server.plist  # 停止
+sudo launchctl list | grep taibai                                      # 查看状态
+tail -f /usr/local/taibai/log/stdout.log                               # 查看日志
 ```
 
 ## 配置
 
-配置文件：`conf/monax.yaml`（也可以使用 `conf/example.yaml` 作为模板）
+配置文件：`conf/taibai.yaml`（也可以使用 `conf/example.yaml` 作为模板）
 
 ```yaml
 server:
@@ -158,7 +158,7 @@ server:
   max_message_size: 67108864  # 64MB
 
 storage:
-  data_dir: "/usr/local/monax/data"
+  data_dir: "/usr/local/taibai/data"
   default_database: "main"
   flush_threshold_rows: 65536
   min_segment_seal_size_mb: 500
@@ -200,7 +200,7 @@ rustup target add aarch64-apple-darwin
 
 ```bash
 # 查看版本
-./target/release/monax --version
+./target/release/taibai --version
 
 # 构建时指定自定义版本
 VERSION=1.0.0 make build

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::segment::ScanStats;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
@@ -45,7 +45,7 @@ fn exec_select_inner(
     let from = match stmt {
         Statement::Select { from, .. } => from,
         _ => {
-            return Err(MonaxError::Internal(
+            return Err(TaibaiError::Internal(
                 "exec_select called with non-SELECT".into(),
             ))
         }
@@ -116,12 +116,12 @@ fn exec_table_select(
 
         for table_ref in &table_refs {
             let catalog = catalogs.get(&table_ref.database).ok_or_else(|| {
-                MonaxError::Sql(format!("database '{}' does not exist", table_ref.database))
+                TaibaiError::Sql(format!("database '{}' does not exist", table_ref.database))
             })?;
             let meta = catalog
                 .get_table(&table_ref.table)
                 .ok_or_else(|| {
-                    MonaxError::Sql(format!(
+                    TaibaiError::Sql(format!(
                         "table '{}.{}' does not exist",
                         table_ref.database, table_ref.table
                     ))
@@ -384,7 +384,7 @@ fn execute_in_subquery(
     subquery: &Statement,
 ) -> Result<Vec<ScalarValue>> {
     let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
-        return Err(MonaxError::Sql("IN subquery must be a SELECT".into()));
+        return Err(TaibaiError::Sql("IN subquery must be a SELECT".into()));
     };
 
     let mut values = Vec::new();
@@ -607,13 +607,13 @@ pub fn exec_union(
     let left_batches = match left_result {
         ExecResult::Query { batches, .. } => batches,
         ExecResult::Ok { .. } => {
-            return Err(MonaxError::Sql("UNION left side returned no data".into()))
+            return Err(TaibaiError::Sql("UNION left side returned no data".into()))
         }
     };
     let right_batches = match right_result {
         ExecResult::Query { batches, .. } => batches,
         ExecResult::Ok { .. } => {
-            return Err(MonaxError::Sql("UNION right side returned no data".into()))
+            return Err(TaibaiError::Sql("UNION right side returned no data".into()))
         }
     };
 
@@ -622,7 +622,7 @@ pub fn exec_union(
     } else if !right_batches.is_empty() {
         right_batches[0].schema.clone()
     } else {
-        return Err(MonaxError::Sql("UNION with empty result sets".into()));
+        return Err(TaibaiError::Sql("UNION with empty result sets".into()));
     };
 
     let mut combined_batches = left_batches;
@@ -675,7 +675,7 @@ fn exec_union_recursive(engine: &Engine, db: &str, stmt: &Statement) -> Result<E
             offset,
         } => exec_union(engine, db, left, right, *all, order_by, limit, offset),
         Statement::Select { .. } => exec_select(engine, db, stmt),
-        _ => Err(MonaxError::Sql(format!(
+        _ => Err(TaibaiError::Sql(format!(
             "UNION component must be SELECT, got {:?}",
             stmt
         ))),

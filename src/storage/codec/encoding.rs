@@ -21,7 +21,7 @@ impl EncodingType {
             3 => Ok(EncodingType::Delta),
             4 => Ok(EncodingType::DeltaOfDelta),
             5 => Ok(EncodingType::BitPacked),
-            _ => Err(crate::common::error::MonaxError::Storage(format!(
+            _ => Err(crate::common::error::TaibaiError::Storage(format!(
                 "unknown encoding type: {}",
                 v
             ))),

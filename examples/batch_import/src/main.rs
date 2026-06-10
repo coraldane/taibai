@@ -4,7 +4,7 @@ use std::io::{BufReader, Read};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use monax::net::client::{BulkImportConfig, Client};
+use taibai::net::client::{BulkImportConfig, Client};
 use tokio::sync::mpsc;
 
 #[allow(dead_code)]
@@ -200,10 +200,10 @@ async fn ensure_tick_table(client: &mut Client) {
     );
 
     match client.query(&sql).await {
-        Ok(monax::net::client::QueryResult::Ok { .. }) => {
+        Ok(taibai::net::client::QueryResult::Ok { .. }) => {
             println!("Table '{}' ensured.", TICK_TABLE);
         }
-        Ok(monax::net::client::QueryResult::Error(e)) => {
+        Ok(taibai::net::client::QueryResult::Error(e)) => {
             println!("Table ensure warning: {}", e);
         }
         Ok(_) => {}
@@ -687,7 +687,7 @@ fn encode_interned_varchar_column(buf: &mut Vec<u8>, name: &str, indices: &[u32]
     write_column_header(
         buf,
         name,
-        monax::protocol::types::DataType::VarChar as u8,
+        taibai::protocol::types::DataType::VarChar as u8,
         0,
         0,
         indices.len() as u32,
@@ -704,7 +704,7 @@ fn encode_int32_column_fast(buf: &mut Vec<u8>, name: &str, data: &[i32]) {
     write_column_header(
         buf,
         name,
-        monax::protocol::types::DataType::Int32 as u8,
+        taibai::protocol::types::DataType::Int32 as u8,
         0,
         0,
         data.len() as u32,
@@ -717,7 +717,7 @@ fn encode_int64_column_fast(buf: &mut Vec<u8>, name: &str, data: &[i64]) {
     write_column_header(
         buf,
         name,
-        monax::protocol::types::DataType::Int64 as u8,
+        taibai::protocol::types::DataType::Int64 as u8,
         0,
         0,
         data.len() as u32,
@@ -736,7 +736,7 @@ fn encode_decimal_column_fast(
     write_column_header(
         buf,
         name,
-        monax::protocol::types::DataType::Decimal as u8,
+        taibai::protocol::types::DataType::Decimal as u8,
         scale,
         precision,
         data.len() as u32,
@@ -749,7 +749,7 @@ fn encode_timestamp_column_fast(buf: &mut Vec<u8>, name: &str, data: &[i64]) {
     write_column_header(
         buf,
         name,
-        monax::protocol::types::DataType::Timestamp as u8,
+        taibai::protocol::types::DataType::Timestamp as u8,
         0,
         0,
         data.len() as u32,

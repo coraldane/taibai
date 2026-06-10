@@ -1,6 +1,6 @@
 use std::io::{self, Cursor, Read};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 pub fn read_u8(cursor: &mut Cursor<&[u8]>) -> std::result::Result<u8, io::Error> {
     let mut buf = [0u8; 1];
@@ -33,14 +33,14 @@ pub fn read_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     let mut shift = 0u32;
     loop {
         let byte = read_u8(cursor)
-            .map_err(|e| MonaxError::Storage(format!("varint read error: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("varint read error: {}", e)))?;
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
         }
         shift += 7;
         if shift >= 64 {
-            return Err(MonaxError::Storage("varint too long".into()));
+            return Err(TaibaiError::Storage("varint too long".into()));
         }
     }
 }

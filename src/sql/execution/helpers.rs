@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -12,11 +12,11 @@ pub fn eval_expr_to_int(expr: &Expr) -> Result<i64> {
         Expr::Literal(ScalarValue::Int32(Some(v))) => Ok(*v as i64),
         Expr::Literal(ScalarValue::UInt64(Some(v))) => Ok(*v as i64),
         Expr::Literal(ScalarValue::UInt32(Some(v))) => Ok(*v as i64),
-        Expr::Literal(v) => Err(MonaxError::Sql(format!(
+        Expr::Literal(v) => Err(TaibaiError::Sql(format!(
             "expected integer literal for OFFSET/LIMIT, got {:?}",
             v
         ))),
-        _ => Err(MonaxError::Sql(
+        _ => Err(TaibaiError::Sql(
             "OFFSET/LIMIT requires a constant integer expression".into(),
         )),
     }
@@ -273,7 +273,7 @@ pub fn eval_expr_for_row(
         Expr::Column(col_name) => {
             let col_idx = schema
                 .index_of(col_name)
-                .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", col_name)))?;
+                .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", col_name)))?;
             Ok(batch
                 .scalar(row_idx, col_idx)
                 .unwrap_or(ScalarValue::null_for_type(
@@ -306,7 +306,7 @@ pub fn eval_expr_for_row(
         Expr::QualifiedColumn { column, .. } => {
             let col_idx = schema
                 .index_of(column)
-                .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", column)))?;
+                .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", column)))?;
             Ok(batch
                 .scalar(row_idx, col_idx)
                 .unwrap_or(ScalarValue::null_for_type(
@@ -355,7 +355,7 @@ fn coerce_scalar_for_dtype(value: &ScalarValue, dtype: DataType) -> Result<Scala
     match (dtype, value) {
         (DataType::Int32, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int32(Some(
             i32::try_from(*v)
-                .map_err(|_| MonaxError::Sql(format!("value '{}' overflows INT32", v)))?,
+                .map_err(|_| TaibaiError::Sql(format!("value '{}' overflows INT32", v)))?,
         ))),
         (DataType::Int64, ScalarValue::Int32(Some(v))) => Ok(ScalarValue::Int64(Some(*v as i64))),
         _ => Ok(value.clone()),
@@ -389,7 +389,7 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
                 match v.to_ascii_lowercase().as_str() {
                     "true" | "1" => Ok(ScalarValue::Bool(Some(true))),
                     "false" | "0" => Ok(ScalarValue::Bool(Some(false))),
-                    _ => Err(MonaxError::Sql(format!("invalid bool '{}'", v))),
+                    _ => Err(TaibaiError::Sql(format!("invalid bool '{}'", v))),
                 }
             }
             (DataType::Int64, ScalarValue::Int32(Some(v))) => {
@@ -397,20 +397,20 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
             }
             (DataType::Int32, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int32(Some(
                 i32::try_from(*v)
-                    .map_err(|_| MonaxError::Sql(format!("value '{}' overflows INT32", v)))?,
+                    .map_err(|_| TaibaiError::Sql(format!("value '{}' overflows INT32", v)))?,
             ))),
             (DataType::Int16, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int16(Some(
                 i16::try_from(*v)
-                    .map_err(|_| MonaxError::Sql(format!("value '{}' overflows INT16", v)))?,
+                    .map_err(|_| TaibaiError::Sql(format!("value '{}' overflows INT16", v)))?,
             ))),
             (DataType::Int8, ScalarValue::Int64(Some(v))) => {
                 Ok(ScalarValue::Int8(Some(i8::try_from(*v).map_err(|_| {
-                    MonaxError::Sql(format!("value '{}' overflows INT8", v))
+                    TaibaiError::Sql(format!("value '{}' overflows INT8", v))
                 })?)))
             }
             (DataType::UInt64, ScalarValue::Int64(Some(v))) => {
                 if *v < 0 {
-                    return Err(MonaxError::Sql(format!(
+                    return Err(TaibaiError::Sql(format!(
                         "negative value '{}' for UINT64",
                         v
                     )));
@@ -419,32 +419,32 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
             }
             (DataType::UInt32, ScalarValue::Int64(Some(v))) => {
                 if *v < 0 {
-                    return Err(MonaxError::Sql(format!(
+                    return Err(TaibaiError::Sql(format!(
                         "negative value '{}' for UINT32",
                         v
                     )));
                 }
                 Ok(ScalarValue::UInt32(Some(u32::try_from(*v).map_err(
-                    |_| MonaxError::Sql(format!("value '{}' overflows UINT32", v)),
+                    |_| TaibaiError::Sql(format!("value '{}' overflows UINT32", v)),
                 )?)))
             }
             (DataType::UInt16, ScalarValue::Int64(Some(v))) => {
                 if *v < 0 {
-                    return Err(MonaxError::Sql(format!(
+                    return Err(TaibaiError::Sql(format!(
                         "negative value '{}' for UINT16",
                         v
                     )));
                 }
                 Ok(ScalarValue::UInt16(Some(u16::try_from(*v).map_err(
-                    |_| MonaxError::Sql(format!("value '{}' overflows UINT16", v)),
+                    |_| TaibaiError::Sql(format!("value '{}' overflows UINT16", v)),
                 )?)))
             }
             (DataType::UInt8, ScalarValue::Int64(Some(v))) => {
                 if *v < 0 {
-                    return Err(MonaxError::Sql(format!("negative value '{}' for UINT8", v)));
+                    return Err(TaibaiError::Sql(format!("negative value '{}' for UINT8", v)));
                 }
                 Ok(ScalarValue::UInt8(Some(u8::try_from(*v).map_err(
-                    |_| MonaxError::Sql(format!("value '{}' overflows UINT8", v)),
+                    |_| TaibaiError::Sql(format!("value '{}' overflows UINT8", v)),
                 )?)))
             }
             (DataType::Float64, ScalarValue::Int64(Some(v))) => {
@@ -466,7 +466,7 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
                 let multiplier = decimal_multiplier(scale)?;
                 Ok(ScalarValue::Decimal(Some(
                     v.checked_mul(multiplier).ok_or_else(|| {
-                        MonaxError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
+                        TaibaiError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
                     })?,
                 )))
             }
@@ -507,11 +507,11 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
 
 fn decimal_multiplier(scale: i32) -> Result<i64> {
     if !(0..=18).contains(&scale) {
-        return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
+        return Err(TaibaiError::Sql(format!("invalid decimal scale {}", scale)));
     }
     10_i64
         .checked_pow(scale as u32)
-        .ok_or_else(|| MonaxError::Sql(format!("invalid decimal scale {}", scale)))
+        .ok_or_else(|| TaibaiError::Sql(format!("invalid decimal scale {}", scale)))
 }
 
 pub fn sort_batch_by_key(

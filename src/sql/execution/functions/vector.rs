@@ -10,7 +10,7 @@ fn get_vector(args: &[ScalarValue], idx: usize) -> Option<Vec<f32>> {
                 .split(',')
                 .map(|p| {
                     p.trim().parse::<f32>().map_err(|e| {
-                        crate::common::error::MonaxError::Sql(format!(
+                        crate::common::error::TaibaiError::Sql(format!(
                             "invalid vector element: {}",
                             e
                         ))
@@ -56,7 +56,7 @@ pub fn vector_distance(args: &[ScalarValue]) -> Result<ScalarValue> {
                 }
                 "manhattan" => a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum(),
                 _ => {
-                    return Err(crate::common::error::MonaxError::Sql(format!(
+                    return Err(crate::common::error::TaibaiError::Sql(format!(
                         "unknown distance metric '{}'",
                         metric
                     )))

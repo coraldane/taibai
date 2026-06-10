@@ -2,7 +2,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::storage::bulk_payload::DirectBulkColumn;
 use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::partition::pruning::compute_segment_zone_maps_from_row_groups;
@@ -131,7 +131,7 @@ impl ActiveSegmentWriter {
                 let encoded = encode_column_direct_range(col, 0, rows_to_flush);
                 let orig_len = encoded.len() as u64;
                 let compressed = zstd::bulk::compress(&encoded, compression_level)
-                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
+                    .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
                 Ok((compressed, orig_len))
             })
             .collect::<Result<Vec<_>>>()?;

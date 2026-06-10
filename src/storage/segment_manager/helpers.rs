@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::bulk_payload::{DirectBulkColumn, DirectBulkRequest};
 use crate::storage::partition::pruning::ZoneMap;
@@ -15,8 +15,8 @@ pub fn table_key(db: &str, table: &str) -> String {
     format!("{}:{}", db, table)
 }
 
-pub(super) fn is_transient_footer_error(err: &MonaxError) -> bool {
-    matches!(err, MonaxError::Storage(msg) if msg.contains("invalid footer offset"))
+pub(super) fn is_transient_footer_error(err: &TaibaiError) -> bool {
+    matches!(err, TaibaiError::Storage(msg) if msg.contains("invalid footer offset"))
 }
 
 pub(super) fn ensure_state_not_retired(
@@ -25,7 +25,7 @@ pub(super) fn ensure_state_not_retired(
     table: &str,
 ) -> Result<()> {
     if state.retired.load(Ordering::Acquire) {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "table '{}.{}' was removed while a write was waiting",
             db, table
         )));
@@ -112,9 +112,9 @@ fn direct_bulk_column_scalar_at(col: &DirectBulkColumn<'_>, row_idx: usize) -> R
     if let Some(width) = col.data_type.fixed_size() {
         let offset = row_idx
             .checked_mul(width)
-            .ok_or_else(|| MonaxError::Protocol("bulk column offset overflow".into()))?;
+            .ok_or_else(|| TaibaiError::Protocol("bulk column offset overflow".into()))?;
         return read_fixed_scalar(col.data, offset, col.data_type).ok_or_else(|| {
-            MonaxError::Protocol(format!(
+            TaibaiError::Protocol(format!(
                 "bulk column '{}' row {} is truncated",
                 col.name, row_idx
             ))
@@ -125,7 +125,7 @@ fn direct_bulk_column_scalar_at(col: &DirectBulkColumn<'_>, row_idx: usize) -> R
     match col.data_type {
         DataType::VarChar => {
             let s = std::str::from_utf8(&col.data[offset..offset + len])
-                .map_err(|_| MonaxError::Protocol("invalid utf8 in bulk varchar".into()))?;
+                .map_err(|_| TaibaiError::Protocol("invalid utf8 in bulk varchar".into()))?;
             Ok(ScalarValue::VarChar(Some(s.to_string())))
         }
         DataType::Blob => Ok(ScalarValue::Blob(Some(
@@ -133,7 +133,7 @@ fn direct_bulk_column_scalar_at(col: &DirectBulkColumn<'_>, row_idx: usize) -> R
         ))),
         DataType::Vector => {
             if len % 4 != 0 {
-                return Err(MonaxError::Protocol(
+                return Err(TaibaiError::Protocol(
                     "bulk vector payload length must be a multiple of 4".into(),
                 ));
             }
@@ -143,7 +143,7 @@ fn direct_bulk_column_scalar_at(col: &DirectBulkColumn<'_>, row_idx: usize) -> R
             }
             Ok(ScalarValue::Vector(Some(values)))
         }
-        _ => Err(MonaxError::Protocol(format!(
+        _ => Err(TaibaiError::Protocol(format!(
             "unsupported variable bulk type {}",
             col.data_type.display_name()
         ))),
@@ -156,7 +156,7 @@ fn direct_bulk_variable_range_at(
 ) -> Result<(usize, usize)> {
     if let Some(ranges) = &col.variable_ranges {
         return ranges.get(target_row).copied().ok_or_else(|| {
-            MonaxError::Protocol(format!(
+            TaibaiError::Protocol(format!(
                 "bulk column '{}' row {} not found",
                 col.name, target_row
             ))
@@ -169,7 +169,7 @@ fn direct_bulk_variable_range_at(
             continue;
         }
         if offset + 4 > col.data.len() {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "bulk column '{}' variable length prefix truncated",
                 col.name
             )));
@@ -177,7 +177,7 @@ fn direct_bulk_variable_range_at(
         let len = u32::from_le_bytes(col.data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if offset + len > col.data.len() {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "bulk column '{}' variable data truncated",
                 col.name
             )));
@@ -187,7 +187,7 @@ fn direct_bulk_variable_range_at(
         }
         offset += len;
     }
-    Err(MonaxError::Protocol(format!(
+    Err(TaibaiError::Protocol(format!(
         "bulk column '{}' row {} not found",
         col.name, target_row
     )))

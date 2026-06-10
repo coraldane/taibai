@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::codec::io_util::{read_u32_le, read_u8};
 use crate::types::scalar::ScalarValue;
@@ -100,7 +100,7 @@ fn scalar_tag(v: &ScalarValue) -> u8 {
 }
 
 pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<ScalarValue> {
-    let tag = read_u8(cursor).map_err(|e| MonaxError::Storage(format!("read tag: {}", e)))?;
+    let tag = read_u8(cursor).map_err(|e| TaibaiError::Storage(format!("read tag: {}", e)))?;
     let is_null = (tag & 0x80) != 0;
     let dtype_tag = tag & 0x7F;
     let dtype = match dtype_tag {
@@ -123,7 +123,7 @@ pub fn decode_scalar_with_tag(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Sca
         17 => DataType::VarChar,
         18 => DataType::Blob,
         19 => DataType::Vector,
-        other => return Err(MonaxError::Storage(format!("bad scalar tag: {}", other))),
+        other => return Err(TaibaiError::Storage(format!("bad scalar tag: {}", other))),
     };
     if is_null {
         return Ok(null_for_dtype(dtype));

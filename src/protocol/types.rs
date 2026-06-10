@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 /// Wire data type enum (19 types, aligned with taibai protocol).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ impl DataType {
             b'A' => Ok(DataType::Blob),
             b'B' => Ok(DataType::Vector),
             0 => Ok(DataType::Bool),
-            _ => Err(MonaxError::Protocol(format!("unknown DataType: {v}"))),
+            _ => Err(TaibaiError::Protocol(format!("unknown DataType: {v}"))),
         }
     }
 
@@ -160,7 +160,7 @@ impl StorageType {
             7 => Ok(StorageType::Uint32),
             8 => Ok(StorageType::Timestamp),
             18 => Ok(StorageType::Decimal),
-            _ => Err(MonaxError::Protocol(format!("unknown StorageType: {v}"))),
+            _ => Err(TaibaiError::Protocol(format!("unknown StorageType: {v}"))),
         }
     }
 

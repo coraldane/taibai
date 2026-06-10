@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common::config::ServerConfig;
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;
@@ -469,19 +469,19 @@ impl Handler {
         match dt {
             DataType::Bool => {
                 if data.is_empty() {
-                    return Err(MonaxError::Protocol("no data for Bool param".into()));
+                    return Err(TaibaiError::Protocol("no data for Bool param".into()));
                 }
                 Ok((ScalarValue::Bool(Some(data[0] != 0)), 1))
             }
             DataType::Int8 => {
                 if data.is_empty() {
-                    return Err(MonaxError::Protocol("no data for Int8 param".into()));
+                    return Err(TaibaiError::Protocol("no data for Int8 param".into()));
                 }
                 Ok((ScalarValue::Int8(Some(data[0] as i8)), 1))
             }
             DataType::Int16 => {
                 if data.len() < 2 {
-                    return Err(MonaxError::Protocol("no data for Int16 param".into()));
+                    return Err(TaibaiError::Protocol("no data for Int16 param".into()));
                 }
                 Ok((
                     ScalarValue::Int16(Some(i16::from_le_bytes([data[0], data[1]]))),
@@ -490,14 +490,14 @@ impl Handler {
             }
             DataType::Int32 => {
                 if data.len() < 4 {
-                    return Err(MonaxError::Protocol("no data for Int32 param".into()));
+                    return Err(TaibaiError::Protocol("no data for Int32 param".into()));
                 }
                 let v = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 Ok((ScalarValue::Int32(Some(v)), 4))
             }
             DataType::Int64 => {
                 if data.len() < 8 {
-                    return Err(MonaxError::Protocol("no data for Int64 param".into()));
+                    return Err(TaibaiError::Protocol("no data for Int64 param".into()));
                 }
                 let v = i64::from_le_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -506,13 +506,13 @@ impl Handler {
             }
             DataType::UInt8 => {
                 if data.is_empty() {
-                    return Err(MonaxError::Protocol("no data for UInt8 param".into()));
+                    return Err(TaibaiError::Protocol("no data for UInt8 param".into()));
                 }
                 Ok((ScalarValue::UInt8(Some(data[0])), 1))
             }
             DataType::UInt16 => {
                 if data.len() < 2 {
-                    return Err(MonaxError::Protocol("no data for UInt16 param".into()));
+                    return Err(TaibaiError::Protocol("no data for UInt16 param".into()));
                 }
                 Ok((
                     ScalarValue::UInt16(Some(u16::from_le_bytes([data[0], data[1]]))),
@@ -521,14 +521,14 @@ impl Handler {
             }
             DataType::UInt32 => {
                 if data.len() < 4 {
-                    return Err(MonaxError::Protocol("no data for UInt32 param".into()));
+                    return Err(TaibaiError::Protocol("no data for UInt32 param".into()));
                 }
                 let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 Ok((ScalarValue::UInt32(Some(v)), 4))
             }
             DataType::UInt64 => {
                 if data.len() < 8 {
-                    return Err(MonaxError::Protocol("no data for UInt64 param".into()));
+                    return Err(TaibaiError::Protocol("no data for UInt64 param".into()));
                 }
                 let v = u64::from_le_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -537,14 +537,14 @@ impl Handler {
             }
             DataType::Float32 => {
                 if data.len() < 4 {
-                    return Err(MonaxError::Protocol("no data for Float32 param".into()));
+                    return Err(TaibaiError::Protocol("no data for Float32 param".into()));
                 }
                 let v = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 Ok((ScalarValue::Float32(Some(v)), 4))
             }
             DataType::Float64 => {
                 if data.len() < 8 {
-                    return Err(MonaxError::Protocol("no data for Float64 param".into()));
+                    return Err(TaibaiError::Protocol("no data for Float64 param".into()));
                 }
                 let v = f64::from_le_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -553,7 +553,7 @@ impl Handler {
             }
             DataType::Decimal => {
                 if data.len() < 8 {
-                    return Err(MonaxError::Protocol("no data for Decimal param".into()));
+                    return Err(TaibaiError::Protocol("no data for Decimal param".into()));
                 }
                 let v = i64::from_le_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -562,14 +562,14 @@ impl Handler {
             }
             DataType::Date => {
                 if data.len() < 4 {
-                    return Err(MonaxError::Protocol("no data for Date param".into()));
+                    return Err(TaibaiError::Protocol("no data for Date param".into()));
                 }
                 let v = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 Ok((ScalarValue::Date(Some(v)), 4))
             }
             DataType::Time => {
                 if data.len() < 8 {
-                    return Err(MonaxError::Protocol("no data for Time param".into()));
+                    return Err(TaibaiError::Protocol("no data for Time param".into()));
                 }
                 let v = i64::from_le_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -578,7 +578,7 @@ impl Handler {
             }
             DataType::Timestamp => {
                 if data.len() < 8 {
-                    return Err(MonaxError::Protocol("no data for Timestamp param".into()));
+                    return Err(TaibaiError::Protocol("no data for Timestamp param".into()));
                 }
                 let v = i64::from_le_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -587,7 +587,7 @@ impl Handler {
             }
             DataType::Interval => {
                 if data.len() < 8 {
-                    return Err(MonaxError::Protocol("no data for Interval param".into()));
+                    return Err(TaibaiError::Protocol("no data for Interval param".into()));
                 }
                 let v = i64::from_le_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -596,35 +596,35 @@ impl Handler {
             }
             DataType::VarChar => {
                 if data.len() < 4 {
-                    return Err(MonaxError::Protocol("no data for VarChar param".into()));
+                    return Err(TaibaiError::Protocol("no data for VarChar param".into()));
                 }
                 let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
                 if data.len() < 4 + len {
-                    return Err(MonaxError::Protocol("VarChar param data truncated".into()));
+                    return Err(TaibaiError::Protocol("VarChar param data truncated".into()));
                 }
                 let s = std::str::from_utf8(&data[4..4 + len]).map_err(|e| {
-                    MonaxError::Protocol(format!("invalid UTF-8 in VarChar param: {}", e))
+                    TaibaiError::Protocol(format!("invalid UTF-8 in VarChar param: {}", e))
                 })?;
                 Ok((ScalarValue::VarChar(Some(s.to_string())), 4 + len))
             }
             DataType::Blob => {
                 if data.len() < 4 {
-                    return Err(MonaxError::Protocol("no data for Blob param".into()));
+                    return Err(TaibaiError::Protocol("no data for Blob param".into()));
                 }
                 let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
                 if data.len() < 4 + len {
-                    return Err(MonaxError::Protocol("Blob param data truncated".into()));
+                    return Err(TaibaiError::Protocol("Blob param data truncated".into()));
                 }
                 Ok((ScalarValue::Blob(Some(data[4..4 + len].to_vec())), 4 + len))
             }
             DataType::Vector => {
                 if data.len() < 4 {
-                    return Err(MonaxError::Protocol("no data for Vector param".into()));
+                    return Err(TaibaiError::Protocol("no data for Vector param".into()));
                 }
                 let dim = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
                 let total = 4 + dim * 4;
                 if data.len() < total {
-                    return Err(MonaxError::Protocol("Vector param data truncated".into()));
+                    return Err(TaibaiError::Protocol("Vector param data truncated".into()));
                 }
                 let mut floats = Vec::with_capacity(dim);
                 for i in 0..dim {

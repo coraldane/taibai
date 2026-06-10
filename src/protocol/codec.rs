@@ -1,7 +1,7 @@
 use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::message::{Message, MessageHeader, HEADER_SIZE, MSG_TYPE_QUERY};
 
 pub struct MessageCodec {
@@ -25,7 +25,7 @@ impl MessageCodec {
 
 impl Decoder for MessageCodec {
     type Item = Message;
-    type Error = MonaxError;
+    type Error = TaibaiError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Message>> {
         if src.len() < HEADER_SIZE {
@@ -37,7 +37,7 @@ impl Decoder for MessageCodec {
 
         let payload_len = header.payload_len as usize;
         if payload_len > self.max_message_size {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "payload length {payload_len} exceeds max {}",
                 self.max_message_size
             )));
@@ -72,7 +72,7 @@ impl Decoder for MessageCodec {
 }
 
 impl Encoder<Message> for MessageCodec {
-    type Error = MonaxError;
+    type Error = TaibaiError;
 
     fn encode(&mut self, msg: Message, dst: &mut BytesMut) -> Result<()> {
         let is_bulk = msg.msg_type == 0x20 || msg.msg_type == 0x21 || msg.msg_type == 0x23;

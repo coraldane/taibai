@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::storage::partition::pruning::compute_segment_zone_maps_from_row_groups;
 use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::writer::encode_segment_footer;
@@ -159,7 +159,7 @@ pub fn compact_sidecar_footer_if_needed(
     match fs::remove_file(&tmp_path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(MonaxError::Io(err)),
+        Err(err) => return Err(TaibaiError::Io(err)),
     }
 
     let mut record = Vec::with_capacity(V2_RECORD_HEADER_SIZE + footer.len() + RECORD_CRC_SIZE);
@@ -192,7 +192,7 @@ pub fn remove_sidecar_meta(segment_path: &Path) -> Result<()> {
     match fs::remove_file(&meta_path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(MonaxError::Io(err)),
+        Err(err) => Err(TaibaiError::Io(err)),
     }
 }
 
@@ -260,7 +260,7 @@ fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
         )
     };
     if ok == 0 {
-        return Err(MonaxError::Io(std::io::Error::last_os_error()));
+        return Err(TaibaiError::Io(std::io::Error::last_os_error()));
     }
     Ok(())
 }

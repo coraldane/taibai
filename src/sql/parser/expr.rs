@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{
@@ -164,7 +164,7 @@ impl Parser {
                     negated: true,
                 })
             } else {
-                Err(MonaxError::Sql(format!(
+                Err(TaibaiError::Sql(format!(
                     "expected BETWEEN, IN, or LIKE after NOT, got {}",
                     self.peek()
                 )))
@@ -252,7 +252,7 @@ impl Parser {
                     self.advance();
                 }
                 other => {
-                    return Err(MonaxError::Sql(format!(
+                    return Err(TaibaiError::Sql(format!(
                         "expected 'THEN' in CASE, got {}",
                         other
                     )))
@@ -272,7 +272,7 @@ impl Parser {
                 self.advance();
             }
             other => {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "expected 'END' in CASE, got {}",
                     other
                 )))
@@ -450,7 +450,7 @@ impl Parser {
                 self.placeholder_count += 1;
                 Ok(Expr::Placeholder(idx))
             }
-            ref other => Err(MonaxError::Sql(format!(
+            ref other => Err(TaibaiError::Sql(format!(
                 "unexpected token in expression: {}",
                 other
             ))),
@@ -598,7 +598,7 @@ impl Parser {
                 self.advance();
                 Ok(FrameBound::UnboundedFollowing)
             } else {
-                Err(MonaxError::Sql(
+                Err(TaibaiError::Sql(
                     "expected PRECEDING or FOLLOWING after UNBOUNDED".into(),
                 ))
             }
@@ -625,12 +625,12 @@ impl Parser {
                 self.advance();
                 Ok(FrameBound::Following(n))
             } else {
-                Err(MonaxError::Sql(
+                Err(TaibaiError::Sql(
                     "expected PRECEDING or FOLLOWING after integer".into(),
                 ))
             }
         } else {
-            Err(MonaxError::Sql(format!(
+            Err(TaibaiError::Sql(format!(
                 "unexpected frame bound: {}",
                 self.peek()
             )))

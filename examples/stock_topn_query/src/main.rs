@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use monax::net::client::{Client, QueryResult};
+use taibai::net::client::{Client, QueryResult};
 
 const TARGET_SQL: &str = "SELECT d.security_id, s.display_name,
     d.open_px, d.high_px, d.low_px, d.close_px, d.pre_close,
@@ -64,7 +64,7 @@ async fn main() {
     let _ = client.close().await;
 }
 
-fn print_result(result: monax::common::error::Result<QueryResult>) {
+fn print_result(result: taibai::common::error::Result<QueryResult>) {
     match result {
         Ok(QueryResult::Rows {
             schema, batches, ..

@@ -3,8 +3,8 @@ use std::thread;
 
 use tempfile::TempDir;
 
-use monax::net::session::Session;
-use monax::sql::execution::engine::Engine;
+use taibai::net::session::Session;
+use taibai::sql::execution::engine::Engine;
 
 fn session() -> Session {
     Session::new("root".to_string(), "main".to_string())

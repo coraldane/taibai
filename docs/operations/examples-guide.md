@@ -1,6 +1,6 @@
-# Monax 示例工具使用指南
+# Taibai 示例工具使用指南
 
-本文档介绍 Monax 数据库 `examples` 目录下的各类工具的使用方法。
+本文档介绍 Taibai 数据库 `examples` 目录下的各类工具的使用方法。
 
 ## 目录
 
@@ -173,7 +173,7 @@ batch_import <host> <csv_path> \
 
 ### check_segment
 
-**用途**: 检查 Monax Segment 文件的元数据和结构。
+**用途**: 检查 Taibai Segment 文件的元数据和结构。
 
 **特点**:
 - 显示文件基本信息（路径、大小）
@@ -288,11 +288,11 @@ security_id,deal_date,deal_time,pre_close,open_px,high_px,low_px,close_px,high_l
 
 所有导入工具需要：
 
-1. **Monax 服务已启动**: 默认监听 `127.0.0.1:5151`
+1. **Taibai 服务已启动**: 默认监听 `127.0.0.1:5151`
 2. **认证信息**: 默认用户 `root`，密码 `taibai`
 3. **数据库存在**: 默认数据库 `main`
 
-启动 Monax 服务：
+启动 Taibai 服务：
 ```bash
-monax-server --config conf/example.yaml
+taibai-server --config conf/example.yaml
 ```

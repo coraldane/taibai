@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::net::session::Session;
 use crate::storage::catalog::auth::{AuthManager, PermissionObjectType, PermissionType};
 use crate::storage::catalog::auto_increment::AutoIncrementManager;
@@ -193,7 +193,7 @@ impl Engine {
         }
         let stmts = Parser::parse(sql)?;
         if stmts.is_empty() {
-            return Err(MonaxError::Sql("empty query".into()));
+            return Err(TaibaiError::Sql("empty query".into()));
         }
         self.execute_stmt(session, &stmts[0])
     }
@@ -477,7 +477,7 @@ impl Engine {
             Statement::UseDatabase(database) => {
                 let catalogs = self.catalogs().read().unwrap();
                 if !catalogs.contains_key(database.as_str()) {
-                    return Err(MonaxError::Sql(format!(
+                    return Err(TaibaiError::Sql(format!(
                         "database '{}' does not exist",
                         database
                     )));
@@ -512,7 +512,7 @@ impl Engine {
             } => super::explain::exec_explain(self, &session.database, inner, *analyze),
             Statement::Begin => {
                 if session.in_txn() {
-                    return Err(MonaxError::Sql("transaction already in progress".into()));
+                    return Err(TaibaiError::Sql("transaction already in progress".into()));
                 }
                 let txn_id = self.alloc_txn_id();
                 session.begin_txn(txn_id);
@@ -522,14 +522,14 @@ impl Engine {
             }
             Statement::Commit => {
                 if !session.in_txn() {
-                    return Err(MonaxError::Sql("no active transaction".into()));
+                    return Err(TaibaiError::Sql("no active transaction".into()));
                 }
                 self.commit_session_txn(session)?;
                 Ok(ExecResult::Ok { rows_affected: 0 })
             }
             Statement::Rollback => {
                 if !session.in_txn() {
-                    return Err(MonaxError::Sql("no active transaction".into()));
+                    return Err(TaibaiError::Sql("no active transaction".into()));
                 }
                 let txn_id = session.active_txn_id();
                 let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
@@ -833,7 +833,7 @@ impl Engine {
         ) {
             return Ok(());
         }
-        Err(MonaxError::Sql(format!(
+        Err(TaibaiError::Sql(format!(
             "access denied for user '{}' to {:?} on {:?} '{}'",
             session.username, permission, object_type, object_name
         )))
@@ -899,7 +899,7 @@ impl Engine {
         sequence: u64,
     ) -> Result<u64> {
         if group.trim().is_empty() {
-            return Err(MonaxError::Sql("consumer group is required".into()));
+            return Err(TaibaiError::Sql("consumer group is required".into()));
         }
         if session.in_txn() {
             session.record_pending_change_ack(group, sequence);
@@ -941,7 +941,7 @@ impl Engine {
 
     pub fn commit_session_txn(&self, session: &mut Session) -> Result<()> {
         if !session.in_txn() {
-            return Err(MonaxError::Sql("no active transaction".into()));
+            return Err(TaibaiError::Sql("no active transaction".into()));
         }
         let txn_id = session.active_txn_id();
         let had_writes = session
@@ -1179,7 +1179,7 @@ impl Engine {
         let catalogs = self.catalogs.read().unwrap();
         let catalog = catalogs
             .get(db)
-            .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
         let result = self.segment_mgr.bulk_insert_payload_with_catalog(
             db,
@@ -1195,7 +1195,7 @@ impl Engine {
                 let catalogs = self.catalogs.read().unwrap();
                 let catalog = catalogs
                     .get(db)
-                    .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+                    .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
                 if catalog.get_table(&table_name).is_some() {
                     let row_count = result as i64;
                     drop(catalogs);
@@ -1239,16 +1239,16 @@ impl Engine {
 
 fn bulk_payload_table_name(payload: &[u8]) -> Result<&str> {
     if payload.len() < 2 {
-        return Err(MonaxError::Protocol("bulk payload too short".into()));
+        return Err(TaibaiError::Protocol("bulk payload too short".into()));
     }
     let table_len = u16::from_le_bytes(payload[0..2].try_into().unwrap()) as usize;
     let start = 2;
     let end = start + table_len;
     if end > payload.len() {
-        return Err(MonaxError::Protocol("bulk payload truncated".into()));
+        return Err(TaibaiError::Protocol("bulk payload truncated".into()));
     }
     std::str::from_utf8(&payload[start..end])
-        .map_err(|e| MonaxError::Protocol(format!("invalid utf8: {}", e)))
+        .map_err(|e| TaibaiError::Protocol(format!("invalid utf8: {}", e)))
 }
 
 pub(crate) fn change_row_from_images(

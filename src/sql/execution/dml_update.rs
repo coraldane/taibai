@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::RecordBatch;
 use crate::types::batch::Schema;
@@ -24,10 +24,10 @@ pub fn exec_update(
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs
             .get(db)
-            .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
         let meta = catalog
             .get_table(table)
-            .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
             .clone();
         (Schema::new(meta.columns.clone()), meta)
     };

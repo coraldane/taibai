@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::storage::codec::column_codec::encode_column;
 use crate::storage::codec::io_util::encode_len_prefixed_str;
 use crate::storage::codec::scalar_tag::{encode_scalar_with_tag, null_for_dtype};
@@ -142,7 +142,7 @@ impl SegmentWriter {
                 let uncompressed_len = encoded.len() as u64;
 
                 let compressed = zstd::bulk::compress(&encoded, 3)
-                    .map_err(|e| MonaxError::Storage(format!("zstd compress error: {}", e)))?;
+                    .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
 
                 group.uncompressed_sizes[col_idx] += uncompressed_len;
                 group.columns[col_idx].extend_from_slice(&compressed);

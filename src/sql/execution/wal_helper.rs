@@ -250,51 +250,51 @@ pub fn deserialize_batch_from_wal(
     data: &[u8],
     schema: &crate::types::batch::Schema,
 ) -> Result<crate::types::batch::RecordBatch> {
-    use crate::common::error::MonaxError;
+    use crate::common::error::TaibaiError;
 
     const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
     const FLAG_COMPRESSED: u8 = 0x01;
 
     if data.len() < 13 {
-        return Err(MonaxError::Internal("WAL data too short".into()));
+        return Err(TaibaiError::Internal("WAL data too short".into()));
     }
 
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     if magic != WAL_BATCH_MAGIC {
-        return Err(MonaxError::Internal("WAL data: invalid magic".into()));
+        return Err(TaibaiError::Internal("WAL data: invalid magic".into()));
     }
 
     let flags = data[4];
 
     let payload = if flags & FLAG_COMPRESSED != 0 {
         if data.len() < 13 {
-            return Err(MonaxError::Internal("WAL compressed data too short".into()));
+            return Err(TaibaiError::Internal("WAL compressed data too short".into()));
         }
         let uncompressed_len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
         let compressed_len = u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
         if data.len() < 13 + compressed_len {
-            return Err(MonaxError::Internal("WAL compressed data truncated".into()));
+            return Err(TaibaiError::Internal("WAL compressed data truncated".into()));
         }
         zstd::bulk::decompress(&data[13..13 + compressed_len], uncompressed_len)
-            .map_err(|e| MonaxError::Internal(format!("WAL decompression failed: {}", e)))?
+            .map_err(|e| TaibaiError::Internal(format!("WAL decompression failed: {}", e)))?
     } else {
         data.to_vec()
     };
 
     if payload.len() < 13 {
-        return Err(MonaxError::Internal("WAL payload too short".into()));
+        return Err(TaibaiError::Internal("WAL payload too short".into()));
     }
 
     let p_magic = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if p_magic != WAL_BATCH_MAGIC {
-        return Err(MonaxError::Internal("WAL payload: invalid magic".into()));
+        return Err(TaibaiError::Internal("WAL payload: invalid magic".into()));
     }
 
     let num_cols = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
     let num_rows = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]) as usize;
 
     if num_cols != schema.columns.len() {
-        return Err(MonaxError::Internal(format!(
+        return Err(TaibaiError::Internal(format!(
             "WAL column count mismatch: {} vs {}",
             num_cols,
             schema.columns.len()
@@ -306,7 +306,7 @@ pub fn deserialize_batch_from_wal(
 
     for col_idx in 0..num_cols {
         if offset >= payload.len() {
-            return Err(MonaxError::Internal(
+            return Err(TaibaiError::Internal(
                 "WAL data truncated at column header".into(),
             ));
         }
@@ -315,7 +315,7 @@ pub fn deserialize_batch_from_wal(
         offset += 1;
 
         if offset + 4 > payload.len() {
-            return Err(MonaxError::Internal(
+            return Err(TaibaiError::Internal(
                 "WAL data truncated at bitmap len".into(),
             ));
         }
@@ -329,7 +329,7 @@ pub fn deserialize_batch_from_wal(
 
         let null_bitmap = if bitmap_len > 0 {
             if offset + bitmap_len > payload.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated at bitmap data".into(),
                 ));
             }
@@ -343,7 +343,7 @@ pub fn deserialize_batch_from_wal(
         offset += bitmap_len;
 
         if offset + 4 > payload.len() {
-            return Err(MonaxError::Internal(
+            return Err(TaibaiError::Internal(
                 "WAL data truncated at data len".into(),
             ));
         }
@@ -356,7 +356,7 @@ pub fn deserialize_batch_from_wal(
         offset += 4;
 
         if offset + data_len > payload.len() {
-            return Err(MonaxError::Internal(
+            return Err(TaibaiError::Internal(
                 "WAL data truncated at column data".into(),
             ));
         }
@@ -408,13 +408,13 @@ fn decode_fixed_value(
     pos: &mut usize,
     dt: crate::protocol::types::DataType,
 ) -> Result<crate::types::scalar::ScalarValue> {
-    use crate::common::error::MonaxError;
+    use crate::common::error::TaibaiError;
     use crate::types::scalar::ScalarValue;
 
     match dt {
         crate::protocol::types::DataType::Bool => {
             if *pos >= data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Bool".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Bool".into()));
             }
             let v = data[*pos] != 0;
             *pos += 1;
@@ -422,7 +422,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Int8 => {
             if *pos >= data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Int8".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Int8".into()));
             }
             let v = data[*pos] as i8;
             *pos += 1;
@@ -430,7 +430,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Int16 => {
             if *pos + 2 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Int16".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Int16".into()));
             }
             let v = i16::from_le_bytes([data[*pos], data[*pos + 1]]);
             *pos += 2;
@@ -438,7 +438,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Int32 => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Int32".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Int32".into()));
             }
             let v =
                 i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
@@ -447,7 +447,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Int64 => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Int64".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Int64".into()));
             }
             let v = i64::from_le_bytes([
                 data[*pos],
@@ -464,7 +464,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::UInt8 => {
             if *pos >= data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for UInt8".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for UInt8".into()));
             }
             let v = data[*pos];
             *pos += 1;
@@ -472,7 +472,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::UInt16 => {
             if *pos + 2 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for UInt16".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for UInt16".into()));
             }
             let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
             *pos += 2;
@@ -480,7 +480,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::UInt32 => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for UInt32".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for UInt32".into()));
             }
             let v =
                 u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
@@ -489,7 +489,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::UInt64 => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for UInt64".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for UInt64".into()));
             }
             let v = u64::from_le_bytes([
                 data[*pos],
@@ -506,7 +506,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Float32 => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for Float32".into(),
                 ));
             }
@@ -517,7 +517,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Float64 => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for Float64".into(),
                 ));
             }
@@ -536,7 +536,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Decimal => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for Decimal".into(),
                 ));
             }
@@ -555,7 +555,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Date => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Date".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Date".into()));
             }
             let v =
                 i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
@@ -564,7 +564,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Time => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Time".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Time".into()));
             }
             let v = i64::from_le_bytes([
                 data[*pos],
@@ -581,7 +581,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Timestamp => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for Timestamp".into(),
                 ));
             }
@@ -600,7 +600,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Interval => {
             if *pos + 8 > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for Interval".into(),
                 ));
             }
@@ -619,7 +619,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::VarChar => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for VarChar".into(),
                 ));
             }
@@ -628,25 +628,25 @@ fn decode_fixed_value(
                     as usize;
             *pos += 4;
             if *pos + len > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for VarChar payload".into(),
                 ));
             }
             let s = std::str::from_utf8(&data[*pos..*pos + len])
-                .map_err(|_| MonaxError::Internal("invalid UTF-8 in WAL".into()))?;
+                .map_err(|_| TaibaiError::Internal("invalid UTF-8 in WAL".into()))?;
             *pos += len;
             Ok(ScalarValue::VarChar(Some(s.to_string())))
         }
         crate::protocol::types::DataType::Blob => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Blob".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Blob".into()));
             }
             let len =
                 u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
                     as usize;
             *pos += 4;
             if *pos + len > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for Blob payload".into(),
                 ));
             }
@@ -656,7 +656,7 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Vector => {
             if *pos + 4 > data.len() {
-                return Err(MonaxError::Internal("WAL data truncated for Vector".into()));
+                return Err(TaibaiError::Internal("WAL data truncated for Vector".into()));
             }
             let len =
                 u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])
@@ -664,7 +664,7 @@ fn decode_fixed_value(
             *pos += 4;
             let total_bytes = len * 4;
             if *pos + total_bytes > data.len() {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "WAL data truncated for Vector payload".into(),
                 ));
             }

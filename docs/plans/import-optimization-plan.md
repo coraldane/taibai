@@ -164,7 +164,7 @@ INSERT → WAL write → return OK
 
 ### 策略 6: zstd 压缩级别调优（预期 +1-2万/秒）
 
-**当前**: 默认 level 3，通过环境变量 `MONAX_BULK_ZSTD_LEVEL` 可调。
+**当前**: 默认 level 3，通过环境变量 `TAIBAI_BULK_ZSTD_LEVEL` 可调。
 
 **分析**: zstd level 3 的压缩速度约 400MB/s（单核），对于批量导入场景：
 - Level 1: ~500MB/s，压缩比略低

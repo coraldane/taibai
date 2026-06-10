@@ -2,12 +2,12 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use monax::net::session::Session;
-use monax::protocol::types::DataType;
-use monax::sql::execution::engine::{Engine, ExecResult};
-use monax::storage::segment::meta::sidecar_meta_path;
-use monax::storage::segment_manager::SegmentManager;
-use monax::types::scalar::ScalarValue;
+use taibai::net::session::Session;
+use taibai::protocol::types::DataType;
+use taibai::sql::execution::engine::{Engine, ExecResult};
+use taibai::storage::segment::meta::sidecar_meta_path;
+use taibai::storage::segment_manager::SegmentManager;
+use taibai::types::scalar::ScalarValue;
 
 fn bulk_payload(table: &str, row_count: u32, columns: Vec<(&str, DataType, Vec<u8>)>) -> Vec<u8> {
     let mut payload = Vec::new();

@@ -6,7 +6,7 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -93,7 +93,7 @@ impl Permission {
             "ALTER" => Ok(Permission::Alter),
             "TRUNCATE" => Ok(Permission::Truncate),
             "ALL" | "ALL_PRIVILEGES" => Ok(Permission::All),
-            _ => Err(MonaxError::Sql(format!("unknown permission: {}", s))),
+            _ => Err(TaibaiError::Sql(format!("unknown permission: {}", s))),
         }
     }
 }
@@ -135,14 +135,14 @@ impl UserCatalog {
         let path = meta_dir.join("users.json");
         if path.exists() {
             let data = fs::read_to_string(&path)
-                .map_err(|e| MonaxError::Storage(format!("failed to read users.json: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to read users.json: {}", e)))?;
             let catalog: UserCatalog = serde_json::from_str(&data)
-                .map_err(|e| MonaxError::Storage(format!("failed to parse users.json: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to parse users.json: {}", e)))?;
             Ok(catalog)
         } else {
             let catalog = UserCatalog::new();
             fs::create_dir_all(meta_dir)
-                .map_err(|e| MonaxError::Storage(format!("failed to create meta dir: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to create meta dir: {}", e)))?;
             catalog.save(meta_dir)?;
             Ok(catalog)
         }
@@ -150,21 +150,21 @@ impl UserCatalog {
 
     pub fn save(&self, meta_dir: &Path) -> Result<()> {
         fs::create_dir_all(meta_dir)
-            .map_err(|e| MonaxError::Storage(format!("failed to create meta dir: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to create meta dir: {}", e)))?;
         let path = meta_dir.join("users.json");
         let data = serde_json::to_string_pretty(self)
-            .map_err(|e| MonaxError::Storage(format!("failed to serialize user catalog: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to serialize user catalog: {}", e)))?;
         let tmp_path = path.with_extension("json.tmp");
         fs::write(&tmp_path, &data)
-            .map_err(|e| MonaxError::Storage(format!("failed to write users.json.tmp: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to write users.json.tmp: {}", e)))?;
         fs::rename(&tmp_path, &path)
-            .map_err(|e| MonaxError::Storage(format!("failed to rename users.json: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to rename users.json: {}", e)))?;
         Ok(())
     }
 
     pub fn create_user(&mut self, name: &str, password: &str) -> Result<()> {
         if self.users.contains_key(name) {
-            return Err(MonaxError::Sql(format!("user '{}' already exists", name)));
+            return Err(TaibaiError::Sql(format!("user '{}' already exists", name)));
         }
         self.users
             .insert(name.to_string(), User::new(name, password));
@@ -173,7 +173,7 @@ impl UserCatalog {
 
     pub fn drop_user(&mut self, name: &str) -> Result<()> {
         if self.users.remove(name).is_none() {
-            return Err(MonaxError::Sql(format!("user '{}' does not exist", name)));
+            return Err(TaibaiError::Sql(format!("user '{}' does not exist", name)));
         }
         Ok(())
     }
@@ -184,7 +184,7 @@ impl UserCatalog {
 
     pub fn create_role(&mut self, name: &str) -> Result<()> {
         if self.roles.contains_key(name) {
-            return Err(MonaxError::Sql(format!("role '{}' already exists", name)));
+            return Err(TaibaiError::Sql(format!("role '{}' already exists", name)));
         }
         self.roles.insert(name.to_string(), Role::new(name));
         Ok(())
@@ -192,7 +192,7 @@ impl UserCatalog {
 
     pub fn drop_role(&mut self, name: &str) -> Result<()> {
         if self.roles.remove(name).is_none() {
-            return Err(MonaxError::Sql(format!("role '{}' does not exist", name)));
+            return Err(TaibaiError::Sql(format!("role '{}' does not exist", name)));
         }
         Ok(())
     }
@@ -205,9 +205,9 @@ impl UserCatalog {
         let user = self
             .users
             .get_mut(user_name)
-            .ok_or_else(|| MonaxError::Sql(format!("user '{}' does not exist", user_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("user '{}' does not exist", user_name)))?;
         if !self.roles.contains_key(role_name) {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "role '{}' does not exist",
                 role_name
             )));
@@ -222,7 +222,7 @@ impl UserCatalog {
         let user = self
             .users
             .get_mut(user_name)
-            .ok_or_else(|| MonaxError::Sql(format!("user '{}' does not exist", user_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("user '{}' does not exist", user_name)))?;
         user.roles.retain(|r| r != role_name);
         Ok(())
     }
@@ -236,7 +236,7 @@ impl UserCatalog {
         let role = self
             .roles
             .get_mut(role_name)
-            .ok_or_else(|| MonaxError::Sql(format!("role '{}' does not exist", role_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("role '{}' does not exist", role_name)))?;
         let key = scope_to_key(&scope);
         let existing = role.privileges.entry(key).or_insert_with(Vec::new);
         for perm in permissions {
@@ -256,7 +256,7 @@ impl UserCatalog {
         let role = self
             .roles
             .get_mut(role_name)
-            .ok_or_else(|| MonaxError::Sql(format!("role '{}' does not exist", role_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("role '{}' does not exist", role_name)))?;
         let key = scope_to_key(&scope);
         if let Some(existing) = role.privileges.get_mut(&key) {
             for perm in permissions {
@@ -421,7 +421,7 @@ impl UserManager {
                     catalog.grant_to_user(target, &role_name)?;
                 }
             } else {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "'{}' is not a valid user or role",
                     target
                 )));
@@ -449,7 +449,7 @@ impl UserManager {
                     catalog.revoke_from_role(&role_name, scope, permissions)?;
                 }
             } else {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "'{}' is not a valid user or role",
                     target
                 )));
@@ -463,7 +463,7 @@ impl UserManager {
         let catalog = self.catalog.read().unwrap();
         match catalog.get_user(user_name) {
             Some(user) => Ok(user.verify_password(password)),
-            None => Err(MonaxError::Sql(format!(
+            None => Err(TaibaiError::Sql(format!(
                 "user '{}' does not exist",
                 user_name
             ))),

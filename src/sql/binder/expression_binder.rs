@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::sql::parser::ast::Expr;
 use crate::types::scalar::ScalarValue;
 
@@ -74,7 +74,7 @@ impl<'a> ExpressionBinder<'a> {
                 let idx = self
                     .ctx
                     .resolve_column(name)
-                    .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", name)))?;
+                    .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", name)))?;
                 let dt = self.ctx.column_type(idx).unwrap_or(DataType::Int64);
                 Ok(BoundExpr {
                     kind: BoundExprKind::ColumnRef {
@@ -89,7 +89,7 @@ impl<'a> ExpressionBinder<'a> {
                     .ctx
                     .resolve_qualified_column(table, column)
                     .ok_or_else(|| {
-                        MonaxError::Sql(format!(
+                        TaibaiError::Sql(format!(
                             "column '{}' not found in table '{}'",
                             column, table
                         ))
@@ -153,7 +153,7 @@ impl<'a> ExpressionBinder<'a> {
                     "AVG" => crate::sql::planner::AggFunc::Avg,
                     "MIN" => crate::sql::planner::AggFunc::Min,
                     "MAX" => crate::sql::planner::AggFunc::Max,
-                    other => return Err(MonaxError::Sql(format!("unknown function '{}'", other))),
+                    other => return Err(TaibaiError::Sql(format!("unknown function '{}'", other))),
                 };
                 let arg = if args.is_empty()
                     || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))

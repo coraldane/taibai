@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::types::batch::ColumnDef;
 
 /// Partition type for a table.
@@ -219,9 +219,9 @@ impl DatabaseCatalog {
         let schema_path = Self::catalog_path(meta_dir, db_name);
         if schema_path.exists() {
             let data = fs::read_to_string(&schema_path)
-                .map_err(|e| MonaxError::Storage(format!("failed to read catalog: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to read catalog: {}", e)))?;
             let mut catalog: DatabaseCatalog = serde_json::from_str(&data)
-                .map_err(|e| MonaxError::Storage(format!("failed to parse catalog: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to parse catalog: {}", e)))?;
             catalog.name = db_name.to_string();
             for table in catalog.tables.values_mut() {
                 table.database = db_name.to_string();
@@ -243,15 +243,15 @@ impl DatabaseCatalog {
         let schema_path = Self::catalog_path(meta_dir, &self.name);
         if let Some(parent) = schema_path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| MonaxError::Storage(format!("failed to create catalog dir: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to create catalog dir: {}", e)))?;
         }
         let data = serde_json::to_string_pretty(self)
-            .map_err(|e| MonaxError::Storage(format!("failed to serialize catalog: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to serialize catalog: {}", e)))?;
         let tmp_path = schema_path.with_extension("json.tmp");
         fs::write(&tmp_path, &data)
-            .map_err(|e| MonaxError::Storage(format!("failed to write catalog tmp: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to write catalog tmp: {}", e)))?;
         fs::rename(&tmp_path, &schema_path)
-            .map_err(|e| MonaxError::Storage(format!("failed to rename catalog: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to rename catalog: {}", e)))?;
         Ok(())
     }
 
@@ -269,10 +269,10 @@ impl DatabaseCatalog {
             return Ok(None);
         }
         let data = fs::read_to_string(&legacy_path).map_err(|e| {
-            MonaxError::Storage(format!("failed to read legacy schema.json: {}", e))
+            TaibaiError::Storage(format!("failed to read legacy schema.json: {}", e))
         })?;
         let mut catalog: DatabaseCatalog = serde_json::from_str(&data).map_err(|e| {
-            MonaxError::Storage(format!("failed to parse legacy schema.json: {}", e))
+            TaibaiError::Storage(format!("failed to parse legacy schema.json: {}", e))
         })?;
         if catalog.name != db_name {
             return Ok(None);
@@ -288,7 +288,7 @@ impl DatabaseCatalog {
 
     pub fn create_table(&mut self, name: &str, columns: Vec<ColumnDef>) -> Result<()> {
         if self.tables.contains_key(name) {
-            return Err(MonaxError::Sql(format!("table '{}' already exists", name)));
+            return Err(TaibaiError::Sql(format!("table '{}' already exists", name)));
         }
         let meta = TableMeta::new(&self.name, name, columns);
         self.tables.insert(name.to_string(), meta);
@@ -297,7 +297,7 @@ impl DatabaseCatalog {
 
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         if self.tables.remove(name).is_none() {
-            return Err(MonaxError::Sql(format!("table '{}' does not exist", name)));
+            return Err(TaibaiError::Sql(format!("table '{}' does not exist", name)));
         }
         Ok(())
     }
@@ -316,13 +316,13 @@ impl DatabaseCatalog {
 
     pub fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()> {
         if !self.tables.contains_key(old_name) {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "table '{}' does not exist",
                 old_name
             )));
         }
         if self.tables.contains_key(new_name) {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "table '{}' already exists",
                 new_name
             )));
@@ -337,9 +337,9 @@ impl DatabaseCatalog {
         let table = self
             .tables
             .get_mut(table_name)
-            .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         if table.columns.iter().any(|c| c.name == column.name) {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "column '{}' already exists in table '{}'",
                 column.name, table_name
             )));
@@ -352,13 +352,13 @@ impl DatabaseCatalog {
         let table = self
             .tables
             .get_mut(table_name)
-            .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         let idx = table
             .columns
             .iter()
             .position(|c| c.name == column_name)
             .ok_or_else(|| {
-                MonaxError::Sql(format!(
+                TaibaiError::Sql(format!(
                     "column '{}' does not exist in table '{}'",
                     column_name, table_name
                 ))
@@ -386,9 +386,9 @@ impl DatabaseCatalog {
         let table = self
             .tables
             .get_mut(table_name)
-            .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         if table.columns.iter().any(|c| c.name == new_name) {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "column '{}' already exists in table '{}'",
                 new_name, table_name
             )));
@@ -398,7 +398,7 @@ impl DatabaseCatalog {
             .iter_mut()
             .find(|c| c.name == old_name)
             .ok_or_else(|| {
-                MonaxError::Sql(format!(
+                TaibaiError::Sql(format!(
                     "column '{}' does not exist in table '{}'",
                     old_name, table_name
                 ))
@@ -419,13 +419,13 @@ impl DatabaseCatalog {
         let table = self
             .tables
             .get_mut(table_name)
-            .ok_or_else(|| MonaxError::Sql(format!("table '{}' does not exist", table_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         let col = table
             .columns
             .iter_mut()
             .find(|c| c.name == column_name)
             .ok_or_else(|| {
-                MonaxError::Sql(format!(
+                TaibaiError::Sql(format!(
                     "column '{}' does not exist in table '{}'",
                     column_name, table_name
                 ))

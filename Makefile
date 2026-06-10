@@ -1,6 +1,6 @@
 .PHONY: all build build-all package package-all install uninstall start stop restart status clean test help
 
-BINARY_NAME := monax
+BINARY_NAME := taibai
 VERSION ?= $(shell grep '^version =' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
 BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -12,7 +12,7 @@ BUILD_DIR := build
 DIST_DIR := dist
 SCRIPTS_DIR := scripts
 
-PREFIX ?= /usr/local/monax
+PREFIX ?= /usr/local/taibai
 
 all: build
 
@@ -74,7 +74,7 @@ bench:
 	@cargo bench
 
 help:
-	@echo "Monax Build Tool - Build, package, and deployment utility"
+	@echo "Taibai Build Tool - Build, package, and deployment utility"
 	@echo ""
 	@echo "Usage: make <target> [options]"
 	@echo ""
@@ -85,16 +85,16 @@ help:
 	@echo "  package-all    Create distribution packages for all platforms"
 	@echo ""
 	@echo "Installation targets:"
-	@echo "  install        Install monax to PREFIX (default: /usr/local/monax)"
-	@echo "                 Usage: make install PREFIX=/opt/monax"
-	@echo "  uninstall      Remove monax installation (keeps data directory)"
-	@echo "  uninstall-purge Remove monax installation including data directory"
+	@echo "  install        Install taibai to PREFIX (default: /usr/local/taibai)"
+	@echo "                 Usage: make install PREFIX=/opt/taibai"
+	@echo "  uninstall      Remove taibai installation (keeps data directory)"
+	@echo "  uninstall-purge Remove taibai installation including data directory"
 	@echo ""
-	@echo "Service management (requires installed monax):"
-	@echo "  start          Start monax service"
-	@echo "  stop           Stop monax service"
-	@echo "  restart        Restart monax service"
-	@echo "  status         Check monax service status"
+	@echo "Service management (requires installed taibai):"
+	@echo "  start          Start taibai service"
+	@echo "  stop           Stop taibai service"
+	@echo "  restart        Restart taibai service"
+	@echo "  status         Check taibai service status"
 	@echo ""
 	@echo "Development targets:"
 	@echo "  test           Run unit tests"
@@ -104,12 +104,12 @@ help:
 	@echo ""
 	@echo "Options:"
 	@echo "  VERSION        Set version (default: $(VERSION))"
-	@echo "  PREFIX         Set installation prefix (default: /usr/local/monax)"
+	@echo "  PREFIX         Set installation prefix (default: /usr/local/taibai)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build                          # Build for current platform"
 	@echo "  make build-all                      # Build for all platforms"
 	@echo "  make package                        # Package for current platform"
-	@echo "  sudo make install                   # Install to /usr/local/monax"
-	@echo "  sudo make install PREFIX=/opt/monax # Install to /opt/monax"
+	@echo "  sudo make install                   # Install to /usr/local/taibai"
+	@echo "  sudo make install PREFIX=/opt/taibai # Install to /opt/taibai"
 	@echo "  make start                          # Start the service"

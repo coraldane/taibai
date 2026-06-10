@@ -1,6 +1,6 @@
 use tempfile::TempDir;
 
-use monax::storage::segment_manager::SegmentManager;
+use taibai::storage::segment_manager::SegmentManager;
 
 fn file_name(path: &std::path::Path) -> String {
     path.file_name()

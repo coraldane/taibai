@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::codec::column_codec::{decode_adaptive_column, COLUMN_ENCODING_MAGIC};
 use crate::storage::codec::io_util::read_u32_le;
@@ -108,7 +108,7 @@ fn selected_eq_rows_adaptive(
     value: &ScalarValue,
 ) -> Result<Vec<usize>> {
     if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
-        return Err(MonaxError::Storage(
+        return Err(TaibaiError::Storage(
             "adaptive column header truncated".into(),
         ));
     }
@@ -149,7 +149,7 @@ fn selected_eq_rows_varchar_dictionary(
         let start = cursor.position() as usize;
         let end = start + len;
         if end > payload.len() {
-            return Err(MonaxError::Storage("dictionary value truncated".into()));
+            return Err(TaibaiError::Storage("dictionary value truncated".into()));
         }
         if &payload[start..end] == target {
             target_idx = Some(idx as u32);
@@ -193,7 +193,7 @@ fn selected_eq_rows_varchar(
             continue;
         }
         if pos + 4 > data.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "variable column length prefix truncated".into(),
             ));
         }
@@ -201,7 +201,7 @@ fn selected_eq_rows_varchar(
         let start = pos + 4;
         let end = start + len;
         if end > data.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "variable column selected value truncated".into(),
             ));
         }
@@ -231,7 +231,7 @@ fn selected_eq_rows_fixed(
         }
         let end = offset + width;
         if end > data.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "fixed column selected scan exceeds data".into(),
             ));
         }
@@ -451,7 +451,7 @@ fn count_eq_adaptive(
     value: &ScalarValue,
 ) -> Result<u64> {
     if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
-        return Err(MonaxError::Storage(
+        return Err(TaibaiError::Storage(
             "adaptive column header truncated".into(),
         ));
     }
@@ -472,7 +472,7 @@ fn count_eq_adaptive(
         {
             count_eq_varchar_dictionary(payload, row_count, bitmap, value)
         }
-        other => Err(MonaxError::Storage(format!(
+        other => Err(TaibaiError::Storage(format!(
             "unsupported adaptive column encoding {:?} for count_eq",
             other
         ))),

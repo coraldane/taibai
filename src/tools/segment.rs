@@ -3,7 +3,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::segment::meta::read_latest_sidecar_footer;
 use crate::storage::segment::{
@@ -63,7 +63,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
     let file_modified = metadata.modified().ok();
 
     if file_size < (SEGMENT_HEADER_SIZE as u64) + 8 {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "segment file too small: {} bytes (need >= {})",
             file_size,
             SEGMENT_HEADER_SIZE + 8
@@ -79,13 +79,13 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
     let header_created_at = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
     let header_flags = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
     if header_magic != SEGMENT_MAGIC {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "invalid segment header magic: {:08X} (expected {:08X})",
             header_magic, SEGMENT_MAGIC
         )));
     }
     if header_version != SEGMENT_VERSION {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "unsupported segment header version: {} (expected {})",
             header_version, SEGMENT_VERSION
         )));
@@ -100,7 +100,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         let footer_offset = u64::from_le_bytes(footer_offset_buf);
 
         if footer_offset < SEGMENT_HEADER_SIZE as u64 || footer_offset >= file_size - 8 {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "invalid footer offset: {} (file size {}, header size {})",
                 footer_offset, file_size, SEGMENT_HEADER_SIZE
             )));
@@ -117,7 +117,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
 
     let magic = read_u32_le(&mut cursor)?;
     if magic != crate::storage::segment::SEGMENT_MAGIC {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "invalid segment magic: {:08X}, expected {:08X}",
             magic,
             crate::storage::segment::SEGMENT_MAGIC
@@ -418,7 +418,7 @@ fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8> {
     let mut buf = [0u8; 1];
     cursor
         .read_exact(&mut buf)
-        .map_err(|e| MonaxError::Storage(format!("read_u8 error: {}", e)))?;
+        .map_err(|e| TaibaiError::Storage(format!("read_u8 error: {}", e)))?;
     Ok(buf[0])
 }
 
@@ -426,7 +426,7 @@ fn read_u32_le(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
     let mut buf = [0u8; 4];
     cursor
         .read_exact(&mut buf)
-        .map_err(|e| MonaxError::Storage(format!("read_u32 error: {}", e)))?;
+        .map_err(|e| TaibaiError::Storage(format!("read_u32 error: {}", e)))?;
     Ok(u32::from_le_bytes(buf))
 }
 
@@ -434,7 +434,7 @@ fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     let mut buf = [0u8; 8];
     cursor
         .read_exact(&mut buf)
-        .map_err(|e| MonaxError::Storage(format!("read_u64 error: {}", e)))?;
+        .map_err(|e| TaibaiError::Storage(format!("read_u64 error: {}", e)))?;
     Ok(u64::from_le_bytes(buf))
 }
 
@@ -446,9 +446,9 @@ fn skip_bloom_filters(cursor: &mut Cursor<&[u8]>, data: &[u8], col_count: usize)
             let start = cursor.position() as usize;
             let end = start
                 .checked_add(bf_len)
-                .ok_or_else(|| MonaxError::Storage("invalid bloom filter length".to_string()))?;
+                .ok_or_else(|| TaibaiError::Storage("invalid bloom filter length".to_string()))?;
             if end > data.len() {
-                return Err(MonaxError::Storage(format!(
+                return Err(TaibaiError::Storage(format!(
                     "invalid bloom filter length: {} at footer offset {} (footer size {})",
                     bf_len,
                     start,
@@ -466,7 +466,7 @@ fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     let mut buf = vec![0u8; len];
     cursor
         .read_exact(&mut buf)
-        .map_err(|e| MonaxError::Storage(format!("read_str error: {}", e)))?;
+        .map_err(|e| TaibaiError::Storage(format!("read_str error: {}", e)))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 

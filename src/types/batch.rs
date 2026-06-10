@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::types::array::ColumnArray;
 use crate::types::scalar::ScalarValue;
@@ -154,7 +154,7 @@ impl RecordBatch {
     #[track_caller]
     pub fn try_new(schema: Schema, columns: Vec<ColumnArray>) -> Result<Self> {
         if columns.len() != schema.num_columns() {
-            return Err(MonaxError::Internal(format!(
+            return Err(TaibaiError::Internal(format!(
                 "column count mismatch: schema has {} columns but got {} arrays",
                 schema.num_columns(),
                 columns.len(),
@@ -163,7 +163,7 @@ impl RecordBatch {
         // Validate types match
         for (i, (col_def, col_arr)) in schema.columns.iter().zip(columns.iter()).enumerate() {
             if col_def.data_type != col_arr.data_type() {
-                return Err(MonaxError::Internal(format!(
+                return Err(TaibaiError::Internal(format!(
                     "type mismatch at column {}: schema says {} but array is {}",
                     i,
                     col_def.data_type.display_name(),
@@ -176,7 +176,7 @@ impl RecordBatch {
             for (i, col_arr) in columns.iter().enumerate().skip(1) {
                 if col_arr.len() != expected_len {
                     let caller = std::panic::Location::caller();
-                    return Err(MonaxError::Internal(format!(
+                    return Err(TaibaiError::Internal(format!(
                         "column length mismatch at {}:{}: column 0 has {} rows but column {} has {} rows",
                         caller.file(),
                         caller.line(),

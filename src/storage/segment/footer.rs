@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::codec::io_util::{read_len_prefixed_str, read_u32_le, read_u64_le, read_u8};
 use crate::storage::codec::scalar_tag::decode_scalar_with_tag;
@@ -27,7 +27,7 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
 
     let magic = read_u32_le(&mut cursor)?;
     if magic != SEGMENT_MAGIC {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "invalid segment magic: {:08X}, expected {:08X}",
             magic, SEGMENT_MAGIC
         )));
@@ -120,10 +120,10 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
                 let bf_len = read_u32_le(&mut cursor)? as usize;
                 let bf_data_start = cursor.position() as usize;
                 let bf_data_end = bf_data_start.checked_add(bf_len).ok_or_else(|| {
-                    MonaxError::Storage("invalid bloom filter length".to_string())
+                    TaibaiError::Storage("invalid bloom filter length".to_string())
                 })?;
                 if bf_data_end > buf.len() {
-                    return Err(MonaxError::Storage(format!(
+                    return Err(TaibaiError::Storage(format!(
                         "invalid bloom filter length: {} at footer offset {} (footer size {})",
                         bf_len,
                         bf_data_start,
@@ -159,7 +159,7 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
     }
 
     if cursor.position() as usize != buf.len() {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "trailing bytes after segment footer: parsed {}, footer size {}",
             cursor.position(),
             buf.len()
@@ -232,10 +232,10 @@ pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
                 let bf_len = read_u32_le(&mut cursor)? as usize;
                 let start = cursor.position() as usize;
                 let end = start.checked_add(bf_len).ok_or_else(|| {
-                    MonaxError::Storage("invalid bloom filter length".to_string())
+                    TaibaiError::Storage("invalid bloom filter length".to_string())
                 })?;
                 if end > buf.len() {
-                    return Err(MonaxError::Storage(format!(
+                    return Err(TaibaiError::Storage(format!(
                         "invalid bloom filter length: {} at footer offset {} (footer size {})",
                         bf_len,
                         start,

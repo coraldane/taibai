@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 
 pub struct DirectBulkRequest<'a> {
@@ -19,7 +19,7 @@ pub struct DirectBulkColumn<'a> {
 
 pub fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>> {
     if payload.len() < 10 {
-        return Err(MonaxError::Protocol("bulk payload too short".into()));
+        return Err(TaibaiError::Protocol("bulk payload too short".into()));
     }
 
     let mut pos = 0usize;
@@ -39,7 +39,7 @@ pub fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>
         let nulls_size = read_u32_at(payload, &mut pos)? as usize;
 
         if elem_count != row_count {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "column {} row count mismatch: header={} column={}",
                 col_idx, row_count, elem_count
             )));
@@ -47,7 +47,7 @@ pub fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>
 
         let (data_len, variable_ranges) = direct_column_layout(dtype, elem_count, &payload[pos..])?;
         if pos + data_len > payload.len() {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "column {} data exceeds payload",
                 col_idx
             )));
@@ -56,7 +56,7 @@ pub fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>
         pos += data_len;
 
         if pos + nulls_size > payload.len() {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "column {} null bitmap exceeds payload",
                 col_idx
             )));
@@ -76,7 +76,7 @@ pub fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>
     }
 
     if pos != payload.len() {
-        return Err(MonaxError::Protocol(format!(
+        return Err(TaibaiError::Protocol(format!(
             "trailing bytes after bulk payload: parsed {}, payload size {}",
             pos,
             payload.len()
@@ -98,7 +98,7 @@ fn direct_column_layout(
     if let Some(width) = data_type.fixed_size() {
         let len = elem_count
             .checked_mul(width)
-            .ok_or_else(|| MonaxError::Protocol("fixed-width column length overflow".into()))?;
+            .ok_or_else(|| TaibaiError::Protocol("fixed-width column length overflow".into()))?;
         return Ok((len, None));
     }
 
@@ -106,19 +106,19 @@ fn direct_column_layout(
     let mut ranges = Vec::with_capacity(elem_count);
     for _ in 0..elem_count {
         if offset + 4 > data.len() {
-            return Err(MonaxError::Protocol(
+            return Err(TaibaiError::Protocol(
                 "variable column length prefix truncated".into(),
             ));
         }
         let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         let value_offset = offset
             .checked_add(4)
-            .ok_or_else(|| MonaxError::Protocol("variable column length overflow".into()))?;
+            .ok_or_else(|| TaibaiError::Protocol("variable column length overflow".into()))?;
         offset = value_offset
             .checked_add(len)
-            .ok_or_else(|| MonaxError::Protocol("variable column length overflow".into()))?;
+            .ok_or_else(|| TaibaiError::Protocol("variable column length overflow".into()))?;
         if offset > data.len() {
-            return Err(MonaxError::Protocol(
+            return Err(TaibaiError::Protocol(
                 "variable column data truncated".into(),
             ));
         }
@@ -129,7 +129,7 @@ fn direct_column_layout(
 
 fn read_u8_at(payload: &[u8], pos: &mut usize) -> Result<u8> {
     if *pos >= payload.len() {
-        return Err(MonaxError::Protocol("payload truncated reading u8".into()));
+        return Err(TaibaiError::Protocol("payload truncated reading u8".into()));
     }
     let v = payload[*pos];
     *pos += 1;
@@ -138,7 +138,7 @@ fn read_u8_at(payload: &[u8], pos: &mut usize) -> Result<u8> {
 
 fn read_u16_at(payload: &[u8], pos: &mut usize) -> Result<u16> {
     if *pos + 2 > payload.len() {
-        return Err(MonaxError::Protocol("payload truncated reading u16".into()));
+        return Err(TaibaiError::Protocol("payload truncated reading u16".into()));
     }
     let v = u16::from_le_bytes(payload[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
@@ -147,7 +147,7 @@ fn read_u16_at(payload: &[u8], pos: &mut usize) -> Result<u16> {
 
 fn read_u32_at(payload: &[u8], pos: &mut usize) -> Result<u32> {
     if *pos + 4 > payload.len() {
-        return Err(MonaxError::Protocol("payload truncated reading u32".into()));
+        return Err(TaibaiError::Protocol("payload truncated reading u32".into()));
     }
     let v = u32::from_le_bytes(payload[*pos..*pos + 4].try_into().unwrap());
     *pos += 4;
@@ -156,12 +156,12 @@ fn read_u32_at(payload: &[u8], pos: &mut usize) -> Result<u32> {
 
 fn read_utf8_at<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a str> {
     if *pos + len > payload.len() {
-        return Err(MonaxError::Protocol(
+        return Err(TaibaiError::Protocol(
             "payload truncated reading string".into(),
         ));
     }
     let s = std::str::from_utf8(&payload[*pos..*pos + len])
-        .map_err(|e| MonaxError::Protocol(format!("invalid utf8 in bulk payload: {}", e)))?;
+        .map_err(|e| TaibaiError::Protocol(format!("invalid utf8 in bulk payload: {}", e)))?;
     *pos += len;
     Ok(s)
 }

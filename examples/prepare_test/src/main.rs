@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
-use monax::net::client::Client;
+use taibai::net::client::Client;
 use tick::{parse_tick_csv_line, TICK_CREATE_TABLE_SQL, TICK_INSERT_SQL};
 
 const TICK_TABLE: &str = "stock_tick_prep";
@@ -161,12 +161,12 @@ async fn import_ticks_prepared(
     skip_header: bool,
     max_rows: u64,
     client: &mut Client,
-    stmt: &monax::net::client::PreparedStatement,
+    stmt: &taibai::net::client::PreparedStatement,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(csv_path)?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
 
-    let mut batch: Vec<Vec<monax::types::scalar::ScalarValue>> = Vec::with_capacity(batch_size);
+    let mut batch: Vec<Vec<taibai::types::scalar::ScalarValue>> = Vec::with_capacity(batch_size);
     let mut read_count: u64 = 0;
     let mut parsed_count: u64 = 0;
     let mut sent_count: u64 = 0;

@@ -84,7 +84,7 @@ pub struct Session {
 
 ### Primary Strategy: MVCC (Multi-Version Concurrency Control)
 
-Monax uses MVCC as its primary concurrency control mechanism:
+Taibai uses MVCC as its primary concurrency control mechanism:
 
 1. **Snapshot Isolation**: Each transaction sees a consistent snapshot of data at transaction start time
 2. **Version Chains**: Multiple versions of rows are maintained for concurrent readers

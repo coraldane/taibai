@@ -1,8 +1,8 @@
 use tempfile::TempDir;
 
-use monax::net::session::Session;
-use monax::sql::execution::engine::{Engine, ExecResult};
-use monax::types::scalar::ScalarValue;
+use taibai::net::session::Session;
+use taibai::sql::execution::engine::{Engine, ExecResult};
+use taibai::types::scalar::ScalarValue;
 
 fn collect_first_column(result: ExecResult) -> Vec<ScalarValue> {
     let ExecResult::Query { batches, .. } = result else {

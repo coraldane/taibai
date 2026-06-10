@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
@@ -653,7 +653,7 @@ impl ColumnArray {
                 }
             }
             (arr, val) => {
-                return Err(MonaxError::Internal(format!(
+                return Err(TaibaiError::Internal(format!(
                     "type mismatch: column is {} but value is {}",
                     arr.data_type().display_name(),
                     val.data_type().display_name(),
@@ -676,7 +676,7 @@ impl ColumnArray {
     /// Append another ColumnArray of the same type.
     pub fn extend(&mut self, other: &ColumnArray) -> Result<()> {
         if self.data_type() != other.data_type() {
-            return Err(MonaxError::Internal(format!(
+            return Err(TaibaiError::Internal(format!(
                 "cannot extend {} with {}",
                 self.data_type().display_name(),
                 other.data_type().display_name(),

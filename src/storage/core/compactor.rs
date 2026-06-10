@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
@@ -303,7 +303,7 @@ impl Compactor {
 
         for (source_idx, positions) in positions_by_source {
             let source = source_row_groups.get(source_idx).ok_or_else(|| {
-                MonaxError::Storage(format!("missing source row group {}", source_idx))
+                TaibaiError::Storage(format!("missing source row group {}", source_idx))
             })?;
             let src_batch = row_group_cache.get(source, &self.segment_mgr)?;
 
@@ -313,20 +313,20 @@ impl Compactor {
                         .get(source_idx)
                         .and_then(|batch| batch.column(key_pos))
                         .ok_or_else(|| {
-                            MonaxError::Storage(format!(
+                            TaibaiError::Storage(format!(
                                 "missing key column {} in row group {}",
                                 col_idx, source_idx
                             ))
                         })?
                 } else {
                     let projected_pos = projected_positions[col_idx].ok_or_else(|| {
-                        MonaxError::Storage(format!(
+                        TaibaiError::Storage(format!(
                             "missing projection for source column {}",
                             col_idx
                         ))
                     })?;
                     src_batch.column(projected_pos).ok_or_else(|| {
-                        MonaxError::Storage(format!(
+                        TaibaiError::Storage(format!(
                             "missing source column {} in row group {}",
                             col_idx, source_idx
                         ))
@@ -347,7 +347,7 @@ impl Compactor {
         let mut indices = Vec::new();
         for key_col in &table_meta.cluster_key {
             let idx = schema.index_of(key_col).ok_or_else(|| {
-                MonaxError::Sql(format!("cluster key column '{}' not found", key_col))
+                TaibaiError::Sql(format!("cluster key column '{}' not found", key_col))
             })?;
             indices.push(idx);
         }
@@ -795,7 +795,7 @@ fn gather_column_positions(
             },
         ) => copy_clone!(dst_data, dst_bitmap, src_data, src_bitmap),
         (dst, src) => {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "column type mismatch while compacting: dst={} src={}",
                 dst.data_type().display_name(),
                 src.data_type().display_name()

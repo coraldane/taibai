@@ -4,7 +4,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::net::client::{BulkImportConfig, Client};
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
@@ -139,9 +139,9 @@ impl BulkImporter {
             crate::protocol::message::MSG_TYPE_OK => Ok(()),
             crate::protocol::message::MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
-                Err(MonaxError::Storage(msg))
+                Err(TaibaiError::Storage(msg))
             }
-            other => Err(MonaxError::Protocol(format!(
+            other => Err(TaibaiError::Protocol(format!(
                 "unexpected bulk import response type: {other:#04X}"
             ))),
         }
@@ -204,13 +204,13 @@ pub fn encode_columnar_bulk_insert(table_name: &str, batch: &RecordBatch) -> Res
         buf.extend_from_slice(col_def.name.as_bytes());
         buf.push(col_def.data_type as u8);
         let scale = u8::try_from(col_def.scale).map_err(|_| {
-            MonaxError::Protocol(format!(
+            TaibaiError::Protocol(format!(
                 "column '{}' scale {} exceeds u8 bulk metadata range",
                 col_def.name, col_def.scale
             ))
         })?;
         let precision = u8::try_from(col_def.precision).map_err(|_| {
-            MonaxError::Protocol(format!(
+            TaibaiError::Protocol(format!(
                 "column '{}' precision {} exceeds u8 bulk metadata range",
                 col_def.name, col_def.precision
             ))

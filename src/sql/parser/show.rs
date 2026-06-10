@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::lexer::Token;
@@ -119,13 +119,13 @@ impl Parser {
                         limit,
                     })
                 } else {
-                    Err(MonaxError::Sql(format!(
+                    Err(TaibaiError::Sql(format!(
                         "expected CONSUMERS, STATUS, or EVENTS after SHOW CHANGE, got {}",
                         kind
                     )))
                 }
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected TABLES, DATABASES, COLUMNS, INDEXES, CREATE, USER, ROLE, GRANTS, PARTITIONS, STATS, ENGINES, PROCESSLIST, or CHANGE after SHOW, got {}",
                 other
             ))),
@@ -219,18 +219,18 @@ impl Parser {
     pub fn parse_reset(&mut self) -> Result<Statement> {
         let reset = self.expect_ident()?;
         if !reset.eq_ignore_ascii_case("RESET") {
-            return Err(MonaxError::Sql(format!("expected RESET, got {}", reset)));
+            return Err(TaibaiError::Sql(format!("expected RESET, got {}", reset)));
         }
         let change = self.expect_ident()?;
         if !change.eq_ignore_ascii_case("CHANGE") {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "expected CHANGE after RESET, got {}",
                 change
             )));
         }
         let consumer = self.expect_ident()?;
         if !consumer.eq_ignore_ascii_case("CONSUMER") {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "expected CONSUMER after RESET CHANGE, got {}",
                 consumer
             )));
@@ -244,18 +244,18 @@ impl Parser {
     pub fn parse_ack(&mut self) -> Result<Statement> {
         let ack = self.expect_ident()?;
         if !ack.eq_ignore_ascii_case("ACK") {
-            return Err(MonaxError::Sql(format!("expected ACK, got {}", ack)));
+            return Err(TaibaiError::Sql(format!("expected ACK, got {}", ack)));
         }
         let change = self.expect_ident()?;
         if !change.eq_ignore_ascii_case("CHANGE") {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "expected CHANGE after ACK, got {}",
                 change
             )));
         }
         let consumer = self.expect_ident()?;
         if !consumer.eq_ignore_ascii_case("CONSUMER") {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "expected CONSUMER after ACK CHANGE, got {}",
                 consumer
             )));

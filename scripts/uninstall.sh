@@ -1,25 +1,25 @@
 #!/bin/bash
 set -e
 
-PREFIX="/usr/local/monax"
+PREFIX="/usr/local/taibai"
 PURGE_DATA=false
 KEEP_CONFIG=false
 
 print_help() {
     cat << EOF
-Monax Uninstallation Script
+Taibai Uninstallation Script
 
 Usage: sudo ./scripts/uninstall.sh [options]
 
 Options:
-  -prefix=PATH      Installation prefix (default: /usr/local/monax)
+  -prefix=PATH      Installation prefix (default: /usr/local/taibai)
   -purge-data       Also remove data directory (default: keep data)
   -keep-config      Keep configuration files (default: remove)
 
 Examples:
   sudo ./scripts/uninstall.sh                    # Remove installation, keep data
   sudo ./scripts/uninstall.sh -purge-data        # Remove everything including data
-  sudo ./scripts/uninstall.sh -prefix=/opt/monax # Uninstall from custom location
+  sudo ./scripts/uninstall.sh -prefix=/opt/taibai # Uninstall from custom location
 
 Notes:
   - Data directory is preserved by default for safety
@@ -53,7 +53,7 @@ fi
 OS="$(uname -s)"
 
 echo "========================================="
-echo "Monax Database Server Uninstaller"
+echo "Taibai Database Server Uninstaller"
 echo "========================================="
 echo "Install prefix: $PREFIX"
 echo "Purge data: $PURGE_DATA"
@@ -63,10 +63,10 @@ stop_service() {
     echo "Stopping service..."
     
     if [ "$OS" = "Linux" ]; then
-        systemctl stop monax 2>/dev/null || true
+        systemctl stop taibai 2>/dev/null || true
         echo "  -> Stopped systemd service"
     elif [ "$OS" = "Darwin" ]; then
-        launchctl unload /Library/LaunchDaemons/com.monax.server.plist 2>/dev/null || true
+        launchctl unload /Library/LaunchDaemons/com.taibai.server.plist 2>/dev/null || true
         echo "  -> Stopped launchd service"
     fi
 }
@@ -75,12 +75,12 @@ remove_service() {
     echo "Removing system service..."
     
     if [ "$OS" = "Linux" ]; then
-        systemctl disable monax 2>/dev/null || true
-        rm -f /etc/systemd/system/monax.service
+        systemctl disable taibai 2>/dev/null || true
+        rm -f /etc/systemd/system/taibai.service
         systemctl daemon-reload
         echo "  -> Removed systemd service"
     elif [ "$OS" = "Darwin" ]; then
-        rm -f /Library/LaunchDaemons/com.monax.server.plist
+        rm -f /Library/LaunchDaemons/com.taibai.server.plist
         echo "  -> Removed launchd service"
     fi
 }

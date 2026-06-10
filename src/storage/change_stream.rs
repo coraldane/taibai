@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::types::scalar::ScalarValue;
 
 const DEFAULT_RECENT_EVENTS: usize = 1024;
@@ -274,7 +274,7 @@ impl ChangeStream {
     fn persist_and_broadcast(&self, event: ChangeEvent) -> Result<()> {
         if let Some(log_file) = &self.log_file {
             let mut file = log_file.lock().map_err(|e| {
-                MonaxError::Internal(format!("failed to lock change stream log: {}", e))
+                TaibaiError::Internal(format!("failed to lock change stream log: {}", e))
             })?;
             let line = encode_log_record(&event)?;
             writeln!(file, "{}", line)?;
@@ -323,7 +323,7 @@ impl ChangeStream {
         let entry = outbox
             .iter_mut()
             .find(|entry| entry.id == id)
-            .ok_or_else(|| MonaxError::Storage(format!("change stream outbox {} not found", id)))?;
+            .ok_or_else(|| TaibaiError::Storage(format!("change stream outbox {} not found", id)))?;
         entry.state = ChangeOutboxState::Committed;
         self.save_outbox(&outbox)
     }
@@ -387,7 +387,7 @@ impl ChangeStream {
         let events = load_events(log_path)?;
         if let Some(first) = events.first() {
             if sequence < first.sequence {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "change stream sequence {} is no longer available, earliest available sequence is {}",
                     sequence, first.sequence
                 )));
@@ -525,7 +525,7 @@ impl ChangeStream {
             return Ok(());
         };
         let data = serde_json::to_vec_pretty(consumers).map_err(|e| {
-            MonaxError::Internal(format!("failed to encode change stream consumers: {}", e))
+            TaibaiError::Internal(format!("failed to encode change stream consumers: {}", e))
         })?;
         write_file_atomically(path, &data)?;
         Ok(())
@@ -536,7 +536,7 @@ impl ChangeStream {
             return Ok(());
         };
         let data = serde_json::to_vec_pretty(outbox)
-            .map_err(|e| MonaxError::Internal(format!("failed to encode change outbox: {}", e)))?;
+            .map_err(|e| TaibaiError::Internal(format!("failed to encode change outbox: {}", e)))?;
         write_file_atomically(path, &data)
     }
 
@@ -606,7 +606,7 @@ fn load_events_with_repair(path: &Path, repair: bool) -> Result<Vec<ChangeEvent>
                 "repaired change stream log by truncating at first corrupt entry"
             );
         } else {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "change stream log '{}' contains corrupt entries",
                 path.display()
             )));
@@ -621,7 +621,7 @@ fn load_consumers(path: &Path) -> Result<HashMap<String, u64>> {
     }
     let data = std::fs::read(path)?;
     serde_json::from_slice(&data)
-        .map_err(|e| MonaxError::Storage(format!("failed to parse change stream consumers: {}", e)))
+        .map_err(|e| TaibaiError::Storage(format!("failed to parse change stream consumers: {}", e)))
 }
 
 fn load_outbox(path: &Path) -> Result<Vec<ChangeOutboxEntry>> {
@@ -630,7 +630,7 @@ fn load_outbox(path: &Path) -> Result<Vec<ChangeOutboxEntry>> {
     }
     let data = std::fs::read(path)?;
     serde_json::from_slice(&data)
-        .map_err(|e| MonaxError::Storage(format!("failed to parse change stream outbox: {}", e)))
+        .map_err(|e| TaibaiError::Storage(format!("failed to parse change stream outbox: {}", e)))
 }
 
 fn rewrite_events(path: &Path, events: &[ChangeEvent]) -> Result<()> {
@@ -657,21 +657,21 @@ fn encode_log_record(event: &ChangeEvent) -> Result<String> {
         checksum,
     };
     serde_json::to_string(&record)
-        .map_err(|e| MonaxError::Internal(format!("failed to encode change log record: {}", e)))
+        .map_err(|e| TaibaiError::Internal(format!("failed to encode change log record: {}", e)))
 }
 
 fn decode_log_line(line: &str) -> Result<ChangeEvent> {
     let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
-        MonaxError::Storage(format!("failed to parse change stream log entry: {}", e))
+        TaibaiError::Storage(format!("failed to parse change stream log entry: {}", e))
     })?;
 
     if value.get("event").is_some() && value.get("checksum").is_some() {
         let record: ChangeLogRecord = serde_json::from_value(value).map_err(|e| {
-            MonaxError::Storage(format!("failed to parse change stream log record: {}", e))
+            TaibaiError::Storage(format!("failed to parse change stream log record: {}", e))
         })?;
         let actual = checksum_event(&record.event)?;
         if actual != record.checksum {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "change stream checksum mismatch for sequence {}: expected {}, got {}",
                 record.event.sequence, record.checksum, actual
             )));
@@ -680,7 +680,7 @@ fn decode_log_line(line: &str) -> Result<ChangeEvent> {
     }
 
     serde_json::from_value(value).map_err(|e| {
-        MonaxError::Storage(format!(
+        TaibaiError::Storage(format!(
             "failed to parse legacy change stream log entry: {}",
             e
         ))
@@ -689,7 +689,7 @@ fn decode_log_line(line: &str) -> Result<ChangeEvent> {
 
 fn checksum_event(event: &ChangeEvent) -> Result<u32> {
     let data = serde_json::to_vec(event)
-        .map_err(|e| MonaxError::Internal(format!("failed to encode change event: {}", e)))?;
+        .map_err(|e| TaibaiError::Internal(format!("failed to encode change event: {}", e)))?;
     let mut hasher = Hasher::new();
     hasher.update(&data);
     Ok(hasher.finalize())
@@ -702,7 +702,7 @@ fn change_event_matches(event: &ChangeEvent, database: Option<&str>, table: Opti
 
 fn validate_consumer_group(group: &str) -> Result<()> {
     if group.trim().is_empty() {
-        return Err(MonaxError::Sql("consumer group is required".into()));
+        return Err(TaibaiError::Sql("consumer group is required".into()));
     }
     Ok(())
 }

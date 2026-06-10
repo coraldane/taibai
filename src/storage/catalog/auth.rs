@@ -6,7 +6,7 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PermissionType {
@@ -284,15 +284,15 @@ impl AuthStore {
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
             let data = fs::read_to_string(path)
-                .map_err(|e| MonaxError::Storage(format!("failed to read auth.json: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to read auth.json: {}", e)))?;
             let store: AuthStore = serde_json::from_str(&data)
-                .map_err(|e| MonaxError::Storage(format!("failed to parse auth.json: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to parse auth.json: {}", e)))?;
             Ok(store)
         } else {
             let store = AuthStore::new();
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
-                    MonaxError::Storage(format!("failed to create auth dir: {}", e))
+                    TaibaiError::Storage(format!("failed to create auth dir: {}", e))
                 })?;
             }
             store.save(path)?;
@@ -303,21 +303,21 @@ impl AuthStore {
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| MonaxError::Storage(format!("failed to create auth dir: {}", e)))?;
+                .map_err(|e| TaibaiError::Storage(format!("failed to create auth dir: {}", e)))?;
         }
         let data = serde_json::to_string_pretty(self)
-            .map_err(|e| MonaxError::Storage(format!("failed to serialize auth: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to serialize auth: {}", e)))?;
         let tmp_path = path.with_extension("json.tmp");
         fs::write(&tmp_path, &data)
-            .map_err(|e| MonaxError::Storage(format!("failed to write auth.json.tmp: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to write auth.json.tmp: {}", e)))?;
         fs::rename(&tmp_path, path)
-            .map_err(|e| MonaxError::Storage(format!("failed to rename auth.json: {}", e)))?;
+            .map_err(|e| TaibaiError::Storage(format!("failed to rename auth.json: {}", e)))?;
         Ok(())
     }
 
     pub fn create_user(&mut self, name: &str, password: &str) -> Result<()> {
         if self.users.contains_key(name) {
-            return Err(MonaxError::Sql(format!("user '{}' already exists", name)));
+            return Err(TaibaiError::Sql(format!("user '{}' already exists", name)));
         }
         let user = UserInfo::new(name, password);
         self.users.insert(name.to_string(), user);
@@ -326,14 +326,14 @@ impl AuthStore {
 
     pub fn drop_user(&mut self, name: &str, if_exists: bool) -> Result<()> {
         if self.users.remove(name).is_none() && !if_exists {
-            return Err(MonaxError::Sql(format!("user '{}' does not exist", name)));
+            return Err(TaibaiError::Sql(format!("user '{}' does not exist", name)));
         }
         Ok(())
     }
 
     pub fn create_role(&mut self, name: &str) -> Result<()> {
         if self.roles.contains_key(name) {
-            return Err(MonaxError::Sql(format!("role '{}' already exists", name)));
+            return Err(TaibaiError::Sql(format!("role '{}' already exists", name)));
         }
         let role = RoleInfo::new(name);
         self.roles.insert(name.to_string(), role);
@@ -342,7 +342,7 @@ impl AuthStore {
 
     pub fn drop_role(&mut self, name: &str, if_exists: bool) -> Result<()> {
         if self.roles.remove(name).is_none() && !if_exists {
-            return Err(MonaxError::Sql(format!("role '{}' does not exist", name)));
+            return Err(TaibaiError::Sql(format!("role '{}' does not exist", name)));
         }
         Ok(())
     }
@@ -357,7 +357,7 @@ impl AuthStore {
                 role.permissions.push(perm);
             }
         } else {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "user or role '{}' does not exist",
                 target
             )));
@@ -375,7 +375,7 @@ impl AuthStore {
         let is_role = self.roles.contains_key(target);
 
         if !is_user && !is_role {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "user or role '{}' does not exist",
                 target
             )));
@@ -461,7 +461,7 @@ impl AuthStore {
             user.password_hash = hash_password(password);
             Ok(())
         } else {
-            Err(MonaxError::Sql(format!("user '{}' does not exist", name)))
+            Err(TaibaiError::Sql(format!("user '{}' does not exist", name)))
         }
     }
 
@@ -470,7 +470,7 @@ impl AuthStore {
             user.account_locked = true;
             Ok(())
         } else {
-            Err(MonaxError::Sql(format!("user '{}' does not exist", name)))
+            Err(TaibaiError::Sql(format!("user '{}' does not exist", name)))
         }
     }
 
@@ -479,7 +479,7 @@ impl AuthStore {
             user.account_locked = false;
             Ok(())
         } else {
-            Err(MonaxError::Sql(format!("user '{}' does not exist", name)))
+            Err(TaibaiError::Sql(format!("user '{}' does not exist", name)))
         }
     }
 

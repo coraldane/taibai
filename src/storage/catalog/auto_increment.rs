@@ -5,7 +5,7 @@ use std::sync::{
     Arc, RwLock,
 };
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 pub struct AutoIncrementCounter {
     current: AtomicU64,
@@ -80,7 +80,7 @@ impl AutoIncrementManager {
             let counters = self.counters.read().unwrap();
             if let Some(counter) = counters.get(&key) {
                 if counter.column() != column {
-                    return Err(MonaxError::Internal(format!(
+                    return Err(TaibaiError::Internal(format!(
                         "auto_increment column mismatch: expected {}, got {}",
                         counter.column(),
                         column
@@ -106,7 +106,7 @@ impl AutoIncrementManager {
 
     pub fn next_value(&self, db: &str, table: &str) -> Result<u64> {
         let counter = self.get(db, table).ok_or_else(|| {
-            MonaxError::Internal(format!(
+            TaibaiError::Internal(format!(
                 "no auto_increment counter for table {}.{}",
                 db, table
             ))
@@ -139,7 +139,7 @@ impl AutoIncrementManager {
 
     pub fn reset(&self, db: &str, table: &str, value: u64) -> Result<()> {
         let counter = self.get(db, table).ok_or_else(|| {
-            MonaxError::Internal(format!(
+            TaibaiError::Internal(format!(
                 "no auto_increment counter for table {}.{}",
                 db, table
             ))
@@ -150,7 +150,7 @@ impl AutoIncrementManager {
 
     pub fn advance_past(&self, db: &str, table: &str, value: u64) -> Result<()> {
         let counter = self.get(db, table).ok_or_else(|| {
-            MonaxError::Internal(format!(
+            TaibaiError::Internal(format!(
                 "no auto_increment counter for table {}.{}",
                 db, table
             ))

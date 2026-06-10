@@ -2,7 +2,7 @@
 /// Inspired by taibai's FunctionRegistry + DuckDB's function catalog.
 use std::collections::HashMap;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
@@ -165,7 +165,7 @@ impl FunctionRegistry {
     pub fn execute(&self, name: &str, args: &[ScalarValue]) -> Result<ScalarValue> {
         match self.get(name) {
             Some(handler) => handler(args),
-            None => Err(MonaxError::Sql(format!("unknown function '{}'", name))),
+            None => Err(TaibaiError::Sql(format!("unknown function '{}'", name))),
         }
     }
 

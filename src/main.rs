@@ -21,7 +21,7 @@ async fn main() {
         )
         .init();
 
-    tracing::info!("Monax {}", version::get_full_version());
+    tracing::info!("Taibai {}", version::get_full_version());
 
     match RunMode::from_args() {
         RunMode::Server(config) => run_server(config).await,
@@ -42,7 +42,7 @@ async fn run_server(config: ServerConfig) {
         database = %config.storage.default_database,
         tls_enabled = config.tls.enabled,
         compression = config.compression.enabled,
-        "starting monax server"
+        "starting taibai server"
     );
 
     if let Err(e) = std::fs::create_dir_all(&config.storage.data_dir) {
@@ -175,12 +175,12 @@ async fn run_client(
             }
         }
     } else {
-        println!("monax client interactive mode. Type SQL queries or 'quit' to exit.");
+        println!("taibai client interactive mode. Type SQL queries or 'quit' to exit.");
         let stdin = std::io::stdin();
         let mut buf = String::new();
         loop {
             buf.clear();
-            print!("monax> ");
+            print!("taibai> ");
             if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
                 eprintln!("IO error: {}", e);
                 break;

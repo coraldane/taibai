@@ -26,7 +26,7 @@ Cargo.lock
 ehthumbs.db
 Thumbs.db
 
-# Monax data directory (database files)
+# Taibai data directory (database files)
 /data/
 *.col
 

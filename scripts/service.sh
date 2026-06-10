@@ -4,20 +4,20 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-PREFIX="/usr/local/monax"
+PREFIX="/usr/local/taibai"
 BIN_DIR="$PREFIX/bin"
 CONF_DIR="$PREFIX/conf"
 LOG_DIR="$PREFIX/log"
 RUN_DIR="$PREFIX/run"
 
-DEV_BIN="$PROJECT_ROOT/target/release/monax"
+DEV_BIN="$PROJECT_ROOT/target/release/taibai"
 DEV_CONF="$PROJECT_ROOT/conf/example.yaml"
-DEV_PID="$PROJECT_ROOT/monax.pid"
+DEV_PID="$PROJECT_ROOT/taibai.pid"
 
 OS="$(uname -s)"
 
 is_installed() {
-    [ -f "$BIN_DIR/monax" ] || [ -f "${BIN_DIR}.exe" ]
+    [ -f "$BIN_DIR/taibai" ] || [ -f "${BIN_DIR}.exe" ]
 }
 
 is_development() {
@@ -26,22 +26,22 @@ is_development() {
 
 is_service_installed() {
     if [ "$OS" = "Linux" ]; then
-        [ -f /etc/systemd/system/monax.service ]
+        [ -f /etc/systemd/system/taibai.service ]
     elif [ "$OS" = "Darwin" ]; then
-        [ -f /Library/LaunchDaemons/com.monax.server.plist ]
+        [ -f /Library/LaunchDaemons/com.taibai.server.plist ]
     else
         false
     fi
 }
 
 start_installed() {
-    echo "Starting monax service..."
+    echo "Starting taibai service..."
     
     if [ "$OS" = "Linux" ]; then
-        systemctl start monax
+        systemctl start taibai
         echo "Service started via systemd"
     elif [ "$OS" = "Darwin" ]; then
-        launchctl load /Library/LaunchDaemons/com.monax.server.plist
+        launchctl load /Library/LaunchDaemons/com.taibai.server.plist
         echo "Service started via launchd"
     fi
     
@@ -50,7 +50,7 @@ start_installed() {
 }
 
 start_development() {
-    echo "Starting monax in development mode..."
+    echo "Starting taibai in development mode..."
     
     if [ ! -f "$DEV_BIN" ]; then
         echo "Binary not found at $DEV_BIN"
@@ -70,34 +70,34 @@ start_development() {
     fi
     
     cd "$PROJECT_ROOT"
-    nohup "$DEV_BIN" --config "$DEV_CONF" > "$LOG_DIR/monax.log" 2>&1 &
+    nohup "$DEV_BIN" --config "$DEV_CONF" > "$LOG_DIR/taibai.log" 2>&1 &
     local pid=$!
     echo "$pid" > "$DEV_PID"
     
     sleep 1
     if kill -0 "$pid" 2>/dev/null; then
-        echo "Started monax (PID: $pid)"
-        echo "Logs: $LOG_DIR/monax.log"
+        echo "Started taibai (PID: $pid)"
+        echo "Logs: $LOG_DIR/taibai.log"
     else
-        echo "Failed to start monax"
+        echo "Failed to start taibai"
         exit 1
     fi
 }
 
 stop_installed() {
-    echo "Stopping monax service..."
+    echo "Stopping taibai service..."
     
     if [ "$OS" = "Linux" ]; then
-        systemctl stop monax || true
+        systemctl stop taibai || true
         echo "Service stopped via systemd"
     elif [ "$OS" = "Darwin" ]; then
-        launchctl unload /Library/LaunchDaemons/com.monax.server.plist || true
+        launchctl unload /Library/LaunchDaemons/com.taibai.server.plist || true
         echo "Service stopped via launchd"
     fi
 }
 
 stop_development() {
-    echo "Stopping monax (development mode)..."
+    echo "Stopping taibai (development mode)..."
     
     if [ -f "$DEV_PID" ]; then
         local pid="$(cat "$DEV_PID")"
@@ -124,7 +124,7 @@ stop_development() {
     else
         echo "No PID file found"
         
-        local running_pid="$(pgrep -f 'monax.*--config' 2>/dev/null | head -1)"
+        local running_pid="$(pgrep -f 'taibai.*--config' 2>/dev/null | head -1)"
         if [ -n "$running_pid" ]; then
             echo "Found running process (PID: $running_pid)"
             kill "$running_pid" 2>/dev/null || true
@@ -134,15 +134,15 @@ stop_development() {
 }
 
 status_installed() {
-    echo "Checking monax service status..."
+    echo "Checking taibai service status..."
     
     if [ "$OS" = "Linux" ]; then
-        systemctl status monax --no-pager || true
+        systemctl status taibai --no-pager || true
     elif [ "$OS" = "Darwin" ]; then
-        local status="$(launchctl list | grep com.monax.server || echo 'Not running')"
+        local status="$(launchctl list | grep com.taibai.server || echo 'Not running')"
         echo "$status"
         
-        if echo "$status" | grep -q "com.monax.server"; then
+        if echo "$status" | grep -q "com.taibai.server"; then
             echo "Service is running"
         else
             echo "Service is not running"
@@ -151,7 +151,7 @@ status_installed() {
 }
 
 status_development() {
-    echo "Checking monax status (development mode)..."
+    echo "Checking taibai status (development mode)..."
     
     if [ -f "$DEV_PID" ]; then
         local pid="$(cat "$DEV_PID")"
@@ -163,13 +163,13 @@ status_development() {
                 echo "Listening on port $port"
             fi
             
-            echo "Logs: $LOG_DIR/monax.log"
+            echo "Logs: $LOG_DIR/taibai.log"
         else
             echo "Not running (stale PID: $pid)"
             rm -f "$DEV_PID"
         fi
     else
-        local running_pid="$(pgrep -f 'monax.*--config' 2>/dev/null | head -1)"
+        local running_pid="$(pgrep -f 'taibai.*--config' 2>/dev/null | head -1)"
         if [ -n "$running_pid" ]; then
             echo "Running (PID: $running_pid - no PID file)"
         else
@@ -180,18 +180,18 @@ status_development() {
 
 print_help() {
     cat << EOF
-Monax Service Management
+Taibai Service Management
 
 Usage: ./scripts/service.sh <command>
 
 Commands:
-  start     Start the monax service
-  stop      Stop the monax service  
-  restart   Restart the monax service
+  start     Start the taibai service
+  stop      Stop the taibai service  
+  restart   Restart the taibai service
   status    Check service status
 
 Modes:
-  - If monax is installed (binary at $BIN_DIR/monax), uses systemd/launchd
+  - If taibai is installed (binary at $BIN_DIR/taibai), uses systemd/launchd
   - If in development mode (binary at $DEV_BIN), runs directly
 
 Environment:
@@ -200,7 +200,7 @@ Environment:
     - No installed binary found
 
   Installed mode is used when:
-    - Binary exists at: $BIN_DIR/monax
+    - Binary exists at: $BIN_DIR/taibai
 EOF
 }
 
@@ -223,8 +223,8 @@ main() {
             elif is_development; then
                 start_development
             else
-                echo "Error: No monax binary found"
-                echo "Either install monax or build it with: cargo build --release"
+                echo "Error: No taibai binary found"
+                echo "Either install taibai or build it with: cargo build --release"
                 exit 1
             fi
             ;;
@@ -247,10 +247,10 @@ main() {
         status)
             if is_service_installed; then
                 status_installed
-            elif [ -f "$DEV_PID" ] || pgrep -f 'monax' >/dev/null 2>&1; then
+            elif [ -f "$DEV_PID" ] || pgrep -f 'taibai' >/dev/null 2>&1; then
                 status_development
             else
-                echo "No monax process found"
+                echo "No taibai process found"
             fi
             ;;
         help|-h|--help)

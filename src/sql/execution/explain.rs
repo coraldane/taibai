@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::sql::parser::ast::{Statement, TableRef};
 use crate::sql::planner::*;
@@ -19,7 +19,7 @@ pub fn exec_explain(
     let select_from = match inner {
         Statement::Select { .. } => inner,
         other => {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "EXPLAIN currently supports SELECT only, got: {:?}",
                 std::mem::discriminant(other)
             )));
@@ -31,7 +31,7 @@ pub fn exec_explain(
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs
             .get(db)
-            .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
         collect_tables_from_stmt(select_from, |t| {
             if let Some(meta) = catalog.get_table(t) {
                 table_schemas.insert(t.to_string(), Schema::new(meta.columns.clone()));

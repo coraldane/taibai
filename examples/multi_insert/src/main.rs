@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
-use monax::net::client::{BulkImportConfig, Client};
+use taibai::net::client::{BulkImportConfig, Client};
 use tick::{append_insert_prefix, append_tick_csv_values, TICK_CREATE_TABLE_SQL};
 
 const TICK_TABLE: &str = "stock_tick_multi";

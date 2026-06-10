@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
 use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType};
@@ -32,7 +32,7 @@ pub fn exec_create_table(
         if if_not_exists {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "table '{}.{}' already exists",
             db, name
         )));
@@ -119,7 +119,7 @@ pub fn exec_drop_table(
         if if_exists {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "table '{}.{}' does not exist",
             db, name
         )));
@@ -159,10 +159,10 @@ pub fn exec_alter_table(
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = catalogs
         .get_mut(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
     if catalog.get_table(name).is_none() {
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "table '{}.{}' does not exist",
             db, name
         )));
@@ -277,14 +277,14 @@ pub fn exec_alter_table(
             }
             AlterOperation::SetTtl { ttl } => {
                 let meta = catalog.get_table_mut(name).ok_or_else(|| {
-                    MonaxError::Sql(format!("table '{}.{}' does not exist", db, name))
+                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
                 })?;
                 validate_ttl_definition(meta, ttl)?;
                 meta.set_ttl(&ttl.column, ttl.duration_secs);
             }
             AlterOperation::DropTtl => {
                 let meta = catalog.get_table_mut(name).ok_or_else(|| {
-                    MonaxError::Sql(format!("table '{}.{}' does not exist", db, name))
+                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
                 })?;
                 meta.clear_ttl();
             }
@@ -306,7 +306,7 @@ fn validate_ttl_definition(
 
 fn validate_ttl_columns(columns: &[ColumnDef], ttl: &TtlDef) -> Result<()> {
     if ttl.duration_secs <= 0 {
-        return Err(MonaxError::Sql(
+        return Err(TaibaiError::Sql(
             "TTL duration must be a positive number of seconds".into(),
         ));
     }
@@ -314,10 +314,10 @@ fn validate_ttl_columns(columns: &[ColumnDef], ttl: &TtlDef) -> Result<()> {
     let column = columns
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(&ttl.column))
-        .ok_or_else(|| MonaxError::Sql(format!("TTL column '{}' not found", ttl.column)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("TTL column '{}' not found", ttl.column)))?;
 
     if column.data_type != DataType::Timestamp {
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "TTL column '{}' must be TIMESTAMP",
             ttl.column
         )));
@@ -331,7 +331,7 @@ fn apply_table_primary_key(columns: &mut [ColumnDef], primary_key: &[String]) ->
         let column = columns
             .iter_mut()
             .find(|c| c.name.eq_ignore_ascii_case(pk_col))
-            .ok_or_else(|| MonaxError::Sql(format!("primary key column '{}' not found", pk_col)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("primary key column '{}' not found", pk_col)))?;
         column.primary_key = true;
     }
     Ok(())
@@ -344,11 +344,11 @@ fn validate_column_constraints(columns: &mut [ColumnDef]) -> Result<()> {
     for col in columns {
         let name_key = col.name.to_ascii_lowercase();
         if !seen_names.insert(name_key.clone()) {
-            return Err(MonaxError::Sql(format!("duplicate column '{}'", col.name)));
+            return Err(TaibaiError::Sql(format!("duplicate column '{}'", col.name)));
         }
         if col.primary_key {
             if !seen_pk.insert(name_key) {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "duplicate primary key column '{}'",
                     col.name
                 )));
@@ -376,7 +376,7 @@ fn normalize_default_value(
     match default_value {
         ColumnDefaultValue::CurrentTimestamp => {
             if data_type != DataType::Timestamp {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "CURRENT_TIMESTAMP default requires TIMESTAMP column '{}'",
                     column_name
                 )));
@@ -389,7 +389,7 @@ fn normalize_default_value(
                 &expr, &data_type, scale, 0,
             )?;
             if !scalar.is_null() && scalar.data_type() != data_type {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "default value for column '{}' has type {}, expected {}",
                     column_name,
                     scalar.data_type().display_name(),
@@ -405,10 +405,10 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = catalogs
         .get_mut(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
     if catalog.get_table(table).is_none() {
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "table '{}.{}' does not exist",
             db, table
         )));
@@ -474,7 +474,7 @@ pub fn exec_create_database(
         if if_not_exists {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "database '{}' already exists",
             name
         )));
@@ -498,14 +498,14 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
         if if_exists {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "database '{}' does not exist",
             name
         )));
     }
 
     if name == "default" {
-        return Err(MonaxError::Sql("cannot drop default database".into()));
+        return Err(TaibaiError::Sql("cannot drop default database".into()));
     }
 
     let table_names = catalogs
@@ -645,7 +645,7 @@ pub fn exec_show_tables(engine: &Engine, db: &str) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
     let schema = Schema::new(vec![ColumnDef::new("table_name", DataType::VarChar)]);
 
     let mut batch = RecordBatch::new(schema.clone());
@@ -684,11 +684,11 @@ pub fn exec_show_columns(engine: &Engine, db: &str, table: &str) -> Result<ExecR
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
     let table_meta = catalog
         .get_table(table)
-        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
 
     let schema = Schema::new(vec![
         ColumnDef::new("column_name", DataType::VarChar),
@@ -734,11 +734,11 @@ pub fn exec_show_indexes(engine: &Engine, db: &str, table: &str) -> Result<ExecR
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
     let table_meta = catalog
         .get_table(table)
-        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
 
     let schema = Schema::new(vec![
         ColumnDef::new("Table", DataType::VarChar),
@@ -787,11 +787,11 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
     let table_meta = catalog
         .get_table(table)
-        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
 
     let mut create_sql = format!("CREATE TABLE {} (\n", table);
     for (i, col) in table_meta.columns.iter().enumerate() {
@@ -894,7 +894,7 @@ fn get_existing_catalog<'a>(
 ) -> Result<&'a mut DatabaseCatalog> {
     catalogs
         .get_mut(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))
 }
 
 use crate::sql::parser::ast::AlterUserOperation;
@@ -985,7 +985,7 @@ pub fn exec_show_partitions(
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
     let schema = Schema::new(vec![
         ColumnDef::new("Table", DataType::VarChar),
@@ -1296,11 +1296,11 @@ pub fn exec_optimize_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
     let table_meta = catalog
         .get_table(table)
-        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
         .clone();
     drop(catalogs);
 

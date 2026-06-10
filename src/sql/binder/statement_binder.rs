@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 
@@ -37,7 +37,7 @@ impl StatementBinder {
                     distinct,
                 ),
                 _ => {
-                    return Err(MonaxError::Internal(
+                    return Err(TaibaiError::Internal(
                         "bind_select called with non-SELECT".into(),
                     ))
                 }
@@ -82,7 +82,7 @@ impl StatementBinder {
                     let schema = table_schemas
                         .get(&table_name)
                         .ok_or_else(|| {
-                            MonaxError::Sql(format!("table '{}' not found", table_name))
+                            TaibaiError::Sql(format!("table '{}' not found", table_name))
                         })?
                         .clone();
                     let mut ctx = BindContext::with_table(&table_name, schema.clone());
@@ -92,7 +92,7 @@ impl StatementBinder {
                     Ok((ctx, schema))
                 }
                 TableRef::Subquery { query: _, alias: _ } => {
-                    Err(MonaxError::Sql("subquery in FROM not yet supported".into()))
+                    Err(TaibaiError::Sql("subquery in FROM not yet supported".into()))
                 }
             },
             FromClause::Join(join_expr) => {
@@ -106,7 +106,7 @@ impl StatementBinder {
                             let right_schema = table_schemas
                                 .get(&right_table)
                                 .ok_or_else(|| {
-                                    MonaxError::Sql(format!("table '{}' not found", right_table))
+                                    TaibaiError::Sql(format!("table '{}' not found", right_table))
                                 })?
                                 .clone();
 
@@ -129,7 +129,7 @@ impl StatementBinder {
                             }
                         }
                         TableRef::Subquery { query: _, alias: _ } => {
-                            return Err(MonaxError::Sql(
+                            return Err(TaibaiError::Sql(
                                 "subquery in JOIN not yet supported".into(),
                             ));
                         }

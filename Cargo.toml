@@ -8,17 +8,17 @@ members = [
 ]
 
 [package]
-name = "monax"
+name = "taibai"
 version = "0.1.0"
 edition = "2021"
 description = "A columnar database server wire-compatible with taibai-go"
 
 [lib]
-name = "monax"
+name = "taibai"
 path = "src/lib.rs"
 
 [[bin]]
-name = "monax"
+name = "taibai"
 path = "src/main.rs"
 
 [[bin]]

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::sql::parser::parser::Parser;
 use crate::sql::parser::ast::Statement;
 
@@ -38,7 +38,7 @@ impl PreparedStatementCache {
     pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         let stmts = Parser::parse(sql)?;
         if stmts.is_empty() {
-            return Err(MonaxError::Sql("empty query".into()));
+            return Err(TaibaiError::Sql("empty query".into()));
         }
 
         let id = self.next_id;

@@ -1,6 +1,6 @@
-# Monax — 列式数据库服务器
+# Taibai — 列式数据库服务器
 
-> **Monax** 是一个高性能列式数据库服务器，兼容 taibai-go 协议。  
+> **Taibai** 是一个高性能列式数据库服务器，兼容 taibai-go 协议。  
 > 使用 Rust 构建，旨在提供高效的 OLAP 查询性能，同时支持 OLTP 场景。
 
 ---
@@ -21,7 +21,7 @@
 
 ## 架构概览
 
-Monax 采用分层架构：
+Taibai 采用分层架构：
 
 ```
 ┌─────────────────────────────────┐
@@ -179,7 +179,7 @@ FLUSH;
 
 ### 段式列存 (Segment Storage)
 
-Monax 使用自定义的列式段存储格式：
+Taibai 使用自定义的列式段存储格式：
 
 - **段 (Segment)**：磁盘上的基本存储单元，包含多个行组 (Row Group)
 - **行组 (Row Group)**：固定行数（默认 8192 行）的列数据块
@@ -397,7 +397,7 @@ cargo build --release
 ### 运行
 
 ```bash
-./monax --data-dir ./data --listen 0.0.0.0:7654
+./taibai --data-dir ./data --listen 0.0.0.0:7654
 ```
 
 ### 命令行参数

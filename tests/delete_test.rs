@@ -1,7 +1,7 @@
 use tempfile::TempDir;
 
-use monax::net::session::Session;
-use monax::sql::execution::engine::{Engine, ExecResult};
+use taibai::net::session::Session;
+use taibai::sql::execution::engine::{Engine, ExecResult};
 
 fn create_engine() -> (TempDir, Engine, Session) {
     let temp_dir = TempDir::new().expect("failed to create temp dir");

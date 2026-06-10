@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 use crate::sql::parser::ast::{
     FromClause, JoinClause, JoinExpr, JoinType, OrderByItem, SelectItem, Statement, TableRef,
@@ -260,14 +260,14 @@ impl Parser {
                 } else if matches!(self.peek(), Token::Ident(_)) {
                     self.expect_ident()?
                 } else {
-                    return Err(MonaxError::Sql("derived table requires an alias".into()));
+                    return Err(TaibaiError::Sql("derived table requires an alias".into()));
                 };
                 Ok(TableRef::Subquery {
                     query: Box::new(stmt),
                     alias,
                 })
             } else {
-                Err(MonaxError::Sql("expected SELECT in derived table".into()))
+                Err(TaibaiError::Sql("expected SELECT in derived table".into()))
             }
         } else {
             let name = self.parse_object_name()?;

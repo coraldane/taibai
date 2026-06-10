@@ -75,8 +75,8 @@ pub struct TickElement {
 }
 
 impl TickElement {
-    pub fn to_scalar_values(&self) -> Vec<monax::types::scalar::ScalarValue> {
-        use monax::types::scalar::ScalarValue;
+    pub fn to_scalar_values(&self) -> Vec<taibai::types::scalar::ScalarValue> {
+        use taibai::types::scalar::ScalarValue;
         vec![
             ScalarValue::VarChar(Some(self.security_id.clone())),
             ScalarValue::Int32(Some(self.deal_date)),

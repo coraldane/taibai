@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 pub const FILE_PREFIX: &str = "wal_";
 pub const FILE_SUFFIX: &str = ".log";
@@ -38,7 +38,7 @@ impl RecordType {
             6 => Ok(RecordType::Checkpoint),
             7 => Ok(RecordType::CompactSwap),
             8 => Ok(RecordType::BatchInsert),
-            _ => Err(MonaxError::Storage(format!(
+            _ => Err(TaibaiError::Storage(format!(
                 "unknown WAL record type: {}",
                 v
             ))),
@@ -69,7 +69,7 @@ impl WalRecord {
 
     pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
         if buf.len() < HEADER_SIZE {
-            return Err(MonaxError::Storage("WAL record too short".into()));
+            return Err(TaibaiError::Storage("WAL record too short".into()));
         }
 
         let sequence = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -79,14 +79,14 @@ impl WalRecord {
         let stored_crc = u32::from_le_bytes(buf[21..25].try_into().unwrap());
 
         if buf.len() < HEADER_SIZE + data_len {
-            return Err(MonaxError::Storage("WAL record truncated".into()));
+            return Err(TaibaiError::Storage("WAL record truncated".into()));
         }
 
         let data = buf[HEADER_SIZE..HEADER_SIZE + data_len].to_vec();
 
         let computed_crc = compute_crc(&buf[..21], &data);
         if stored_crc != computed_crc {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "WAL CRC mismatch: stored={}, computed={}",
                 stored_crc, computed_crc
             )));
@@ -387,7 +387,7 @@ impl WalReader {
                     offset += consumed;
                     records.push(record);
                 }
-                Err(MonaxError::Storage(msg)) if msg.contains("truncated") => {
+                Err(TaibaiError::Storage(msg)) if msg.contains("truncated") => {
                     break;
                 }
                 Err(e) => {

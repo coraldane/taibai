@@ -1,12 +1,12 @@
 # 变更流
 
-Monax 通过现有的 TCP 消息协议暴露表级 DML 变更通知，因此订阅者可以用任何语言实现。
+Taibai 通过现有的 TCP 消息协议暴露表级 DML 变更通知，因此订阅者可以用任何语言实现。
 
-面向消费者的使用指南，请参阅 `docs/change-stream-quickstart.md`。
+面向消费者的使用指南，请参阅 `change-stream-quickstart.md`。
 
 ## 线路协议
 
-每条消息使用标准的 Monax 帧：
+每条消息使用标准的 Taibai 帧：
 
 | 字段 | 大小 | 编码 |
 | --- | ---: | --- |
@@ -136,12 +136,12 @@ ACK 也可以参与普通的 SQL 事务：
 
 ```sql
 BEGIN;
--- 在 Monax 中应用下游/幂等写入
+-- 在 Taibai 中应用下游/幂等写入
 ACK CHANGE CONSUMER 'etl-worker' TO 1288;
 COMMIT;
 ```
 
-在事务内部，`ACK CHANGE CONSUMER` 在会话中暂存，仅在 `COMMIT` 成功时持久化。`ROLLBACK` 会丢弃暂存的 ACK。当消费者将其处理结果或幂等键存储在 Monax 中，并希望结果写入和消费者偏移量一起推进时，这是推荐的模式。
+在事务内部，`ACK CHANGE CONSUMER` 在会话中暂存，仅在 `COMMIT` 成功时持久化。`ROLLBACK` 会丢弃暂存的 ACK。当消费者将其处理结果或幂等键存储在 Taibai 中，并希望结果写入和消费者偏移量一起推进时，这是推荐的模式。
 
 消费者偏移量可以通过 SQL 查看：
 
@@ -174,7 +174,7 @@ SHOW CHANGE EVENTS FOR market.ticks FROM 1200 LIMIT 100;
 
 如果服务端发送带有 `change stream lagged, skipped N events` 等文本的 `MSG_TYPE_ERROR`，说明订阅者太慢，应重新同步，例如重新查询受影响的表或使用 `include_recent=true` 重新连接。
 
-变更事件以 JSON 行的形式追加到配置的数据目录下的 `meta/change_stream.log`。启动时，Monax 重新加载日志，恢复下一个序列号，从日志尾部重建内存中的近期缓存，并保留最新的 `change_stream.retention_events` 个事件。默认为 1,000,000 个事件。
+变更事件以 JSON 行的形式追加到配置的数据目录下的 `meta/change_stream.log`。启动时，Taibai 重新加载日志，恢复下一个序列号，从日志尾部重建内存中的近期缓存，并保留最新的 `change_stream.retention_events` 个事件。默认为 1,000,000 个事件。
 
 新的日志条目以校验和保护的 JSON 记录形式写入。较旧的纯 `ChangeEvent` JSON 行仍然可读。启动时，损坏的尾部条目会被检测到，日志通过截断到最后一个有效事件来修复。
 
@@ -182,4 +182,4 @@ SHOW CHANGE EVENTS FOR market.ticks FROM 1200 LIMIT 100;
 
 对于可恢复的消费，在下游服务中持久化最后处理的 `sequence`，并使用设置为下一个要消费序列的 `from_sequence` 重新连接。如果请求的序列早于保留的日志，服务端返回带有最早可用序列的 `MSG_TYPE_ERROR`，消费者必须从全表快照重新同步。
 
-投递语义是至少一次。消费者应仅在持久化下游处理后 ACK，并使用 `sequence` 加上主键行映像使处理幂等。事务性 ACK 为副作用和 ACK 状态都存储在 Monax 中的消费者提供有效一次的行为；外部系统中的副作用仍需要自己的幂等性或事务性偏移存储。
+投递语义是至少一次。消费者应仅在持久化下游处理后 ACK，并使用 `sequence` 加上主键行映像使处理幂等。事务性 ACK 为副作用和 ACK 状态都存储在 Taibai 中的消费者提供有效一次的行为；外部系统中的副作用仍需要自己的幂等性或事务性偏移存储。

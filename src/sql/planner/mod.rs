@@ -3,7 +3,7 @@ pub mod types;
 
 use std::collections::HashMap;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
@@ -80,7 +80,7 @@ pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Resul
                 distinct,
             ),
             _ => {
-                return Err(MonaxError::Internal(
+                return Err(TaibaiError::Internal(
                     "plan_select called with non-SELECT".into(),
                 ))
             }
@@ -218,7 +218,7 @@ fn plan_from_clause(
                 let table_name = name.plan_key();
                 let schema = table_schemas
                     .get(&table_name)
-                    .ok_or_else(|| MonaxError::Sql(format!("table '{}' not found", table_name)))?
+                    .ok_or_else(|| TaibaiError::Sql(format!("table '{}' not found", table_name)))?
                     .clone();
                 let plan = LogicalPlan::Scan(ScanPlan::new(table_name.clone(), schema.clone()));
 
@@ -237,7 +237,7 @@ fn plan_from_clause(
 
                 Ok((plan, schema, alias_map, table_info))
             }
-            TableRef::Subquery { query: _, alias: _ } => Err(MonaxError::Sql(
+            TableRef::Subquery { query: _, alias: _ } => Err(TaibaiError::Sql(
                 "subquery in FROM not yet supported in planner".into(),
             )),
         },
@@ -255,7 +255,7 @@ fn plan_from_clause(
                         let right_schema = table_schemas
                             .get(&right_table)
                             .ok_or_else(|| {
-                                MonaxError::Sql(format!("table '{}' not found", right_table))
+                                TaibaiError::Sql(format!("table '{}' not found", right_table))
                             })?
                             .clone();
 
@@ -301,7 +301,7 @@ fn plan_from_clause(
                         current_schema = output_schema;
                     }
                     TableRef::Subquery { query: _, alias: _ } => {
-                        return Err(MonaxError::Sql(
+                        return Err(TaibaiError::Sql(
                             "subquery in JOIN not yet supported in planner".into(),
                         ));
                     }

@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
@@ -17,7 +17,7 @@ impl Parser {
             Token::Database => self.parse_create_database_rest(),
             Token::User => self.parse_create_user(),
             Token::Role => self.parse_create_role(),
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected TABLE, DATABASE, USER, or ROLE after CREATE, got {}",
                 other
             ))),
@@ -36,7 +36,7 @@ impl Parser {
                 self.advance();
                 s.clone()
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected credential string, got {}",
                 other
             )))?,
@@ -211,7 +211,7 @@ impl Parser {
                 self.advance();
             }
             other => {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "expected TTL table option, got {}",
                     other
                 )))
@@ -236,7 +236,7 @@ impl Parser {
         }
 
         if duration_secs <= 0 {
-            return Err(MonaxError::Sql(
+            return Err(TaibaiError::Sql(
                 "TTL duration must be a positive number of seconds".into(),
             ));
         }
@@ -319,7 +319,7 @@ impl Parser {
                     DefaultValue::Literal(ScalarValue::Int64(None))
                 }
                 other => {
-                    return Err(MonaxError::Sql(format!(
+                    return Err(TaibaiError::Sql(format!(
                         "unexpected token after DEFAULT: {}",
                         other
                     )));
@@ -328,10 +328,10 @@ impl Parser {
         }
 
         if data_type == DataType::Decimal && scale < 0 {
-            return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
+            return Err(TaibaiError::Sql(format!("invalid decimal scale {}", scale)));
         }
         if data_type == DataType::Decimal && scale > 18 {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "decimal scale {} exceeds supported maximum 18",
                 scale
             )));
@@ -359,7 +359,7 @@ impl Parser {
             Token::Ident(word) if word.eq_ignore_ascii_case("CHANGE") => {
                 self.parse_drop_change_consumer()
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected TABLE, DATABASE, USER, ROLE, or CHANGE after DROP, got {}",
                 other
             ))),
@@ -369,11 +369,11 @@ impl Parser {
     fn parse_drop_change_consumer(&mut self) -> Result<Statement> {
         let change = self.expect_ident()?;
         if !change.eq_ignore_ascii_case("CHANGE") {
-            return Err(MonaxError::Sql(format!("expected CHANGE, got {}", change)));
+            return Err(TaibaiError::Sql(format!("expected CHANGE, got {}", change)));
         }
         let consumer = self.expect_ident()?;
         if !consumer.eq_ignore_ascii_case("CONSUMER") {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "expected CONSUMER after DROP CHANGE, got {}",
                 consumer
             )));
@@ -466,7 +466,7 @@ impl Parser {
                     Privilege::All
                 }
                 _ => {
-                    return Err(MonaxError::Sql(format!(
+                    return Err(TaibaiError::Sql(format!(
                         "expected privilege name, got {}",
                         self.peek()
                     )))
@@ -503,7 +503,7 @@ impl Parser {
                         self.advance();
                         Ok(GrantObject::AllTables)
                     } else {
-                        Err(MonaxError::Sql("expected '*' after '*.'".into()))
+                        Err(TaibaiError::Sql("expected '*' after '*.'".into()))
                     }
                 } else {
                     Ok(GrantObject::AllTables)
@@ -518,7 +518,7 @@ impl Parser {
                     _ => Ok(GrantObject::Table(name)),
                 }
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected TABLE, DATABASE, or identifier after ON, got {}",
                 other
             ))),
@@ -580,7 +580,7 @@ impl Parser {
                 self.advance();
                 self.parse_alter_user_rest()
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected TABLE or USER after ALTER, got {}",
                 other
             ))),
@@ -631,7 +631,7 @@ impl Parser {
                         ttl: self.parse_ttl_def()?,
                     }
                 } else {
-                    return Err(MonaxError::Sql(
+                    return Err(TaibaiError::Sql(
                         "expected TTL after SET in ALTER TABLE".into(),
                     ));
                 }
@@ -642,7 +642,7 @@ impl Parser {
                     let partition_key = self.expect_ident()?;
                     AlterOperation::TruncatePartition { partition_key }
                 } else {
-                    return Err(MonaxError::Sql(
+                    return Err(TaibaiError::Sql(
                         "expected PARTITION after TRUNCATE in ALTER TABLE".into(),
                     ));
                 }
@@ -659,7 +659,7 @@ impl Parser {
                     let new_name = self.expect_ident()?;
                     AlterOperation::RenameTable { new_name }
                 } else {
-                    return Err(MonaxError::Sql("expected COLUMN or TO after RENAME".into()));
+                    return Err(TaibaiError::Sql("expected COLUMN or TO after RENAME".into()));
                 }
             } else if self.peek() == &Token::Modify {
                 self.advance();
@@ -691,7 +691,7 @@ impl Parser {
                         self.advance();
                         s.clone()
                     }
-                    other => Err(MonaxError::Sql(format!(
+                    other => Err(TaibaiError::Sql(format!(
                         "expected password string, got {}",
                         other
                     )))?,
@@ -705,7 +705,7 @@ impl Parser {
                         self.advance();
                         s.clone()
                     }
-                    other => Err(MonaxError::Sql(format!(
+                    other => Err(TaibaiError::Sql(format!(
                         "expected password string, got {}",
                         other
                     )))?,

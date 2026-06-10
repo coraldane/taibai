@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 
 /// SQL token types.
 #[derive(Debug, Clone, PartialEq)]
@@ -355,7 +355,7 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                         Token::Neq
                     } else {
-                        return Err(MonaxError::Sql("unexpected character '!'".into()));
+                        return Err(TaibaiError::Sql("unexpected character '!'".into()));
                     }
                 }
                 b'/' => {
@@ -382,7 +382,7 @@ impl<'a> Lexer<'a> {
                     if ch.is_whitespace() {
                         continue;
                     }
-                    return Err(MonaxError::Sql(format!("unexpected character '{}'", ch)));
+                    return Err(TaibaiError::Sql(format!("unexpected character '{}'", ch)));
                 }
             };
             tokens.push(token);
@@ -421,7 +421,7 @@ impl<'a> Lexer<'a> {
         }
         if end >= self.bytes.len() {
             self.pos = end;
-            return Err(MonaxError::Sql("unterminated string literal".into()));
+            return Err(TaibaiError::Sql("unterminated string literal".into()));
         }
         let s = if has_escape {
             let mut result = String::with_capacity(end - start);
@@ -463,13 +463,13 @@ impl<'a> Lexer<'a> {
             let s = &self.input[start..self.pos];
             let v = s
                 .parse::<f64>()
-                .map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
+                .map_err(|e| TaibaiError::Sql(format!("invalid float '{}': {}", s, e)))?;
             Ok(Token::Float(v))
         } else {
             let s = &self.input[start..self.pos];
             let v = s
                 .parse::<i64>()
-                .map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
+                .map_err(|e| TaibaiError::Sql(format!("invalid integer '{}': {}", s, e)))?;
             Ok(Token::Integer(v))
         }
     }
@@ -487,13 +487,13 @@ impl<'a> Lexer<'a> {
             let s = &self.input[start..self.pos];
             let v = s
                 .parse::<f64>()
-                .map_err(|e| MonaxError::Sql(format!("invalid float '{}': {}", s, e)))?;
+                .map_err(|e| TaibaiError::Sql(format!("invalid float '{}': {}", s, e)))?;
             Ok(Token::Float(-v))
         } else {
             let s = &self.input[start..self.pos];
             let v = s
                 .parse::<i64>()
-                .map_err(|e| MonaxError::Sql(format!("invalid integer '{}': {}", s, e)))?;
+                .map_err(|e| TaibaiError::Sql(format!("invalid integer '{}': {}", s, e)))?;
             Ok(Token::Integer(-v))
         }
     }

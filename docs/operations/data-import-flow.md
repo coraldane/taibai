@@ -1,6 +1,6 @@
-# Monax 数据导入流程说明
+# Taibai 数据导入流程说明
 
-本文基于当前已实现代码整理，重点说明 Monax 现有数据导入入口、服务端处理链路、落盘流程，以及检查时发现的实现限制。
+本文基于当前已实现代码整理，重点说明 Taibai 现有数据导入入口、服务端处理链路、落盘流程，以及检查时发现的实现限制。
 
 ## 导入方式总览
 
@@ -219,7 +219,7 @@ MSG_TYPE_BULK_INSERT_COLUMNAR
 bulk 压缩级别由环境变量控制：
 
 ```text
-MONAX_BULK_ZSTD_LEVEL
+TAIBAI_BULK_ZSTD_LEVEL
 ```
 
 默认值为 `1`。
@@ -330,7 +330,7 @@ examples/batch_import
 - 尽量使用列式二进制 bulk。
 - 对可重放导入使用 `disable_wal=true`。
 - 调大 batch size 和 pipeline depth，但不要超过 `Client::start_pipeline` 当前上限 16。
-- 对无需查询裁剪的导入阶段，可通过 `MONAX_BULK_ZSTD_LEVEL=1` 或更低级别压缩减少 CPU。
+- 对无需查询裁剪的导入阶段，可通过 `TAIBAI_BULK_ZSTD_LEVEL=1` 或更低级别压缩减少 CPU。
 - 若希望直接列式路径收益最大，优先导入无分区/无聚簇表，或后续再执行整理/优化。
 
 ## 后续优化建议

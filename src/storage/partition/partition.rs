@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::types::scalar::ScalarValue;
 
 /// Partition strategy for a table.
@@ -23,7 +23,7 @@ impl PartitionStrategy {
             "DAY" => Ok(PartitionStrategy::Day),
             "YEAR" => Ok(PartitionStrategy::Year),
             "MONTH" => Ok(PartitionStrategy::Month),
-            _ => Err(MonaxError::Sql(format!(
+            _ => Err(TaibaiError::Sql(format!(
                 "unknown partition strategy: '{}'",
                 s
             ))),
@@ -47,14 +47,14 @@ pub fn compute_partition_key(value: &ScalarValue, strategy: PartitionStrategy) -
             crate::storage::partition::partition_function::PartitionFunction::Year
         }
         PartitionStrategy::None => {
-            return Err(MonaxError::Internal(
+            return Err(TaibaiError::Internal(
                 "cannot compute partition key for None strategy".into(),
             ))
         }
     };
     crate::storage::partition::partition_function::temporal_partition_key(&func, value).ok_or_else(
         || {
-            MonaxError::Sql(format!(
+            TaibaiError::Sql(format!(
                 "cannot extract partition key from value: {:?}",
                 value
             ))

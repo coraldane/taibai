@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::codec::encoding::EncodingType;
 use crate::storage::codec::io_util::{
@@ -314,7 +314,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 } else {
                     let mut b = [0u8; $size];
                     dc.read_exact(&mut b)
-                        .map_err(|e| MonaxError::Storage(format!("read error: {}", e)))?;
+                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
                     vals.push(<$ty>::from_le_bytes(b));
                 }
             }
@@ -334,7 +334,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 } else {
                     let mut b = [0u8; 1];
                     dc.read_exact(&mut b)
-                        .map_err(|e| MonaxError::Storage(format!("read error: {}", e)))?;
+                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
                     b[0]
                 });
             }
@@ -351,7 +351,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 } else {
                     let mut b = [0u8; 1];
                     dc.read_exact(&mut b)
-                        .map_err(|e| MonaxError::Storage(format!("read error: {}", e)))?;
+                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
                     b[0] as i8
                 });
             }
@@ -371,7 +371,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 } else {
                     let mut b = [0u8; 1];
                     dc.read_exact(&mut b)
-                        .map_err(|e| MonaxError::Storage(format!("read error: {}", e)))?;
+                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
                     b[0]
                 });
             }
@@ -457,7 +457,7 @@ pub(crate) fn decode_adaptive_column(
     bitmap: NullBitmap,
 ) -> Result<ColumnArray> {
     if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
-        return Err(MonaxError::Storage(
+        return Err(TaibaiError::Storage(
             "adaptive column header truncated".into(),
         ));
     }
@@ -477,7 +477,7 @@ pub(crate) fn decode_adaptive_column(
             let values = decode_varchar_dictionary_payload(payload)?;
             build_varchar_column(values, row_count, bitmap)
         }
-        other => Err(MonaxError::Storage(format!(
+        other => Err(TaibaiError::Storage(format!(
             "unsupported adaptive column encoding {:?} for {}",
             other,
             col_def.data_type.display_name()
@@ -515,7 +515,7 @@ pub(crate) fn decode_i64_delta_payload(payload: &[u8]) -> Result<Vec<i64>> {
         let delta = zigzag_decode(encoded);
         let next = prev
             .checked_add(delta)
-            .ok_or_else(|| MonaxError::Storage("delta decoded value overflowed i64".into()))?;
+            .ok_or_else(|| TaibaiError::Storage("delta decoded value overflowed i64".into()))?;
         values.push(next);
         prev = next;
     }
@@ -537,7 +537,7 @@ fn decode_varchar_dictionary_payload(payload: &[u8]) -> Result<Vec<String>> {
     for _ in 0..index_count {
         let idx = read_u32_le(&mut cursor)? as usize;
         let value = dict.get(idx).ok_or_else(|| {
-            MonaxError::Storage(format!("dictionary index {} out of bounds", idx))
+            TaibaiError::Storage(format!("dictionary index {} out of bounds", idx))
         })?;
         values.push(value.clone());
     }
@@ -552,7 +552,7 @@ fn build_numeric_column_from_i64(
 ) -> Result<ColumnArray> {
     let expected = row_count.saturating_sub(bitmap.null_count());
     if values.len() != expected {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "adaptive numeric value count mismatch: got {}, expected {}",
             values.len(),
             expected
@@ -604,7 +604,7 @@ fn build_numeric_column_from_i64(
         DataType::UInt32 => build_unsigned!(UInt32, u32),
         DataType::UInt64 => build_unsigned!(UInt64, u64),
         other => {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "adaptive numeric encoding cannot decode {}",
                 other.display_name()
             )))
@@ -619,7 +619,7 @@ fn build_varchar_column(
 ) -> Result<ColumnArray> {
     let expected = row_count.saturating_sub(bitmap.null_count());
     if values.len() != expected {
-        return Err(MonaxError::Storage(format!(
+        return Err(TaibaiError::Storage(format!(
             "adaptive varchar value count mismatch: got {}, expected {}",
             values.len(),
             expected
@@ -643,7 +643,7 @@ fn project_column(col: &ColumnArray, selected_rows: &[usize]) -> Result<ColumnAr
     let mut out = ColumnArray::empty(col.data_type());
     for &row in selected_rows {
         if row >= col.len() {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "selected row {} out of bounds {}",
                 row,
                 col.len()
@@ -757,17 +757,17 @@ where
     if bitmap.null_count() == 0 {
         for &row in selected_rows {
             if row >= row_count {
-                return Err(MonaxError::Storage(format!(
+                return Err(TaibaiError::Storage(format!(
                     "selected row {} out of bounds {}",
                     row, row_count
                 )));
             }
             let offset = row
                 .checked_mul(WIDTH)
-                .ok_or_else(|| MonaxError::Storage("fixed column offset overflow".into()))?;
+                .ok_or_else(|| TaibaiError::Storage("fixed column offset overflow".into()))?;
             let end = offset + WIDTH;
             if end > values.len() {
-                return Err(MonaxError::Storage(
+                return Err(TaibaiError::Storage(
                     "fixed column selected offset exceeds data".into(),
                 ));
             }
@@ -790,7 +790,7 @@ where
 
         let end = value_offset + WIDTH;
         if end > values.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "fixed column selected scan exceeds data".into(),
             ));
         }
@@ -828,7 +828,7 @@ fn decode_selected_varchar(
             continue;
         }
         if value_offset + 4 > values.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "variable column length prefix truncated".into(),
             ));
         }
@@ -837,7 +837,7 @@ fn decode_selected_varchar(
         let start = value_offset + 4;
         let end = start + len;
         if end > values.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "variable column selected value truncated".into(),
             ));
         }
@@ -878,7 +878,7 @@ fn decode_selected_blob(
             continue;
         }
         if value_offset + 4 > values.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "blob column length prefix truncated".into(),
             ));
         }
@@ -887,7 +887,7 @@ fn decode_selected_blob(
         let start = value_offset + 4;
         let end = start + len;
         if end > values.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "blob column selected value truncated".into(),
             ));
         }
@@ -928,7 +928,7 @@ fn decode_selected_vector(
             continue;
         }
         if value_offset + 4 > values.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "vector column length prefix truncated".into(),
             ));
         }
@@ -937,7 +937,7 @@ fn decode_selected_vector(
         let start = value_offset + 4;
         let end = start + count * 4;
         if end > values.len() {
-            return Err(MonaxError::Storage(
+            return Err(TaibaiError::Storage(
                 "vector column selected value truncated".into(),
             ));
         }

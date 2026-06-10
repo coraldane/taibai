@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
@@ -19,7 +19,7 @@ pub fn ast_expr_to_logical_with_context(
         Expr::Column(name) => {
             let idx = schema
                 .index_of(name)
-                .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", name)))?;
+                .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", name)))?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
@@ -98,7 +98,7 @@ pub fn ast_expr_to_logical_with_context(
                 "AVG" => AggFunc::Avg,
                 "MIN" => AggFunc::Min,
                 "MAX" => AggFunc::Max,
-                other => return Err(MonaxError::Sql(format!("unknown function '{}'", other))),
+                other => return Err(TaibaiError::Sql(format!("unknown function '{}'", other))),
             };
             let arg = if args.is_empty()
                 || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
@@ -124,7 +124,7 @@ pub fn ast_expr_to_logical_with_context(
                 let subquery_plan = plan_select_with_context(subquery_stmt, ctx)?;
                 Ok(LogicalExpr::ExistsSubquery(Box::new(subquery_plan)))
             }
-            _ => Err(MonaxError::Sql("EXISTS requires a subquery".into())),
+            _ => Err(TaibaiError::Sql("EXISTS requires a subquery".into())),
         },
         Expr::In {
             expr: inner_expr,
@@ -146,12 +146,12 @@ pub fn ast_expr_to_logical_with_context(
                     negated: *negated,
                 })
             } else {
-                Err(MonaxError::Sql(
+                Err(TaibaiError::Sql(
                     "IN subquery not yet supported in execution".into(),
                 ))
             }
         }
-        _ => Err(MonaxError::Sql("unsupported expression type".to_string())),
+        _ => Err(TaibaiError::Sql("unsupported expression type".to_string())),
     }
 }
 
@@ -165,7 +165,7 @@ pub fn ast_expr_to_logical(
         Expr::Column(name) => {
             let idx = schema
                 .index_of(name)
-                .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", name)))?;
+                .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", name)))?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
@@ -263,7 +263,7 @@ pub fn ast_expr_to_logical(
                 "AVG" => AggFunc::Avg,
                 "MIN" => AggFunc::Min,
                 "MAX" => AggFunc::Max,
-                other => return Err(MonaxError::Sql(format!("unknown function '{}'", other))),
+                other => return Err(TaibaiError::Sql(format!("unknown function '{}'", other))),
             };
             let arg = if args.is_empty()
                 || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
@@ -278,7 +278,7 @@ pub fn ast_expr_to_logical(
                 distinct: *distinct,
             }))
         }
-        _ => Err(MonaxError::Sql("unsupported expression type".to_string())),
+        _ => Err(TaibaiError::Sql("unsupported expression type".to_string())),
     }
 }
 
@@ -300,7 +300,7 @@ fn resolve_qualified_column_index(
                 return Ok(idx);
             }
         }
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "column '{}' not found in table '{}'",
             column, table
         )));
@@ -318,7 +318,7 @@ fn resolve_qualified_column_index(
         return Ok(matching_indices[0]);
     }
 
-    Err(MonaxError::Sql(format!(
+    Err(TaibaiError::Sql(format!(
         "table '{}' not found or column '{}' is ambiguous",
         table, column
     )))
@@ -337,7 +337,7 @@ pub fn ast_expr_to_logical_join(
         Expr::Column(name) => {
             let idx = output_schema
                 .index_of(name)
-                .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", name)))?;
+                .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", name)))?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
@@ -381,7 +381,7 @@ pub fn ast_expr_to_logical_join(
                 }
                 (Some(l), Some(_r), _, _) => l,
                 (None, None, _, _) => {
-                    return Err(MonaxError::Sql(format!(
+                    return Err(TaibaiError::Sql(format!(
                         "column '{}' not found in table '{}'",
                         column, table
                     )));
@@ -472,7 +472,7 @@ pub fn ast_expr_to_logical_join(
                 "AVG" => AggFunc::Avg,
                 "MIN" => AggFunc::Min,
                 "MAX" => AggFunc::Max,
-                other => return Err(MonaxError::Sql(format!("unknown function '{}'", other))),
+                other => return Err(TaibaiError::Sql(format!("unknown function '{}'", other))),
             };
             let arg = if args.is_empty()
                 || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
@@ -494,7 +494,7 @@ pub fn ast_expr_to_logical_join(
                 distinct: *distinct,
             }))
         }
-        _ => Err(MonaxError::Sql(
+        _ => Err(TaibaiError::Sql(
             "unsupported expression type in join context".to_string(),
         )),
     }

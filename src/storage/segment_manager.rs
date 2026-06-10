@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::storage::bulk_payload::parse_direct_bulk_payload;
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
@@ -113,7 +113,7 @@ impl SegmentManager {
         let stop = mgr.flush_stop.clone();
         let paused = mgr.flush_paused.clone();
         std::thread::Builder::new()
-            .name("monax-flush".into())
+            .name("taibai-flush".into())
             .spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     std::thread::sleep(std::time::Duration::from_secs(FLUSH_CHECK_INTERVAL_SECS));
@@ -181,7 +181,7 @@ impl SegmentManager {
 
     fn table_state_key_from_dir(&self, table_dir: &Path) -> Result<String> {
         let relative = table_dir.strip_prefix(&self.data_dir).map_err(|_| {
-            MonaxError::Storage(format!(
+            TaibaiError::Storage(format!(
                 "table dir '{}' is outside data dir '{}'",
                 table_dir.display(),
                 self.data_dir.display()
@@ -191,10 +191,10 @@ impl SegmentManager {
         let mut components = relative.components();
         let db = components
             .next()
-            .ok_or_else(|| MonaxError::Storage("table dir is missing database name".into()))?;
+            .ok_or_else(|| TaibaiError::Storage("table dir is missing database name".into()))?;
         let table = components
             .next()
-            .ok_or_else(|| MonaxError::Storage("table dir is missing table name".into()))?;
+            .ok_or_else(|| TaibaiError::Storage("table dir is missing table name".into()))?;
 
         Ok(table_key(
             &db.as_os_str().to_string_lossy(),
@@ -325,7 +325,7 @@ impl SegmentManager {
         old_segments: &[PathBuf],
     ) -> Result<()> {
         if final_path.exists() {
-            return Err(MonaxError::Storage(format!(
+            return Err(TaibaiError::Storage(format!(
                 "segment target already exists: {}",
                 final_path.display()
             )));
@@ -822,7 +822,7 @@ impl SegmentManager {
                 encoded.extend_from_slice(col.data);
                 let orig_len = encoded.len() as u64;
                 let compressed = zstd::bulk::compress(&encoded, compression_level)
-                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
+                    .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
                 Ok((compressed, orig_len))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -874,14 +874,14 @@ impl SegmentManager {
 
         let (schema, table_meta) = {
             let table_meta = catalogs.get_table(req.table_name).ok_or_else(|| {
-                MonaxError::Sql(format!("table '{}.{}' does not exist", db, req.table_name))
+                TaibaiError::Sql(format!("table '{}.{}' does not exist", db, req.table_name))
             })?;
             let schema = Schema::new(table_meta.columns.clone());
             (schema, table_meta.clone())
         };
 
         if schema.num_columns() != req.columns.len() {
-            return Err(MonaxError::Protocol(format!(
+            return Err(TaibaiError::Protocol(format!(
                 "bulk column count mismatch: schema has {} columns but payload has {}",
                 schema.num_columns(),
                 req.columns.len()
@@ -892,7 +892,7 @@ impl SegmentManager {
             schema.columns.iter().zip(req.columns.iter()).enumerate()
         {
             if col_def.data_type != payload_col.data_type {
-                return Err(MonaxError::Protocol(format!(
+                return Err(TaibaiError::Protocol(format!(
                     "bulk column {} type mismatch for '{}': schema={} payload={}",
                     idx,
                     col_def.name,
@@ -901,13 +901,13 @@ impl SegmentManager {
                 )));
             }
             if !col_def.name.eq_ignore_ascii_case(payload_col.name) {
-                return Err(MonaxError::Protocol(format!(
+                return Err(TaibaiError::Protocol(format!(
                     "bulk column {} name mismatch: schema='{}' payload='{}'",
                     idx, col_def.name, payload_col.name
                 )));
             }
             if !payload_col.nulls.is_empty() {
-                return Err(MonaxError::Protocol(
+                return Err(TaibaiError::Protocol(
                     "direct bulk path currently supports all-valid columns only".into(),
                 ));
             }
@@ -947,7 +947,7 @@ impl SegmentManager {
                 encoded.extend_from_slice(col.data);
                 let orig_len = encoded.len() as u64;
                 let compressed = zstd::bulk::compress(&encoded, compression_level)
-                    .map_err(|e| MonaxError::Storage(format!("zstd error: {}", e)))?;
+                    .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
                 Ok((compressed, orig_len))
             })
             .collect::<Result<Vec<_>>>()?;

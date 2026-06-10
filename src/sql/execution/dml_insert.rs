@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 use crate::storage::index::sort_key::SortKeyInserter;
 use crate::storage::segment_manager::SegmentManager;
@@ -32,11 +32,11 @@ pub fn exec_insert(
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
-        .ok_or_else(|| MonaxError::Sql(format!("database '{}' does not exist", db)))?;
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
     let table_meta = catalog
         .get_table(table)
-        .ok_or_else(|| MonaxError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
         .clone();
 
     let schema = Schema::new(table_meta.columns.clone());
@@ -394,7 +394,7 @@ fn push_literal_fast(
         (ColumnArray::Int32 { data, bitmap }, ScalarValue::Int64(Some(v))) => {
             data.push(
                 i32::try_from(*v)
-                    .map_err(|_| MonaxError::Sql(format!("value '{}' overflows INT32", v)))?,
+                    .map_err(|_| TaibaiError::Sql(format!("value '{}' overflows INT32", v)))?,
             );
             bitmap.push_valid();
             Ok(())
@@ -418,7 +418,7 @@ fn push_literal_fast(
         (ColumnArray::Decimal { data, bitmap }, ScalarValue::Int64(Some(v))) => {
             let multiplier = decimal_multiplier(scale)?;
             data.push(v.checked_mul(multiplier).ok_or_else(|| {
-                MonaxError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
+                TaibaiError::Sql(format!("decimal value '{}' overflows scale {}", v, scale))
             })?);
             bitmap.push_valid();
             Ok(())
@@ -440,11 +440,11 @@ fn push_literal_fast(
 
 fn decimal_multiplier(scale: i32) -> Result<i64> {
     if !(0..=18).contains(&scale) {
-        return Err(MonaxError::Sql(format!("invalid decimal scale {}", scale)));
+        return Err(TaibaiError::Sql(format!("invalid decimal scale {}", scale)));
     }
     10_i64
         .checked_pow(scale as u32)
-        .ok_or_else(|| MonaxError::Sql(format!("invalid decimal scale {}", scale)))
+        .ok_or_else(|| TaibaiError::Sql(format!("invalid decimal scale {}", scale)))
 }
 
 fn resolve_insert_columns(
@@ -455,7 +455,7 @@ fn resolve_insert_columns(
     if columns.is_empty() {
         for row in values {
             if row.len() != schema.columns.len() {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "insert has {} values but table has {} columns",
                     row.len(),
                     schema.columns.len()
@@ -470,9 +470,9 @@ fn resolve_insert_columns(
     for col_name in columns {
         let idx = schema
             .index_of(col_name)
-            .ok_or_else(|| MonaxError::Sql(format!("column '{}' not found", col_name)))?;
+            .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", col_name)))?;
         if !seen.insert(idx) {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "column '{}' specified more than once",
                 col_name
             )));
@@ -482,7 +482,7 @@ fn resolve_insert_columns(
 
     for row in values {
         if row.len() != columns.len() {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "insert has {} values but {} columns were specified",
                 row.len(),
                 columns.len()
@@ -502,7 +502,7 @@ fn materialize_default_value(
     match default {
         ColumnDefaultValue::CurrentTimestamp => {
             if schema.columns[col_idx].data_type != DataType::Timestamp {
-                return Err(MonaxError::Sql(format!(
+                return Err(TaibaiError::Sql(format!(
                     "CURRENT_TIMESTAMP default requires TIMESTAMP column '{}'",
                     schema.columns[col_idx].name
                 )));
@@ -528,7 +528,7 @@ fn materialize_default_value(
 fn validate_nullable(schema: &Schema, col_idx: usize, scalar: &ScalarValue) -> Result<()> {
     let col = &schema.columns[col_idx];
     if (col.primary_key || !col.nullable) && scalar.is_null() {
-        return Err(MonaxError::Sql(format!(
+        return Err(TaibaiError::Sql(format!(
             "column '{}' cannot be NULL",
             col.name
         )));
@@ -687,7 +687,7 @@ fn primary_key_for_row(
                 schema.columns[col_idx].data_type,
             ));
         if value.is_null() {
-            return Err(MonaxError::Sql(format!(
+            return Err(TaibaiError::Sql(format!(
                 "primary key column '{}' cannot be NULL",
                 schema.columns[col_idx].name
             )));
@@ -697,13 +697,13 @@ fn primary_key_for_row(
     Ok(key)
 }
 
-fn duplicate_primary_key_error(table: &str, key: &[ScalarValue]) -> MonaxError {
+fn duplicate_primary_key_error(table: &str, key: &[ScalarValue]) -> TaibaiError {
     let key_text = key
         .iter()
         .map(|v| v.to_text().unwrap_or_else(|| "NULL".to_string()))
         .collect::<Vec<_>>()
         .join(", ");
-    MonaxError::Sql(format!(
+    TaibaiError::Sql(format!(
         "duplicate primary key for table '{}': ({})",
         table, key_text
     ))

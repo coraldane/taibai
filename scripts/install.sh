@@ -1,28 +1,28 @@
 #!/bin/bash
 set -e
 
-BINARY_NAME="monax"
-PREFIX="/usr/local/monax"
+BINARY_NAME="taibai"
+PREFIX="/usr/local/taibai"
 INSTALL_SERVICE=true
 CONFIG_FILE=""
 DATA_DIR=""
 
 print_help() {
     cat << EOF
-Monax Installation Script
+Taibai Installation Script
 
 Usage: sudo ./scripts/install.sh [options]
 
 Options:
-  -prefix=PATH      Installation prefix (default: /usr/local/monax)
+  -prefix=PATH      Installation prefix (default: /usr/local/taibai)
   -config=PATH     Path to existing config file (optional)
   -data-dir=PATH   Data directory path (default: PREFIX/data)
   -no-service      Skip systemd/launchd service installation
 
 Examples:
   sudo ./scripts/install.sh
-  sudo ./scripts/install.sh -prefix=/opt/monax
-  sudo ./scripts/install.sh -data-dir=/data/monax -no-service
+  sudo ./scripts/install.sh -prefix=/opt/taibai
+  sudo ./scripts/install.sh -data-dir=/data/taibai -no-service
 
 Installation directories:
   <prefix>/bin/     - Binary files
@@ -72,7 +72,7 @@ RUN_DIR="$PREFIX/run"
 DATA_DIR="${DATA_DIR:-$PREFIX/data}"
 
 echo "========================================="
-echo "Monax Database Server Installer"
+echo "Taibai Database Server Installer"
 echo "========================================="
 echo "Platform: $OS/$ARCH"
 echo "Install prefix: $PREFIX"
@@ -119,12 +119,12 @@ mkdir -p "$RUN_DIR"
 mkdir -p "$DATA_DIR"
 
 echo "Installing binary..."
-cp -f "$BINARY_PATH" "$BIN_DIR/monax"
-chmod 755 "$BIN_DIR/monax"
-echo "  -> $BIN_DIR/monax"
+cp -f "$BINARY_PATH" "$BIN_DIR/taibai"
+chmod 755 "$BIN_DIR/taibai"
+echo "  -> $BIN_DIR/taibai"
 
 echo "Installing configuration..."
-CONFIG_DEST="$CONF_DIR/monax.yaml"
+CONFIG_DEST="$CONF_DIR/taibai.yaml"
 if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
     cp -f "$CONFIG_FILE" "$CONFIG_DEST"
     echo "  -> $CONFIG_DEST (from $CONFIG_FILE)"
@@ -138,7 +138,7 @@ elif [ -f "$SCRIPT_DIR/../conf/example.yaml" ]; then
 else
     if [ ! -f "$CONFIG_DEST" ]; then
         cat > "$CONFIG_DEST" << EOF
-# Monax Database Server Configuration
+# Taibai Database Server Configuration
 server:
   host: "0.0.0.0"
   port: 5151
@@ -184,9 +184,9 @@ if [ "$INSTALL_SERVICE" = true ]; then
     echo "Installing system service..."
     
     if [ "$OS" = "Linux" ]; then
-        cat > /etc/systemd/system/monax.service << EOF
+        cat > /etc/systemd/system/taibai.service << EOF
 [Unit]
-Description=Monax Columnar Database Server
+Description=Taibai Columnar Database Server
 After=network.target
 Wants=network-online.target
 
@@ -194,34 +194,34 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-ExecStart=$BIN_DIR/monax --config $CONF_DIR/monax.yaml
+ExecStart=$BIN_DIR/taibai --config $CONF_DIR/taibai.yaml
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
 LimitNPROC=65536
-StandardOutput=append:$LOG_DIR/monax.log
-StandardError=append:$LOG_DIR/monax.log
-PIDFile=$RUN_DIR/monax.pid
+StandardOutput=append:$LOG_DIR/taibai.log
+StandardError=append:$LOG_DIR/taibai.log
+PIDFile=$RUN_DIR/taibai.pid
 WorkingDirectory=$PREFIX
 
 [Install]
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        echo "  -> Created systemd service: /etc/systemd/system/monax.service"
+        echo "  -> Created systemd service: /etc/systemd/system/taibai.service"
     elif [ "$OS" = "Darwin" ]; then
-        cat > /Library/LaunchDaemons/com.monax.server.plist << EOF
+        cat > /Library/LaunchDaemons/com.taibai.server.plist << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.monax.server</string>
+    <string>com.taibai.server</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$BIN_DIR/monax</string>
+        <string>$BIN_DIR/taibai</string>
         <string>--config</string>
-        <string>$CONF_DIR/monax.yaml</string>
+        <string>$CONF_DIR/taibai.yaml</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -246,8 +246,8 @@ EOF
 </dict>
 </plist>
 EOF
-        chmod 644 /Library/LaunchDaemons/com.monax.server.plist
-        echo "  -> Created launchd service: /Library/LaunchDaemons/com.monax.server.plist"
+        chmod 644 /Library/LaunchDaemons/com.taibai.server.plist
+        echo "  -> Created launchd service: /Library/LaunchDaemons/com.taibai.server.plist"
     fi
 fi
 
@@ -257,8 +257,8 @@ echo "Installation Complete!"
 echo "========================================="
 echo ""
 echo "Directories:"
-echo "  Binary:  $BIN_DIR/monax"
-echo "  Config:  $CONF_DIR/monax.yaml"
+echo "  Binary:  $BIN_DIR/taibai"
+echo "  Config:  $CONF_DIR/taibai.yaml"
 echo "  Data:    $DATA_DIR"
 echo "  Logs:    $LOG_DIR"
 echo "  PID:     $RUN_DIR"
@@ -267,20 +267,20 @@ echo ""
 if [ "$INSTALL_SERVICE" = true ]; then
     echo "Service Management:"
     if [ "$OS" = "Linux" ]; then
-        echo "  Start:   sudo systemctl start monax"
-        echo "  Stop:    sudo systemctl stop monax"
-        echo "  Status:  sudo systemctl status monax"
-        echo "  Enable:  sudo systemctl enable monax"
-        echo "  Logs:    sudo journalctl -u monax -f"
+        echo "  Start:   sudo systemctl start taibai"
+        echo "  Stop:    sudo systemctl stop taibai"
+        echo "  Status:  sudo systemctl status taibai"
+        echo "  Enable:  sudo systemctl enable taibai"
+        echo "  Logs:    sudo journalctl -u taibai -f"
     elif [ "$OS" = "Darwin" ]; then
-        echo "  Start:   sudo launchctl load /Library/LaunchDaemons/com.monax.server.plist"
-        echo "  Stop:    sudo launchctl unload /Library/LaunchDaemons/com.monax.server.plist"
-        echo "  Status:  sudo launchctl list | grep monax"
+        echo "  Start:   sudo launchctl load /Library/LaunchDaemons/com.taibai.server.plist"
+        echo "  Stop:    sudo launchctl unload /Library/LaunchDaemons/com.taibai.server.plist"
+        echo "  Status:  sudo launchctl list | grep taibai"
         echo "  Logs:    tail -f $LOG_DIR/stdout.log"
     fi
 else
     echo "Manual Start:"
-    echo "  $BIN_DIR/monax --config $CONF_DIR/monax.yaml"
+    echo "  $BIN_DIR/taibai --config $CONF_DIR/taibai.yaml"
 fi
 
 echo ""

@@ -178,7 +178,7 @@ impl IndexManager {
 
 impl Default for IndexManager {
     fn default() -> Self {
-        let segment_mgr = SegmentManager::new(std::path::Path::new("/tmp/monax_default"))
+        let segment_mgr = SegmentManager::new(std::path::Path::new("/tmp/taibai_default"))
             .expect("failed to create default SegmentManager");
         Self::new(Arc::new(segment_mgr))
     }

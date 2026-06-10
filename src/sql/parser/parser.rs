@@ -1,4 +1,4 @@
-use crate::common::error::{MonaxError, Result};
+use crate::common::error::{TaibaiError, Result};
 use crate::protocol::types::DataType;
 
 use super::ast::*;
@@ -69,7 +69,7 @@ impl Parser {
             Token::Resume => self.parse_resume(),
             Token::Ident(word) if word.eq_ignore_ascii_case("RESET") => self.parse_reset(),
             Token::Ident(word) if word.eq_ignore_ascii_case("ACK") => self.parse_ack(),
-            other => Err(MonaxError::Sql(format!("unexpected token: {}", other))),
+            other => Err(TaibaiError::Sql(format!("unexpected token: {}", other))),
         }
     }
 
@@ -89,7 +89,7 @@ impl Parser {
             self.pos += 1;
             Ok(tok)
         } else {
-            Err(MonaxError::Sql(format!(
+            Err(TaibaiError::Sql(format!(
                 "expected '{}', got '{}'",
                 expected, tok
             )))
@@ -103,7 +103,7 @@ impl Parser {
                 self.pos += 1;
                 Ok(s)
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected identifier, got '{}'",
                 other
                     .as_ref()
@@ -120,7 +120,7 @@ impl Parser {
                 self.pos += 1;
                 Ok(s)
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected identifier or string, got '{}'",
                 other
                     .as_ref()
@@ -137,7 +137,7 @@ impl Parser {
                 self.pos += 1;
                 Ok(v)
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected non-negative integer, got '{}'",
                 other
                     .as_ref()
@@ -165,7 +165,7 @@ impl Parser {
                 self.pos += 1;
                 Ok(v)
             }
-            other => Err(MonaxError::Sql(format!(
+            other => Err(TaibaiError::Sql(format!(
                 "expected integer, got '{}'",
                 other
                     .as_ref()
@@ -197,6 +197,6 @@ pub fn parse_data_type(s: &str) -> Result<DataType> {
         "VARCHAR" | "TEXT" | "STRING" => Ok(DataType::VarChar),
         "BLOB" | "BYTES" => Ok(DataType::Blob),
         "VECTOR" => Ok(DataType::Vector),
-        _ => Err(MonaxError::Sql(format!("unknown data type: '{}'", s))),
+        _ => Err(TaibaiError::Sql(format!("unknown data type: '{}'", s))),
     }
 }

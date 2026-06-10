@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BINARY_NAME="monax"
+BINARY_NAME="taibai"
 BUILD_DIR="$PROJECT_ROOT/build"
 DIST_DIR="$PROJECT_ROOT/dist"
 
@@ -24,7 +24,7 @@ PLATFORMS=(
 
 print_help() {
     cat << EOF
-Monax Build Tool - Cross-platform build and packaging utility
+Taibai Build Tool - Cross-platform build and packaging utility
 
 Usage: ./scripts/build.sh <command> [options]
 
@@ -103,9 +103,9 @@ build_binary() {
     local out_dir="$BUILD_DIR/${target_os}_${target_arch}"
     mkdir -p "$out_dir"
     
-    export MONAX_VERSION="$VERSION"
-    export MONAX_BUILD_TIME="$BUILD_TIME"
-    export MONAX_GIT_COMMIT="$GIT_COMMIT"
+    export TAIBAI_VERSION="$VERSION"
+    export TAIBAI_BUILD_TIME="$BUILD_TIME"
+    export TAIBAI_GIT_COMMIT="$GIT_COMMIT"
     
     if [ "$target_os" = "$DEFAULT_OS" ] && [ "$target_arch" = "$DEFAULT_ARCH" ]; then
         cargo build --release
@@ -156,7 +156,7 @@ create_package() {
     mkdir -p "$pkg_dir/conf"
     
     cp -f "$src_dir/$BINARY_NAME" "$pkg_dir/"
-    cp -f "$PROJECT_ROOT/conf/example.yaml" "$pkg_dir/conf/monax.yaml"
+    cp -f "$PROJECT_ROOT/conf/example.yaml" "$pkg_dir/conf/taibai.yaml"
     
     if [ -f "$PROJECT_ROOT/README.md" ]; then
         cp -f "$PROJECT_ROOT/README.md" "$pkg_dir/"

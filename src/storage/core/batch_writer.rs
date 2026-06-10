@@ -81,7 +81,7 @@ impl BatchWriter {
             let mt_mgr_clone = Arc::clone(&memtable_mgr);
             workers.push(
                 std::thread::Builder::new()
-                    .name(format!("monax-bw-worker-{}", i))
+                    .name(format!("taibai-bw-worker-{}", i))
                     .spawn(move || {
                         Self::worker_loop(rx, stop_clone, mgr_clone, mt_mgr_clone);
                     })
@@ -94,7 +94,7 @@ impl BatchWriter {
         let flush_mgr = Arc::clone(&segment_mgr);
         let flush_mt_mgr = Arc::clone(&memtable_mgr);
         let flush_handle = std::thread::Builder::new()
-            .name("monax-bw-flush".into())
+            .name("taibai-bw-flush".into())
             .spawn(move || {
                 while !flush_stop.load(Ordering::Acquire) {
                     std::thread::sleep(std::time::Duration::from_secs(flush_interval));
