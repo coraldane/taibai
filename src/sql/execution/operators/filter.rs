@@ -195,7 +195,10 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
         }
         LogicalExpr::Literal(v) => {
             for m in mask.iter_mut().take(num_rows) {
-                *m = !v.is_null();
+                *m = match v {
+                    ScalarValue::Bool(Some(value)) => *value,
+                    _ => !v.is_null(),
+                };
             }
         }
         _ => {

@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
@@ -64,15 +64,6 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        if table_meta.cluster_key.is_empty() {
-            tracing::info!(
-                db,
-                table,
-                "table has no CLUSTER BY key, skipping optimization"
-            );
-            return Ok(CompactStats::default());
-        }
-
         let start_time = Instant::now();
         let table_dir = self.data_dir.join(db).join(table);
 
@@ -84,7 +75,9 @@ impl Compactor {
         let schema = Schema::new(table_meta.columns.clone());
         let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
         let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
-            let segment_files = SegmentManager::discover_segments(&table_dir)?;
+            let segment_files = self
+                .segment_mgr
+                .discover_inactive_segments(db, table, &table_dir)?;
             if segment_files.is_empty() {
                 return Ok(CompactStats::default());
             }
@@ -150,9 +143,16 @@ impl Compactor {
             let reader = self.segment_mgr.open_reader(seg_path)?;
             let mut segment_row_base = 0u64;
             for rg_idx in 0..reader.num_row_groups() {
-                let key_batch = reader.read_columns_fast(rg_idx, cluster_key_indices)?;
-                let batch_idx = key_batches.len();
-                for row_idx in 0..key_batch.num_rows() {
+                let batch_idx = source_row_groups.len();
+                let row_count = if cluster_key_indices.is_empty() {
+                    reader.row_group_rows(rg_idx) as usize
+                } else {
+                    let key_batch = reader.read_columns_fast(rg_idx, cluster_key_indices)?;
+                    let row_count = key_batch.num_rows();
+                    key_batches.push(key_batch);
+                    row_count
+                };
+                for row_idx in 0..row_count {
                     let row_id = segment_row_base + row_idx as u64;
                     if reader.is_row_deleted(row_id) {
                         deleted_rows += 1;
@@ -165,8 +165,7 @@ impl Compactor {
                     });
                     ordinal += 1;
                 }
-                segment_row_base += key_batch.num_rows() as u64;
-                key_batches.push(key_batch);
+                segment_row_base += row_count as u64;
                 source_row_groups.push(SourceRowGroup {
                     segment_path: seg_path.clone(),
                     row_group_idx: rg_idx,
@@ -843,6 +842,10 @@ mod tests {
         meta
     }
 
+    fn test_meta_without_cluster(schema: &Schema) -> TableMeta {
+        TableMeta::new("default", "t", schema.columns.clone())
+    }
+
     fn make_batch(schema: &Schema, rows: &[(i64, &str)]) -> Result<RecordBatch> {
         let mut batch = RecordBatch::new(schema.clone());
         for (id, name) in rows {
@@ -935,6 +938,39 @@ mod tests {
         assert_eq!(read_ids(&segments[0])?, vec![2, 3]);
         let reader = SegmentReader::open(&segments[0])?;
         assert_eq!(reader.deleted_row_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn optimize_table_without_cluster_key_preserves_row_order() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("default").join("t");
+        std::fs::create_dir_all(&table_dir)?;
+
+        let schema = test_schema();
+        write_segment(
+            &table_dir.join("seg_00001.dat"),
+            &schema,
+            &[(3, "c"), (1, "a")],
+        )?;
+        write_segment(
+            &table_dir.join("seg_00002.dat"),
+            &schema,
+            &[(4, "d"), (2, "b")],
+        )?;
+
+        let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+        let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
+        let stats =
+            compactor.optimize_table("default", "t", &test_meta_without_cluster(&schema))?;
+
+        assert_eq!(stats.segments_read, 2);
+        assert_eq!(stats.segments_written, 1);
+        assert_eq!(stats.rows_written, 4);
+
+        let segments = SegmentManager::discover_segments(&table_dir)?;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(read_ids(&segments[0])?, vec![3, 1, 4, 2]);
         Ok(())
     }
 }

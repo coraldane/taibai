@@ -5,14 +5,14 @@ mod helpers;
 mod reader_cache;
 mod state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::bulk_payload::parse_direct_bulk_payload;
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
@@ -212,6 +212,38 @@ impl SegmentManager {
 
     pub fn discover_segments(table_dir: &Path) -> Result<Vec<PathBuf>> {
         store::discover_segments(table_dir)
+    }
+
+    pub fn discover_inactive_segments(
+        &self,
+        db: &str,
+        table: &str,
+        table_dir: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        let segments = Self::discover_segments(table_dir)?;
+        let key = table_key(db, table);
+        let active_paths = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(&key)
+                .map(|state| {
+                    let active_guard = state.active_segments.lock().unwrap();
+                    active_guard
+                        .values()
+                        .map(|segment| segment.path.clone())
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        if active_paths.is_empty() {
+            return Ok(segments);
+        }
+
+        Ok(segments
+            .into_iter()
+            .filter(|path| !active_paths.contains(path))
+            .collect())
     }
 
     pub fn find_unsealed_segment(

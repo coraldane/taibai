@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -191,6 +191,23 @@ pub fn eval_where_clause_batch(
             let inner_mask = eval_where_clause_batch(inner, batch, schema)?;
             Ok(inner_mask.iter().map(|b| !*b).collect())
         }
+        Expr::In {
+            expr,
+            values,
+            negated,
+        } => {
+            let mut mask = Vec::with_capacity(num_rows);
+            for row_idx in 0..num_rows {
+                let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+                let found = values.iter().any(|candidate| {
+                    eval_expr_for_row(candidate, batch, row_idx, schema)
+                        .map(|candidate| scalar_values_equal(&value, &candidate))
+                        .unwrap_or(false)
+                });
+                mask.push(if *negated { !found } else { found });
+            }
+            Ok(mask)
+        }
         Expr::Literal(v) => Ok(vec![!v.is_null(); num_rows]),
         Expr::Column(_) => Ok(vec![true; num_rows]),
         _ => Ok(vec![true; num_rows]),
@@ -247,12 +264,24 @@ pub fn eval_where_clause(
             let inner_bool = eval_where_clause(inner, batch, row_idx, schema)?;
             Ok(!inner_bool)
         }
+        Expr::In {
+            expr,
+            values,
+            negated,
+        } => {
+            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+            let found = values.iter().any(|candidate| {
+                eval_expr_for_row(candidate, batch, row_idx, schema)
+                    .map(|candidate| scalar_values_equal(&value, &candidate))
+                    .unwrap_or(false)
+            });
+            Ok(if *negated { !found } else { found })
+        }
         Expr::Literal(v) => Ok(!v.is_null()),
         Expr::Column(_) => Ok(true),
         Expr::QualifiedColumn { .. } => Ok(true),
         Expr::Function { .. } => Ok(true),
         Expr::UnaryMinus(_) => Ok(true),
-        Expr::In { .. } => Ok(true),
         Expr::Between { .. } => Ok(true),
         Expr::Case { .. } => Ok(true),
         Expr::Like { .. } => Ok(true),
@@ -441,7 +470,10 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
             }
             (DataType::UInt8, ScalarValue::Int64(Some(v))) => {
                 if *v < 0 {
-                    return Err(TaibaiError::Sql(format!("negative value '{}' for UINT8", v)));
+                    return Err(TaibaiError::Sql(format!(
+                        "negative value '{}' for UINT8",
+                        v
+                    )));
                 }
                 Ok(ScalarValue::UInt8(Some(u8::try_from(*v).map_err(
                     |_| TaibaiError::Sql(format!("value '{}' overflows UINT8", v)),

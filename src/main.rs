@@ -65,6 +65,10 @@ async fn run_server(config: ServerConfig) {
     let config = Arc::new(config);
     let engine = Arc::new(engine);
     let _ = rayon::ThreadPoolBuilder::new().build_global();
+    let mut auto_compactor = storage::core::auto_compact::AutoCompactorHandle::start(
+        engine.clone(),
+        config.auto_compact.clone(),
+    );
     let server = Server::new(config, engine.clone());
 
     let server_handle = tokio::spawn(async move {
@@ -79,11 +83,18 @@ async fn run_server(config: ServerConfig) {
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("received Ctrl+C, flushing active segments...");
+            if let Some(handle) = auto_compactor.as_mut() {
+                handle.stop();
+            }
             match engine.flush_all_buffers() {
                 Ok(n) => tracing::info!(rows_flushed = n, "all active segments sealed"),
                 Err(e) => tracing::error!(error = %e, "failed to flush segments on shutdown"),
             }
         }
+    }
+
+    if let Some(handle) = auto_compactor.as_mut() {
+        handle.stop();
     }
 }
 

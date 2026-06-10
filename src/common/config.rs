@@ -40,6 +40,30 @@ fn default_change_stream_retention_events() -> usize {
     1_000_000
 }
 
+fn default_auto_compact_enabled() -> bool {
+    true
+}
+
+fn default_auto_compact_check_interval_secs() -> u64 {
+    60
+}
+
+fn default_auto_compact_idle_threshold_secs() -> u64 {
+    30
+}
+
+fn default_auto_compact_min_segments() -> usize {
+    4
+}
+
+fn default_auto_compact_min_deleted_rows() -> u64 {
+    100_000
+}
+
+fn default_auto_compact_max_tables_per_run() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub server: ServerSettings,
@@ -49,6 +73,8 @@ pub struct ServerConfig {
     pub tls: TlsConfigYaml,
     #[serde(default)]
     pub change_stream: ChangeStreamSettings,
+    #[serde(default)]
+    pub auto_compact: AutoCompactSettings,
     pub log: LogSettings,
 }
 
@@ -106,6 +132,35 @@ impl Default for ChangeStreamSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoCompactSettings {
+    #[serde(default = "default_auto_compact_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_auto_compact_check_interval_secs")]
+    pub check_interval_secs: u64,
+    #[serde(default = "default_auto_compact_idle_threshold_secs")]
+    pub idle_threshold_secs: u64,
+    #[serde(default = "default_auto_compact_min_segments")]
+    pub min_segments: usize,
+    #[serde(default = "default_auto_compact_min_deleted_rows")]
+    pub min_deleted_rows: u64,
+    #[serde(default = "default_auto_compact_max_tables_per_run")]
+    pub max_tables_per_run: usize,
+}
+
+impl Default for AutoCompactSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_compact_enabled(),
+            check_interval_secs: default_auto_compact_check_interval_secs(),
+            idle_threshold_secs: default_auto_compact_idle_threshold_secs(),
+            min_segments: default_auto_compact_min_segments(),
+            min_deleted_rows: default_auto_compact_min_deleted_rows(),
+            max_tables_per_run: default_auto_compact_max_tables_per_run(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSettings {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -129,6 +184,7 @@ impl Default for ServerConfig {
             compression: CompressionSettings { enabled: true },
             tls: TlsConfigYaml::default(),
             change_stream: ChangeStreamSettings::default(),
+            auto_compact: AutoCompactSettings::default(),
             log: LogSettings {
                 level: "info".to_string(),
             },

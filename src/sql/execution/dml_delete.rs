@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::catalog::schema::{PartitionType, TableMeta};
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::pruning::ZoneMap;
@@ -40,6 +40,8 @@ pub fn exec_delete(
         (Schema::new(meta.columns.clone()), meta)
     };
 
+    let resolved_where_clause = resolve_in_subqueries(engine, db, where_clause)?;
+
     engine.flush_all_buffers()?;
 
     let table_dir = engine.data_dir().join(db).join(table);
@@ -49,8 +51,8 @@ pub fn exec_delete(
 
     let mgr = engine.segment_mgr();
     let mut total_deleted: u64 = 0;
-    let predicate = build_row_group_predicate(where_clause, &table_schema);
-    let predicate_projection = where_clause
+    let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
+    let predicate_projection = resolved_where_clause
         .as_ref()
         .map(|expr| collect_expr_column_indices(expr, &table_schema))
         .unwrap_or_default();
@@ -58,7 +60,7 @@ pub fn exec_delete(
     mgr.with_table_mutation_lock(db, table, || {
         let mut segment_files = prune_segments_by_partition(
             SegmentManager::discover_segments(&table_dir)?,
-            where_clause,
+            &resolved_where_clause,
             &table_schema,
             &table_meta,
         );
@@ -108,7 +110,7 @@ pub fn exec_delete(
                         }
                     }
 
-                    if let Some(ref where_expr) = where_clause {
+                    if let Some(ref where_expr) = resolved_where_clause {
                         let batch = if predicate_projection.is_empty() {
                             reader.read_row_group(rg_idx)?
                         } else {
@@ -197,6 +199,276 @@ pub fn exec_delete(
     Ok(ExecResult::Ok {
         rows_affected: total_deleted,
     })
+}
+
+fn resolve_in_subqueries(
+    engine: &Engine,
+    db: &str,
+    where_clause: &Option<Expr>,
+) -> Result<Option<Expr>> {
+    where_clause
+        .as_ref()
+        .map(|expr| resolve_expr_in_subqueries(engine, db, expr))
+        .transpose()
+}
+
+fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &Expr) -> Result<Expr> {
+    Ok(match expr {
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(resolve_expr_in_subqueries(engine, db, left)?),
+            op: *op,
+            right: Box::new(resolve_expr_in_subqueries(engine, db, right)?),
+        },
+        Expr::UnaryNot(inner) => {
+            Expr::UnaryNot(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
+        }
+        Expr::UnaryMinus(inner) => {
+            Expr::UnaryMinus(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
+        }
+        Expr::IsNull(inner) => {
+            Expr::IsNull(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
+        }
+        Expr::IsNotNull(inner) => {
+            Expr::IsNotNull(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
+        }
+        Expr::Exists(inner) => {
+            Expr::Exists(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
+        }
+        Expr::In {
+            expr: inner,
+            values,
+            negated,
+        } => {
+            let resolved_inner = resolve_expr_in_subqueries(engine, db, inner)?;
+            let resolved_values = if let [Expr::Subquery(subquery)] = values.as_slice() {
+                execute_in_subquery(engine, db, subquery)?
+                    .into_iter()
+                    .map(Expr::Literal)
+                    .collect()
+            } else {
+                values
+                    .iter()
+                    .map(|value| resolve_expr_in_subqueries(engine, db, value))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            Expr::In {
+                expr: Box::new(resolved_inner),
+                values: resolved_values,
+                negated: *negated,
+            }
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(resolve_expr_in_subqueries(engine, db, inner)?),
+            low: Box::new(resolve_expr_in_subqueries(engine, db, low)?),
+            high: Box::new(resolve_expr_in_subqueries(engine, db, high)?),
+            negated: *negated,
+        },
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|expr| resolve_expr_in_subqueries(engine, db, expr).map(Box::new))
+                .transpose()?,
+            when_clauses: when_clauses
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    Ok((
+                        resolve_expr_in_subqueries(engine, db, when_expr)?,
+                        resolve_expr_in_subqueries(engine, db, then_expr)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_clause: else_clause
+                .as_ref()
+                .map(|expr| resolve_expr_in_subqueries(engine, db, expr).map(Box::new))
+                .transpose()?,
+        },
+        Expr::Like {
+            expr: inner,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(resolve_expr_in_subqueries(engine, db, inner)?),
+            pattern: Box::new(resolve_expr_in_subqueries(engine, db, pattern)?),
+            negated: *negated,
+        },
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| resolve_expr_in_subqueries(engine, db, arg))
+                .collect::<Result<Vec<_>>>()?,
+            distinct: *distinct,
+        },
+        Expr::Subquery(subquery) => {
+            Expr::Subquery(Box::new(resolve_stmt_in_subqueries(engine, db, subquery)?))
+        }
+        Expr::WindowFunction {
+            func,
+            partition_by,
+            order_by,
+            frame,
+        } => Expr::WindowFunction {
+            func: func.clone(),
+            partition_by: partition_by
+                .iter()
+                .map(|arg| resolve_expr_in_subqueries(engine, db, arg))
+                .collect::<Result<Vec<_>>>()?,
+            order_by: order_by
+                .iter()
+                .map(|item| {
+                    Ok(crate::sql::parser::ast::OrderByItem {
+                        expr: resolve_expr_in_subqueries(engine, db, &item.expr)?,
+                        desc: item.desc,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            frame: frame.clone(),
+        },
+        Expr::Literal(_)
+        | Expr::Placeholder(_)
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. } => expr.clone(),
+    })
+}
+
+fn resolve_stmt_in_subqueries(
+    engine: &Engine,
+    db: &str,
+    stmt: &crate::sql::parser::ast::Statement,
+) -> Result<crate::sql::parser::ast::Statement> {
+    let mut stmt = stmt.clone();
+    if let crate::sql::parser::ast::Statement::Select {
+        select_list,
+        where_clause,
+        group_by,
+        having,
+        order_by,
+        limit,
+        offset,
+        ..
+    } = &mut stmt
+    {
+        for item in select_list {
+            if let crate::sql::parser::ast::SelectItem::Expr(expr, _) = item {
+                *expr = resolve_expr_in_subqueries(engine, db, expr)?;
+            }
+        }
+        if let Some(expr) = where_clause {
+            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
+        }
+        for expr in group_by {
+            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
+        }
+        if let Some(expr) = having {
+            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
+        }
+        for item in order_by {
+            item.expr = resolve_expr_in_subqueries(engine, db, &item.expr)?;
+        }
+        if let Some(expr) = limit {
+            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
+        }
+        if let Some(expr) = offset {
+            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
+        }
+    }
+    Ok(stmt)
+}
+
+fn execute_in_subquery(
+    engine: &Engine,
+    db: &str,
+    subquery: &crate::sql::parser::ast::Statement,
+) -> Result<Vec<ScalarValue>> {
+    let subquery = resolve_stmt_in_subqueries(engine, db, subquery)?;
+    if let Some(values) = execute_simple_derived_subquery(engine, db, &subquery)? {
+        return Ok(values);
+    }
+    let ExecResult::Query { batches, .. } = super::query::exec_select(engine, db, &subquery)?
+    else {
+        return Err(TaibaiError::Sql("IN subquery must be a SELECT".into()));
+    };
+    Ok(first_column_values(&batches, 0))
+}
+
+fn execute_simple_derived_subquery(
+    engine: &Engine,
+    db: &str,
+    stmt: &crate::sql::parser::ast::Statement,
+) -> Result<Option<Vec<ScalarValue>>> {
+    use crate::sql::parser::ast::{FromClause, SelectItem, Statement, TableRef};
+
+    let Statement::Select {
+        select_list,
+        from: Some(FromClause::Table(TableRef::Subquery { query, alias })),
+        where_clause: None,
+        group_by,
+        having: None,
+        order_by: _,
+        limit: None,
+        offset: None,
+        ..
+    } = stmt
+    else {
+        return Ok(None);
+    };
+
+    if !group_by.is_empty() || select_list.len() != 1 {
+        return Ok(None);
+    }
+
+    let inner = resolve_stmt_in_subqueries(engine, db, query)?;
+    let ExecResult::Query { schema, batches } = super::query::exec_select(engine, db, &inner)?
+    else {
+        return Err(TaibaiError::Sql(
+            "derived IN subquery must be a SELECT".into(),
+        ));
+    };
+
+    let col_idx = match &select_list[0] {
+        SelectItem::Star => 0,
+        SelectItem::Expr(Expr::Column(name), _) => schema.index_of(name).unwrap_or(0),
+        SelectItem::Expr(Expr::QualifiedColumn { table, column }, _)
+            if table.eq_ignore_ascii_case(alias) =>
+        {
+            schema.index_of(column).unwrap_or(0)
+        }
+        SelectItem::Expr(_, _) => 0,
+    };
+    Ok(Some(first_column_values(&batches, col_idx)))
+}
+
+fn first_column_values(
+    batches: &[crate::types::batch::RecordBatch],
+    col_idx: usize,
+) -> Vec<ScalarValue> {
+    let mut values = Vec::new();
+    for batch in batches {
+        if batch.num_columns() <= col_idx {
+            continue;
+        }
+        for row_idx in 0..batch.num_rows() {
+            values.push(
+                batch
+                    .scalar(row_idx, col_idx)
+                    .unwrap_or(ScalarValue::Int64(None)),
+            );
+        }
+    }
+    values
 }
 
 fn segment_may_match(

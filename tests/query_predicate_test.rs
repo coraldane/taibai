@@ -28,6 +28,20 @@ fn collect_rows(result: ExecResult) -> Vec<Vec<ScalarValue>> {
     rows
 }
 
+fn count_star(result: ExecResult) -> i64 {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    batches
+        .first()
+        .and_then(|batch| batch.scalar(0, 0))
+        .and_then(|value| match value {
+            ScalarValue::Int64(Some(v)) => Some(v),
+            _ => None,
+        })
+        .expect("count(*) value")
+}
+
 fn seed_predicate_tables(engine: &Engine, session: &mut Session) {
     engine
         .execute(
@@ -48,6 +62,98 @@ fn seed_predicate_tables(engine: &Engine, session: &mut Session) {
                 (4, 'd')",
         )
         .expect("insert predicate_t");
+}
+
+#[test]
+fn count_star_matches_select_rows_for_constant_true_predicate() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    seed_predicate_tables(&engine, &mut session);
+    engine
+        .execute(&mut session, "FLUSH TABLE predicate_t")
+        .expect("flush predicate_t");
+
+    let count = count_star(
+        engine
+            .execute(&mut session, "SELECT COUNT(*) FROM predicate_t WHERE 1 = 1")
+            .expect("count rows"),
+    );
+    let rows = collect_rows(
+        engine
+            .execute(&mut session, "SELECT * FROM predicate_t WHERE 1 = 1")
+            .expect("select rows"),
+    );
+
+    assert_eq!(count, 4);
+    assert_eq!(rows.len() as i64, count);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn count_star_matches_select_rows_for_constant_false_predicate() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    seed_predicate_tables(&engine, &mut session);
+    engine
+        .execute(&mut session, "FLUSH TABLE predicate_t")
+        .expect("flush predicate_t");
+
+    let count = count_star(
+        engine
+            .execute(&mut session, "SELECT COUNT(*) FROM predicate_t WHERE 1 = 0")
+            .expect("count rows"),
+    );
+    let rows = collect_rows(
+        engine
+            .execute(&mut session, "SELECT * FROM predicate_t WHERE 1 = 0")
+            .expect("select rows"),
+    );
+
+    assert_eq!(count, 0);
+    assert_eq!(rows.len() as i64, count);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn count_star_matches_select_rows_across_segments_and_memtables() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    seed_predicate_tables(&engine, &mut session);
+    engine
+        .execute(&mut session, "FLUSH TABLE predicate_t")
+        .expect("flush predicate_t");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO predicate_t VALUES
+                (5, 'e'),
+                (6, 'f')",
+        )
+        .expect("insert memtable rows");
+
+    let count = count_star(
+        engine
+            .execute(&mut session, "SELECT COUNT(*) FROM predicate_t WHERE 1 = 1")
+            .expect("count rows"),
+    );
+    let rows = collect_rows(
+        engine
+            .execute(&mut session, "SELECT * FROM predicate_t WHERE 1 = 1")
+            .expect("select rows"),
+    );
+    assert_eq!(count, 6);
+    assert_eq!(rows.len() as i64, count);
+
+    let false_count = count_star(
+        engine
+            .execute(&mut session, "SELECT COUNT(*) FROM predicate_t WHERE 1 = 0")
+            .expect("count false rows"),
+    );
+    let false_rows = collect_rows(
+        engine
+            .execute(&mut session, "SELECT * FROM predicate_t WHERE 1 = 0")
+            .expect("select false rows"),
+    );
+    assert_eq!(false_count, 0);
+    assert_eq!(false_rows.len() as i64, false_count);
+    engine.segment_mgr().shutdown();
 }
 
 #[test]

@@ -2,11 +2,11 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::net::session::Session;
 use crate::storage::catalog::auth::{AuthManager, PermissionObjectType, PermissionType};
 use crate::storage::catalog::auto_increment::AutoIncrementManager;
@@ -45,6 +45,8 @@ pub struct Engine {
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
     bulk_mode_sessions: AtomicUsize,
+    in_flight_operations: AtomicUsize,
+    last_activity_epoch_ms: AtomicU64,
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
@@ -177,6 +179,8 @@ impl Engine {
             segment_mgr,
             batch_writer,
             bulk_mode_sessions: AtomicUsize::new(0),
+            in_flight_operations: AtomicUsize::new(0),
+            last_activity_epoch_ms: AtomicU64::new(current_epoch_millis()),
             auth_manager,
             auto_increment_mgr,
             index_manager,
@@ -185,6 +189,7 @@ impl Engine {
     }
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
+        let _op_guard = self.begin_operation();
         if sql.as_bytes().first().map(|b| b.to_ascii_uppercase()) == Some(b'I') {
             if let Some(result) = crate::sql::parser::fast_insert::try_fast_parse_insert(sql) {
                 let stmt = result?;
@@ -203,6 +208,7 @@ impl Engine {
         session: &mut Session,
         prepared: &mut crate::sql::execution::prepared::PreparedStatement,
     ) -> Result<ExecResult> {
+        let _op_guard = self.begin_operation();
         let has_placeholders = crate::sql::execution::prepared::has_placeholders(&prepared.stmt);
         let mut stmt = prepared.stmt.clone();
         if !prepared.params.is_empty() {
@@ -1057,6 +1063,25 @@ impl Engine {
         self.bulk_mode_sessions.load(Ordering::Acquire)
     }
 
+    fn begin_operation(&self) -> EngineOperationGuard<'_> {
+        self.mark_activity();
+        self.in_flight_operations.fetch_add(1, Ordering::AcqRel);
+        EngineOperationGuard { engine: self }
+    }
+
+    fn mark_activity(&self) {
+        self.last_activity_epoch_ms
+            .store(current_epoch_millis(), Ordering::Release);
+    }
+
+    pub fn is_idle_for(&self, duration: Duration) -> bool {
+        if self.in_flight_operations.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        let last = self.last_activity_epoch_ms.load(Ordering::Acquire);
+        current_epoch_millis().saturating_sub(last) >= duration.as_millis() as u64
+    }
+
     pub fn alloc_txn_id(&self) -> u64 {
         self.segment_mgr.alloc_txn_id()
     }
@@ -1235,6 +1260,26 @@ impl Engine {
         }
         Ok(result)
     }
+}
+
+struct EngineOperationGuard<'a> {
+    engine: &'a Engine,
+}
+
+impl Drop for EngineOperationGuard<'_> {
+    fn drop(&mut self) {
+        self.engine
+            .in_flight_operations
+            .fetch_sub(1, Ordering::AcqRel);
+        self.engine.mark_activity();
+    }
+}
+
+fn current_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn bulk_payload_table_name(payload: &[u8]) -> Result<&str> {

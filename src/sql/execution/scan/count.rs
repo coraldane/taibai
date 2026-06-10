@@ -125,11 +125,6 @@ fn count_with_predicates(
     mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<()> {
     let filter_columns = spec.all_predicate_columns();
-    let _projection = if filter_columns.is_empty() {
-        None
-    } else {
-        Some(filter_columns.as_slice())
-    };
 
     for seg_path in segment_files {
         let reader = segment_mgr.open_reader_cached(seg_path)?;
@@ -147,7 +142,11 @@ fn count_with_predicates(
         );
 
         for rg_idx in &prune_result.candidate_indices {
-            let mut batch = reader.read_row_group_with_projection(*rg_idx, &filter_columns)?;
+            let mut batch = if filter_columns.is_empty() {
+                reader.read_row_group(*rg_idx)?
+            } else {
+                reader.read_row_group_with_projection(*rg_idx, &filter_columns)?
+            };
             let bitmap_active = !reader.delete_bitmap().is_empty();
             if bitmap_active {
                 let rg_start_row: u64 = reader
@@ -159,14 +158,24 @@ fn count_with_predicates(
                 batch = delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
             }
 
-            let filtered = row_filter::apply_predicates_with_column_map(
-                &batch,
-                &filter_columns,
-                &spec.eq_predicates,
-                &spec.range_predicates,
-                &spec.in_predicates,
-                spec.remaining_predicate.as_ref(),
-            )?;
+            let filtered = if filter_columns.is_empty() {
+                row_filter::apply_predicates(
+                    &batch,
+                    &spec.eq_predicates,
+                    &spec.range_predicates,
+                    &spec.in_predicates,
+                    spec.remaining_predicate.as_ref(),
+                )
+            } else {
+                row_filter::apply_predicates_with_column_map(
+                    &batch,
+                    &filter_columns,
+                    &spec.eq_predicates,
+                    &spec.range_predicates,
+                    &spec.in_predicates,
+                    spec.remaining_predicate.as_ref(),
+                )?
+            };
             *total_rows += filtered.num_rows() as u64;
         }
 
