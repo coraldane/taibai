@@ -798,16 +798,7 @@ impl Handler {
         if !session.in_txn() {
             return Ok(vec![build_error("no active transaction")]);
         }
-        let txn_id = session.active_txn_id();
-        let had_writes = session
-            .active_txn
-            .as_ref()
-            .map(|t| t.had_writes)
-            .unwrap_or(false);
-        if had_writes {
-            self.engine.batch_writer().commit_txn(txn_id)?;
-        }
-        session.commit_txn();
+        self.engine.commit_session_txn(session)?;
         Ok(vec![build_ok(0)])
     }
 

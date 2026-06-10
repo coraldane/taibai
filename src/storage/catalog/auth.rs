@@ -19,6 +19,7 @@ pub enum PermissionType {
     Drop,
     Alter,
     Truncate,
+    Subscribe,
 }
 
 #[cfg(test)]
@@ -117,6 +118,7 @@ impl PermissionType {
             PermissionType::Drop => "DROP",
             PermissionType::Alter => "ALTER",
             PermissionType::Truncate => "TRUNCATE",
+            PermissionType::Subscribe => "SUBSCRIBE",
         }
     }
 }

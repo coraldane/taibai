@@ -50,9 +50,10 @@ async fn run_server(config: ServerConfig) {
         std::process::exit(1);
     }
 
-    let engine = match Engine::new(
+    let engine = match Engine::new_with_change_stream_retention(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
+        config.change_stream.retention_events,
     ) {
         Ok(e) => e,
         Err(e) => {

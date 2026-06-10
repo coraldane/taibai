@@ -356,11 +356,30 @@ impl Parser {
             Token::Database => self.parse_drop_database_rest(),
             Token::User => self.parse_drop_user(),
             Token::Role => self.parse_drop_role(),
+            Token::Ident(word) if word.eq_ignore_ascii_case("CHANGE") => {
+                self.parse_drop_change_consumer()
+            }
             other => Err(MonaxError::Sql(format!(
-                "expected TABLE, DATABASE, USER, or ROLE after DROP, got {}",
+                "expected TABLE, DATABASE, USER, ROLE, or CHANGE after DROP, got {}",
                 other
             ))),
         }
+    }
+
+    fn parse_drop_change_consumer(&mut self) -> Result<Statement> {
+        let change = self.expect_ident()?;
+        if !change.eq_ignore_ascii_case("CHANGE") {
+            return Err(MonaxError::Sql(format!("expected CHANGE, got {}", change)));
+        }
+        let consumer = self.expect_ident()?;
+        if !consumer.eq_ignore_ascii_case("CONSUMER") {
+            return Err(MonaxError::Sql(format!(
+                "expected CONSUMER after DROP CHANGE, got {}",
+                consumer
+            )));
+        }
+        let group = self.expect_ident_or_string()?;
+        Ok(Statement::DropChangeConsumer { group })
     }
 
     fn parse_drop_user(&mut self) -> Result<Statement> {
@@ -440,6 +459,7 @@ impl Parser {
                 Token::Drop => Privilege::Drop,
                 Token::Alter => Privilege::Alter,
                 Token::Truncate => Privilege::Truncate,
+                Token::Subscribe => Privilege::Subscribe,
                 Token::Ident(s)
                     if s.to_uppercase() == "ALL" || s.to_uppercase() == "ALL_PRIVILEGES" =>
                 {

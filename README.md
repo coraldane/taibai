@@ -1,155 +1,155 @@
 # Monax
 
-A columnar database server wire-compatible with taibai-go, implemented in Rust.
+Monax 是一个使用 Rust 实现的列式数据库服务器，线协议兼容 taibai-go。
 
-## Features
+## 功能特性
 
-- Columnar storage optimized for OLAP queries
-- Wire protocol compatible with taibai-go
-- High-performance batch import
-- TLS encryption support
-- Compression support (zstd)
-- Cross-platform deployment (Linux, macOS)
+- 面向 OLAP 查询优化的列式存储
+- 兼容 taibai-go 的线协议
+- 高性能批量导入
+- 支持 TLS 加密
+- 支持 zstd 压缩
+- 支持跨平台部署（Linux、macOS）
 
-## Quick Start
+## 快速开始
 
-### Build
+### 构建
 
 ```bash
-# Build for current platform
+# 为当前平台构建
 make build
 
-# Or using scripts directly
+# 或直接使用脚本构建
 ./scripts/build.sh build
 
-# Build for all platforms (linux/amd64, linux/arm64, darwin/amd64, darwin/arm64)
+# 为所有平台构建（linux/amd64、linux/arm64、darwin/amd64、darwin/arm64）
 make build-all
 ```
 
-### Package
+### 打包
 
 ```bash
-# Create distribution package for current platform
+# 为当前平台创建发行包
 make package
 
-# Package for all platforms
+# 为所有平台创建发行包
 make package-all
 ```
 
-### Install
+### 安装
 
 ```bash
-# Install to default location (/usr/local/monax)
+# 安装到默认位置（/usr/local/monax）
 sudo make install
 
-# Install to custom location
+# 安装到自定义位置
 sudo make install PREFIX=/opt/monax
 ```
 
-### Run
+### 运行
 
 ```bash
-# Start server
+# 启动服务
 make start
 
-# Or run directly
+# 或直接运行
 ./target/release/monax --config conf/example.yaml
 
-# Check server status
+# 查看服务状态
 make status
 
-# Stop server
+# 停止服务
 make stop
 ```
 
-## Project Structure
+## 项目结构
 
 ```
 monax/
-├── Makefile              # Build system entry point
-├── Cargo.toml            # Rust package manifest
-├── build.rs              # Build script (version embedding)
+├── Makefile              # 构建系统入口
+├── Cargo.toml            # Rust 包清单
+├── build.rs              # 构建脚本（嵌入版本信息）
 ├── conf/
-│   └── example.yaml      # Example configuration
+│   └── example.yaml      # 示例配置
 ├── scripts/
-│   ├── build.sh          # Cross-platform build script
-│   ├── install.sh        # System installation script
-│   ├── uninstall.sh      # Uninstallation script
-│   └── service.sh        # Service management script
+│   ├── build.sh          # 跨平台构建脚本
+│   ├── install.sh        # 系统安装脚本
+│   ├── uninstall.sh      # 卸载脚本
+│   └── service.sh        # 服务管理脚本
 ├── src/
-│   ├── main.rs           # Main entry point
-│   ├── lib.rs            # Library root
-│   ├── version.rs        # Version info module
-│   ├── common/           # Common utilities
-│   ├── net/              # Network layer
-│   ├── protocol/         # Wire protocol
-│   ├── sql/              # SQL execution
-│   ├── storage/          # Storage engine
-│   └── types/            # Type definitions
-├── build/                # Build outputs
-└── dist/                 # Distribution packages
+│   ├── main.rs           # 主入口
+│   ├── lib.rs            # 库入口
+│   ├── version.rs        # 版本信息模块
+│   ├── common/           # 通用工具
+│   ├── net/              # 网络层
+│   ├── protocol/         # 线协议
+│   ├── sql/              # SQL 执行
+│   ├── storage/          # 存储引擎
+│   └── types/            # 类型定义
+├── build/                # 构建产物
+└── dist/                 # 发行包
 ```
 
-## Build Commands
+## 构建命令
 
-| Command | Description |
-|---------|-------------|
-| `make build` | Build for current platform |
-| `make build-all` | Build for all platforms |
-| `make package` | Create package for current platform |
-| `make package-all` | Create packages for all platforms |
-| `make install` | Install to system |
-| `make uninstall` | Remove installation (keeps data) |
-| `make uninstall-purge` | Remove everything including data |
-| `make start` | Start service |
-| `make stop` | Stop service |
-| `make restart` | Restart service |
-| `make status` | Check service status |
-| `make test` | Run tests |
-| `make clean` | Clean build artifacts |
-| `make help` | Show all commands |
+| 命令 | 说明 |
+|------|------|
+| `make build` | 为当前平台构建 |
+| `make build-all` | 为所有平台构建 |
+| `make package` | 为当前平台创建发行包 |
+| `make package-all` | 为所有平台创建发行包 |
+| `make install` | 安装到系统 |
+| `make uninstall` | 卸载安装内容（保留数据） |
+| `make uninstall-purge` | 删除所有内容，包括数据 |
+| `make start` | 启动服务 |
+| `make stop` | 停止服务 |
+| `make restart` | 重启服务 |
+| `make status` | 查看服务状态 |
+| `make test` | 运行测试 |
+| `make clean` | 清理构建产物 |
+| `make help` | 显示所有命令 |
 
-## Installation Directory Structure
+## 安装目录结构
 
-After installation, the following directories are created:
+安装完成后会创建以下目录：
 
 ```
 /usr/local/monax/
-├── bin/                  # Binary files
+├── bin/                  # 二进制文件
 │   └── monax
-├── conf/                 # Configuration files
+├── conf/                 # 配置文件
 │   └── monax.yaml
-├── data/                 # Database files
-├── log/                  # Log files
+├── data/                 # 数据库文件
+├── log/                  # 日志文件
 │   └── monax.log
-└── run/                  # PID files
+└── run/                  # PID 文件
     └── monax.pid
 ```
 
-## Service Management
+## 服务管理
 
-### Linux (systemd)
-
-```bash
-sudo systemctl start monax    # Start service
-sudo systemctl stop monax     # Stop service
-sudo systemctl status monax   # Check status
-sudo systemctl enable monax   # Enable auto-start
-sudo journalctl -u monax -f   # View logs
-```
-
-### macOS (launchd)
+### Linux（systemd）
 
 ```bash
-sudo launchctl load /Library/LaunchDaemons/com.monax.server.plist    # Start
-sudo launchctl unload /Library/LaunchDaemons/com.monax.server.plist  # Stop
-sudo launchctl list | grep monax                                      # Status
-tail -f /usr/local/monax/log/stdout.log                               # Logs
+sudo systemctl start monax    # 启动服务
+sudo systemctl stop monax     # 停止服务
+sudo systemctl status monax   # 查看状态
+sudo systemctl enable monax   # 设置开机自启
+sudo journalctl -u monax -f   # 查看日志
 ```
 
-## Configuration
+### macOS（launchd）
 
-Configuration file: `conf/monax.yaml` (or `conf/example.yaml` as template)
+```bash
+sudo launchctl load /Library/LaunchDaemons/com.monax.server.plist    # 启动
+sudo launchctl unload /Library/LaunchDaemons/com.monax.server.plist  # 停止
+sudo launchctl list | grep monax                                      # 查看状态
+tail -f /usr/local/monax/log/stdout.log                               # 查看日志
+```
+
+## 配置
+
+配置文件：`conf/monax.yaml`（也可以使用 `conf/example.yaml` 作为模板）
 
 ```yaml
 server:
@@ -178,58 +178,59 @@ log:
   level: "info"
 ```
 
-## Cross-Compilation
+## 交叉编译
 
-For cross-compilation, ensure you have the required Rust targets:
+进行交叉编译前，请确保已安装所需的 Rust target：
 
 ```bash
-# Add targets
+# 添加 target
 rustup target add x86_64-unknown-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 rustup target add x86_64-apple-darwin
 rustup target add aarch64-apple-darwin
 
-# Build for specific platform
+# 为指定平台构建
 ./scripts/build.sh build -os=linux -arch=amd64
 ./scripts/build.sh build -os=darwin -arch=arm64
 ```
 
-## Version Information
+## 版本信息
 
-Version information is embedded at build time:
+版本信息会在构建时嵌入：
 
 ```bash
-# View version
+# 查看版本
 ./target/release/monax --version
 
-# Set custom version during build
+# 构建时指定自定义版本
 VERSION=1.0.0 make build
 ```
 
-Built version includes:
-- Version number (from Cargo.toml or VERSION env)
-- Git commit hash
-- Build timestamp
-- Target platform
-- Build profile
+构建版本包含：
 
-## Development
+- 版本号（来自 Cargo.toml 或 VERSION 环境变量）
+- Git 提交哈希
+- 构建时间戳
+- 目标平台
+- 构建配置
+
+## 开发
 
 ```bash
-# Run in development mode
+# 以开发模式运行
 cargo run --release -- --config conf/example.yaml
 
-# Run tests
+# 运行测试
 cargo test
 
-# Run benchmarks
+# 运行基准测试
 cargo bench
 
-# Check code
+# 检查代码
 cargo clippy
 cargo fmt --check
 ```
 
-## License
+## 许可证
 
-MIT or Apache-2.0
+MIT 或 Apache-2.0

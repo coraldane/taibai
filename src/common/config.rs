@@ -36,6 +36,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_change_stream_retention_events() -> usize {
+    1_000_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub server: ServerSettings,
@@ -43,6 +47,8 @@ pub struct ServerConfig {
     pub buffer: BufferSettings,
     pub compression: CompressionSettings,
     pub tls: TlsConfigYaml,
+    #[serde(default)]
+    pub change_stream: ChangeStreamSettings,
     pub log: LogSettings,
 }
 
@@ -86,6 +92,20 @@ pub struct TlsConfigYaml {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeStreamSettings {
+    #[serde(default = "default_change_stream_retention_events")]
+    pub retention_events: usize,
+}
+
+impl Default for ChangeStreamSettings {
+    fn default() -> Self {
+        Self {
+            retention_events: default_change_stream_retention_events(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSettings {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -108,6 +128,7 @@ impl Default for ServerConfig {
             buffer: BufferSettings { batch_size: 4096 },
             compression: CompressionSettings { enabled: true },
             tls: TlsConfigYaml::default(),
+            change_stream: ChangeStreamSettings::default(),
             log: LogSettings {
                 level: "info".to_string(),
             },

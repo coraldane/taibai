@@ -4,7 +4,7 @@ use crate::types::batch::RecordBatch;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
-use super::engine::{Engine, ExecResult};
+use super::engine::{change_row_from_images, Engine, ExecResult, MAX_CHANGE_ROWS_PER_EVENT};
 use super::helpers::{
     build_row_group_predicate, collect_expr_column_indices, eval_expr_to_scalar,
     eval_where_clause_batch,
@@ -17,6 +17,8 @@ pub fn exec_update(
     table: &str,
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
+    change_rows: &mut Vec<crate::storage::change_stream::ChangeRow>,
+    row_images_truncated: &mut bool,
 ) -> Result<ExecResult> {
     let (table_schema, _table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
@@ -106,6 +108,17 @@ pub fn exec_update(
                     }
                     if matches {
                         updated_count += 1;
+                        if change_rows.len() < MAX_CHANGE_ROWS_PER_EVENT {
+                            change_rows.push(change_row_from_images(
+                                &table_schema,
+                                Some(&batch),
+                                row_idx,
+                                Some(&new_batch),
+                                row_idx,
+                            ));
+                        } else {
+                            *row_images_truncated = true;
+                        }
                     }
                 }
                 row_group_updates.push((rg_idx, Some(new_batch)));
