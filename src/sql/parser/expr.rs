@@ -1,4 +1,4 @@
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{

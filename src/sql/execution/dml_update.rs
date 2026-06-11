@@ -1,4 +1,4 @@
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::RecordBatch;
 use crate::types::batch::Schema;
@@ -20,7 +20,7 @@ pub fn exec_update(
     change_rows: &mut Vec<crate::storage::change_stream::ChangeRow>,
     row_images_truncated: &mut bool,
 ) -> Result<ExecResult> {
-    let (table_schema, _table_meta) = {
+    let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs
             .get(db)
@@ -138,6 +138,31 @@ pub fn exec_update(
 
         if rewritten_segments.is_empty() {
             return Ok(0);
+        }
+
+        if !table_meta.unique_indexes.is_empty() {
+            let mut validation_batches = Vec::new();
+            for seg_path in SegmentManager::discover_segments(&table_dir)? {
+                if rewritten_segments
+                    .iter()
+                    .any(|(old_seg, _)| old_seg == &seg_path)
+                {
+                    continue;
+                }
+                let reader = mgr.open_reader(&seg_path)?;
+                for rg_idx in 0..reader.num_row_groups() {
+                    validation_batches.push(reader.read_row_group(rg_idx)?);
+                }
+            }
+            for (_, batches) in &rewritten_segments {
+                validation_batches.extend(batches.iter().cloned());
+            }
+            super::dml_insert::validate_unique_indexes_in_batches(
+                table,
+                &table_schema,
+                &table_meta.unique_indexes,
+                &validation_batches,
+            )?;
         }
 
         mgr.clear_active_segments(db, table);

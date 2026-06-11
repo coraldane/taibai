@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common::config::ServerConfig;
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;

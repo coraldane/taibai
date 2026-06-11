@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 
 /// Wire data type enum (19 types, aligned with taibai protocol).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

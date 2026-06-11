@@ -2,7 +2,7 @@
 /// Inspired by taibai's FunctionRegistry + DuckDB's function catalog.
 use std::collections::HashMap;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 

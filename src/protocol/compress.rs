@@ -1,4 +1,4 @@
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 
 /// Compress data using gzip.
 pub fn gzip_compress(data: &[u8]) -> Result<Vec<u8>> {

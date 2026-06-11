@@ -8,7 +8,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
 
 use crate::common::config::ServerConfig;
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::net::handler::{build_error, Handler};
 use crate::net::tls::TlsMode;
 use crate::protocol::codec::MessageCodec;

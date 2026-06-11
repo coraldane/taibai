@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::array::ColumnArray;
 use crate::types::scalar::ScalarValue;

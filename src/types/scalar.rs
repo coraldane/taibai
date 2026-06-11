@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

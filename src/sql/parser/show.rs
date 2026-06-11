@@ -1,4 +1,4 @@
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::lexer::Token;

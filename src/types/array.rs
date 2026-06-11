@@ -1,4 +1,4 @@
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;

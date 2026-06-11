@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 
@@ -91,9 +91,9 @@ impl StatementBinder {
                     }
                     Ok((ctx, schema))
                 }
-                TableRef::Subquery { query: _, alias: _ } => {
-                    Err(TaibaiError::Sql("subquery in FROM not yet supported".into()))
-                }
+                TableRef::Subquery { query: _, alias: _ } => Err(TaibaiError::Sql(
+                    "subquery in FROM not yet supported".into(),
+                )),
             },
             FromClause::Join(join_expr) => {
                 let (mut left_ctx, left_schema) = Self::bind_from(&join_expr.left, table_schemas)?;

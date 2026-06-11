@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;

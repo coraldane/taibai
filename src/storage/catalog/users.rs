@@ -6,7 +6,7 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -152,8 +152,9 @@ impl UserCatalog {
         fs::create_dir_all(meta_dir)
             .map_err(|e| TaibaiError::Storage(format!("failed to create meta dir: {}", e)))?;
         let path = meta_dir.join("users.json");
-        let data = serde_json::to_string_pretty(self)
-            .map_err(|e| TaibaiError::Storage(format!("failed to serialize user catalog: {}", e)))?;
+        let data = serde_json::to_string_pretty(self).map_err(|e| {
+            TaibaiError::Storage(format!("failed to serialize user catalog: {}", e))
+        })?;
         let tmp_path = path.with_extension("json.tmp");
         fs::write(&tmp_path, &data)
             .map_err(|e| TaibaiError::Storage(format!("failed to write users.json.tmp: {}", e)))?;

@@ -2,7 +2,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::bulk_payload::DirectBulkColumn;
 use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::partition::pruning::compute_segment_zone_maps_from_row_groups;

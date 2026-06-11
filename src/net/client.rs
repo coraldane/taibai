@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::codec::MessageCodec;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;

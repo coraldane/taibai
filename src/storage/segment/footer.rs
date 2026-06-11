@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::codec::io_util::{read_len_prefixed_str, read_u32_le, read_u64_le, read_u8};
 use crate::storage::codec::scalar_tag::decode_scalar_with_tag;

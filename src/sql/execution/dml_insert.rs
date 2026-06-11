@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::index::sort_key::SortKeyInserter;
 use crate::storage::segment_manager::SegmentManager;
@@ -158,12 +158,16 @@ pub fn exec_insert(
 
     let row_count = batch.num_rows() as u64;
 
+    let unique_constraints = unique_constraints(&table_meta, &schema)?;
+    let has_unique_checks = !unique_constraints.is_empty();
     let primary_key_indices = primary_key_indices(&schema);
-    let _pk_guard = if primary_key_indices.is_empty() {
+    let _pk_guard = if primary_key_indices.is_empty() && !has_unique_checks {
         None
     } else {
         Some(PRIMARY_KEY_INSERT_LOCK.lock().unwrap())
     };
+
+    validate_unique_constraints(engine, db, table, &batch, &schema, &unique_constraints)?;
 
     if !primary_key_indices.is_empty() {
         if generated_auto_increment_key_guarantees_uniqueness(
@@ -534,6 +538,187 @@ fn validate_nullable(schema: &Schema, col_idx: usize, scalar: &ScalarValue) -> R
         )));
     }
     Ok(())
+}
+
+fn unique_constraints(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+) -> Result<Vec<(String, Vec<usize>)>> {
+    let mut constraints = Vec::new();
+    for index in &table_meta.unique_indexes {
+        let mut indices = Vec::with_capacity(index.columns.len());
+        for column in &index.columns {
+            indices.push(schema.index_of(column).ok_or_else(|| {
+                TaibaiError::Sql(format!("unique index column '{}' not found", column))
+            })?);
+        }
+        constraints.push((index.name.clone(), indices));
+    }
+    Ok(constraints)
+}
+
+fn validate_unique_constraints(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    batch: &RecordBatch,
+    schema: &Schema,
+    constraints: &[(String, Vec<usize>)],
+) -> Result<()> {
+    for (name, indices) in constraints {
+        validate_unique_key_uniqueness(engine, db, table, schema, indices, name, Some(batch))?;
+    }
+    Ok(())
+}
+
+pub fn validate_unique_key_uniqueness(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    schema: &Schema,
+    indices: &[usize],
+    index_name: &str,
+    new_batch: Option<&RecordBatch>,
+) -> Result<()> {
+    let mut keys = HashSet::new();
+    if let Some(batch) = new_batch {
+        for row_idx in 0..batch.num_rows() {
+            let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
+                continue;
+            };
+            if !keys.insert(key.clone()) {
+                return Err(duplicate_unique_key_error(table, index_name, &key));
+            }
+        }
+    }
+    load_existing_unique_keys(engine, db, table, indices, index_name, &mut keys)
+}
+
+fn load_existing_unique_keys(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    indices: &[usize],
+    index_name: &str,
+    inserted_keys: &mut HashSet<Vec<ScalarValue>>,
+) -> Result<()> {
+    let table_dir = engine.data_dir().join(db).join(table);
+    if table_dir.exists() {
+        for seg_path in SegmentManager::discover_segments(&table_dir)? {
+            let reader = engine.segment_mgr().open_reader_cached(&seg_path)?;
+            for rg_idx in 0..reader.num_row_groups() {
+                let batch = reader.read_row_group_with_projection(rg_idx, indices)?;
+                check_existing_unique_batch(table, index_name, &batch, inserted_keys)?;
+            }
+        }
+    }
+    for memtable in engine.memtable_manager().get_by_table(db, table) {
+        if let Some(batch) = memtable.read() {
+            check_existing_unique_batch_with_indices(
+                table,
+                index_name,
+                &batch,
+                indices,
+                inserted_keys,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn check_existing_unique_batch(
+    table: &str,
+    index_name: &str,
+    batch: &RecordBatch,
+    inserted_keys: &mut HashSet<Vec<ScalarValue>>,
+) -> Result<()> {
+    let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
+    check_existing_unique_batch_with_indices(
+        table,
+        index_name,
+        batch,
+        &projected_indices,
+        inserted_keys,
+    )
+}
+
+fn check_existing_unique_batch_with_indices(
+    table: &str,
+    index_name: &str,
+    batch: &RecordBatch,
+    indices: &[usize],
+    inserted_keys: &mut HashSet<Vec<ScalarValue>>,
+) -> Result<()> {
+    for row_idx in 0..batch.num_rows() {
+        let Some(key) = unique_key_for_row(batch, row_idx, indices, &batch.schema) else {
+            continue;
+        };
+        if !inserted_keys.insert(key.clone()) {
+            return Err(duplicate_unique_key_error(table, index_name, &key));
+        }
+    }
+    Ok(())
+}
+
+fn unique_key_for_row(
+    batch: &RecordBatch,
+    row_idx: usize,
+    indices: &[usize],
+    schema: &Schema,
+) -> Option<Vec<ScalarValue>> {
+    let mut key = Vec::with_capacity(indices.len());
+    for &col_idx in indices {
+        let value = batch
+            .scalar(row_idx, col_idx)
+            .unwrap_or(ScalarValue::null_for_type(
+                schema.columns[col_idx].data_type,
+            ));
+        if value.is_null() {
+            return None;
+        }
+        key.push(value);
+    }
+    Some(key)
+}
+
+pub fn validate_unique_indexes_in_batches(
+    table: &str,
+    schema: &Schema,
+    unique_indexes: &[crate::storage::catalog::schema::UniqueIndexMeta],
+    batches: &[RecordBatch],
+) -> Result<()> {
+    for index in unique_indexes {
+        let mut indices = Vec::with_capacity(index.columns.len());
+        for column in &index.columns {
+            indices.push(schema.index_of(column).ok_or_else(|| {
+                TaibaiError::Sql(format!("unique index column '{}' not found", column))
+            })?);
+        }
+        let mut keys = HashSet::new();
+        for batch in batches {
+            for row_idx in 0..batch.num_rows() {
+                let Some(key) = unique_key_for_row(batch, row_idx, &indices, schema) else {
+                    continue;
+                };
+                if !keys.insert(key.clone()) {
+                    return Err(duplicate_unique_key_error(table, &index.name, &key));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn duplicate_unique_key_error(table: &str, index_name: &str, key: &[ScalarValue]) -> TaibaiError {
+    let key_text = key
+        .iter()
+        .map(|v| v.to_text().unwrap_or_else(|| "NULL".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    TaibaiError::Sql(format!(
+        "duplicate unique key '{}' for table '{}': ({})",
+        index_name, table, key_text
+    ))
 }
 
 fn primary_key_indices(schema: &Schema) -> Vec<usize> {

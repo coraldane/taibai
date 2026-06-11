@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::codec::column_codec::{decode_adaptive_column, COLUMN_ENCODING_MAGIC};
 use crate::storage::codec::io_util::read_u32_le;

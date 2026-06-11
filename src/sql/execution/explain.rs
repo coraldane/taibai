@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::sql::parser::ast::{Statement, TableRef};
 use crate::sql::planner::*;

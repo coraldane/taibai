@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::types::batch::ColumnDef;
 
 /// Partition type for a table.
@@ -57,6 +57,12 @@ fn default_ttl_column_idx() -> i32 {
 
 /// Table metadata stored in the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniqueIndexMeta {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMeta {
     pub name: String,
     pub database: String,
@@ -80,6 +86,8 @@ pub struct TableMeta {
     pub partition_key_idx: i32,
     #[serde(default)]
     pub ttl: Option<TtlInfo>,
+    #[serde(default)]
+    pub unique_indexes: Vec<UniqueIndexMeta>,
 }
 
 impl TableMeta {
@@ -103,6 +111,7 @@ impl TableMeta {
             partitions: Vec::new(),
             partition_key_idx: -1,
             ttl: None,
+            unique_indexes: Vec::new(),
         }
     }
 
@@ -184,6 +193,43 @@ impl TableMeta {
         self.partition_type != PartitionType::None
     }
 
+    pub fn drop_unique_index(&mut self, name: &str) -> Result<()> {
+        let before = self.unique_indexes.len();
+        self.unique_indexes
+            .retain(|idx| !idx.name.eq_ignore_ascii_case(name));
+        if self.unique_indexes.len() == before {
+            return Err(TaibaiError::Sql(format!("index '{}' does not exist", name)));
+        }
+        Ok(())
+    }
+
+    pub fn add_unique_index(&mut self, name: &str, columns: Vec<String>) -> Result<()> {
+        if self
+            .unique_indexes
+            .iter()
+            .any(|idx| idx.name.eq_ignore_ascii_case(name))
+        {
+            return Err(TaibaiError::Sql(format!("index '{}' already exists", name)));
+        }
+        for column in &columns {
+            if !self
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(column))
+            {
+                return Err(TaibaiError::Sql(format!(
+                    "unique index column '{}' not found",
+                    column
+                )));
+            }
+        }
+        self.unique_indexes.push(UniqueIndexMeta {
+            name: name.to_string(),
+            columns,
+        });
+        Ok(())
+    }
+
     pub fn get_partition_column_index(&self) -> Option<usize> {
         if self.partition_key.is_empty() {
             return None;
@@ -242,8 +288,9 @@ impl DatabaseCatalog {
     pub fn save(&self, meta_dir: &Path) -> Result<()> {
         let schema_path = Self::catalog_path(meta_dir, &self.name);
         if let Some(parent) = schema_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| TaibaiError::Storage(format!("failed to create catalog dir: {}", e)))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                TaibaiError::Storage(format!("failed to create catalog dir: {}", e))
+            })?;
         }
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| TaibaiError::Storage(format!("failed to serialize catalog: {}", e)))?;

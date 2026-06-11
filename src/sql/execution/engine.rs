@@ -280,6 +280,7 @@ impl Engine {
                 columns,
                 if_not_exists,
                 primary_key,
+                unique_keys,
                 cluster_by,
                 partition_by,
                 ttl,
@@ -294,6 +295,7 @@ impl Engine {
                     columns,
                     *if_not_exists,
                     primary_key,
+                    unique_keys,
                     cluster_by,
                     partition_by,
                     ttl,
@@ -310,6 +312,30 @@ impl Engine {
                 }
                 result
             }
+            Statement::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+            } => super::ddl::exec_create_index(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+                name,
+                columns,
+                *unique,
+            ),
+            Statement::DropIndex {
+                name,
+                table,
+                if_exists,
+            } => super::ddl::exec_drop_index(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+                name,
+                *if_exists,
+            ),
             Statement::DropTable { name, if_exists } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
@@ -646,6 +672,18 @@ impl Engine {
                 PermissionType::Create,
                 name.effective_database(&session.database),
                 &name.name,
+            ),
+            Statement::CreateIndex { table, .. } => self.require_table_permission(
+                session,
+                PermissionType::Create,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::DropIndex { table, .. } => self.require_table_permission(
+                session,
+                PermissionType::Drop,
+                table.effective_database(&session.database),
+                &table.name,
             ),
             Statement::DropTable { name, .. } => self.require_table_permission(
                 session,
@@ -1148,6 +1186,40 @@ impl Engine {
         Ok(())
     }
 
+    fn validate_batch_unique_indexes(
+        &self,
+        db: &str,
+        table: &str,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let catalogs = self.catalogs.read().unwrap();
+        let Some(catalog) = catalogs.get(db) else {
+            return Ok(());
+        };
+        let Some(table_meta) = catalog.get_table(table) else {
+            return Ok(());
+        };
+        let schema = Schema::new(table_meta.columns.clone());
+        for index in &table_meta.unique_indexes {
+            let mut indices = Vec::with_capacity(index.columns.len());
+            for column in &index.columns {
+                indices.push(schema.index_of(column).ok_or_else(|| {
+                    TaibaiError::Sql(format!("unique index column '{}' not found", column))
+                })?);
+            }
+            super::dml_insert::validate_unique_key_uniqueness(
+                self,
+                db,
+                table,
+                &schema,
+                &indices,
+                &index.name,
+                Some(batch),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn exec_bulk_insert_with_wal_control(
         &self,
         db: &str,
@@ -1155,6 +1227,7 @@ impl Engine {
         batch: RecordBatch,
         disable_wal: bool,
     ) -> Result<u64> {
+        self.validate_batch_unique_indexes(db, table, &batch)?;
         if self.is_bulk_mode() {
             self.segment_mgr
                 .bulk_insert_batch_deferred(db, table, batch, disable_wal)
@@ -1172,6 +1245,7 @@ impl Engine {
         batch: RecordBatch,
         disable_wal: bool,
     ) -> Result<u64> {
+        self.validate_batch_unique_indexes(db, table, &batch)?;
         if self.is_bulk_mode() {
             self.segment_mgr
                 .bulk_insert_batch_partitioned_deferred(db, table, table_meta, batch)
@@ -1205,6 +1279,16 @@ impl Engine {
         let catalog = catalogs
             .get(db)
             .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+
+        if let Some(table_meta) = catalog.get_table(&table_name) {
+            if !table_meta.unique_indexes.is_empty() {
+                let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
+                let schema = Schema::new(table_meta.columns.clone());
+                let batch =
+                    crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)?;
+                self.validate_batch_unique_indexes(db, &table_name, &batch)?;
+            }
+        }
 
         let result = self.segment_mgr.bulk_insert_payload_with_catalog(
             db,

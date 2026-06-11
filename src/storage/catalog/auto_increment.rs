@@ -5,7 +5,7 @@ use std::sync::{
     Arc, RwLock,
 };
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 
 pub struct AutoIncrementCounter {
     current: AtomicU64,

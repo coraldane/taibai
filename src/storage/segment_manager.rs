@@ -24,6 +24,7 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 pub use config::SegmentConfig;
+pub(crate) use helpers::direct_bulk_request_to_batch;
 pub use helpers::table_key;
 
 use active_writer::ActiveSegmentWriter;
@@ -32,8 +33,8 @@ use config::{
     FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
-    direct_bulk_request_to_batch, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
-    is_transient_footer_error, sort_batch_by_key_indices,
+    discover_max_seq, ensure_state_not_retired, filter_batch_by_mask, is_transient_footer_error,
+    sort_batch_by_key_indices,
 };
 use reader_cache::ReaderCache;
 use state::TableSegmentState;

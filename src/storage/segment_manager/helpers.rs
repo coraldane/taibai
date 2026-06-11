@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::bulk_payload::{DirectBulkColumn, DirectBulkRequest};
 use crate::storage::partition::pruning::ZoneMap;
@@ -88,7 +88,7 @@ pub(super) fn compute_zone_maps_from_batch(
     zone_maps
 }
 
-pub(super) fn direct_bulk_request_to_batch(
+pub(crate) fn direct_bulk_request_to_batch(
     req: &DirectBulkRequest<'_>,
     schema: &Schema,
 ) -> Result<RecordBatch> {

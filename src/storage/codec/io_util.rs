@@ -1,6 +1,6 @@
 use std::io::{self, Cursor, Read};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 
 pub fn read_u8(cursor: &mut Cursor<&[u8]>) -> std::result::Result<u8, io::Error> {
     let mut buf = [0u8; 1];

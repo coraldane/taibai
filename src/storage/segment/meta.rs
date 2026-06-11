@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::partition::pruning::compute_segment_zone_maps_from_row_groups;
 use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::writer::encode_segment_footer;

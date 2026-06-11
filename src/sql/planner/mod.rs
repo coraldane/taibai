@@ -3,7 +3,7 @@ pub mod types;
 
 use std::collections::HashMap;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
