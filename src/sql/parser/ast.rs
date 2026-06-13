@@ -86,6 +86,8 @@ pub enum Statement {
         table: ObjectName,
         columns: Vec<String>,
         unique: bool,
+        if_not_exists: bool,
+        index_type: Option<String>,
     },
     CreateTable {
         name: ObjectName,

@@ -128,6 +128,8 @@ impl<'a> ScanExecutor<'a> {
             let pred = self.spec.to_row_group_predicate();
             let bloom_checks = row_group::build_bloom_check_list(self.spec);
             let in_checks = row_group::build_in_check_list(self.spec);
+            let set_checks = row_group::build_set_check_list(self.spec);
+            let set_in_checks = row_group::build_set_in_check_list(self.spec);
 
             let mgr = self.engine.segment_mgr();
 
@@ -162,6 +164,8 @@ impl<'a> ScanExecutor<'a> {
                     &pred,
                     &bloom_checks,
                     &in_checks,
+                    &set_checks,
+                    &set_in_checks,
                     segment_zone_maps,
                 );
 

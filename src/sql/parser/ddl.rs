@@ -44,6 +44,14 @@ impl Parser {
                 )))
             }
         }
+        let if_not_exists = if self.peek() == &Token::If {
+            self.advance();
+            self.expect(&Token::Not)?;
+            self.expect(&Token::Exists)?;
+            true
+        } else {
+            false
+        };
         let name = self.expect_ident()?;
         self.expect(&Token::On)?;
         let table = self.parse_object_name()?;
@@ -58,12 +66,38 @@ impl Parser {
             }
         }
         self.expect(&Token::RightParen)?;
+        let index_type = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("TYPE"))
+        {
+            self.advance();
+            Some(self.parse_index_type_name()?)
+        } else {
+            None
+        };
         Ok(Statement::CreateIndex {
             name,
             table,
             columns,
             unique,
+            if_not_exists,
+            index_type,
         })
+    }
+
+    fn parse_index_type_name(&mut self) -> Result<String> {
+        match self.peek().clone() {
+            Token::Ident(s) => {
+                self.advance();
+                Ok(s.to_ascii_lowercase())
+            }
+            Token::Set => {
+                self.advance();
+                Ok("set".to_string())
+            }
+            other => Err(TaibaiError::Sql(format!(
+                "expected index type name, got {}",
+                other
+            ))),
+        }
     }
 
     fn parse_create_user(&mut self) -> Result<Statement> {

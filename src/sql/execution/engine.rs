@@ -317,6 +317,8 @@ impl Engine {
                 table,
                 columns,
                 unique,
+                if_not_exists,
+                index_type,
             } => super::ddl::exec_create_index(
                 self,
                 table.effective_database(&session.database),
@@ -324,6 +326,8 @@ impl Engine {
                 name,
                 columns,
                 *unique,
+                *if_not_exists,
+                index_type.as_deref(),
             ),
             Statement::DropIndex {
                 name,

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
-use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType};
+use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType, SecondaryIndexType};
 use crate::storage::segment::meta::remove_sidecar_meta;
 use crate::types::batch::{ColumnDef, ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -123,11 +123,15 @@ pub fn exec_drop_index(
     let table_meta = catalog
         .get_table(table)
         .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
-    if !table_meta
+    let has_unique_index = table_meta
         .unique_indexes
         .iter()
-        .any(|idx| idx.name.eq_ignore_ascii_case(index_name))
-    {
+        .any(|idx| idx.name.eq_ignore_ascii_case(index_name));
+    let has_secondary_index = table_meta
+        .secondary_indexes
+        .iter()
+        .any(|idx| idx.name.eq_ignore_ascii_case(index_name));
+    if !has_unique_index && !has_secondary_index {
         if if_exists {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
@@ -136,10 +140,14 @@ pub fn exec_drop_index(
             index_name
         )));
     }
-    catalog
+    let table_meta = catalog
         .get_table_mut(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-        .drop_unique_index(index_name)?;
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
+    if has_unique_index {
+        table_meta.drop_unique_index(index_name)?;
+    } else {
+        table_meta.drop_secondary_index(index_name)?;
+    }
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
     Ok(ExecResult::Ok { rows_affected: 0 })
@@ -152,12 +160,9 @@ pub fn exec_create_index(
     index_name: &str,
     columns: &[String],
     unique: bool,
+    if_not_exists: bool,
+    index_type: Option<&str>,
 ) -> Result<ExecResult> {
-    if !unique {
-        return Err(TaibaiError::Sql(
-            "only UNIQUE INDEX is currently supported".into(),
-        ));
-    }
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
     let table_meta = catalog
@@ -166,33 +171,59 @@ pub fn exec_create_index(
         .clone();
     let schema = Schema::new(table_meta.columns.clone());
     let indices = resolve_unique_index_columns(&schema, columns)?;
-    super::dml_insert::validate_unique_key_uniqueness(
-        engine, db, table, &schema, &indices, index_name, None,
-    )?;
-    catalog
+    let table_meta = catalog
         .get_table_mut(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-        .add_unique_index(index_name, columns.to_vec())?;
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
+    if table_meta.has_index(index_name) {
+        if if_not_exists {
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
+        return Err(TaibaiError::Sql(format!(
+            "index '{}' already exists",
+            index_name
+        )));
+    }
+    if unique {
+        super::dml_insert::validate_unique_key_uniqueness(
+            engine, db, table, &schema, &indices, index_name, None,
+        )?;
+        table_meta.add_unique_index(index_name, columns.to_vec())?;
+    } else {
+        let index_type = parse_secondary_index_type(index_type)?;
+        table_meta.add_secondary_index(index_name, columns.to_vec(), index_type)?;
+    }
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
+fn parse_secondary_index_type(index_type: Option<&str>) -> Result<SecondaryIndexType> {
+    match index_type.unwrap_or("bloom").to_ascii_lowercase().as_str() {
+        "bloom" => Ok(SecondaryIndexType::Bloom),
+        "minmax" | "min_max" => Ok(SecondaryIndexType::MinMax),
+        "set" => Ok(SecondaryIndexType::Set),
+        other => Err(TaibaiError::Sql(format!(
+            "unsupported index type '{}'; supported types: bloom, minmax, set",
+            other
+        ))),
+    }
+}
+
 fn resolve_unique_index_columns(schema: &Schema, columns: &[String]) -> Result<Vec<usize>> {
     if columns.is_empty() {
         return Err(TaibaiError::Sql(
-            "unique index must contain at least one column".into(),
+            "index must contain at least one column".into(),
         ));
     }
     let mut seen = std::collections::HashSet::new();
     let mut indices = Vec::with_capacity(columns.len());
     for column in columns {
-        let idx = schema.index_of(column).ok_or_else(|| {
-            TaibaiError::Sql(format!("unique index column '{}' not found", column))
-        })?;
+        let idx = schema
+            .index_of(column)
+            .ok_or_else(|| TaibaiError::Sql(format!("index column '{}' not found", column)))?;
         if !seen.insert(idx) {
             return Err(TaibaiError::Sql(format!(
-                "duplicate unique index column '{}'",
+                "duplicate index column '{}'",
                 column
             )));
         }
@@ -288,6 +319,11 @@ pub fn exec_alter_table(
                             .iter()
                             .any(|col| col.eq_ignore_ascii_case(col_name))
                     });
+                    meta.secondary_indexes.retain(|idx| {
+                        !idx.columns
+                            .iter()
+                            .any(|col| col.eq_ignore_ascii_case(col_name))
+                    });
                     meta.update_partition_key_idx();
                     meta.update_ttl_column_idx();
                 }
@@ -322,15 +358,37 @@ pub fn exec_alter_table(
                     .add_unique_index(&index_name, key.columns.clone())?;
             }
             AlterOperation::DropIndex { name: index_name } => {
-                catalog
-                    .get_table_mut(name)
-                    .ok_or_else(|| {
-                        TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
-                    })?
-                    .drop_unique_index(index_name)?;
+                let table_meta = catalog.get_table_mut(name).ok_or_else(|| {
+                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
+                })?;
+                if table_meta
+                    .unique_indexes
+                    .iter()
+                    .any(|idx| idx.name.eq_ignore_ascii_case(index_name))
+                {
+                    table_meta.drop_unique_index(index_name)?;
+                } else {
+                    table_meta.drop_secondary_index(index_name)?;
+                }
             }
             AlterOperation::RenameColumn { old_name, new_name } => {
                 catalog.rename_column(name, old_name, new_name)?;
+                if let Some(meta) = catalog.get_table_mut(name) {
+                    for index in &mut meta.unique_indexes {
+                        for column in &mut index.columns {
+                            if column.eq_ignore_ascii_case(old_name) {
+                                *column = new_name.clone();
+                            }
+                        }
+                    }
+                    for index in &mut meta.secondary_indexes {
+                        for column in &mut index.columns {
+                            if column.eq_ignore_ascii_case(old_name) {
+                                *column = new_name.clone();
+                            }
+                        }
+                    }
+                }
             }
             AlterOperation::ModifyColumn { column } => {
                 catalog.modify_column(
@@ -989,10 +1047,49 @@ pub fn exec_show_indexes(engine: &Engine, db: &str, table: &str) -> Result<ExecR
         }
     }
 
+    for secondary_index in &table_meta.secondary_indexes {
+        for (idx, col_name) in secondary_index.columns.iter().enumerate() {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(table.to_string())))?;
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(1)))?;
+            batch
+                .column_mut(2)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(secondary_index.name.clone())))?;
+            batch
+                .column_mut(3)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some((idx + 1) as i64)))?;
+            batch
+                .column_mut(4)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(col_name.clone())))?;
+            batch
+                .column_mut(5)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(
+                    secondary_index_type_display(secondary_index.index_type).to_string(),
+                )))?;
+        }
+    }
+
     Ok(ExecResult::Query {
         schema,
         batches: vec![batch],
     })
+}
+
+fn secondary_index_type_display(index_type: SecondaryIndexType) -> &'static str {
+    match index_type {
+        SecondaryIndexType::Bloom => "BLOOM",
+        SecondaryIndexType::MinMax => "MINMAX",
+        SecondaryIndexType::Set => "SET",
+    }
 }
 
 pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
@@ -1081,6 +1178,17 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
 
     if let Some(ttl) = &table_meta.ttl {
         create_sql.push_str(&format!(" TTL ({}, {})", ttl.column, ttl.duration_secs));
+    }
+
+    for secondary_index in &table_meta.secondary_indexes {
+        let cols = secondary_index.columns.join(", ");
+        create_sql.push_str(&format!(
+            ";\nCREATE INDEX {} ON {} ({}) TYPE {}",
+            secondary_index.name,
+            table,
+            cols,
+            secondary_index_type_display(secondary_index.index_type).to_ascii_lowercase()
+        ));
     }
 
     let schema = Schema::new(vec![

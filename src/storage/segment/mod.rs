@@ -19,6 +19,7 @@ pub struct RowGroupMeta {
     pub uncompressed_sizes: Vec<u64>,
     pub zone_maps: Vec<crate::storage::partition::pruning::ZoneMap>,
     pub bloom_filters: Vec<Option<BloomFilter>>,
+    pub value_sets: Vec<Option<Vec<crate::types::scalar::ScalarValue>>>,
 }
 
 #[allow(unused_imports)]

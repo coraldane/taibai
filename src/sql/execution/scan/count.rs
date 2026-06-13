@@ -24,6 +24,8 @@ pub fn count_star(
     let pred = spec.to_row_group_predicate();
     let bloom_checks = row_group::build_bloom_check_list(spec);
     let in_checks = row_group::build_in_check_list(spec);
+    let set_checks = row_group::build_set_check_list(spec);
+    let set_in_checks = row_group::build_set_in_check_list(spec);
 
     let mut total_rows: u64 = 0;
 
@@ -50,6 +52,8 @@ pub fn count_star(
             &pred,
             &bloom_checks,
             &in_checks,
+            &set_checks,
+            &set_in_checks,
             &mut total_rows,
             stats,
         )?;
@@ -121,6 +125,8 @@ fn count_with_predicates(
     pred: &crate::storage::partition::pruning::RowGroupPredicate,
     bloom_checks: &[(usize, ScalarValue)],
     in_checks: &[&super::spec::InPredicate],
+    set_checks: &[(usize, ScalarValue)],
+    set_in_checks: &[&super::spec::InPredicate],
     total_rows: &mut u64,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<()> {
@@ -138,6 +144,8 @@ fn count_with_predicates(
             pred,
             bloom_checks,
             in_checks,
+            set_checks,
+            set_in_checks,
             reader.segment_zone_maps(),
         );
 

@@ -174,6 +174,13 @@ impl SegmentReader {
         &self.footer.row_groups[row_group].bloom_filters
     }
 
+    pub fn value_sets(
+        &self,
+        row_group: usize,
+    ) -> &[Option<Vec<crate::types::scalar::ScalarValue>>] {
+        &self.footer.row_groups[row_group].value_sets
+    }
+
     pub fn segment_zone_maps(&self) -> &[ZoneMap] {
         &self.footer.segment_zone_maps
     }

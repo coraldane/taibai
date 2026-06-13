@@ -1,3 +1,4 @@
+use taibai::net::bulk_importer::encode_columnar_bulk_insert;
 use taibai::protocol::types::DataType;
 use taibai::storage::segment::meta::{compact_sidecar_footer_if_needed, sidecar_meta_path};
 use taibai::storage::segment::{encode_segment_footer, SegmentReader};
@@ -155,4 +156,27 @@ fn delete_footer_rewrite_updates_sidecar_footer() {
     assert_eq!(reader.deleted_row_count(), 1);
     assert!(reader.is_row_deleted(0));
     assert!(!reader.is_row_deleted(1));
+}
+
+#[test]
+fn direct_bulk_row_group_writes_value_sets() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::new(dir.path()).unwrap();
+    let payload = encode_columnar_bulk_insert("t", &batch(1, 3)).unwrap();
+
+    mgr.bulk_insert_payload("main", &payload, false).unwrap();
+
+    let table_dir = dir.path().join("main").join("t");
+    let segments = SegmentManager::discover_segments(&table_dir).unwrap();
+    let reader = SegmentReader::open(&segments[0]).unwrap();
+    let values = reader.value_sets(0)[0].as_ref().unwrap();
+
+    assert_eq!(
+        values,
+        &vec![
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(2)),
+            ScalarValue::Int64(Some(3)),
+        ]
+    );
 }
