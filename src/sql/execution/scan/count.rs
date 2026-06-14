@@ -5,6 +5,7 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
+use super::partition;
 use super::row_filter;
 use super::row_group;
 use super::spec::ScanSpec;
@@ -14,13 +15,18 @@ use std::path::Path;
 
 pub fn count_star(
     spec: &ScanSpec,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
     table_dir: &Path,
     segment_mgr: &SegmentManager,
     memtable_mgr: &crate::storage::core::memtable::MemTableManager,
     db: &str,
     stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<u64> {
-    let segment_files = SegmentManager::discover_segments(table_dir)?;
+    let segment_files = partition::prune_segments_by_partition(
+        SegmentManager::discover_segments(table_dir)?,
+        spec,
+        Some(table_meta),
+    );
     let pred = spec.to_row_group_predicate();
     let bloom_checks = row_group::build_bloom_check_list(spec);
     let in_checks = row_group::build_in_check_list(spec);
