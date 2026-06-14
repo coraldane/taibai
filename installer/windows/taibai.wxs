@@ -5,10 +5,9 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Taibai is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-    <SetDirectory Id="DataDir" Value="[CommonAppDataFolder]Taibai\data" Before="CostFinalize" Sequence="both" Condition="NOT DATADIR" />
-    <Property Id="SERVICECONFIG" Value="[CommonAppDataFolder]Taibai\conf\windows.yaml" />
+    <SetDirectory Id="DATADIR" Value="[CommonAppDataFolder]Taibai\data" Sequence="both" Condition="NOT DATADIR" />
     <ui:WixUI Id="WixUI_InstallDir" />
-    <CustomAction Id="WriteWindowsConfig" Directory="ProgramDataTaibaiConfFolder" Execute="deferred" Impersonate="no" ExeCommand="cmd.exe /c &quot;if not exist &quot;&quot;[ProgramDataTaibaiConfFolder]&quot;&quot; mkdir &quot;&quot;[ProgramDataTaibaiConfFolder]&quot;&quot; &amp;&amp; (echo server: &amp; echo   host: &quot;&quot;0.0.0.0&quot;&quot; &amp; echo   port: 5151 &amp; echo   max_message_size: 67108864 &amp; echo storage: &amp; echo   data_dir: &quot;&quot;[DATADIR]&quot;&quot; &amp; echo   default_database: &quot;&quot;main&quot;&quot; &amp; echo   flush_threshold_rows: 65536 &amp; echo   min_segment_seal_size_mb: 500 &amp; echo buffer: &amp; echo   batch_size: 4096 &amp; echo compression: &amp; echo   enabled: true &amp; echo tls: &amp; echo   enabled: false &amp; echo   cert_path: &quot;&quot;&quot;&quot; &amp; echo   key_path: &quot;&quot;&quot;&quot; &amp; echo change_stream: &amp; echo   retention_events: 1000000 &amp; echo auto_compact: &amp; echo   enabled: true &amp; echo   check_interval_secs: 60 &amp; echo   idle_threshold_secs: 30 &amp; echo   min_segments: 4 &amp; echo   min_deleted_rows: 100000 &amp; echo   max_tables_per_run: 1 &amp; echo log: &amp; echo   level: &quot;&quot;info&quot;&quot;) &gt; &quot;&quot;[SERVICECONFIG]&quot;&quot;&quot; />
+    <CustomAction Id="WriteWindowsConfig" Directory="ProgramDataTaibaiConfFolder" Execute="deferred" Impersonate="no" ExeCommand="cmd.exe /c &quot;if not exist &quot;&quot;[ProgramDataTaibaiConfFolder]&quot;&quot; mkdir &quot;&quot;[ProgramDataTaibaiConfFolder]&quot;&quot; &amp;&amp; (echo server: &amp; echo   host: &quot;&quot;0.0.0.0&quot;&quot; &amp; echo   port: 5151 &amp; echo   max_message_size: 67108864 &amp; echo storage: &amp; echo   data_dir: &quot;&quot;[DATADIR]&quot;&quot; &amp; echo   default_database: &quot;&quot;main&quot;&quot; &amp; echo   flush_threshold_rows: 65536 &amp; echo   min_segment_seal_size_mb: 500 &amp; echo buffer: &amp; echo   batch_size: 4096 &amp; echo compression: &amp; echo   enabled: true &amp; echo tls: &amp; echo   enabled: false &amp; echo   cert_path: &quot;&quot;&quot;&quot; &amp; echo   key_path: &quot;&quot;&quot;&quot; &amp; echo change_stream: &amp; echo   retention_events: 1000000 &amp; echo auto_compact: &amp; echo   enabled: true &amp; echo   check_interval_secs: 60 &amp; echo   idle_threshold_secs: 30 &amp; echo   min_segments: 4 &amp; echo   min_deleted_rows: 100000 &amp; echo   max_tables_per_run: 1 &amp; echo log: &amp; echo   level: &quot;&quot;info&quot;&quot;) &gt; &quot;&quot;[ProgramDataTaibaiConfFolder]windows.yaml&quot;&quot;&quot;" />
     <InstallExecuteSequence>
       <Custom Action="WriteWindowsConfig" Before="StartServices" Condition="NOT Installed" />
     </InstallExecuteSequence>
@@ -16,6 +15,7 @@
       <ComponentGroupRef Id="TaibaiFiles" />
     </Feature>
   </Package>
+
   <Fragment>
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Taibai">
@@ -29,19 +29,16 @@
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="ProgramDataTaibaiFolder" Name="Taibai">
         <Directory Id="ProgramDataTaibaiConfFolder" Name="conf" />
+        <Directory Id="DATADIR" Name="data" />
       </Directory>
     </StandardDirectory>
-    <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="DataRoot" Name="TaibaiDataRoot">
-        <Directory Id="DataDir" Name="TaibaiData" />
-      </Directory>
-    </Directory>
   </Fragment>
+
   <Fragment>
     <ComponentGroup Id="TaibaiFiles">
       <Component Id="TaibaiExeComponent" Directory="BinFolder" Guid="b306d025-b558-45fc-98f0-08e2a4d60f5a" Bitness="always64">
         <File Id="TaibaiExe" Source="target\release\taibai.exe" KeyPath="yes" />
-        <ServiceInstall Id="TaibaiServiceInstall" Type="ownProcess" Name="TaibaiDB" DisplayName="Taibai Database" Description="Taibai columnar database server" Start="auto" ErrorControl="normal" Arguments="--service --service-name TaibaiDB --config &quot;[SERVICECONFIG]&quot;" />
+        <ServiceInstall Id="TaibaiServiceInstall" Type="ownProcess" Name="TaibaiDB" DisplayName="Taibai Database" Description="Taibai columnar database server" Start="auto" ErrorControl="normal" Arguments="--service --service-name TaibaiDB --config &quot;[ProgramDataTaibaiConfFolder]windows.yaml&quot;" />
         <ServiceControl Id="TaibaiServiceControl" Name="TaibaiDB" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
       <Component Id="TaibaiConfigComponent" Directory="ConfFolder" Guid="6da63444-7ae6-4f08-acf1-7e5da29ec018" Bitness="always64">
@@ -63,7 +60,7 @@
           <Permission User="Users" GenericAll="yes" />
         </CreateFolder>
       </Component>
-      <Component Id="TaibaiDataDirComponent" Directory="DataDir" Guid="0b2108b4-4e46-4794-8fb2-e35609ce265f" Bitness="always64">
+      <Component Id="TaibaiDataDirComponent" Directory="DATADIR" Guid="0b2108b4-4e46-4794-8fb2-e35609ce265f" Bitness="always64">
         <CreateFolder>
           <Permission User="Users" GenericAll="yes" />
         </CreateFolder>

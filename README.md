@@ -212,6 +212,14 @@ make package
 sudo make install PREFIX=/usr/local/taibai
 ```
 
+Windows 平台生成 MSI 安装包：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\windows\build.ps1 -AcceptWixEula
+```
+
+生成的安装包位于 `target\release\Taibai-0.1.0.msi`。
+
 安装后的默认目录结构：
 
 ```text
