@@ -3,8 +3,8 @@ param(
     [string]$ServiceName = "TaibaiDB",
     [switch]$RemoveFiles,
     [switch]$RemoveData,
-    [string]$DataDir = "C:\ProgramData\Taibai\data",
-    [string]$ConfigDir = "C:\ProgramData\Taibai\conf"
+    [string]$DataDir = "",
+    [string]$ConfigDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +14,12 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 }
 
 $exe = Join-Path $InstallDir "bin\taibai.exe"
+if ([string]::IsNullOrWhiteSpace($DataDir)) {
+    $DataDir = Join-Path $InstallDir "data"
+}
+if ([string]::IsNullOrWhiteSpace($ConfigDir)) {
+    $ConfigDir = Join-Path $InstallDir "conf"
+}
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Stop-Service -Name $ServiceName -ErrorAction SilentlyContinue

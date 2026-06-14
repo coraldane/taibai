@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::net::tls::TlsMode;
 
@@ -26,6 +26,10 @@ fn default_flush_threshold_rows() -> u32 {
 
 fn default_min_segment_seal_size_mb() -> u32 {
     500
+}
+
+fn default_max_segment_size_mb() -> u32 {
+    2048
 }
 
 fn default_batch_size() -> usize {
@@ -97,6 +101,8 @@ pub struct StorageSettings {
     pub flush_threshold_rows: u32,
     #[serde(default = "default_min_segment_seal_size_mb")]
     pub min_segment_seal_size_mb: u32,
+    #[serde(default = "default_max_segment_size_mb")]
+    pub max_segment_size_mb: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +170,8 @@ impl Default for AutoCompactSettings {
 pub struct LogSettings {
     #[serde(default = "default_log_level")]
     pub level: String,
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -179,6 +187,7 @@ impl Default for ServerConfig {
                 default_database: "main".to_string(),
                 flush_threshold_rows: 65536,
                 min_segment_seal_size_mb: 500,
+                max_segment_size_mb: 2048,
             },
             buffer: BufferSettings { batch_size: 4096 },
             compression: CompressionSettings { enabled: true },
@@ -187,6 +196,7 @@ impl Default for ServerConfig {
             auto_compact: AutoCompactSettings::default(),
             log: LogSettings {
                 level: "info".to_string(),
+                file: None,
             },
         }
     }
@@ -201,10 +211,22 @@ impl ServerConfig {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
 
-        let config: ServerConfig = serde_yaml::from_str(&content)
+        let mut config: ServerConfig = serde_yaml::from_str(&content)
             .map_err(|e| format!("Failed to parse config file {}: {}", path.display(), e))?;
 
+        config.resolve_relative_paths(path);
         Ok(config)
+    }
+
+    fn resolve_relative_paths(&mut self, config_path: &Path) {
+        let Some(config_dir) = config_path.parent() else {
+            return;
+        };
+
+        self.storage.data_dir = resolve_config_relative(config_dir, &self.storage.data_dir);
+        if let Some(log_file) = self.log.file.as_mut() {
+            *log_file = resolve_config_relative(config_dir, log_file);
+        }
     }
 
     pub fn tls_mode(&self) -> TlsMode {
@@ -217,6 +239,33 @@ impl ServerConfig {
             TlsMode::Disable
         }
     }
+}
+
+fn resolve_config_relative(config_dir: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return value.to_string();
+    }
+
+    normalize_path(config_dir.join(path))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 #[derive(Parser, Debug)]
@@ -308,6 +357,15 @@ pub enum RunMode {
 }
 
 impl RunMode {
+    pub fn log_level(&self) -> &str {
+        match self {
+            RunMode::Server(config) | RunMode::Service { config, .. } => &config.log.level,
+            RunMode::InstallService { .. }
+            | RunMode::UninstallService { .. }
+            | RunMode::Client { .. } => "info",
+        }
+    }
+
     pub fn from_args() -> Self {
         let args = Args::parse();
 
@@ -391,5 +449,53 @@ impl RunMode {
         }
 
         RunMode::Server(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+
+    #[test]
+    fn config_relative_storage_and_log_paths_resolve_from_config_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let conf_dir = temp.path().join("conf");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        let config_path = conf_dir.join("windows.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 5151
+storage:
+  data_dir: "../data"
+  default_database: "main"
+buffer:
+  batch_size: 4096
+compression:
+  enabled: true
+tls:
+  enabled: false
+  cert_path: ""
+  key_path: ""
+log:
+  level: "info"
+  file: "../logs/taibai.log"
+"#,
+        )
+        .unwrap();
+
+        let config = ServerConfig::from_yaml_file(&config_path).unwrap();
+        let expected_data_dir = temp.path().join("data").to_string_lossy().to_string();
+        let expected_log_file = temp
+            .path()
+            .join("logs")
+            .join("taibai.log")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(config.storage.data_dir, expected_data_dir);
+        assert_eq!(config.log.file.as_deref(), Some(expected_log_file.as_str()));
     }
 }

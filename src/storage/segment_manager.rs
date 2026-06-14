@@ -495,6 +495,16 @@ impl SegmentManager {
         }
     }
 
+    pub fn has_active_segments(&self) -> bool {
+        let tables = self.tables.read().unwrap();
+        tables.values().any(|state| {
+            let active_guard = state.active_segments.lock().unwrap();
+            active_guard
+                .values()
+                .any(|seg| seg.total_rows > 0 || seg.buffered_rows > 0 || seg.dirty_meta)
+        })
+    }
+
     pub fn remove_wal(&self, table_dir: &Path) {
         let Ok(key) = self.table_state_key_from_dir(table_dir) else {
             return;

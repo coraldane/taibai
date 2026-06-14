@@ -1,7 +1,7 @@
 param(
     [string]$InstallDir = "C:\Program Files\Taibai",
-    [string]$DataDir = "C:\ProgramData\Taibai\data",
-    [string]$ConfigDir = "C:\ProgramData\Taibai\conf",
+    [string]$DataDir = "",
+    [string]$ConfigDir = "",
     [string]$ServiceName = "TaibaiDB",
     [string]$DisplayName = "Taibai Database",
     [int]$Port = 5151,
@@ -16,7 +16,14 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 
 $binDir = Join-Path $InstallDir "bin"
 $confDir = Join-Path $InstallDir "conf"
-$logDir = Join-Path $InstallDir "log"
+$dataDirDefault = Join-Path $InstallDir "data"
+$logDir = Join-Path $InstallDir "logs"
+if ([string]::IsNullOrWhiteSpace($DataDir)) {
+    $DataDir = $dataDirDefault
+}
+if ([string]::IsNullOrWhiteSpace($ConfigDir)) {
+    $ConfigDir = $confDir
+}
 $configPath = Join-Path $ConfigDir "windows.yaml"
 $targetExe = Join-Path $binDir "taibai.exe"
 $packagedExe = Join-Path $SourceDir "bin\taibai.exe"
@@ -67,6 +74,7 @@ auto_compact:
   max_tables_per_run: 1
 log:
   level: ""info""
+  file: ""$((Join-Path $logDir "taibai.log").Replace('\', '/'))""
 "@
 Set-Content -Path $configPath -Value $config -Encoding UTF8
 

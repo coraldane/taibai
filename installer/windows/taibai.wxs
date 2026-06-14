@@ -1,16 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-  <Package Name="Taibai Database" Manufacturer="Taibai" Version="0.1.0" UpgradeCode="9f9f2835-0a88-4e99-9d6b-ea3a9202291a" Scope="perMachine">
+  <Package Name="Taibai Database" Manufacturer="Taibai" Version="$(var.TaibaiVersion)" UpgradeCode="9f9f2835-0a88-4e99-9d6b-ea3a9202291a" Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Taibai is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-    <SetDirectory Id="DATADIR" Value="[CommonAppDataFolder]Taibai\data" Sequence="both" Condition="NOT DATADIR" />
+    <SetDirectory Id="DATADIR" Value="[INSTALLFOLDER]data" Sequence="both" Condition="NOT DATADIR" />
+    <SetDirectory Id="LOGDIR" Value="[INSTALLFOLDER]logs" Sequence="both" Condition="NOT LOGDIR" />
     <ui:WixUI Id="WixUI_InstallDir" />
-    <CustomAction Id="WriteWindowsConfig" Directory="ProgramDataTaibaiConfFolder" Execute="deferred" Impersonate="no" ExeCommand="cmd.exe /c &quot;if not exist &quot;&quot;[ProgramDataTaibaiConfFolder]&quot;&quot; mkdir &quot;&quot;[ProgramDataTaibaiConfFolder]&quot;&quot; &amp;&amp; (echo server: &amp; echo   host: &quot;&quot;0.0.0.0&quot;&quot; &amp; echo   port: 5151 &amp; echo   max_message_size: 67108864 &amp; echo storage: &amp; echo   data_dir: &quot;&quot;[DATADIR]&quot;&quot; &amp; echo   default_database: &quot;&quot;main&quot;&quot; &amp; echo   flush_threshold_rows: 65536 &amp; echo   min_segment_seal_size_mb: 500 &amp; echo buffer: &amp; echo   batch_size: 4096 &amp; echo compression: &amp; echo   enabled: true &amp; echo tls: &amp; echo   enabled: false &amp; echo   cert_path: &quot;&quot;&quot;&quot; &amp; echo   key_path: &quot;&quot;&quot;&quot; &amp; echo change_stream: &amp; echo   retention_events: 1000000 &amp; echo auto_compact: &amp; echo   enabled: true &amp; echo   check_interval_secs: 60 &amp; echo   idle_threshold_secs: 30 &amp; echo   min_segments: 4 &amp; echo   min_deleted_rows: 100000 &amp; echo   max_tables_per_run: 1 &amp; echo log: &amp; echo   level: &quot;&quot;info&quot;&quot;) &gt; &quot;&quot;[ProgramDataTaibaiConfFolder]windows.yaml&quot;&quot;&quot;" />
-    <InstallExecuteSequence>
-      <Custom Action="WriteWindowsConfig" Before="StartServices" Condition="NOT Installed" />
-    </InstallExecuteSequence>
     <Feature Id="Main" Title="Taibai Database" Level="1">
       <ComponentGroupRef Id="TaibaiFiles" />
     </Feature>
@@ -21,15 +18,11 @@
       <Directory Id="INSTALLFOLDER" Name="Taibai">
         <Directory Id="BinFolder" Name="bin" />
         <Directory Id="ConfFolder" Name="conf" />
+        <Directory Id="DATADIR" Name="data" />
+        <Directory Id="LOGDIR" Name="logs" />
         <Directory Id="ScriptsFolder" Name="scripts">
           <Directory Id="WindowsScriptsFolder" Name="windows" />
         </Directory>
-      </Directory>
-    </StandardDirectory>
-    <StandardDirectory Id="CommonAppDataFolder">
-      <Directory Id="ProgramDataTaibaiFolder" Name="Taibai">
-        <Directory Id="ProgramDataTaibaiConfFolder" Name="conf" />
-        <Directory Id="DATADIR" Name="data" />
       </Directory>
     </StandardDirectory>
   </Fragment>
@@ -38,7 +31,7 @@
     <ComponentGroup Id="TaibaiFiles">
       <Component Id="TaibaiExeComponent" Directory="BinFolder" Guid="b306d025-b558-45fc-98f0-08e2a4d60f5a" Bitness="always64">
         <File Id="TaibaiExe" Source="target\release\taibai.exe" KeyPath="yes" />
-        <ServiceInstall Id="TaibaiServiceInstall" Type="ownProcess" Name="TaibaiDB" DisplayName="Taibai Database" Description="Taibai columnar database server" Start="auto" ErrorControl="normal" Arguments="--service --service-name TaibaiDB --config &quot;[ProgramDataTaibaiConfFolder]windows.yaml&quot;" />
+        <ServiceInstall Id="TaibaiServiceInstall" Type="ownProcess" Name="TaibaiDB" DisplayName="Taibai Database" Description="Taibai columnar database server" Start="auto" ErrorControl="normal" Arguments="--service --service-name TaibaiDB --config &quot;[ConfFolder]windows.yaml&quot;" />
         <ServiceControl Id="TaibaiServiceControl" Name="TaibaiDB" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
       <Component Id="TaibaiConfigComponent" Directory="ConfFolder" Guid="6da63444-7ae6-4f08-acf1-7e5da29ec018" Bitness="always64">
@@ -50,17 +43,12 @@
       <Component Id="TaibaiUninstallScriptComponent" Directory="WindowsScriptsFolder" Guid="d7714b8f-08ea-4234-8432-3fe24395be19" Bitness="always64">
         <File Source="scripts\windows\uninstall.ps1" KeyPath="yes" />
       </Component>
-      <Component Id="TaibaiProgramDataComponent" Directory="ProgramDataTaibaiFolder" Guid="3f8771af-5f71-4ed5-a65b-2bf209539cf9" Bitness="always64">
-        <CreateFolder>
-          <Permission User="Users" GenericAll="yes" />
-        </CreateFolder>
-      </Component>
-      <Component Id="TaibaiProgramDataConfComponent" Directory="ProgramDataTaibaiConfFolder" Guid="78cd035f-47a0-4c4d-bf2e-06b1f7d6fbf6" Bitness="always64">
-        <CreateFolder>
-          <Permission User="Users" GenericAll="yes" />
-        </CreateFolder>
-      </Component>
       <Component Id="TaibaiDataDirComponent" Directory="DATADIR" Guid="0b2108b4-4e46-4794-8fb2-e35609ce265f" Bitness="always64">
+        <CreateFolder>
+          <Permission User="Users" GenericAll="yes" />
+        </CreateFolder>
+      </Component>
+      <Component Id="TaibaiLogDirComponent" Directory="LOGDIR" Guid="2c2c0e71-76f2-43b8-8a5a-51d8376aa858" Bitness="always64">
         <CreateFolder>
           <Permission User="Users" GenericAll="yes" />
         </CreateFolder>

@@ -17,7 +17,7 @@ use crate::storage::change_stream::{
 use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
 use crate::storage::core::memtable::MemTableManager;
 use crate::storage::index::index_manager::IndexManager;
-use crate::storage::segment_manager::SegmentManager;
+use crate::storage::segment_manager::{SegmentConfig, SegmentManager};
 
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
@@ -71,6 +71,20 @@ impl Engine {
         default_database: &str,
         change_stream_retention_events: usize,
     ) -> Result<Self> {
+        Self::new_with_storage_config(
+            data_dir,
+            default_database,
+            change_stream_retention_events,
+            SegmentConfig::default(),
+        )
+    }
+
+    pub fn new_with_storage_config(
+        data_dir: &Path,
+        default_database: &str,
+        change_stream_retention_events: usize,
+        segment_config: SegmentConfig,
+    ) -> Result<Self> {
         let mut catalogs = HashMap::new();
         let meta_dir = data_dir.join("meta");
 
@@ -121,7 +135,7 @@ impl Engine {
             catalogs.insert(default_database.to_string(), catalog);
         }
 
-        let segment_mgr = Arc::new(SegmentManager::new(data_dir)?);
+        let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
         let batch_writer = BatchWriter::new(BatchWriterConfig::default(), Arc::clone(&segment_mgr));
@@ -1124,6 +1138,10 @@ impl Engine {
         current_epoch_millis().saturating_sub(last) >= duration.as_millis() as u64
     }
 
+    pub fn has_active_segments(&self) -> bool {
+        self.segment_mgr.has_active_segments()
+    }
+
     pub fn alloc_txn_id(&self) -> u64 {
         self.segment_mgr.alloc_txn_id()
     }
@@ -1278,6 +1296,7 @@ impl Engine {
         disable_wal: bool,
         bulk_import_mode: bool,
     ) -> Result<u64> {
+        let _op_guard = self.begin_operation();
         let table_name = bulk_payload_table_name(payload)?.to_string();
         let catalogs = self.catalogs.read().unwrap();
         let catalog = catalogs

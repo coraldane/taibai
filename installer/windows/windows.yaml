@@ -3,7 +3,7 @@ server:
   port: 5151
   max_message_size: 67108864
 storage:
-  data_dir: "C:/ProgramData/Taibai/data"
+  data_dir: "../data"
   default_database: "main"
   flush_threshold_rows: 65536
   min_segment_seal_size_mb: 500
@@ -26,3 +26,4 @@ auto_compact:
   max_tables_per_run: 1
 log:
   level: "info"
+  file: "../logs/taibai.log"

@@ -11,23 +11,45 @@ use std::sync::Arc;
 use common::config::{RunMode, ServerConfig};
 use net::server::Server;
 use sql::execution::Engine;
+use storage::segment_manager::SegmentConfig;
 
-fn init_tracing() {
+fn init_tracing(level: &str) {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(env_filter(level))
         .try_init();
+}
+
+fn init_file_tracing(level: &str, log_file: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = log_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)?;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter(level))
+        .with_ansi(false)
+        .with_writer(file)
+        .try_init();
+    Ok(())
+}
+
+fn env_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level))
 }
 
 #[tokio::main]
 async fn main() {
-    init_tracing();
+    let run_mode = RunMode::from_args();
 
+    if !matches!(&run_mode, RunMode::Service { .. }) {
+        init_tracing(run_mode.log_level());
+    }
     tracing::info!("Taibai {}", version::get_full_version());
 
-    match RunMode::from_args() {
+    match run_mode {
         RunMode::Server(config) => run_server(config).await,
         RunMode::Service {
             service_name,
@@ -76,10 +98,11 @@ where
         std::process::exit(1);
     }
 
-    let engine = match Engine::new_with_change_stream_retention(
+    let engine = match Engine::new_with_storage_config(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
         config.change_stream.retention_events,
+        segment_config_from_server_config(&config),
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -108,6 +131,16 @@ where
     match engine.flush_all_buffers() {
         Ok(n) => tracing::info!(rows_flushed = n, "all active segments sealed"),
         Err(e) => tracing::error!(error = %e, "failed to flush segments on shutdown"),
+    }
+}
+
+fn segment_config_from_server_config(config: &ServerConfig) -> SegmentConfig {
+    let mb = 1024_u64 * 1024_u64;
+    let min_segment_size = config.storage.min_segment_seal_size_mb as u64 * mb;
+    let max_segment_size = (config.storage.max_segment_size_mb as u64 * mb).max(min_segment_size);
+    SegmentConfig {
+        min_segment_size,
+        max_segment_size,
     }
 }
 async fn run_client(
@@ -473,6 +506,8 @@ fn install_windows_service(service_name: &str, display_name: &str, config_path: 
         executable_path: exe_path,
         launch_arguments: vec![
             OsString::from("--service"),
+            OsString::from("--service-name"),
+            OsString::from(service_name),
             OsString::from("--config"),
             config_path.into_os_string(),
         ],
@@ -534,7 +569,20 @@ static SERVICE_STOP_TX: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(windows)]
-async fn run_windows_service(service_name: String, _config_path: String, _config: ServerConfig) {
+static SERVICE_CONTEXT: std::sync::OnceLock<ServiceContext> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+struct ServiceContext {
+    service_name: String,
+    config_path: String,
+}
+
+#[cfg(windows)]
+async fn run_windows_service(service_name: String, config_path: String, _config: ServerConfig) {
+    let _ = SERVICE_CONTEXT.set(ServiceContext {
+        service_name: service_name.clone(),
+        config_path,
+    });
     if let Err(e) = windows_service::service_dispatcher::start(service_name, ffi_service_main) {
         eprintln!("failed to start Windows service dispatcher: {}", e);
         std::process::exit(1);
@@ -564,10 +612,34 @@ fn run_windows_service_main(
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 
-    init_tracing();
-
     let config_path = parse_service_config_path(&arguments);
     let service_name = parse_service_name(&arguments);
+    let mut config_load_error = None;
+    let config = match ServerConfig::from_yaml_file(std::path::Path::new(&config_path)) {
+        Ok(config) => config,
+        Err(e) => {
+            config_load_error = Some(e);
+            default_service_config(&config_path)
+        }
+    };
+    let log_file = service_log_file(&config_path, &config);
+    if let Err(e) = init_file_tracing(&config.log.level, &log_file) {
+        eprintln!(
+            "failed to initialize Windows service log {}: {}",
+            log_file.display(),
+            e
+        );
+    }
+    if let Some(e) = config_load_error {
+        tracing::warn!("Config load error: {}, using service defaults", e);
+    }
+    tracing::info!(
+        service_name = %service_name,
+        config_path = %config_path,
+        log_file = %log_file.display(),
+        "starting Taibai Windows service"
+    );
+
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let stop_slot = SERVICE_STOP_TX.get_or_init(|| std::sync::Mutex::new(None));
     *stop_slot.lock().unwrap() = Some(stop_tx);
@@ -598,12 +670,6 @@ fn run_windows_service_main(
         wait_hint: Duration::from_secs(30),
         process_id: None,
     })?;
-
-    let config =
-        ServerConfig::from_yaml_file(std::path::Path::new(&config_path)).unwrap_or_else(|e| {
-            tracing::warn!("Config load error: {}, using defaults", e);
-            ServerConfig::default()
-        });
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -651,6 +717,11 @@ fn parse_service_config_path(arguments: &[std::ffi::OsString]) -> String {
         .find_map(|pair| {
             (pair[0].to_string_lossy() == "--config").then(|| pair[1].to_string_lossy().to_string())
         })
+        .or_else(|| {
+            SERVICE_CONTEXT
+                .get()
+                .map(|context| context.config_path.clone())
+        })
         .unwrap_or_else(|| "conf/windows.yaml".to_string())
 }
 
@@ -662,5 +733,45 @@ fn parse_service_name(arguments: &[std::ffi::OsString]) -> String {
             (pair[0].to_string_lossy() == "--service-name")
                 .then(|| pair[1].to_string_lossy().to_string())
         })
+        .or_else(|| {
+            SERVICE_CONTEXT
+                .get()
+                .map(|context| context.service_name.clone())
+        })
         .unwrap_or_else(|| "TaibaiDB".to_string())
+}
+
+#[cfg(windows)]
+fn default_service_config(config_path: &str) -> ServerConfig {
+    let mut config = ServerConfig::default();
+    if let Some(install_dir) = install_dir_from_config_path(config_path) {
+        config.storage.data_dir = install_dir.join("data").to_string_lossy().to_string();
+        config.log.file = Some(
+            install_dir
+                .join("logs")
+                .join("taibai.log")
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+    config
+}
+
+#[cfg(windows)]
+fn service_log_file(config_path: &str, config: &ServerConfig) -> std::path::PathBuf {
+    if let Some(log_file) = config.log.file.as_deref() {
+        return std::path::PathBuf::from(log_file);
+    }
+
+    install_dir_from_config_path(config_path)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("logs")
+        .join("taibai.log")
+}
+
+#[cfg(windows)]
+fn install_dir_from_config_path(config_path: &str) -> Option<std::path::PathBuf> {
+    let config_path = std::path::Path::new(config_path);
+    let config_dir = config_path.parent()?;
+    config_dir.parent().map(std::path::Path::to_path_buf)
 }

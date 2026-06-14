@@ -37,12 +37,19 @@ if (-not $uiExtensionInstalled) {
 
 Push-Location $root
 try {
+    $versionMatch = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if (-not $versionMatch) {
+        throw "Failed to read package version from Cargo.toml"
+    }
+    $version = $versionMatch.Matches[0].Groups[1].Value
+    $msiPath = "target\release\Taibai-$version.msi"
+
     cargo build --release
-    & $wixPath build -arch x64 -ext WixToolset.UI.wixext installer\windows\taibai.wxs -o target\release\Taibai-0.1.0.msi
+    & $wixPath build -arch x64 -d "TaibaiVersion=$version" -ext WixToolset.UI.wixext installer\windows\taibai.wxs -o $msiPath
     if ($LASTEXITCODE -ne 0) {
         throw "WiX build failed with exit code $LASTEXITCODE"
     }
-    Write-Host "MSI created: target\release\Taibai-0.1.0.msi"
+    Write-Host "MSI created: $msiPath"
 } finally {
     Pop-Location
 }

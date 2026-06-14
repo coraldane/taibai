@@ -66,6 +66,10 @@ pub fn run_auto_compact_once(engine: &Engine, config: &AutoCompactSettings) -> R
         tracing::debug!("auto compact skipped while bulk import mode is active");
         return Ok(0);
     }
+    if engine.has_active_segments() {
+        tracing::debug!("auto compact skipped because active segments are still being written");
+        return Ok(0);
+    }
     if !engine.is_idle_for(Duration::from_secs(config.idle_threshold_secs)) {
         tracing::debug!("auto compact skipped because server is not idle");
         return Ok(0);
@@ -88,6 +92,7 @@ pub fn run_auto_compact_once(engine: &Engine, config: &AutoCompactSettings) -> R
 
     for candidate in candidates.into_iter().take(max_tables) {
         if engine.is_bulk_mode()
+            || engine.has_active_segments()
             || !engine.is_idle_for(Duration::from_secs(config.idle_threshold_secs))
         {
             break;

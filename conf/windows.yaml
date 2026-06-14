@@ -13,6 +13,7 @@ storage:
   default_database: "main"
   flush_threshold_rows: 65536
   min_segment_seal_size_mb: 500  # Minimum segment size in MB before sealing
+  max_segment_size_mb: 2048  # Target maximum segment size in MB before rotating
 
 # Buffer settings
 buffer:
@@ -45,3 +46,4 @@ auto_compact:
 # Log settings
 log:
   level: "info"  # trace, debug, info, warn, error
+  file: "../logs/taibai.log"
