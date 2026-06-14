@@ -77,10 +77,6 @@ impl Server {
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
-        self.run_with_shutdown(std::future::pending::<()>()).await
-    }
-
     pub async fn run_with_shutdown<S>(&self, shutdown: S) -> Result<()>
     where
         S: std::future::Future<Output = ()>,
