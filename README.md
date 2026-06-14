@@ -199,7 +199,7 @@ log:
 - `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。
 - `docs/features/change-stream.md`：变更订阅功能说明。
 - `docs/operations/data-import-flow.md`：数据导入流程。
-- `docs/operations/examples-guide.md`：示例工具使用指南。
+- `docs/operations/windows-installation.md`：Windows 图形安装包和系统服务安装说明。
 - `docs/reports/performance-verification-report.md`：性能验证报告。
 
 完整文档目录见 `docs/README.md`。

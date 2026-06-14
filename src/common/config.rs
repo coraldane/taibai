@@ -245,6 +245,21 @@ struct Args {
 
     #[arg(long)]
     no_compression: bool,
+
+    #[arg(long)]
+    service: bool,
+
+    #[arg(long)]
+    install_service: bool,
+
+    #[arg(long)]
+    uninstall_service: bool,
+
+    #[arg(long, default_value = "TaibaiDB")]
+    service_name: String,
+
+    #[arg(long, default_value = "Taibai Database")]
+    service_display_name: String,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -270,6 +285,19 @@ enum Commands {
 #[derive(Debug, Clone)]
 pub enum RunMode {
     Server(ServerConfig),
+    Service {
+        service_name: String,
+        config_path: String,
+        config: ServerConfig,
+    },
+    InstallService {
+        service_name: String,
+        display_name: String,
+        config_path: String,
+    },
+    UninstallService {
+        service_name: String,
+    },
     Client {
         host: String,
         user: String,
@@ -299,6 +327,14 @@ impl RunMode {
                 query,
             };
         }
+
+        if args.uninstall_service {
+            return RunMode::UninstallService {
+                service_name: args.service_name,
+            };
+        }
+
+        let config_path = args.config.clone();
 
         let mut config = Path::new(&args.config)
             .exists()
@@ -336,6 +372,22 @@ impl RunMode {
 
         if args.no_compression {
             config.compression.enabled = false;
+        }
+
+        if args.install_service {
+            return RunMode::InstallService {
+                service_name: args.service_name,
+                display_name: args.service_display_name,
+                config_path,
+            };
+        }
+
+        if args.service {
+            return RunMode::Service {
+                service_name: args.service_name,
+                config_path,
+                config,
+            };
         }
 
         RunMode::Server(config)

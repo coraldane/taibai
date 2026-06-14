@@ -1,4 +1,5 @@
 use crate::common::error::Result;
+use crate::sql::execution::functions::registry::FunctionRegistry;
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::{AggregateExpr, LogicalExpr};
 use crate::types::batch::{RecordBatch, Schema};
@@ -35,7 +36,13 @@ pub fn remap_expr_for_batch(
         LogicalExpr::Column(idx) => logical_schema
             .columns
             .get(*idx)
-            .and_then(|col| batch_schema.index_of(&col.name))
+            .and_then(|col| {
+                if batch_schema.columns.get(*idx) == Some(col) {
+                    Some(*idx)
+                } else {
+                    batch_schema.index_of(&col.name)
+                }
+            })
             .map(LogicalExpr::Column)
             .unwrap_or_else(|| expr.clone()),
         LogicalExpr::BinaryOp { left, op, right } => LogicalExpr::BinaryOp {
@@ -386,6 +393,22 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
                     ScalarValue::Bool(Some(if *negated { !found } else { found }))
                 })
                 .collect())
+        }
+        LogicalExpr::Function { name, args } => {
+            let arg_columns = args
+                .iter()
+                .map(|arg| eval_expr_column(arg, batch))
+                .collect::<Result<Vec<_>>>()?;
+            let registry = FunctionRegistry::default();
+            let mut result = Vec::with_capacity(num_rows);
+            for row_idx in 0..num_rows {
+                let row_args = arg_columns
+                    .iter()
+                    .map(|values| values[row_idx].clone())
+                    .collect::<Vec<_>>();
+                result.push(registry.execute(name, &row_args)?);
+            }
+            Ok(result)
         }
         _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
     }

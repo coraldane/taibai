@@ -377,17 +377,98 @@ fn scalar_values_equal(a: &ScalarValue, b: &ScalarValue) -> bool {
     }
 }
 
-fn coerce_scalar_for_dtype(value: &ScalarValue, dtype: DataType) -> Result<ScalarValue> {
+pub fn coerce_scalar_for_dtype(value: &ScalarValue, dtype: DataType) -> Result<ScalarValue> {
     if value.is_null() {
         return Ok(ScalarValue::null_for_type(dtype));
     }
     match (dtype, value) {
+        (target, value) if target == value.data_type() => Ok(value.clone()),
+        (DataType::Bool, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Bool(Some(*v != 0))),
+        (DataType::Bool, ScalarValue::Int32(Some(v))) => Ok(ScalarValue::Bool(Some(*v != 0))),
+        (DataType::Bool, ScalarValue::VarChar(Some(v))) => match v.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(ScalarValue::Bool(Some(true))),
+            "false" | "0" | "no" => Ok(ScalarValue::Bool(Some(false))),
+            _ => Err(TaibaiError::Sql(format!("invalid bool '{}'", v))),
+        },
+        (DataType::Int64, value) => value
+            .integer_i128()
+            .and_then(|v| i64::try_from(v).ok())
+            .map(|v| ScalarValue::Int64(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to INT64", value))),
         (DataType::Int32, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int32(Some(
             i32::try_from(*v)
                 .map_err(|_| TaibaiError::Sql(format!("value '{}' overflows INT32", v)))?,
         ))),
-        (DataType::Int64, ScalarValue::Int32(Some(v))) => Ok(ScalarValue::Int64(Some(*v as i64))),
+        (DataType::Int32, value) => value
+            .integer_i128()
+            .and_then(|v| i32::try_from(v).ok())
+            .map(|v| ScalarValue::Int32(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to INT32", value))),
+        (DataType::Int16, value) => value
+            .integer_i128()
+            .and_then(|v| i16::try_from(v).ok())
+            .map(|v| ScalarValue::Int16(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to INT16", value))),
+        (DataType::Int8, value) => value
+            .integer_i128()
+            .and_then(|v| i8::try_from(v).ok())
+            .map(|v| ScalarValue::Int8(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to INT8", value))),
+        (DataType::UInt64, value) => value
+            .integer_i128()
+            .and_then(|v| u64::try_from(v).ok())
+            .map(|v| ScalarValue::UInt64(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to UINT64", value))),
+        (DataType::UInt32, value) => value
+            .integer_i128()
+            .and_then(|v| u32::try_from(v).ok())
+            .map(|v| ScalarValue::UInt32(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to UINT32", value))),
+        (DataType::UInt16, value) => value
+            .integer_i128()
+            .and_then(|v| u16::try_from(v).ok())
+            .map(|v| ScalarValue::UInt16(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to UINT16", value))),
+        (DataType::UInt8, value) => value
+            .integer_i128()
+            .and_then(|v| u8::try_from(v).ok())
+            .map(|v| ScalarValue::UInt8(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to UINT8", value))),
+        (DataType::Float64, value) => value
+            .numeric_f64()
+            .map(|v| ScalarValue::Float64(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to FLOAT64", value))),
+        (DataType::Float32, value) => value
+            .numeric_f64()
+            .map(|v| ScalarValue::Float32(Some(v as f32)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to FLOAT32", value))),
+        (DataType::VarChar, value) => value
+            .to_text()
+            .map(|v| ScalarValue::VarChar(Some(v)))
+            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to VARCHAR", value))),
         _ => Ok(value.clone()),
+    }
+}
+
+pub fn eval_constant_expr(expr: &Expr) -> Result<ScalarValue> {
+    match expr {
+        Expr::Literal(v) => Ok(v.clone()),
+        Expr::UnaryMinus(inner) => match eval_constant_expr(inner)? {
+            ScalarValue::Int64(Some(v)) => Ok(ScalarValue::Int64(Some(-v))),
+            ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(-v))),
+            ScalarValue::Float64(Some(v)) => Ok(ScalarValue::Float64(Some(-v))),
+            ScalarValue::Float32(Some(v)) => Ok(ScalarValue::Float32(Some(-v))),
+            _ => Ok(ScalarValue::Int64(None)),
+        },
+        Expr::Function { name, args, .. } => {
+            let arg_values = args
+                .iter()
+                .map(eval_constant_expr)
+                .collect::<Result<Vec<_>>>()?;
+            crate::sql::execution::functions::registry::FunctionRegistry::default()
+                .execute(name, &arg_values)
+        }
+        _ => Ok(ScalarValue::Int64(None)),
     }
 }
 
@@ -410,6 +491,10 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
     timezone_offset_hours: i32,
 ) -> Result<ScalarValue> {
     match expr {
+        Expr::Function { .. } => {
+            let value = eval_constant_expr(expr)?;
+            coerce_scalar_for_dtype(&value, *dt)
+        }
         Expr::Literal(v) if v.is_null() => Ok(ScalarValue::null_for_type(*dt)),
         Expr::Literal(v) => match (dt, v) {
             (target, value) if *target == value.data_type() => Ok(value.clone()),

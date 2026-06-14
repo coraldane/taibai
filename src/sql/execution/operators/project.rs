@@ -1,5 +1,6 @@
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
+use crate::sql::execution::helpers::coerce_scalar_for_dtype;
 use crate::sql::execution::operators::filter::{eval_expr_column, remap_expr_for_batch};
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::LogicalExpr;
@@ -39,7 +40,8 @@ impl ExecutionOp for ProjectExec {
 
                     let mut col = ColumnArray::empty(dt);
                     for v in &vals {
-                        col.push(v)?;
+                        let coerced = coerce_scalar_for_dtype(v, dt)?;
+                        col.push(&coerced)?;
                     }
                     columns.push(col);
                     col_defs.push(project_column_def(
@@ -144,6 +146,13 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
                 })
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Int64)
+        }
+        LogicalExpr::Function { name, args } => {
+            let arg_types = args
+                .iter()
+                .map(|arg| infer_type(arg, schema))
+                .collect::<Vec<_>>();
+            crate::sql::planner::expr::infer_scalar_function_type(name, &arg_types)
         }
         _ => DataType::Int64,
     }

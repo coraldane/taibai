@@ -31,6 +31,10 @@ pub enum BoundExprKind {
         arg: Box<BoundExpr>,
         distinct: bool,
     },
+    Function {
+        name: String,
+        args: Vec<BoundExpr>,
+    },
     In {
         expr: Box<BoundExpr>,
         values: Vec<BoundExpr>,
@@ -147,36 +151,68 @@ impl<'a> ExpressionBinder<'a> {
                 distinct,
             } => {
                 let func_name = name.to_uppercase();
-                let func = match func_name.as_str() {
-                    "COUNT" => crate::sql::planner::AggFunc::Count,
-                    "SUM" => crate::sql::planner::AggFunc::Sum,
-                    "AVG" => crate::sql::planner::AggFunc::Avg,
-                    "MIN" => crate::sql::planner::AggFunc::Min,
-                    "MAX" => crate::sql::planner::AggFunc::Max,
-                    other => return Err(TaibaiError::Sql(format!("unknown function '{}'", other))),
-                };
-                let arg = if args.is_empty()
-                    || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
-                {
-                    BoundExpr {
-                        kind: BoundExprKind::Wildcard,
-                        data_type: DataType::Int64,
+                match func_name.as_str() {
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                        let func = match func_name.as_str() {
+                            "COUNT" => crate::sql::planner::AggFunc::Count,
+                            "SUM" => crate::sql::planner::AggFunc::Sum,
+                            "AVG" => crate::sql::planner::AggFunc::Avg,
+                            "MIN" => crate::sql::planner::AggFunc::Min,
+                            "MAX" => crate::sql::planner::AggFunc::Max,
+                            _ => unreachable!(),
+                        };
+                        let arg = if args.is_empty()
+                            || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
+                        {
+                            BoundExpr {
+                                kind: BoundExprKind::Wildcard,
+                                data_type: DataType::Int64,
+                            }
+                        } else {
+                            self.bind(&args[0])?
+                        };
+                        let dt = match func {
+                            crate::sql::planner::AggFunc::Count => DataType::Int64,
+                            _ => DataType::Float64,
+                        };
+                        Ok(BoundExpr {
+                            kind: BoundExprKind::Aggregate {
+                                func,
+                                arg: Box::new(arg),
+                                distinct: *distinct,
+                            },
+                            data_type: dt,
+                        })
                     }
-                } else {
-                    self.bind(&args[0])?
-                };
-                let dt = match func {
-                    crate::sql::planner::AggFunc::Count => DataType::Int64,
-                    _ => DataType::Float64,
-                };
-                Ok(BoundExpr {
-                    kind: BoundExprKind::Aggregate {
-                        func,
-                        arg: Box::new(arg),
-                        distinct: *distinct,
-                    },
-                    data_type: dt,
-                })
+                    _ => {
+                        if *distinct {
+                            return Err(TaibaiError::Sql(format!(
+                                "DISTINCT is not supported for scalar function '{}'",
+                                name
+                            )));
+                        }
+                        if !crate::sql::planner::expr::scalar_function_exists(name) {
+                            return Err(TaibaiError::Sql(format!("unknown function '{}'", name)));
+                        }
+                        let bound_args = args
+                            .iter()
+                            .map(|arg| self.bind(arg))
+                            .collect::<Result<Vec<_>>>()?;
+                        let arg_types = bound_args
+                            .iter()
+                            .map(|arg| arg.data_type)
+                            .collect::<Vec<_>>();
+                        let dt =
+                            crate::sql::planner::expr::infer_scalar_function_type(name, &arg_types);
+                        Ok(BoundExpr {
+                            kind: BoundExprKind::Function {
+                                name: name.clone(),
+                                args: bound_args,
+                            },
+                            data_type: dt,
+                        })
+                    }
+                }
             }
             // Handle new expression types with default binding
             Expr::UnaryMinus(inner) => {

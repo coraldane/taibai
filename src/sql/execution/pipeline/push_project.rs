@@ -1,4 +1,5 @@
 use crate::common::error::Result;
+use crate::sql::execution::helpers::coerce_scalar_for_dtype;
 use crate::sql::execution::operators::filter::eval_expr_column;
 use crate::sql::execution::operators::project::{infer_type, project_column_def};
 use crate::sql::planner::LogicalExpr;
@@ -35,7 +36,8 @@ impl PushOp for PushProject {
             let dt = infer_type(expr, &batch.schema);
             let mut col = ColumnArray::empty(dt);
             for v in &vals {
-                col.push(v)?;
+                let coerced = coerce_scalar_for_dtype(v, dt)?;
+                col.push(&coerced)?;
             }
             columns.push(col);
             col_defs.push(project_column_def(
