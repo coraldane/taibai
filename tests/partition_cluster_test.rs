@@ -108,6 +108,25 @@ fn write_two_i32_segment(path: &Path, schema: &Schema, rows: &[(i32, i32)]) {
 }
 
 #[test]
+fn auto_compact_can_be_stopped_and_started_by_sql() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    assert!(engine.auto_compact_enabled());
+    engine
+        .execute(&mut session, "STOP AUTO COMPACT")
+        .expect("stop auto compact");
+    assert!(!engine.auto_compact_enabled());
+    engine
+        .execute(&mut session, "START AUTO COMPACT")
+        .expect("start auto compact");
+    assert!(engine.auto_compact_enabled());
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
 fn bulk_import_honors_year_partition_on_int32_yyyymmdd() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");

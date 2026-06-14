@@ -113,11 +113,12 @@ where
 
     let config = Arc::new(config);
     let engine = Arc::new(engine);
+    engine.set_auto_compact_enabled(config.auto_compact.enabled);
     let _ = rayon::ThreadPoolBuilder::new().build_global();
-    let mut auto_compactor = storage::core::auto_compact::AutoCompactorHandle::start(
+    let mut auto_compactor = Some(storage::core::auto_compact::AutoCompactorHandle::start(
         engine.clone(),
         config.auto_compact.clone(),
-    );
+    ));
     let server = Server::new(config, engine.clone());
 
     if let Err(e) = server.run_with_shutdown(shutdown).await {

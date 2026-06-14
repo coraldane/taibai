@@ -16,12 +16,7 @@ pub struct AutoCompactorHandle {
 }
 
 impl AutoCompactorHandle {
-    pub fn start(engine: Arc<Engine>, config: AutoCompactSettings) -> Option<Self> {
-        if !config.enabled {
-            tracing::info!("auto compact disabled");
-            return None;
-        }
-
+    pub fn start(engine: Arc<Engine>, config: AutoCompactSettings) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
@@ -29,10 +24,10 @@ impl AutoCompactorHandle {
             .spawn(move || run_loop(engine, config, thread_stop))
             .expect("failed to spawn auto compact thread");
 
-        Some(Self {
+        Self {
             stop,
             handle: Some(handle),
-        })
+        }
     }
 
     pub fn stop(&mut self) {
@@ -59,7 +54,8 @@ struct AutoCompactCandidate {
 }
 
 pub fn run_auto_compact_once(engine: &Engine, config: &AutoCompactSettings) -> Result<usize> {
-    if !config.enabled {
+    if !engine.auto_compact_enabled() {
+        tracing::debug!("auto compact skipped because runtime flag is disabled");
         return Ok(0);
     }
     if engine.is_bulk_mode() {
@@ -110,7 +106,11 @@ pub fn run_auto_compact_once(engine: &Engine, config: &AutoCompactSettings) -> R
             continue;
         }
 
-        match compactor.optimize_table(&candidate.db, &candidate.table, &candidate.table_meta) {
+        match compactor.optimize_one_partition(
+            &candidate.db,
+            &candidate.table,
+            &candidate.table_meta,
+        ) {
             Ok(stats) => {
                 if compact_succeeded(stats) {
                     engine
@@ -120,6 +120,7 @@ pub fn run_auto_compact_once(engine: &Engine, config: &AutoCompactSettings) -> R
                     tracing::info!(
                         db = %candidate.db,
                         table = %candidate.table,
+                        table_full_name = %format!("{}.{}", candidate.db, candidate.table),
                         segments = candidate.segment_count,
                         deleted_rows = candidate.deleted_rows,
                         rows_written = stats.rows_written,
@@ -132,6 +133,7 @@ pub fn run_auto_compact_once(engine: &Engine, config: &AutoCompactSettings) -> R
                 tracing::warn!(
                     db = %candidate.db,
                     table = %candidate.table,
+                    table_full_name = %format!("{}.{}", candidate.db, candidate.table),
                     error = %err,
                     "auto compact failed"
                 );
@@ -144,6 +146,7 @@ pub fn run_auto_compact_once(engine: &Engine, config: &AutoCompactSettings) -> R
 
 fn run_loop(engine: Arc<Engine>, config: AutoCompactSettings, stop: Arc<AtomicBool>) {
     tracing::info!(
+        enabled = config.enabled,
         check_interval_secs = config.check_interval_secs,
         idle_threshold_secs = config.idle_threshold_secs,
         min_segments = config.min_segments,

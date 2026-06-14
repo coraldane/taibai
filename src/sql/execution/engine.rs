@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,7 @@ pub struct Engine {
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
     bulk_mode_sessions: AtomicUsize,
+    auto_compact_enabled: AtomicBool,
     in_flight_operations: AtomicUsize,
     last_activity_epoch_ms: AtomicU64,
     auth_manager: Arc<AuthManager>,
@@ -193,6 +194,7 @@ impl Engine {
             segment_mgr,
             batch_writer,
             bulk_mode_sessions: AtomicUsize::new(0),
+            auto_compact_enabled: AtomicBool::new(true),
             in_flight_operations: AtomicUsize::new(0),
             last_activity_epoch_ms: AtomicU64::new(current_epoch_millis()),
             auth_manager,
@@ -667,11 +669,20 @@ impl Engine {
                 ),
                 None => super::ddl::exec_flush_table(self, &session.database, &None),
             },
-            Statement::OptimizeTable { table } => super::ddl::exec_optimize_table(
+            Statement::OptimizeTable { table, partition } => super::ddl::exec_optimize_table(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
+                partition.as_deref(),
             ),
+            Statement::StartAutoCompact => {
+                self.set_auto_compact_enabled(true);
+                Ok(ExecResult::Ok { rows_affected: 0 })
+            }
+            Statement::StopAutoCompact => {
+                self.set_auto_compact_enabled(false);
+                Ok(ExecResult::Ok { rows_affected: 0 })
+            }
             Statement::PauseFlush => {
                 self.segment_mgr().pause_flush();
                 Ok(ExecResult::Ok { rows_affected: 0 })
@@ -812,7 +823,7 @@ impl Engine {
                     )
                 }
             }
-            Statement::OptimizeTable { table } => self.require_table_permission(
+            Statement::OptimizeTable { table, .. } => self.require_table_permission(
                 session,
                 PermissionType::Alter,
                 table.effective_database(&session.database),
@@ -842,6 +853,8 @@ impl Engine {
             | Statement::ShowChangeEvents { .. }
             | Statement::ResetChangeConsumer { .. }
             | Statement::DropChangeConsumer { .. }
+            | Statement::StartAutoCompact
+            | Statement::StopAutoCompact
             | Statement::PauseFlush
             | Statement::ResumeFlush => self.require_global_admin(session),
         }
@@ -1117,6 +1130,15 @@ impl Engine {
 
     pub fn bulk_mode_session_count(&self) -> usize {
         self.bulk_mode_sessions.load(Ordering::Acquire)
+    }
+
+    pub fn set_auto_compact_enabled(&self, enabled: bool) {
+        self.auto_compact_enabled.store(enabled, Ordering::Release);
+        tracing::info!(enabled, "auto compact runtime flag updated");
+    }
+
+    pub fn auto_compact_enabled(&self) -> bool {
+        self.auto_compact_enabled.load(Ordering::Acquire)
     }
 
     fn begin_operation(&self) -> EngineOperationGuard<'_> {

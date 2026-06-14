@@ -242,7 +242,10 @@ pub enum Statement {
     },
     OptimizeTable {
         table: ObjectName,
+        partition: Option<String>,
     },
+    StartAutoCompact,
+    StopAutoCompact,
     PauseFlush,
     ResumeFlush,
 }

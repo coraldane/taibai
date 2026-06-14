@@ -74,6 +74,7 @@ impl SegmentManager {
                                 continue;
                             }
                             let tbl_dir = tbl_entry.path();
+                            cleanup_incomplete_compaction_files(&tbl_dir);
                             let max_seq = discover_max_seq(&tbl_dir);
                             let key = table_key(&db_name, &tbl_entry.file_name().to_string_lossy());
                             tables.insert(key, Arc::new(TableSegmentState::new(max_seq)));
@@ -1236,4 +1237,35 @@ impl SegmentManager {
         }
         Ok(())
     }
+}
+
+fn cleanup_incomplete_compaction_files(table_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(table_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_incomplete_compaction_file(name) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                "removed incomplete compact temporary file during startup"
+            ),
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to remove incomplete compact temporary file during startup"
+            ),
+        }
+    }
+}
+
+fn is_incomplete_compaction_file(name: &str) -> bool {
+    name.ends_with(".compact_tmp") || name.ends_with(".meta.compact.tmp")
 }

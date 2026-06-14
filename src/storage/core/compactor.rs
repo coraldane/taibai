@@ -97,6 +97,8 @@ impl Compactor {
 
             for (partition_key, files) in group_segments_by_partition(segment_files) {
                 let part_stats = self.compact_segment_group(
+                    db,
+                    table,
                     &table_dir,
                     partition_key.as_deref(),
                     &files,
@@ -125,8 +127,185 @@ impl Compactor {
         Ok(stats)
     }
 
+    pub fn optimize_one_partition(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &TableMeta,
+    ) -> Result<CompactStats> {
+        let start_time = Instant::now();
+        let table_dir = self.data_dir.join(db).join(table);
+
+        if !table_dir.exists() {
+            tracing::info!(db, table, table_full_name = %format!("{}.{}", db, table), "table directory does not exist, skipping");
+            return Ok(CompactStats::default());
+        }
+
+        let schema = Schema::new(table_meta.columns.clone());
+        let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
+        let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+            let segment_files = self
+                .segment_mgr
+                .discover_inactive_segments(db, table, &table_dir)?;
+            if segment_files.is_empty() {
+                return Ok(CompactStats::default());
+            }
+
+            let mut groups = group_segments_by_partition(segment_files)
+                .into_iter()
+                .filter(|(_, files)| files.len() >= 2)
+                .collect::<Vec<_>>();
+            groups.sort_by(|left, right| right.1.len().cmp(&left.1.len()));
+
+            let Some((partition_key, files)) = groups.into_iter().next() else {
+                return Ok(CompactStats::default());
+            };
+
+            tracing::info!(
+                db,
+                table,
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key = partition_key.as_deref().unwrap_or("<unpartitioned>"),
+                cluster_key = ?table_meta.cluster_key,
+                segments = files.len(),
+                "starting one-partition table optimization"
+            );
+
+            self.compact_segment_group(
+                db,
+                table,
+                &table_dir,
+                partition_key.as_deref(),
+                &files,
+                &schema,
+                &cluster_key_indices,
+            )
+        })?;
+
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            rows_written = stats.rows_written,
+            rows_dropped = stats.rows_dropped,
+            segments_read = stats.segments_read,
+            segments_written = stats.segments_written,
+            elapsed_ms = start_time.elapsed().as_millis(),
+            "one-partition optimization completed"
+        );
+
+        Ok(stats)
+    }
+
+    pub fn optimize_partition(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &TableMeta,
+        partition_key: &str,
+    ) -> Result<CompactStats> {
+        if !table_meta.is_partitioned() {
+            return Err(TaibaiError::Sql(format!(
+                "table '{}.{}' is not partitioned",
+                db, table
+            )));
+        }
+
+        let start_time = Instant::now();
+        let table_dir = self.data_dir.join(db).join(table);
+        let candidates = partition_key_candidates(partition_key);
+
+        if !table_dir.exists() {
+            tracing::info!(
+                db,
+                table,
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key,
+                "table directory does not exist, skipping partition optimization"
+            );
+            return Ok(CompactStats::default());
+        }
+
+        let schema = Schema::new(table_meta.columns.clone());
+        let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
+        let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+            let segment_files = self
+                .segment_mgr
+                .discover_inactive_segments(db, table, &table_dir)?;
+            let mut groups = group_segments_by_partition(segment_files);
+            let matched_key = candidates
+                .iter()
+                .find(|candidate| groups.contains_key(&Some((*candidate).clone())))
+                .cloned();
+
+            let Some(matched_key) = matched_key else {
+                let available = groups
+                    .keys()
+                    .filter_map(|key| key.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(TaibaiError::Sql(format!(
+                    "partition '{}' not found for table '{}.{}'{}",
+                    partition_key,
+                    db,
+                    table,
+                    if available.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; available partitions: {}", available)
+                    }
+                )));
+            };
+
+            let files = groups
+                .remove(&Some(matched_key.clone()))
+                .unwrap_or_default();
+            if files.is_empty() {
+                return Ok(CompactStats::default());
+            }
+
+            tracing::info!(
+                db,
+                table,
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key = %matched_key,
+                requested_partition = partition_key,
+                cluster_key = ?table_meta.cluster_key,
+                segments = files.len(),
+                "starting requested partition optimization"
+            );
+
+            self.compact_segment_group(
+                db,
+                table,
+                &table_dir,
+                Some(&matched_key),
+                &files,
+                &schema,
+                &cluster_key_indices,
+            )
+        })?;
+
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            requested_partition = partition_key,
+            rows_written = stats.rows_written,
+            rows_dropped = stats.rows_dropped,
+            segments_read = stats.segments_read,
+            segments_written = stats.segments_written,
+            elapsed_ms = start_time.elapsed().as_millis(),
+            "requested partition optimization completed"
+        );
+
+        Ok(stats)
+    }
+
     fn compact_segment_group(
         &self,
+        db: &str,
+        table: &str,
         table_dir: &Path,
         partition_key: Option<&str>,
         segment_files: &[PathBuf],
@@ -138,6 +317,16 @@ impl Compactor {
         let mut row_refs = Vec::new();
         let mut ordinal = 0u64;
         let mut deleted_rows = 0u64;
+        let partition_label = partition_key.unwrap_or("<unpartitioned>");
+
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key = partition_label,
+            segments = segment_files.len(),
+            "compact partition started"
+        );
 
         for seg_path in segment_files {
             let reader = self.segment_mgr.open_reader(seg_path)?;
@@ -177,6 +366,15 @@ impl Compactor {
             for old_seg in segment_files {
                 self.segment_mgr.remove_segment_file(old_seg)?;
             }
+            tracing::info!(
+                db,
+                table,
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key = partition_label,
+                segments_read = segment_files.len(),
+                rows_dropped = deleted_rows,
+                "compact partition removed empty/deleted segments"
+            );
             return Ok(CompactStats {
                 segments_read: segment_files.len(),
                 rows_dropped: deleted_rows,
@@ -191,6 +389,18 @@ impl Compactor {
             .next_replacement_segment_path(table_dir, partition_key)?;
         let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
 
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key = partition_label,
+            source_row_groups = source_row_groups.len(),
+            rows_to_write = row_refs.len(),
+            tmp_path = %tmp_path.display(),
+            final_path = %final_path.display(),
+            "compact partition writing replacement segment"
+        );
+
         let write_result = self.write_sorted_segment(
             &tmp_path,
             schema,
@@ -201,11 +411,32 @@ impl Compactor {
         );
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
+            tracing::warn!(
+                db,
+                table,
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key = partition_label,
+                tmp_path = %tmp_path.display(),
+                error = %err,
+                "compact partition write failed"
+            );
             return Err(err);
         }
 
         self.segment_mgr
             .replace_segments_with_tmp(&tmp_path, &final_path, segment_files)?;
+
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key = partition_label,
+            final_path = %final_path.display(),
+            segments_read = segment_files.len(),
+            rows_written = row_refs.len(),
+            rows_dropped = deleted_rows,
+            "compact partition completed"
+        );
 
         Ok(CompactStats {
             segments_read: segment_files.len(),
@@ -820,10 +1051,23 @@ fn group_segments_by_partition(
     groups
 }
 
+fn partition_key_candidates(raw: &str) -> Vec<String> {
+    let key = raw.trim();
+    let mut candidates = vec![key.to_string()];
+    if key.len() > 1
+        && key.as_bytes()[0].eq_ignore_ascii_case(&b'p')
+        && key[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        candidates.push(key[1..].to_string());
+    }
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::types::DataType;
+    use crate::storage::catalog::schema::PartitionType;
     use crate::storage::segment::SegmentReader;
     use crate::types::batch::ColumnDef;
 
@@ -839,6 +1083,14 @@ mod tests {
     fn test_meta(schema: &Schema) -> TableMeta {
         let mut meta = TableMeta::new("default", "t", schema.columns.clone());
         meta.cluster_key = vec!["id".to_string()];
+        meta
+    }
+
+    fn partitioned_test_meta(schema: &Schema) -> TableMeta {
+        let mut meta = test_meta(schema);
+        meta.partition_type = PartitionType::Year;
+        meta.partition_key = "id".to_string();
+        meta.update_partition_key_idx();
         meta
     }
 
@@ -971,6 +1223,63 @@ mod tests {
         let segments = SegmentManager::discover_segments(&table_dir)?;
         assert_eq!(segments.len(), 1);
         assert_eq!(read_ids(&segments[0])?, vec![3, 1, 4, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn optimize_partition_only_rewrites_requested_partition() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("default").join("t");
+        std::fs::create_dir_all(&table_dir)?;
+
+        let schema = test_schema();
+        write_segment(
+            &table_dir.join("p2024_0001.dat"),
+            &schema,
+            &[(3, "c"), (1, "a")],
+        )?;
+        write_segment(
+            &table_dir.join("p2024_0002.dat"),
+            &schema,
+            &[(4, "d"), (2, "b")],
+        )?;
+        write_segment(&table_dir.join("p2025_0001.dat"), &schema, &[(30, "z")])?;
+        write_segment(&table_dir.join("p2025_0002.dat"), &schema, &[(20, "y")])?;
+
+        let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+        let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
+        let stats = compactor.optimize_partition(
+            "default",
+            "t",
+            &partitioned_test_meta(&schema),
+            "P2024",
+        )?;
+
+        assert_eq!(stats.segments_read, 2);
+        assert_eq!(stats.segments_written, 1);
+        assert_eq!(stats.rows_written, 4);
+
+        let mut files = SegmentManager::discover_segments(&table_dir)?
+            .into_iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+
+        assert_eq!(
+            files,
+            vec![
+                "p2024_0003.dat".to_string(),
+                "p2025_0001.dat".to_string(),
+                "p2025_0002.dat".to_string(),
+            ]
+        );
+        assert_eq!(
+            read_ids(&table_dir.join("p2024_0003.dat"))?,
+            vec![1, 2, 3, 4]
+        );
         Ok(())
     }
 }

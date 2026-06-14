@@ -188,7 +188,14 @@ impl Parser {
         self.expect(&Token::Optimize)?;
         self.expect(&Token::Table)?;
         let table = self.parse_object_name()?;
-        Ok(Statement::OptimizeTable { table })
+        let partition = if self.peek() == &Token::On {
+            self.advance();
+            self.expect(&Token::Partition)?;
+            Some(self.expect_ident_or_string()?)
+        } else {
+            None
+        };
+        Ok(Statement::OptimizeTable { table, partition })
     }
 
     pub fn parse_pause(&mut self) -> Result<Statement> {
@@ -199,6 +206,42 @@ impl Parser {
     pub fn parse_resume(&mut self) -> Result<Statement> {
         self.expect(&Token::Resume)?;
         Ok(Statement::ResumeFlush)
+    }
+
+    pub fn parse_start(&mut self) -> Result<Statement> {
+        let start = self.expect_ident()?;
+        if !start.eq_ignore_ascii_case("START") {
+            return Err(TaibaiError::Sql(format!("expected START, got {}", start)));
+        }
+        self.expect_auto_compact_phrase()?;
+        Ok(Statement::StartAutoCompact)
+    }
+
+    pub fn parse_stop(&mut self) -> Result<Statement> {
+        let stop = self.expect_ident()?;
+        if !stop.eq_ignore_ascii_case("STOP") {
+            return Err(TaibaiError::Sql(format!("expected STOP, got {}", stop)));
+        }
+        self.expect_auto_compact_phrase()?;
+        Ok(Statement::StopAutoCompact)
+    }
+
+    fn expect_auto_compact_phrase(&mut self) -> Result<()> {
+        let auto = self.expect_ident()?;
+        if !auto.eq_ignore_ascii_case("AUTO") {
+            return Err(TaibaiError::Sql(format!(
+                "expected AUTO after START/STOP, got {}",
+                auto
+            )));
+        }
+        let compact = self.expect_ident()?;
+        if !compact.eq_ignore_ascii_case("COMPACT") {
+            return Err(TaibaiError::Sql(format!(
+                "expected COMPACT after AUTO, got {}",
+                compact
+            )));
+        }
+        Ok(())
     }
 
     pub fn parse_explain(&mut self) -> Result<Statement> {

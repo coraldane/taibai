@@ -34,3 +34,22 @@ fn segment_sequence_is_restored_per_table_from_table_dirs() {
         "seg_00009.dat"
     );
 }
+
+#[test]
+fn startup_removes_incomplete_compact_temp_files() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let table_dir = temp_dir.path().join("main").join("ticks");
+    std::fs::create_dir_all(&table_dir).expect("create table dir");
+    let segment = table_dir.join("p2024_0001.dat");
+    let compact_tmp = table_dir.join("p2024_0002.dat.compact_tmp");
+    let meta_compact_tmp = table_dir.join("p2024_0001.meta.compact.tmp");
+    std::fs::File::create(&segment).expect("seed segment");
+    std::fs::File::create(&compact_tmp).expect("seed compact tmp");
+    std::fs::File::create(&meta_compact_tmp).expect("seed meta compact tmp");
+
+    let _mgr = SegmentManager::new(temp_dir.path()).expect("create segment manager");
+
+    assert!(segment.exists());
+    assert!(!compact_tmp.exists());
+    assert!(!meta_compact_tmp.exists());
+}

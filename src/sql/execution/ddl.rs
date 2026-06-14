@@ -1616,7 +1616,12 @@ pub fn exec_flush_table(engine: &Engine, db: &str, table: &Option<String>) -> Re
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
-pub fn exec_optimize_table(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
+pub fn exec_optimize_table(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    partition: Option<&str>,
+) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
@@ -1635,13 +1640,19 @@ pub fn exec_optimize_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
         engine.data_dir().to_path_buf(),
     );
 
-    let stats = compactor.optimize_table(db, table, &table_meta)?;
+    let stats = if let Some(partition) = partition {
+        compactor.optimize_partition(db, table, &table_meta, partition)?
+    } else {
+        compactor.optimize_table(db, table, &table_meta)?
+    };
 
     engine.index_manager().mark_index_stale(db, table);
 
     tracing::info!(
         db,
         table,
+        table_full_name = %format!("{}.{}", db, table),
+        partition_key = partition.unwrap_or("<all>"),
         rows_written = stats.rows_written,
         rows_dropped = stats.rows_dropped,
         "OPTIMIZE TABLE executed"
