@@ -1,4 +1,4 @@
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 
 pub struct DirectBulkRequest<'a> {
@@ -138,7 +138,9 @@ fn read_u8_at(payload: &[u8], pos: &mut usize) -> Result<u8> {
 
 fn read_u16_at(payload: &[u8], pos: &mut usize) -> Result<u16> {
     if *pos + 2 > payload.len() {
-        return Err(TaibaiError::Protocol("payload truncated reading u16".into()));
+        return Err(TaibaiError::Protocol(
+            "payload truncated reading u16".into(),
+        ));
     }
     let v = u16::from_le_bytes(payload[*pos..*pos + 2].try_into().unwrap());
     *pos += 2;
@@ -147,7 +149,9 @@ fn read_u16_at(payload: &[u8], pos: &mut usize) -> Result<u16> {
 
 fn read_u32_at(payload: &[u8], pos: &mut usize) -> Result<u32> {
     if *pos + 4 > payload.len() {
-        return Err(TaibaiError::Protocol("payload truncated reading u32".into()));
+        return Err(TaibaiError::Protocol(
+            "payload truncated reading u32".into(),
+        ));
     }
     let v = u32::from_le_bytes(payload[*pos..*pos + 4].try_into().unwrap());
     *pos += 4;

@@ -1,7 +1,7 @@
 use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::message::{Message, MessageHeader, HEADER_SIZE, MSG_TYPE_QUERY};
 
 pub struct MessageCodec {

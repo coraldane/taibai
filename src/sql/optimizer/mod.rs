@@ -105,6 +105,8 @@ fn plan_complexity(plan: &LogicalPlan) -> usize {
                 + s.index_columns.len()
                 + s.time_range.as_ref().map(|_| 1).unwrap_or(0)
                 + s.bloom_filter_columns.len()
+                + s.minmax_index_columns.len()
+                + s.set_index_columns.len()
                 + s.partition_filter.as_ref().map(|_| 1).unwrap_or(0)
         }
         LogicalPlan::Empty => 1,

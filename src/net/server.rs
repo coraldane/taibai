@@ -8,7 +8,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
 
 use crate::common::config::ServerConfig;
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::net::handler::{build_error, Handler};
 use crate::net::tls::TlsMode;
 use crate::protocol::codec::MessageCodec;
@@ -77,7 +77,11 @@ impl Server {
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run_with_shutdown<S>(&self, shutdown: S) -> Result<()>
+    where
+        S: std::future::Future<Output = ()>,
+    {
+        tokio::pin!(shutdown);
         let listener = TcpListener::bind(&self.config.listen_addr()).await?;
         tracing::info!("taibai listening on {}", self.config.listen_addr());
 
@@ -86,17 +90,25 @@ impl Server {
         }
 
         loop {
-            let (stream, addr) = listener.accept().await?;
-            let config = self.config.clone();
-            let engine = self.engine.clone();
-            let tls_acceptor = self.tls_acceptor.clone();
-            tracing::debug!(peer = %addr, "connection accepted");
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, addr) = result?;
+                    let config = self.config.clone();
+                    let engine = self.engine.clone();
+                    let tls_acceptor = self.tls_acceptor.clone();
+                    tracing::debug!(peer = %addr, "connection accepted");
 
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, config, engine, tls_acceptor).await {
-                    tracing::error!(peer = %addr, error = %e, "connection error");
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, config, engine, tls_acceptor).await {
+                            tracing::error!(peer = %addr, error = %e, "connection error");
+                        }
+                    });
                 }
-            });
+                _ = &mut shutdown => {
+                    tracing::info!("server shutdown requested");
+                    return Ok(());
+                }
+            }
         }
     }
 }

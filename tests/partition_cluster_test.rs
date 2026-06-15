@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use tempfile::TempDir;
 
@@ -6,7 +7,9 @@ use taibai::net::session::Session;
 use taibai::protocol::types::DataType;
 use taibai::sql::execution::engine::{Engine, ExecResult};
 use taibai::storage::segment::meta::sidecar_meta_path;
+use taibai::storage::segment::SegmentWriter;
 use taibai::storage::segment_manager::SegmentManager;
+use taibai::types::batch::{ColumnDef, RecordBatch, Schema};
 use taibai::types::scalar::ScalarValue;
 
 fn bulk_payload(table: &str, row_count: u32, columns: Vec<(&str, DataType, Vec<u8>)>) -> Vec<u8> {
@@ -64,6 +67,63 @@ fn collect_i32_rows(result: ExecResult) -> Vec<Vec<i32>> {
         }
     }
     rows
+}
+
+fn count_star(result: ExecResult) -> i64 {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    batches
+        .first()
+        .and_then(|batch| batch.scalar(0, 0))
+        .and_then(|value| match value {
+            ScalarValue::Int64(Some(v)) => Some(v),
+            _ => None,
+        })
+        .expect("count(*) value")
+}
+
+fn make_two_i32_batch(schema: &Schema, rows: &[(i32, i32)]) -> RecordBatch {
+    let mut batch = RecordBatch::new(schema.clone());
+    for (deal_date, id) in rows {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int32(Some(*deal_date)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int32(Some(*id)))
+            .unwrap();
+    }
+    batch
+}
+
+fn write_two_i32_segment(path: &Path, schema: &Schema, rows: &[(i32, i32)]) {
+    let batch = make_two_i32_batch(schema, rows);
+    let mut writer = SegmentWriter::create(path, schema.clone(), 8192).expect("create segment");
+    writer.write_batch(&batch).expect("write segment");
+    writer.seal().expect("seal segment");
+}
+
+#[test]
+fn auto_compact_can_be_stopped_and_started_by_sql() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    assert!(engine.auto_compact_enabled());
+    engine
+        .execute(&mut session, "STOP AUTO COMPACT")
+        .expect("stop auto compact");
+    assert!(!engine.auto_compact_enabled());
+    engine
+        .execute(&mut session, "START AUTO COMPACT")
+        .expect("start auto compact");
+    assert!(engine.auto_compact_enabled());
+
+    engine.segment_mgr().shutdown();
 }
 
 #[test]
@@ -152,6 +212,60 @@ fn bulk_import_honors_year_partition_on_int32_yyyymmdd() {
             vec![20250102, 930],
         ]
     );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn select_limit_falls_back_when_cluster_segment_order_is_not_monotonic() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ticks (
+                deal_date INT32 NOT NULL,
+                id INT32 NOT NULL
+            ) CLUSTER BY (deal_date, id) PARTITION BY YEAR(deal_date)",
+        )
+        .expect("create ticks");
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("deal_date", DataType::Int32).with_nullable(false),
+        ColumnDef::new("id", DataType::Int32).with_nullable(false),
+    ]);
+    let table_dir = temp_dir.path().join("main").join("ticks");
+    fs::create_dir_all(&table_dir).expect("create table dir");
+
+    write_two_i32_segment(
+        &table_dir.join("p2026_0001.dat"),
+        &schema,
+        &[(20260612, 1), (20260612, 2)],
+    );
+    write_two_i32_segment(&table_dir.join("p2026_0002.dat"), &schema, &[(20260610, 3)]);
+    write_two_i32_segment(&table_dir.join("p2026_0003.dat"), &schema, &[(20260611, 4)]);
+
+    let count = count_star(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*) FROM ticks WHERE deal_date = 20260612",
+            )
+            .expect("count rows"),
+    );
+    assert_eq!(count, 2);
+
+    let rows = collect_i32_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT deal_date, id FROM ticks WHERE deal_date = 20260612 LIMIT 10",
+            )
+            .expect("select rows"),
+    );
+    assert_eq!(rows, vec![vec![20260612, 1], vec![20260612, 2]]);
 
     engine.segment_mgr().shutdown();
 }

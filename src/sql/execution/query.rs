@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::segment::ScanStats;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
@@ -62,19 +62,28 @@ fn exec_literal_select(stmt: &Statement) -> Result<ExecResult> {
         Statement::Select { select_list, .. } => select_list,
         _ => unreachable!(),
     };
-    let schema = Schema::new(vec![ColumnDef::new("1", DataType::Int64)]);
+    let mut values = Vec::with_capacity(select_list.len());
+    let mut columns = Vec::with_capacity(select_list.len());
+    for item in select_list {
+        match item {
+            SelectItem::Expr(expr, alias) => {
+                let val = super::helpers::eval_constant_expr(expr)?;
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| crate::sql::planner::expr::expr_to_name(expr));
+                columns.push(ColumnDef::new(&name, val.data_type()));
+                values.push(val);
+            }
+            SelectItem::Star => {
+                columns.push(ColumnDef::new("1", DataType::Int64));
+                values.push(ScalarValue::Int64(Some(1)));
+            }
+        }
+    }
+    let schema = Schema::new(columns);
     let mut batch = RecordBatch::new(schema.clone());
-    match &select_list[0] {
-        SelectItem::Expr(expr, _) => {
-            let val = super::helpers::eval_expr_to_scalar(expr, &DataType::Int64)?;
-            batch.column_mut(0).unwrap().push(&val)?;
-        }
-        SelectItem::Star => {
-            batch
-                .column_mut(0)
-                .unwrap()
-                .push(&ScalarValue::Int64(Some(1)))?;
-        }
+    for (col_idx, val) in values.iter().enumerate() {
+        batch.column_mut(col_idx).unwrap().push(val)?;
     }
     Ok(ExecResult::Query {
         schema,

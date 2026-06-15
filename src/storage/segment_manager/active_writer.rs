@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::bulk_payload::DirectBulkColumn;
 use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::partition::pruning::compute_segment_zone_maps_from_row_groups;
@@ -10,15 +11,18 @@ use crate::storage::segment::meta::{
     append_sidecar_footer, append_sidecar_row_groups, compact_sidecar_footer_if_needed,
     remove_sidecar_meta,
 };
+use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
 use crate::storage::segment::{encode_segment_footer, RowGroupMeta};
 use crate::storage::segment_manager::config::{
     bulk_compression_level, FLUSH_META_AFTER_ROW_GROUP, SIDECAR_COMPACT_MIN_BYTES,
     SIDECAR_COMPACT_MIN_RECORDS, SQL_INSERT_ROW_GROUP_TARGET_ROWS,
 };
 use crate::storage::segment_manager::helpers::{
-    compute_zone_maps_from_batch, compute_zone_maps_from_bulk_columns,
+    compute_value_sets_from_bulk_columns, compute_zone_maps_from_batch,
+    compute_zone_maps_from_bulk_columns,
 };
 use crate::types::batch::{RecordBatch, Schema};
+use crate::types::scalar::ScalarValue;
 
 pub(super) struct ActiveSegmentWriter {
     pub(super) file: std::io::BufWriter<std::fs::File>,
@@ -87,6 +91,8 @@ impl ActiveSegmentWriter {
         }
         self.file.write_all(&write_buf)?;
 
+        let value_sets = compute_value_sets_from_bulk_columns(columns, row_count)?;
+
         self.row_groups.push(RowGroupMeta {
             offset,
             length: total_length,
@@ -96,6 +102,7 @@ impl ActiveSegmentWriter {
             compressed_sizes,
             uncompressed_sizes,
             bloom_filters: vec![None; self.schema.num_columns()],
+            value_sets,
         });
         self.current_size += total_length;
         self.total_rows += row_count;
@@ -162,6 +169,7 @@ impl ActiveSegmentWriter {
             compressed_sizes,
             uncompressed_sizes,
             bloom_filters: vec![None; self.schema.num_columns()],
+            value_sets: compute_value_sets_from_batch(&buffered, 0, rows_to_flush),
         });
         self.current_size += total_length;
         self.total_rows += rows_to_flush as u64;
@@ -330,4 +338,36 @@ impl ActiveSegmentWriter {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default()
     }
+}
+
+fn compute_value_sets_from_batch(
+    batch: &RecordBatch,
+    offset: usize,
+    count: usize,
+) -> Vec<Option<Vec<ScalarValue>>> {
+    let mut result = Vec::with_capacity(batch.num_columns());
+    for col_idx in 0..batch.num_columns() {
+        let col = batch.column(col_idx).unwrap();
+        let mut values = HashSet::new();
+        let mut complete = true;
+        for row_idx in offset..offset + count {
+            let value = col.scalar(row_idx);
+            if value.is_null() {
+                continue;
+            }
+            values.insert(value);
+            if values.len() > VALUE_SET_MAX_DISTINCT {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            let mut values: Vec<ScalarValue> = values.into_iter().collect();
+            values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+            result.push(Some(values));
+        } else {
+            result.push(None);
+        }
+    }
+    result
 }

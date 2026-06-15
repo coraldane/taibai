@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::types::scalar::ScalarValue;
 
 /// Partition strategy for a table.

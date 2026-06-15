@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Taibai Database" Manufacturer="Taibai" Version="$(var.TaibaiVersion)" UpgradeCode="9f9f2835-0a88-4e99-9d6b-ea3a9202291a" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Taibai is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <SetDirectory Id="DATADIR" Value="[INSTALLFOLDER]data" Sequence="both" Condition="NOT DATADIR" />
+    <SetDirectory Id="LOGDIR" Value="[INSTALLFOLDER]logs" Sequence="both" Condition="NOT LOGDIR" />
+    <ui:WixUI Id="WixUI_InstallDir" />
+    <Feature Id="Main" Title="Taibai Database" Level="1">
+      <ComponentGroupRef Id="TaibaiFiles" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Taibai">
+        <Directory Id="BinFolder" Name="bin" />
+        <Directory Id="ConfFolder" Name="conf" />
+        <Directory Id="DATADIR" Name="data" />
+        <Directory Id="LOGDIR" Name="logs" />
+        <Directory Id="ScriptsFolder" Name="scripts">
+          <Directory Id="WindowsScriptsFolder" Name="windows" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="TaibaiFiles">
+      <Component Id="TaibaiExeComponent" Directory="BinFolder" Guid="b306d025-b558-45fc-98f0-08e2a4d60f5a" Bitness="always64">
+        <File Id="TaibaiExe" Source="target\release\taibai.exe" KeyPath="yes" />
+        <ServiceInstall Id="TaibaiServiceInstall" Type="ownProcess" Name="TaibaiDB" DisplayName="Taibai Database" Description="Taibai columnar database server" Start="auto" ErrorControl="normal" Arguments="--service --service-name TaibaiDB --config &quot;[ConfFolder]windows.yaml&quot;" />
+        <ServiceControl Id="TaibaiServiceControl" Name="TaibaiDB" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="TaibaiConfigComponent" Directory="ConfFolder" Guid="6da63444-7ae6-4f08-acf1-7e5da29ec018" Bitness="always64">
+        <File Id="TaibaiWindowsConfig" Source="installer\windows\windows.yaml" Name="windows.yaml" KeyPath="yes" />
+      </Component>
+      <Component Id="TaibaiInstallScriptComponent" Directory="WindowsScriptsFolder" Guid="6633babe-1508-4b65-827f-fcb26a8578f2" Bitness="always64">
+        <File Source="scripts\windows\install.ps1" KeyPath="yes" />
+      </Component>
+      <Component Id="TaibaiUninstallScriptComponent" Directory="WindowsScriptsFolder" Guid="d7714b8f-08ea-4234-8432-3fe24395be19" Bitness="always64">
+        <File Source="scripts\windows\uninstall.ps1" KeyPath="yes" />
+      </Component>
+      <Component Id="TaibaiDataDirComponent" Directory="DATADIR" Guid="0b2108b4-4e46-4794-8fb2-e35609ce265f" Bitness="always64">
+        <CreateFolder>
+          <Permission User="Users" GenericAll="yes" />
+        </CreateFolder>
+      </Component>
+      <Component Id="TaibaiLogDirComponent" Directory="LOGDIR" Guid="2c2c0e71-76f2-43b8-8a5a-51d8376aa858" Bitness="always64">
+        <CreateFolder>
+          <Permission User="Users" GenericAll="yes" />
+        </CreateFolder>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

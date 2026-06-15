@@ -4,7 +4,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::net::client::{BulkImportConfig, Client};
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};

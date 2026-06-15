@@ -1,11 +1,13 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::bulk_payload::{DirectBulkColumn, DirectBulkRequest};
 use crate::storage::partition::pruning::ZoneMap;
 use crate::storage::segment::store;
+use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
 use crate::storage::segment_manager::state::TableSegmentState;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
@@ -88,7 +90,7 @@ pub(super) fn compute_zone_maps_from_batch(
     zone_maps
 }
 
-pub(super) fn direct_bulk_request_to_batch(
+pub(crate) fn direct_bulk_request_to_batch(
     req: &DirectBulkRequest<'_>,
     schema: &Schema,
 ) -> Result<RecordBatch> {
@@ -104,7 +106,10 @@ pub(super) fn direct_bulk_request_to_batch(
     RecordBatch::try_new(schema.clone(), columns)
 }
 
-fn direct_bulk_column_scalar_at(col: &DirectBulkColumn<'_>, row_idx: usize) -> Result<ScalarValue> {
+pub(super) fn direct_bulk_column_scalar_at(
+    col: &DirectBulkColumn<'_>,
+    row_idx: usize,
+) -> Result<ScalarValue> {
     if is_null_at(col.nulls, row_idx) {
         return Ok(ScalarValue::null_for_type(col.data_type));
     }
@@ -301,6 +306,36 @@ pub(super) fn compute_zone_maps_from_bulk_columns(
         zone_maps.push(zm);
     }
     zone_maps
+}
+
+pub(super) fn compute_value_sets_from_bulk_columns(
+    columns: &[DirectBulkColumn<'_>],
+    row_count: u64,
+) -> Result<Vec<Option<Vec<ScalarValue>>>> {
+    let mut result = Vec::with_capacity(columns.len());
+    for col in columns {
+        let mut values = HashSet::new();
+        let mut complete = true;
+        for row_idx in 0..row_count as usize {
+            let value = direct_bulk_column_scalar_at(col, row_idx)?;
+            if value.is_null() {
+                continue;
+            }
+            values.insert(value);
+            if values.len() > VALUE_SET_MAX_DISTINCT {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            let mut values: Vec<ScalarValue> = values.into_iter().collect();
+            values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+            result.push(Some(values));
+        } else {
+            result.push(None);
+        }
+    }
+    Ok(result)
 }
 
 fn is_null_at(nulls: &[u8], idx: usize) -> bool {

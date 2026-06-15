@@ -3,9 +3,10 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::segment::meta::read_latest_sidecar_footer;
+use crate::storage::segment::writer::VALUE_SET_EXTENSION_MAGIC;
 use crate::storage::segment::{
     decode_scalar_with_tag, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION,
 };
@@ -213,6 +214,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         // The inspector does not print these, but it must advance past them
         // before reading the next row group or the delete-bitmap section.
         skip_bloom_filters(&mut cursor, footer_data.as_slice(), col_count)?;
+        skip_value_sets_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
 
         row_groups.push(RowGroupInfo {
             offset: rg_offset,
@@ -428,6 +430,36 @@ fn read_u32_le(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
         .read_exact(&mut buf)
         .map_err(|e| TaibaiError::Storage(format!("read_u32 error: {}", e)))?;
     Ok(u32::from_le_bytes(buf))
+}
+
+fn skip_value_sets_if_present(
+    cursor: &mut Cursor<&[u8]>,
+    data: &[u8],
+    col_count: usize,
+) -> Result<()> {
+    let pos = cursor.position() as usize;
+    if pos + 4 > data.len() {
+        return Ok(());
+    }
+    let marker = u32::from_le_bytes(
+        data[pos..pos + 4]
+            .try_into()
+            .map_err(|_| TaibaiError::Storage("invalid value set extension marker".to_string()))?,
+    );
+    if marker != VALUE_SET_EXTENSION_MAGIC {
+        return Ok(());
+    }
+    cursor.set_position((pos + 4) as u64);
+    for _ in 0..col_count {
+        let has_set = read_u8(cursor)?;
+        if has_set != 0 {
+            let value_count = read_u32_le(cursor)? as usize;
+            for _ in 0..value_count {
+                let _ = decode_scalar_with_tag(cursor)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> Result<u64> {

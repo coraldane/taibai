@@ -32,6 +32,8 @@ pub struct ScanPlan {
     pub index_columns: Vec<String>,
     pub time_range: Option<TimeRange>,
     pub bloom_filter_columns: Vec<String>,
+    pub minmax_index_columns: Vec<String>,
+    pub set_index_columns: Vec<String>,
     pub partition_filter: Option<PartitionFilter>,
 }
 
@@ -48,6 +50,8 @@ impl ScanPlan {
             index_columns: Vec::new(),
             time_range: None,
             bloom_filter_columns: Vec::new(),
+            minmax_index_columns: Vec::new(),
+            set_index_columns: Vec::new(),
             partition_filter: None,
         }
     }

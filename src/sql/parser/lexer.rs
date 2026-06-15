@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 
 /// SQL token types.
 #[derive(Debug, Clone, PartialEq)]

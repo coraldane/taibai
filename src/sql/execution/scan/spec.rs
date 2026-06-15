@@ -2,7 +2,7 @@
 
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
 use crate::sql::planner::{LogicalExpr, LogicalPlan, TimeRange};
-use crate::storage::catalog::schema::TableMeta;
+use crate::storage::catalog::schema::{SecondaryIndexType, TableMeta};
 use crate::storage::partition::pruning::RangeClause;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
@@ -27,6 +27,9 @@ pub struct ScanSpec {
 
     pub cluster_key: Option<Vec<String>>,
     pub partition_info: Option<PartitionScanInfo>,
+    pub bloom_index_columns: Vec<usize>,
+    pub minmax_index_columns: Vec<usize>,
+    pub set_index_columns: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +63,9 @@ impl ScanSpec {
             limit: None,
             cluster_key: None,
             partition_info: None,
+            bloom_index_columns: Vec::new(),
+            minmax_index_columns: Vec::new(),
+            set_index_columns: Vec::new(),
         }
     }
 
@@ -107,6 +113,7 @@ impl ScanSpec {
     pub fn bloom_check_columns(&self) -> Vec<(usize, &ScalarValue)> {
         self.eq_predicates
             .iter()
+            .filter(|(idx, _)| self.bloom_index_columns.contains(idx))
             .map(|(idx, v)| (*idx, v))
             .collect()
     }
@@ -137,6 +144,12 @@ pub fn compile_scan_spec(
         spec.cluster_key = Some(table_meta.cluster_key.clone());
     }
 
+    spec.bloom_index_columns = bloom_index_columns(table_meta, table_schema);
+    spec.minmax_index_columns =
+        secondary_index_columns(table_meta, table_schema, SecondaryIndexType::MinMax);
+    spec.set_index_columns =
+        secondary_index_columns(table_meta, table_schema, SecondaryIndexType::Set);
+
     if table_meta.is_partitioned() {
         let pk_idx = table_meta.get_partition_column_index();
         spec.partition_info = Some(PartitionScanInfo {
@@ -155,6 +168,41 @@ pub fn compile_scan_spec(
     }
 
     spec
+}
+
+fn bloom_index_columns(table_meta: &TableMeta, table_schema: &Schema) -> Vec<usize> {
+    let mut cols = secondary_index_columns(table_meta, table_schema, SecondaryIndexType::Bloom);
+    for index in &table_meta.unique_indexes {
+        for column in &index.columns {
+            if let Some(idx) = table_schema.index_of(column) {
+                if !cols.contains(&idx) {
+                    cols.push(idx);
+                }
+            }
+        }
+    }
+    cols
+}
+
+fn secondary_index_columns(
+    table_meta: &TableMeta,
+    table_schema: &Schema,
+    index_type: SecondaryIndexType,
+) -> Vec<usize> {
+    let mut cols = Vec::new();
+    for index in &table_meta.secondary_indexes {
+        if index.index_type != index_type {
+            continue;
+        }
+        for column in &index.columns {
+            if let Some(idx) = table_schema.index_of(column) {
+                if !cols.contains(&idx) {
+                    cols.push(idx);
+                }
+            }
+        }
+    }
+    cols
 }
 
 fn collect_expr_columns(expr: &LogicalExpr, cols: &mut Vec<usize>) {

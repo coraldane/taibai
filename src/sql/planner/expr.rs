@@ -1,12 +1,81 @@
 #![allow(dead_code)]
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
+use crate::sql::execution::functions::registry::FunctionRegistry;
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::types::*;
 use super::{AliasMap, JoinTableInfo, PlannerContext};
+
+fn aggregate_func(name: &str) -> Option<AggFunc> {
+    match name.to_uppercase().as_str() {
+        "COUNT" => Some(AggFunc::Count),
+        "SUM" => Some(AggFunc::Sum),
+        "AVG" => Some(AggFunc::Avg),
+        "MIN" => Some(AggFunc::Min),
+        "MAX" => Some(AggFunc::Max),
+        _ => None,
+    }
+}
+
+pub fn scalar_function_exists(name: &str) -> bool {
+    FunctionRegistry::default().exists(name)
+}
+
+fn common_function_type(arg_types: &[DataType]) -> DataType {
+    if arg_types.is_empty() {
+        return DataType::Int64;
+    }
+    if arg_types.iter().any(|dt| *dt == DataType::VarChar) {
+        return DataType::VarChar;
+    }
+    if arg_types
+        .iter()
+        .any(|dt| matches!(dt, DataType::Float32 | DataType::Float64))
+    {
+        return DataType::Float64;
+    }
+    if arg_types.iter().any(|dt| *dt == DataType::Decimal) {
+        return DataType::Decimal;
+    }
+    if arg_types.iter().any(|dt| matches!(dt, DataType::UInt64)) {
+        return DataType::UInt64;
+    }
+    if arg_types.iter().any(|dt| {
+        matches!(
+            dt,
+            DataType::Int64 | DataType::UInt32 | DataType::UInt16 | DataType::UInt8
+        )
+    }) {
+        return DataType::Int64;
+    }
+    arg_types[0]
+}
+
+pub fn infer_scalar_function_type(name: &str, arg_types: &[DataType]) -> DataType {
+    match name.to_lowercase().as_str() {
+        "abs" | "ceil" | "ceiling" | "floor" | "round" | "sqrt" | "pow" | "power" | "log"
+        | "ln" | "log10" | "log2" | "exp" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "atan2" | "sign" | "mod" | "truncate" | "pi" | "vector_distance" | "vector_norm"
+        | "vector_dot" => DataType::Float64,
+        "length" | "len" | "instr" | "locate" | "year" | "month" | "day" | "hour" | "minute"
+        | "second" | "dayofweek" | "dayofyear" | "week" | "quarter" | "to_int" => DataType::Int64,
+        "upper" | "ucase" | "lower" | "lcase" | "trim" | "ltrim" | "rtrim" | "substring"
+        | "substr" | "concat" | "concat_ws" | "replace" | "reverse" | "left" | "right" | "lpad"
+        | "rpad" | "repeat" | "space" | "date_format" | "to_string" => DataType::VarChar,
+        "now" | "current_timestamp" => DataType::Timestamp,
+        "current_date" | "last_day" => DataType::Date,
+        "current_time" => DataType::Time,
+        "to_float" => DataType::Float64,
+        "to_bool" => DataType::Bool,
+        "vector_normalize" | "vector_add" | "vector_sub" | "vector_scale" => DataType::Vector,
+        "coalesce" | "ifnull" | "isnull" => common_function_type(arg_types),
+        "nullif" => arg_types.first().copied().unwrap_or(DataType::Int64),
+        _ => arg_types.first().copied().unwrap_or(DataType::Int64),
+    }
+}
 
 pub fn ast_expr_to_logical_with_context(
     expr: &Expr,
@@ -92,26 +161,37 @@ pub fn ast_expr_to_logical_with_context(
             args,
             distinct,
         } => {
-            let func = match name.to_uppercase().as_str() {
-                "COUNT" => AggFunc::Count,
-                "SUM" => AggFunc::Sum,
-                "AVG" => AggFunc::Avg,
-                "MIN" => AggFunc::Min,
-                "MAX" => AggFunc::Max,
-                other => return Err(TaibaiError::Sql(format!("unknown function '{}'", other))),
-            };
-            let arg = if args.is_empty()
-                || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
-            {
-                LogicalExpr::Wildcard
-            } else {
-                ast_expr_to_logical_with_context(&args[0], schema, alias_map, ctx)?
-            };
-            Ok(LogicalExpr::Aggregate(AggregateExpr {
-                func,
-                arg: Box::new(arg),
-                distinct: *distinct,
-            }))
+            if let Some(func) = aggregate_func(name) {
+                let arg = if args.is_empty()
+                    || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
+                {
+                    LogicalExpr::Wildcard
+                } else {
+                    ast_expr_to_logical_with_context(&args[0], schema, alias_map, ctx)?
+                };
+                return Ok(LogicalExpr::Aggregate(AggregateExpr {
+                    func,
+                    arg: Box::new(arg),
+                    distinct: *distinct,
+                }));
+            }
+            if *distinct {
+                return Err(TaibaiError::Sql(format!(
+                    "DISTINCT is not supported for scalar function '{}'",
+                    name
+                )));
+            }
+            if !scalar_function_exists(name) {
+                return Err(TaibaiError::Sql(format!("unknown function '{}'", name)));
+            }
+            let bound_args = args
+                .iter()
+                .map(|arg| ast_expr_to_logical_with_context(arg, schema, alias_map, ctx))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(LogicalExpr::Function {
+                name: name.clone(),
+                args: bound_args,
+            })
         }
         Expr::Subquery(subquery_stmt) => {
             use super::plan_select_with_context;
@@ -257,26 +337,37 @@ pub fn ast_expr_to_logical(
             args,
             distinct,
         } => {
-            let func = match name.to_uppercase().as_str() {
-                "COUNT" => AggFunc::Count,
-                "SUM" => AggFunc::Sum,
-                "AVG" => AggFunc::Avg,
-                "MIN" => AggFunc::Min,
-                "MAX" => AggFunc::Max,
-                other => return Err(TaibaiError::Sql(format!("unknown function '{}'", other))),
-            };
-            let arg = if args.is_empty()
-                || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
-            {
-                LogicalExpr::Wildcard
-            } else {
-                ast_expr_to_logical(&args[0], schema, alias_map)?
-            };
-            Ok(LogicalExpr::Aggregate(AggregateExpr {
-                func,
-                arg: Box::new(arg),
-                distinct: *distinct,
-            }))
+            if let Some(func) = aggregate_func(name) {
+                let arg = if args.is_empty()
+                    || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
+                {
+                    LogicalExpr::Wildcard
+                } else {
+                    ast_expr_to_logical(&args[0], schema, alias_map)?
+                };
+                return Ok(LogicalExpr::Aggregate(AggregateExpr {
+                    func,
+                    arg: Box::new(arg),
+                    distinct: *distinct,
+                }));
+            }
+            if *distinct {
+                return Err(TaibaiError::Sql(format!(
+                    "DISTINCT is not supported for scalar function '{}'",
+                    name
+                )));
+            }
+            if !scalar_function_exists(name) {
+                return Err(TaibaiError::Sql(format!("unknown function '{}'", name)));
+            }
+            let bound_args = args
+                .iter()
+                .map(|arg| ast_expr_to_logical(arg, schema, alias_map))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(LogicalExpr::Function {
+                name: name.clone(),
+                args: bound_args,
+            })
         }
         _ => Err(TaibaiError::Sql("unsupported expression type".to_string())),
     }
@@ -466,33 +557,53 @@ pub fn ast_expr_to_logical_join(
             args,
             distinct,
         } => {
-            let func = match name.to_uppercase().as_str() {
-                "COUNT" => AggFunc::Count,
-                "SUM" => AggFunc::Sum,
-                "AVG" => AggFunc::Avg,
-                "MIN" => AggFunc::Min,
-                "MAX" => AggFunc::Max,
-                other => return Err(TaibaiError::Sql(format!("unknown function '{}'", other))),
-            };
-            let arg = if args.is_empty()
-                || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
-            {
-                LogicalExpr::Wildcard
-            } else {
-                ast_expr_to_logical_join(
-                    &args[0],
-                    output_schema,
-                    left_schema,
-                    right_schema,
-                    alias_map,
-                    table_info,
-                )?
-            };
-            Ok(LogicalExpr::Aggregate(AggregateExpr {
-                func,
-                arg: Box::new(arg),
-                distinct: *distinct,
-            }))
+            if let Some(func) = aggregate_func(name) {
+                let arg = if args.is_empty()
+                    || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
+                {
+                    LogicalExpr::Wildcard
+                } else {
+                    ast_expr_to_logical_join(
+                        &args[0],
+                        output_schema,
+                        left_schema,
+                        right_schema,
+                        alias_map,
+                        table_info,
+                    )?
+                };
+                return Ok(LogicalExpr::Aggregate(AggregateExpr {
+                    func,
+                    arg: Box::new(arg),
+                    distinct: *distinct,
+                }));
+            }
+            if *distinct {
+                return Err(TaibaiError::Sql(format!(
+                    "DISTINCT is not supported for scalar function '{}'",
+                    name
+                )));
+            }
+            if !scalar_function_exists(name) {
+                return Err(TaibaiError::Sql(format!("unknown function '{}'", name)));
+            }
+            let bound_args = args
+                .iter()
+                .map(|arg| {
+                    ast_expr_to_logical_join(
+                        arg,
+                        output_schema,
+                        left_schema,
+                        right_schema,
+                        alias_map,
+                        table_info,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(LogicalExpr::Function {
+                name: name.clone(),
+                args: bound_args,
+            })
         }
         _ => Err(TaibaiError::Sql(
             "unsupported expression type in join context".to_string(),
@@ -517,14 +628,7 @@ fn extract_aggs_from_expr(expr: &Expr, aggs: &mut Vec<(AggFunc, Option<Expr>, bo
         distinct,
     } = expr
     {
-        let func = match name.to_uppercase().as_str() {
-            "COUNT" => Some(AggFunc::Count),
-            "SUM" => Some(AggFunc::Sum),
-            "AVG" => Some(AggFunc::Avg),
-            "MIN" => Some(AggFunc::Min),
-            "MAX" => Some(AggFunc::Max),
-            _ => None,
-        };
+        let func = aggregate_func(name);
         if let Some(func) = func {
             let arg = if args.is_empty()
                 || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
@@ -632,6 +736,36 @@ pub fn collect_cols_from_expr(expr: &LogicalExpr, cols: &mut Vec<usize>) {
         LogicalExpr::IsNull(inner) => collect_cols_from_expr(inner, cols),
         LogicalExpr::IsNotNull(inner) => collect_cols_from_expr(inner, cols),
         LogicalExpr::Aggregate(agg) => collect_cols_from_expr(&agg.arg, cols),
+        LogicalExpr::Function { args, .. } => {
+            for arg in args {
+                collect_cols_from_expr(arg, cols);
+            }
+        }
+        LogicalExpr::In { expr, .. } => collect_cols_from_expr(expr, cols),
+        LogicalExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_cols_from_expr(expr, cols);
+            collect_cols_from_expr(low, cols);
+            collect_cols_from_expr(high, cols);
+        }
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                collect_cols_from_expr(operand, cols);
+            }
+            for (when_expr, then_expr) in when_clauses {
+                collect_cols_from_expr(when_expr, cols);
+                collect_cols_from_expr(then_expr, cols);
+            }
+            if let Some(else_expr) = else_clause {
+                collect_cols_from_expr(else_expr, cols);
+            }
+        }
+        LogicalExpr::Like { expr, .. } => collect_cols_from_expr(expr, cols),
         _ => {}
     }
 }
@@ -649,6 +783,13 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
             AggFunc::Count => DataType::Int64,
             _ => DataType::Float64,
         },
+        LogicalExpr::Function { name, args } => {
+            let arg_types = args
+                .iter()
+                .map(|arg| infer_type(arg, schema))
+                .collect::<Vec<_>>();
+            infer_scalar_function_type(name, &arg_types)
+        }
         _ => DataType::Int64,
     }
 }

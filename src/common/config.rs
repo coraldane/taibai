@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::net::tls::TlsMode;
 
@@ -28,6 +28,10 @@ fn default_min_segment_seal_size_mb() -> u32 {
     500
 }
 
+fn default_max_segment_size_mb() -> u32 {
+    2048
+}
+
 fn default_batch_size() -> usize {
     4096
 }
@@ -40,6 +44,30 @@ fn default_change_stream_retention_events() -> usize {
     1_000_000
 }
 
+fn default_auto_compact_enabled() -> bool {
+    true
+}
+
+fn default_auto_compact_check_interval_secs() -> u64 {
+    60
+}
+
+fn default_auto_compact_idle_threshold_secs() -> u64 {
+    30
+}
+
+fn default_auto_compact_min_segments() -> usize {
+    4
+}
+
+fn default_auto_compact_min_deleted_rows() -> u64 {
+    100_000
+}
+
+fn default_auto_compact_max_tables_per_run() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub server: ServerSettings,
@@ -49,6 +77,8 @@ pub struct ServerConfig {
     pub tls: TlsConfigYaml,
     #[serde(default)]
     pub change_stream: ChangeStreamSettings,
+    #[serde(default)]
+    pub auto_compact: AutoCompactSettings,
     pub log: LogSettings,
 }
 
@@ -71,6 +101,8 @@ pub struct StorageSettings {
     pub flush_threshold_rows: u32,
     #[serde(default = "default_min_segment_seal_size_mb")]
     pub min_segment_seal_size_mb: u32,
+    #[serde(default = "default_max_segment_size_mb")]
+    pub max_segment_size_mb: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,9 +138,40 @@ impl Default for ChangeStreamSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoCompactSettings {
+    #[serde(default = "default_auto_compact_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_auto_compact_check_interval_secs")]
+    pub check_interval_secs: u64,
+    #[serde(default = "default_auto_compact_idle_threshold_secs")]
+    pub idle_threshold_secs: u64,
+    #[serde(default = "default_auto_compact_min_segments")]
+    pub min_segments: usize,
+    #[serde(default = "default_auto_compact_min_deleted_rows")]
+    pub min_deleted_rows: u64,
+    #[serde(default = "default_auto_compact_max_tables_per_run")]
+    pub max_tables_per_run: usize,
+}
+
+impl Default for AutoCompactSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_compact_enabled(),
+            check_interval_secs: default_auto_compact_check_interval_secs(),
+            idle_threshold_secs: default_auto_compact_idle_threshold_secs(),
+            min_segments: default_auto_compact_min_segments(),
+            min_deleted_rows: default_auto_compact_min_deleted_rows(),
+            max_tables_per_run: default_auto_compact_max_tables_per_run(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSettings {
     #[serde(default = "default_log_level")]
     pub level: String,
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -124,13 +187,16 @@ impl Default for ServerConfig {
                 default_database: "main".to_string(),
                 flush_threshold_rows: 65536,
                 min_segment_seal_size_mb: 500,
+                max_segment_size_mb: 2048,
             },
             buffer: BufferSettings { batch_size: 4096 },
             compression: CompressionSettings { enabled: true },
             tls: TlsConfigYaml::default(),
             change_stream: ChangeStreamSettings::default(),
+            auto_compact: AutoCompactSettings::default(),
             log: LogSettings {
                 level: "info".to_string(),
+                file: None,
             },
         }
     }
@@ -145,10 +211,22 @@ impl ServerConfig {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
 
-        let config: ServerConfig = serde_yaml::from_str(&content)
+        let mut config: ServerConfig = serde_yaml::from_str(&content)
             .map_err(|e| format!("Failed to parse config file {}: {}", path.display(), e))?;
 
+        config.resolve_relative_paths(path);
         Ok(config)
+    }
+
+    fn resolve_relative_paths(&mut self, config_path: &Path) {
+        let Some(config_dir) = config_path.parent() else {
+            return;
+        };
+
+        self.storage.data_dir = resolve_config_relative(config_dir, &self.storage.data_dir);
+        if let Some(log_file) = self.log.file.as_mut() {
+            *log_file = resolve_config_relative(config_dir, log_file);
+        }
     }
 
     pub fn tls_mode(&self) -> TlsMode {
@@ -161,6 +239,33 @@ impl ServerConfig {
             TlsMode::Disable
         }
     }
+}
+
+fn resolve_config_relative(config_dir: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return value.to_string();
+    }
+
+    normalize_path(config_dir.join(path))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 #[derive(Parser, Debug)]
@@ -189,6 +294,21 @@ struct Args {
 
     #[arg(long)]
     no_compression: bool,
+
+    #[arg(long)]
+    service: bool,
+
+    #[arg(long)]
+    install_service: bool,
+
+    #[arg(long)]
+    uninstall_service: bool,
+
+    #[arg(long, default_value = "TaibaiDB")]
+    service_name: String,
+
+    #[arg(long, default_value = "Taibai Database")]
+    service_display_name: String,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -214,6 +334,19 @@ enum Commands {
 #[derive(Debug, Clone)]
 pub enum RunMode {
     Server(ServerConfig),
+    Service {
+        service_name: String,
+        config_path: String,
+        config: ServerConfig,
+    },
+    InstallService {
+        service_name: String,
+        display_name: String,
+        config_path: String,
+    },
+    UninstallService {
+        service_name: String,
+    },
     Client {
         host: String,
         user: String,
@@ -224,6 +357,15 @@ pub enum RunMode {
 }
 
 impl RunMode {
+    pub fn log_level(&self) -> &str {
+        match self {
+            RunMode::Server(config) | RunMode::Service { config, .. } => &config.log.level,
+            RunMode::InstallService { .. }
+            | RunMode::UninstallService { .. }
+            | RunMode::Client { .. } => "info",
+        }
+    }
+
     pub fn from_args() -> Self {
         let args = Args::parse();
 
@@ -243,6 +385,14 @@ impl RunMode {
                 query,
             };
         }
+
+        if args.uninstall_service {
+            return RunMode::UninstallService {
+                service_name: args.service_name,
+            };
+        }
+
+        let config_path = args.config.clone();
 
         let mut config = Path::new(&args.config)
             .exists()
@@ -282,6 +432,70 @@ impl RunMode {
             config.compression.enabled = false;
         }
 
+        if args.install_service {
+            return RunMode::InstallService {
+                service_name: args.service_name,
+                display_name: args.service_display_name,
+                config_path,
+            };
+        }
+
+        if args.service {
+            return RunMode::Service {
+                service_name: args.service_name,
+                config_path,
+                config,
+            };
+        }
+
         RunMode::Server(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerConfig;
+
+    #[test]
+    fn config_relative_storage_and_log_paths_resolve_from_config_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let conf_dir = temp.path().join("conf");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        let config_path = conf_dir.join("windows.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 5151
+storage:
+  data_dir: "../data"
+  default_database: "main"
+buffer:
+  batch_size: 4096
+compression:
+  enabled: true
+tls:
+  enabled: false
+  cert_path: ""
+  key_path: ""
+log:
+  level: "info"
+  file: "../logs/taibai.log"
+"#,
+        )
+        .unwrap();
+
+        let config = ServerConfig::from_yaml_file(&config_path).unwrap();
+        let expected_data_dir = temp.path().join("data").to_string_lossy().to_string();
+        let expected_log_file = temp
+            .path()
+            .join("logs")
+            .join("taibai.log")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(config.storage.data_dir, expected_data_dir);
+        assert_eq!(config.log.file.as_deref(), Some(expected_log_file.as_str()));
     }
 }

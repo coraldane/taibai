@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::sql::parser::ast::{Statement, TableRef};
 use crate::sql::planner::*;
+use crate::storage::catalog::schema::{SecondaryIndexType, TableMeta};
 use crate::storage::segment::ScanStats;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -27,6 +28,7 @@ pub fn exec_explain(
     };
 
     let mut table_schemas = HashMap::new();
+    let mut table_metas = HashMap::new();
     {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs
@@ -35,12 +37,14 @@ pub fn exec_explain(
         collect_tables_from_stmt(select_from, |t| {
             if let Some(meta) = catalog.get_table(t) {
                 table_schemas.insert(t.to_string(), Schema::new(meta.columns.clone()));
+                table_metas.insert(t.to_string(), meta.clone());
             }
         });
     }
 
     let plan = plan_select(select_from, &table_schemas)?;
     let plan = crate::sql::optimizer::optimize(plan);
+    let plan = reconcile_plan_indexes(plan, &table_metas);
 
     let mut out = String::new();
     render_plan(&plan, 0, &mut out);
@@ -189,6 +193,18 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String) {
                     pad, scan.bloom_filter_columns
                 ));
             }
+            if !scan.minmax_index_columns.is_empty() {
+                out.push_str(&format!(
+                    "{}  minmax_index_columns: {:?}\n",
+                    pad, scan.minmax_index_columns
+                ));
+            }
+            if !scan.set_index_columns.is_empty() {
+                out.push_str(&format!(
+                    "{}  set_index_columns: {:?}\n",
+                    pad, scan.set_index_columns
+                ));
+            }
         }
         LogicalPlan::Filter(f) => {
             out.push_str(&format!(
@@ -265,6 +281,118 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String) {
             out.push_str(&format!("{}Empty\n", pad));
         }
     }
+}
+
+fn reconcile_plan_indexes(
+    plan: LogicalPlan,
+    table_metas: &HashMap<String, TableMeta>,
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Scan(mut scan) => {
+            if let Some(meta) = table_metas.get(&scan.table_name) {
+                let all_indexed = all_indexed_columns(meta);
+                let bloom_indexed = bloom_indexed_columns(meta);
+                let minmax_indexed = meta.indexed_columns_by_type(SecondaryIndexType::MinMax);
+                let set_indexed = meta.indexed_columns_by_type(SecondaryIndexType::Set);
+                scan.index_columns
+                    .retain(|col| contains_column(&all_indexed, col));
+                scan.bloom_filter_columns
+                    .retain(|col| contains_column(&bloom_indexed, col));
+                scan.minmax_index_columns = scan
+                    .index_columns
+                    .iter()
+                    .filter(|col| contains_column(&minmax_indexed, col))
+                    .cloned()
+                    .collect();
+                scan.set_index_columns = scan
+                    .index_columns
+                    .iter()
+                    .filter(|col| contains_column(&set_indexed, col))
+                    .cloned()
+                    .collect();
+            } else {
+                scan.index_columns.clear();
+                scan.bloom_filter_columns.clear();
+                scan.minmax_index_columns.clear();
+                scan.set_index_columns.clear();
+            }
+            LogicalPlan::Scan(scan)
+        }
+        LogicalPlan::Filter(mut filter) => {
+            filter.input = Box::new(reconcile_plan_indexes(*filter.input, table_metas));
+            LogicalPlan::Filter(filter)
+        }
+        LogicalPlan::Project(mut project) => {
+            project.input = Box::new(reconcile_plan_indexes(*project.input, table_metas));
+            LogicalPlan::Project(project)
+        }
+        LogicalPlan::Aggregate(mut aggregate) => {
+            aggregate.input = Box::new(reconcile_plan_indexes(*aggregate.input, table_metas));
+            LogicalPlan::Aggregate(aggregate)
+        }
+        LogicalPlan::Sort(mut sort) => {
+            sort.input = Box::new(reconcile_plan_indexes(*sort.input, table_metas));
+            LogicalPlan::Sort(sort)
+        }
+        LogicalPlan::Limit(mut limit) => {
+            limit.input = Box::new(reconcile_plan_indexes(*limit.input, table_metas));
+            LogicalPlan::Limit(limit)
+        }
+        LogicalPlan::TopN(mut topn) => {
+            topn.input = Box::new(reconcile_plan_indexes(*topn.input, table_metas));
+            LogicalPlan::TopN(topn)
+        }
+        LogicalPlan::Distinct(mut distinct) => {
+            distinct.input = Box::new(reconcile_plan_indexes(*distinct.input, table_metas));
+            LogicalPlan::Distinct(distinct)
+        }
+        LogicalPlan::Window(mut window) => {
+            window.input = Box::new(reconcile_plan_indexes(*window.input, table_metas));
+            LogicalPlan::Window(window)
+        }
+        LogicalPlan::Join(mut join) => {
+            join.left = Box::new(reconcile_plan_indexes(*join.left, table_metas));
+            join.right = Box::new(reconcile_plan_indexes(*join.right, table_metas));
+            LogicalPlan::Join(join)
+        }
+        LogicalPlan::SemiJoin(mut join) => {
+            join.left = Box::new(reconcile_plan_indexes(*join.left, table_metas));
+            join.right = Box::new(reconcile_plan_indexes(*join.right, table_metas));
+            LogicalPlan::SemiJoin(join)
+        }
+        LogicalPlan::Empty => LogicalPlan::Empty,
+    }
+}
+
+fn all_indexed_columns(meta: &TableMeta) -> Vec<String> {
+    let mut columns = bloom_indexed_columns(meta);
+    for column in meta.indexed_columns_by_type(SecondaryIndexType::MinMax) {
+        if !contains_column(&columns, &column) {
+            columns.push(column);
+        }
+    }
+    for column in meta.indexed_columns_by_type(SecondaryIndexType::Set) {
+        if !contains_column(&columns, &column) {
+            columns.push(column);
+        }
+    }
+    columns
+}
+
+fn bloom_indexed_columns(meta: &TableMeta) -> Vec<String> {
+    let mut columns = meta.indexed_columns_by_type(SecondaryIndexType::Bloom);
+    for index in &meta.unique_indexes {
+        for column in &index.columns {
+            if !contains_column(&columns, column) {
+                columns.push(column.clone());
+            }
+        }
+    }
+    columns
+}
+
+fn contains_column(columns: &[String], column: &str) -> bool {
+    columns.iter().any(|c| c.eq_ignore_ascii_case(column))
 }
 
 fn get_input_schema(plan: &LogicalPlan) -> Schema {

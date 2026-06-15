@@ -15,6 +15,8 @@ pub fn prune_row_groups(
     predicate: &RowGroupPredicate,
     eq_checks: &[(usize, ScalarValue)],
     in_checks: &[&InPredicate],
+    set_eq_checks: &[(usize, ScalarValue)],
+    set_in_checks: &[&InPredicate],
     _segment_zone_maps: &[ZoneMap],
 ) -> RowGroupPruneResult {
     let num_rgs = reader.num_row_groups();
@@ -23,8 +25,34 @@ pub fn prune_row_groups(
     for rg_idx in 0..num_rgs {
         let rg_zone_maps = reader.zone_maps(rg_idx);
         let rg_bloom_filters = reader.bloom_filters(rg_idx);
+        let rg_value_sets = reader.value_sets(rg_idx);
 
         if !predicate.matches_row_group(rg_zone_maps) {
+            continue;
+        }
+
+        let mut set_pass = true;
+        for (col_idx, val) in set_eq_checks {
+            if let Some(Some(values)) = rg_value_sets.get(*col_idx) {
+                if !values.contains(val) {
+                    set_pass = false;
+                    break;
+                }
+            }
+        }
+        if !set_pass {
+            continue;
+        }
+
+        for pred in set_in_checks {
+            if let Some(Some(values)) = rg_value_sets.get(pred.column_index) {
+                if !pred.values.iter().any(|value| values.contains(value)) {
+                    set_pass = false;
+                    break;
+                }
+            }
+        }
+        if !set_pass {
             continue;
         }
 
@@ -110,9 +138,31 @@ fn check_in_predicate_row_group(
 }
 
 pub fn build_bloom_check_list(spec: &super::spec::ScanSpec) -> Vec<(usize, ScalarValue)> {
-    spec.eq_predicates.clone()
+    spec.eq_predicates
+        .iter()
+        .filter(|(idx, _)| spec.bloom_index_columns.contains(idx))
+        .cloned()
+        .collect()
 }
 
 pub fn build_in_check_list(spec: &super::spec::ScanSpec) -> Vec<&InPredicate> {
-    spec.in_predicates.iter().collect()
+    spec.in_predicates
+        .iter()
+        .filter(|pred| spec.bloom_index_columns.contains(&pred.column_index))
+        .collect()
+}
+
+pub fn build_set_check_list(spec: &super::spec::ScanSpec) -> Vec<(usize, ScalarValue)> {
+    spec.eq_predicates
+        .iter()
+        .filter(|(idx, _)| spec.set_index_columns.contains(idx))
+        .cloned()
+        .collect()
+}
+
+pub fn build_set_in_check_list(spec: &super::spec::ScanSpec) -> Vec<&InPredicate> {
+    spec.in_predicates
+        .iter()
+        .filter(|pred| spec.set_index_columns.contains(&pred.column_index))
+        .collect()
 }

@@ -93,6 +93,7 @@ impl<'a> ScanExecutor<'a> {
         }
         let count = count::count_star(
             self.spec,
+            &self.table_meta,
             &table_dir,
             self.engine.segment_mgr(),
             self.engine.memtable_manager(),
@@ -128,6 +129,8 @@ impl<'a> ScanExecutor<'a> {
             let pred = self.spec.to_row_group_predicate();
             let bloom_checks = row_group::build_bloom_check_list(self.spec);
             let in_checks = row_group::build_in_check_list(self.spec);
+            let set_checks = row_group::build_set_check_list(self.spec);
+            let set_in_checks = row_group::build_set_in_check_list(self.spec);
 
             let mgr = self.engine.segment_mgr();
 
@@ -162,6 +165,8 @@ impl<'a> ScanExecutor<'a> {
                     &pred,
                     &bloom_checks,
                     &in_checks,
+                    &set_checks,
+                    &set_in_checks,
                     segment_zone_maps,
                 );
 
@@ -557,6 +562,10 @@ impl<'a> ScanExecutor<'a> {
         segments: &[PathBuf],
         bounds: &row_filter::ClusterKeyBounds,
     ) -> Option<(usize, usize)> {
+        if !self.cluster_segment_zone_maps_are_monotonic(segments, bounds.column_index) {
+            return None;
+        }
+
         let start = match &bounds.lower {
             Some((value, inclusive)) => self.first_segment_with_max_at_least(
                 segments,
@@ -582,6 +591,39 @@ impl<'a> ScanExecutor<'a> {
             None => segments.len().saturating_sub(1),
         };
         Some((start, end))
+    }
+
+    fn cluster_segment_zone_maps_are_monotonic(
+        &self,
+        segments: &[PathBuf],
+        col_idx: usize,
+    ) -> bool {
+        let mut prev_min: Option<crate::types::scalar::ScalarValue> = None;
+        let mut prev_max: Option<crate::types::scalar::ScalarValue> = None;
+
+        for segment in segments {
+            let Some(zm) = self.segment_cluster_zone_map(segment, col_idx) else {
+                return false;
+            };
+            if let Some(prev) = &prev_min {
+                if crate::storage::index::sort_key::compare_scalars_for_sort(&zm.min_value, prev)
+                    == std::cmp::Ordering::Less
+                {
+                    return false;
+                }
+            }
+            if let Some(prev) = &prev_max {
+                if crate::storage::index::sort_key::compare_scalars_for_sort(&zm.max_value, prev)
+                    == std::cmp::Ordering::Less
+                {
+                    return false;
+                }
+            }
+            prev_min = Some(zm.min_value);
+            prev_max = Some(zm.max_value);
+        }
+
+        true
     }
 
     fn first_segment_with_max_at_least(

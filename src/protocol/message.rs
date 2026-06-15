@@ -1,4 +1,4 @@
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use bytes::Bytes;
 
 pub const MAGIC: [u8; 2] = [0x01, 0xDB];

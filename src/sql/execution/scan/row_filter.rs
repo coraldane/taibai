@@ -175,6 +175,11 @@ fn eval_logical_expr_batch(
                     Ok(lm.iter().zip(rm.iter()).map(|(l, r)| *l || *r).collect())
                 }
                 BinOp::Eq => {
+                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
+                        return compare_simple_values(left, right, batch, |ord| {
+                            ord == std::cmp::Ordering::Equal
+                        });
+                    }
                     if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
                         (&**left, &**right)
                     {
@@ -191,7 +196,20 @@ fn eval_logical_expr_batch(
                     }
                     Ok(vec![true; num_rows])
                 }
+                BinOp::Neq => {
+                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
+                        return compare_simple_values(left, right, batch, |ord| {
+                            ord != std::cmp::Ordering::Equal
+                        });
+                    }
+                    Ok(vec![true; num_rows])
+                }
                 BinOp::Lt => {
+                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
+                        return compare_simple_values(left, right, batch, |ord| {
+                            ord == std::cmp::Ordering::Less
+                        });
+                    }
                     if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
                         (&**left, &**right)
                     {
@@ -202,6 +220,11 @@ fn eval_logical_expr_batch(
                     Ok(vec![true; num_rows])
                 }
                 BinOp::Gt => {
+                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
+                        return compare_simple_values(left, right, batch, |ord| {
+                            ord == std::cmp::Ordering::Greater
+                        });
+                    }
                     if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
                         (&**left, &**right)
                     {
@@ -212,6 +235,11 @@ fn eval_logical_expr_batch(
                     Ok(vec![true; num_rows])
                 }
                 BinOp::Lte => {
+                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
+                        return compare_simple_values(left, right, batch, |ord| {
+                            matches!(ord, std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                        });
+                    }
                     if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
                         (&**left, &**right)
                     {
@@ -222,6 +250,11 @@ fn eval_logical_expr_batch(
                     Ok(vec![true; num_rows])
                 }
                 BinOp::Gte => {
+                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
+                        return compare_simple_values(left, right, batch, |ord| {
+                            matches!(ord, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                        });
+                    }
                     if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
                         (&**left, &**right)
                     {
@@ -238,6 +271,13 @@ fn eval_logical_expr_batch(
             let inner_mask = eval_logical_expr_batch(inner, batch)?;
             Ok(inner_mask.iter().map(|m| !m).collect())
         }
+        LogicalExpr::Literal(value) => Ok(vec![
+            match value {
+                ScalarValue::Bool(Some(value)) => *value,
+                _ => !value.is_null(),
+            };
+            num_rows
+        ]),
         LogicalExpr::IsNull(inner) => {
             if let LogicalExpr::Column(idx) = &**inner {
                 if let Some(col) = batch.column(*idx) {
@@ -274,6 +314,39 @@ fn eval_logical_expr_batch(
         }
         _ => Ok(vec![true; num_rows]),
     }
+}
+
+fn is_simple_value_expr(expr: &crate::sql::planner::LogicalExpr) -> bool {
+    matches!(
+        expr,
+        crate::sql::planner::LogicalExpr::Column(_) | crate::sql::planner::LogicalExpr::Literal(_)
+    )
+}
+
+fn compare_simple_values<F>(
+    left: &crate::sql::planner::LogicalExpr,
+    right: &crate::sql::planner::LogicalExpr,
+    batch: &RecordBatch,
+    keep: F,
+) -> crate::common::error::Result<Vec<bool>>
+where
+    F: Fn(std::cmp::Ordering) -> bool,
+{
+    let left_values = eval_logical_value_batch(left, batch)?;
+    let right_values = eval_logical_value_batch(right, batch)?;
+    Ok(left_values
+        .iter()
+        .zip(right_values.iter())
+        .map(|(left, right)| {
+            if left.is_null() || right.is_null() {
+                false
+            } else {
+                keep(crate::storage::index::sort_key::compare_scalars_for_sort(
+                    left, right,
+                ))
+            }
+        })
+        .collect())
 }
 
 fn eval_logical_value_batch(

@@ -1,10 +1,10 @@
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{
     AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, GrantObject, PartitionDef,
-    PartitionStrategy, Privilege, Statement, TtlDef,
+    PartitionStrategy, Privilege, Statement, TtlDef, UniqueKeyDef,
 };
 use crate::sql::parser::lexer::Token;
 use crate::sql::parser::parser::{parse_data_type, Parser};
@@ -12,13 +12,89 @@ use crate::sql::parser::parser::{parse_data_type, Parser};
 impl Parser {
     pub fn parse_create(&mut self) -> Result<Statement> {
         self.expect(&Token::Create)?;
+        let unique = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("UNIQUE"));
+        if unique {
+            self.advance();
+            return self.parse_create_index_rest(true);
+        }
         match self.peek() {
             Token::Table => self.parse_create_table_rest(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("INDEX") => {
+                self.parse_create_index_rest(false)
+            }
             Token::Database => self.parse_create_database_rest(),
             Token::User => self.parse_create_user(),
             Token::Role => self.parse_create_role(),
             other => Err(TaibaiError::Sql(format!(
-                "expected TABLE, DATABASE, USER, or ROLE after CREATE, got {}",
+                "expected TABLE, DATABASE, USER, ROLE, or INDEX after CREATE, got {}",
+                other
+            ))),
+        }
+    }
+
+    fn parse_create_index_rest(&mut self, unique: bool) -> Result<Statement> {
+        match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("INDEX") => {
+                self.advance();
+            }
+            other => {
+                return Err(TaibaiError::Sql(format!(
+                    "expected INDEX after CREATE, got {}",
+                    other
+                )))
+            }
+        }
+        let if_not_exists = if self.peek() == &Token::If {
+            self.advance();
+            self.expect(&Token::Not)?;
+            self.expect(&Token::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect(&Token::On)?;
+        let table = self.parse_object_name()?;
+        self.expect(&Token::LeftParen)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_ident()?);
+            if self.peek() == &Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Token::RightParen)?;
+        let index_type = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("TYPE"))
+        {
+            self.advance();
+            Some(self.parse_index_type_name()?)
+        } else {
+            None
+        };
+        Ok(Statement::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            if_not_exists,
+            index_type,
+        })
+    }
+
+    fn parse_index_type_name(&mut self) -> Result<String> {
+        match self.peek().clone() {
+            Token::Ident(s) => {
+                self.advance();
+                Ok(s.to_ascii_lowercase())
+            }
+            Token::Set => {
+                self.advance();
+                Ok("set".to_string())
+            }
+            other => Err(TaibaiError::Sql(format!(
+                "expected index type name, got {}",
                 other
             ))),
         }
@@ -84,6 +160,7 @@ impl Parser {
         self.expect(&Token::LeftParen)?;
         let mut columns = Vec::new();
         let mut primary_key = Vec::new();
+        let mut unique_keys = Vec::new();
         loop {
             if self.peek() == &Token::Primary {
                 self.advance();
@@ -98,6 +175,8 @@ impl Parser {
                     }
                 }
                 self.expect(&Token::RightParen)?;
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("UNIQUE")) {
+                unique_keys.push(self.parse_unique_key_def()?);
             } else {
                 columns.push(self.parse_column_def()?);
             }
@@ -199,10 +278,36 @@ impl Parser {
             columns,
             if_not_exists,
             primary_key,
+            unique_keys,
             cluster_by,
             partition_by,
             ttl,
         })
+    }
+
+    fn parse_unique_key_def(&mut self) -> Result<UniqueKeyDef> {
+        self.expect_ident()?;
+        let mut name = None;
+        if matches!(self.peek(), Token::Key)
+            || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INDEX"))
+        {
+            self.advance();
+            if self.peek() != &Token::LeftParen {
+                name = Some(self.expect_ident()?);
+            }
+        }
+        self.expect(&Token::LeftParen)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_ident()?);
+            if self.peek() == &Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Token::RightParen)?;
+        Ok(UniqueKeyDef { name, columns })
     }
 
     fn parse_ttl_def(&mut self) -> Result<TtlDef> {
@@ -257,6 +362,7 @@ impl Parser {
         let mut precision = 0i32;
         let mut auto_increment = false;
         let mut primary_key = false;
+        let mut unique = false;
         let mut default_value: Option<DefaultValue> = None;
 
         if self.peek() == &Token::LeftParen {
@@ -285,6 +391,16 @@ impl Parser {
             self.advance();
             self.expect(&Token::Key)?;
             primary_key = true;
+        }
+
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("UNIQUE")) {
+            self.advance();
+            unique = true;
+            if self.peek() == &Token::Key
+                || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INDEX"))
+            {
+                self.advance();
+            }
         }
 
         if self.peek() == &Token::Default {
@@ -345,6 +461,7 @@ impl Parser {
             precision,
             auto_increment,
             primary_key,
+            unique,
             default_value,
         })
     }
@@ -353,6 +470,9 @@ impl Parser {
         self.expect(&Token::Drop)?;
         match self.peek() {
             Token::Table => self.parse_drop_table_rest(),
+            Token::Ident(word) if word.eq_ignore_ascii_case("INDEX") => {
+                self.parse_drop_index_rest()
+            }
             Token::Database => self.parse_drop_database_rest(),
             Token::User => self.parse_drop_user(),
             Token::Role => self.parse_drop_role(),
@@ -360,7 +480,7 @@ impl Parser {
                 self.parse_drop_change_consumer()
             }
             other => Err(TaibaiError::Sql(format!(
-                "expected TABLE, DATABASE, USER, ROLE, or CHANGE after DROP, got {}",
+                "expected TABLE, DATABASE, USER, ROLE, INDEX, or CHANGE after DROP, got {}",
                 other
             ))),
         }
@@ -554,6 +674,25 @@ impl Parser {
         Ok(Statement::DropDatabase { name, if_exists })
     }
 
+    fn parse_drop_index_rest(&mut self) -> Result<Statement> {
+        self.expect_ident()?;
+        let if_exists = if self.peek() == &Token::If {
+            self.advance();
+            self.expect(&Token::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect(&Token::On)?;
+        let table = self.parse_object_name()?;
+        Ok(Statement::DropIndex {
+            name,
+            table,
+            if_exists,
+        })
+    }
+
     fn parse_drop_table_rest(&mut self) -> Result<Statement> {
         self.expect(&Token::Table)?;
 
@@ -597,6 +736,11 @@ impl Parser {
                     self.advance();
                     let column = self.parse_column_def()?;
                     AlterOperation::AddColumn { column }
+                } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("UNIQUE"))
+                {
+                    AlterOperation::AddUniqueKey {
+                        key: self.parse_unique_key_def()?,
+                    }
                 } else if self.peek() == &Token::Partition {
                     self.advance();
                     let partition_key = self.expect_ident()?;
@@ -616,6 +760,12 @@ impl Parser {
                     self.advance();
                     let partition_key = self.expect_ident()?;
                     AlterOperation::DropPartition { partition_key }
+                } else if self.peek() == &Token::Key
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INDEX"))
+                {
+                    self.advance();
+                    let name = self.expect_ident()?;
+                    AlterOperation::DropIndex { name }
                 } else if is_ttl_token(self.peek()) {
                     self.advance();
                     AlterOperation::DropTtl
@@ -659,7 +809,9 @@ impl Parser {
                     let new_name = self.expect_ident()?;
                     AlterOperation::RenameTable { new_name }
                 } else {
-                    return Err(TaibaiError::Sql("expected COLUMN or TO after RENAME".into()));
+                    return Err(TaibaiError::Sql(
+                        "expected COLUMN or TO after RENAME".into(),
+                    ));
                 }
             } else if self.peek() == &Token::Modify {
                 self.advance();

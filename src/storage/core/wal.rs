@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 
 pub const FILE_PREFIX: &str = "wal_";
 pub const FILE_SUFFIX: &str = ".log";

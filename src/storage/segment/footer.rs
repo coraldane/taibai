@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::codec::io_util::{read_len_prefixed_str, read_u32_le, read_u64_le, read_u8};
 use crate::storage::codec::scalar_tag::decode_scalar_with_tag;
@@ -10,6 +10,7 @@ use crate::types::batch::{ColumnDef, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::constants::SEGMENT_MAGIC;
+use super::writer::VALUE_SET_EXTENSION_MAGIC;
 use super::RowGroupMeta;
 
 pub struct ParsedSegmentFooter {
@@ -139,6 +140,27 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
             }
         }
 
+        let value_sets = if peek_u32(buf, &cursor) == Some(VALUE_SET_EXTENSION_MAGIC) {
+            let _magic = read_u32_le(&mut cursor)?;
+            let mut value_sets = Vec::with_capacity(col_count);
+            for _ in 0..col_count {
+                let has_set = read_u8(&mut cursor)?;
+                if has_set != 0 {
+                    let value_count = read_u32_le(&mut cursor)? as usize;
+                    let mut values = Vec::with_capacity(value_count);
+                    for _ in 0..value_count {
+                        values.push(decode_scalar_with_tag(&mut cursor)?);
+                    }
+                    value_sets.push(Some(values));
+                } else {
+                    value_sets.push(None);
+                }
+            }
+            value_sets
+        } else {
+            vec![None; col_count]
+        };
+
         row_groups.push(RowGroupMeta {
             offset,
             length,
@@ -148,6 +170,7 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
             uncompressed_sizes,
             zone_maps,
             bloom_filters,
+            value_sets,
         });
     }
 
@@ -175,6 +198,14 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
         delete_bitmap,
         segment_zone_maps,
     })
+}
+
+fn peek_u32(buf: &[u8], cursor: &Cursor<&[u8]>) -> Option<u32> {
+    let pos = cursor.position() as usize;
+    if pos + 4 > buf.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?))
 }
 
 pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
@@ -245,8 +276,31 @@ pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
                 cursor.set_position(end as u64);
             }
         }
+        skip_value_set_extension(buf, &mut cursor, col_count)?;
     }
     Ok(cursor.position() as usize)
+}
+
+fn skip_value_set_extension(
+    buf: &[u8],
+    cursor: &mut Cursor<&[u8]>,
+    col_count: usize,
+) -> Result<()> {
+    if peek_u32(buf, cursor) != Some(VALUE_SET_EXTENSION_MAGIC) {
+        return Ok(());
+    }
+
+    let _magic = read_u32_le(cursor)?;
+    for _ in 0..col_count {
+        let has_set = read_u8(cursor)?;
+        if has_set != 0 {
+            let value_count = read_u32_le(cursor)? as usize;
+            for _ in 0..value_count {
+                let _ = decode_scalar_with_tag(cursor)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -254,6 +308,7 @@ mod tests {
     use super::*;
     use crate::storage::codec::io_util::encode_len_prefixed_str;
     use crate::storage::codec::scalar_tag::encode_scalar_with_tag;
+    use crate::storage::segment::writer::encode_segment_footer;
 
     #[test]
     fn parses_footer_with_u8_decimal_meta() {
@@ -300,5 +355,60 @@ mod tests {
             reserved_section_offset(&footer).unwrap(),
             footer.len() - std::mem::size_of::<u64>() - std::mem::size_of::<u32>()
         );
+    }
+
+    #[test]
+    fn reserved_section_offset_skips_value_sets_for_all_row_groups() {
+        let schema = Schema::new(vec![ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            scale: 0,
+            precision: 0,
+            auto_increment: false,
+            primary_key: false,
+            default_value: None,
+        }]);
+        let row_groups = vec![
+            RowGroupMeta {
+                offset: 32,
+                length: 8,
+                row_count: 1,
+                column_compressed_sizes: vec![8],
+                compressed_sizes: vec![8],
+                uncompressed_sizes: vec![8],
+                zone_maps: vec![ZoneMap {
+                    min_value: ScalarValue::Int64(Some(1)),
+                    max_value: ScalarValue::Int64(Some(1)),
+                    null_count: 0,
+                    row_count: 1,
+                }],
+                bloom_filters: vec![None],
+                value_sets: vec![Some(vec![ScalarValue::Int64(Some(1))])],
+            },
+            RowGroupMeta {
+                offset: 40,
+                length: 8,
+                row_count: 1,
+                column_compressed_sizes: vec![8],
+                compressed_sizes: vec![8],
+                uncompressed_sizes: vec![8],
+                zone_maps: vec![ZoneMap {
+                    min_value: ScalarValue::Int64(Some(2)),
+                    max_value: ScalarValue::Int64(Some(2)),
+                    null_count: 0,
+                    row_count: 1,
+                }],
+                bloom_filters: vec![None],
+                value_sets: vec![Some(vec![ScalarValue::Int64(Some(2))])],
+            },
+        ];
+        let footer = encode_segment_footer(&schema, 2, &row_groups, &[0], 1, "t", &[]);
+
+        assert_eq!(
+            reserved_section_offset(&footer).unwrap(),
+            footer.len() - std::mem::size_of::<u64>() - std::mem::size_of::<u32>() - 1
+        );
+        parse_segment_footer(&footer).unwrap();
     }
 }

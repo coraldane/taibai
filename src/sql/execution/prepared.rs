@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::collections::{HashMap, VecDeque};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::sql::parser::ast::{Expr, Statement};
 use crate::sql::parser::parser::Parser;
 use crate::sql::planner::LogicalPlan;

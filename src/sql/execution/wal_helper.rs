@@ -268,12 +268,16 @@ pub fn deserialize_batch_from_wal(
 
     let payload = if flags & FLAG_COMPRESSED != 0 {
         if data.len() < 13 {
-            return Err(TaibaiError::Internal("WAL compressed data too short".into()));
+            return Err(TaibaiError::Internal(
+                "WAL compressed data too short".into(),
+            ));
         }
         let uncompressed_len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
         let compressed_len = u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
         if data.len() < 13 + compressed_len {
-            return Err(TaibaiError::Internal("WAL compressed data truncated".into()));
+            return Err(TaibaiError::Internal(
+                "WAL compressed data truncated".into(),
+            ));
         }
         zstd::bulk::decompress(&data[13..13 + compressed_len], uncompressed_len)
             .map_err(|e| TaibaiError::Internal(format!("WAL decompression failed: {}", e)))?
@@ -472,7 +476,9 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::UInt16 => {
             if *pos + 2 > data.len() {
-                return Err(TaibaiError::Internal("WAL data truncated for UInt16".into()));
+                return Err(TaibaiError::Internal(
+                    "WAL data truncated for UInt16".into(),
+                ));
             }
             let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
             *pos += 2;
@@ -480,7 +486,9 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::UInt32 => {
             if *pos + 4 > data.len() {
-                return Err(TaibaiError::Internal("WAL data truncated for UInt32".into()));
+                return Err(TaibaiError::Internal(
+                    "WAL data truncated for UInt32".into(),
+                ));
             }
             let v =
                 u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
@@ -489,7 +497,9 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::UInt64 => {
             if *pos + 8 > data.len() {
-                return Err(TaibaiError::Internal("WAL data truncated for UInt64".into()));
+                return Err(TaibaiError::Internal(
+                    "WAL data truncated for UInt64".into(),
+                ));
             }
             let v = u64::from_le_bytes([
                 data[*pos],
@@ -656,7 +666,9 @@ fn decode_fixed_value(
         }
         crate::protocol::types::DataType::Vector => {
             if *pos + 4 > data.len() {
-                return Err(TaibaiError::Internal("WAL data truncated for Vector".into()));
+                return Err(TaibaiError::Internal(
+                    "WAL data truncated for Vector".into(),
+                ));
             }
             let len =
                 u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]])

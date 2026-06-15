@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::codec::io_util::{read_u32_le, read_u8};
 use crate::types::scalar::ScalarValue;

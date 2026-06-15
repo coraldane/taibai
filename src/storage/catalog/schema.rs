@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::types::batch::ColumnDef;
 
 /// Partition type for a table.
@@ -57,6 +57,28 @@ fn default_ttl_column_idx() -> i32 {
 
 /// Table metadata stored in the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniqueIndexMeta {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SecondaryIndexType {
+    #[default]
+    Bloom,
+    MinMax,
+    Set,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecondaryIndexMeta {
+    pub name: String,
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub index_type: SecondaryIndexType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMeta {
     pub name: String,
     pub database: String,
@@ -80,6 +102,10 @@ pub struct TableMeta {
     pub partition_key_idx: i32,
     #[serde(default)]
     pub ttl: Option<TtlInfo>,
+    #[serde(default)]
+    pub unique_indexes: Vec<UniqueIndexMeta>,
+    #[serde(default)]
+    pub secondary_indexes: Vec<SecondaryIndexMeta>,
 }
 
 impl TableMeta {
@@ -103,6 +129,8 @@ impl TableMeta {
             partitions: Vec::new(),
             partition_key_idx: -1,
             ttl: None,
+            unique_indexes: Vec::new(),
+            secondary_indexes: Vec::new(),
         }
     }
 
@@ -184,6 +212,135 @@ impl TableMeta {
         self.partition_type != PartitionType::None
     }
 
+    pub fn drop_unique_index(&mut self, name: &str) -> Result<()> {
+        let before = self.unique_indexes.len();
+        self.unique_indexes
+            .retain(|idx| !idx.name.eq_ignore_ascii_case(name));
+        if self.unique_indexes.len() == before {
+            return Err(TaibaiError::Sql(format!("index '{}' does not exist", name)));
+        }
+        Ok(())
+    }
+
+    pub fn drop_secondary_index(&mut self, name: &str) -> Result<()> {
+        let before = self.secondary_indexes.len();
+        self.secondary_indexes
+            .retain(|idx| !idx.name.eq_ignore_ascii_case(name));
+        if self.secondary_indexes.len() == before {
+            return Err(TaibaiError::Sql(format!("index '{}' does not exist", name)));
+        }
+        Ok(())
+    }
+
+    pub fn has_index(&self, name: &str) -> bool {
+        self.unique_indexes
+            .iter()
+            .any(|idx| idx.name.eq_ignore_ascii_case(name))
+            || self
+                .secondary_indexes
+                .iter()
+                .any(|idx| idx.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn indexed_columns_by_type(&self, index_type: SecondaryIndexType) -> Vec<String> {
+        let mut columns = Vec::new();
+        for index in &self.secondary_indexes {
+            if index.index_type != index_type {
+                continue;
+            }
+            for column in &index.columns {
+                if !columns
+                    .iter()
+                    .any(|c: &String| c.eq_ignore_ascii_case(column))
+                {
+                    columns.push(column.clone());
+                }
+            }
+        }
+        columns
+    }
+
+    pub fn add_unique_index(&mut self, name: &str, columns: Vec<String>) -> Result<()> {
+        if self
+            .unique_indexes
+            .iter()
+            .any(|idx| idx.name.eq_ignore_ascii_case(name))
+            || self
+                .secondary_indexes
+                .iter()
+                .any(|idx| idx.name.eq_ignore_ascii_case(name))
+        {
+            return Err(TaibaiError::Sql(format!("index '{}' already exists", name)));
+        }
+        for column in &columns {
+            if !self
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(column))
+            {
+                return Err(TaibaiError::Sql(format!(
+                    "unique index column '{}' not found",
+                    column
+                )));
+            }
+        }
+        self.unique_indexes.push(UniqueIndexMeta {
+            name: name.to_string(),
+            columns,
+        });
+        Ok(())
+    }
+
+    pub fn add_secondary_index(
+        &mut self,
+        name: &str,
+        columns: Vec<String>,
+        index_type: SecondaryIndexType,
+    ) -> Result<()> {
+        if self
+            .secondary_indexes
+            .iter()
+            .any(|idx| idx.name.eq_ignore_ascii_case(name))
+            || self
+                .unique_indexes
+                .iter()
+                .any(|idx| idx.name.eq_ignore_ascii_case(name))
+        {
+            return Err(TaibaiError::Sql(format!("index '{}' already exists", name)));
+        }
+        if columns.is_empty() {
+            return Err(TaibaiError::Sql(
+                "index must contain at least one column".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for column in &columns {
+            let Some((idx, _)) = self
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name.eq_ignore_ascii_case(column))
+            else {
+                return Err(TaibaiError::Sql(format!(
+                    "index column '{}' not found",
+                    column
+                )));
+            };
+            if !seen.insert(idx) {
+                return Err(TaibaiError::Sql(format!(
+                    "duplicate index column '{}'",
+                    column
+                )));
+            }
+        }
+        self.secondary_indexes.push(SecondaryIndexMeta {
+            name: name.to_string(),
+            columns,
+            index_type,
+        });
+        Ok(())
+    }
+
     pub fn get_partition_column_index(&self) -> Option<usize> {
         if self.partition_key.is_empty() {
             return None;
@@ -242,8 +399,9 @@ impl DatabaseCatalog {
     pub fn save(&self, meta_dir: &Path) -> Result<()> {
         let schema_path = Self::catalog_path(meta_dir, &self.name);
         if let Some(parent) = schema_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| TaibaiError::Storage(format!("failed to create catalog dir: {}", e)))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                TaibaiError::Storage(format!("failed to create catalog dir: {}", e))
+            })?;
         }
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| TaibaiError::Storage(format!("failed to serialize catalog: {}", e)))?;

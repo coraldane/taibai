@@ -2,11 +2,11 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::net::session::Session;
 use crate::storage::catalog::auth::{AuthManager, PermissionObjectType, PermissionType};
 use crate::storage::catalog::auto_increment::AutoIncrementManager;
@@ -17,7 +17,7 @@ use crate::storage::change_stream::{
 use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
 use crate::storage::core::memtable::MemTableManager;
 use crate::storage::index::index_manager::IndexManager;
-use crate::storage::segment_manager::SegmentManager;
+use crate::storage::segment_manager::{SegmentConfig, SegmentManager};
 
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
@@ -45,6 +45,9 @@ pub struct Engine {
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
     bulk_mode_sessions: AtomicUsize,
+    auto_compact_enabled: AtomicBool,
+    in_flight_operations: AtomicUsize,
+    last_activity_epoch_ms: AtomicU64,
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
@@ -68,6 +71,20 @@ impl Engine {
         data_dir: &Path,
         default_database: &str,
         change_stream_retention_events: usize,
+    ) -> Result<Self> {
+        Self::new_with_storage_config(
+            data_dir,
+            default_database,
+            change_stream_retention_events,
+            SegmentConfig::default(),
+        )
+    }
+
+    pub fn new_with_storage_config(
+        data_dir: &Path,
+        default_database: &str,
+        change_stream_retention_events: usize,
+        segment_config: SegmentConfig,
     ) -> Result<Self> {
         let mut catalogs = HashMap::new();
         let meta_dir = data_dir.join("meta");
@@ -119,7 +136,7 @@ impl Engine {
             catalogs.insert(default_database.to_string(), catalog);
         }
 
-        let segment_mgr = Arc::new(SegmentManager::new(data_dir)?);
+        let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
         let batch_writer = BatchWriter::new(BatchWriterConfig::default(), Arc::clone(&segment_mgr));
@@ -177,6 +194,9 @@ impl Engine {
             segment_mgr,
             batch_writer,
             bulk_mode_sessions: AtomicUsize::new(0),
+            auto_compact_enabled: AtomicBool::new(true),
+            in_flight_operations: AtomicUsize::new(0),
+            last_activity_epoch_ms: AtomicU64::new(current_epoch_millis()),
             auth_manager,
             auto_increment_mgr,
             index_manager,
@@ -185,6 +205,7 @@ impl Engine {
     }
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
+        let _op_guard = self.begin_operation();
         if sql.as_bytes().first().map(|b| b.to_ascii_uppercase()) == Some(b'I') {
             if let Some(result) = crate::sql::parser::fast_insert::try_fast_parse_insert(sql) {
                 let stmt = result?;
@@ -203,6 +224,7 @@ impl Engine {
         session: &mut Session,
         prepared: &mut crate::sql::execution::prepared::PreparedStatement,
     ) -> Result<ExecResult> {
+        let _op_guard = self.begin_operation();
         let has_placeholders = crate::sql::execution::prepared::has_placeholders(&prepared.stmt);
         let mut stmt = prepared.stmt.clone();
         if !prepared.params.is_empty() {
@@ -274,6 +296,7 @@ impl Engine {
                 columns,
                 if_not_exists,
                 primary_key,
+                unique_keys,
                 cluster_by,
                 partition_by,
                 ttl,
@@ -288,6 +311,7 @@ impl Engine {
                     columns,
                     *if_not_exists,
                     primary_key,
+                    unique_keys,
                     cluster_by,
                     partition_by,
                     ttl,
@@ -304,6 +328,34 @@ impl Engine {
                 }
                 result
             }
+            Statement::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                if_not_exists,
+                index_type,
+            } => super::ddl::exec_create_index(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+                name,
+                columns,
+                *unique,
+                *if_not_exists,
+                index_type.as_deref(),
+            ),
+            Statement::DropIndex {
+                name,
+                table,
+                if_exists,
+            } => super::ddl::exec_drop_index(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
+                name,
+                *if_exists,
+            ),
             Statement::DropTable { name, if_exists } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
@@ -617,11 +669,20 @@ impl Engine {
                 ),
                 None => super::ddl::exec_flush_table(self, &session.database, &None),
             },
-            Statement::OptimizeTable { table } => super::ddl::exec_optimize_table(
+            Statement::OptimizeTable { table, partition } => super::ddl::exec_optimize_table(
                 self,
                 table.effective_database(&session.database),
                 &table.name,
+                partition.as_deref(),
             ),
+            Statement::StartAutoCompact => {
+                self.set_auto_compact_enabled(true);
+                Ok(ExecResult::Ok { rows_affected: 0 })
+            }
+            Statement::StopAutoCompact => {
+                self.set_auto_compact_enabled(false);
+                Ok(ExecResult::Ok { rows_affected: 0 })
+            }
             Statement::PauseFlush => {
                 self.segment_mgr().pause_flush();
                 Ok(ExecResult::Ok { rows_affected: 0 })
@@ -640,6 +701,18 @@ impl Engine {
                 PermissionType::Create,
                 name.effective_database(&session.database),
                 &name.name,
+            ),
+            Statement::CreateIndex { table, .. } => self.require_table_permission(
+                session,
+                PermissionType::Create,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::DropIndex { table, .. } => self.require_table_permission(
+                session,
+                PermissionType::Drop,
+                table.effective_database(&session.database),
+                &table.name,
             ),
             Statement::DropTable { name, .. } => self.require_table_permission(
                 session,
@@ -750,7 +823,7 @@ impl Engine {
                     )
                 }
             }
-            Statement::OptimizeTable { table } => self.require_table_permission(
+            Statement::OptimizeTable { table, .. } => self.require_table_permission(
                 session,
                 PermissionType::Alter,
                 table.effective_database(&session.database),
@@ -780,6 +853,8 @@ impl Engine {
             | Statement::ShowChangeEvents { .. }
             | Statement::ResetChangeConsumer { .. }
             | Statement::DropChangeConsumer { .. }
+            | Statement::StartAutoCompact
+            | Statement::StopAutoCompact
             | Statement::PauseFlush
             | Statement::ResumeFlush => self.require_global_admin(session),
         }
@@ -1057,6 +1132,38 @@ impl Engine {
         self.bulk_mode_sessions.load(Ordering::Acquire)
     }
 
+    pub fn set_auto_compact_enabled(&self, enabled: bool) {
+        self.auto_compact_enabled.store(enabled, Ordering::Release);
+        tracing::info!(enabled, "auto compact runtime flag updated");
+    }
+
+    pub fn auto_compact_enabled(&self) -> bool {
+        self.auto_compact_enabled.load(Ordering::Acquire)
+    }
+
+    fn begin_operation(&self) -> EngineOperationGuard<'_> {
+        self.mark_activity();
+        self.in_flight_operations.fetch_add(1, Ordering::AcqRel);
+        EngineOperationGuard { engine: self }
+    }
+
+    fn mark_activity(&self) {
+        self.last_activity_epoch_ms
+            .store(current_epoch_millis(), Ordering::Release);
+    }
+
+    pub fn is_idle_for(&self, duration: Duration) -> bool {
+        if self.in_flight_operations.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        let last = self.last_activity_epoch_ms.load(Ordering::Acquire);
+        current_epoch_millis().saturating_sub(last) >= duration.as_millis() as u64
+    }
+
+    pub fn has_active_segments(&self) -> bool {
+        self.segment_mgr.has_active_segments()
+    }
+
     pub fn alloc_txn_id(&self) -> u64 {
         self.segment_mgr.alloc_txn_id()
     }
@@ -1123,6 +1230,40 @@ impl Engine {
         Ok(())
     }
 
+    fn validate_batch_unique_indexes(
+        &self,
+        db: &str,
+        table: &str,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let catalogs = self.catalogs.read().unwrap();
+        let Some(catalog) = catalogs.get(db) else {
+            return Ok(());
+        };
+        let Some(table_meta) = catalog.get_table(table) else {
+            return Ok(());
+        };
+        let schema = Schema::new(table_meta.columns.clone());
+        for index in &table_meta.unique_indexes {
+            let mut indices = Vec::with_capacity(index.columns.len());
+            for column in &index.columns {
+                indices.push(schema.index_of(column).ok_or_else(|| {
+                    TaibaiError::Sql(format!("unique index column '{}' not found", column))
+                })?);
+            }
+            super::dml_insert::validate_unique_key_uniqueness(
+                self,
+                db,
+                table,
+                &schema,
+                &indices,
+                &index.name,
+                Some(batch),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn exec_bulk_insert_with_wal_control(
         &self,
         db: &str,
@@ -1130,6 +1271,7 @@ impl Engine {
         batch: RecordBatch,
         disable_wal: bool,
     ) -> Result<u64> {
+        self.validate_batch_unique_indexes(db, table, &batch)?;
         if self.is_bulk_mode() {
             self.segment_mgr
                 .bulk_insert_batch_deferred(db, table, batch, disable_wal)
@@ -1147,6 +1289,7 @@ impl Engine {
         batch: RecordBatch,
         disable_wal: bool,
     ) -> Result<u64> {
+        self.validate_batch_unique_indexes(db, table, &batch)?;
         if self.is_bulk_mode() {
             self.segment_mgr
                 .bulk_insert_batch_partitioned_deferred(db, table, table_meta, batch)
@@ -1175,11 +1318,22 @@ impl Engine {
         disable_wal: bool,
         bulk_import_mode: bool,
     ) -> Result<u64> {
+        let _op_guard = self.begin_operation();
         let table_name = bulk_payload_table_name(payload)?.to_string();
         let catalogs = self.catalogs.read().unwrap();
         let catalog = catalogs
             .get(db)
             .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+
+        if let Some(table_meta) = catalog.get_table(&table_name) {
+            if !table_meta.unique_indexes.is_empty() {
+                let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
+                let schema = Schema::new(table_meta.columns.clone());
+                let batch =
+                    crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)?;
+                self.validate_batch_unique_indexes(db, &table_name, &batch)?;
+            }
+        }
 
         let result = self.segment_mgr.bulk_insert_payload_with_catalog(
             db,
@@ -1235,6 +1389,26 @@ impl Engine {
         }
         Ok(result)
     }
+}
+
+struct EngineOperationGuard<'a> {
+    engine: &'a Engine,
+}
+
+impl Drop for EngineOperationGuard<'_> {
+    fn drop(&mut self) {
+        self.engine
+            .in_flight_operations
+            .fetch_sub(1, Ordering::AcqRel);
+        self.engine.mark_activity();
+    }
+}
+
+fn current_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn bulk_payload_table_name(payload: &[u8]) -> Result<&str> {

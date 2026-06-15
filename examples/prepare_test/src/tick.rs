@@ -33,7 +33,7 @@ pub const TICK_CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS {table} ( \
     bid_vol4 INT32, \
     bid_vol5 INT32, \
     local_time TIMESTAMP \
-) PARTITION BY deal_date CLUSTER BY security_id";
+) PARTITION BY deal_date CLUSTER BY (security_id, deal_date, deal_time)";
 
 pub const TICK_INSERT_SQL: &str = "INSERT INTO {table} (security_id, deal_date, deal_time, pre_close, open_px, high_px, low_px, close_px, high_limit, low_limit, total_num_trade, trans_volume, trans_value, ask_px1, ask_px2, ask_px3, ask_px4, ask_px5, ask_vol1, ask_vol2, ask_vol3, ask_vol4, ask_vol5, bid_px1, bid_px2, bid_px3, bid_px4, bid_px5, bid_vol1, bid_vol2, bid_vol3, bid_vol4, bid_vol5, local_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 

@@ -39,6 +39,8 @@ impl ObjectName {
 pub enum AlterOperation {
     AddColumn { column: ColumnDefAst },
     DropColumn { name: String },
+    AddUniqueKey { key: UniqueKeyDef },
+    DropIndex { name: String },
     RenameColumn { old_name: String, new_name: String },
     ModifyColumn { column: ColumnDefAst },
     RenameTable { new_name: String },
@@ -79,17 +81,31 @@ pub enum GrantObject {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    CreateIndex {
+        name: String,
+        table: ObjectName,
+        columns: Vec<String>,
+        unique: bool,
+        if_not_exists: bool,
+        index_type: Option<String>,
+    },
     CreateTable {
         name: ObjectName,
         columns: Vec<ColumnDefAst>,
         if_not_exists: bool,
         primary_key: Vec<String>,
+        unique_keys: Vec<UniqueKeyDef>,
         cluster_by: Option<Vec<String>>,
         partition_by: Option<PartitionDef>,
         ttl: Option<TtlDef>,
     },
     DropTable {
         name: ObjectName,
+        if_exists: bool,
+    },
+    DropIndex {
+        name: String,
+        table: ObjectName,
         if_exists: bool,
     },
     AlterTable {
@@ -226,7 +242,10 @@ pub enum Statement {
     },
     OptimizeTable {
         table: ObjectName,
+        partition: Option<String>,
     },
+    StartAutoCompact,
+    StopAutoCompact,
     PauseFlush,
     ResumeFlush,
 }
@@ -238,6 +257,12 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct UniqueKeyDef {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDefAst {
     pub name: String,
     pub data_type: DataType,
@@ -246,6 +271,7 @@ pub struct ColumnDefAst {
     pub precision: i32,
     pub auto_increment: bool,
     pub primary_key: bool,
+    pub unique: bool,
     pub default_value: Option<DefaultValue>,
 }
 
@@ -265,6 +291,7 @@ impl ColumnDefAst {
             precision: 0,
             auto_increment: false,
             primary_key: false,
+            unique: false,
             default_value: None,
         }
     }

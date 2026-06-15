@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::codec::column_codec::{decode_column, decode_column_selected};
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
@@ -172,6 +172,13 @@ impl SegmentReader {
 
     pub fn bloom_filters(&self, row_group: usize) -> &[Option<BloomFilter>] {
         &self.footer.row_groups[row_group].bloom_filters
+    }
+
+    pub fn value_sets(
+        &self,
+        row_group: usize,
+    ) -> &[Option<Vec<crate::types::scalar::ScalarValue>>] {
+        &self.footer.row_groups[row_group].value_sets
     }
 
     pub fn segment_zone_maps(&self) -> &[ZoneMap] {

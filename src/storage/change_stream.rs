@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::types::scalar::ScalarValue;
 
 const DEFAULT_RECENT_EVENTS: usize = 1024;
@@ -323,7 +323,9 @@ impl ChangeStream {
         let entry = outbox
             .iter_mut()
             .find(|entry| entry.id == id)
-            .ok_or_else(|| TaibaiError::Storage(format!("change stream outbox {} not found", id)))?;
+            .ok_or_else(|| {
+                TaibaiError::Storage(format!("change stream outbox {} not found", id))
+            })?;
         entry.state = ChangeOutboxState::Committed;
         self.save_outbox(&outbox)
     }
@@ -620,8 +622,9 @@ fn load_consumers(path: &Path) -> Result<HashMap<String, u64>> {
         return Ok(HashMap::new());
     }
     let data = std::fs::read(path)?;
-    serde_json::from_slice(&data)
-        .map_err(|e| TaibaiError::Storage(format!("failed to parse change stream consumers: {}", e)))
+    serde_json::from_slice(&data).map_err(|e| {
+        TaibaiError::Storage(format!("failed to parse change stream consumers: {}", e))
+    })
 }
 
 fn load_outbox(path: &Path) -> Result<Vec<ChangeOutboxEntry>> {

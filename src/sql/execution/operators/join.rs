@@ -2,7 +2,9 @@
 /// Supports: Inner, Left, Right, Full, Cross, Semi, Anti, and Asof joins.
 /// Uses columnar data processing through RecordBatch for cache efficiency.
 use crate::common::error::Result;
+use crate::sql::execution::functions::registry::FunctionRegistry;
 use crate::sql::execution::join_hashtable::{AsofJoinIndex, JoinHashTable, RowPointer};
+use crate::sql::parser::ast::BinOp;
 use crate::sql::parser::ast::JoinType;
 use crate::sql::planner::LogicalExpr;
 use crate::types::array::ColumnArray;
@@ -164,9 +166,11 @@ impl HashJoinExec {
             };
             for ptr in &matches {
                 let left_row = self.collect_left_row(ptr);
-                self.probe_state
-                    .output_buffer
-                    .push((left_row, Some(right_row.clone())));
+                if self.join_rows_match(&left_row, &right_row)? {
+                    self.probe_state
+                        .output_buffer
+                        .push((left_row, Some(right_row.clone())));
+                }
             }
             if self.probe_state.output_buffer.is_empty() {
                 continue;
@@ -208,17 +212,17 @@ impl HashJoinExec {
                 // No left match for this right row - for LEFT JOIN, we don't emit this case
                 // We only emit unmatched left rows at the end
             } else {
-                {
-                    let ht = self.hash_table.as_mut().unwrap();
-                    for ptr in &matches {
-                        ht.mark_matched(ptr);
-                    }
-                }
                 for ptr in &matches {
                     let left_row = self.collect_left_row(ptr);
-                    self.probe_state
-                        .output_buffer
-                        .push((left_row, Some(right_row.clone())));
+                    if self.join_rows_match(&left_row, &right_row)? {
+                        {
+                            let ht = self.hash_table.as_mut().unwrap();
+                            ht.mark_matched(ptr);
+                        }
+                        self.probe_state
+                            .output_buffer
+                            .push((left_row, Some(right_row.clone())));
+                    }
                 }
             }
             if self.probe_state.output_buffer.is_empty() {
@@ -258,20 +262,20 @@ impl HashJoinExec {
                 ht.probe(&key)
             };
             if !matches.is_empty() {
-                {
-                    let ht = self.hash_table.as_mut().unwrap();
-                    for ptr in &matches {
-                        ht.mark_matched(ptr);
-                    }
-                }
                 for ptr in &matches {
                     let right_row = {
                         let ht = self.hash_table.as_ref().unwrap();
                         self.collect_build_row(ht, ptr)
                     };
-                    self.probe_state
-                        .output_buffer
-                        .push((left_row.clone(), Some(right_row)));
+                    if self.join_rows_match(&left_row, &right_row)? {
+                        {
+                            let ht = self.hash_table.as_mut().unwrap();
+                            ht.mark_matched(ptr);
+                        }
+                        self.probe_state
+                            .output_buffer
+                            .push((left_row.clone(), Some(right_row)));
+                    }
                 }
             }
             if self.probe_state.output_buffer.is_empty() {
@@ -316,20 +320,28 @@ impl HashJoinExec {
                     .output_buffer
                     .push((left_row, Some(null_right)));
             } else {
-                {
-                    let ht = self.hash_table.as_mut().unwrap();
-                    for ptr in &matches {
-                        ht.mark_matched(ptr);
-                    }
-                }
+                let mut matched_any = false;
                 for ptr in &matches {
                     let right_row = {
                         let ht = self.hash_table.as_ref().unwrap();
                         self.collect_build_row(ht, ptr)
                     };
+                    if self.join_rows_match(&left_row, &right_row)? {
+                        matched_any = true;
+                        {
+                            let ht = self.hash_table.as_mut().unwrap();
+                            ht.mark_matched(ptr);
+                        }
+                        self.probe_state
+                            .output_buffer
+                            .push((left_row.clone(), Some(right_row)));
+                    }
+                }
+                if !matched_any {
+                    let null_right = self.make_null_right_row();
                     self.probe_state
                         .output_buffer
-                        .push((left_row.clone(), Some(right_row)));
+                        .push((left_row, Some(null_right)));
                 }
             }
             if self.probe_state.output_buffer.is_empty() {
@@ -396,7 +408,9 @@ impl HashJoinExec {
             };
             for ptr in &matches {
                 let left_row = self.collect_left_row(ptr);
-                self.probe_state.output_buffer.push((left_row, None));
+                if self.join_rows_match(&left_row, &right_row)? {
+                    self.probe_state.output_buffer.push((left_row, None));
+                }
             }
             if self.probe_state.output_buffer.is_empty() {
                 continue;
@@ -421,11 +435,15 @@ impl HashJoinExec {
                     let _matches = {
                         let ht = self.hash_table.as_mut().unwrap();
                         let m = ht.probe(&key);
-                        for ptr in &m {
-                            ht.mark_matched(ptr);
-                        }
                         m
                     };
+                    for ptr in &_matches {
+                        let left_row = self.collect_left_row(ptr);
+                        if self.join_rows_match(&left_row, &right_row)? {
+                            let ht = self.hash_table.as_mut().unwrap();
+                            ht.mark_matched(ptr);
+                        }
+                    }
                 }
             }
             self.probe_state.right_collected = true;
@@ -604,6 +622,18 @@ impl HashJoinExec {
         Ok(())
     }
 
+    fn join_rows_match(&self, left_row: &[ScalarValue], right_row: &[ScalarValue]) -> Result<bool> {
+        match eval_join_expr(
+            &self.condition,
+            left_row,
+            right_row,
+            self.left_schema.columns.len(),
+        )? {
+            ScalarValue::Bool(Some(v)) => Ok(v),
+            value => Ok(!value.is_null()),
+        }
+    }
+
     fn drain_buffer(&mut self) -> Result<Option<RecordBatch>> {
         let start = self.probe_state.buffer_pos;
         let end = (start + Self::BATCH_SIZE).min(self.probe_state.output_buffer.len());
@@ -677,20 +707,114 @@ fn collect_keys(
     right_keys: &mut Vec<usize>,
 ) {
     match expr {
-        LogicalExpr::BinaryOp { left, op: _, right } => {
-            if let LogicalExpr::Column(l) = **left {
-                if let LogicalExpr::Column(r) = **right {
-                    if l < left_ncols && r >= left_ncols {
-                        left_keys.push(l);
-                        right_keys.push(r - left_ncols);
-                    } else if r < left_ncols && l >= left_ncols {
-                        left_keys.push(r);
-                        right_keys.push(l - left_ncols);
+        LogicalExpr::BinaryOp { left, op, right } => {
+            if matches!(op, BinOp::And) {
+                collect_keys(left, left_ncols, left_keys, right_keys);
+                collect_keys(right, left_ncols, left_keys, right_keys);
+                return;
+            }
+            if matches!(op, BinOp::Eq) {
+                if let LogicalExpr::Column(l) = **left {
+                    if let LogicalExpr::Column(r) = **right {
+                        if l < left_ncols && r >= left_ncols {
+                            left_keys.push(l);
+                            right_keys.push(r - left_ncols);
+                        } else if r < left_ncols && l >= left_ncols {
+                            left_keys.push(r);
+                            right_keys.push(l - left_ncols);
+                        }
                     }
                 }
             }
         }
         LogicalExpr::Literal(_) => {}
         _ => {}
+    }
+}
+
+fn eval_join_expr(
+    expr: &LogicalExpr,
+    left_row: &[ScalarValue],
+    right_row: &[ScalarValue],
+    left_ncols: usize,
+) -> Result<ScalarValue> {
+    match expr {
+        LogicalExpr::Column(idx) => {
+            if *idx < left_ncols {
+                Ok(left_row
+                    .get(*idx)
+                    .cloned()
+                    .unwrap_or(ScalarValue::Int64(None)))
+            } else {
+                Ok(right_row
+                    .get(*idx - left_ncols)
+                    .cloned()
+                    .unwrap_or(ScalarValue::Int64(None)))
+            }
+        }
+        LogicalExpr::Literal(value) => Ok(value.clone()),
+        LogicalExpr::BinaryOp { left, op, right } => {
+            if matches!(op, BinOp::And | BinOp::Or) {
+                let left_bool =
+                    scalar_truthy(&eval_join_expr(left, left_row, right_row, left_ncols)?);
+                let right_bool =
+                    scalar_truthy(&eval_join_expr(right, left_row, right_row, left_ncols)?);
+                return Ok(ScalarValue::Bool(Some(if matches!(op, BinOp::And) {
+                    left_bool && right_bool
+                } else {
+                    left_bool || right_bool
+                })));
+            }
+            let left_value = eval_join_expr(left, left_row, right_row, left_ncols)?;
+            let right_value = eval_join_expr(right, left_row, right_row, left_ncols)?;
+            Ok(eval_join_binary_scalar(&left_value, op, &right_value))
+        }
+        LogicalExpr::Not(inner) => {
+            let value = eval_join_expr(inner, left_row, right_row, left_ncols)?;
+            Ok(ScalarValue::Bool(Some(!scalar_truthy(&value))))
+        }
+        LogicalExpr::IsNull(inner) => {
+            let value = eval_join_expr(inner, left_row, right_row, left_ncols)?;
+            Ok(ScalarValue::Bool(Some(value.is_null())))
+        }
+        LogicalExpr::IsNotNull(inner) => {
+            let value = eval_join_expr(inner, left_row, right_row, left_ncols)?;
+            Ok(ScalarValue::Bool(Some(!value.is_null())))
+        }
+        LogicalExpr::Function { name, args } => {
+            let arg_values = args
+                .iter()
+                .map(|arg| eval_join_expr(arg, left_row, right_row, left_ncols))
+                .collect::<Result<Vec<_>>>()?;
+            FunctionRegistry::default().execute(name, &arg_values)
+        }
+        _ => Ok(ScalarValue::Int64(None)),
+    }
+}
+
+fn scalar_truthy(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Bool(Some(v)) => *v,
+        _ => !value.is_null(),
+    }
+}
+
+fn eval_join_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> ScalarValue {
+    if left.is_null() || right.is_null() {
+        return ScalarValue::Bool(None);
+    }
+    let cmp = left.numeric_cmp(right).or_else(|| match (left, right) {
+        (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => Some(l.cmp(r)),
+        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => Some(l.cmp(r)),
+        _ => None,
+    });
+    match op {
+        BinOp::Eq => ScalarValue::Bool(Some(cmp == Some(std::cmp::Ordering::Equal))),
+        BinOp::Neq => ScalarValue::Bool(Some(cmp != Some(std::cmp::Ordering::Equal))),
+        BinOp::Lt => ScalarValue::Bool(Some(cmp == Some(std::cmp::Ordering::Less))),
+        BinOp::Gt => ScalarValue::Bool(Some(cmp == Some(std::cmp::Ordering::Greater))),
+        BinOp::Lte => ScalarValue::Bool(Some(cmp != Some(std::cmp::Ordering::Greater))),
+        BinOp::Gte => ScalarValue::Bool(Some(cmp != Some(std::cmp::Ordering::Less))),
+        _ => ScalarValue::Bool(None),
     }
 }

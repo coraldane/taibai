@@ -5,6 +5,7 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
+use super::partition;
 use super::row_filter;
 use super::row_group;
 use super::spec::ScanSpec;
@@ -14,16 +15,23 @@ use std::path::Path;
 
 pub fn count_star(
     spec: &ScanSpec,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
     table_dir: &Path,
     segment_mgr: &SegmentManager,
     memtable_mgr: &crate::storage::core::memtable::MemTableManager,
     db: &str,
     stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<u64> {
-    let segment_files = SegmentManager::discover_segments(table_dir)?;
+    let segment_files = partition::prune_segments_by_partition(
+        SegmentManager::discover_segments(table_dir)?,
+        spec,
+        Some(table_meta),
+    );
     let pred = spec.to_row_group_predicate();
     let bloom_checks = row_group::build_bloom_check_list(spec);
     let in_checks = row_group::build_in_check_list(spec);
+    let set_checks = row_group::build_set_check_list(spec);
+    let set_in_checks = row_group::build_set_in_check_list(spec);
 
     let mut total_rows: u64 = 0;
 
@@ -50,6 +58,8 @@ pub fn count_star(
             &pred,
             &bloom_checks,
             &in_checks,
+            &set_checks,
+            &set_in_checks,
             &mut total_rows,
             stats,
         )?;
@@ -121,15 +131,12 @@ fn count_with_predicates(
     pred: &crate::storage::partition::pruning::RowGroupPredicate,
     bloom_checks: &[(usize, ScalarValue)],
     in_checks: &[&super::spec::InPredicate],
+    set_checks: &[(usize, ScalarValue)],
+    set_in_checks: &[&super::spec::InPredicate],
     total_rows: &mut u64,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<()> {
     let filter_columns = spec.all_predicate_columns();
-    let _projection = if filter_columns.is_empty() {
-        None
-    } else {
-        Some(filter_columns.as_slice())
-    };
 
     for seg_path in segment_files {
         let reader = segment_mgr.open_reader_cached(seg_path)?;
@@ -143,11 +150,17 @@ fn count_with_predicates(
             pred,
             bloom_checks,
             in_checks,
+            set_checks,
+            set_in_checks,
             reader.segment_zone_maps(),
         );
 
         for rg_idx in &prune_result.candidate_indices {
-            let mut batch = reader.read_row_group_with_projection(*rg_idx, &filter_columns)?;
+            let mut batch = if filter_columns.is_empty() {
+                reader.read_row_group(*rg_idx)?
+            } else {
+                reader.read_row_group_with_projection(*rg_idx, &filter_columns)?
+            };
             let bitmap_active = !reader.delete_bitmap().is_empty();
             if bitmap_active {
                 let rg_start_row: u64 = reader
@@ -159,14 +172,24 @@ fn count_with_predicates(
                 batch = delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
             }
 
-            let filtered = row_filter::apply_predicates_with_column_map(
-                &batch,
-                &filter_columns,
-                &spec.eq_predicates,
-                &spec.range_predicates,
-                &spec.in_predicates,
-                spec.remaining_predicate.as_ref(),
-            )?;
+            let filtered = if filter_columns.is_empty() {
+                row_filter::apply_predicates(
+                    &batch,
+                    &spec.eq_predicates,
+                    &spec.range_predicates,
+                    &spec.in_predicates,
+                    spec.remaining_predicate.as_ref(),
+                )
+            } else {
+                row_filter::apply_predicates_with_column_map(
+                    &batch,
+                    &filter_columns,
+                    &spec.eq_predicates,
+                    &spec.range_predicates,
+                    &spec.in_predicates,
+                    spec.remaining_predicate.as_ref(),
+                )?
+            };
             *total_rows += filtered.num_rows() as u64;
         }
 

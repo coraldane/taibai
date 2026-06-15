@@ -5,14 +5,14 @@ mod helpers;
 mod reader_cache;
 mod state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::bulk_payload::parse_direct_bulk_payload;
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
@@ -24,6 +24,7 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 pub use config::SegmentConfig;
+pub(crate) use helpers::direct_bulk_request_to_batch;
 pub use helpers::table_key;
 
 use active_writer::ActiveSegmentWriter;
@@ -32,8 +33,8 @@ use config::{
     FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
-    direct_bulk_request_to_batch, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
-    is_transient_footer_error, sort_batch_by_key_indices,
+    discover_max_seq, ensure_state_not_retired, filter_batch_by_mask, is_transient_footer_error,
+    sort_batch_by_key_indices,
 };
 use reader_cache::ReaderCache;
 use state::TableSegmentState;
@@ -73,6 +74,7 @@ impl SegmentManager {
                                 continue;
                             }
                             let tbl_dir = tbl_entry.path();
+                            cleanup_incomplete_compaction_files(&tbl_dir);
                             let max_seq = discover_max_seq(&tbl_dir);
                             let key = table_key(&db_name, &tbl_entry.file_name().to_string_lossy());
                             tables.insert(key, Arc::new(TableSegmentState::new(max_seq)));
@@ -212,6 +214,38 @@ impl SegmentManager {
 
     pub fn discover_segments(table_dir: &Path) -> Result<Vec<PathBuf>> {
         store::discover_segments(table_dir)
+    }
+
+    pub fn discover_inactive_segments(
+        &self,
+        db: &str,
+        table: &str,
+        table_dir: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        let segments = Self::discover_segments(table_dir)?;
+        let key = table_key(db, table);
+        let active_paths = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(&key)
+                .map(|state| {
+                    let active_guard = state.active_segments.lock().unwrap();
+                    active_guard
+                        .values()
+                        .map(|segment| segment.path.clone())
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        if active_paths.is_empty() {
+            return Ok(segments);
+        }
+
+        Ok(segments
+            .into_iter()
+            .filter(|path| !active_paths.contains(path))
+            .collect())
     }
 
     pub fn find_unsealed_segment(
@@ -460,6 +494,16 @@ impl SegmentManager {
         if let Some(state) = tables.get(&key) {
             state.active_segments.lock().unwrap().clear();
         }
+    }
+
+    pub fn has_active_segments(&self) -> bool {
+        let tables = self.tables.read().unwrap();
+        tables.values().any(|state| {
+            let active_guard = state.active_segments.lock().unwrap();
+            active_guard
+                .values()
+                .any(|seg| seg.total_rows > 0 || seg.buffered_rows > 0 || seg.dirty_meta)
+        })
     }
 
     pub fn remove_wal(&self, table_dir: &Path) {
@@ -1193,4 +1237,35 @@ impl SegmentManager {
         }
         Ok(())
     }
+}
+
+fn cleanup_incomplete_compaction_files(table_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(table_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_incomplete_compaction_file(name) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                "removed incomplete compact temporary file during startup"
+            ),
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to remove incomplete compact temporary file during startup"
+            ),
+        }
+    }
+}
+
+fn is_incomplete_compaction_file(name: &str) -> bool {
+    name.ends_with(".compact_tmp") || name.ends_with(".meta.compact.tmp")
 }

@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::common::error::{TaibaiError, Result};
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::codec::column_codec::encode_column;
 use crate::storage::codec::io_util::encode_len_prefixed_str;
 use crate::storage::codec::scalar_tag::{encode_scalar_with_tag, null_for_dtype};
@@ -15,6 +16,9 @@ use crate::types::scalar::ScalarValue;
 use super::constants::{FOOTER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use super::meta::remove_sidecar_meta;
 
+pub(crate) const VALUE_SET_EXTENSION_MAGIC: u32 = 0x5354_4958; // STIX
+pub(crate) const VALUE_SET_MAX_DISTINCT: usize = 1024;
+
 struct BuildingRowGroup {
     columns: Vec<Vec<u8>>,
     row_count: usize,
@@ -23,6 +27,7 @@ struct BuildingRowGroup {
     zone_maxs: Vec<Option<ScalarValue>>,
     null_counts: Vec<u64>,
     bloom_filters: Vec<Option<BloomFilter>>,
+    value_sets: Vec<Option<HashSet<ScalarValue>>>,
 }
 
 impl BuildingRowGroup {
@@ -38,6 +43,7 @@ impl BuildingRowGroup {
                 .iter()
                 .map(|enabled| enabled.then(BloomFilter::with_defaults))
                 .collect(),
+            value_sets: vec![Some(HashSet::new()); num_columns],
         }
     }
 }
@@ -136,6 +142,14 @@ impl SegmentWriter {
                     if let Some(bloom_filter) = &mut group.bloom_filters[col_idx] {
                         bloom_filter.add(&val);
                     }
+                    if !val.is_null() {
+                        if let Some(values) = &mut group.value_sets[col_idx] {
+                            values.insert(val);
+                            if values.len() > VALUE_SET_MAX_DISTINCT {
+                                group.value_sets[col_idx] = None;
+                            }
+                        }
+                    }
                 }
 
                 let encoded = encode_column(col, offset, to_write)?;
@@ -227,6 +241,15 @@ impl SegmentWriter {
             .into_iter()
             .map(|bf| bf.filter(|b| !b.is_empty()))
             .collect();
+        let value_sets: Vec<Option<Vec<ScalarValue>>> = group
+            .value_sets
+            .into_iter()
+            .map(|values| {
+                let mut values: Vec<ScalarValue> = values?.into_iter().collect();
+                values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+                Some(values)
+            })
+            .collect();
 
         self.row_groups.push(crate::storage::segment::RowGroupMeta {
             offset,
@@ -237,6 +260,7 @@ impl SegmentWriter {
             uncompressed_sizes: group.uncompressed_sizes,
             zone_maps,
             bloom_filters,
+            value_sets,
         });
 
         Ok(())
@@ -351,6 +375,19 @@ pub fn encode_segment_footer(
                 let bf_data = b.serialize();
                 buf.extend_from_slice(&(bf_data.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&bf_data);
+            } else {
+                buf.push(0);
+            }
+        }
+
+        buf.extend_from_slice(&VALUE_SET_EXTENSION_MAGIC.to_le_bytes());
+        for value_set in &rg.value_sets {
+            if let Some(values) = value_set {
+                buf.push(1);
+                buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                for value in values {
+                    encode_scalar_with_tag(&mut buf, value);
+                }
             } else {
                 buf.push(0);
             }
