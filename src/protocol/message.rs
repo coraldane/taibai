@@ -33,10 +33,6 @@ pub const MSG_TYPE_EXECUTE: u8 = 0x51;
 pub const MSG_TYPE_CLOSE_STMT: u8 = 0x52;
 pub const MSG_TYPE_BATCH_EXECUTE: u8 = 0x53;
 
-pub const MSG_TYPE_CHANGE_SUBSCRIBE: u8 = 0x60;
-pub const MSG_TYPE_CHANGE_EVENT: u8 = 0x61;
-pub const MSG_TYPE_CHANGE_ACK: u8 = 0x62;
-pub const MSG_TYPE_CHANGE_ACK_STATE: u8 = 0x63;
 
 #[derive(Debug, Clone)]
 pub struct MessageHeader {

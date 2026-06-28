@@ -101,7 +101,6 @@ where
     let engine = match Engine::new_with_storage_config(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
-        config.change_stream.retention_events,
         segment_config_from_server_config(&config),
     ) {
         Ok(e) => e,

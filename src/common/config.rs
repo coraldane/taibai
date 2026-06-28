@@ -40,9 +40,6 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_change_stream_retention_events() -> usize {
-    1_000_000
-}
 
 fn default_auto_compact_enabled() -> bool {
     true
@@ -75,8 +72,6 @@ pub struct ServerConfig {
     pub buffer: BufferSettings,
     pub compression: CompressionSettings,
     pub tls: TlsConfigYaml,
-    #[serde(default)]
-    pub change_stream: ChangeStreamSettings,
     #[serde(default)]
     pub auto_compact: AutoCompactSettings,
     pub log: LogSettings,
@@ -123,19 +118,6 @@ pub struct TlsConfigYaml {
     pub key_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangeStreamSettings {
-    #[serde(default = "default_change_stream_retention_events")]
-    pub retention_events: usize,
-}
-
-impl Default for ChangeStreamSettings {
-    fn default() -> Self {
-        Self {
-            retention_events: default_change_stream_retention_events(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoCompactSettings {
@@ -192,7 +174,6 @@ impl Default for ServerConfig {
             buffer: BufferSettings { batch_size: 4096 },
             compression: CompressionSettings { enabled: true },
             tls: TlsConfigYaml::default(),
-            change_stream: ChangeStreamSettings::default(),
             auto_compact: AutoCompactSettings::default(),
             log: LogSettings {
                 level: "info".to_string(),

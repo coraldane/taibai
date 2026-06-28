@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -11,9 +10,6 @@ use crate::net::session::Session;
 use crate::storage::catalog::auth::{AuthManager, PermissionObjectType, PermissionType};
 use crate::storage::catalog::auto_increment::AutoIncrementManager;
 use crate::storage::catalog::schema::DatabaseCatalog;
-use crate::storage::change_stream::{
-    ChangeEvent, ChangeOperation, ChangePublishRequest, ChangeRow, ChangeStream,
-};
 use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
 use crate::storage::core::memtable::MemTableManager;
 use crate::storage::index::index_manager::IndexManager;
@@ -23,7 +19,6 @@ use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
 
 use crate::types::batch::{RecordBatch, Schema};
-use crate::types::scalar::ScalarValue;
 
 #[derive(Debug)]
 pub enum ExecResult {
@@ -35,8 +30,6 @@ pub enum ExecResult {
         batches: Vec<RecordBatch>,
     },
 }
-
-pub(crate) const MAX_CHANGE_ROWS_PER_EVENT: usize = 1024;
 
 pub struct Engine {
     data_dir: PathBuf,
@@ -51,7 +44,6 @@ pub struct Engine {
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
-    change_stream: Arc<ChangeStream>,
 }
 
 struct CatalogSaveState {
@@ -64,26 +56,11 @@ const CATALOG_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Engine {
     pub fn new(data_dir: &Path, default_database: &str) -> Result<Self> {
-        Self::new_with_change_stream_retention(data_dir, default_database, 1_000_000)
+        Self::new_with_storage_config(data_dir, default_database, SegmentConfig::default())
     }
-
-    pub fn new_with_change_stream_retention(
-        data_dir: &Path,
-        default_database: &str,
-        change_stream_retention_events: usize,
-    ) -> Result<Self> {
-        Self::new_with_storage_config(
-            data_dir,
-            default_database,
-            change_stream_retention_events,
-            SegmentConfig::default(),
-        )
-    }
-
     pub fn new_with_storage_config(
         data_dir: &Path,
         default_database: &str,
-        change_stream_retention_events: usize,
         segment_config: SegmentConfig,
     ) -> Result<Self> {
         let mut catalogs = HashMap::new();
@@ -178,11 +155,6 @@ impl Engine {
             }
         }
         let index_manager = Arc::new(IndexManager::new(Arc::clone(&segment_mgr)));
-        let change_stream = Arc::new(ChangeStream::persistent_with_options(
-            data_dir,
-            1024,
-            change_stream_retention_events,
-        )?);
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
@@ -200,7 +172,6 @@ impl Engine {
             auth_manager,
             auto_increment_mgr,
             index_manager,
-            change_stream,
         })
     }
 
@@ -303,7 +274,6 @@ impl Engine {
             } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                let existed_before = self.get_table_meta(&db, &table).is_some();
                 let result = super::ddl::exec_create_table(
                     self,
                     &db,
@@ -316,16 +286,6 @@ impl Engine {
                     partition_by,
                     ttl,
                 );
-                if result.is_ok() && !existed_before {
-                    self.publish_autocommit_change(ChangePublishRequest {
-                        database: db,
-                        table,
-                        operation: ChangeOperation::CreateTable,
-                        rows_affected: 0,
-                        rows: Vec::new(),
-                        row_images_truncated: false,
-                    });
-                }
                 result
             }
             Statement::CreateIndex {
@@ -359,50 +319,19 @@ impl Engine {
             Statement::DropTable { name, if_exists } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                let existed_before = self.get_table_meta(&db, &table).is_some();
                 let result = super::ddl::exec_drop_table(self, &db, &table, *if_exists);
-                if result.is_ok() && existed_before {
-                    self.publish_autocommit_change(ChangePublishRequest {
-                        database: db,
-                        table,
-                        operation: ChangeOperation::DropTable,
-                        rows_affected: 0,
-                        rows: Vec::new(),
-                        row_images_truncated: false,
-                    });
-                }
                 result
             }
             Statement::AlterTable { name, operations } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
                 let result = super::ddl::exec_alter_table(self, &db, &table, operations);
-                if result.is_ok() {
-                    self.publish_autocommit_change(ChangePublishRequest {
-                        database: db,
-                        table,
-                        operation: ChangeOperation::AlterTable,
-                        rows_affected: 0,
-                        rows: Vec::new(),
-                        row_images_truncated: false,
-                    });
-                }
                 result
             }
             Statement::Truncate { table } => {
                 let db = table.effective_database(&session.database).to_string();
                 let table_name = table.name.clone();
                 let result = super::ddl::exec_truncate_table(self, &db, &table_name);
-                if result.is_ok() {
-                    self.publish_autocommit_change(ChangePublishRequest {
-                        database: db,
-                        table: table_name,
-                        operation: ChangeOperation::Truncate,
-                        rows_affected: 0,
-                        rows: Vec::new(),
-                        row_images_truncated: false,
-                    });
-                }
                 result
             }
             Statement::CreateDatabase {
@@ -436,8 +365,6 @@ impl Engine {
                 values,
             } => {
                 let txn_id = session.active_txn_id();
-                let mut change_rows = Vec::new();
-                let mut row_images_truncated = false;
                 let result = super::dml_insert::exec_insert(
                     self,
                     table.effective_database(&session.database),
@@ -447,22 +374,10 @@ impl Engine {
                     session.timezone_offset_hours,
                     txn_id,
                     session.bulk_import_mode,
-                    &mut change_rows,
-                    &mut row_images_truncated,
                 );
                 if result.is_ok() && txn_id > 0 {
                     session.mark_txn_write();
                 }
-                let db = table.effective_database(&session.database).to_string();
-                self.publish_or_record_dml_change(
-                    session,
-                    &db,
-                    &table.name,
-                    ChangeOperation::Insert,
-                    &result,
-                    change_rows,
-                    row_images_truncated,
-                );
                 result
             }
             Statement::Update {
@@ -471,29 +386,16 @@ impl Engine {
                 where_clause,
             } => {
                 let db = table.effective_database(&session.database).to_string();
-                let mut change_rows = Vec::new();
-                let mut row_images_truncated = false;
                 let result = super::dml_update::exec_update(
                     self,
                     &db,
                     &table.name,
                     assignments,
                     where_clause,
-                    &mut change_rows,
-                    &mut row_images_truncated,
                 );
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
                 }
-                self.publish_or_record_dml_change(
-                    session,
-                    &db,
-                    &table.name,
-                    ChangeOperation::Update,
-                    &result,
-                    change_rows,
-                    row_images_truncated,
-                );
                 result
             }
             Statement::Delete {
@@ -501,28 +403,15 @@ impl Engine {
                 where_clause,
             } => {
                 let db = table.effective_database(&session.database).to_string();
-                let mut change_rows = Vec::new();
-                let mut row_images_truncated = false;
                 let result = super::dml_delete::exec_delete(
                     self,
                     &db,
                     &table.name,
                     where_clause,
-                    &mut change_rows,
-                    &mut row_images_truncated,
                 );
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
                 }
-                self.publish_or_record_dml_change(
-                    session,
-                    &db,
-                    &table.name,
-                    ChangeOperation::Delete,
-                    &result,
-                    change_rows,
-                    row_images_truncated,
-                );
                 result
             }
             Statement::Select { .. } => super::query::exec_select(self, &session.database, stmt),
@@ -590,85 +479,29 @@ impl Engine {
                     rows_rolled_back = rolled_back,
                     "transaction rolled back"
                 );
-                session.pending_change_events.clear();
                 session.rollback_txn();
                 Ok(ExecResult::Ok {
                     rows_affected: rolled_back,
                 })
             }
-            Statement::AckChangeConsumer { group, sequence } => {
-                let stored = self.ack_change_consumer_for_session(session, group, *sequence)?;
-                Ok(ExecResult::Ok {
-                    rows_affected: stored,
-                })
-            }
-            Statement::AlterUser { name, operations } => {
-                super::ddl::exec_alter_user(self, name, operations)
-            }
-            Statement::Union {
-                left,
-                right,
-                all,
-                order_by,
-                limit,
-                offset,
-            } => super::query::exec_union(
-                self,
-                &session.database,
-                left,
-                right,
-                *all,
-                order_by,
-                limit,
-                offset,
-            ),
-            Statement::ShowUsers => super::ddl::exec_show_users(self),
-            Statement::ShowRoles => super::ddl::exec_show_roles(self),
-            Statement::ShowGrants { user } => super::ddl::exec_show_grants(self, user),
-            Statement::ShowPartitions { table } => match table {
-                Some(table) => super::ddl::exec_show_partitions(
-                    self,
-                    table.effective_database(&session.database),
-                    &Some(table.name.clone()),
-                ),
-                None => super::ddl::exec_show_partitions(self, &session.database, &None),
-            },
             Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),
             Statement::ShowEngines => super::ddl::exec_show_engines(self),
             Statement::ShowProcesslist { full } => super::ddl::exec_show_processlist(self, *full),
-            Statement::ShowChangeConsumers => super::ddl::exec_show_change_consumers(self),
-            Statement::ShowChangeStatus => super::ddl::exec_show_change_status(self),
-            Statement::ShowChangeEvents {
-                table,
-                from_sequence,
-                limit,
-            } => {
-                let database = table
-                    .as_ref()
-                    .map(|table| table.effective_database(&session.database).to_string());
-                let table_name = table.as_ref().map(|table| table.name.clone());
-                super::ddl::exec_show_change_events(
-                    self,
-                    *from_sequence,
-                    *limit,
-                    database.as_deref(),
-                    table_name.as_deref(),
-                )
+            Statement::AlterUser { name, operations } => super::ddl::exec_alter_user(self, name, operations),
+            Statement::ShowUsers => super::ddl::exec_show_users(self),
+            Statement::ShowRoles => super::ddl::exec_show_roles(self),
+            Statement::ShowGrants { user } => super::ddl::exec_show_grants(self, user),
+            Statement::ShowPartitions { table } => {
+                let db = table.as_ref().map(|t| t.effective_database(&session.database)).unwrap_or(&session.database);
+                let table_name = table.as_ref().map(|t| t.name.clone());
+                super::ddl::exec_show_partitions(self, db, &table_name)
             }
-            Statement::ResetChangeConsumer { group, sequence } => {
-                super::ddl::exec_reset_change_consumer(self, group, *sequence)
-            }
-            Statement::DropChangeConsumer { group } => {
-                super::ddl::exec_drop_change_consumer(self, group)
-            }
-            Statement::FlushTable { table } => match table {
-                Some(table) => super::ddl::exec_flush_table(
-                    self,
-                    table.effective_database(&session.database),
-                    &Some(table.name.clone()),
-                ),
-                None => super::ddl::exec_flush_table(self, &session.database, &None),
+            Statement::FlushTable { table } => {
+                let db = table.as_ref().map(|t| t.effective_database(&session.database)).unwrap_or(&session.database);
+                let table_name = table.as_ref().map(|t| t.name.clone());
+                super::ddl::exec_flush_table(self, db, &table_name)
             },
+            Statement::Union { .. } => super::query::exec_select(self, &session.database, stmt),
             Statement::OptimizeTable { table, partition } => super::ddl::exec_optimize_table(
                 self,
                 table.effective_database(&session.database),
@@ -835,8 +668,7 @@ impl Engine {
             | Statement::ShowEngines
             | Statement::Begin
             | Statement::Commit
-            | Statement::Rollback
-            | Statement::AckChangeConsumer { .. } => Ok(()),
+            | Statement::Rollback => Ok(()),
             Statement::CreateUser { .. }
             | Statement::AlterUser { .. }
             | Statement::CreateRole { .. }
@@ -848,11 +680,6 @@ impl Engine {
             | Statement::ShowRoles
             | Statement::ShowGrants { .. }
             | Statement::ShowProcesslist { .. }
-            | Statement::ShowChangeConsumers
-            | Statement::ShowChangeStatus
-            | Statement::ShowChangeEvents { .. }
-            | Statement::ResetChangeConsumer { .. }
-            | Statement::DropChangeConsumer { .. }
             | Statement::StartAutoCompact
             | Statement::StopAutoCompact
             | Statement::PauseFlush
@@ -942,78 +769,6 @@ impl Engine {
         &self.index_manager
     }
 
-    pub fn change_stream(&self) -> &Arc<ChangeStream> {
-        &self.change_stream
-    }
-
-    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<ChangeEvent> {
-        self.change_stream.subscribe()
-    }
-
-    pub fn recent_changes(&self, db: Option<&str>, table: Option<&str>) -> Vec<ChangeEvent> {
-        self.change_stream.recent(db, table)
-    }
-
-    pub fn changes_since(
-        &self,
-        sequence: u64,
-        db: Option<&str>,
-        table: Option<&str>,
-    ) -> Result<Vec<ChangeEvent>> {
-        self.change_stream.since(sequence, db, table)
-    }
-
-    pub fn ack_change_consumer(&self, group: &str, sequence: u64) -> Result<u64> {
-        self.change_stream.ack_consumer(group, sequence)
-    }
-
-    pub fn ack_change_consumer_for_session(
-        &self,
-        session: &mut Session,
-        group: &str,
-        sequence: u64,
-    ) -> Result<u64> {
-        if group.trim().is_empty() {
-            return Err(TaibaiError::Sql("consumer group is required".into()));
-        }
-        if session.in_txn() {
-            session.record_pending_change_ack(group, sequence);
-            let current = self.change_stream.consumer_sequence(group);
-            let pending = session.pending_change_ack_sequence(group).unwrap_or(0);
-            Ok(current.max(pending))
-        } else {
-            self.change_stream.ack_consumer(group, sequence)
-        }
-    }
-
-    pub fn change_consumer_sequence(&self, group: &str) -> u64 {
-        self.change_stream.consumer_sequence(group)
-    }
-
-    pub fn change_stream_status(
-        &self,
-    ) -> Result<crate::storage::change_stream::ChangeStreamStatus> {
-        self.change_stream.status()
-    }
-
-    pub fn change_events(
-        &self,
-        from_sequence: Option<u64>,
-        limit: Option<usize>,
-        db: Option<&str>,
-        table: Option<&str>,
-    ) -> Result<Vec<ChangeEvent>> {
-        self.change_stream.events(from_sequence, limit, db, table)
-    }
-
-    pub fn reset_change_consumer(&self, group: &str, sequence: u64) -> Result<u64> {
-        self.change_stream.reset_consumer(group, sequence)
-    }
-
-    pub fn drop_change_consumer(&self, group: &str) -> Result<bool> {
-        self.change_stream.drop_consumer(group)
-    }
-
     pub fn commit_session_txn(&self, session: &mut Session) -> Result<()> {
         if !session.in_txn() {
             return Err(TaibaiError::Sql("no active transaction".into()));
@@ -1024,78 +779,13 @@ impl Engine {
             .as_ref()
             .map(|t| t.had_writes)
             .unwrap_or(false);
-        let pending_changes = session.take_pending_changes();
-        let outbox_id = self.change_stream.prepare_outbox(pending_changes)?;
 
         if had_writes {
             self.batch_writer().commit_txn(txn_id)?;
         }
 
-        if let Some(outbox_id) = outbox_id {
-            self.change_stream.commit_outbox(outbox_id)?;
-            self.change_stream.publish_outbox(outbox_id)?;
-        }
-
-        for ack in session.take_pending_change_acks() {
-            self.change_stream.ack_consumer(&ack.group, ack.sequence)?;
-        }
-
         session.commit_txn();
         Ok(())
-    }
-
-    fn publish_autocommit_change(&self, request: ChangePublishRequest) {
-        if let Err(e) = self
-            .change_stream
-            .prepare_outbox(vec![request])
-            .and_then(|outbox_id| {
-                if let Some(outbox_id) = outbox_id {
-                    self.change_stream.commit_outbox(outbox_id)?;
-                    self.change_stream.publish_outbox(outbox_id)?;
-                }
-                Ok(())
-            })
-        {
-            tracing::warn!(error = %e, "failed to publish autocommit change through outbox");
-        }
-    }
-
-    fn publish_or_record_dml_change(
-        &self,
-        session: &mut Session,
-        db: &str,
-        table: &str,
-        operation: ChangeOperation,
-        result: &Result<ExecResult>,
-        rows: Vec<ChangeRow>,
-        row_images_truncated: bool,
-    ) {
-        let Ok(ExecResult::Ok { rows_affected }) = result else {
-            return;
-        };
-        if *rows_affected == 0 {
-            return;
-        }
-        if session.in_txn() {
-            session.record_pending_change(
-                db,
-                table,
-                operation,
-                *rows_affected,
-                rows,
-                row_images_truncated,
-            );
-        } else {
-            let request = ChangePublishRequest {
-                database: db.to_string(),
-                table: table.to_string(),
-                operation,
-                rows_affected: *rows_affected,
-                rows,
-                row_images_truncated,
-            };
-            self.publish_autocommit_change(request);
-        }
     }
 
     pub fn get_table_meta(
@@ -1363,14 +1053,6 @@ impl Engine {
                     }
                 }
                 if result > 0 {
-                    self.publish_autocommit_change(ChangePublishRequest {
-                        database: db.to_string(),
-                        table: table_name.clone(),
-                        operation: ChangeOperation::Insert,
-                        rows_affected: result,
-                        rows: Vec::new(),
-                        row_images_truncated: false,
-                    });
                 }
                 result
             };
@@ -1378,14 +1060,6 @@ impl Engine {
         }
 
         if result > 0 {
-            self.publish_autocommit_change(ChangePublishRequest {
-                database: db.to_string(),
-                table: table_name,
-                operation: ChangeOperation::Insert,
-                rows_affected: result,
-                rows: Vec::new(),
-                row_images_truncated: false,
-            });
         }
         Ok(result)
     }
@@ -1423,57 +1097,6 @@ fn bulk_payload_table_name(payload: &[u8]) -> Result<&str> {
     }
     std::str::from_utf8(&payload[start..end])
         .map_err(|e| TaibaiError::Protocol(format!("invalid utf8: {}", e)))
-}
-
-pub(crate) fn change_row_from_images(
-    schema: &Schema,
-    before: Option<&RecordBatch>,
-    before_row_idx: usize,
-    after: Option<&RecordBatch>,
-    after_row_idx: usize,
-) -> ChangeRow {
-    let primary_source = after.or(before);
-    let primary_row_idx = if after.is_some() {
-        after_row_idx
-    } else {
-        before_row_idx
-    };
-    let mut primary_key = BTreeMap::new();
-    if let Some(batch) = primary_source {
-        for (col_idx, col) in schema.columns.iter().enumerate() {
-            if col.primary_key {
-                primary_key.insert(
-                    col.name.clone(),
-                    batch
-                        .scalar(primary_row_idx, col_idx)
-                        .unwrap_or_else(|| ScalarValue::null_for_type(col.data_type)),
-                );
-            }
-        }
-    }
-
-    ChangeRow {
-        primary_key,
-        before: before.map(|batch| row_image(schema, batch, before_row_idx)),
-        after: after.map(|batch| row_image(schema, batch, after_row_idx)),
-    }
-}
-
-fn row_image(
-    schema: &Schema,
-    batch: &RecordBatch,
-    row_idx: usize,
-) -> BTreeMap<String, ScalarValue> {
-    let mut image = BTreeMap::new();
-    for (col_idx, col) in schema.columns.iter().enumerate() {
-        image.insert(
-            col.name.clone(),
-            batch
-                .scalar(row_idx, col_idx)
-                .unwrap_or_else(|| ScalarValue::null_for_type(col.data_type)),
-        );
-    }
-    image
 }
 
 fn restored_auto_increment_start(

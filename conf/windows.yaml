@@ -30,10 +30,6 @@ tls:
   cert_path: ""
   key_path: ""
 
-# Change stream settings
-change_stream:
-  retention_events: 1000000
-
 # Auto compaction settings
 auto_compact:
   enabled: true

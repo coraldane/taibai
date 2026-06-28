@@ -148,8 +148,6 @@ tls:
   cert_path: ""
   key_path: ""
 
-change_stream:
-  retention_events: 1000000
 
 log:
   level: "info"
@@ -197,7 +195,6 @@ log:
 
 - `docs/overview/project-summary.md`：工程功能总览。
 - `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。
-- `docs/features/change-stream.md`：变更订阅功能说明。
 - `docs/operations/data-import-flow.md`：数据导入流程。
 - `docs/operations/windows-installation.md`：Windows 图形安装包和系统服务安装说明。
 - `docs/reports/performance-verification-report.md`：性能验证报告。
