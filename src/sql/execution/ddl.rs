@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
@@ -241,40 +242,110 @@ pub fn exec_drop_table(
     name: &str,
     if_exists: bool,
 ) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
+    let total_start = Instant::now();
+    tracing::info!(db, table = name, "drop table: start");
 
-    if catalog.get_table(name).is_none() {
-        if if_exists {
-            return Ok(ExecResult::Ok { rows_affected: 0 });
+    {
+        let stage_start = Instant::now();
+        let mut catalogs = engine.catalogs().write().unwrap();
+        tracing::info!(
+            db,
+            table = name,
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "drop table: acquired catalog write lock"
+        );
+
+        let catalog = get_existing_catalog(&mut catalogs, db)?;
+
+        if catalog.get_table(name).is_none() {
+            if if_exists {
+                tracing::info!(
+                    db,
+                    table = name,
+                    total_elapsed_ms = total_start.elapsed().as_millis(),
+                    "drop table: table missing, if exists ignored"
+                );
+                return Ok(ExecResult::Ok { rows_affected: 0 });
+            }
+            return Err(TaibaiError::Sql(format!(
+                "table '{}.{}' does not exist",
+                db, name
+            )));
         }
-        return Err(TaibaiError::Sql(format!(
-            "table '{}.{}' does not exist",
-            db, name
-        )));
-    }
 
-    catalog.drop_table(name)?;
-    engine.auto_increment_manager().unregister(db, name);
-    engine.index_manager().remove_index(db, name);
+        let stage_start = Instant::now();
+        catalog.drop_table(name)?;
+        engine.auto_increment_manager().unregister(db, name);
+        engine.index_manager().remove_index(db, name);
+        tracing::info!(
+            db,
+            table = name,
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "drop table: removed metadata managers"
+        );
+
+        let meta_dir = engine.data_dir().join("meta");
+        let stage_start = Instant::now();
+        catalog.save(&meta_dir)?;
+        tracing::info!(
+            db,
+            table = name,
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            total_elapsed_ms = total_start.elapsed().as_millis(),
+            "drop table: saved catalog"
+        );
+    }
+    tracing::info!(
+        db,
+        table = name,
+        total_elapsed_ms = total_start.elapsed().as_millis(),
+        "drop table: released catalog write lock"
+    );
 
     let table_dir = engine.data_dir().join(db).join(name);
+    tracing::info!(db, table = name, path = %table_dir.display(), "drop table: waiting for table mutation lock");
+    let stage_start = Instant::now();
     engine
         .segment_mgr()
         .with_table_mutation_lock(db, name, || {
+            tracing::info!(db, table = name, elapsed_ms = stage_start.elapsed().as_millis(), "drop table: acquired table mutation lock");
+
+            let step_start = Instant::now();
             engine.segment_mgr().remove_wal(&table_dir);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed wal handle");
+
+            let step_start = Instant::now();
             engine.segment_mgr().remove_table_state(db, name);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table state");
+
+            let step_start = Instant::now();
             engine.segment_mgr().invalidate_readers_under(&table_dir);
-            engine.batch_writer().clear_memtables(db, name);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: invalidated readers");
+
+            let step_start = Instant::now();
+            let cleared_rows = engine.batch_writer().clear_memtables(db, name);
+            tracing::info!(db, table = name, cleared_rows, elapsed_ms = step_start.elapsed().as_millis(), "drop table: cleared memtables");
 
             if table_dir.exists() {
-                let _ = std::fs::remove_dir_all(&table_dir);
+                let step_start = Instant::now();
+                tracing::info!(db, table = name, path = %table_dir.display(), "drop table: removing table directory");
+                std::fs::remove_dir_all(&table_dir).map_err(|err| {
+                    tracing::error!(db, table = name, path = %table_dir.display(), error = %err, elapsed_ms = step_start.elapsed().as_millis(), "drop table: failed to remove table directory");
+                    err
+                })?;
+                tracing::info!(db, table = name, path = %table_dir.display(), elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table directory");
+            } else {
+                tracing::info!(db, table = name, path = %table_dir.display(), "drop table: table directory missing");
             }
             Ok(())
         })?;
 
-    let meta_dir = engine.data_dir().join("meta");
-    catalog.save(&meta_dir)?;
+    tracing::info!(
+        db,
+        table = name,
+        total_elapsed_ms = total_start.elapsed().as_millis(),
+        "drop table: finished"
+    );
 
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
