@@ -130,23 +130,6 @@ impl Parser {
         }
     }
 
-    fn expect_u64(&mut self) -> Result<u64> {
-        match self.tokens.get(self.pos) {
-            Some(Token::Integer(v)) if *v >= 0 => {
-                let v = *v as u64;
-                self.pos += 1;
-                Ok(v)
-            }
-            other => Err(TaibaiError::Sql(format!(
-                "expected non-negative integer, got '{}'",
-                other
-                    .as_ref()
-                    .map(|t| t.to_string())
-                    .unwrap_or("EOF".into())
-            ))),
-        }
-    }
-
     fn parse_object_name(&mut self) -> Result<ObjectName> {
         let first = self.expect_ident()?;
         if self.peek() == &Token::Dot {
