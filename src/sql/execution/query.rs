@@ -7,7 +7,9 @@ use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::physical::{build_physical_pipeline, can_use_physical_pipeline, drain_pipeline, PhysicalContext};
+use super::physical::{
+    build_physical_pipeline, can_use_physical_pipeline, drain_pipeline, PhysicalContext,
+};
 use crate::sql::parser::ast::{Expr, FromClause, ObjectName, SelectItem, Statement, TableRef};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
@@ -166,7 +168,10 @@ fn exec_table_select(
         let pipeline = build_physical_pipeline(plan, &mut physical_ctx)?;
         tracing::debug!("query: physical pipeline built, starting next_batch loop");
         let (schema, batches) = drain_pipeline(pipeline)?;
-        tracing::debug!("query: physical pipeline finished, {} batches", batches.len());
+        tracing::debug!(
+            "query: physical pipeline finished, {} batches",
+            batches.len()
+        );
         return Ok(ExecResult::Query { schema, batches });
     }
 

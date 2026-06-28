@@ -38,6 +38,7 @@ impl Optimizer {
                 Box::new(limit_pushdown::LimitPushdownRule),
                 Box::new(order_limit_pushdown::OrderLimitPushdownRule),
                 Box::new(topn::TopNRule),
+                Box::new(order_limit_pushdown::TopNPushdownRule),
                 Box::new(filter_reorder::FilterReorderRule),
                 Box::new(index_selection::IndexSelectionRule),
                 Box::new(partition_pruning::PartitionPruningRule),

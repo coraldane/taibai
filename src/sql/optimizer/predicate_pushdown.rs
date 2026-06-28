@@ -1,5 +1,6 @@
 use crate::sql::parser::ast::{BinOp, JoinType};
 use crate::sql::planner::*;
+use crate::types::scalar::ScalarValue;
 
 use super::Rule;
 
@@ -157,12 +158,30 @@ fn push_filter(input: LogicalPlan, predicate: LogicalExpr) -> (LogicalPlan, bool
                 match expr_side(&part, left_ncols, total_cols) {
                     ExprSide::Left if can_push_filter_through_join(join.join_type, true) => {
                         left_filters.push(part.clone());
+                        if let Some(derived) = derive_join_side_filter(
+                            &part,
+                            &join.condition,
+                            left_ncols,
+                            total_cols,
+                            true,
+                        ) {
+                            right_filters.push(derived);
+                        }
                         residuals.push(part);
                         changed = true;
                     }
                     ExprSide::Right if can_push_filter_through_join(join.join_type, false) => {
                         if let Some(remapped) = remap_right_expr(&part, left_ncols) {
                             right_filters.push(remapped);
+                            if let Some(derived) = derive_join_side_filter(
+                                &part,
+                                &join.condition,
+                                left_ncols,
+                                total_cols,
+                                false,
+                            ) {
+                                left_filters.push(derived);
+                            }
                             residuals.push(part);
                             changed = true;
                         } else {
@@ -317,6 +336,89 @@ fn can_push_filter_through_join(join_type: JoinType, is_left: bool) -> bool {
         JoinType::Right => !is_left,
         JoinType::Full => false,
         JoinType::Asof => is_left,
+    }
+}
+
+fn derive_join_side_filter(
+    filter: &LogicalExpr,
+    join_condition: &LogicalExpr,
+    left_ncols: usize,
+    total_cols: usize,
+    filter_is_left: bool,
+) -> Option<LogicalExpr> {
+    let (filter_col, value) = equality_column_literal(filter)?;
+    for part in split_conjunct_refs(join_condition) {
+        let Some((left_col, right_col)) = equality_column_column(part, left_ncols, total_cols)
+        else {
+            continue;
+        };
+        if filter_is_left && filter_col == left_col {
+            return Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(right_col - left_ncols)),
+                op: BinOp::Eq,
+                right: Box::new(LogicalExpr::Literal(value.clone())),
+            });
+        }
+        if !filter_is_left && filter_col == right_col {
+            return Some(LogicalExpr::BinaryOp {
+                left: Box::new(LogicalExpr::Column(left_col)),
+                op: BinOp::Eq,
+                right: Box::new(LogicalExpr::Literal(value.clone())),
+            });
+        }
+    }
+    None
+}
+
+fn equality_column_literal(expr: &LogicalExpr) -> Option<(usize, ScalarValue)> {
+    match expr {
+        LogicalExpr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => match (&**left, &**right) {
+            (LogicalExpr::Column(idx), LogicalExpr::Literal(value)) => Some((*idx, value.clone())),
+            (LogicalExpr::Literal(value), LogicalExpr::Column(idx)) => Some((*idx, value.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn equality_column_column(
+    expr: &LogicalExpr,
+    left_ncols: usize,
+    total_cols: usize,
+) -> Option<(usize, usize)> {
+    match expr {
+        LogicalExpr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => match (&**left, &**right) {
+            (LogicalExpr::Column(l), LogicalExpr::Column(r)) => {
+                normalize_join_columns(*l, *r, left_ncols, total_cols)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn normalize_join_columns(
+    a: usize,
+    b: usize,
+    left_ncols: usize,
+    total_cols: usize,
+) -> Option<(usize, usize)> {
+    let a_left = a < left_ncols;
+    let b_left = b < left_ncols;
+    let a_right = a >= left_ncols && a < total_cols;
+    let b_right = b >= left_ncols && b < total_cols;
+    match (a_left, a_right, b_left, b_right) {
+        (true, false, false, true) => Some((a, b)),
+        (false, true, true, false) => Some((b, a)),
+        _ => None,
     }
 }
 
@@ -489,6 +591,43 @@ mod tests {
             .unwrap();
         assert!(daily_scan.pushed_filter.is_some());
         assert!(valuation_scan.pushed_filter.is_some());
+    }
+
+    #[test]
+    fn propagates_left_filter_across_left_join_equality_to_right_scan() {
+        let daily = Schema::new(vec![
+            ColumnDef::new("security_id", DataType::Int64),
+            ColumnDef::new("deal_date", DataType::Int64),
+            ColumnDef::new("change_ratio", DataType::Float64),
+        ]);
+        let online = Schema::new(vec![
+            ColumnDef::new("deal_date", DataType::Int64),
+            ColumnDef::new("security_id", DataType::Int64),
+            ColumnDef::new("display_name", DataType::VarChar),
+        ]);
+        let mut schemas = HashMap::new();
+        schemas.insert("t_stock_daily".to_string(), daily);
+        schemas.insert("t_online_stock".to_string(), online);
+
+        let stmt = Parser::parse(
+            "SELECT d.security_id, os.display_name FROM t_stock_daily d \
+             LEFT JOIN t_online_stock os ON os.deal_date = d.deal_date AND os.security_id = d.security_id \
+             WHERE d.deal_date = 20260626 \
+             ORDER BY d.change_ratio DESC LIMIT 20",
+        )
+        .unwrap()
+        .remove(0);
+        let plan = plan_select(&stmt, &schemas).unwrap();
+        let (optimized, changed) = PredicatePushdownRule.apply(plan);
+        assert!(changed);
+        let mut scans = Vec::new();
+        collect_scans(&optimized, &mut scans);
+        assert_eq!(scans.len(), 2);
+        let online_scan = scans
+            .iter()
+            .find(|s| s.table_name == "t_online_stock")
+            .unwrap();
+        assert!(online_scan.pushed_filter.is_some());
     }
 
     fn collect_scans<'a>(plan: &'a LogicalPlan, scans: &mut Vec<&'a ScanPlan>) {

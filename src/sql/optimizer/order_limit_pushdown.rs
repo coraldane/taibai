@@ -1,3 +1,4 @@
+use crate::sql::parser::ast::JoinType;
 use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan, SortKey, TopNPlan};
 
 use super::Rule;
@@ -227,6 +228,29 @@ fn push_topn_to_scan(plan: LogicalPlan) -> (LogicalPlan, bool) {
                 }
             }
             other => {
+                let sort_keys = topn.sort_keys.clone();
+                let topn_limit = topn.limit;
+                let topn_offset = topn.offset;
+                if let LogicalPlan::Join(join) = &other {
+                    if can_push_topn_to_left_join(&sort_keys, join) {
+                        let mut new_join = join.clone();
+                        new_join.left = Box::new(LogicalPlan::TopN(TopNPlan {
+                            sort_keys: sort_keys.clone(),
+                            limit: topn_limit.saturating_add(topn_offset),
+                            offset: 0,
+                            input: new_join.left,
+                        }));
+                        let (new_left, left_changed) = push_topn_to_scan(*new_join.left);
+                        let (new_right, right_changed) = push_topn_to_scan(*new_join.right);
+                        new_join.left = Box::new(new_left);
+                        new_join.right = Box::new(new_right);
+                        topn.input = Box::new(LogicalPlan::Join(new_join));
+                        return (
+                            LogicalPlan::TopN(topn),
+                            true || left_changed || right_changed,
+                        );
+                    }
+                }
                 let (new_input, changed) = push_topn_to_scan(other);
                 topn.input = Box::new(new_input);
                 (LogicalPlan::TopN(topn), changed)
@@ -294,6 +318,61 @@ fn can_push_topn_to_scan(topn: &TopNPlan, scan: &ScanPlan) -> bool {
         return false;
     }
     can_push_order_to_scan(&topn.sort_keys, scan)
+}
+
+fn can_push_topn_to_left_join(sort_keys: &[SortKey], join: &crate::sql::planner::JoinPlan) -> bool {
+    if !matches!(join.join_type, JoinType::Left) {
+        return false;
+    }
+
+    sort_keys
+        .iter()
+        .all(|sk| expr_columns_within(&sk.expr, join.left_schema.columns.len()))
+}
+
+fn expr_columns_within(expr: &LogicalExpr, upper_bound: usize) -> bool {
+    match expr {
+        LogicalExpr::Column(idx) => *idx < upper_bound,
+        LogicalExpr::Literal(_) | LogicalExpr::Wildcard => true,
+        LogicalExpr::BinaryOp { left, right, .. } => {
+            expr_columns_within(left, upper_bound) && expr_columns_within(right, upper_bound)
+        }
+        LogicalExpr::Not(inner) | LogicalExpr::IsNull(inner) | LogicalExpr::IsNotNull(inner) => {
+            expr_columns_within(inner, upper_bound)
+        }
+        LogicalExpr::Aggregate(agg) => expr_columns_within(&agg.arg, upper_bound),
+        LogicalExpr::In { expr, .. } => expr_columns_within(expr, upper_bound),
+        LogicalExpr::Between {
+            expr, low, high, ..
+        } => {
+            expr_columns_within(expr, upper_bound)
+                && expr_columns_within(low, upper_bound)
+                && expr_columns_within(high, upper_bound)
+        }
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand
+                .as_deref()
+                .map(|e| expr_columns_within(e, upper_bound))
+                .unwrap_or(true)
+                && when_clauses.iter().all(|(when, then)| {
+                    expr_columns_within(when, upper_bound) && expr_columns_within(then, upper_bound)
+                })
+                && else_clause
+                    .as_deref()
+                    .map(|e| expr_columns_within(e, upper_bound))
+                    .unwrap_or(true)
+        }
+        LogicalExpr::Like { expr, .. } => expr_columns_within(expr, upper_bound),
+        LogicalExpr::Function { args, .. } => {
+            args.iter().all(|arg| expr_columns_within(arg, upper_bound))
+        }
+        LogicalExpr::InSubquery { expr, .. } => expr_columns_within(expr, upper_bound),
+        LogicalExpr::ScalarSubquery(_) | LogicalExpr::ExistsSubquery(_) => false,
+    }
 }
 
 fn can_push_topn_past_filter(topn: &TopNPlan, predicate: &LogicalExpr, scan: &ScanPlan) -> bool {

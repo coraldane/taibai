@@ -28,7 +28,9 @@ pub fn build_physical_pipeline(
     build_operator_with_limit(plan, ctx, None)
 }
 
-pub fn drain_pipeline(mut pipeline: Box<dyn ExecutionOp + '_>) -> Result<(Schema, Vec<RecordBatch>)> {
+pub fn drain_pipeline(
+    mut pipeline: Box<dyn ExecutionOp + '_>,
+) -> Result<(Schema, Vec<RecordBatch>)> {
     let mut result_batches = Vec::new();
     let mut result_schema = None;
     while let Some(batch) = pipeline.next_batch()? {
@@ -59,7 +61,12 @@ fn build_operator_with_limit(
             let meta = ctx.meta(&scan.table_name).cloned().ok_or_else(|| {
                 TaibaiError::Internal(format!("missing metadata for '{}'", scan.table_name))
             })?;
-            let mut spec = compile_scan_spec(&LogicalPlan::Scan(scan.clone()), &scan.table_name, &schema, &meta);
+            let mut spec = compile_scan_spec(
+                &LogicalPlan::Scan(scan.clone()),
+                &scan.table_name,
+                &schema,
+                &meta,
+            );
             spec.table_name = physical_table_name;
             if let Some(limit) = limit_hint {
                 spec.limit = Some(spec.limit.map_or(limit, |current| current.min(limit)));
@@ -193,7 +200,8 @@ fn remove_redundant_pushed_filters(plan: LogicalPlan) -> LogicalPlan {
             let input = remove_redundant_pushed_filters(*filter.input);
             match input {
                 LogicalPlan::Scan(scan)
-                    if scan.pushed_filter
+                    if scan
+                        .pushed_filter
                         .as_ref()
                         .map(is_scan_filter_fully_rechecked_by_scan)
                         .unwrap_or(false) =>
@@ -242,13 +250,20 @@ fn is_scan_filter_fully_rechecked_by_scan(expr: &LogicalExpr) -> bool {
             | crate::sql::parser::ast::BinOp::Gt
             | crate::sql::parser::ast::BinOp::Lte
             | crate::sql::parser::ast::BinOp::Gte => {
-                matches!((&**left, &**right), (LogicalExpr::Column(_), LogicalExpr::Literal(_)))
-                    || matches!((&**left, &**right), (LogicalExpr::Literal(_), LogicalExpr::Column(_)))
+                matches!(
+                    (&**left, &**right),
+                    (LogicalExpr::Column(_), LogicalExpr::Literal(_))
+                ) || matches!(
+                    (&**left, &**right),
+                    (LogicalExpr::Literal(_), LogicalExpr::Column(_))
+                )
             }
             _ => false,
         },
         LogicalExpr::In { expr, .. } => matches!(&**expr, LogicalExpr::Column(_)),
-        LogicalExpr::Between { expr, low, high, .. } => {
+        LogicalExpr::Between {
+            expr, low, high, ..
+        } => {
             matches!(&**expr, LogicalExpr::Column(_))
                 && matches!(&**low, LogicalExpr::Literal(_))
                 && matches!(&**high, LogicalExpr::Literal(_))
@@ -320,4 +335,3 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::Empty => Schema::new(vec![ColumnDef::new("count(*)", DataType::Int64)]),
     }
 }
-

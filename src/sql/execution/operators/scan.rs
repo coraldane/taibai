@@ -164,7 +164,8 @@ fn project_batch(
         let new_schema = Schema::new(col_defs);
         Ok(Some(RecordBatch::try_new(new_schema, cols)?))
     } else {
-        let schema_cols: Vec<&ColumnDef> = indices.iter().map(|&i| &batch.schema.columns[i]).collect();
+        let schema_cols: Vec<&ColumnDef> =
+            indices.iter().map(|&i| &batch.schema.columns[i]).collect();
         let new_schema = Schema::new(schema_cols.iter().map(|c| (*c).clone()).collect());
         let mut cols = Vec::with_capacity(indices.len());
         for &idx in indices {
