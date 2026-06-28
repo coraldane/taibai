@@ -200,7 +200,7 @@ fn bulk_import_honors_year_partition_on_int32_yyyymmdd() {
 
     let rows = collect_i32_rows(
         engine
-            .execute(&mut session, "SELECT deal_date, deal_time FROM ticks")
+            .execute(&mut session, "SELECT deal_date, deal_time FROM ticks ORDER BY deal_date, deal_time")
             .expect("select rows"),
     );
     assert_eq!(

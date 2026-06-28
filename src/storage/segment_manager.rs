@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::common::error::{Result, TaibaiError};
-use crate::storage::bulk_payload::parse_direct_bulk_payload;
+use crate::storage::bulk_payload::{parse_direct_bulk_payload, DirectBulkColumn, DirectBulkRequest};
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
 use crate::storage::segment::meta::remove_sidecar_meta;
@@ -34,10 +34,19 @@ use config::{
 };
 use helpers::{
     discover_max_seq, ensure_state_not_retired, filter_batch_by_mask, is_transient_footer_error,
-    sort_batch_by_key_indices,
 };
 use reader_cache::ReaderCache;
 use state::TableSegmentState;
+
+struct OwnedDirectBulkColumn<'a> {
+    name: &'a str,
+    data_type: crate::protocol::types::DataType,
+    scale: i32,
+    precision: i32,
+    data: Vec<u8>,
+    nulls: Vec<u8>,
+    variable_ranges: Option<Vec<(usize, usize)>>,
+}
 
 pub struct SegmentManager {
     data_dir: PathBuf,
@@ -906,42 +915,32 @@ impl SegmentManager {
         catalogs: &crate::storage::catalog::schema::DatabaseCatalog,
         flush_immediately: bool,
     ) -> Result<u64> {
-        use rayon::prelude::*;
-
         let req = parse_direct_bulk_payload(payload)?;
-        if req.row_count == 0 {
-            return Ok(0);
-        }
-
-        let table_dir = self.data_dir.join(db).join(req.table_name);
-        std::fs::create_dir_all(&table_dir)?;
+        if req.row_count == 0 { return Ok(0); }
 
         let (schema, table_meta) = {
             let table_meta = catalogs.get_table(req.table_name).ok_or_else(|| {
                 TaibaiError::Sql(format!("table '{}.{}' does not exist", db, req.table_name))
             })?;
-            let schema = Schema::new(table_meta.columns.clone());
-            (schema, table_meta.clone())
+            (Schema::new(table_meta.columns.clone()), table_meta.clone())
         };
 
+        self.validate_direct_bulk_request(&req, &schema)?;
+        self.append_direct_bulk_request(db, &req, &schema, &table_meta, flush_immediately)
+    }
+
+    fn validate_direct_bulk_request(&self, req: &DirectBulkRequest<'_>, schema: &Schema) -> Result<()> {
         if schema.num_columns() != req.columns.len() {
             return Err(TaibaiError::Protocol(format!(
                 "bulk column count mismatch: schema has {} columns but payload has {}",
-                schema.num_columns(),
-                req.columns.len()
+                schema.num_columns(), req.columns.len()
             )));
         }
-
-        for (idx, (col_def, payload_col)) in
-            schema.columns.iter().zip(req.columns.iter()).enumerate()
-        {
+        for (idx, (col_def, payload_col)) in schema.columns.iter().zip(req.columns.iter()).enumerate() {
             if col_def.data_type != payload_col.data_type {
                 return Err(TaibaiError::Protocol(format!(
                     "bulk column {} type mismatch for '{}': schema={} payload={}",
-                    idx,
-                    col_def.name,
-                    col_def.data_type.display_name(),
-                    payload_col.data_type.display_name()
+                    idx, col_def.name, col_def.data_type.display_name(), payload_col.data_type.display_name()
                 )));
             }
             if !col_def.name.eq_ignore_ascii_case(payload_col.name) {
@@ -951,76 +950,112 @@ impl SegmentManager {
                 )));
             }
             if !payload_col.nulls.is_empty() {
-                return Err(TaibaiError::Protocol(
-                    "direct bulk path currently supports all-valid columns only".into(),
-                ));
+                return Err(TaibaiError::Protocol("direct bulk path currently supports all-valid columns only".into()));
             }
         }
+        Ok(())
+    }
 
-        if table_meta.is_partitioned() || !table_meta.cluster_key.is_empty() {
-            let mut batch = direct_bulk_request_to_batch(&req, &schema)?;
-            if !table_meta.cluster_key.is_empty() {
-                let key_indices: Vec<usize> = table_meta
-                    .cluster_key
-                    .iter()
-                    .filter_map(|key| schema.index_of(key))
-                    .collect();
-                if !key_indices.is_empty() {
-                    batch = sort_batch_by_key_indices(&batch, &key_indices)?;
-                }
-            }
-            return if flush_immediately {
-                self.bulk_insert_batch_partitioned(db, req.table_name, &table_meta, batch)
-            } else {
-                self.bulk_insert_batch_partitioned_deferred(db, req.table_name, &table_meta, batch)
-            };
-        }
-
-        let partition_key = String::new();
-
+    fn append_direct_bulk_request(
+        &self, db: &str, req: &DirectBulkRequest<'_>, schema: &Schema,
+        table_meta: &crate::storage::catalog::schema::TableMeta, flush_immediately: bool,
+    ) -> Result<u64> {
+        let table_dir = self.data_dir.join(db).join(req.table_name);
+        std::fs::create_dir_all(&table_dir)?;
+        let partition_groups = self.direct_bulk_partition_groups(req, table_meta)?;
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, req.table_name)?;
 
-        let compression_level = bulk_compression_level();
-        let compressed_columns: Vec<(Vec<u8>, u64)> = req
-            .columns
-            .par_iter()
-            .map(|col| {
-                let mut encoded = Vec::with_capacity(4 + col.data.len());
-                encoded.extend_from_slice(&0u32.to_le_bytes());
-                encoded.extend_from_slice(col.data);
-                let orig_len = encoded.len() as u64;
-                let compressed = zstd::bulk::compress(&encoded, compression_level)
-                    .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
-                Ok((compressed, orig_len))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        {
-            let _mutation_guard = state.mutation_lock.lock().unwrap();
-            ensure_state_not_retired(&state, db, req.table_name)?;
-
-            let mut active_guard = state.active_segments.lock().unwrap();
-            self.get_or_create_active_segment_for_partition_locked(
-                &table_dir,
-                &schema,
-                &partition_key,
-                &mut active_guard,
-            )?;
-
+        let mut written = 0u64;
+        let mut active_guard = state.active_segments.lock().unwrap();
+        for (partition_key, rows) in partition_groups {
+            if rows.is_empty() { continue; }
+            let selected_storage = self.direct_bulk_select_columns(req, &rows)?;
+            let selected_columns: Vec<DirectBulkColumn<'_>> = selected_storage.iter().map(|col| DirectBulkColumn {
+                name: col.name, data_type: col.data_type, scale: col.scale, precision: col.precision,
+                data: &col.data, nulls: &col.nulls, variable_ranges: col.variable_ranges.clone(),
+            }).collect();
+            let compressed_columns = self.compress_direct_bulk_columns(&selected_columns)?;
+            self.get_or_create_active_segment_for_partition_locked(&table_dir, schema, &partition_key, &mut active_guard)?;
             let seg = active_guard.get_mut(&partition_key).unwrap();
-
-            seg.append_direct_row_group(&req.columns, &compressed_columns, req.row_count as u64)?;
-
+            seg.append_direct_row_group(&selected_columns, &compressed_columns, rows.len() as u64)?;
             if seg.current_size >= self.max_segment_size() {
                 seg.seal(&|path| self.invalidate_reader(path))?;
                 active_guard.remove(&partition_key);
             } else if flush_immediately {
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
             }
+            written += rows.len() as u64;
         }
+        Ok(written)
+    }
 
-        Ok(req.row_count as u64)
+    fn direct_bulk_partition_groups(
+        &self, req: &DirectBulkRequest<'_>, table_meta: &crate::storage::catalog::schema::TableMeta,
+    ) -> Result<Vec<(String, Vec<usize>)>> {
+        if !table_meta.is_partitioned() { return Ok(vec![(String::new(), (0..req.row_count).collect())]); }
+        let pk_idx = table_meta.get_partition_column_index_cached().ok_or_else(|| {
+            TaibaiError::Sql(format!("partitioned table '{}' has no cached partition column index", table_meta.name))
+        })?;
+        let pk_col = req.columns.get(pk_idx).ok_or_else(|| TaibaiError::Protocol(format!("partition column index {} out of bulk payload", pk_idx)))?;
+        let strategy = table_meta.partition_strategy();
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut order = Vec::new();
+        for row_idx in 0..req.row_count {
+            let value = helpers::direct_bulk_column_scalar_at(pk_col, row_idx)?;
+            let partition_key = compute_partition_key_from_scalar(&strategy, &value);
+            if !groups.contains_key(&partition_key) {
+                order.push(partition_key.clone());
+                groups.insert(partition_key.clone(), Vec::new());
+            }
+            groups.get_mut(&partition_key).unwrap().push(row_idx);
+        }
+        Ok(order.into_iter().filter_map(|key| groups.remove(&key).map(|rows| (key, rows))).collect())
+    }
+
+    fn direct_bulk_select_columns<'a>(&self, req: &'a DirectBulkRequest<'a>, rows: &[usize]) -> Result<Vec<OwnedDirectBulkColumn<'a>>> {
+        req.columns.iter().map(|col| self.direct_bulk_select_column(col, rows)).collect()
+    }
+
+    fn direct_bulk_select_column<'a>(&self, col: &DirectBulkColumn<'a>, rows: &[usize]) -> Result<OwnedDirectBulkColumn<'a>> {
+        let mut data = Vec::new();
+        let mut variable_ranges = col.variable_ranges.as_ref().map(|_| Vec::with_capacity(rows.len()));
+        if let Some(width) = col.data_type.fixed_size() {
+            data.reserve(rows.len() * width);
+            for &row_idx in rows {
+                let offset = row_idx.checked_mul(width).ok_or_else(|| TaibaiError::Protocol("bulk column offset overflow".into()))?;
+                let end = offset + width;
+                if end > col.data.len() { return Err(TaibaiError::Protocol(format!("bulk column '{}' row {} is truncated", col.name, row_idx))); }
+                data.extend_from_slice(&col.data[offset..end]);
+            }
+        } else {
+            for &row_idx in rows {
+                let (offset, len) = col.variable_ranges.as_ref().and_then(|ranges| ranges.get(row_idx).copied()).ok_or_else(|| {
+                    TaibaiError::Protocol(format!("bulk column '{}' row {} not found", col.name, row_idx))
+                })?;
+                if offset + len > col.data.len() { return Err(TaibaiError::Protocol(format!("bulk column '{}' variable data truncated", col.name))); }
+                data.extend_from_slice(&(len as u32).to_le_bytes());
+                let value_offset = data.len();
+                data.extend_from_slice(&col.data[offset..offset + len]);
+                if let Some(ranges) = variable_ranges.as_mut() { ranges.push((value_offset, len)); }
+            }
+        }
+        Ok(OwnedDirectBulkColumn { name: col.name, data_type: col.data_type, scale: col.scale, precision: col.precision, data, nulls: Vec::new(), variable_ranges })
+    }
+
+    fn compress_direct_bulk_columns(&self, columns: &[DirectBulkColumn<'_>]) -> Result<Vec<(Vec<u8>, u64)>> {
+        use rayon::prelude::*;
+        let compression_level = bulk_compression_level();
+        columns.par_iter().map(|col| {
+            let mut encoded = Vec::with_capacity(4 + col.data.len());
+            encoded.extend_from_slice(&0u32.to_le_bytes());
+            encoded.extend_from_slice(col.data);
+            let orig_len = encoded.len() as u64;
+            let compressed = zstd::bulk::compress(&encoded, compression_level).map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
+            Ok((compressed, orig_len))
+        }).collect::<Result<Vec<_>>>()
     }
 
     pub fn bulk_insert_batch_partitioned(
