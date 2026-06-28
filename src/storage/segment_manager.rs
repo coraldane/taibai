@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 mod active_writer;
+mod cluster_meta_cache;
 mod config;
 mod helpers;
 mod reader_cache;
@@ -30,6 +31,7 @@ pub(crate) use helpers::direct_bulk_request_to_batch;
 pub use helpers::table_key;
 
 use active_writer::ActiveSegmentWriter;
+use cluster_meta_cache::ClusterMetaCache;
 use config::{
     bulk_compression_level, reader_cache_capacity, FLUSH_CHECK_INTERVAL_SECS,
     FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
@@ -66,6 +68,7 @@ pub struct SegmentManager {
     data_dir: PathBuf,
     tables: RwLock<HashMap<String, Arc<TableSegmentState>>>,
     reader_cache: Mutex<ReaderCache>,
+    cluster_meta_cache: Mutex<ClusterMetaCache>,
     flush_stop: Arc<AtomicBool>,
     flush_paused: Arc<AtomicBool>,
     next_txn_id: AtomicU64,
@@ -114,6 +117,7 @@ impl SegmentManager {
             data_dir: data_dir.to_path_buf(),
             tables: RwLock::new(tables),
             reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
+            cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
             flush_stop,
             flush_paused,
             next_txn_id: AtomicU64::new(1),
@@ -362,10 +366,56 @@ impl SegmentManager {
 
     pub fn invalidate_reader(&self, path: &Path) {
         self.reader_cache.lock().unwrap().invalidate(path);
+        self.cluster_meta_cache.lock().unwrap().invalidate(path);
     }
 
     pub fn invalidate_readers_under(&self, dir: &Path) {
         self.reader_cache.lock().unwrap().invalidate_under(dir);
+        self.cluster_meta_cache
+            .lock()
+            .unwrap()
+            .invalidate_under(dir);
+    }
+
+    /// Read-side metadata cache for a sealed segment's cluster-key column zone map.
+    ///
+    /// Returns the cached zone map for `col_idx` in `path`, deriving and caching it
+    /// on first access. Returns `None` when the segment has no usable bounds for the
+    /// column (empty/null). Mutable (unsealed) segments are never cached because their
+    /// footer can still change. The cache shares the reader-cache invalidation
+    /// lifecycle, so compaction/seal/delete automatically clears stale entries.
+    pub fn cluster_zone_map_cached(
+        &self,
+        path: &Path,
+        col_idx: usize,
+    ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        if self.is_mutable_segment_path(path) {
+            return self.derive_cluster_zone_map(path, col_idx);
+        }
+
+        if let Some(cached) = self.cluster_meta_cache.lock().unwrap().get(path, col_idx) {
+            return cached;
+        }
+
+        let derived = self.derive_cluster_zone_map(path, col_idx);
+        self.cluster_meta_cache
+            .lock()
+            .unwrap()
+            .put(path.to_path_buf(), col_idx, derived.clone());
+        derived
+    }
+
+    fn derive_cluster_zone_map(
+        &self,
+        path: &Path,
+        col_idx: usize,
+    ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        let reader = self.open_reader_cached(path).ok()?;
+        let zm = reader.segment_zone_maps().get(col_idx)?;
+        if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
+            return None;
+        }
+        Some(zm.clone())
     }
 
     pub fn remove_segment_file(&self, path: &Path) -> Result<()> {

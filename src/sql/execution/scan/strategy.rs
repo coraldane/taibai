@@ -1,0 +1,466 @@
+use crate::common::error::Result;
+use crate::storage::catalog::schema::TableMeta;
+use crate::storage::segment::SegmentReader;
+use crate::types::array::ColumnArray;
+use crate::types::batch::{RecordBatch, Schema};
+use crate::types::scalar::ScalarValue;
+
+use super::row_filter::{self, ClusterKeyBounds};
+use super::row_group::{self, RowGroupPruneResult};
+use super::spec::ScanSpec;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowGroupReadStrategy {
+    PlainRead,
+    PredicateFirstRead,
+    ClusterKeyRangeRead,
+}
+
+pub struct ScanPlan {
+    pub predicate_cols: Vec<usize>,
+    pub projection_cols: Vec<usize>,
+    pub strip_ttl_column: bool,
+    pub cluster_key_bounds: Option<ClusterKeyBounds>,
+    pub strategy: RowGroupReadStrategy,
+    pub scan_limit: Option<usize>,
+}
+
+pub struct ScanPlanner<'a> {
+    spec: &'a ScanSpec,
+    table_schema: &'a Schema,
+    table_meta: &'a TableMeta,
+}
+
+impl<'a> ScanPlanner<'a> {
+    pub fn new(spec: &'a ScanSpec, table_schema: &'a Schema, table_meta: &'a TableMeta) -> Self {
+        Self {
+            spec,
+            table_schema,
+            table_meta,
+        }
+    }
+
+    pub fn build(&self) -> ScanPlan {
+        let predicate_cols = self.spec.all_predicate_columns();
+        let mut projection_cols = match &self.spec.projection {
+            Some(p) => p.clone(),
+            None => (0..self.table_schema.num_columns()).collect(),
+        };
+        let strip_ttl_column = self.extend_projection_for_ttl(&mut projection_cols);
+
+        let cluster_key_bounds = self.cluster_key_bounds();
+        let strategy = self.select_strategy(&predicate_cols, &projection_cols, &cluster_key_bounds);
+
+        ScanPlan {
+            predicate_cols,
+            projection_cols,
+            strip_ttl_column,
+            cluster_key_bounds,
+            strategy,
+            scan_limit: self.effective_scan_limit(),
+        }
+    }
+
+    fn select_strategy(
+        &self,
+        predicate_cols: &[usize],
+        projection_cols: &[usize],
+        cluster_key_bounds: &Option<ClusterKeyBounds>,
+    ) -> RowGroupReadStrategy {
+        if cluster_key_bounds.is_some() {
+            return RowGroupReadStrategy::ClusterKeyRangeRead;
+        }
+        if self.should_use_predicate_first()
+            && !predicate_cols.is_empty()
+            && !projection_cols.is_empty()
+        {
+            return RowGroupReadStrategy::PredicateFirstRead;
+        }
+        RowGroupReadStrategy::PlainRead
+    }
+
+    fn effective_scan_limit(&self) -> Option<usize> {
+        let limit = self.spec.limit?;
+        if self.spec.has_order_by
+            || self.spec.has_aggregate
+            || self.spec.has_group_by
+            || self.spec.has_join
+            || self.spec.remaining_predicate.is_some()
+        {
+            return None;
+        }
+        Some(limit)
+    }
+
+    fn should_use_predicate_first(&self) -> bool {
+        if !self.spec.has_predicates() {
+            return false;
+        }
+        if self.spec.projection.is_none() {
+            return false;
+        }
+        if self.spec.all_predicate_columns().is_empty() {
+            return false;
+        }
+        true
+    }
+
+    fn extend_projection_for_ttl(&self, projection_cols: &mut Vec<usize>) -> bool {
+        let Some(ttl_idx) = self.table_meta.get_ttl_column_index_cached() else {
+            return false;
+        };
+        if projection_cols.contains(&ttl_idx) {
+            return false;
+        }
+        projection_cols.push(ttl_idx);
+        self.spec.projection.is_some()
+    }
+
+    fn cluster_key_bounds(&self) -> Option<ClusterKeyBounds> {
+        let cluster_key = self.spec.cluster_key.as_ref()?;
+        let key_col = cluster_key.first()?;
+        let key_col_idx = self.table_schema.index_of(key_col)?;
+
+        if let Some(value) = self.spec.eq_value_for_column(key_col_idx) {
+            return Some(ClusterKeyBounds {
+                column_index: key_col_idx,
+                lower: Some((value.clone(), true)),
+                upper: Some((value.clone(), true)),
+            });
+        }
+
+        let mut lower: Option<(crate::types::scalar::ScalarValue, bool)> = None;
+        let mut upper: Option<(crate::types::scalar::ScalarValue, bool)> = None;
+        for clause in &self.spec.range_predicates {
+            if clause.column_index != key_col_idx {
+                continue;
+            }
+            match clause.op {
+                crate::storage::partition::pruning::RangeOp::Eq => {
+                    return Some(ClusterKeyBounds {
+                        column_index: key_col_idx,
+                        lower: Some((clause.value.clone(), true)),
+                        upper: Some((clause.value.clone(), true)),
+                    });
+                }
+                crate::storage::partition::pruning::RangeOp::Gt => {
+                    set_tighter_lower(&mut lower, clause.value.clone(), false);
+                }
+                crate::storage::partition::pruning::RangeOp::Ge => {
+                    set_tighter_lower(&mut lower, clause.value.clone(), true);
+                }
+                crate::storage::partition::pruning::RangeOp::Lt => {
+                    set_tighter_upper(&mut upper, clause.value.clone(), false);
+                }
+                crate::storage::partition::pruning::RangeOp::Le => {
+                    set_tighter_upper(&mut upper, clause.value.clone(), true);
+                }
+            }
+        }
+
+        if lower.is_some() || upper.is_some() {
+            Some(ClusterKeyBounds {
+                column_index: key_col_idx,
+                lower,
+                upper,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+pub fn prune_segment(spec: &ScanSpec, reader: &SegmentReader) -> Option<RowGroupPruneResult> {
+    let pred = spec.to_row_group_predicate();
+    let segment_zone_maps = reader.segment_zone_maps();
+    if !row_group::prune_segment_by_zone_map(&pred, segment_zone_maps) {
+        return None;
+    }
+
+    let bloom_checks = row_group::build_bloom_check_list(spec);
+    let in_checks = row_group::build_in_check_list(spec);
+    let set_checks = row_group::build_set_check_list(spec);
+    let set_in_checks = row_group::build_set_in_check_list(spec);
+
+    Some(row_group::prune_row_groups(
+        reader,
+        &pred,
+        &bloom_checks,
+        &in_checks,
+        &set_checks,
+        &set_in_checks,
+        segment_zone_maps,
+    ))
+}
+
+pub fn read_row_group_with_strategy(
+    spec: &ScanSpec,
+    plan: &ScanPlan,
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+) -> Result<RecordBatch> {
+    match plan.strategy {
+        RowGroupReadStrategy::ClusterKeyRangeRead => {
+            let bounds = plan
+                .cluster_key_bounds
+                .as_ref()
+                .expect("cluster key bounds present for cluster key strategy");
+            row_filter::cluster_key_range_read(
+                reader,
+                rg_idx,
+                bounds,
+                &plan.projection_cols,
+                &plan.predicate_cols,
+                &spec.eq_predicates,
+                &spec.range_predicates,
+                &spec.in_predicates,
+                spec.remaining_predicate.as_ref(),
+            )
+        }
+        RowGroupReadStrategy::PredicateFirstRead => row_filter::predicate_first_read(
+            reader,
+            rg_idx,
+            &plan.predicate_cols,
+            &plan.projection_cols,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        ),
+        RowGroupReadStrategy::PlainRead => {
+            read_plain_row_group(spec, &plan.projection_cols, table_schema, reader, rg_idx)
+        }
+    }
+}
+
+pub fn read_plain_row_group(
+    spec: &ScanSpec,
+    projection_cols: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+) -> Result<RecordBatch> {
+    let mut batch = read_projected_row_group(projection_cols, table_schema, reader, rg_idx)?;
+
+    if !reader.delete_bitmap().is_empty() {
+        let rg_start_row: u64 = reader
+            .footer_row_groups_info()
+            .iter()
+            .take(rg_idx)
+            .map(|r| r.row_count)
+            .sum();
+        batch = crate::storage::segment::delete_bitmap::filter_batch(
+            &batch,
+            rg_start_row,
+            reader.delete_bitmap(),
+        )?;
+    }
+
+    if batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+
+    if spec.has_predicates() {
+        Ok(row_filter::apply_predicates(
+            &batch,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        ))
+    } else {
+        Ok(batch)
+    }
+}
+
+pub fn read_projected_row_group(
+    projection_cols: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+) -> Result<RecordBatch> {
+    let segment_col_count = reader.schema().num_columns();
+
+    if projection_cols.is_empty() {
+        return reader.read_row_group(rg_idx);
+    }
+
+    let valid_projection: Vec<usize> = projection_cols
+        .iter()
+        .filter(|&&idx| idx < segment_col_count)
+        .copied()
+        .collect();
+
+    if valid_projection.len() == projection_cols.len() {
+        reader.read_row_group_with_projection(rg_idx, projection_cols)
+    } else {
+        read_row_group_with_missing_columns(
+            projection_cols,
+            &valid_projection,
+            table_schema,
+            reader,
+            rg_idx,
+        )
+    }
+}
+
+fn read_row_group_with_missing_columns(
+    projection_cols: &[usize],
+    valid_projection: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+) -> Result<RecordBatch> {
+    let partial_batch = if valid_projection.is_empty() {
+        None
+    } else {
+        Some(reader.read_row_group_with_projection(rg_idx, valid_projection)?)
+    };
+    let row_count = partial_batch
+        .as_ref()
+        .map(|batch| batch.num_rows())
+        .unwrap_or_else(|| reader.row_group_rows(rg_idx) as usize);
+    let segment_col_count = reader.schema().num_columns();
+    let mut columns = Vec::with_capacity(projection_cols.len());
+    let mut col_defs = Vec::with_capacity(projection_cols.len());
+    let mut valid_idx = 0usize;
+
+    for &col_idx in projection_cols {
+        let col_def = &table_schema.columns[col_idx];
+        if col_idx < segment_col_count {
+            columns.push(partial_batch.as_ref().unwrap().columns[valid_idx].clone());
+            valid_idx += 1;
+        } else {
+            let mut null_col = ColumnArray::empty(col_def.data_type);
+            for _ in 0..row_count {
+                null_col.push(&ScalarValue::null_for_type(col_def.data_type))?;
+            }
+            columns.push(null_col);
+        }
+        col_defs.push(col_def.clone());
+    }
+
+    RecordBatch::try_new(Schema::new(col_defs), columns)
+}
+
+pub fn apply_ttl_filter_and_projection(
+    batch: RecordBatch,
+    table_meta: &TableMeta,
+    projection_cols: &[usize],
+    strip_ttl_column: bool,
+) -> Result<RecordBatch> {
+    let Some(ttl) = table_meta.ttl.as_ref() else {
+        return Ok(batch);
+    };
+    let Some(ttl_idx) = table_meta.get_ttl_column_index_cached() else {
+        return Ok(batch);
+    };
+    let Some(ttl_pos) = projection_cols.iter().position(|idx| *idx == ttl_idx) else {
+        return Ok(batch);
+    };
+    if batch.num_rows() == 0 || ttl_pos >= batch.num_columns() {
+        return Ok(batch);
+    }
+
+    let now = now_micros();
+    let ttl_micros = ttl.duration_secs.saturating_mul(1_000_000);
+    let ttl_col = batch.column(ttl_pos).unwrap();
+    let mut mask = Vec::with_capacity(batch.num_rows());
+    for row_idx in 0..batch.num_rows() {
+        let keep = match ttl_col.scalar(row_idx) {
+            ScalarValue::Timestamp(Some(ts)) => ts.saturating_add(ttl_micros) > now,
+            _ => false,
+        };
+        mask.push(keep);
+    }
+
+    let match_count = mask.iter().filter(|keep| **keep).count();
+    let filtered = if match_count == batch.num_rows() {
+        batch
+    } else if match_count == 0 {
+        RecordBatch::new(batch.schema.clone())
+    } else {
+        let columns = batch
+            .columns
+            .iter()
+            .map(|col| col.filter_by_mask_fast(&mask, match_count))
+            .collect();
+        RecordBatch::try_new(batch.schema.clone(), columns)?
+    };
+
+    if strip_ttl_column {
+        strip_projection_column(filtered, ttl_pos)
+    } else {
+        Ok(filtered)
+    }
+}
+
+fn strip_projection_column(batch: RecordBatch, column_pos: usize) -> Result<RecordBatch> {
+    if column_pos >= batch.num_columns() {
+        return Ok(batch);
+    }
+    let schema = Schema::new(
+        batch
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| (idx != column_pos).then_some(col.clone()))
+            .collect(),
+    );
+    let columns = batch
+        .columns
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, col)| (idx != column_pos).then_some(col))
+        .collect();
+    RecordBatch::try_new(schema, columns)
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
+}
+
+fn set_tighter_lower(
+    current: &mut Option<(crate::types::scalar::ScalarValue, bool)>,
+    candidate: crate::types::scalar::ScalarValue,
+    inclusive: bool,
+) {
+    let replace = match current {
+        Some((value, current_inclusive)) => {
+            match crate::storage::index::sort_key::compare_scalars_for_sort(&candidate, value) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => !inclusive && *current_inclusive,
+                std::cmp::Ordering::Less => false,
+            }
+        }
+        None => true,
+    };
+    if replace {
+        *current = Some((candidate, inclusive));
+    }
+}
+
+fn set_tighter_upper(
+    current: &mut Option<(crate::types::scalar::ScalarValue, bool)>,
+    candidate: crate::types::scalar::ScalarValue,
+    inclusive: bool,
+) {
+    let replace = match current {
+        Some((value, current_inclusive)) => {
+            match crate::storage::index::sort_key::compare_scalars_for_sort(&candidate, value) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => !inclusive && *current_inclusive,
+                std::cmp::Ordering::Greater => false,
+            }
+        }
+        None => true,
+    };
+    if replace {
+        *current = Some((candidate, inclusive));
+    }
+}

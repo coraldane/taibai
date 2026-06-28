@@ -7,6 +7,7 @@ use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
+use super::physical::{build_physical_pipeline, can_use_physical_pipeline, drain_pipeline, PhysicalContext};
 use crate::sql::parser::ast::{Expr, FromClause, ObjectName, SelectItem, Statement, TableRef};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
@@ -96,7 +97,7 @@ fn exec_table_select(
     db: &str,
     stmt: &Statement,
     from_clause: &FromClause,
-    mut stats: Option<&mut HashMap<String, ScanStats>>,
+    stats: Option<&mut HashMap<String, ScanStats>>,
     cached_plan: Option<LogicalPlan>,
 ) -> Result<ExecResult> {
     let resolved_stmt;
@@ -154,10 +155,49 @@ fn exec_table_select(
 
     let is_count_star = detect_count_star(stmt, &table_names);
 
+    if stats.is_none() && !is_count_star && can_use_physical_pipeline(&plan) {
+        let mut physical_ctx = PhysicalContext::new(
+            engine,
+            &table_refs,
+            &table_schemas,
+            &table_metas,
+            is_count_star,
+        );
+        let pipeline = build_physical_pipeline(plan, &mut physical_ctx)?;
+        tracing::debug!("query: physical pipeline built, starting next_batch loop");
+        let (schema, batches) = drain_pipeline(pipeline)?;
+        tracing::debug!("query: physical pipeline finished, {} batches", batches.len());
+        return Ok(ExecResult::Query { schema, batches });
+    }
+
+    exec_table_select_materialized(
+        engine,
+        &table_refs,
+        table_names,
+        table_schemas,
+        table_cluster_keys,
+        table_metas,
+        plan,
+        is_count_star,
+        stats,
+    )
+}
+
+fn exec_table_select_materialized(
+    engine: &Engine,
+    table_refs: &[ResolvedTableRef],
+    table_names: Vec<String>,
+    table_schemas: HashMap<String, Schema>,
+    table_cluster_keys: HashMap<String, Vec<String>>,
+    table_metas: HashMap<String, crate::storage::catalog::schema::TableMeta>,
+    plan: LogicalPlan,
+    is_count_star: bool,
+    mut stats: Option<&mut HashMap<String, ScanStats>>,
+) -> Result<ExecResult> {
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
 
-    for table_ref in &table_refs {
+    for table_ref in table_refs {
         let table_name = &table_ref.key;
         let schema = table_schemas.get(table_name).unwrap().clone();
         let meta = table_metas.get(table_name).unwrap().clone();
@@ -210,7 +250,7 @@ fn exec_table_select(
         try_skip_sort_for_cluster_key(plan, &table_batches, &table_cluster_keys, &table_schemas);
 
     let mut pipeline = super::operators::build_pipeline(plan, &table_batches)?;
-    tracing::debug!("query: pipeline built, starting next_batch loop");
+    tracing::debug!("query: materialized pipeline built, starting next_batch loop");
     let mut result_batches = Vec::new();
     let mut result_schema = None;
     while let Some(batch) = pipeline.next_batch()? {
