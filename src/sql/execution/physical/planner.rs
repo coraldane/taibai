@@ -119,7 +119,12 @@ fn build_operator_with_limit(
         }
         LogicalPlan::TopN(topn) => {
             let schema = get_scan_schema(&topn.input);
-            let input = build_operator_with_limit(*topn.input, ctx, None)?;
+            let input_plan = annotate_single_scan_with_ordered_limit(
+                *topn.input,
+                topn.sort_keys.clone(),
+                topn.limit.saturating_add(topn.offset),
+            );
+            let input = build_operator_with_limit(input_plan, ctx, None)?;
             let sorted = SortExec::new(topn.sort_keys, input, schema.clone())
                 .with_limit(topn.limit.saturating_add(topn.offset));
             if topn.offset == 0 {
@@ -316,6 +321,47 @@ fn single_scan(plan: &LogicalPlan) -> Option<&crate::sql::planner::ScanPlan> {
         LogicalPlan::Limit(limit) => single_scan(&limit.input),
         LogicalPlan::TopN(topn) => single_scan(&topn.input),
         _ => None,
+    }
+}
+
+fn annotate_single_scan_with_ordered_limit(
+    plan: LogicalPlan,
+    sort_keys: Vec<crate::sql::planner::SortKey>,
+    limit: usize,
+) -> LogicalPlan {
+    if single_scan(&plan).is_none() {
+        return plan;
+    }
+    annotate_scan(plan, &sort_keys, limit)
+}
+
+fn annotate_scan(
+    plan: LogicalPlan,
+    sort_keys: &[crate::sql::planner::SortKey],
+    limit: usize,
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Scan(mut scan) => {
+            scan.pushed_order = Some(sort_keys.to_vec());
+            scan.pushed_limit = Some(
+                scan.pushed_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+            LogicalPlan::Scan(scan)
+        }
+        LogicalPlan::Filter(mut filter) => {
+            filter.input = Box::new(annotate_scan(*filter.input, sort_keys, limit));
+            LogicalPlan::Filter(filter)
+        }
+        LogicalPlan::Project(mut project) => {
+            project.input = Box::new(annotate_scan(*project.input, sort_keys, limit));
+            LogicalPlan::Project(project)
+        }
+        LogicalPlan::Limit(mut limit_plan) => {
+            limit_plan.input = Box::new(annotate_scan(*limit_plan.input, sort_keys, limit));
+            LogicalPlan::Limit(limit_plan)
+        }
+        other => other,
     }
 }
 

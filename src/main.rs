@@ -94,11 +94,18 @@ where
     );
 
     if let Some(query_file) = config.log.query_file.as_deref() {
-        if let Err(e) = common::query_log::init(std::path::Path::new(query_file)) {
+        if let Err(e) = common::query_log::init(
+            std::path::Path::new(query_file),
+            config.log.query_max_size_mb,
+        ) {
             tracing::error!(error = %e, query_file, "failed to initialize query log");
             std::process::exit(1);
         }
-        tracing::info!(query_file, "query log initialized");
+        tracing::info!(
+            query_file,
+            query_max_size_mb = config.log.query_max_size_mb,
+            "query log initialized"
+        );
     }
 
     if let Err(e) = std::fs::create_dir_all(&config.storage.data_dir) {

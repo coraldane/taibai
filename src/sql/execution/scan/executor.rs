@@ -1,6 +1,7 @@
 use crate::common::error::Result;
 use crate::storage::segment::ScanStats;
 use crate::storage::segment_manager::SegmentManager;
+use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -124,7 +125,7 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_scan(&mut self) -> Result<Vec<RecordBatch>> {
-        let mut output = LimitedBatchSink::new(self.effective_scan_limit());
+        let mut output = LimitedBatchSink::new(None);
         self.execute_scan_into(&mut output)?;
         Ok(output.finish())
     }
@@ -139,7 +140,15 @@ impl<'a> ScanExecutor<'a> {
         let plan =
             super::strategy::ScanPlanner::new(self.spec, &self.table_schema, &self.table_meta)
                 .build();
-        let scan_limit = plan.scan_limit;
+        let mut scan_limit = plan.scan_limit;
+        let memtables_present = !self
+            .runtime
+            .memtable_manager()
+            .get_by_table(self.db, &self.spec.table_name)
+            .is_empty();
+        if plan.ordered_limit.is_some() && memtables_present {
+            scan_limit = None;
+        }
 
         if table_dir.exists() {
             let all_segments = SegmentManager::discover_segments(&table_dir)?;
@@ -154,6 +163,27 @@ impl<'a> ScanExecutor<'a> {
 
             let filtered_segments = self
                 .prune_segments_by_cluster_key(filtered_segments, plan.cluster_key_bounds.as_ref());
+            let ordered_limit = if let Some(order) = plan.ordered_limit {
+                if !memtables_present
+                    && self.ordered_cluster_segments_are_monotonic(
+                        &filtered_segments,
+                        order.order_column_index,
+                    )
+                {
+                    Some(order)
+                } else {
+                    scan_limit = None;
+                    None
+                }
+            } else {
+                None
+            };
+            output.set_limit(scan_limit);
+
+            let mut filtered_segments = filtered_segments;
+            if ordered_limit.is_some_and(|order| order.desc) {
+                filtered_segments.reverse();
+            }
 
             for seg_path in &filtered_segments {
                 let reader = match mgr.open_reader_cached(seg_path) {
@@ -181,10 +211,15 @@ impl<'a> ScanExecutor<'a> {
                     }
                 }
 
+                let mut candidate_indices = prune_result.candidate_indices;
+                if ordered_limit.is_some_and(|order| order.desc) {
+                    candidate_indices.reverse();
+                }
+
                 if scan_limit.is_some() {
-                    for rg_idx in &prune_result.candidate_indices {
-                        self.record_row_group_read();
-                        let batch = match super::strategy::read_row_group_with_strategy(
+                    for rg_idx in &candidate_indices {
+                        self.record_row_group_read(&reader, *rg_idx, &plan);
+                        let mut batch = match super::strategy::read_row_group_with_strategy(
                             self.spec,
                             &plan,
                             &self.table_schema,
@@ -194,6 +229,9 @@ impl<'a> ScanExecutor<'a> {
                             Ok(b) => b,
                             Err(_) => continue,
                         };
+                        if ordered_limit.is_some_and(|order| order.desc) {
+                            batch = reverse_batch(&batch)?;
+                        }
                         self.record_rows_scanned(batch.num_rows() as u64);
                         let batch = super::strategy::apply_ttl_filter_and_projection(
                             batch,
@@ -210,8 +248,7 @@ impl<'a> ScanExecutor<'a> {
 
                 use rayon::prelude::*;
 
-                let mut rg_batches: Vec<(usize, RecordBatch)> = prune_result
-                    .candidate_indices
+                let mut rg_batches: Vec<(usize, RecordBatch)> = candidate_indices
                     .par_iter()
                     .enumerate()
                     .filter_map(|(pos, rg_idx)| {
@@ -250,6 +287,8 @@ impl<'a> ScanExecutor<'a> {
                     }
                 }
             }
+        } else {
+            output.set_limit(scan_limit);
         }
 
         let mut memtable_spec = self.spec.clone();
@@ -275,17 +314,8 @@ impl<'a> ScanExecutor<'a> {
         Ok(())
     }
 
-    fn effective_scan_limit(&self) -> Option<usize> {
-        let limit = self.spec.limit?;
-        if self.spec.has_order_by
-            || self.spec.has_aggregate
-            || self.spec.has_group_by
-            || self.spec.has_join
-            || self.spec.remaining_predicate.is_some()
-        {
-            return None;
-        }
-        Some(limit)
+    fn ordered_cluster_segments_are_monotonic(&self, segments: &[PathBuf], col_idx: usize) -> bool {
+        segments.len() <= 1 || self.cluster_segment_zone_maps_are_monotonic(segments, col_idx)
     }
 
     fn prune_segments_by_cluster_key(
@@ -450,11 +480,29 @@ impl<'a> ScanExecutor<'a> {
             .cluster_zone_map_cached(segment, col_idx)
     }
 
-    fn record_row_group_read(&mut self) {
+    fn record_row_group_read(
+        &mut self,
+        reader: &crate::storage::segment::SegmentReader,
+        rg_idx: usize,
+        plan: &super::strategy::ScanPlan,
+    ) {
         if let Some(s) = self.stats.as_deref_mut() {
-            s.entry(self.spec.table_name.clone())
-                .or_default()
-                .row_groups_read += 1;
+            let entry = s.entry(self.spec.table_name.clone()).or_default();
+            entry.row_groups_read += 1;
+            let mut cols = plan.projection_cols.clone();
+            for col in &plan.predicate_cols {
+                if !cols.contains(col) {
+                    cols.push(*col);
+                }
+            }
+            let row_groups = reader.footer_row_groups_info();
+            if let Some(rg) = row_groups.get(rg_idx) {
+                for col_idx in cols {
+                    if let Some(bytes) = rg.column_compressed_sizes.get(col_idx) {
+                        entry.bytes_read_compressed += *bytes;
+                    }
+                }
+            }
         }
     }
 
@@ -483,6 +531,7 @@ impl<'a> ScanExecutor<'a> {
 
 trait BatchSink {
     fn push(&mut self, batch: RecordBatch) -> bool;
+    fn set_limit(&mut self, _limit: Option<usize>) {}
 }
 
 struct LimitedBatchSink {
@@ -506,6 +555,10 @@ impl LimitedBatchSink {
 }
 
 impl BatchSink for LimitedBatchSink {
+    fn set_limit(&mut self, limit: Option<usize>) {
+        self.limit = limit;
+    }
+
     fn push(&mut self, batch: RecordBatch) -> bool {
         if batch.num_rows() == 0 {
             return true;
@@ -534,4 +587,23 @@ impl BatchSink for LimitedBatchSink {
         self.batches.push(batch);
         self.rows_emitted < limit
     }
+}
+
+fn reverse_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    if batch.num_rows() <= 1 {
+        return Ok(batch.clone());
+    }
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for col in &batch.columns {
+        columns.push(reverse_column(col)?);
+    }
+    RecordBatch::try_new(batch.schema.clone(), columns)
+}
+
+fn reverse_column(col: &ColumnArray) -> Result<ColumnArray> {
+    let mut out = ColumnArray::with_capacity(col.data_type(), col.len());
+    for row_idx in (0..col.len()).rev() {
+        out.push(&col.scalar(row_idx))?;
+    }
+    Ok(out)
 }

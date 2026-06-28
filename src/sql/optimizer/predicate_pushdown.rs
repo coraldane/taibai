@@ -112,11 +112,8 @@ fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
 fn push_filter(input: LogicalPlan, predicate: LogicalExpr) -> (LogicalPlan, bool) {
     match input {
         LogicalPlan::Scan(mut scan) => {
-            if scan
-                .pushed_filter
-                .as_ref()
-                .is_some_and(|existing| contains_conjunct(existing, &predicate))
-            {
+            let missing = missing_conjuncts(scan.pushed_filter.as_ref(), predicate.clone());
+            if missing.is_empty() {
                 return (
                     LogicalPlan::Filter(FilterPlan {
                         predicate,
@@ -125,10 +122,7 @@ fn push_filter(input: LogicalPlan, predicate: LogicalExpr) -> (LogicalPlan, bool
                     false,
                 );
             }
-            scan.pushed_filter = Some(match scan.pushed_filter.take() {
-                Some(existing) => and_expr(existing, predicate.clone()),
-                None => predicate.clone(),
-            });
+            scan.pushed_filter = combine_scan_filter(scan.pushed_filter.take(), missing);
             (
                 LogicalPlan::Filter(FilterPlan {
                     predicate,
@@ -274,6 +268,28 @@ fn contains_conjunct(existing: &LogicalExpr, predicate: &LogicalExpr) -> bool {
     split_conjunct_refs(existing)
         .iter()
         .any(|part| *part == predicate)
+}
+
+fn missing_conjuncts(existing: Option<&LogicalExpr>, predicate: LogicalExpr) -> Vec<LogicalExpr> {
+    let parts = split_conjuncts(predicate);
+    let Some(existing) = existing else {
+        return parts;
+    };
+    parts
+        .into_iter()
+        .filter(|part| !contains_conjunct(existing, part))
+        .collect()
+}
+
+fn combine_scan_filter(
+    existing: Option<LogicalExpr>,
+    missing: Vec<LogicalExpr>,
+) -> Option<LogicalExpr> {
+    let missing = combine_conjuncts(missing)?;
+    Some(match existing {
+        Some(existing) => and_expr(existing, missing),
+        None => missing,
+    })
 }
 
 fn split_conjunct_refs(expr: &LogicalExpr) -> Vec<&LogicalExpr> {

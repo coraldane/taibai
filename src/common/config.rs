@@ -40,6 +40,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_query_log_max_size_mb() -> u64 {
+    1024
+}
+
 fn default_auto_compact_enabled() -> bool {
     true
 }
@@ -154,6 +158,8 @@ pub struct LogSettings {
     pub file: Option<String>,
     #[serde(default)]
     pub query_file: Option<String>,
+    #[serde(default = "default_query_log_max_size_mb")]
+    pub query_max_size_mb: u64,
 }
 
 impl Default for ServerConfig {
@@ -179,6 +185,7 @@ impl Default for ServerConfig {
                 level: "info".to_string(),
                 file: None,
                 query_file: None,
+                query_max_size_mb: default_query_log_max_size_mb(),
             },
         }
     }

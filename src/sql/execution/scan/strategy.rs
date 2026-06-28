@@ -23,6 +23,13 @@ pub struct ScanPlan {
     pub cluster_key_bounds: Option<ClusterKeyBounds>,
     pub strategy: RowGroupReadStrategy,
     pub scan_limit: Option<usize>,
+    pub ordered_limit: Option<OrderedClusterLimit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderedClusterLimit {
+    pub order_column_index: usize,
+    pub desc: bool,
 }
 
 pub struct ScanPlanner<'a> {
@@ -49,6 +56,7 @@ impl<'a> ScanPlanner<'a> {
         let strip_ttl_column = self.extend_projection_for_ttl(&mut projection_cols);
 
         let cluster_key_bounds = self.cluster_key_bounds();
+        let ordered_limit = self.ordered_cluster_limit();
         let strategy = self.select_strategy(&predicate_cols, &projection_cols, &cluster_key_bounds);
 
         ScanPlan {
@@ -58,6 +66,7 @@ impl<'a> ScanPlanner<'a> {
             cluster_key_bounds,
             strategy,
             scan_limit: self.effective_scan_limit(),
+            ordered_limit,
         }
     }
 
@@ -81,15 +90,56 @@ impl<'a> ScanPlanner<'a> {
 
     fn effective_scan_limit(&self) -> Option<usize> {
         let limit = self.spec.limit?;
-        if self.spec.has_order_by
-            || self.spec.has_aggregate
+        if self.spec.has_aggregate
             || self.spec.has_group_by
             || self.spec.has_join
             || self.spec.remaining_predicate.is_some()
         {
             return None;
         }
+        if self.spec.has_order_by && self.ordered_cluster_limit().is_none() {
+            return None;
+        }
         Some(limit)
+    }
+
+    fn ordered_cluster_limit(&self) -> Option<OrderedClusterLimit> {
+        let limit = self.spec.limit?;
+        if limit == 0
+            || !self.spec.has_order_by
+            || self.spec.has_aggregate
+            || self.spec.has_group_by
+            || self.spec.has_join
+            || self.spec.remaining_predicate.is_some()
+            || self.spec.order_by.len() != 1
+        {
+            return None;
+        }
+
+        let cluster_key = self.spec.cluster_key.as_ref()?;
+        let order = self.spec.order_by.first()?;
+        let order_col_name = self
+            .table_schema
+            .columns
+            .get(order.column_index)?
+            .name
+            .as_str();
+        let order_key_pos = cluster_key
+            .iter()
+            .position(|key| key.eq_ignore_ascii_case(order_col_name))?;
+        if order_key_pos == 0 {
+            return None;
+        }
+
+        for key in cluster_key.iter().take(order_key_pos) {
+            let key_idx = self.table_schema.index_of(key)?;
+            self.spec.eq_value_for_column(key_idx)?;
+        }
+
+        Some(OrderedClusterLimit {
+            order_column_index: order.column_index,
+            desc: order.desc,
+        })
     }
 
     fn should_use_predicate_first(&self) -> bool {
@@ -462,5 +512,75 @@ fn set_tighter_upper(
     };
     if replace {
         *current = Some((candidate, inclusive));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::sql::execution::scan::spec::{ScanSortKey, ScanSpec};
+    use crate::storage::catalog::schema::TableMeta;
+    use crate::types::batch::{ColumnDef, Schema};
+    use crate::types::scalar::ScalarValue;
+
+    fn stock_schema() -> Schema {
+        Schema::new(vec![
+            ColumnDef::new("security_id", DataType::VarChar),
+            ColumnDef::new("deal_date", DataType::Int32),
+            ColumnDef::new("close_px", DataType::Float64),
+        ])
+    }
+
+    fn stock_meta(schema: &Schema) -> TableMeta {
+        let mut meta = TableMeta::new("main", "t_stock_daily", schema.columns.clone());
+        meta.cluster_key = vec!["security_id".to_string(), "deal_date".to_string()];
+        meta
+    }
+
+    #[test]
+    fn ordered_cluster_limit_allows_scan_limit_for_eq_prefix_and_desc_next_key() {
+        let schema = stock_schema();
+        let meta = stock_meta(&schema);
+        let mut spec = ScanSpec::new("t_stock_daily");
+        spec.cluster_key = Some(meta.cluster_key.clone());
+        spec.eq_predicates
+            .push((0, ScalarValue::VarChar(Some("688256.SH".to_string()))));
+        spec.has_order_by = true;
+        spec.limit = Some(121);
+        spec.order_by.push(ScanSortKey {
+            column_index: 1,
+            desc: true,
+        });
+
+        let plan = ScanPlanner::new(&spec, &schema, &meta).build();
+
+        assert_eq!(plan.scan_limit, Some(121));
+        assert_eq!(
+            plan.ordered_limit,
+            Some(OrderedClusterLimit {
+                order_column_index: 1,
+                desc: true
+            })
+        );
+    }
+
+    #[test]
+    fn ordered_cluster_limit_requires_eq_prefix() {
+        let schema = stock_schema();
+        let meta = stock_meta(&schema);
+        let mut spec = ScanSpec::new("t_stock_daily");
+        spec.cluster_key = Some(meta.cluster_key.clone());
+        spec.has_order_by = true;
+        spec.limit = Some(121);
+        spec.order_by.push(ScanSortKey {
+            column_index: 1,
+            desc: true,
+        });
+
+        let plan = ScanPlanner::new(&spec, &schema, &meta).build();
+
+        assert_eq!(plan.scan_limit, None);
+        assert_eq!(plan.ordered_limit, None);
     }
 }
