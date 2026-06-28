@@ -71,6 +71,7 @@ impl ActiveSegmentWriter {
         columns: &[DirectBulkColumn<'_>],
         compressed_columns: &[(Vec<u8>, u64)],
         row_count: u64,
+        build_value_sets: bool,
     ) -> Result<()> {
         self.ensure_data_write_position()?;
 
@@ -91,7 +92,11 @@ impl ActiveSegmentWriter {
         }
         self.file.write_all(&write_buf)?;
 
-        let value_sets = compute_value_sets_from_bulk_columns(columns, row_count)?;
+        let value_sets = if build_value_sets {
+            compute_value_sets_from_bulk_columns(columns, row_count)?
+        } else {
+            vec![None; self.schema.num_columns()]
+        };
 
         self.row_groups.push(RowGroupMeta {
             offset,
