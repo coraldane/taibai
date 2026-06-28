@@ -11,7 +11,7 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use super::ExecutionOp;
+use super::{ExecutionOp, RuntimeInFilter};
 
 /// Columnar Hash Join Executor
 pub struct HashJoinExec {
@@ -115,11 +115,36 @@ impl HashJoinExec {
                     ht.insert_batch(batch);
                 }
                 ht.finalize();
+                self.inject_right_runtime_filter(&ht);
                 self.hash_table = Some(ht);
             }
         }
         self.probe_state.build_done = true;
         Ok(())
+    }
+    fn inject_right_runtime_filter(&mut self, ht: &JoinHashTable) {
+        if !matches!(
+            self.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Semi
+        ) {
+            return;
+        }
+        if self.left_key_cols.len() != 1 || self.right_key_cols.len() != 1 {
+            return;
+        }
+        let values: Vec<ScalarValue> = ht
+            .unique_key_values()
+            .into_iter()
+            .filter_map(|key| key.into_iter().next())
+            .filter(|value| !value.is_null())
+            .collect();
+        if values.is_empty() || values.len() > 1024 {
+            return;
+        }
+        self.right.add_runtime_in_filter(RuntimeInFilter {
+            column_index: self.right_key_cols[0],
+            values,
+        });
     }
 }
 

@@ -402,6 +402,9 @@ impl Compactor {
         );
 
         let write_result = self.write_sorted_segment(
+            db,
+            table,
+            partition_label,
             &tmp_path,
             schema,
             cluster_key_indices,
@@ -448,6 +451,9 @@ impl Compactor {
 
     fn write_sorted_segment(
         &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
         path: &Path,
         schema: &Schema,
         cluster_key_indices: &[usize],
@@ -469,6 +475,10 @@ impl Compactor {
         let mut row_group_cache = RowGroupCache::new(source_row_groups.len(), non_key_projection);
 
         tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key,
             source_row_groups = source_row_groups.len(),
             cache_capacity = row_group_cache.capacity(),
             chunk_rows = WRITE_GATHER_CHUNK_ROWS,
@@ -488,15 +498,26 @@ impl Compactor {
             rows_written += batch.num_rows();
             writer.write_batch(&batch)?;
             if rows_written.is_multiple_of(WRITE_GATHER_CHUNK_ROWS * 16) {
+                let total_rows = row_refs.len();
+                let progress_pct = rows_written as f64 * 100.0 / total_rows as f64;
                 tracing::info!(
+                    db,
+                    table,
+                    table_full_name = %format!("{}.{}", db, table),
+                    partition_key,
                     rows_written,
-                    total_rows = row_refs.len(),
+                    total_rows,
+                    progress_pct = format_args!("{:.2}", progress_pct),
                     "compact write progress"
                 );
             }
         }
 
         tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key,
             rows_written,
             cache_hits = row_group_cache.hits(),
             cache_misses = row_group_cache.misses(),

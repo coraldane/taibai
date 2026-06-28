@@ -11,7 +11,7 @@ use super::memtable;
 use super::partition;
 use super::row_group::RowGroupPruneResult;
 use super::runtime::ScanRuntime;
-use super::spec::ScanSpec;
+use super::spec::{InPredicate, ScanSpec};
 use super::strategy::{self, ScanPlan};
 
 pub struct ScanCursor {
@@ -64,6 +64,24 @@ impl ScanCursor {
             memtable_batches: Vec::new(),
             memtable_pos: 0,
         }))
+    }
+
+    pub fn add_in_filter(
+        &mut self,
+        column_index: usize,
+        values: Vec<crate::types::scalar::ScalarValue>,
+    ) -> bool {
+        if self.initialized || values.is_empty() {
+            return false;
+        }
+        self.spec.in_predicates.push(InPredicate {
+            column_index,
+            values,
+        });
+        self.plan =
+            strategy::ScanPlanner::new(&self.spec, &self.table_schema, &self.table_meta).build();
+        self.remaining_limit = self.plan.scan_limit;
+        true
     }
 
     pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {

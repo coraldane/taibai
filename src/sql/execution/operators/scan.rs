@@ -11,6 +11,12 @@ use crate::types::scalar::ScalarValue;
 
 use super::ExecutionOp;
 
+#[derive(Clone)]
+pub struct RuntimeInFilter {
+    pub column_index: usize,
+    pub values: Vec<ScalarValue>,
+}
+
 pub struct ScanExec {
     source: ScanSource,
     projection: Option<Vec<usize>>,
@@ -124,6 +130,27 @@ impl ExecutionOp for ScanExec {
         match &self.projection {
             Some(indices) => project_batch(batch, indices, self.table_schema.as_ref()),
             None => Ok(Some(batch)),
+        }
+    }
+
+    fn add_runtime_in_filter(&mut self, filter: RuntimeInFilter) -> bool {
+        if filter.values.is_empty() {
+            return false;
+        }
+        match &mut self.source {
+            ScanSource::Cursor(cursor) => cursor.add_in_filter(filter.column_index, filter.values),
+            ScanSource::Deferred { spec, batches, .. } => {
+                if batches.is_some() {
+                    return false;
+                }
+                spec.in_predicates
+                    .push(crate::sql::execution::scan::spec::InPredicate {
+                        column_index: filter.column_index,
+                        values: filter.values,
+                    });
+                true
+            }
+            ScanSource::Batches(_) => false,
         }
     }
 }

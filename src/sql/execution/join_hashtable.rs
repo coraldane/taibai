@@ -20,6 +20,10 @@ impl JoinKey {
                 .collect(),
         )
     }
+
+    pub fn to_scalars(&self) -> Vec<ScalarValue> {
+        self.0.iter().map(ScalarValueHashable::to_scalar).collect()
+    }
 }
 
 /// Wrapper to make ScalarValue hashable for use in HashMap.
@@ -66,6 +70,28 @@ impl ScalarValueHashable {
             ScalarValue::Timestamp(t) => ScalarValueHashable::Timestamp(*t),
             ScalarValue::Decimal(d) => ScalarValueHashable::Int64(*d),
             _ => ScalarValueHashable::Null,
+        }
+    }
+
+    pub fn to_scalar(&self) -> ScalarValue {
+        match self {
+            ScalarValueHashable::Bool(v) => ScalarValue::Bool(*v),
+            ScalarValueHashable::Int8(v) => ScalarValue::Int8(*v),
+            ScalarValueHashable::Int16(v) => ScalarValue::Int16(*v),
+            ScalarValueHashable::Int32(v) => ScalarValue::Int32(*v),
+            ScalarValueHashable::Int64(v) => ScalarValue::Int64(*v),
+            ScalarValueHashable::UInt8(v) => ScalarValue::UInt8(*v),
+            ScalarValueHashable::UInt16(v) => ScalarValue::UInt16(*v),
+            ScalarValueHashable::UInt32(v) => ScalarValue::UInt32(*v),
+            ScalarValueHashable::UInt64(v) => ScalarValue::UInt64(*v),
+            ScalarValueHashable::FloatToI64(v) => {
+                ScalarValue::Float64(v.map(|bits| f64::from_bits(bits as u64)))
+            }
+            ScalarValueHashable::VarChar(v) => ScalarValue::VarChar(v.clone()),
+            ScalarValueHashable::Date(v) => ScalarValue::Date(*v),
+            ScalarValueHashable::Time(v) => ScalarValue::Time(*v),
+            ScalarValueHashable::Timestamp(v) => ScalarValue::Timestamp(*v),
+            ScalarValueHashable::Null => ScalarValue::Int64(None),
         }
     }
 }
@@ -184,6 +210,10 @@ impl JoinHashTable {
     /// Number of unique keys.
     pub fn key_count(&self) -> usize {
         self.table.len()
+    }
+
+    pub fn unique_key_values(&self) -> Vec<Vec<ScalarValue>> {
+        self.table.keys().map(|key| key.to_scalars()).collect()
     }
 
     fn row_offset(&self, batch_idx: usize, row_idx: usize) -> usize {
