@@ -43,3 +43,4 @@ auto_compact:
 log:
   level: "info"  # trace, debug, info, warn, error
   file: "../logs/taibai.log"
+  query_file: "../logs/taibai-query.log"

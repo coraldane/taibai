@@ -120,37 +120,16 @@ impl Engine {
 
         let auth_manager = Arc::new(AuthManager::new(data_dir)?);
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
-        for (db_name, catalog) in &catalogs {
-            for table_meta in catalog.tables.values() {
-                for (col_idx, col) in table_meta.columns.iter().enumerate() {
-                    if col.auto_increment {
-                        let catalog_start = (table_meta.row_count.max(0) as u64) + 1;
-                        let start_value = match restored_auto_increment_start(
-                            &segment_mgr,
-                            data_dir,
-                            db_name,
-                            &table_meta.name,
-                            col_idx,
-                            catalog_start,
-                        ) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    table = %table_meta.name,
-                                    column = %col.name,
-                                    "failed to scan auto_increment max value, using catalog row count"
-                                );
-                                catalog_start
-                            }
-                        };
-                        auto_increment_mgr.register(
-                            db_name,
-                            &table_meta.name,
-                            &col.name,
-                            start_value,
-                        )?;
-                    }
+        for (db_name, catalog) in &mut catalogs {
+            for table_meta in catalog.tables.values_mut() {
+                table_meta.ensure_auto_increment_next_value();
+                if let Some(col) = table_meta.auto_increment_column() {
+                    auto_increment_mgr.register(
+                        db_name,
+                        &table_meta.name,
+                        &col.name,
+                        table_meta.auto_increment_next_value,
+                    )?;
                 }
             }
         }
@@ -403,12 +382,7 @@ impl Engine {
                 where_clause,
             } => {
                 let db = table.effective_database(&session.database).to_string();
-                let result = super::dml_delete::exec_delete(
-                    self,
-                    &db,
-                    &table.name,
-                    where_clause,
-                );
+                let result = super::dml_delete::exec_delete(self, &db, &table.name, where_clause);
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
                 }
@@ -487,20 +461,28 @@ impl Engine {
             Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),
             Statement::ShowEngines => super::ddl::exec_show_engines(self),
             Statement::ShowProcesslist { full } => super::ddl::exec_show_processlist(self, *full),
-            Statement::AlterUser { name, operations } => super::ddl::exec_alter_user(self, name, operations),
+            Statement::AlterUser { name, operations } => {
+                super::ddl::exec_alter_user(self, name, operations)
+            }
             Statement::ShowUsers => super::ddl::exec_show_users(self),
             Statement::ShowRoles => super::ddl::exec_show_roles(self),
             Statement::ShowGrants { user } => super::ddl::exec_show_grants(self, user),
             Statement::ShowPartitions { table } => {
-                let db = table.as_ref().map(|t| t.effective_database(&session.database)).unwrap_or(&session.database);
+                let db = table
+                    .as_ref()
+                    .map(|t| t.effective_database(&session.database))
+                    .unwrap_or(&session.database);
                 let table_name = table.as_ref().map(|t| t.name.clone());
                 super::ddl::exec_show_partitions(self, db, &table_name)
             }
             Statement::FlushTable { table } => {
-                let db = table.as_ref().map(|t| t.effective_database(&session.database)).unwrap_or(&session.database);
+                let db = table
+                    .as_ref()
+                    .map(|t| t.effective_database(&session.database))
+                    .unwrap_or(&session.database);
                 let table_name = table.as_ref().map(|t| t.name.clone());
                 super::ddl::exec_flush_table(self, db, &table_name)
-            },
+            }
             Statement::Union { .. } => super::query::exec_select(self, &session.database, stmt),
             Statement::OptimizeTable { table, partition } => super::ddl::exec_optimize_table(
                 self,
@@ -911,11 +893,38 @@ impl Engine {
         if let Some(catalog) = catalogs.get_mut(db) {
             if let Some(meta) = catalog.get_table_mut(table) {
                 meta.row_count += rows;
+                if let Some(counter) = self.auto_increment_mgr.get(db, table) {
+                    meta.auto_increment_next_value = counter.current_value();
+                }
             }
             if should_save {
                 let meta_dir = self.data_dir.join("meta");
                 catalog.save(&meta_dir)?;
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persist_auto_increment_next_value(
+        &self,
+        db: &str,
+        table: &str,
+        save_immediately: bool,
+    ) -> Result<()> {
+        let Some(counter) = self.auto_increment_mgr.get(db, table) else {
+            return Ok(());
+        };
+        let mut catalogs = self.catalogs.write().unwrap();
+        let Some(catalog) = catalogs.get_mut(db) else {
+            return Ok(());
+        };
+        let Some(meta) = catalog.get_table_mut(table) else {
+            return Ok(());
+        };
+        meta.auto_increment_next_value = counter.current_value();
+        if save_immediately {
+            let meta_dir = self.data_dir.join("meta");
+            catalog.save(&meta_dir)?;
         }
         Ok(())
     }
@@ -1015,13 +1024,38 @@ impl Engine {
             .get(db)
             .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
+        let mut explicit_auto_increment_max = None;
         if let Some(table_meta) = catalog.get_table(&table_name) {
-            if !table_meta.unique_indexes.is_empty() {
+            if !table_meta.unique_indexes.is_empty() || table_meta.has_auto_increment() {
                 let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
                 let schema = Schema::new(table_meta.columns.clone());
                 let batch =
                     crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)?;
-                self.validate_batch_unique_indexes(db, &table_name, &batch)?;
+                if !table_meta.unique_indexes.is_empty() {
+                    self.validate_batch_unique_indexes(db, &table_name, &batch)?;
+                }
+                if let Some((col_idx, _)) = table_meta
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, col)| col.auto_increment)
+                {
+                    let mut max_value = None;
+                    for row_idx in 0..batch.num_rows() {
+                        let Some(value) = batch.scalar(row_idx, col_idx) else {
+                            continue;
+                        };
+                        let Some(int_value) = value.integer_i128() else {
+                            continue;
+                        };
+                        let Ok(unsigned) = u64::try_from(int_value) else {
+                            continue;
+                        };
+                        max_value =
+                            Some(max_value.map_or(unsigned, |current: u64| current.max(unsigned)));
+                    }
+                    explicit_auto_increment_max = max_value;
+                }
             }
         }
 
@@ -1033,6 +1067,11 @@ impl Engine {
             !bulk_import_mode,
         )?;
         drop(catalogs);
+
+        if let Some(max_value) = explicit_auto_increment_max {
+            self.auto_increment_mgr
+                .advance_past(db, &table_name, max_value)?;
+        }
 
         if !disable_wal && !bulk_import_mode {
             let req = {
@@ -1047,20 +1086,24 @@ impl Engine {
                     if let Some(catalog) = catalogs_mut.get_mut(db) {
                         if let Some(meta) = catalog.get_table_mut(&table_name) {
                             meta.row_count += row_count;
+                            if let Some(counter) = self.auto_increment_mgr.get(db, &table_name) {
+                                meta.auto_increment_next_value = counter.current_value();
+                            }
                         }
                         let meta_dir = self.data_dir.join("meta");
                         catalog.save(&meta_dir)?;
                     }
                 }
-                if result > 0 {
-                }
+                if result > 0 {}
                 result
             };
             return Ok(req);
         }
 
-        if result > 0 {
+        if explicit_auto_increment_max.is_some() {
+            self.persist_auto_increment_next_value(db, &table_name, false)?;
         }
+        if result > 0 {}
         Ok(result)
     }
 }
@@ -1097,40 +1140,4 @@ fn bulk_payload_table_name(payload: &[u8]) -> Result<&str> {
     }
     std::str::from_utf8(&payload[start..end])
         .map_err(|e| TaibaiError::Protocol(format!("invalid utf8: {}", e)))
-}
-
-fn restored_auto_increment_start(
-    segment_mgr: &Arc<SegmentManager>,
-    data_dir: &Path,
-    db: &str,
-    table: &str,
-    col_idx: usize,
-    catalog_start: u64,
-) -> Result<u64> {
-    let table_dir = data_dir.join(db).join(table);
-    if !table_dir.exists() {
-        return Ok(catalog_start);
-    }
-
-    let mut max_value = catalog_start.saturating_sub(1);
-    for seg_path in SegmentManager::discover_segments(&table_dir)? {
-        let reader = segment_mgr.open_reader_cached(&seg_path)?;
-        for rg_idx in 0..reader.num_row_groups() {
-            let batch = reader.read_row_group_with_projection(rg_idx, &[col_idx])?;
-            for row_idx in 0..batch.num_rows() {
-                let Some(value) = batch.scalar(row_idx, 0) else {
-                    continue;
-                };
-                let Some(int_value) = value.integer_i128() else {
-                    continue;
-                };
-                let Ok(unsigned) = u64::try_from(int_value) else {
-                    continue;
-                };
-                max_value = max_value.max(unsigned);
-            }
-        }
-    }
-
-    Ok(max_value.saturating_add(1).max(catalog_start))
 }

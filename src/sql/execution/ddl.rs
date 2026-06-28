@@ -97,6 +97,9 @@ pub fn exec_create_table(
 
     let auto_inc_col = columns.iter().find(|c| c.auto_increment);
     if let Some(ai_col) = auto_inc_col {
+        if let Some(meta) = catalog.get_table_mut(name) {
+            meta.auto_increment_next_value = 1;
+        }
         engine
             .auto_increment_manager()
             .register(db, name, &ai_col.name, 1)?;
@@ -309,10 +312,31 @@ pub fn exec_alter_table(
                     .with_primary_key(column.primary_key)
                     .with_default_value(default_value);
                 validate_column_constraints(std::slice::from_mut(&mut col_def))?;
+                let added_auto_increment = col_def.auto_increment;
+                let added_column_name = col_def.name.clone();
                 catalog.add_column(name, col_def)?;
+                if added_auto_increment {
+                    if let Some(meta) = catalog.get_table_mut(name) {
+                        meta.auto_increment_next_value = 1;
+                    }
+                    engine
+                        .auto_increment_manager()
+                        .register(db, name, &added_column_name, 1)?;
+                }
             }
             AlterOperation::DropColumn { name: col_name } => {
+                let dropped_auto_increment = catalog
+                    .get_table(name)
+                    .and_then(|meta| {
+                        meta.columns
+                            .iter()
+                            .find(|col| col.name.eq_ignore_ascii_case(col_name))
+                    })
+                    .is_some_and(|col| col.auto_increment);
                 catalog.drop_column(name, col_name)?;
+                if dropped_auto_increment {
+                    engine.auto_increment_manager().unregister(db, name);
+                }
                 if let Some(meta) = catalog.get_table_mut(name) {
                     meta.unique_indexes.retain(|idx| {
                         !idx.columns
@@ -398,6 +422,7 @@ pub fn exec_alter_table(
                     column.scale,
                     column.precision,
                 )?;
+                engine.persist_auto_increment_next_value(db, name, false)?;
             }
             AlterOperation::RenameTable { new_name } => {
                 let old_table_dir = engine.data_dir().join(db).join(name);
@@ -690,6 +715,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     }
 
     if let Some(meta) = catalog.get_table_mut(table) {
+        meta.reset_auto_increment_next_value();
         meta.row_count = 0;
         meta.segment_count = 0;
         for part in &mut meta.partitions {

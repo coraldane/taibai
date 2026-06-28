@@ -180,14 +180,47 @@ impl Handler {
 
         let session = match &mut self.session {
             Some(s) => s,
-            None => return Ok(vec![build_error("not logged in")]),
+            None => {
+                crate::common::query_log::log_query(
+                    "",
+                    database,
+                    sql,
+                    "error:not_logged_in",
+                    server_start.elapsed(),
+                );
+                return Ok(vec![build_error("not logged in")]);
+            }
+        };
+        let query_user = session.username.clone();
+        let query_database = if database.is_empty() {
+            session.database.clone()
+        } else {
+            database.to_string()
         };
 
         if sql.starts_with("START BULK IMPORT") {
-            return self.handle_start_bulk_import(sql);
+            let result = self.handle_start_bulk_import(sql);
+            let status = if result.is_ok() { "ok" } else { "error" };
+            crate::common::query_log::log_query(
+                &query_user,
+                &query_database,
+                sql,
+                status,
+                server_start.elapsed(),
+            );
+            return result;
         }
         if sql == "STOP BULK IMPORT" {
-            return self.handle_stop_bulk_import();
+            let result = self.handle_stop_bulk_import();
+            let status = if result.is_ok() { "ok" } else { "error" };
+            crate::common::query_log::log_query(
+                &query_user,
+                &query_database,
+                sql,
+                status,
+                server_start.elapsed(),
+            );
+            return result;
         }
 
         let use_binary = session.binary_results;
@@ -218,6 +251,13 @@ impl Handler {
                         s.mark_txn_write();
                     }
                 }
+                crate::common::query_log::log_query(
+                    &query_user,
+                    &query_database,
+                    sql,
+                    "ok",
+                    server_start.elapsed(),
+                );
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
                     execute: execute_elapsed,
@@ -232,6 +272,13 @@ impl Handler {
                 } else {
                     build_query_result(&schema, &batches)
                 };
+                crate::common::query_log::log_query(
+                    &query_user,
+                    &query_database,
+                    sql,
+                    "ok",
+                    server_start.elapsed(),
+                );
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
                     execute: execute_elapsed,
@@ -243,6 +290,14 @@ impl Handler {
                 if !is_insert {
                     tracing::warn!(error = %e, sql, "query error");
                 }
+                let status = format!("error:{}", e);
+                crate::common::query_log::log_query(
+                    &query_user,
+                    &query_database,
+                    sql,
+                    &status,
+                    server_start.elapsed(),
+                );
                 Ok(vec![build_error(&e.to_string())])
             }
         }

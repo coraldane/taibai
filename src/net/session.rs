@@ -6,7 +6,6 @@ use uuid::Uuid;
 use crate::sql::execution::prepared::PreparedStatementCache;
 use crate::storage::txn::txn::{AccessMode, IsolationLevel, Transaction};
 
-
 pub struct Session {
     pub id: Uuid,
     pub database: String,

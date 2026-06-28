@@ -40,7 +40,6 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-
 fn default_auto_compact_enabled() -> bool {
     true
 }
@@ -118,7 +117,6 @@ pub struct TlsConfigYaml {
     pub key_path: String,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoCompactSettings {
     #[serde(default = "default_auto_compact_enabled")]
@@ -154,6 +152,8 @@ pub struct LogSettings {
     pub level: String,
     #[serde(default)]
     pub file: Option<String>,
+    #[serde(default)]
+    pub query_file: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -178,6 +178,7 @@ impl Default for ServerConfig {
             log: LogSettings {
                 level: "info".to_string(),
                 file: None,
+                query_file: None,
             },
         }
     }
@@ -208,6 +209,11 @@ impl ServerConfig {
         if let Some(log_file) = self.log.file.as_mut() {
             *log_file = resolve_config_relative(config_dir, log_file);
         }
+        if let Some(query_file) = self.log.query_file.as_mut() {
+            *query_file = resolve_config_relative(config_dir, query_file);
+        } else if let Some(log_file) = self.log.file.as_deref() {
+            self.log.query_file = Some(default_query_log_file(log_file));
+        }
     }
 
     pub fn tls_mode(&self) -> TlsMode {
@@ -220,6 +226,15 @@ impl ServerConfig {
             TlsMode::Disable
         }
     }
+}
+
+fn default_query_log_file(log_file: &str) -> String {
+    let path = Path::new(log_file);
+    path.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("taibai-query.log")
+        .to_string_lossy()
+        .to_string()
 }
 
 fn resolve_config_relative(config_dir: &Path, value: &str) -> String {
@@ -475,8 +490,18 @@ log:
             .join("taibai.log")
             .to_string_lossy()
             .to_string();
+        let expected_query_file = temp
+            .path()
+            .join("logs")
+            .join("taibai-query.log")
+            .to_string_lossy()
+            .to_string();
 
         assert_eq!(config.storage.data_dir, expected_data_dir);
         assert_eq!(config.log.file.as_deref(), Some(expected_log_file.as_str()));
+        assert_eq!(
+            config.log.query_file.as_deref(),
+            Some(expected_query_file.as_str())
+        );
     }
 }

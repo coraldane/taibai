@@ -193,6 +193,8 @@ pub fn exec_insert(
         &missing_auto_inc,
     )?;
 
+    let auto_increment_touched = !auto_inc_cols.is_empty();
+
     if bulk_import_mode {
         engine.exec_bulk_insert_partitioned_with_wal_control(
             db,
@@ -212,6 +214,9 @@ pub fn exec_insert(
         !bulk_import_mode && txn_id > 0,
         !bulk_import_mode && txn_id == 0,
     )?;
+    if auto_increment_touched {
+        engine.persist_auto_increment_next_value(db, table, !bulk_import_mode && txn_id > 0)?;
+    }
 
     Ok(ExecResult::Ok {
         rows_affected: row_count,

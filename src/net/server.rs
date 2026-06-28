@@ -37,7 +37,11 @@ impl Server {
             },
             TlsMode::Disable => None,
         };
-        Self { config, engine, tls_acceptor }
+        Self {
+            config,
+            engine,
+            tls_acceptor,
+        }
     }
 
     pub async fn run_with_shutdown<S>(&self, shutdown: S) -> Result<()>
@@ -138,8 +142,10 @@ mod tests {
     use tokio::io::DuplexStream;
     use tokio::task::JoinHandle;
 
-    use crate::protocol::message::{write_len_prefixed_string, Message, MAX_MESSAGE_SIZE, MSG_TYPE_AUTH_OK, MSG_TYPE_LOGIN};
     use crate::net::session::Session;
+    use crate::protocol::message::{
+        write_len_prefixed_string, Message, MAX_MESSAGE_SIZE, MSG_TYPE_AUTH_OK, MSG_TYPE_LOGIN,
+    };
 
     fn test_engine() -> (TempDir, Arc<Engine>) {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -176,5 +182,4 @@ mod tests {
             .expect("login frame");
         assert_eq!(resp.msg_type, MSG_TYPE_AUTH_OK);
     }
-
 }

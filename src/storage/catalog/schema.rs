@@ -40,6 +40,9 @@ fn default_partition_param() -> i32 {
 fn default_partition_key_idx() -> i32 {
     -1
 }
+fn default_auto_increment_next_value() -> u64 {
+    1
+}
 
 /// Time-to-live policy for a table. Rows are visible while
 /// `column + duration_secs` is greater than the current time.
@@ -106,6 +109,8 @@ pub struct TableMeta {
     pub unique_indexes: Vec<UniqueIndexMeta>,
     #[serde(default)]
     pub secondary_indexes: Vec<SecondaryIndexMeta>,
+    #[serde(default = "default_auto_increment_next_value")]
+    pub auto_increment_next_value: u64,
 }
 
 impl TableMeta {
@@ -131,6 +136,7 @@ impl TableMeta {
             ttl: None,
             unique_indexes: Vec::new(),
             secondary_indexes: Vec::new(),
+            auto_increment_next_value: 1,
         }
     }
 
@@ -157,6 +163,26 @@ impl TableMeta {
             .position(|c| c.name.eq_ignore_ascii_case(&ttl.column))
             .map(|i| i as i32)
             .unwrap_or(-1);
+    }
+
+    pub fn auto_increment_column(&self) -> Option<&ColumnDef> {
+        self.columns.iter().find(|c| c.auto_increment)
+    }
+
+    pub fn has_auto_increment(&self) -> bool {
+        self.auto_increment_column().is_some()
+    }
+
+    pub fn ensure_auto_increment_next_value(&mut self) {
+        if self.has_auto_increment() && self.auto_increment_next_value == 0 {
+            self.auto_increment_next_value = self.row_count.max(0) as u64 + 1;
+        }
+    }
+
+    pub fn reset_auto_increment_next_value(&mut self) {
+        if self.has_auto_increment() {
+            self.auto_increment_next_value = 1;
+        }
     }
 
     pub fn set_ttl(&mut self, column: &str, duration_secs: i64) {
@@ -384,6 +410,7 @@ impl DatabaseCatalog {
                 table.database = db_name.to_string();
                 table.update_partition_key_idx();
                 table.update_ttl_column_idx();
+                table.ensure_auto_increment_next_value();
             }
             Ok(catalog)
         } else if let Some(catalog) = Self::load_legacy_catalog(meta_dir, db_name)? {
@@ -522,6 +549,9 @@ impl DatabaseCatalog {
                 ))
             })?;
         table.columns.remove(idx);
+        if table.columns.iter().all(|c| !c.auto_increment) {
+            table.auto_increment_next_value = 1;
+        }
         if table
             .ttl
             .as_ref()
