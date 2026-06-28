@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::bulk_payload::DirectBulkColumn;
 use crate::storage::column_encoding::encode_column_direct_range;
-use crate::storage::partition::pruning::compute_segment_zone_maps_from_row_groups;
+use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::meta::{
     append_sidecar_footer, append_sidecar_row_groups, compact_sidecar_footer_if_needed,
     remove_sidecar_meta,
@@ -72,6 +72,7 @@ impl ActiveSegmentWriter {
         compressed_columns: &[(Vec<u8>, u64)],
         row_count: u64,
         build_value_sets: bool,
+        zone_map_columns: Option<&[usize]>,
     ) -> Result<()> {
         self.ensure_data_write_position()?;
 
@@ -102,7 +103,11 @@ impl ActiveSegmentWriter {
             offset,
             length: total_length,
             row_count,
-            zone_maps: compute_zone_maps_from_bulk_columns(columns, &self.schema, row_count),
+            zone_maps: self.compute_direct_row_group_zone_maps(
+                columns,
+                row_count,
+                zone_map_columns,
+            ),
             column_compressed_sizes,
             compressed_sizes,
             uncompressed_sizes,
@@ -116,6 +121,52 @@ impl ActiveSegmentWriter {
         self.last_write_at = Instant::now();
 
         Ok(())
+    }
+
+    fn compute_direct_row_group_zone_maps(
+        &self,
+        columns: &[DirectBulkColumn<'_>],
+        row_count: u64,
+        zone_map_columns: Option<&[usize]>,
+    ) -> Vec<ZoneMap> {
+        match zone_map_columns {
+            None => compute_zone_maps_from_bulk_columns(columns, &self.schema, row_count),
+            Some(indices) => {
+                let mut zone_maps = vec![ZoneMap::default(); self.schema.num_columns()];
+                if indices.is_empty() {
+                    for zm in &mut zone_maps {
+                        zm.row_count = row_count;
+                    }
+                    return zone_maps;
+                }
+                let selected_columns: Vec<DirectBulkColumn<'_>> = indices
+                    .iter()
+                    .filter_map(|&idx| columns.get(idx))
+                    .map(|col| DirectBulkColumn {
+                        name: col.name,
+                        data_type: col.data_type,
+                        scale: col.scale,
+                        precision: col.precision,
+                        data: col.data,
+                        nulls: col.nulls,
+                        variable_ranges: col.variable_ranges.clone(),
+                    })
+                    .collect();
+                let selected_maps =
+                    compute_zone_maps_from_bulk_columns(&selected_columns, &self.schema, row_count);
+                for (&idx, zm) in indices.iter().zip(selected_maps.into_iter()) {
+                    if idx < zone_maps.len() {
+                        zone_maps[idx] = zm;
+                    }
+                }
+                for zm in &mut zone_maps {
+                    if zm.row_count == 0 {
+                        zm.row_count = row_count;
+                    }
+                }
+                zone_maps
+            }
+        }
     }
 
     pub(super) fn flush_buffer(

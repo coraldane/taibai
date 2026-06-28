@@ -913,6 +913,7 @@ impl SegmentManager {
                 &compressed_columns,
                 req.row_count as u64,
                 true,
+                None,
             )?;
 
             if seg.current_size >= self.max_segment_size() {
@@ -1004,6 +1005,11 @@ impl SegmentManager {
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
         let build_value_sets = flush_immediately;
+        let zone_map_columns = if flush_immediately {
+            None
+        } else {
+            Some(self.direct_bulk_key_column_indices(schema, table_meta))
+        };
 
         let _mutation_guard = state.mutation_lock.lock().unwrap();
         ensure_state_not_retired(&state, db, req.table_name)?;
@@ -1025,6 +1031,7 @@ impl SegmentManager {
                         &group.compressed_columns,
                         group.row_count as u64,
                         build_value_sets,
+                        zone_map_columns.as_deref(),
                     )?;
                 }
                 PreparedDirectColumns::Owned(storage) => {
@@ -1045,6 +1052,7 @@ impl SegmentManager {
                         &group.compressed_columns,
                         group.row_count as u64,
                         build_value_sets,
+                        zone_map_columns.as_deref(),
                     )?;
                 }
             }
@@ -1057,6 +1065,25 @@ impl SegmentManager {
             written += group.row_count as u64;
         }
         Ok(written)
+    }
+
+    fn direct_bulk_key_column_indices(
+        &self,
+        schema: &Schema,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+    ) -> Vec<usize> {
+        let mut indices = Vec::new();
+        if let Some(idx) = table_meta.get_partition_column_index_cached() {
+            indices.push(idx);
+        }
+        for key in &table_meta.cluster_key {
+            if let Some(idx) = schema.index_of(key) {
+                if !indices.contains(&idx) {
+                    indices.push(idx);
+                }
+            }
+        }
+        indices
     }
 
     fn direct_bulk_partition_groups(
