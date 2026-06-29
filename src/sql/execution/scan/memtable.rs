@@ -9,7 +9,7 @@ pub fn scan_memtables(
     table_name: &str,
     spec: &ScanSpec,
 ) -> Vec<RecordBatch> {
-    let memtables = memtable_mgr.get_by_table(db, table_name);
+    let memtables = memtable_mgr.get_readable_by_table(db, table_name);
     let mut batches = Vec::new();
 
     for mt in &memtables {
@@ -50,7 +50,7 @@ pub fn count_memtable_rows(
     table_name: &str,
     spec: &ScanSpec,
 ) -> u64 {
-    let memtables = memtable_mgr.get_by_table(db, table_name);
+    let memtables = memtable_mgr.get_readable_by_table(db, table_name);
     let mut total: u64 = 0;
 
     for mt in &memtables {

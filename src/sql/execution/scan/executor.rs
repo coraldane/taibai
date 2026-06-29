@@ -102,7 +102,13 @@ impl<'a> ScanExecutor<'a> {
             .join(self.db)
             .join(&self.spec.table_name);
         if !table_dir.exists() {
-            let result = count::build_count_star_result(0);
+            let count = memtable::count_memtable_rows(
+                self.runtime.memtable_manager(),
+                self.db,
+                &self.spec.table_name,
+                self.spec,
+            );
+            let result = count::build_count_star_result(count);
             return match result {
                 crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
                 _ => Ok(Vec::new()),
