@@ -203,10 +203,10 @@ mod tests {
         let mut meta = TableMeta::new(
             "main",
             "test_table",
-            vec![ColumnDef::new("deal_date", DataType::Int64)],
+            vec![ColumnDef::new("partition_key", DataType::Int64)],
         );
         meta.partition_type = PartitionType::Year;
-        meta.partition_key = "deal_date".to_string();
+        meta.partition_key = "partition_key".to_string();
         meta.update_partition_key_idx();
 
         let mut spec = ScanSpec::new("test_table");

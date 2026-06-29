@@ -131,6 +131,12 @@ fn push_filter(input: LogicalPlan, predicate: LogicalExpr) -> (LogicalPlan, bool
                 true,
             )
         }
+        LogicalPlan::Filter(inner) => {
+            let combined = combine_conjuncts(vec![predicate, inner.predicate])
+                .unwrap_or(LogicalExpr::Literal(ScalarValue::Bool(Some(true))));
+            let (plan, _) = push_filter(*inner.input, combined);
+            (plan, true)
+        }
         LogicalPlan::Sort(mut sort) => {
             let (sort_input, _) = push_predicates(*sort.input);
             sort.input = Box::new(LogicalPlan::Filter(FilterPlan {
@@ -568,26 +574,26 @@ mod tests {
 
     #[test]
     fn pushes_left_where_and_right_on_filters_for_left_join() {
-        let daily = Schema::new(vec![
-            ColumnDef::new("security_id", DataType::Int64),
-            ColumnDef::new("deal_date", DataType::Int32),
-            ColumnDef::new("close_px", DataType::Float64),
-            ColumnDef::new("pre_close", DataType::Float64),
+        let left = Schema::new(vec![
+            ColumnDef::new("k", DataType::VarChar),
+            ColumnDef::new("p", DataType::Int32),
+            ColumnDef::new("x", DataType::Float64),
+            ColumnDef::new("y", DataType::Float64),
         ]);
-        let valuation = Schema::new(vec![
-            ColumnDef::new("security_id", DataType::Int64),
-            ColumnDef::new("deal_date", DataType::Int32),
-            ColumnDef::new("pe_ratio", DataType::Float64),
+        let right = Schema::new(vec![
+            ColumnDef::new("k", DataType::VarChar),
+            ColumnDef::new("p", DataType::Int32),
+            ColumnDef::new("v", DataType::Float64),
         ]);
         let mut schemas = HashMap::new();
-        schemas.insert("t_stock_daily".to_string(), daily);
-        schemas.insert("t_valuation".to_string(), valuation);
+        schemas.insert("left_t".to_string(), left);
+        schemas.insert("right_t".to_string(), right);
 
         let stmt = Parser::parse(
-            "SELECT d.security_id, v.pe_ratio FROM t_stock_daily d \
-             LEFT JOIN t_valuation v ON v.deal_date = 20260604 AND d.security_id = v.security_id \
-             WHERE d.deal_date = 20260604 \
-             ORDER BY (d.close_px - d.pre_close) / d.pre_close DESC LIMIT 20",
+            "SELECT l.k, r.v FROM left_t l \
+             LEFT JOIN right_t r ON r.p = 42 AND l.k = r.k \
+             WHERE l.p = 42 \
+             ORDER BY (l.x - l.y) / l.y DESC LIMIT 20",
         )
         .unwrap()
         .remove(0);
@@ -597,39 +603,74 @@ mod tests {
         let mut scans = Vec::new();
         collect_scans(&optimized, &mut scans);
         assert_eq!(scans.len(), 2);
-        let daily_scan = scans
-            .iter()
-            .find(|s| s.table_name == "t_stock_daily")
-            .unwrap();
-        let valuation_scan = scans
-            .iter()
-            .find(|s| s.table_name == "t_valuation")
-            .unwrap();
-        assert!(daily_scan.pushed_filter.is_some());
-        assert!(valuation_scan.pushed_filter.is_some());
+        let left_scan = scans.iter().find(|s| s.table_name == "left_t").unwrap();
+        let right_scan = scans.iter().find(|s| s.table_name == "right_t").unwrap();
+        assert!(left_scan.pushed_filter.is_some());
+        assert!(right_scan.pushed_filter.is_some());
+    }
+
+    #[test]
+    fn merges_stacked_filters_before_pushing_into_join_scan() {
+        let left = Schema::new(vec![
+            ColumnDef::new("k", DataType::VarChar),
+            ColumnDef::new("p", DataType::Int32),
+        ]);
+        let right = Schema::new(vec![
+            ColumnDef::new("k", DataType::VarChar),
+            ColumnDef::new("p", DataType::Int32),
+            ColumnDef::new("v", DataType::VarChar),
+        ]);
+        let mut schemas = HashMap::new();
+        schemas.insert("left_t".to_string(), left);
+        schemas.insert("right_t".to_string(), right);
+
+        let stmt = Parser::parse(
+            "SELECT l.k, r.v FROM left_t l \
+             LEFT JOIN right_t r ON r.p = 42 AND l.k = r.k \
+             WHERE l.p = 42 AND l.k = 'k1'",
+        )
+        .unwrap()
+        .remove(0);
+        let plan = plan_select(&stmt, &schemas).unwrap();
+        let (optimized, changed) = PredicatePushdownRule.apply(plan);
+        assert!(changed);
+
+        let mut scans = Vec::new();
+        collect_scans(&optimized, &mut scans);
+        let right_scan = scans.iter().find(|s| s.table_name == "right_t").unwrap();
+        let pushed = right_scan
+            .pushed_filter
+            .as_ref()
+            .expect("right scan should have pushed filters");
+        assert!(has_eq(
+            pushed,
+            0,
+            &ScalarValue::VarChar(Some("k1".to_string()))
+        ));
+        assert!(has_eq(pushed, 1, &ScalarValue::Int64(Some(42))));
     }
 
     #[test]
     fn propagates_left_filter_across_left_join_equality_to_right_scan() {
-        let daily = Schema::new(vec![
-            ColumnDef::new("security_id", DataType::Int64),
-            ColumnDef::new("deal_date", DataType::Int64),
-            ColumnDef::new("change_ratio", DataType::Float64),
+        let left = Schema::new(vec![
+            ColumnDef::new("k", DataType::Int64),
+            ColumnDef::new("p", DataType::Int64),
+            ColumnDef::new("score", DataType::Float64),
         ]);
-        let online = Schema::new(vec![
-            ColumnDef::new("deal_date", DataType::Int64),
-            ColumnDef::new("security_id", DataType::Int64),
-            ColumnDef::new("display_name", DataType::VarChar),
+        let right = Schema::new(vec![
+            ColumnDef::new("p", DataType::Int64),
+            ColumnDef::new("k", DataType::Int64),
+            ColumnDef::new("label", DataType::VarChar),
         ]);
         let mut schemas = HashMap::new();
-        schemas.insert("t_stock_daily".to_string(), daily);
-        schemas.insert("t_online_stock".to_string(), online);
+        schemas.insert("left_t".to_string(), left);
+        schemas.insert("right_t".to_string(), right);
 
         let stmt = Parser::parse(
-            "SELECT d.security_id, os.display_name FROM t_stock_daily d \
-             LEFT JOIN t_online_stock os ON os.deal_date = d.deal_date AND os.security_id = d.security_id \
-             WHERE d.deal_date = 20260626 \
-             ORDER BY d.change_ratio DESC LIMIT 20",
+            "SELECT l.k, r.label FROM left_t l \
+             LEFT JOIN right_t r ON r.p = l.p AND r.k = l.k \
+             WHERE l.p = 42 \
+             ORDER BY l.score DESC LIMIT 20",
         )
         .unwrap()
         .remove(0);
@@ -639,11 +680,8 @@ mod tests {
         let mut scans = Vec::new();
         collect_scans(&optimized, &mut scans);
         assert_eq!(scans.len(), 2);
-        let online_scan = scans
-            .iter()
-            .find(|s| s.table_name == "t_online_stock")
-            .unwrap();
-        assert!(online_scan.pushed_filter.is_some());
+        let right_scan = scans.iter().find(|s| s.table_name == "right_t").unwrap();
+        assert!(right_scan.pushed_filter.is_some());
     }
 
     fn collect_scans<'a>(plan: &'a LogicalPlan, scans: &mut Vec<&'a ScanPlan>) {
@@ -659,6 +697,32 @@ mod tests {
                 collect_scans(&j.right, scans);
             }
             _ => {}
+        }
+    }
+
+    fn has_eq(expr: &LogicalExpr, column: usize, value: &ScalarValue) -> bool {
+        match expr {
+            LogicalExpr::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            } => has_eq(left, column, value) || has_eq(right, column, value),
+            LogicalExpr::BinaryOp {
+                left,
+                op: BinOp::Eq,
+                right,
+            } => {
+                matches!(
+                    (&**left, &**right),
+                    (LogicalExpr::Column(idx), LogicalExpr::Literal(lit))
+                        if *idx == column && lit == value
+                ) || matches!(
+                    (&**left, &**right),
+                    (LogicalExpr::Literal(lit), LogicalExpr::Column(idx))
+                        if *idx == column && lit == value
+                )
+            }
+            _ => false,
         }
     }
 }

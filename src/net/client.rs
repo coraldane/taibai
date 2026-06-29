@@ -1135,8 +1135,8 @@ mod tests {
     #[test]
     fn parses_binary_decimal_result() {
         let schema = Schema::new(vec![
-            ColumnDef::new("symbol", DataType::VarChar),
-            ColumnDef::new("price", DataType::Decimal)
+            ColumnDef::new("name", DataType::VarChar),
+            ColumnDef::new("amount", DataType::Decimal)
                 .with_scale(2)
                 .with_precision(9),
         ]);
@@ -1144,7 +1144,7 @@ mod tests {
         batch
             .column_mut(0)
             .unwrap()
-            .push(&ScalarValue::VarChar(Some("688256.SH".into())))
+            .push(&ScalarValue::VarChar(Some("row-a".into())))
             .unwrap();
         batch
             .column_mut(1)
@@ -1166,7 +1166,7 @@ mod tests {
         assert_eq!(parsed_schema.columns[1].precision, 9);
         assert_eq!(
             batches[0].scalar(0, 0).unwrap(),
-            ScalarValue::VarChar(Some("688256.SH".into()))
+            ScalarValue::VarChar(Some("row-a".into()))
         );
         assert_eq!(
             batches[0].scalar(0, 1).unwrap(),

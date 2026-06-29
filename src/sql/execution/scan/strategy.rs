@@ -524,28 +524,28 @@ mod tests {
     use crate::types::batch::{ColumnDef, Schema};
     use crate::types::scalar::ScalarValue;
 
-    fn stock_schema() -> Schema {
+    fn clustered_schema() -> Schema {
         Schema::new(vec![
-            ColumnDef::new("security_id", DataType::VarChar),
-            ColumnDef::new("deal_date", DataType::Int32),
-            ColumnDef::new("close_px", DataType::Float64),
+            ColumnDef::new("k", DataType::VarChar),
+            ColumnDef::new("p", DataType::Int32),
+            ColumnDef::new("v", DataType::Float64),
         ])
     }
 
-    fn stock_meta(schema: &Schema) -> TableMeta {
-        let mut meta = TableMeta::new("main", "t_stock_daily", schema.columns.clone());
-        meta.cluster_key = vec!["security_id".to_string(), "deal_date".to_string()];
+    fn clustered_meta(schema: &Schema) -> TableMeta {
+        let mut meta = TableMeta::new("main", "test_table", schema.columns.clone());
+        meta.cluster_key = vec!["k".to_string(), "p".to_string()];
         meta
     }
 
     #[test]
     fn ordered_cluster_limit_allows_scan_limit_for_eq_prefix_and_desc_next_key() {
-        let schema = stock_schema();
-        let meta = stock_meta(&schema);
-        let mut spec = ScanSpec::new("t_stock_daily");
+        let schema = clustered_schema();
+        let meta = clustered_meta(&schema);
+        let mut spec = ScanSpec::new("test_table");
         spec.cluster_key = Some(meta.cluster_key.clone());
         spec.eq_predicates
-            .push((0, ScalarValue::VarChar(Some("688256.SH".to_string()))));
+            .push((0, ScalarValue::VarChar(Some("k1".to_string()))));
         spec.has_order_by = true;
         spec.limit = Some(121);
         spec.order_by.push(ScanSortKey {
@@ -567,9 +567,9 @@ mod tests {
 
     #[test]
     fn ordered_cluster_limit_requires_eq_prefix() {
-        let schema = stock_schema();
-        let meta = stock_meta(&schema);
-        let mut spec = ScanSpec::new("t_stock_daily");
+        let schema = clustered_schema();
+        let meta = clustered_meta(&schema);
+        let mut spec = ScanSpec::new("test_table");
         spec.cluster_key = Some(meta.cluster_key.clone());
         spec.has_order_by = true;
         spec.limit = Some(121);
