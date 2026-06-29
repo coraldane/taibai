@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crc32fast::Hasher;
 
 use crate::common::error::{Result, TaibaiError};
+use crate::storage::partition::partition::parse_partition_key;
 use crate::storage::partition::pruning::compute_segment_zone_maps_from_row_groups;
 use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::writer::encode_segment_footer;
@@ -27,11 +28,34 @@ pub struct SidecarFooter {
 }
 
 pub fn sidecar_meta_path(segment_path: &Path) -> PathBuf {
+    if let Some(file_name) = segment_path.file_name().and_then(|name| name.to_str()) {
+        if let Some(partition_key) = parse_partition_key(file_name) {
+            if let Some(parent) = segment_path.parent() {
+                return parent.join(format!("p{}.meta", partition_key));
+            }
+        }
+    }
+    segment_path.with_extension("meta")
+}
+
+fn legacy_sidecar_meta_path(segment_path: &Path) -> PathBuf {
     segment_path.with_extension("meta")
 }
 
 pub fn read_latest_sidecar_footer(segment_path: &Path) -> Result<Option<SidecarFooter>> {
-    let meta_path = sidecar_meta_path(segment_path);
+    if let Some(sidecar) = read_latest_sidecar_footer_from(&sidecar_meta_path(segment_path))? {
+        return Ok(Some(sidecar));
+    }
+
+    let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
+    if legacy_meta_path != sidecar_meta_path(segment_path) {
+        return read_latest_sidecar_footer_from(&legacy_meta_path);
+    }
+
+    Ok(None)
+}
+
+fn read_latest_sidecar_footer_from(meta_path: &Path) -> Result<Option<SidecarFooter>> {
     if !meta_path.exists() {
         return Ok(None);
     }
@@ -135,6 +159,10 @@ pub fn append_record(segment_path: &Path, kind: u32, data_end: u64, footer: &[u8
         .open(&meta_path)?;
     file.write_all(&record)?;
     file.sync_all()?;
+    let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
+    if legacy_meta_path != meta_path && legacy_meta_path.exists() {
+        remove_file_if_exists(&legacy_meta_path)?;
+    }
     Ok(())
 }
 
@@ -189,11 +217,24 @@ pub fn compact_sidecar_footer_if_needed(
 
 pub fn remove_sidecar_meta(segment_path: &Path) -> Result<()> {
     let meta_path = sidecar_meta_path(segment_path);
-    match fs::remove_file(&meta_path) {
+    remove_file_if_exists(&meta_path)?;
+    let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
+    if legacy_meta_path != meta_path {
+        remove_file_if_exists(&legacy_meta_path)?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(TaibaiError::Io(err)),
     }
+}
+
+fn compact_tmp_path(segment_path: &Path) -> PathBuf {
+    sidecar_meta_path(segment_path).with_extension("meta.compact.tmp")
 }
 
 fn valid_record_count(path: &Path) -> Result<usize> {
@@ -229,10 +270,6 @@ fn valid_record_count(path: &Path) -> Result<usize> {
         offset = record_end;
     }
     Ok(count)
-}
-
-fn compact_tmp_path(segment_path: &Path) -> PathBuf {
-    segment_path.with_extension("meta.compact.tmp")
 }
 
 #[cfg(windows)]

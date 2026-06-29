@@ -145,20 +145,20 @@ fn flushing_memtable_rows_remain_countable() {
     engine
         .execute(
             &mut setup,
-            "CREATE TABLE t_stock_daily (
+            "CREATE TABLE t_partitioned_metrics (
                 id INT64 AUTO_INCREMENT PRIMARY KEY,
-                security_id VARCHAR NOT NULL,
-                deal_date INT32 NOT NULL,
-                close_px DECIMAL(12, 4)
-            ) PARTITION BY YEAR(deal_date) CLUSTER BY (security_id, deal_date)",
+                entity_key VARCHAR NOT NULL,
+                event_day INT32 NOT NULL,
+                metric_value DECIMAL(12, 4)
+            ) PARTITION BY YEAR(event_day) CLUSTER BY (entity_key, event_day)",
         )
         .expect("create table");
-    std::fs::create_dir_all(temp_dir.path().join("main").join("t_stock_daily"))
+    std::fs::create_dir_all(temp_dir.path().join("main").join("t_partitioned_metrics"))
         .expect("create table data dir");
     engine
         .execute(
             &mut setup,
-            "INSERT INTO t_stock_daily (security_id, deal_date, close_px) VALUES
+            "INSERT INTO t_partitioned_metrics (entity_key, event_day, metric_value) VALUES
                 ('new_1', 20260629, 1.0000),
                 ('new_2', 20260629, 2.0000),
                 ('other', 20260630, 3.0000)",
@@ -167,7 +167,7 @@ fn flushing_memtable_rows_remain_countable() {
 
     for memtable in engine
         .memtable_manager()
-        .get_by_table("main", "t_stock_daily")
+        .get_by_table("main", "t_partitioned_metrics")
     {
         memtable.set_state(MemTableState::Flushing);
     }
@@ -176,7 +176,7 @@ fn flushing_memtable_rows_remain_countable() {
     let count = engine
         .execute(
             &mut verifier,
-            "SELECT COUNT(*) FROM t_stock_daily WHERE deal_date = 20260629",
+            "SELECT COUNT(*) FROM t_partitioned_metrics WHERE event_day = 20260629",
         )
         .expect("count flushing rows");
     assert_eq!(count_star(count), 2);
@@ -184,40 +184,40 @@ fn flushing_memtable_rows_remain_countable() {
 }
 
 #[test]
-fn concurrent_sql_insert_after_delete_same_date_is_immediately_countable() {
+fn concurrent_sql_insert_after_delete_same_partition_key_is_immediately_countable() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let engine = Arc::new(Engine::new(temp_dir.path(), "main").expect("create engine"));
     let mut setup = session();
     engine
         .execute(
             &mut setup,
-            "CREATE TABLE t_stock_daily (
+            "CREATE TABLE t_partitioned_metrics (
                 id INT64 AUTO_INCREMENT PRIMARY KEY,
                 gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                security_id VARCHAR NOT NULL,
-                deal_date INT32 NOT NULL,
-                close_px DECIMAL(12, 4)
-            ) PARTITION BY YEAR(deal_date) CLUSTER BY (security_id, deal_date)",
+                entity_key VARCHAR NOT NULL,
+                event_day INT32 NOT NULL,
+                metric_value DECIMAL(12, 4)
+            ) PARTITION BY YEAR(event_day) CLUSTER BY (entity_key, event_day)",
         )
         .expect("create table");
     engine
         .execute(
             &mut setup,
-            "INSERT INTO t_stock_daily (security_id, deal_date, close_px) VALUES
+            "INSERT INTO t_partitioned_metrics (entity_key, event_day, metric_value) VALUES
                 ('old_1', 20260629, 1.0000),
                 ('old_2', 20260629, 2.0000),
                 ('other', 20260630, 3.0000)",
         )
         .expect("insert old rows");
     engine
-        .execute(&mut setup, "FLUSH TABLE t_stock_daily")
+        .execute(&mut setup, "FLUSH TABLE t_partitioned_metrics")
         .expect("flush old rows");
     engine
         .execute(
             &mut setup,
-            "DELETE FROM t_stock_daily WHERE deal_date = 20260629",
+            "DELETE FROM t_partitioned_metrics WHERE event_day = 20260629",
         )
-        .expect("delete old date rows");
+        .expect("delete old partition-key rows");
 
     let mut writers = Vec::new();
     for worker in 0..4 {
@@ -225,14 +225,14 @@ fn concurrent_sql_insert_after_delete_same_date_is_immediately_countable() {
         writers.push(thread::spawn(move || {
             let mut s = session();
             for row in 0..50 {
-                let security_id = format!("W{}_{:03}.SZ", worker, row);
+                let entity_key = format!("W{}_{:03}", worker, row);
                 writer_engine
                     .execute(
                         &mut s,
                         &format!(
-                            "INSERT INTO t_stock_daily (security_id, deal_date, close_px) \
+                            "INSERT INTO t_partitioned_metrics (entity_key, event_day, metric_value) \
                              VALUES ('{}', 20260629, {}.0000)",
-                            security_id,
+                            entity_key,
                             worker * 100 + row
                         ),
                     )
@@ -248,7 +248,7 @@ fn concurrent_sql_insert_after_delete_same_date_is_immediately_countable() {
     let count = engine
         .execute(
             &mut verifier,
-            "SELECT COUNT(*) FROM t_stock_daily WHERE deal_date = 20260629",
+            "SELECT COUNT(*) FROM t_partitioned_metrics WHERE event_day = 20260629",
         )
         .expect("count replacement rows");
     assert_eq!(count_star(count), 200);
@@ -256,58 +256,55 @@ fn concurrent_sql_insert_after_delete_same_date_is_immediately_countable() {
 }
 
 #[test]
-fn multi_value_sql_insert_after_delete_same_date_is_immediately_countable() {
+fn multi_value_sql_insert_after_delete_same_partition_key_is_immediately_countable() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
     let mut setup = session();
     engine
         .execute(
             &mut setup,
-            "CREATE TABLE t_stock_daily (
+            "CREATE TABLE t_partitioned_metrics (
                 id INT64 AUTO_INCREMENT PRIMARY KEY,
                 gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                security_id VARCHAR NOT NULL,
-                trade_date INT32,
-                deal_date INT32 NOT NULL,
-                close_px DECIMAL(12, 4)
-            ) PARTITION BY YEAR(deal_date) CLUSTER BY (security_id, deal_date)",
+                entity_key VARCHAR NOT NULL,
+                source_day INT32,
+                event_day INT32 NOT NULL,
+                metric_value DECIMAL(12, 4)
+            ) PARTITION BY YEAR(event_day) CLUSTER BY (entity_key, event_day)",
         )
         .expect("create table");
     engine
         .execute(
             &mut setup,
-            "INSERT INTO t_stock_daily (security_id, trade_date, deal_date, close_px) VALUES
+            "INSERT INTO t_partitioned_metrics (entity_key, source_day, event_day, metric_value) VALUES
                 ('old_1', 20260629, 20260629, 1.0000),
                 ('old_2', 20260629, 20260629, 2.0000),
                 ('other', 20260630, 20260630, 3.0000)",
         )
         .expect("insert old rows");
     engine
-        .execute(&mut setup, "FLUSH TABLE t_stock_daily")
+        .execute(&mut setup, "FLUSH TABLE t_partitioned_metrics")
         .expect("flush old rows");
     assert_eq!(
         rows_affected(
             engine
                 .execute(
                     &mut setup,
-                    "DELETE FROM t_stock_daily WHERE deal_date = 20260629"
+                    "DELETE FROM t_partitioned_metrics WHERE event_day = 20260629"
                 )
-                .expect("delete old date rows")
+                .expect("delete old partition-key rows")
         ),
         2
     );
 
     let mut sql = String::from(
-        "INSERT INTO t_stock_daily (security_id, trade_date, deal_date, close_px) VALUES ",
+        "INSERT INTO t_partitioned_metrics (entity_key, source_day, event_day, metric_value) VALUES ",
     );
     for row in 0..5189 {
         if row > 0 {
             sql.push(',');
         }
-        sql.push_str(&format!(
-            "('S{:06}.SZ',20260629,20260629,{}.0000)",
-            row, row
-        ));
+        sql.push_str(&format!("('K{:06}',20260629,20260629,{}.0000)", row, row));
     }
 
     assert_eq!(
@@ -323,7 +320,7 @@ fn multi_value_sql_insert_after_delete_same_date_is_immediately_countable() {
     let count = engine
         .execute(
             &mut verifier,
-            "SELECT COUNT(*) FROM t_stock_daily WHERE deal_date = 20260629",
+            "SELECT COUNT(*) FROM t_partitioned_metrics WHERE event_day = 20260629",
         )
         .expect("count replacement rows");
     assert_eq!(count_star(count), 5189);
@@ -331,7 +328,7 @@ fn multi_value_sql_insert_after_delete_same_date_is_immediately_countable() {
 }
 
 #[test]
-fn recovered_segment_insert_after_delete_same_date_is_immediately_countable() {
+fn recovered_segment_insert_after_delete_same_partition_key_is_immediately_countable() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     {
         let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
@@ -339,33 +336,33 @@ fn recovered_segment_insert_after_delete_same_date_is_immediately_countable() {
         engine
             .execute(
                 &mut setup,
-                "CREATE TABLE t_stock_daily (
+                "CREATE TABLE t_partitioned_metrics (
                     id INT64 AUTO_INCREMENT PRIMARY KEY,
                     gmt_create TIMESTAMP,
                     gmt_modified TIMESTAMP,
-                    security_id VARCHAR NOT NULL,
-                    deal_date INT32 NOT NULL,
-                    open_px DECIMAL(12, 4),
-                    high_px DECIMAL(12, 4),
-                    low_px DECIMAL(12, 4),
-                    high_limit DECIMAL(12, 4),
-                    low_limit DECIMAL(12, 4),
-                    close_px DECIMAL(12, 4),
-                    trade_volume INT64,
-                    trade_value DECIMAL(20, 4),
-                    adj DECIMAL(18, 6),
-                    mean VARCHAR,
-                    pre_close DECIMAL(12, 4),
-                    change_ratio DECIMAL(12, 2)
-                ) PARTITION BY YEAR(deal_date) CLUSTER BY (security_id, deal_date)",
+                    entity_key VARCHAR NOT NULL,
+                    event_day INT32 NOT NULL,
+                    metric_a DECIMAL(12, 4),
+                    metric_b DECIMAL(12, 4),
+                    metric_c DECIMAL(12, 4),
+                    metric_d DECIMAL(12, 4),
+                    metric_e DECIMAL(12, 4),
+                    metric_f DECIMAL(12, 4),
+                    metric_g INT64,
+                    metric_h DECIMAL(20, 4),
+                    metric_i DECIMAL(18, 6),
+                    metric_text VARCHAR,
+                    metric_j DECIMAL(12, 4),
+                    metric_k DECIMAL(12, 2)
+                ) PARTITION BY YEAR(event_day) CLUSTER BY (entity_key, event_day)",
             )
             .expect("create table");
 
         let mut seed = String::from(
-            "INSERT INTO t_stock_daily (
-                gmt_create, gmt_modified, security_id, deal_date, open_px, high_px, low_px,
-                high_limit, low_limit, close_px, trade_volume, trade_value, adj, mean,
-                pre_close, change_ratio
+            "INSERT INTO t_partitioned_metrics (
+                gmt_create, gmt_modified, entity_key, event_day, metric_a, metric_b, metric_c,
+                metric_d, metric_e, metric_f, metric_g, metric_h, metric_i, metric_text,
+                metric_j, metric_k
             ) VALUES ",
         );
         for row in 0..5189 {
@@ -373,13 +370,13 @@ fn recovered_segment_insert_after_delete_same_date_is_immediately_countable() {
                 seed.push(',');
             }
             seed.push_str(&format!(
-                "(1782718238000000,1782718759000000,'S{:06}.SZ',20260629,10.0000,11.0000,9.0000,12.0000,8.0000,10.5000,{},1000.0000,1.000000,'10.50',10.0000,0.50)",
+                "(1782718238000000,1782718759000000,'K{:06}',20260629,10.0000,11.0000,9.0000,12.0000,8.0000,10.5000,{},1000.0000,1.000000,'10.50',10.0000,0.50)",
                 row, row
             ));
         }
         engine.execute(&mut setup, &seed).expect("insert seed rows");
         engine
-            .execute(&mut setup, "FLUSH TABLE t_stock_daily")
+            .execute(&mut setup, "FLUSH TABLE t_partitioned_metrics")
             .expect("flush seed rows");
         engine.segment_mgr().shutdown();
     }
@@ -389,7 +386,7 @@ fn recovered_segment_insert_after_delete_same_date_is_immediately_countable() {
     let before = engine
         .execute(
             &mut delete_session,
-            "SELECT COUNT(*) FROM t_stock_daily WHERE deal_date = 20260629",
+            "SELECT COUNT(*) FROM t_partitioned_metrics WHERE event_day = 20260629",
         )
         .expect("count seed rows");
     assert_eq!(count_star(before), 5189);
@@ -398,7 +395,7 @@ fn recovered_segment_insert_after_delete_same_date_is_immediately_countable() {
             engine
                 .execute(
                     &mut delete_session,
-                    "DELETE FROM t_stock_daily WHERE deal_date = 20260629"
+                    "DELETE FROM t_partitioned_metrics WHERE event_day = 20260629"
                 )
                 .expect("delete seed rows")
         ),
@@ -407,16 +404,16 @@ fn recovered_segment_insert_after_delete_same_date_is_immediately_countable() {
     let after_delete = engine
         .execute(
             &mut delete_session,
-            "SELECT COUNT(*) FROM t_stock_daily WHERE deal_date = 20260629",
+            "SELECT COUNT(*) FROM t_partitioned_metrics WHERE event_day = 20260629",
         )
         .expect("count after delete");
     assert_eq!(count_star(after_delete), 0);
 
     let mut insert = String::from(
-        "INSERT INTO t_stock_daily (
-            gmt_create, gmt_modified, security_id, deal_date, open_px, high_px, low_px,
-            high_limit, low_limit, close_px, trade_volume, trade_value, adj, mean,
-            pre_close, change_ratio
+        "INSERT INTO t_partitioned_metrics (
+            gmt_create, gmt_modified, entity_key, event_day, metric_a, metric_b, metric_c,
+            metric_d, metric_e, metric_f, metric_g, metric_h, metric_i, metric_text,
+            metric_j, metric_k
         ) VALUES ",
     );
     for row in 0..5189 {
@@ -424,7 +421,7 @@ fn recovered_segment_insert_after_delete_same_date_is_immediately_countable() {
             insert.push(',');
         }
         insert.push_str(&format!(
-            "(1782718238000000,1782718759000000,'N{:06}.SZ',20260629,10.0000,11.0000,9.0000,12.0000,8.0000,10.5000,{},1000.0000,1.000000,'10.50',10.0000,0.50)",
+            "(1782718238000000,1782718759000000,'N{:06}',20260629,10.0000,11.0000,9.0000,12.0000,8.0000,10.5000,{},1000.0000,1.000000,'10.50',10.0000,0.50)",
             row, row
         ));
     }
@@ -447,7 +444,7 @@ fn recovered_segment_insert_after_delete_same_date_is_immediately_countable() {
     let count = engine
         .execute(
             &mut verifier,
-            "SELECT COUNT(*) FROM t_stock_daily WHERE deal_date = 20260629",
+            "SELECT COUNT(*) FROM t_partitioned_metrics WHERE event_day = 20260629",
         )
         .expect("count replacement rows");
     assert_eq!(count_star(count), 5189);

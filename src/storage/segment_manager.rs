@@ -37,7 +37,8 @@ use config::{
     FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
-    discover_max_seq, ensure_state_not_retired, filter_batch_by_mask, is_transient_footer_error,
+    discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
+    is_transient_footer_error,
 };
 use reader_cache::ReaderCache;
 use state::TableSegmentState;
@@ -106,8 +107,15 @@ impl SegmentManager {
                             let tbl_dir = tbl_entry.path();
                             cleanup_incomplete_compaction_files(&tbl_dir);
                             let max_seq = discover_max_seq(&tbl_dir);
+                            let partition_seq = discover_max_partition_seq(&tbl_dir);
                             let key = table_key(&db_name, &tbl_entry.file_name().to_string_lossy());
-                            tables.insert(key, Arc::new(TableSegmentState::new(max_seq)));
+                            tables.insert(
+                                key,
+                                Arc::new(TableSegmentState::with_partition_seq(
+                                    max_seq,
+                                    partition_seq,
+                                )),
+                            );
                         }
                     }
                 }
@@ -322,7 +330,12 @@ impl SegmentManager {
         partition_key: &str,
     ) -> Result<PathBuf> {
         let state = self.get_or_create_state_for_table_dir(table_dir)?;
-        let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = {
+            let mut partition_seq = state.partition_seq.lock().unwrap();
+            let entry = partition_seq.entry(partition_key.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
         Ok(table_dir.join(store::partition_segment_filename(partition_key, seq)))
     }
 

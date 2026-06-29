@@ -48,6 +48,29 @@ pub(super) fn discover_max_seq(table_dir: &Path) -> u32 {
     max_seq
 }
 
+pub(super) fn discover_max_partition_seq(
+    table_dir: &Path,
+) -> std::collections::HashMap<String, u32> {
+    let mut max_seq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(table_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(partition_key) =
+                crate::storage::partition::partition::parse_partition_key(&name)
+            else {
+                continue;
+            };
+            if let Some(seq) = store::parse_partition_seq(&name, &partition_key) {
+                max_seq
+                    .entry(partition_key)
+                    .and_modify(|current| *current = (*current).max(seq))
+                    .or_insert(seq);
+            }
+        }
+    }
+    max_seq
+}
+
 #[allow(dead_code)]
 pub(super) fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
     schema
