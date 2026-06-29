@@ -42,6 +42,10 @@ use helpers::{
 use reader_cache::ReaderCache;
 use state::TableSegmentState;
 
+fn same_segment_path(a: &Path, b: &Path) -> bool {
+    a == b || a.to_string_lossy().replace('\\', "/") == b.to_string_lossy().replace('\\', "/")
+}
+
 enum PreparedDirectColumns<'a> {
     Borrowed(Vec<DirectBulkColumn<'a>>),
     Owned(Vec<OwnedDirectBulkColumn<'a>>),
@@ -455,7 +459,19 @@ impl SegmentManager {
         deleted_count: u64,
     ) -> Result<()> {
         self.invalidate_reader(path);
-        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)
+        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+        if let Some(state) = self.state_for_segment_path(path) {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            for segment in active_guard.values_mut() {
+                if same_segment_path(&segment.path, path) {
+                    segment.delete_bitmap = bitmap.to_vec();
+                    segment.deleted_row_count = deleted_count;
+                    segment.dirty_meta = true;
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn with_table_mutation_lock<T>(
@@ -477,7 +493,7 @@ impl SegmentManager {
 
         let mut active_guard = state.active_segments.lock().unwrap();
         for segment in active_guard.values_mut() {
-            if segment.path == path {
+            if same_segment_path(&segment.path, path) {
                 if segment.dirty_meta {
                     segment.flush_meta(&|path| self.invalidate_reader(path))?;
                 }
@@ -502,7 +518,9 @@ impl SegmentManager {
         };
 
         let active_guard = state.active_segments.lock().unwrap();
-        active_guard.values().any(|segment| segment.path == path)
+        active_guard
+            .values()
+            .any(|segment| same_segment_path(&segment.path, path))
     }
 
     fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
@@ -799,6 +817,8 @@ impl SegmentManager {
             row_groups: Vec::new(),
             current_size: SEGMENT_HEADER_SIZE as u64,
             total_rows: 0,
+            delete_bitmap: Vec::new(),
+            deleted_row_count: 0,
             buffered_batch: None,
             buffered_rows: 0,
             dirty_meta: false,
@@ -865,7 +885,9 @@ impl SegmentManager {
             return Ok(None);
         }
 
-        let reader = SegmentReader::open(seg_path)?;
+        self.invalidate_reader(seg_path);
+
+        let reader = SegmentReader::open_owned(seg_path)?;
         let data_end = reader.data_end();
 
         let row_groups = reader.footer_row_groups_info();
@@ -893,6 +915,8 @@ impl SegmentManager {
             row_groups,
             current_size: data_end,
             total_rows: reader.row_count(),
+            delete_bitmap: reader.delete_bitmap().to_vec(),
+            deleted_row_count: reader.deleted_row_count(),
             buffered_batch: None,
             buffered_rows: 0,
             dirty_meta: true,
