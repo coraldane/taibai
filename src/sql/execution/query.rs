@@ -7,6 +7,9 @@ use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
+use super::physical::{
+    build_physical_pipeline, can_use_physical_pipeline, drain_pipeline, PhysicalContext,
+};
 use crate::sql::parser::ast::{Expr, FromClause, ObjectName, SelectItem, Statement, TableRef};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
@@ -96,7 +99,7 @@ fn exec_table_select(
     db: &str,
     stmt: &Statement,
     from_clause: &FromClause,
-    mut stats: Option<&mut HashMap<String, ScanStats>>,
+    stats: Option<&mut HashMap<String, ScanStats>>,
     cached_plan: Option<LogicalPlan>,
 ) -> Result<ExecResult> {
     let resolved_stmt;
@@ -154,10 +157,52 @@ fn exec_table_select(
 
     let is_count_star = detect_count_star(stmt, &table_names);
 
+    if stats.is_none() && !is_count_star && can_use_physical_pipeline(&plan) {
+        let mut physical_ctx = PhysicalContext::new(
+            engine,
+            &table_refs,
+            &table_schemas,
+            &table_metas,
+            is_count_star,
+        );
+        let pipeline = build_physical_pipeline(plan, &mut physical_ctx)?;
+        tracing::debug!("query: physical pipeline built, starting next_batch loop");
+        let (schema, batches) = drain_pipeline(pipeline)?;
+        tracing::debug!(
+            "query: physical pipeline finished, {} batches",
+            batches.len()
+        );
+        return Ok(ExecResult::Query { schema, batches });
+    }
+
+    exec_table_select_materialized(
+        engine,
+        &table_refs,
+        table_names,
+        table_schemas,
+        table_cluster_keys,
+        table_metas,
+        plan,
+        is_count_star,
+        stats,
+    )
+}
+
+fn exec_table_select_materialized(
+    engine: &Engine,
+    table_refs: &[ResolvedTableRef],
+    table_names: Vec<String>,
+    table_schemas: HashMap<String, Schema>,
+    table_cluster_keys: HashMap<String, Vec<String>>,
+    table_metas: HashMap<String, crate::storage::catalog::schema::TableMeta>,
+    plan: LogicalPlan,
+    is_count_star: bool,
+    mut stats: Option<&mut HashMap<String, ScanStats>>,
+) -> Result<ExecResult> {
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
 
-    for table_ref in &table_refs {
+    for table_ref in table_refs {
         let table_name = &table_ref.key;
         let schema = table_schemas.get(table_name).unwrap().clone();
         let meta = table_metas.get(table_name).unwrap().clone();
@@ -210,7 +255,7 @@ fn exec_table_select(
         try_skip_sort_for_cluster_key(plan, &table_batches, &table_cluster_keys, &table_schemas);
 
     let mut pipeline = super::operators::build_pipeline(plan, &table_batches)?;
-    tracing::debug!("query: pipeline built, starting next_batch loop");
+    tracing::debug!("query: materialized pipeline built, starting next_batch loop");
     let mut result_batches = Vec::new();
     let mut result_schema = None;
     while let Some(batch) = pipeline.next_batch()? {
@@ -595,222 +640,5 @@ fn collect_table_refs_from_join(
                 table: alias.clone(),
             }),
         }
-    }
-}
-
-use crate::sql::parser::ast::OrderByItem;
-
-pub fn exec_union(
-    engine: &Engine,
-    db: &str,
-    left: &Statement,
-    right: &Statement,
-    all: bool,
-    order_by: &[OrderByItem],
-    limit: &Option<Expr>,
-    offset: &Option<Expr>,
-) -> Result<ExecResult> {
-    let left_result = exec_union_recursive(engine, db, left)?;
-    let right_result = exec_union_recursive(engine, db, right)?;
-
-    let left_batches = match left_result {
-        ExecResult::Query { batches, .. } => batches,
-        ExecResult::Ok { .. } => {
-            return Err(TaibaiError::Sql("UNION left side returned no data".into()))
-        }
-    };
-    let right_batches = match right_result {
-        ExecResult::Query { batches, .. } => batches,
-        ExecResult::Ok { .. } => {
-            return Err(TaibaiError::Sql("UNION right side returned no data".into()))
-        }
-    };
-
-    let schema = if !left_batches.is_empty() {
-        left_batches[0].schema.clone()
-    } else if !right_batches.is_empty() {
-        right_batches[0].schema.clone()
-    } else {
-        return Err(TaibaiError::Sql("UNION with empty result sets".into()));
-    };
-
-    let mut combined_batches = left_batches;
-    combined_batches.extend(right_batches);
-
-    if !all {
-        combined_batches = deduplicate_batches(&combined_batches);
-    }
-
-    if !order_by.is_empty() {
-        combined_batches = sort_batches(&combined_batches, order_by);
-    }
-
-    if let Some(offset_expr) = offset {
-        let offset_val = super::helpers::eval_expr_to_int(offset_expr)?;
-        if offset_val > 0 && (offset_val as usize) < combined_batches.len() {
-            combined_batches = combined_batches
-                .into_iter()
-                .skip(offset_val as usize)
-                .collect();
-        } else if (offset_val as usize) >= combined_batches.len() {
-            combined_batches = Vec::new();
-        }
-    }
-
-    if let Some(limit_expr) = limit {
-        let limit_val = super::helpers::eval_expr_to_int(limit_expr)?;
-        if limit_val > 0 && limit_val < combined_batches.len() as i64 {
-            combined_batches = combined_batches
-                .into_iter()
-                .take(limit_val as usize)
-                .collect();
-        }
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: combined_batches,
-    })
-}
-
-fn exec_union_recursive(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecResult> {
-    match stmt {
-        Statement::Union {
-            left,
-            right,
-            all,
-            order_by,
-            limit,
-            offset,
-        } => exec_union(engine, db, left, right, *all, order_by, limit, offset),
-        Statement::Select { .. } => exec_select(engine, db, stmt),
-        _ => Err(TaibaiError::Sql(format!(
-            "UNION component must be SELECT, got {:?}",
-            stmt
-        ))),
-    }
-}
-
-fn deduplicate_batches(batches: &[RecordBatch]) -> Vec<RecordBatch> {
-    if batches.is_empty() {
-        return Vec::new();
-    }
-
-    let mut seen_rows: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
-    let mut result_batches = Vec::new();
-    let schema = batches[0].schema.clone();
-    let mut current_batch = RecordBatch::new(schema.clone());
-
-    for batch in batches {
-        for row_idx in 0..batch.num_rows() {
-            let row_key = build_row_key(batch, row_idx);
-            if seen_rows.insert(row_key) {
-                for col_idx in 0..batch.num_columns() {
-                    if let Some(col) = batch.column(col_idx) {
-                        if let Some(dest_col) = current_batch.column_mut(col_idx) {
-                            let val = col.scalar(row_idx);
-                            let _ = dest_col.push(&val);
-                        }
-                    }
-                }
-                if current_batch.num_rows() >= 4096 {
-                    result_batches.push(current_batch);
-                    current_batch = RecordBatch::new(schema.clone());
-                }
-            }
-        }
-    }
-
-    if current_batch.num_rows() > 0 {
-        result_batches.push(current_batch);
-    }
-
-    result_batches
-}
-
-fn build_row_key(batch: &RecordBatch, row_idx: usize) -> Vec<String> {
-    let mut key = Vec::with_capacity(batch.num_columns());
-    for col_idx in 0..batch.num_columns() {
-        if let Some(col) = batch.column(col_idx) {
-            let val = col.scalar(row_idx);
-            key.push(format!("{:?}", val));
-        } else {
-            key.push("NULL".to_string());
-        }
-    }
-    key
-}
-
-fn sort_batches(batches: &[RecordBatch], order_by: &[OrderByItem]) -> Vec<RecordBatch> {
-    if batches.is_empty() || order_by.is_empty() {
-        return batches.to_vec();
-    }
-
-    let schema = batches[0].schema.clone();
-    let mut all_rows: Vec<(usize, usize)> = Vec::new();
-
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        for row_idx in 0..batch.num_rows() {
-            all_rows.push((batch_idx, row_idx));
-        }
-    }
-
-    all_rows.sort_by(|a, b| {
-        for ob in order_by {
-            let col_idx = match &ob.expr {
-                Expr::Column(col_name) => schema.index_of(col_name).unwrap_or(0),
-                Expr::QualifiedColumn { column, .. } => schema.index_of(column).unwrap_or(0),
-                Expr::Literal(ScalarValue::Int64(Some(idx))) => *idx as usize,
-                _ => 0,
-            };
-
-            let val_a = batches[a.0]
-                .column(col_idx)
-                .map(|c| c.scalar(a.1))
-                .unwrap_or_else(|| ScalarValue::Int64(None));
-            let val_b = batches[b.0]
-                .column(col_idx)
-                .map(|c| c.scalar(b.1))
-                .unwrap_or_else(|| ScalarValue::Int64(None));
-
-            let cmp = compare_scalar_values(&val_a, &val_b);
-            if cmp != std::cmp::Ordering::Equal {
-                return if ob.desc { cmp.reverse() } else { cmp };
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
-
-    let mut result_batch = RecordBatch::new(schema.clone());
-    for (batch_idx, row_idx) in all_rows {
-        for col_idx in 0..schema.num_columns() {
-            if let Some(col) = batches[batch_idx].column(col_idx) {
-                if let Some(dest_col) = result_batch.column_mut(col_idx) {
-                    let val = col.scalar(row_idx);
-                    let _ = dest_col.push(&val);
-                }
-            }
-        }
-        if result_batch.num_rows() >= 4096 {
-            break;
-        }
-    }
-
-    vec![result_batch]
-}
-
-fn compare_scalar_values(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    match (a, b) {
-        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-        (ScalarValue::Int64(Some(va)), ScalarValue::Int64(Some(vb))) => va.cmp(vb),
-        (ScalarValue::Float64(Some(va)), ScalarValue::Float64(Some(vb))) => {
-            va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (ScalarValue::VarChar(Some(va)), ScalarValue::VarChar(Some(vb))) => va.cmp(vb),
-        (ScalarValue::Bool(Some(va)), ScalarValue::Bool(Some(vb))) => va.cmp(vb),
-        (ScalarValue::Timestamp(Some(va)), ScalarValue::Timestamp(Some(vb))) => va.cmp(vb),
-        (a_val, b_val) if a_val.is_null() && !b_val.is_null() => std::cmp::Ordering::Less,
-        (a_val, b_val) if !a_val.is_null() && b_val.is_null() => std::cmp::Ordering::Greater,
-        _ => std::cmp::Ordering::Equal,
     }
 }

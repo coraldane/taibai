@@ -476,32 +476,12 @@ impl Parser {
             Token::Database => self.parse_drop_database_rest(),
             Token::User => self.parse_drop_user(),
             Token::Role => self.parse_drop_role(),
-            Token::Ident(word) if word.eq_ignore_ascii_case("CHANGE") => {
-                self.parse_drop_change_consumer()
-            }
             other => Err(TaibaiError::Sql(format!(
-                "expected TABLE, DATABASE, USER, ROLE, INDEX, or CHANGE after DROP, got {}",
+                "expected TABLE, DATABASE, USER, ROLE, INDEX after DROP, got {}",
                 other
             ))),
         }
     }
-
-    fn parse_drop_change_consumer(&mut self) -> Result<Statement> {
-        let change = self.expect_ident()?;
-        if !change.eq_ignore_ascii_case("CHANGE") {
-            return Err(TaibaiError::Sql(format!("expected CHANGE, got {}", change)));
-        }
-        let consumer = self.expect_ident()?;
-        if !consumer.eq_ignore_ascii_case("CONSUMER") {
-            return Err(TaibaiError::Sql(format!(
-                "expected CONSUMER after DROP CHANGE, got {}",
-                consumer
-            )));
-        }
-        let group = self.expect_ident_or_string()?;
-        Ok(Statement::DropChangeConsumer { group })
-    }
-
     fn parse_drop_user(&mut self) -> Result<Statement> {
         self.expect(&Token::User)?;
         let if_exists = if self.peek() == &Token::If {

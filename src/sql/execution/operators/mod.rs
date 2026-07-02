@@ -20,12 +20,17 @@ use filter::FilterExec;
 use join::HashJoinExec;
 use limit::LimitExec;
 use project::ProjectExec;
+pub use scan::RuntimeInFilter;
 use scan::ScanExec;
 use semi_join::SemiJoinExec;
 use sort::SortExec;
 
 pub trait ExecutionOp {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
+
+    fn add_runtime_in_filter(&mut self, _filter: RuntimeInFilter) -> bool {
+        false
+    }
 }
 
 pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {

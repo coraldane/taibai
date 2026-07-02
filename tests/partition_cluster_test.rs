@@ -200,7 +200,10 @@ fn bulk_import_honors_year_partition_on_int32_yyyymmdd() {
 
     let rows = collect_i32_rows(
         engine
-            .execute(&mut session, "SELECT deal_date, deal_time FROM ticks")
+            .execute(
+                &mut session,
+                "SELECT deal_date, deal_time FROM ticks ORDER BY deal_date, deal_time",
+            )
             .expect("select rows"),
     );
     assert_eq!(
@@ -515,5 +518,96 @@ fn hash_and_mod_partition_syntax_create_expected_buckets() {
         mod_files
     );
 
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn bulk_import_append_is_visible_to_count_before_flush() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+
+    {
+        let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE ticks (
+                    deal_date INT32 NOT NULL,
+                    security_id VARCHAR NOT NULL,
+                    deal_time INT32 NOT NULL
+                ) CLUSTER BY (deal_date, security_id, deal_time) PARTITION BY YEAR(deal_date)",
+            )
+            .expect("create ticks");
+
+        let seed = bulk_payload(
+            "ticks",
+            2,
+            vec![
+                (
+                    "deal_date",
+                    DataType::Int32,
+                    int32_col(&[20260101, 20260102]),
+                ),
+                ("security_id", DataType::VarChar, varchar_col(&["A", "B"])),
+                ("deal_time", DataType::Int32, int32_col(&[930, 931])),
+            ],
+        );
+        engine
+            .exec_bulk_insert_payload_with_wal_control("main", &seed, false)
+            .expect("seed bulk insert");
+        engine.flush_all_buffers().expect("flush seed rows");
+        engine.segment_mgr().shutdown();
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to reopen engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+
+    engine
+        .execute(&mut session, "DELETE FROM ticks WHERE deal_date = 20260629")
+        .expect("delete before insert");
+
+    let append = bulk_payload(
+        "ticks",
+        3,
+        vec![
+            (
+                "deal_date",
+                DataType::Int32,
+                int32_col(&[20260629, 20260629, 20260629]),
+            ),
+            (
+                "security_id",
+                DataType::VarChar,
+                varchar_col(&["C", "D", "E"]),
+            ),
+            ("deal_time", DataType::Int32, int32_col(&[940, 941, 942])),
+        ],
+    );
+    assert_eq!(
+        engine
+            .exec_bulk_insert_payload_with_options("main", &append, true, true)
+            .expect("bulk append"),
+        3
+    );
+
+    let count = count_star(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*) FROM ticks WHERE deal_date = 20260629",
+            )
+            .expect("count query"),
+    );
+    assert_eq!(
+        count, 3,
+        "rows appended to a resumed segment in bulk-import mode must be visible to COUNT before flush"
+    );
+
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
     engine.segment_mgr().shutdown();
 }

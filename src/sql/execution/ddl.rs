@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
@@ -97,6 +98,9 @@ pub fn exec_create_table(
 
     let auto_inc_col = columns.iter().find(|c| c.auto_increment);
     if let Some(ai_col) = auto_inc_col {
+        if let Some(meta) = catalog.get_table_mut(name) {
+            meta.auto_increment_next_value = 1;
+        }
         engine
             .auto_increment_manager()
             .register(db, name, &ai_col.name, 1)?;
@@ -238,40 +242,110 @@ pub fn exec_drop_table(
     name: &str,
     if_exists: bool,
 ) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
+    let total_start = Instant::now();
+    tracing::info!(db, table = name, "drop table: start");
 
-    if catalog.get_table(name).is_none() {
-        if if_exists {
-            return Ok(ExecResult::Ok { rows_affected: 0 });
+    {
+        let stage_start = Instant::now();
+        let mut catalogs = engine.catalogs().write().unwrap();
+        tracing::info!(
+            db,
+            table = name,
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "drop table: acquired catalog write lock"
+        );
+
+        let catalog = get_existing_catalog(&mut catalogs, db)?;
+
+        if catalog.get_table(name).is_none() {
+            if if_exists {
+                tracing::info!(
+                    db,
+                    table = name,
+                    total_elapsed_ms = total_start.elapsed().as_millis(),
+                    "drop table: table missing, if exists ignored"
+                );
+                return Ok(ExecResult::Ok { rows_affected: 0 });
+            }
+            return Err(TaibaiError::Sql(format!(
+                "table '{}.{}' does not exist",
+                db, name
+            )));
         }
-        return Err(TaibaiError::Sql(format!(
-            "table '{}.{}' does not exist",
-            db, name
-        )));
-    }
 
-    catalog.drop_table(name)?;
-    engine.auto_increment_manager().unregister(db, name);
-    engine.index_manager().remove_index(db, name);
+        let stage_start = Instant::now();
+        catalog.drop_table(name)?;
+        engine.auto_increment_manager().unregister(db, name);
+        engine.index_manager().remove_index(db, name);
+        tracing::info!(
+            db,
+            table = name,
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            "drop table: removed metadata managers"
+        );
+
+        let meta_dir = engine.data_dir().join("meta");
+        let stage_start = Instant::now();
+        catalog.save(&meta_dir)?;
+        tracing::info!(
+            db,
+            table = name,
+            elapsed_ms = stage_start.elapsed().as_millis(),
+            total_elapsed_ms = total_start.elapsed().as_millis(),
+            "drop table: saved catalog"
+        );
+    }
+    tracing::info!(
+        db,
+        table = name,
+        total_elapsed_ms = total_start.elapsed().as_millis(),
+        "drop table: released catalog write lock"
+    );
 
     let table_dir = engine.data_dir().join(db).join(name);
+    tracing::info!(db, table = name, path = %table_dir.display(), "drop table: waiting for table mutation lock");
+    let stage_start = Instant::now();
     engine
         .segment_mgr()
         .with_table_mutation_lock(db, name, || {
+            tracing::info!(db, table = name, elapsed_ms = stage_start.elapsed().as_millis(), "drop table: acquired table mutation lock");
+
+            let step_start = Instant::now();
             engine.segment_mgr().remove_wal(&table_dir);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed wal handle");
+
+            let step_start = Instant::now();
             engine.segment_mgr().remove_table_state(db, name);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table state");
+
+            let step_start = Instant::now();
             engine.segment_mgr().invalidate_readers_under(&table_dir);
-            engine.batch_writer().clear_memtables(db, name);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: invalidated readers");
+
+            let step_start = Instant::now();
+            let cleared_rows = engine.batch_writer().clear_memtables(db, name);
+            tracing::info!(db, table = name, cleared_rows, elapsed_ms = step_start.elapsed().as_millis(), "drop table: cleared memtables");
 
             if table_dir.exists() {
-                let _ = std::fs::remove_dir_all(&table_dir);
+                let step_start = Instant::now();
+                tracing::info!(db, table = name, path = %table_dir.display(), "drop table: removing table directory");
+                std::fs::remove_dir_all(&table_dir).map_err(|err| {
+                    tracing::error!(db, table = name, path = %table_dir.display(), error = %err, elapsed_ms = step_start.elapsed().as_millis(), "drop table: failed to remove table directory");
+                    err
+                })?;
+                tracing::info!(db, table = name, path = %table_dir.display(), elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table directory");
+            } else {
+                tracing::info!(db, table = name, path = %table_dir.display(), "drop table: table directory missing");
             }
             Ok(())
         })?;
 
-    let meta_dir = engine.data_dir().join("meta");
-    catalog.save(&meta_dir)?;
+    tracing::info!(
+        db,
+        table = name,
+        total_elapsed_ms = total_start.elapsed().as_millis(),
+        "drop table: finished"
+    );
 
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
@@ -309,10 +383,31 @@ pub fn exec_alter_table(
                     .with_primary_key(column.primary_key)
                     .with_default_value(default_value);
                 validate_column_constraints(std::slice::from_mut(&mut col_def))?;
+                let added_auto_increment = col_def.auto_increment;
+                let added_column_name = col_def.name.clone();
                 catalog.add_column(name, col_def)?;
+                if added_auto_increment {
+                    if let Some(meta) = catalog.get_table_mut(name) {
+                        meta.auto_increment_next_value = 1;
+                    }
+                    engine
+                        .auto_increment_manager()
+                        .register(db, name, &added_column_name, 1)?;
+                }
             }
             AlterOperation::DropColumn { name: col_name } => {
+                let dropped_auto_increment = catalog
+                    .get_table(name)
+                    .and_then(|meta| {
+                        meta.columns
+                            .iter()
+                            .find(|col| col.name.eq_ignore_ascii_case(col_name))
+                    })
+                    .is_some_and(|col| col.auto_increment);
                 catalog.drop_column(name, col_name)?;
+                if dropped_auto_increment {
+                    engine.auto_increment_manager().unregister(db, name);
+                }
                 if let Some(meta) = catalog.get_table_mut(name) {
                     meta.unique_indexes.retain(|idx| {
                         !idx.columns
@@ -398,6 +493,7 @@ pub fn exec_alter_table(
                     column.scale,
                     column.precision,
                 )?;
+                engine.persist_auto_increment_next_value(db, name, false)?;
             }
             AlterOperation::RenameTable { new_name } => {
                 let old_table_dir = engine.data_dir().join(db).join(name);
@@ -690,6 +786,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     }
 
     if let Some(meta) = catalog.get_table_mut(table) {
+        meta.reset_auto_increment_next_value();
         meta.row_count = 0;
         meta.segment_count = 0;
         for part in &mut meta.partitions {
@@ -1436,172 +1533,6 @@ pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult
     Ok(ExecResult::Query {
         schema,
         batches: vec![batch],
-    })
-}
-
-pub fn exec_show_change_consumers(engine: &Engine) -> Result<ExecResult> {
-    let schema = Schema::new(vec![
-        ColumnDef::new("consumer_group", DataType::VarChar),
-        ColumnDef::new("sequence", DataType::UInt64),
-    ]);
-    let mut batch = RecordBatch::new(schema.clone());
-
-    for (group, sequence) in engine.change_stream().consumers() {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(group)))?;
-        batch
-            .column_mut(1)
-            .unwrap()
-            .push(&ScalarValue::UInt64(Some(sequence)))?;
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_change_status(engine: &Engine) -> Result<ExecResult> {
-    let status = engine.change_stream_status()?;
-    let schema = Schema::new(vec![
-        ColumnDef::new("next_sequence", DataType::UInt64),
-        ColumnDef::new("earliest_sequence", DataType::UInt64),
-        ColumnDef::new("latest_sequence", DataType::UInt64),
-        ColumnDef::new("retained_events", DataType::UInt64),
-        ColumnDef::new("retention_events", DataType::UInt64),
-        ColumnDef::new("recent_capacity", DataType::UInt64),
-        ColumnDef::new("consumer_count", DataType::UInt64),
-        ColumnDef::new("persistent", DataType::Bool),
-        ColumnDef::new("log_path", DataType::VarChar),
-        ColumnDef::new("outbox_prepared", DataType::UInt64),
-        ColumnDef::new("outbox_committed", DataType::UInt64),
-    ]);
-    let mut batch = RecordBatch::new(schema.clone());
-
-    batch
-        .column_mut(0)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.next_sequence)))?;
-    batch
-        .column_mut(1)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.earliest_sequence)))?;
-    batch
-        .column_mut(2)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.latest_sequence)))?;
-    batch
-        .column_mut(3)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.retained_events as u64)))?;
-    batch
-        .column_mut(4)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.retention_events as u64)))?;
-    batch
-        .column_mut(5)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.recent_capacity as u64)))?;
-    batch
-        .column_mut(6)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.consumer_count as u64)))?;
-    batch
-        .column_mut(7)
-        .unwrap()
-        .push(&ScalarValue::Bool(Some(status.persistent)))?;
-    batch
-        .column_mut(8)
-        .unwrap()
-        .push(&ScalarValue::VarChar(Some(
-            status
-                .log_path
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default(),
-        )))?;
-    batch
-        .column_mut(9)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.outbox_prepared as u64)))?;
-    batch
-        .column_mut(10)
-        .unwrap()
-        .push(&ScalarValue::UInt64(Some(status.outbox_committed as u64)))?;
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_change_events(
-    engine: &Engine,
-    from_sequence: Option<u64>,
-    limit: Option<usize>,
-    database: Option<&str>,
-    table: Option<&str>,
-) -> Result<ExecResult> {
-    let schema = Schema::new(vec![
-        ColumnDef::new("sequence", DataType::UInt64),
-        ColumnDef::new("timestamp_micros", DataType::Int64),
-        ColumnDef::new("database", DataType::VarChar),
-        ColumnDef::new("table", DataType::VarChar),
-        ColumnDef::new("operation", DataType::VarChar),
-        ColumnDef::new("rows_affected", DataType::UInt64),
-    ]);
-    let mut batch = RecordBatch::new(schema.clone());
-
-    for event in engine.change_events(from_sequence, limit, database, table)? {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::UInt64(Some(event.sequence)))?;
-        batch
-            .column_mut(1)
-            .unwrap()
-            .push(&ScalarValue::Int64(Some(event.timestamp_micros)))?;
-        batch
-            .column_mut(2)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(event.database)))?;
-        batch
-            .column_mut(3)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(event.table)))?;
-        batch
-            .column_mut(4)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(format!(
-                "{:?}",
-                event.operation
-            ))))?;
-        batch
-            .column_mut(5)
-            .unwrap()
-            .push(&ScalarValue::UInt64(Some(event.rows_affected)))?;
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_reset_change_consumer(
-    engine: &Engine,
-    group: &str,
-    sequence: u64,
-) -> Result<ExecResult> {
-    engine.reset_change_consumer(group, sequence)?;
-    Ok(ExecResult::Ok { rows_affected: 1 })
-}
-
-pub fn exec_drop_change_consumer(engine: &Engine, group: &str) -> Result<ExecResult> {
-    let removed = engine.drop_change_consumer(group)?;
-    Ok(ExecResult::Ok {
-        rows_affected: if removed { 1 } else { 0 },
     })
 }
 

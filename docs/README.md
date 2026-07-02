@@ -14,8 +14,6 @@
 
 ## Features
 
-- [变更流](features/change-stream.md)
-- [变更流快速入门](features/change-stream-quickstart.md)
 
 ## Operations
 

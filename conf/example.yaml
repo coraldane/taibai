@@ -30,10 +30,6 @@ tls:
   cert_path: ""
   key_path: ""
 
-# Change stream settings
-change_stream:
-  retention_events: 1000000
-
 # Auto compaction settings
 auto_compact:
   enabled: true
@@ -46,3 +42,6 @@ auto_compact:
 # Log settings
 log:
   level: "info"  # trace, debug, info, warn, error
+  # file: "../logs/taibai.log"
+  # query_file: "../logs/taibai-query.log"  # Defaults to taibai-query.log next to log.file when omitted
+  query_max_size_mb: 1024  # 0 disables query log rotation

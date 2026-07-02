@@ -49,6 +49,52 @@ fn active_flush_writes_sidecar_without_dat_footer() {
 }
 
 #[test]
+fn partition_active_flush_writes_partition_sidecar_meta() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::new(dir.path()).unwrap();
+
+    mgr.bulk_insert_batch_with_partition("main", "t", "2024", batch(1, 3))
+        .unwrap();
+
+    let table_dir = dir.path().join("main").join("t");
+    let segments = SegmentManager::discover_segments(&table_dir).unwrap();
+    assert_eq!(segments.len(), 1);
+
+    let seg_path = &segments[0];
+    assert_eq!(
+        sidecar_meta_path(seg_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        "p2024.meta"
+    );
+    assert!(table_dir.join("p2024.meta").exists());
+    assert!(!seg_path.with_extension("meta").exists());
+
+    let reader = SegmentReader::open(seg_path).unwrap();
+    assert_eq!(reader.row_count(), 3);
+}
+
+#[test]
+fn partition_reader_accepts_legacy_segment_sidecar_meta() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::new(dir.path()).unwrap();
+
+    mgr.bulk_insert_batch_with_partition("main", "t", "2024", batch(1, 3))
+        .unwrap();
+
+    let table_dir = dir.path().join("main").join("t");
+    let segments = SegmentManager::discover_segments(&table_dir).unwrap();
+    let seg_path = &segments[0];
+    let partition_meta = sidecar_meta_path(seg_path);
+    let legacy_meta = seg_path.with_extension("meta");
+    std::fs::rename(&partition_meta, &legacy_meta).unwrap();
+
+    let reader = SegmentReader::open(seg_path).unwrap();
+    assert_eq!(reader.row_count(), 3);
+}
+
+#[test]
 fn sidecar_journal_replays_row_group_deltas() {
     let dir = TempDir::new().unwrap();
     let mgr = SegmentManager::new(dir.path()).unwrap();

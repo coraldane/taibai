@@ -202,18 +202,18 @@ mod tests {
     fn sorts_by_expression_not_first_column() {
         let schema = Schema::new(vec![
             ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("close_px", DataType::Float64),
-            ColumnDef::new("pre_close", DataType::Float64),
+            ColumnDef::new("x", DataType::Float64),
+            ColumnDef::new("y", DataType::Float64),
         ]);
         let mut id = ColumnArray::empty(DataType::Int64);
-        let mut close = ColumnArray::empty(DataType::Float64);
-        let mut pre = ColumnArray::empty(DataType::Float64);
+        let mut x = ColumnArray::empty(DataType::Float64);
+        let mut y = ColumnArray::empty(DataType::Float64);
         for (i, c, p) in [(3, 11.0, 10.0), (1, 20.0, 10.0), (2, 9.0, 10.0)] {
             id.push(&ScalarValue::Int64(Some(i))).unwrap();
-            close.push(&ScalarValue::Float64(Some(c))).unwrap();
-            pre.push(&ScalarValue::Float64(Some(p))).unwrap();
+            x.push(&ScalarValue::Float64(Some(c))).unwrap();
+            y.push(&ScalarValue::Float64(Some(p))).unwrap();
         }
-        let batch = RecordBatch::try_new(schema.clone(), vec![id, close, pre]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![id, x, y]).unwrap();
         let expr = LogicalExpr::BinaryOp {
             left: Box::new(LogicalExpr::BinaryOp {
                 left: Box::new(LogicalExpr::Column(1)),

@@ -9,7 +9,8 @@ server:
 
 # Storage settings
 storage:
-  data_dir: "E:/data/taibai_data/"
+  # data_dir: "E:/data/taibai_data/"
+  data_dir: "D:/Program Files/Taibai/data/"
   default_database: "main"
   flush_threshold_rows: 65536
   min_segment_seal_size_mb: 500  # Minimum segment size in MB before sealing
@@ -30,10 +31,6 @@ tls:
   cert_path: ""
   key_path: ""
 
-# Change stream settings
-change_stream:
-  retention_events: 1000000
-
 # Auto compaction settings
 auto_compact:
   enabled: true
@@ -47,3 +44,5 @@ auto_compact:
 log:
   level: "info"  # trace, debug, info, warn, error
   file: "../logs/taibai.log"
+  query_file: "../logs/taibai-query.log"
+  query_max_size_mb: 1024  # 0 disables query log rotation

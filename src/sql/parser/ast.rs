@@ -211,24 +211,6 @@ pub enum Statement {
     ShowProcesslist {
         full: bool,
     },
-    ShowChangeConsumers,
-    ShowChangeStatus,
-    ShowChangeEvents {
-        table: Option<ObjectName>,
-        from_sequence: Option<u64>,
-        limit: Option<usize>,
-    },
-    ResetChangeConsumer {
-        group: String,
-        sequence: u64,
-    },
-    DropChangeConsumer {
-        group: String,
-    },
-    AckChangeConsumer {
-        group: String,
-        sequence: u64,
-    },
     UseDatabase(String),
     Explain {
         analyze: bool,

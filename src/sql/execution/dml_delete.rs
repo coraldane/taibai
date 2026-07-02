@@ -13,7 +13,7 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
-use super::engine::{change_row_from_images, Engine, ExecResult, MAX_CHANGE_ROWS_PER_EVENT};
+use super::engine::{Engine, ExecResult};
 use super::helpers::{
     build_row_group_predicate, collect_expr_column_indices, eval_expr_to_scalar,
     eval_where_clause_batch,
@@ -25,8 +25,6 @@ pub fn exec_delete(
     db: &str,
     table: &str,
     where_clause: &Option<Expr>,
-    change_rows: &mut Vec<crate::storage::change_stream::ChangeRow>,
-    row_images_truncated: &mut bool,
 ) -> Result<ExecResult> {
     let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
@@ -117,54 +115,18 @@ pub fn exec_delete(
                             reader.read_row_group_with_projection(rg_idx, &predicate_projection)?
                         };
                         let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
-                        let full_batch = if predicate_projection.is_empty() {
-                            batch.clone()
-                        } else {
-                            reader.read_row_group(rg_idx)?
-                        };
                         for (i, matches) in mask.into_iter().enumerate() {
                             if matches
                                 && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
                             {
                                 newly_deleted += 1;
-                                if change_rows.len() < MAX_CHANGE_ROWS_PER_EVENT {
-                                    change_rows.push(change_row_from_images(
-                                        &table_schema,
-                                        Some(&full_batch),
-                                        i,
-                                        None,
-                                        0,
-                                    ));
-                                } else {
-                                    *row_images_truncated = true;
-                                }
                             }
                         }
                         row_id += batch.num_rows() as u64;
                     } else {
-                        let batch = if change_rows.len() < MAX_CHANGE_ROWS_PER_EVENT {
-                            Some(reader.read_row_group(rg_idx)?)
-                        } else {
-                            None
-                        };
                         for i in 0..rg_rows {
                             if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
                                 newly_deleted += 1;
-                                if let Some(batch) = &batch {
-                                    if change_rows.len() >= MAX_CHANGE_ROWS_PER_EVENT {
-                                        *row_images_truncated = true;
-                                        continue;
-                                    }
-                                    change_rows.push(change_row_from_images(
-                                        &table_schema,
-                                        Some(batch),
-                                        i as usize,
-                                        None,
-                                        0,
-                                    ));
-                                } else {
-                                    *row_images_truncated = true;
-                                }
                             }
                         }
                         row_id += rg_rows;
@@ -797,10 +759,10 @@ mod tests {
     fn partitioned_meta() -> (Schema, TableMeta) {
         let columns = vec![
             ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("deal_date", DataType::Int32),
+            ColumnDef::new("partition_key", DataType::Int32),
         ];
-        let mut meta = TableMeta::new("main", "ticks", columns.clone());
-        meta.partition_key = "deal_date".to_string();
+        let mut meta = TableMeta::new("main", "test_table", columns.clone());
+        meta.partition_key = "partition_key".to_string();
         meta.partition_type = PartitionType::Year;
         meta.update_partition_key_idx();
         (Schema::new(columns), meta)
@@ -810,7 +772,7 @@ mod tests {
     fn delete_partition_eq_key_uses_partition_function() {
         let (schema, meta) = partitioned_meta();
         let where_clause = Some(Expr::BinaryOp {
-            left: Box::new(Expr::Column("deal_date".to_string())),
+            left: Box::new(Expr::Column("partition_key".to_string())),
             op: BinOp::Eq,
             right: Box::new(Expr::Literal(ScalarValue::Int64(Some(20260108)))),
         });
@@ -825,7 +787,7 @@ mod tests {
     fn prune_segments_by_partition_keeps_only_matching_partition_files() {
         let (schema, meta) = partitioned_meta();
         let where_clause = Some(Expr::BinaryOp {
-            left: Box::new(Expr::Column("deal_date".to_string())),
+            left: Box::new(Expr::Column("partition_key".to_string())),
             op: BinOp::Eq,
             right: Box::new(Expr::Literal(ScalarValue::Int64(Some(20260108)))),
         });
@@ -849,10 +811,10 @@ mod tests {
     #[test]
     fn cluster_key_eq_predicate_builds_exact_bounds() {
         let (schema, mut meta) = partitioned_meta();
-        meta.cluster_key = vec!["deal_date".to_string(), "id".to_string()];
+        meta.cluster_key = vec!["partition_key".to_string(), "id".to_string()];
         let predicate = crate::storage::segment::RowGroupPredicate::new(vec![
             crate::storage::segment::RangeClause {
-                column_index: schema.index_of("deal_date").unwrap(),
+                column_index: schema.index_of("partition_key").unwrap(),
                 op: RangeOp::Eq,
                 value: ScalarValue::Int64(Some(20260108)),
             },
@@ -860,7 +822,10 @@ mod tests {
 
         let bounds = cluster_key_bounds(&schema, &meta, &predicate).expect("bounds");
 
-        assert_eq!(bounds.column_index, schema.index_of("deal_date").unwrap());
+        assert_eq!(
+            bounds.column_index,
+            schema.index_of("partition_key").unwrap()
+        );
         assert_eq!(
             bounds.lower,
             Some((ScalarValue::Int64(Some(20260108)), true))

@@ -10,6 +10,7 @@ pub mod helpers;
 pub mod join_hashtable;
 pub mod morsel;
 pub mod operators;
+pub mod physical;
 pub mod pipeline;
 pub mod prepared;
 pub mod query;

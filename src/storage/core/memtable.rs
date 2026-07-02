@@ -263,6 +263,19 @@ impl MemTableManager {
             .collect()
     }
 
+    pub fn get_readable_by_table(&self, db: &str, table: &str) -> Vec<Arc<MemTable>> {
+        let memtables = self.memtables.read().unwrap();
+        memtables
+            .iter()
+            .filter(|mt| {
+                mt.db() == db
+                    && mt.table() == table
+                    && matches!(mt.state(), MemTableState::Pending | MemTableState::Flushing)
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn get_by_txn(&self, txn_id: u64) -> Vec<Arc<MemTable>> {
         let memtables = self.memtables.read().unwrap();
         memtables

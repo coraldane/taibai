@@ -296,7 +296,7 @@ impl BatchWriter {
             return Ok(());
         }
         mt.set_state(MemTableState::Flushing);
-        let batch = match mt.take_batch() {
+        let batch = match mt.read() {
             Some(b) if b.num_rows() > 0 => b,
             _ => {
                 mt.set_state(MemTableState::Flushed);

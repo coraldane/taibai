@@ -63,8 +63,6 @@ tls:
   enabled: false
   cert_path: """"
   key_path: """"
-change_stream:
-  retention_events: 1000000
 auto_compact:
   enabled: true
   check_interval_secs: 60

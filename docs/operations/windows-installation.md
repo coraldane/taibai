@@ -26,6 +26,7 @@ The script creates:
 - `D:\Program Files\Taibai\data`
 - `D:\Program Files\Taibai\logs`
 - `D:\Program Files\Taibai\logs\taibai.log`
+- `D:\Program Files\Taibai\logs\taibai-query.log`
 - the `TaibaiDB` Windows service
 
 The service command line contains:
@@ -47,6 +48,7 @@ Get-Service TaibaiDB
 
 The service is registered with automatic startup, so it starts with Windows.
 Service logs are written to the `log.file` path in `conf\windows.yaml`; for the default installer layout this is `[INSTALLFOLDER]\logs\taibai.log`.
+SQL query logs are written to `log.query_file`; if omitted, Taibai creates `taibai-query.log` next to `log.file`.
 
 ## Uninstall
 

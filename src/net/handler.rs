@@ -8,6 +8,8 @@ use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;
 use crate::sql::execution::{Engine, ExecResult};
+use crate::sql::parser::ast::Statement;
+use crate::sql::parser::parser::Parser;
 use crate::types::scalar::ScalarValue;
 
 pub struct Handler {
@@ -174,20 +176,39 @@ impl Handler {
         };
 
         let is_insert = sql.to_uppercase().starts_with("INSERT");
+        let should_log_query = should_log_query_sql(sql);
         if !is_insert {
             tracing::info!(sql, "query received");
         }
 
         let session = match &mut self.session {
             Some(s) => s,
-            None => return Ok(vec![build_error("not logged in")]),
+            None => {
+                log_query_if_needed(
+                    should_log_query,
+                    "",
+                    database,
+                    sql,
+                    "error:not_logged_in",
+                    server_start.elapsed(),
+                );
+                return Ok(vec![build_error("not logged in")]);
+            }
+        };
+        let query_user = session.username.clone();
+        let query_database = if database.is_empty() {
+            session.database.clone()
+        } else {
+            database.to_string()
         };
 
         if sql.starts_with("START BULK IMPORT") {
-            return self.handle_start_bulk_import(sql);
+            let result = self.handle_start_bulk_import(sql);
+            return result;
         }
         if sql == "STOP BULK IMPORT" {
-            return self.handle_stop_bulk_import();
+            let result = self.handle_stop_bulk_import();
+            return result;
         }
 
         let use_binary = session.binary_results;
@@ -218,6 +239,14 @@ impl Handler {
                         s.mark_txn_write();
                     }
                 }
+                log_query_if_needed(
+                    should_log_query,
+                    &query_user,
+                    &query_database,
+                    sql,
+                    "ok",
+                    server_start.elapsed(),
+                );
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
                     execute: execute_elapsed,
@@ -232,6 +261,14 @@ impl Handler {
                 } else {
                     build_query_result(&schema, &batches)
                 };
+                log_query_if_needed(
+                    should_log_query,
+                    &query_user,
+                    &query_database,
+                    sql,
+                    "ok",
+                    server_start.elapsed(),
+                );
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
                     execute: execute_elapsed,
@@ -243,6 +280,15 @@ impl Handler {
                 if !is_insert {
                     tracing::warn!(error = %e, sql, "query error");
                 }
+                let status = format!("error:{}", e);
+                log_query_if_needed(
+                    should_log_query,
+                    &query_user,
+                    &query_database,
+                    sql,
+                    &status,
+                    server_start.elapsed(),
+                );
                 Ok(vec![build_error(&e.to_string())])
             }
         }
@@ -846,6 +892,59 @@ impl Handler {
     }
 }
 
+fn log_query_if_needed(
+    should_log: bool,
+    user: &str,
+    database: &str,
+    sql: &str,
+    status: &str,
+    elapsed: Duration,
+) {
+    if should_log {
+        crate::common::query_log::log_query(user, database, sql, status, elapsed);
+    }
+}
+
+fn should_log_query_sql(sql: &str) -> bool {
+    match Parser::parse(sql) {
+        Ok(stmts) => stmts.first().is_some_and(statement_returns_rows),
+        Err(_) => starts_like_query(sql),
+    }
+}
+
+fn statement_returns_rows(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Select { .. }
+            | Statement::Union { .. }
+            | Statement::ShowTables { .. }
+            | Statement::ShowDatabases
+            | Statement::ShowColumns { .. }
+            | Statement::ShowIndexes { .. }
+            | Statement::ShowCreateTable { .. }
+            | Statement::ShowUsers
+            | Statement::ShowRoles
+            | Statement::ShowGrants { .. }
+            | Statement::ShowPartitions { .. }
+            | Statement::ShowStats
+            | Statement::ShowEngines
+            | Statement::ShowProcesslist { .. }
+            | Statement::Explain { .. }
+    )
+}
+
+fn starts_like_query(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let first = trimmed
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
+        .next()
+        .unwrap_or_default();
+    matches!(
+        first.to_ascii_uppercase().as_str(),
+        "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC"
+    )
+}
+
 fn build_auth_ok(session_id: &str) -> Message {
     Message::new(MSG_TYPE_AUTH_OK, Bytes::from(session_id.to_string()))
 }
@@ -1029,6 +1128,33 @@ fn write_decimal_value_with_scale(buf: &mut Vec<u8>, value: i64, scale: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_log_classifier_only_tracks_result_set_queries() {
+        for sql in [
+            "SELECT * FROM metrics",
+            "SHOW TABLES",
+            "DESCRIBE TABLE metrics",
+            "EXPLAIN SELECT * FROM metrics",
+            "SELECT * FROM",
+        ] {
+            assert!(should_log_query_sql(sql), "{sql}");
+        }
+
+        for sql in [
+            "CREATE TABLE metrics (id INT64)",
+            "INSERT INTO metrics VALUES (1)",
+            "DELETE FROM metrics WHERE id = 1",
+            "UPDATE metrics SET id = 2",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "START BULK IMPORT",
+            "STOP BULK IMPORT",
+        ] {
+            assert!(!should_log_query_sql(sql), "{sql}");
+        }
+    }
 
     #[test]
     fn test_header_round_trip() {

@@ -177,14 +177,14 @@ mod tests {
     #[test]
     fn parses_u8_decimal_meta_payload() {
         let mut payload = Vec::new();
-        write_header(&mut payload, "ticks", 2, 1);
-        write_column_header(&mut payload, "price", DataType::Decimal, 2, 9, 2, 0);
+        write_header(&mut payload, "test_table", 2, 1);
+        write_column_header(&mut payload, "amount", DataType::Decimal, 2, 9, 2, 0);
         payload.extend_from_slice(&1234i64.to_le_bytes());
         payload.extend_from_slice(&5678i64.to_le_bytes());
 
         let req = parse_direct_bulk_payload(&payload).unwrap();
 
-        assert_eq!(req.table_name, "ticks");
+        assert_eq!(req.table_name, "test_table");
         assert_eq!(req.row_count, 2);
         assert_eq!(req.columns.len(), 1);
         assert_eq!(req.columns[0].scale, 2);
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn rejects_trailing_bytes() {
         let mut payload = Vec::new();
-        write_header(&mut payload, "ticks", 0, 0);
+        write_header(&mut payload, "test_table", 0, 0);
         payload.push(0);
 
         assert!(parse_direct_bulk_payload(&payload).is_err());

@@ -282,3 +282,147 @@ fn delete_with_not_in_derived_subquery_keeps_group_max_rows() {
     assert_eq!(row_count(remaining), 2);
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn delete_then_insert_same_deal_date_keeps_new_rows_visible() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE t_sync_task_monitor (
+                id INT64,
+                deal_date INT32,
+                table_name VARCHAR
+            ) PARTITION BY YEAR(deal_date) CLUSTER BY (deal_date, table_name)",
+        )
+        .expect("create table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO t_sync_task_monitor VALUES
+                (1, 20260609, 'old_a'),
+                (2, 20260609, 'old_b'),
+                (3, 20260610, 'other')",
+        )
+        .expect("insert original rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE t_sync_task_monitor")
+        .expect("flush original rows");
+
+    let deleted = engine
+        .execute(
+            &mut session,
+            "DELETE FROM t_sync_task_monitor WHERE deal_date = 20260609",
+        )
+        .expect("delete old deal_date rows");
+    match deleted {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 2),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO t_sync_task_monitor VALUES
+                (4, 20260609, 'new_a'),
+                (5, 20260609, 'new_b')",
+        )
+        .expect("insert replacement rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE t_sync_task_monitor")
+        .expect("flush replacement rows");
+
+    let count = engine
+        .execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t_sync_task_monitor WHERE deal_date = 20260609",
+        )
+        .expect("count replacement rows");
+    assert_eq!(count_star(count), 2);
+
+    let remaining = engine
+        .execute(
+            &mut session,
+            "SELECT * FROM t_sync_task_monitor WHERE deal_date = 20260609",
+        )
+        .expect("select replacement rows");
+    assert_eq!(row_count(remaining), 2);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn bulk_import_insert_is_visible_before_stop_bulk_import() {
+    use taibai::net::bulk_importer::encode_columnar_bulk_insert;
+    use taibai::protocol::types::DataType;
+    use taibai::types::batch::{ColumnDef, RecordBatch, Schema};
+    use taibai::types::scalar::ScalarValue;
+
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE t_stock_daily (
+                security_id VARCHAR,
+                deal_date INT32,
+                close_px DECIMAL(18, 4)
+            ) PARTITION BY YEAR(deal_date) CLUSTER BY (security_id, deal_date)",
+        )
+        .expect("create table");
+
+    engine.begin_bulk_import();
+    let schema = Schema::new(vec![
+        ColumnDef::new("security_id", DataType::VarChar),
+        ColumnDef::new("deal_date", DataType::Int32),
+        ColumnDef::new("close_px", DataType::Decimal)
+            .with_precision(18)
+            .with_scale(4),
+    ]);
+    let mut batch = RecordBatch::new(schema);
+    batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::VarChar(Some("000001.SZ".to_string())))
+        .unwrap();
+    batch
+        .column_mut(1)
+        .unwrap()
+        .push(&ScalarValue::Int32(Some(20260629)))
+        .unwrap();
+    batch
+        .column_mut(2)
+        .unwrap()
+        .push(&ScalarValue::Decimal(Some(1234000)))
+        .unwrap();
+    batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::VarChar(Some("000002.SZ".to_string())))
+        .unwrap();
+    batch
+        .column_mut(1)
+        .unwrap()
+        .push(&ScalarValue::Int32(Some(20260629)))
+        .unwrap();
+    batch
+        .column_mut(2)
+        .unwrap()
+        .push(&ScalarValue::Decimal(Some(2345000)))
+        .unwrap();
+
+    let payload = encode_columnar_bulk_insert("t_stock_daily", &batch).expect("encode payload");
+    let inserted = engine
+        .exec_bulk_insert_payload_with_options("main", &payload, true, true)
+        .expect("bulk insert payload");
+    assert_eq!(inserted, 2);
+
+    let count = engine
+        .execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t_stock_daily WHERE deal_date = 20260629",
+        )
+        .expect("count inserted rows before stop bulk import");
+    assert_eq!(count_star(count), 2);
+
+    engine.end_bulk_import();
+    engine.segment_mgr().shutdown();
+}

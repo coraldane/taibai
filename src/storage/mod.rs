@@ -1,6 +1,5 @@
 pub mod bulk_payload;
 pub mod catalog;
-pub mod change_stream;
 pub mod codec;
 pub mod column_encoding;
 pub mod core;

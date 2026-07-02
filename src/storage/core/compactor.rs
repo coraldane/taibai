@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-
-use rayon::prelude::*;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
@@ -22,13 +21,11 @@ const COMPACT_ROW_GROUP_SIZE: usize = 8192;
 // splits the batch into COMPACT_ROW_GROUP_SIZE row groups, but this reduces
 // per-chunk source grouping and per-column dispatch overhead during optimize.
 const WRITE_GATHER_CHUNK_ROWS: usize = COMPACT_ROW_GROUP_SIZE * 8;
-const PARALLEL_SORT_THRESHOLD: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy)]
 struct RowRef {
     batch_idx: usize,
     row_idx: usize,
-    ordinal: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -314,8 +311,8 @@ impl Compactor {
     ) -> Result<CompactStats> {
         let mut key_batches = Vec::new();
         let mut source_row_groups = Vec::new();
+        let mut row_orders = Vec::new();
         let mut row_refs = Vec::new();
-        let mut ordinal = 0u64;
         let mut deleted_rows = 0u64;
         let partition_label = partition_key.unwrap_or("<unpartitioned>");
 
@@ -341,25 +338,33 @@ impl Compactor {
                     key_batches.push(key_batch);
                     row_count
                 };
+                let mut row_order = Vec::new();
                 for row_idx in 0..row_count {
                     let row_id = segment_row_base + row_idx as u64;
                     if reader.is_row_deleted(row_id) {
                         deleted_rows += 1;
                         continue;
                     }
-                    row_refs.push(RowRef {
-                        batch_idx,
-                        row_idx,
-                        ordinal,
-                    });
-                    ordinal += 1;
+                    if cluster_key_indices.is_empty() {
+                        row_refs.push(RowRef { batch_idx, row_idx });
+                    } else {
+                        row_order.push(row_idx);
+                    }
+                }
+                if !cluster_key_indices.is_empty() {
+                    sort_row_group_order(batch_idx, &mut row_order, &key_batches);
                 }
                 segment_row_base += row_count as u64;
                 source_row_groups.push(SourceRowGroup {
                     segment_path: seg_path.clone(),
                     row_group_idx: rg_idx,
                 });
+                row_orders.push(row_order);
             }
+        }
+
+        if !cluster_key_indices.is_empty() {
+            row_refs = merge_sorted_row_groups(&key_batches, &row_orders);
         }
 
         if row_refs.is_empty() {
@@ -382,8 +387,6 @@ impl Compactor {
             });
         }
 
-        sort_row_refs(&mut row_refs, &key_batches);
-
         let final_path = self
             .segment_mgr
             .next_replacement_segment_path(table_dir, partition_key)?;
@@ -402,6 +405,9 @@ impl Compactor {
         );
 
         let write_result = self.write_sorted_segment(
+            db,
+            table,
+            partition_label,
             &tmp_path,
             schema,
             cluster_key_indices,
@@ -448,6 +454,9 @@ impl Compactor {
 
     fn write_sorted_segment(
         &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
         path: &Path,
         schema: &Schema,
         cluster_key_indices: &[usize],
@@ -469,6 +478,10 @@ impl Compactor {
         let mut row_group_cache = RowGroupCache::new(source_row_groups.len(), non_key_projection);
 
         tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key,
             source_row_groups = source_row_groups.len(),
             cache_capacity = row_group_cache.capacity(),
             chunk_rows = WRITE_GATHER_CHUNK_ROWS,
@@ -488,15 +501,26 @@ impl Compactor {
             rows_written += batch.num_rows();
             writer.write_batch(&batch)?;
             if rows_written.is_multiple_of(WRITE_GATHER_CHUNK_ROWS * 16) {
+                let total_rows = row_refs.len();
+                let progress_pct = rows_written as f64 * 100.0 / total_rows as f64;
                 tracing::info!(
+                    db,
+                    table,
+                    table_full_name = %format!("{}.{}", db, table),
+                    partition_key,
                     rows_written,
-                    total_rows = row_refs.len(),
+                    total_rows,
+                    progress_pct = format_args!("{:.2}", progress_pct),
                     "compact write progress"
                 );
             }
         }
 
         tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key,
             rows_written,
             cache_hits = row_group_cache.hits(),
             cache_misses = row_group_cache.misses(),
@@ -662,12 +686,135 @@ impl RowGroupCache {
     }
 }
 
-fn sort_row_refs(row_refs: &mut [RowRef], key_batches: &[RecordBatch]) {
-    if row_refs.len() >= PARALLEL_SORT_THRESHOLD {
-        row_refs.par_sort_unstable_by(|left, right| compare_row_refs(left, right, key_batches));
-    } else {
-        row_refs.sort_unstable_by(|left, right| compare_row_refs(left, right, key_batches));
+#[derive(Debug, Clone)]
+struct MergeEntry {
+    key: Vec<ScalarValue>,
+    ordinal: u64,
+    batch_idx: usize,
+    row_idx: usize,
+}
+
+impl PartialEq for MergeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.ordinal == other.ordinal
     }
+}
+
+impl Eq for MergeEntry {}
+
+impl PartialOrd for MergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_merge_keys(&other.key, &self.key).then_with(|| other.ordinal.cmp(&self.ordinal))
+    }
+}
+
+fn sort_row_group_order(batch_idx: usize, row_order: &mut [usize], key_batches: &[RecordBatch]) {
+    row_order.sort_unstable_by(|left, right| {
+        compare_rows_in_batch(key_batches, batch_idx, *left, *right).then_with(|| left.cmp(right))
+    });
+}
+
+fn merge_sorted_row_groups(key_batches: &[RecordBatch], row_orders: &[Vec<usize>]) -> Vec<RowRef> {
+    let total_rows = row_orders.iter().map(Vec::len).sum();
+    let mut row_refs = Vec::with_capacity(total_rows);
+    let mut heap = BinaryHeap::new();
+    let mut cursors = vec![0usize; row_orders.len()];
+    let mut next_ordinal = 0u64;
+
+    for batch_idx in 0..key_batches.len() {
+        if let Some(&row_idx) = row_orders.get(batch_idx).and_then(|rows| rows.first()) {
+            heap.push(MergeEntry {
+                key: row_key(&key_batches[batch_idx], row_idx),
+                ordinal: next_ordinal,
+                batch_idx,
+                row_idx,
+            });
+            next_ordinal += 1;
+        }
+    }
+
+    while let Some(entry) = heap.pop() {
+        row_refs.push(RowRef {
+            batch_idx: entry.batch_idx,
+            row_idx: entry.row_idx,
+        });
+
+        cursors[entry.batch_idx] += 1;
+        if let Some(&row_idx) = row_orders
+            .get(entry.batch_idx)
+            .and_then(|rows| rows.get(cursors[entry.batch_idx]))
+        {
+            heap.push(MergeEntry {
+                key: row_key(&key_batches[entry.batch_idx], row_idx),
+                ordinal: next_ordinal,
+                batch_idx: entry.batch_idx,
+                row_idx,
+            });
+            next_ordinal += 1;
+        }
+    }
+
+    row_refs
+}
+
+fn compare_rows_in_batch(
+    key_batches: &[RecordBatch],
+    batch_idx: usize,
+    left_row: usize,
+    right_row: usize,
+) -> Ordering {
+    let key_count = key_batches
+        .get(batch_idx)
+        .map(|batch| batch.num_columns())
+        .unwrap_or(0);
+    for key_pos in 0..key_count {
+        let left_val = scalar_at_row(key_batches, batch_idx, left_row, key_pos);
+        let right_val = scalar_at_row(key_batches, batch_idx, right_row, key_pos);
+        let cmp = compare_scalars_for_sort(&left_val, &right_val);
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    Ordering::Equal
+}
+
+fn scalar_at_row(
+    batches: &[RecordBatch],
+    batch_idx: usize,
+    row_idx: usize,
+    col_idx: usize,
+) -> ScalarValue {
+    batches[batch_idx]
+        .scalar(row_idx, col_idx)
+        .unwrap_or_else(|| {
+            ScalarValue::null_for_type(batches[batch_idx].schema.columns[col_idx].data_type)
+        })
+}
+
+fn row_key(batch: &RecordBatch, row_idx: usize) -> Vec<ScalarValue> {
+    (0..batch.num_columns())
+        .map(|col_idx| {
+            batch.scalar(row_idx, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
+            })
+        })
+        .collect()
+}
+
+fn compare_merge_keys(left: &[ScalarValue], right: &[ScalarValue]) -> Ordering {
+    for (left_val, right_val) in left.iter().zip(right.iter()) {
+        let cmp = compare_scalars_for_sort(left_val, right_val);
+        if cmp != Ordering::Equal {
+            return cmp;
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 fn non_key_projection(num_columns: usize, cluster_key_indices: &[usize]) -> Vec<usize> {
@@ -694,34 +841,6 @@ fn key_column_positions(num_columns: usize, cluster_key_indices: &[usize]) -> Ve
         }
     }
     positions
-}
-
-fn compare_row_refs(
-    left: &RowRef,
-    right: &RowRef,
-    key_batches: &[RecordBatch],
-) -> std::cmp::Ordering {
-    let key_count = key_batches
-        .get(left.batch_idx)
-        .map(|batch| batch.num_columns())
-        .unwrap_or(0);
-    for key_pos in 0..key_count {
-        let left_val = scalar_at(key_batches, *left, key_pos);
-        let right_val = scalar_at(key_batches, *right, key_pos);
-        let cmp = compare_scalars_for_sort(&left_val, &right_val);
-        if cmp != std::cmp::Ordering::Equal {
-            return cmp;
-        }
-    }
-    left.ordinal.cmp(&right.ordinal)
-}
-
-fn scalar_at(batches: &[RecordBatch], row_ref: RowRef, col_idx: usize) -> ScalarValue {
-    batches[row_ref.batch_idx]
-        .scalar(row_ref.row_idx, col_idx)
-        .unwrap_or_else(|| {
-            ScalarValue::null_for_type(batches[row_ref.batch_idx].schema.columns[col_idx].data_type)
-        })
 }
 
 fn empty_column_for_gather(data_type: DataType, len: usize) -> ColumnArray {

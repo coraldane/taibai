@@ -38,6 +38,7 @@ impl Optimizer {
                 Box::new(limit_pushdown::LimitPushdownRule),
                 Box::new(order_limit_pushdown::OrderLimitPushdownRule),
                 Box::new(topn::TopNRule),
+                Box::new(order_limit_pushdown::TopNPushdownRule),
                 Box::new(filter_reorder::FilterReorderRule),
                 Box::new(index_selection::IndexSelectionRule),
                 Box::new(partition_pruning::PartitionPruningRule),
@@ -210,35 +211,27 @@ mod tests {
     fn schemas() -> HashMap<String, Schema> {
         let mut schemas = HashMap::new();
         schemas.insert(
-            "t_stock_daily".to_string(),
+            "left_t".to_string(),
             Schema::new(vec![
-                ColumnDef::new("security_id", DataType::Int64),
-                ColumnDef::new("deal_date", DataType::Int64),
-                ColumnDef::new("open_px", DataType::Float64),
-                ColumnDef::new("high_px", DataType::Float64),
-                ColumnDef::new("low_px", DataType::Float64),
-                ColumnDef::new("close_px", DataType::Float64),
-                ColumnDef::new("pre_close", DataType::Float64),
-                ColumnDef::new("trade_value", DataType::Float64),
+                ColumnDef::new("k", DataType::Int64),
+                ColumnDef::new("p", DataType::Int64),
+                ColumnDef::new("x", DataType::Float64),
+                ColumnDef::new("y", DataType::Float64),
             ]),
         );
         schemas.insert(
-            "t_security_info".to_string(),
+            "dim_t".to_string(),
             Schema::new(vec![
-                ColumnDef::new("security_id", DataType::Int64),
-                ColumnDef::new("display_name", DataType::VarChar),
+                ColumnDef::new("k", DataType::Int64),
+                ColumnDef::new("name", DataType::VarChar),
             ]),
         );
         schemas.insert(
-            "t_valuation".to_string(),
+            "right_t".to_string(),
             Schema::new(vec![
-                ColumnDef::new("deal_date", DataType::Int64),
-                ColumnDef::new("security_id", DataType::Int64),
-                ColumnDef::new("turnover_ratio", DataType::Float64),
-                ColumnDef::new("pe_ratio", DataType::Float64),
-                ColumnDef::new("pb_ratio", DataType::Float64),
-                ColumnDef::new("market_cap", DataType::Float64),
-                ColumnDef::new("circulating_market_cap", DataType::Float64),
+                ColumnDef::new("p", DataType::Int64),
+                ColumnDef::new("k", DataType::Int64),
+                ColumnDef::new("v", DataType::Float64),
             ]),
         );
         schemas
@@ -253,15 +246,12 @@ mod tests {
 
     #[test]
     fn optimizes_join_order_by_expression_limit_offset_query() {
-        let sql = "SELECT d.security_id, s.display_name,
-            d.open_px, d.high_px, d.low_px, d.close_px, d.pre_close,
-            d.trade_value,
-            v.turnover_ratio, v.pe_ratio, v.pb_ratio, v.market_cap, v.circulating_market_cap
-            FROM t_stock_daily d
-            LEFT JOIN t_security_info s ON d.security_id = s.security_id
-            LEFT JOIN t_valuation v ON v.deal_date = 20260605 AND d.security_id = v.security_id
-            WHERE d.deal_date = 20260605
-            ORDER BY (d.close_px - d.pre_close) / d.pre_close DESC
+        let sql = "SELECT l.k, d.name, r.v
+            FROM left_t l
+            LEFT JOIN dim_t d ON l.k = d.k
+            LEFT JOIN right_t r ON r.p = 42 AND l.k = r.k
+            WHERE l.p = 42
+            ORDER BY (l.x - l.y) / l.y DESC
             LIMIT 20 OFFSET 0";
         let stmts = Parser::parse(sql).unwrap();
         let plan = plan_select(&stmts[0], &schemas()).unwrap();

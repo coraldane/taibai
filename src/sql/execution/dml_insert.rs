@@ -9,7 +9,7 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use super::engine::{change_row_from_images, Engine, ExecResult, MAX_CHANGE_ROWS_PER_EVENT};
+use super::engine::{Engine, ExecResult};
 use super::helpers::{eval_expr_to_scalar_with_scale_timezone, sort_batch_by_key};
 use crate::sql::parser::ast::Expr;
 
@@ -26,8 +26,6 @@ pub fn exec_insert(
     timezone_offset_hours: i32,
     txn_id: u64,
     bulk_import_mode: bool,
-    change_rows: &mut Vec<crate::storage::change_stream::ChangeRow>,
-    row_images_truncated: &mut bool,
 ) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
@@ -195,19 +193,7 @@ pub fn exec_insert(
         &missing_auto_inc,
     )?;
 
-    for row_idx in 0..batch.num_rows() {
-        if change_rows.len() >= MAX_CHANGE_ROWS_PER_EVENT {
-            *row_images_truncated = true;
-            break;
-        }
-        change_rows.push(change_row_from_images(
-            &schema,
-            None,
-            0,
-            Some(&batch),
-            row_idx,
-        ));
-    }
+    let auto_increment_touched = !auto_inc_cols.is_empty();
 
     if bulk_import_mode {
         engine.exec_bulk_insert_partitioned_with_wal_control(
@@ -228,6 +214,9 @@ pub fn exec_insert(
         !bulk_import_mode && txn_id > 0,
         !bulk_import_mode && txn_id == 0,
     )?;
+    if auto_increment_touched {
+        engine.persist_auto_increment_next_value(db, table, !bulk_import_mode && txn_id > 0)?;
+    }
 
     Ok(ExecResult::Ok {
         rows_affected: row_count,

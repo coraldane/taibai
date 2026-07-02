@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 mod active_writer;
+mod cluster_meta_cache;
 mod config;
 mod helpers;
 mod reader_cache;
@@ -13,7 +14,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::common::error::{Result, TaibaiError};
-use crate::storage::bulk_payload::parse_direct_bulk_payload;
+use crate::storage::bulk_payload::{
+    parse_direct_bulk_payload, DirectBulkColumn, DirectBulkRequest,
+};
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
 use crate::storage::segment::meta::remove_sidecar_meta;
@@ -28,21 +31,49 @@ pub(crate) use helpers::direct_bulk_request_to_batch;
 pub use helpers::table_key;
 
 use active_writer::ActiveSegmentWriter;
+use cluster_meta_cache::ClusterMetaCache;
 use config::{
     bulk_compression_level, reader_cache_capacity, FLUSH_CHECK_INTERVAL_SECS,
     FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
-    discover_max_seq, ensure_state_not_retired, filter_batch_by_mask, is_transient_footer_error,
-    sort_batch_by_key_indices,
+    discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
+    is_transient_footer_error,
 };
 use reader_cache::ReaderCache;
 use state::TableSegmentState;
+
+fn same_segment_path(a: &Path, b: &Path) -> bool {
+    a == b || a.to_string_lossy().replace('\\', "/") == b.to_string_lossy().replace('\\', "/")
+}
+
+enum PreparedDirectColumns<'a> {
+    Borrowed(Vec<DirectBulkColumn<'a>>),
+    Owned(Vec<OwnedDirectBulkColumn<'a>>),
+}
+
+struct PreparedDirectBulkGroup<'a> {
+    partition_key: String,
+    row_count: usize,
+    columns: PreparedDirectColumns<'a>,
+    compressed_columns: Vec<(Vec<u8>, u64)>,
+}
+
+struct OwnedDirectBulkColumn<'a> {
+    name: &'a str,
+    data_type: crate::protocol::types::DataType,
+    scale: i32,
+    precision: i32,
+    data: Vec<u8>,
+    nulls: Vec<u8>,
+    variable_ranges: Option<Vec<(usize, usize)>>,
+}
 
 pub struct SegmentManager {
     data_dir: PathBuf,
     tables: RwLock<HashMap<String, Arc<TableSegmentState>>>,
     reader_cache: Mutex<ReaderCache>,
+    cluster_meta_cache: Mutex<ClusterMetaCache>,
     flush_stop: Arc<AtomicBool>,
     flush_paused: Arc<AtomicBool>,
     next_txn_id: AtomicU64,
@@ -76,8 +107,15 @@ impl SegmentManager {
                             let tbl_dir = tbl_entry.path();
                             cleanup_incomplete_compaction_files(&tbl_dir);
                             let max_seq = discover_max_seq(&tbl_dir);
+                            let partition_seq = discover_max_partition_seq(&tbl_dir);
                             let key = table_key(&db_name, &tbl_entry.file_name().to_string_lossy());
-                            tables.insert(key, Arc::new(TableSegmentState::new(max_seq)));
+                            tables.insert(
+                                key,
+                                Arc::new(TableSegmentState::with_partition_seq(
+                                    max_seq,
+                                    partition_seq,
+                                )),
+                            );
                         }
                     }
                 }
@@ -91,6 +129,7 @@ impl SegmentManager {
             data_dir: data_dir.to_path_buf(),
             tables: RwLock::new(tables),
             reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
+            cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
             flush_stop,
             flush_paused,
             next_txn_id: AtomicU64::new(1),
@@ -291,7 +330,12 @@ impl SegmentManager {
         partition_key: &str,
     ) -> Result<PathBuf> {
         let state = self.get_or_create_state_for_table_dir(table_dir)?;
-        let seq = state.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let seq = {
+            let mut partition_seq = state.partition_seq.lock().unwrap();
+            let entry = partition_seq.entry(partition_key.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
         Ok(table_dir.join(store::partition_segment_filename(partition_key, seq)))
     }
 
@@ -339,10 +383,56 @@ impl SegmentManager {
 
     pub fn invalidate_reader(&self, path: &Path) {
         self.reader_cache.lock().unwrap().invalidate(path);
+        self.cluster_meta_cache.lock().unwrap().invalidate(path);
     }
 
     pub fn invalidate_readers_under(&self, dir: &Path) {
         self.reader_cache.lock().unwrap().invalidate_under(dir);
+        self.cluster_meta_cache
+            .lock()
+            .unwrap()
+            .invalidate_under(dir);
+    }
+
+    /// Read-side metadata cache for a sealed segment's cluster-key column zone map.
+    ///
+    /// Returns the cached zone map for `col_idx` in `path`, deriving and caching it
+    /// on first access. Returns `None` when the segment has no usable bounds for the
+    /// column (empty/null). Mutable (unsealed) segments are never cached because their
+    /// footer can still change. The cache shares the reader-cache invalidation
+    /// lifecycle, so compaction/seal/delete automatically clears stale entries.
+    pub fn cluster_zone_map_cached(
+        &self,
+        path: &Path,
+        col_idx: usize,
+    ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        if self.is_mutable_segment_path(path) {
+            return self.derive_cluster_zone_map(path, col_idx);
+        }
+
+        if let Some(cached) = self.cluster_meta_cache.lock().unwrap().get(path, col_idx) {
+            return cached;
+        }
+
+        let derived = self.derive_cluster_zone_map(path, col_idx);
+        self.cluster_meta_cache
+            .lock()
+            .unwrap()
+            .put(path.to_path_buf(), col_idx, derived.clone());
+        derived
+    }
+
+    fn derive_cluster_zone_map(
+        &self,
+        path: &Path,
+        col_idx: usize,
+    ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        let reader = self.open_reader_cached(path).ok()?;
+        let zm = reader.segment_zone_maps().get(col_idx)?;
+        if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
+            return None;
+        }
+        Some(zm.clone())
     }
 
     pub fn remove_segment_file(&self, path: &Path) -> Result<()> {
@@ -382,7 +472,19 @@ impl SegmentManager {
         deleted_count: u64,
     ) -> Result<()> {
         self.invalidate_reader(path);
-        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)
+        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+        if let Some(state) = self.state_for_segment_path(path) {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            for segment in active_guard.values_mut() {
+                if same_segment_path(&segment.path, path) {
+                    segment.delete_bitmap = bitmap.to_vec();
+                    segment.deleted_row_count = deleted_count;
+                    segment.dirty_meta = true;
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn with_table_mutation_lock<T>(
@@ -404,7 +506,7 @@ impl SegmentManager {
 
         let mut active_guard = state.active_segments.lock().unwrap();
         for segment in active_guard.values_mut() {
-            if segment.path == path {
+            if same_segment_path(&segment.path, path) {
                 if segment.dirty_meta {
                     segment.flush_meta(&|path| self.invalidate_reader(path))?;
                 }
@@ -429,7 +531,9 @@ impl SegmentManager {
         };
 
         let active_guard = state.active_segments.lock().unwrap();
-        active_guard.values().any(|segment| segment.path == path)
+        active_guard
+            .values()
+            .any(|segment| same_segment_path(&segment.path, path))
     }
 
     fn state_for_segment_path(&self, path: &Path) -> Option<Arc<TableSegmentState>> {
@@ -726,6 +830,8 @@ impl SegmentManager {
             row_groups: Vec::new(),
             current_size: SEGMENT_HEADER_SIZE as u64,
             total_rows: 0,
+            delete_bitmap: Vec::new(),
+            deleted_row_count: 0,
             buffered_batch: None,
             buffered_rows: 0,
             dirty_meta: false,
@@ -792,7 +898,9 @@ impl SegmentManager {
             return Ok(None);
         }
 
-        let reader = SegmentReader::open(seg_path)?;
+        self.invalidate_reader(seg_path);
+
+        let reader = SegmentReader::open_owned(seg_path)?;
         let data_end = reader.data_end();
 
         let row_groups = reader.footer_row_groups_info();
@@ -820,6 +928,8 @@ impl SegmentManager {
             row_groups,
             current_size: data_end,
             total_rows: reader.row_count(),
+            delete_bitmap: reader.delete_bitmap().to_vec(),
+            deleted_row_count: reader.deleted_row_count(),
             buffered_batch: None,
             buffered_rows: 0,
             dirty_meta: true,
@@ -885,7 +995,13 @@ impl SegmentManager {
 
             let seg = active_guard.get_mut("").unwrap();
 
-            seg.append_direct_row_group(&req.columns, &compressed_columns, req.row_count as u64)?;
+            seg.append_direct_row_group(
+                &req.columns,
+                &compressed_columns,
+                req.row_count as u64,
+                true,
+                None,
+            )?;
 
             if seg.current_size >= self.max_segment_size() {
                 seg.seal(&|path| self.invalidate_reader(path))?;
@@ -906,24 +1022,27 @@ impl SegmentManager {
         catalogs: &crate::storage::catalog::schema::DatabaseCatalog,
         flush_immediately: bool,
     ) -> Result<u64> {
-        use rayon::prelude::*;
-
         let req = parse_direct_bulk_payload(payload)?;
         if req.row_count == 0 {
             return Ok(0);
         }
 
-        let table_dir = self.data_dir.join(db).join(req.table_name);
-        std::fs::create_dir_all(&table_dir)?;
-
         let (schema, table_meta) = {
             let table_meta = catalogs.get_table(req.table_name).ok_or_else(|| {
                 TaibaiError::Sql(format!("table '{}.{}' does not exist", db, req.table_name))
             })?;
-            let schema = Schema::new(table_meta.columns.clone());
-            (schema, table_meta.clone())
+            (Schema::new(table_meta.columns.clone()), table_meta.clone())
         };
 
+        self.validate_direct_bulk_request(&req, &schema)?;
+        self.append_direct_bulk_request(db, &req, &schema, &table_meta, flush_immediately)
+    }
+
+    fn validate_direct_bulk_request(
+        &self,
+        req: &DirectBulkRequest<'_>,
+        schema: &Schema,
+    ) -> Result<()> {
         if schema.num_columns() != req.columns.len() {
             return Err(TaibaiError::Protocol(format!(
                 "bulk column count mismatch: schema has {} columns but payload has {}",
@@ -931,7 +1050,6 @@ impl SegmentManager {
                 req.columns.len()
             )));
         }
-
         for (idx, (col_def, payload_col)) in
             schema.columns.iter().zip(req.columns.iter()).enumerate()
         {
@@ -956,34 +1074,290 @@ impl SegmentManager {
                 ));
             }
         }
+        Ok(())
+    }
 
-        if table_meta.is_partitioned() || !table_meta.cluster_key.is_empty() {
-            let mut batch = direct_bulk_request_to_batch(&req, &schema)?;
-            if !table_meta.cluster_key.is_empty() {
-                let key_indices: Vec<usize> = table_meta
-                    .cluster_key
-                    .iter()
-                    .filter_map(|key| schema.index_of(key))
-                    .collect();
-                if !key_indices.is_empty() {
-                    batch = sort_batch_by_key_indices(&batch, &key_indices)?;
-                }
-            }
-            return if flush_immediately {
-                self.bulk_insert_batch_partitioned(db, req.table_name, &table_meta, batch)
-            } else {
-                self.bulk_insert_batch_partitioned_deferred(db, req.table_name, &table_meta, batch)
-            };
-        }
-
-        let partition_key = String::new();
-
+    fn append_direct_bulk_request(
+        &self,
+        db: &str,
+        req: &DirectBulkRequest<'_>,
+        schema: &Schema,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        flush_immediately: bool,
+    ) -> Result<u64> {
+        let table_dir = self.data_dir.join(db).join(req.table_name);
+        std::fs::create_dir_all(&table_dir)?;
+        let partition_groups = self.direct_bulk_partition_groups(req, table_meta)?;
+        let prepared_groups = self.prepare_direct_bulk_groups(req, partition_groups)?;
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
+        let build_value_sets = flush_immediately;
+        let zone_map_columns = if flush_immediately {
+            None
+        } else {
+            Some(self.direct_bulk_key_column_indices(schema, table_meta))
+        };
 
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, req.table_name)?;
+
+        let mut written = 0u64;
+        let mut active_guard = state.active_segments.lock().unwrap();
+        for group in prepared_groups {
+            self.get_or_create_active_segment_for_partition_locked(
+                &table_dir,
+                schema,
+                &group.partition_key,
+                &mut active_guard,
+            )?;
+            let seg = active_guard.get_mut(&group.partition_key).unwrap();
+            match &group.columns {
+                PreparedDirectColumns::Borrowed(columns) => {
+                    seg.append_direct_row_group(
+                        columns,
+                        &group.compressed_columns,
+                        group.row_count as u64,
+                        build_value_sets,
+                        zone_map_columns.as_deref(),
+                    )?;
+                }
+                PreparedDirectColumns::Owned(storage) => {
+                    let columns: Vec<DirectBulkColumn<'_>> = storage
+                        .iter()
+                        .map(|col| DirectBulkColumn {
+                            name: col.name,
+                            data_type: col.data_type,
+                            scale: col.scale,
+                            precision: col.precision,
+                            data: &col.data,
+                            nulls: &col.nulls,
+                            variable_ranges: col.variable_ranges.clone(),
+                        })
+                        .collect();
+                    seg.append_direct_row_group(
+                        &columns,
+                        &group.compressed_columns,
+                        group.row_count as u64,
+                        build_value_sets,
+                        zone_map_columns.as_deref(),
+                    )?;
+                }
+            }
+            if seg.current_size >= self.max_segment_size() {
+                seg.seal(&|path| self.invalidate_reader(path))?;
+                active_guard.remove(&group.partition_key);
+            } else if flush_immediately {
+                seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            }
+            written += group.row_count as u64;
+        }
+        Ok(written)
+    }
+
+    fn direct_bulk_key_column_indices(
+        &self,
+        schema: &Schema,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+    ) -> Vec<usize> {
+        let mut indices = Vec::new();
+        if let Some(idx) = table_meta.get_partition_column_index_cached() {
+            indices.push(idx);
+        }
+        for key in &table_meta.cluster_key {
+            if let Some(idx) = schema.index_of(key) {
+                if !indices.contains(&idx) {
+                    indices.push(idx);
+                }
+            }
+        }
+        indices
+    }
+
+    fn direct_bulk_partition_groups(
+        &self,
+        req: &DirectBulkRequest<'_>,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+    ) -> Result<Vec<(String, Vec<usize>)>> {
+        if !table_meta.is_partitioned() {
+            return Ok(vec![(String::new(), (0..req.row_count).collect())]);
+        }
+        let pk_idx = table_meta
+            .get_partition_column_index_cached()
+            .ok_or_else(|| {
+                TaibaiError::Sql(format!(
+                    "partitioned table '{}' has no cached partition column index",
+                    table_meta.name
+                ))
+            })?;
+        let pk_col = req.columns.get(pk_idx).ok_or_else(|| {
+            TaibaiError::Protocol(format!(
+                "partition column index {} out of bulk payload",
+                pk_idx
+            ))
+        })?;
+        let strategy = table_meta.partition_strategy();
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut order = Vec::new();
+        for row_idx in 0..req.row_count {
+            let value = helpers::direct_bulk_column_scalar_at(pk_col, row_idx)?;
+            let partition_key = compute_partition_key_from_scalar(&strategy, &value);
+            if !groups.contains_key(&partition_key) {
+                order.push(partition_key.clone());
+                groups.insert(partition_key.clone(), Vec::new());
+            }
+            groups.get_mut(&partition_key).unwrap().push(row_idx);
+        }
+        Ok(order
+            .into_iter()
+            .filter_map(|key| groups.remove(&key).map(|rows| (key, rows)))
+            .collect())
+    }
+
+    fn prepare_direct_bulk_groups<'a>(
+        &self,
+        req: &'a DirectBulkRequest<'a>,
+        partition_groups: Vec<(String, Vec<usize>)>,
+    ) -> Result<Vec<PreparedDirectBulkGroup<'a>>> {
+        let mut prepared = Vec::with_capacity(partition_groups.len());
+        for (partition_key, rows) in partition_groups {
+            if rows.is_empty() {
+                continue;
+            }
+            if self.direct_bulk_rows_are_full_range(&rows, req.row_count) {
+                let columns: Vec<DirectBulkColumn<'a>> = req
+                    .columns
+                    .iter()
+                    .map(|col| DirectBulkColumn {
+                        name: col.name,
+                        data_type: col.data_type,
+                        scale: col.scale,
+                        precision: col.precision,
+                        data: col.data,
+                        nulls: col.nulls,
+                        variable_ranges: col.variable_ranges.clone(),
+                    })
+                    .collect();
+                let compressed_columns = self.compress_direct_bulk_columns(&columns)?;
+                prepared.push(PreparedDirectBulkGroup {
+                    partition_key,
+                    row_count: req.row_count,
+                    columns: PreparedDirectColumns::Borrowed(columns),
+                    compressed_columns,
+                });
+            } else {
+                let storage = self.direct_bulk_select_columns(req, &rows)?;
+                let columns: Vec<DirectBulkColumn<'_>> = storage
+                    .iter()
+                    .map(|col| DirectBulkColumn {
+                        name: col.name,
+                        data_type: col.data_type,
+                        scale: col.scale,
+                        precision: col.precision,
+                        data: &col.data,
+                        nulls: &col.nulls,
+                        variable_ranges: col.variable_ranges.clone(),
+                    })
+                    .collect();
+                let compressed_columns = self.compress_direct_bulk_columns(&columns)?;
+                prepared.push(PreparedDirectBulkGroup {
+                    partition_key,
+                    row_count: rows.len(),
+                    columns: PreparedDirectColumns::Owned(storage),
+                    compressed_columns,
+                });
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn direct_bulk_rows_are_full_range(&self, rows: &[usize], row_count: usize) -> bool {
+        rows.len() == row_count
+            && rows
+                .iter()
+                .enumerate()
+                .all(|(idx, &row_idx)| idx == row_idx)
+    }
+
+    fn direct_bulk_select_columns<'a>(
+        &self,
+        req: &'a DirectBulkRequest<'a>,
+        rows: &[usize],
+    ) -> Result<Vec<OwnedDirectBulkColumn<'a>>> {
+        req.columns
+            .iter()
+            .map(|col| self.direct_bulk_select_column(col, rows))
+            .collect()
+    }
+
+    fn direct_bulk_select_column<'a>(
+        &self,
+        col: &DirectBulkColumn<'a>,
+        rows: &[usize],
+    ) -> Result<OwnedDirectBulkColumn<'a>> {
+        let mut data = Vec::new();
+        let mut variable_ranges = col
+            .variable_ranges
+            .as_ref()
+            .map(|_| Vec::with_capacity(rows.len()));
+        if let Some(width) = col.data_type.fixed_size() {
+            data.reserve(rows.len() * width);
+            for &row_idx in rows {
+                let offset = row_idx
+                    .checked_mul(width)
+                    .ok_or_else(|| TaibaiError::Protocol("bulk column offset overflow".into()))?;
+                let end = offset + width;
+                if end > col.data.len() {
+                    return Err(TaibaiError::Protocol(format!(
+                        "bulk column '{}' row {} is truncated",
+                        col.name, row_idx
+                    )));
+                }
+                data.extend_from_slice(&col.data[offset..end]);
+            }
+        } else {
+            for &row_idx in rows {
+                let (offset, len) = col
+                    .variable_ranges
+                    .as_ref()
+                    .and_then(|ranges| ranges.get(row_idx).copied())
+                    .ok_or_else(|| {
+                        TaibaiError::Protocol(format!(
+                            "bulk column '{}' row {} not found",
+                            col.name, row_idx
+                        ))
+                    })?;
+                if offset + len > col.data.len() {
+                    return Err(TaibaiError::Protocol(format!(
+                        "bulk column '{}' variable data truncated",
+                        col.name
+                    )));
+                }
+                data.extend_from_slice(&(len as u32).to_le_bytes());
+                let value_offset = data.len();
+                data.extend_from_slice(&col.data[offset..offset + len]);
+                if let Some(ranges) = variable_ranges.as_mut() {
+                    ranges.push((value_offset, len));
+                }
+            }
+        }
+        Ok(OwnedDirectBulkColumn {
+            name: col.name,
+            data_type: col.data_type,
+            scale: col.scale,
+            precision: col.precision,
+            data,
+            nulls: Vec::new(),
+            variable_ranges,
+        })
+    }
+
+    fn compress_direct_bulk_columns(
+        &self,
+        columns: &[DirectBulkColumn<'_>],
+    ) -> Result<Vec<(Vec<u8>, u64)>> {
+        use rayon::prelude::*;
         let compression_level = bulk_compression_level();
-        let compressed_columns: Vec<(Vec<u8>, u64)> = req
-            .columns
+        columns
             .par_iter()
             .map(|col| {
                 let mut encoded = Vec::with_capacity(4 + col.data.len());
@@ -994,33 +1368,7 @@ impl SegmentManager {
                     .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
                 Ok((compressed, orig_len))
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        {
-            let _mutation_guard = state.mutation_lock.lock().unwrap();
-            ensure_state_not_retired(&state, db, req.table_name)?;
-
-            let mut active_guard = state.active_segments.lock().unwrap();
-            self.get_or_create_active_segment_for_partition_locked(
-                &table_dir,
-                &schema,
-                &partition_key,
-                &mut active_guard,
-            )?;
-
-            let seg = active_guard.get_mut(&partition_key).unwrap();
-
-            seg.append_direct_row_group(&req.columns, &compressed_columns, req.row_count as u64)?;
-
-            if seg.current_size >= self.max_segment_size() {
-                seg.seal(&|path| self.invalidate_reader(path))?;
-                active_guard.remove(&partition_key);
-            } else if flush_immediately {
-                seg.flush_meta(&|path| self.invalidate_reader(path))?;
-            }
-        }
-
-        Ok(req.row_count as u64)
+            .collect::<Result<Vec<_>>>()
     }
 
     pub fn bulk_insert_batch_partitioned(

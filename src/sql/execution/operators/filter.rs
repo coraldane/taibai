@@ -5,7 +5,7 @@ use crate::sql::planner::{AggregateExpr, LogicalExpr};
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use super::ExecutionOp;
+use super::{ExecutionOp, RuntimeInFilter};
 
 pub struct FilterExec {
     pub predicate: LogicalExpr,
@@ -24,6 +24,10 @@ impl ExecutionOp for FilterExec {
             }
         }
         Ok(None)
+    }
+
+    fn add_runtime_in_filter(&mut self, filter: RuntimeInFilter) -> bool {
+        self.input.add_runtime_in_filter(filter)
     }
 }
 

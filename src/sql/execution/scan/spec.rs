@@ -24,6 +24,7 @@ pub struct ScanSpec {
     pub has_group_by: bool,
     pub has_join: bool,
     pub limit: Option<usize>,
+    pub order_by: Vec<ScanSortKey>,
 
     pub cluster_key: Option<Vec<String>>,
     pub partition_info: Option<PartitionScanInfo>,
@@ -36,6 +37,12 @@ pub struct ScanSpec {
 pub struct InPredicate {
     pub column_index: usize,
     pub values: Vec<ScalarValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSortKey {
+    pub column_index: usize,
+    pub desc: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +68,7 @@ impl ScanSpec {
             has_group_by: false,
             has_join: false,
             limit: None,
+            order_by: Vec::new(),
             cluster_key: None,
             partition_info: None,
             bloom_index_columns: Vec::new(),
@@ -270,6 +278,10 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
             if let Some(limit) = scan.pushed_limit {
                 set_scan_limit(spec, limit);
             }
+            if let Some(order) = &scan.pushed_order {
+                spec.has_order_by = true;
+                collect_sort_keys(order, schema, spec);
+            }
             if let Some(filter) = &scan.pushed_filter {
                 extract_predicates(filter, schema, spec);
             }
@@ -299,6 +311,7 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
         }
         LogicalPlan::Sort(s) => {
             spec.has_order_by = true;
+            collect_sort_keys(&s.sort_keys, schema, spec);
             collect_from_plan(&s.input, table_name, schema, spec);
         }
         LogicalPlan::Limit(l) => {
@@ -307,6 +320,7 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
         }
         LogicalPlan::TopN(t) => {
             spec.has_order_by = true;
+            collect_sort_keys(&t.sort_keys, schema, spec);
             set_scan_limit(spec, t.limit.saturating_add(t.offset));
             collect_from_plan(&t.input, table_name, schema, spec);
         }
@@ -328,6 +342,28 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
 
 fn set_scan_limit(spec: &mut ScanSpec, limit: usize) {
     spec.limit = Some(spec.limit.map_or(limit, |current| current.min(limit)));
+}
+
+fn collect_sort_keys(
+    sort_keys: &[crate::sql::planner::SortKey],
+    schema: &Schema,
+    spec: &mut ScanSpec,
+) {
+    for key in sort_keys {
+        let LogicalExpr::Column(idx) = key.expr else {
+            continue;
+        };
+        if idx >= schema.num_columns() {
+            continue;
+        }
+        let sort_key = ScanSortKey {
+            column_index: idx,
+            desc: key.desc,
+        };
+        if !spec.order_by.contains(&sort_key) {
+            spec.order_by.push(sort_key);
+        }
+    }
 }
 
 fn plain_projection_columns(expressions: &[LogicalExpr]) -> Option<Vec<usize>> {
