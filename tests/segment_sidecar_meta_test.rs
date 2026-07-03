@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use taibai::net::bulk_importer::encode_columnar_bulk_insert;
 use taibai::protocol::types::DataType;
 use taibai::storage::segment::meta::{compact_sidecar_footer_if_needed, sidecar_meta_path};
@@ -225,4 +226,34 @@ fn direct_bulk_row_group_writes_value_sets() {
             ScalarValue::Int64(Some(3)),
         ]
     );
+}
+
+#[test]
+fn small_inactive_segment_reuses_cached_owned_reader() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::with_config(
+        dir.path(),
+        SegmentConfig {
+            min_segment_size: 500 * 1024 * 1024,
+            max_segment_size: 1024 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+
+    mgr.bulk_insert_batch("main", "t", batch(1, 3), false)
+        .unwrap();
+    mgr.flush_all_active().unwrap();
+    mgr.clear_active_segments("main", "t");
+
+    let table_dir = dir.path().join("main").join("t");
+    let segment = SegmentManager::discover_segments(&table_dir)
+        .unwrap()
+        .remove(0);
+    assert!(std::fs::metadata(&segment).unwrap().len() < 500 * 1024 * 1024);
+
+    let first = mgr.open_reader_cached(&segment).unwrap();
+    let second = mgr.open_reader_cached(&segment).unwrap();
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(second.row_count(), 3);
 }

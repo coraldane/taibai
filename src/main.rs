@@ -127,20 +127,11 @@ where
 
     let config = Arc::new(config);
     let engine = Arc::new(engine);
-    engine.set_auto_compact_enabled(config.auto_compact.enabled);
     let _ = rayon::ThreadPoolBuilder::new().build_global();
-    let mut auto_compactor = Some(storage::core::auto_compact::AutoCompactorHandle::start(
-        engine.clone(),
-        config.auto_compact.clone(),
-    ));
     let server = Server::new(config, engine.clone());
 
     if let Err(e) = server.run_with_shutdown(shutdown).await {
         tracing::error!(error = %e, "server error");
-    }
-
-    if let Some(handle) = auto_compactor.as_mut() {
-        handle.stop();
     }
 
     match engine.flush_all_buffers() {

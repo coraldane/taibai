@@ -223,4 +223,36 @@ mod tests {
 
         assert_eq!(pruned, vec![PathBuf::from("p2026_0001.dat")]);
     }
+
+    #[test]
+    fn year_partition_upper_bound_excludes_later_years() {
+        let files = vec![
+            PathBuf::from("p2025_0001.dat"),
+            PathBuf::from("p2026_0001.dat"),
+        ];
+        let mut meta = TableMeta::new(
+            "main",
+            "test_table",
+            vec![ColumnDef::new("deal_date", DataType::Int32)],
+        );
+        meta.partition_type = PartitionType::Year;
+        meta.partition_key = "deal_date".to_string();
+        meta.update_partition_key_idx();
+
+        let mut spec = ScanSpec::new("test_table");
+        spec.partition_info = Some(PartitionScanInfo {
+            time_range: Some(crate::sql::planner::TimeRange {
+                column: "deal_date".to_string(),
+                start: None,
+                end: Some(ScalarValue::Int64(Some(20251231))),
+            }),
+            partition_filter: None,
+            partition_key_col_idx: meta.get_partition_column_index(),
+            is_partitioned: true,
+        });
+
+        let pruned = prune_segments_by_partition(files, &spec, Some(&meta));
+
+        assert_eq!(pruned, vec![PathBuf::from("p2025_0001.dat")]);
+    }
 }
