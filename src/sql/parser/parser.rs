@@ -67,8 +67,6 @@ impl Parser {
             Token::Optimize => self.parse_optimize(),
             Token::Pause => self.parse_pause(),
             Token::Resume => self.parse_resume(),
-            Token::Ident(word) if word.eq_ignore_ascii_case("START") => self.parse_start(),
-            Token::Ident(word) if word.eq_ignore_ascii_case("STOP") => self.parse_stop(),
             other => Err(TaibaiError::Sql(format!("unexpected token: {}", other))),
         }
     }

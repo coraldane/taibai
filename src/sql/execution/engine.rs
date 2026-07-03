@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -38,9 +38,7 @@ pub struct Engine {
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
     bulk_mode_sessions: AtomicUsize,
-    auto_compact_enabled: AtomicBool,
     in_flight_operations: AtomicUsize,
-    last_activity_epoch_ms: AtomicU64,
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
@@ -145,9 +143,7 @@ impl Engine {
             segment_mgr,
             batch_writer,
             bulk_mode_sessions: AtomicUsize::new(0),
-            auto_compact_enabled: AtomicBool::new(true),
             in_flight_operations: AtomicUsize::new(0),
-            last_activity_epoch_ms: AtomicU64::new(current_epoch_millis()),
             auth_manager,
             auto_increment_mgr,
             index_manager,
@@ -490,14 +486,6 @@ impl Engine {
                 &table.name,
                 partition.as_deref(),
             ),
-            Statement::StartAutoCompact => {
-                self.set_auto_compact_enabled(true);
-                Ok(ExecResult::Ok { rows_affected: 0 })
-            }
-            Statement::StopAutoCompact => {
-                self.set_auto_compact_enabled(false);
-                Ok(ExecResult::Ok { rows_affected: 0 })
-            }
             Statement::PauseFlush => {
                 self.segment_mgr().pause_flush();
                 Ok(ExecResult::Ok { rows_affected: 0 })
@@ -662,8 +650,6 @@ impl Engine {
             | Statement::ShowRoles
             | Statement::ShowGrants { .. }
             | Statement::ShowProcesslist { .. }
-            | Statement::StartAutoCompact
-            | Statement::StopAutoCompact
             | Statement::PauseFlush
             | Statement::ResumeFlush => self.require_global_admin(session),
         }
@@ -804,36 +790,9 @@ impl Engine {
         self.bulk_mode_sessions.load(Ordering::Acquire)
     }
 
-    pub fn set_auto_compact_enabled(&self, enabled: bool) {
-        self.auto_compact_enabled.store(enabled, Ordering::Release);
-        tracing::info!(enabled, "auto compact runtime flag updated");
-    }
-
-    pub fn auto_compact_enabled(&self) -> bool {
-        self.auto_compact_enabled.load(Ordering::Acquire)
-    }
-
     fn begin_operation(&self) -> EngineOperationGuard<'_> {
-        self.mark_activity();
         self.in_flight_operations.fetch_add(1, Ordering::AcqRel);
         EngineOperationGuard { engine: self }
-    }
-
-    fn mark_activity(&self) {
-        self.last_activity_epoch_ms
-            .store(current_epoch_millis(), Ordering::Release);
-    }
-
-    pub fn is_idle_for(&self, duration: Duration) -> bool {
-        if self.in_flight_operations.load(Ordering::Acquire) > 0 {
-            return false;
-        }
-        let last = self.last_activity_epoch_ms.load(Ordering::Acquire);
-        current_epoch_millis().saturating_sub(last) >= duration.as_millis() as u64
-    }
-
-    pub fn has_active_segments(&self) -> bool {
-        self.segment_mgr.has_active_segments()
     }
 
     pub fn alloc_txn_id(&self) -> u64 {
@@ -1117,15 +1076,7 @@ impl Drop for EngineOperationGuard<'_> {
         self.engine
             .in_flight_operations
             .fetch_sub(1, Ordering::AcqRel);
-        self.engine.mark_activity();
     }
-}
-
-fn current_epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn bulk_payload_table_name(payload: &[u8]) -> Result<&str> {

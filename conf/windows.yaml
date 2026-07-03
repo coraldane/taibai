@@ -31,15 +31,6 @@ tls:
   cert_path: ""
   key_path: ""
 
-# Auto compaction settings
-auto_compact:
-  enabled: true
-  check_interval_secs: 60
-  idle_threshold_secs: 30
-  min_segments: 4
-  min_deleted_rows: 100000
-  max_tables_per_run: 1
-
 # Log settings
 log:
   level: "info"  # trace, debug, info, warn, error

@@ -226,8 +226,6 @@ pub enum Statement {
         table: ObjectName,
         partition: Option<String>,
     },
-    StartAutoCompact,
-    StopAutoCompact,
     PauseFlush,
     ResumeFlush,
 }

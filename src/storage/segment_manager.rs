@@ -348,7 +348,7 @@ impl SegmentManager {
     }
 
     pub fn open_reader(&self, path: &Path) -> Result<SegmentReader> {
-        if self.is_mutable_segment_path(path) {
+        if self.requires_owned_reader(path) {
             return self.open_mutable_reader_owned(path);
         }
 
@@ -360,6 +360,10 @@ impl SegmentManager {
     }
 
     pub fn open_reader_cached(&self, path: &Path) -> Result<Arc<SegmentReader>> {
+        // Active writers can change their data and sidecar footer at any time, so
+        // readers for them must remain uncached snapshots. A small *inactive*
+        // segment may be resumed later, but is stable until that happens; cache an
+        // owned snapshot for it and let recovery invalidate the cache before append.
         if self.is_mutable_segment_path(path) {
             self.invalidate_reader(path);
             return Ok(Arc::new(self.open_mutable_reader_owned(path)?));
@@ -369,7 +373,11 @@ impl SegmentManager {
             return Ok(reader);
         }
 
-        let reader = match SegmentReader::open(path) {
+        let reader = match if self.requires_owned_reader(path) {
+            SegmentReader::open_owned(path)
+        } else {
+            SegmentReader::open(path)
+        } {
             Ok(reader) => reader,
             Err(err) if is_transient_footer_error(&err) => self.open_mutable_reader_owned(path)?,
             Err(err) => return Err(err),
@@ -517,7 +525,11 @@ impl SegmentManager {
     }
 
     fn is_mutable_segment_path(&self, path: &Path) -> bool {
-        if self.is_active_segment_path(path) {
+        self.is_active_segment_path(path)
+    }
+
+    fn requires_owned_reader(&self, path: &Path) -> bool {
+        if self.is_mutable_segment_path(path) {
             return true;
         }
         std::fs::metadata(path)
@@ -598,16 +610,6 @@ impl SegmentManager {
         if let Some(state) = tables.get(&key) {
             state.active_segments.lock().unwrap().clear();
         }
-    }
-
-    pub fn has_active_segments(&self) -> bool {
-        let tables = self.tables.read().unwrap();
-        tables.values().any(|state| {
-            let active_guard = state.active_segments.lock().unwrap();
-            active_guard
-                .values()
-                .any(|seg| seg.total_rows > 0 || seg.buffered_rows > 0 || seg.dirty_meta)
-        })
     }
 
     pub fn remove_wal(&self, table_dir: &Path) {
