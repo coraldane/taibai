@@ -592,3 +592,184 @@ fn bulk_import_append_is_visible_to_count_before_flush() {
     engine.end_bulk_import();
     engine.segment_mgr().shutdown();
 }
+
+
+#[test]
+fn deferred_direct_bulk_append_invalidates_cached_reader_for_count() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ticks (
+                deal_date INT32 NOT NULL,
+                security_id VARCHAR NOT NULL,
+                deal_time INT32 NOT NULL
+            ) CLUSTER BY (deal_date, security_id, deal_time) PARTITION BY YEAR(deal_date)",
+        )
+        .expect("create ticks");
+
+    let first = bulk_payload(
+        "ticks",
+        2,
+        vec![
+            (
+                "deal_date",
+                DataType::Int32,
+                int32_col(&[20260629, 20260629]),
+            ),
+            ("security_id", DataType::VarChar, varchar_col(&["A", "B"])),
+            ("deal_time", DataType::Int32, int32_col(&[930, 931])),
+        ],
+    );
+    assert_eq!(
+        engine
+            .exec_bulk_insert_payload_with_wal_control("main", &first, false)
+            .expect("first bulk insert"),
+        2
+    );
+
+    let before = count_star(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*) FROM ticks WHERE deal_date = 20260629",
+            )
+            .expect("count first rows"),
+    );
+    assert_eq!(before, 2);
+
+    engine.begin_bulk_import();
+    let second = bulk_payload(
+        "ticks",
+        3,
+        vec![
+            (
+                "deal_date",
+                DataType::Int32,
+                int32_col(&[20260629, 20260629, 20260629]),
+            ),
+            ("security_id", DataType::VarChar, varchar_col(&["C", "D", "E"])),
+            ("deal_time", DataType::Int32, int32_col(&[932, 933, 934])),
+        ],
+    );
+    assert_eq!(
+        engine
+            .exec_bulk_insert_payload_with_options("main", &second, true, true)
+            .expect("deferred bulk append"),
+        3
+    );
+
+    let after = count_star(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*) FROM ticks WHERE deal_date = 20260629",
+            )
+            .expect("count appended rows"),
+    );
+    assert_eq!(after, 5);
+
+    engine.end_bulk_import();
+    engine.segment_mgr().shutdown();
+}
+
+
+#[test]
+fn deferred_direct_bulk_first_value_partition_insert_is_countable_by_partition_column() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE stock_pool (
+                security_id VARCHAR NOT NULL,
+                deal_date INT32 NOT NULL,
+                weight INT32
+            ) PARTITION BY deal_date CLUSTER BY (security_id, deal_date)",
+        )
+        .expect("create stock_pool");
+
+    engine.begin_bulk_import();
+    let payload = bulk_payload(
+        "stock_pool",
+        3,
+        vec![
+            ("security_id", DataType::VarChar, varchar_col(&["A", "B", "C"])),
+            (
+                "deal_date",
+                DataType::Int32,
+                int32_col(&[20260106, 20260106, 20260106]),
+            ),
+            ("weight", DataType::Int32, int32_col(&[1, 2, 3])),
+        ],
+    );
+    assert_eq!(
+        engine
+            .exec_bulk_insert_payload_with_options("main", &payload, true, true)
+            .expect("deferred bulk insert"),
+        3
+    );
+
+    let count = count_star(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*) FROM stock_pool WHERE deal_date = 20260106",
+            )
+            .expect("count inserted rows"),
+    );
+    assert_eq!(count, 3);
+
+    engine.end_bulk_import();
+    engine.segment_mgr().shutdown();
+}
+
+
+#[test]
+fn deferred_sql_bulk_insert_below_row_group_target_is_immediately_countable() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE stock_pool_sql (
+                security_id VARCHAR NOT NULL,
+                deal_date INT32 NOT NULL,
+                weight INT32
+            ) PARTITION BY deal_date CLUSTER BY (security_id, deal_date)",
+        )
+        .expect("create stock_pool_sql");
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO stock_pool_sql (security_id, deal_date, weight) VALUES
+                ('A', 20260106, 1),
+                ('B', 20260106, 2),
+                ('C', 20260106, 3)",
+        )
+        .expect("deferred sql insert");
+
+    let count = count_star(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*) FROM stock_pool_sql WHERE deal_date = 20260106",
+            )
+            .expect("count inserted rows"),
+    );
+    assert_eq!(count, 3);
+
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    engine.segment_mgr().shutdown();
+}

@@ -817,6 +817,11 @@ impl SegmentManager {
             } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
                 seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            } else if seg.buffered_rows > 0 {
+                seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
+            } else {
+                seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
             }
         }
 
@@ -1219,6 +1224,8 @@ impl SegmentManager {
                 active_guard.remove(&group.partition_key);
             } else if flush_immediately {
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            } else {
+                seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
             }
             written += group.row_count as u64;
         }
