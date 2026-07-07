@@ -39,7 +39,7 @@ use config::{
     FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
-    discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
+    discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask, slice_batch_fast,
     is_transient_footer_error,
 };
 use reader_cache::ReaderCache;
@@ -727,6 +727,16 @@ impl SegmentManager {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, "", &batch, true)
+    }
+
+    pub fn bulk_insert_batch_ref(
+        &self,
+        db: &str,
+        table: &str,
+        batch: &RecordBatch,
+        _disable_wal: bool,
+    ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
     }
 
@@ -737,7 +747,7 @@ impl SegmentManager {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, false)
+        self.bulk_insert_batch_with_partition_inner(db, table, "", &batch, false)
     }
 
     pub fn bulk_insert_batch_with_partition(
@@ -746,6 +756,16 @@ impl SegmentManager {
         table: &str,
         partition_key: &str,
         batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, &batch, true)
+    }
+
+    pub fn bulk_insert_batch_with_partition_ref(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: &RecordBatch,
     ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, true)
     }
@@ -757,7 +777,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: RecordBatch,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, false)
+        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, &batch, false)
     }
 
     fn bulk_insert_batch_with_partition_inner(
@@ -765,7 +785,7 @@ impl SegmentManager {
         db: &str,
         table: &str,
         partition_key: &str,
-        batch: RecordBatch,
+        batch: &RecordBatch,
         flush_immediately: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
@@ -1455,7 +1475,7 @@ impl SegmentManager {
                 db,
                 table,
                 "",
-                batch,
+                &batch,
                 flush_immediately,
             );
         }
@@ -1467,7 +1487,7 @@ impl SegmentManager {
                     db,
                     table,
                     "",
-                    batch,
+                    &batch,
                     flush_immediately,
                 )
             }
@@ -1491,9 +1511,47 @@ impl SegmentManager {
                 db,
                 table,
                 &first_key,
-                batch,
+                &batch,
                 flush_immediately,
             );
+        }
+
+        let mut ranges: Vec<(String, usize, usize)> = Vec::new();
+        let mut contiguous = true;
+        let mut current_key = first_key.clone();
+        let mut current_start = 0usize;
+        let mut seen_keys = HashSet::new();
+        seen_keys.insert(first_key.clone());
+        for row_idx in 1..batch.num_rows() {
+            let val = batch
+                .scalar(row_idx, pk_idx)
+                .unwrap_or(ScalarValue::Int64(None));
+            let key = compute_partition_key_from_scalar(&partition_strategy, &val);
+            if key != current_key {
+                if seen_keys.contains(&key) {
+                    contiguous = false;
+                    break;
+                }
+                ranges.push((current_key, current_start, row_idx - current_start));
+                seen_keys.insert(key.clone());
+                current_key = key;
+                current_start = row_idx;
+            }
+        }
+        if contiguous {
+            ranges.push((current_key, current_start, batch.num_rows() - current_start));
+            let mut written = 0;
+            for (partition_key, start, len) in ranges {
+                let part_batch = slice_batch_fast(&batch, start, len)?;
+                written += self.bulk_insert_batch_with_partition_inner(
+                    db,
+                    table,
+                    &partition_key,
+                    &part_batch,
+                    flush_immediately,
+                )?;
+            }
+            return Ok(written);
         }
 
         let mut key_order = Vec::new();
@@ -1523,7 +1581,7 @@ impl SegmentManager {
                 db,
                 table,
                 &partition_key,
-                part_batch,
+                &part_batch,
                 flush_immediately,
             )?;
         }

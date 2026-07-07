@@ -34,7 +34,12 @@ pub struct MemTable {
 }
 
 impl MemTable {
-    pub fn new(db: String, table: String, partition_key: String, schema: Schema) -> Self {
+    pub fn new(
+        db: String,
+        table: String,
+        partition_key: String,
+        schema: Schema,
+        ) -> Self {
         Self {
             db,
             table,
@@ -54,7 +59,7 @@ impl MemTable {
         partition_key: String,
         schema: Schema,
         txn_id: u64,
-    ) -> Self {
+        ) -> Self {
         Self {
             db,
             table,
@@ -153,6 +158,30 @@ impl MemTable {
         Ok(added)
     }
 
+    pub fn append_owned(&self, batch: RecordBatch) -> Result<u64> {
+        let added = batch.num_rows() as u64;
+        if added == 0 {
+            return Ok(0);
+        }
+        let mut guard = self.batch.write().unwrap();
+        match guard.as_mut() {
+            Some(existing) if existing.num_rows() > 0 => {
+                for col_idx in 0..batch.num_columns() {
+                    if let Some(src) = batch.column(col_idx) {
+                        if let Some(dst) = existing.column_mut(col_idx) {
+                            dst.extend(src)?;
+                        }
+                    }
+                }
+            }
+            _ => {
+                *guard = Some(batch);
+            }
+        }
+        self.row_count.fetch_add(added, Ordering::Release);
+        Ok(added)
+    }
+
     pub fn read(&self) -> Option<RecordBatch> {
         let guard = self.batch.read().unwrap();
         guard.clone()
@@ -161,6 +190,13 @@ impl MemTable {
     pub fn take_batch(&self) -> Option<RecordBatch> {
         let mut guard = self.batch.write().unwrap();
         guard.take()
+    }
+
+    pub fn restore_batch(&self, batch: RecordBatch) {
+        let rows = batch.num_rows() as u64;
+        let mut guard = self.batch.write().unwrap();
+        *guard = Some(batch);
+        self.row_count.store(rows, Ordering::Release);
     }
 
     pub fn schema(&self) -> Option<Schema> {
@@ -172,6 +208,7 @@ impl MemTable {
         self.created_at.elapsed().as_secs()
     }
 }
+
 
 pub struct MemTableManager {
     memtables: RwLock<Vec<Arc<MemTable>>>,
@@ -240,14 +277,14 @@ impl MemTableManager {
                 partition_key.to_string(),
                 schema.clone(),
                 txn_id,
-            ))
+                ))
         } else {
             Arc::new(MemTable::new(
                 db.to_string(),
                 table.to_string(),
                 partition_key.to_string(),
                 schema.clone(),
-            ))
+                ))
         };
         memtables.push(Arc::clone(&mt));
         mt

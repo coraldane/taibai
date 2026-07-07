@@ -274,6 +274,20 @@ pub(super) fn filter_batch_by_mask(
     RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
+
+pub(super) fn slice_batch_fast(
+    batch: &RecordBatch,
+    offset: usize,
+    len: usize,
+) -> Result<RecordBatch> {
+    let columns = batch
+        .columns
+        .iter()
+        .map(|col| col.slice_fast(offset, len))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
+}
+
 pub(super) fn compute_zone_maps_from_bulk_columns(
     columns: &[DirectBulkColumn<'_>],
     _schema: &Schema,

@@ -159,7 +159,11 @@ impl SegmentWriter {
                     .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
 
                 group.uncompressed_sizes[col_idx] += uncompressed_len;
-                group.columns[col_idx].extend_from_slice(&compressed);
+                if group.columns[col_idx].is_empty() {
+                    group.columns[col_idx] = compressed;
+                } else {
+                    group.columns[col_idx].extend_from_slice(&compressed);
+                }
             }
 
             group.row_count += to_write;
