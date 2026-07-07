@@ -1472,6 +1472,30 @@ impl SegmentManager {
                 )
             }
         };
+        let partition_strategy = table_meta.partition_strategy();
+        let first_val = batch.scalar(0, pk_idx).unwrap_or(ScalarValue::Int64(None));
+        let first_key = compute_partition_key_from_scalar(&partition_strategy, &first_val);
+        let mut single_partition = true;
+        for row_idx in 1..batch.num_rows() {
+            let val = batch
+                .scalar(row_idx, pk_idx)
+                .unwrap_or(ScalarValue::Int64(None));
+            let key = compute_partition_key_from_scalar(&partition_strategy, &val);
+            if key != first_key {
+                single_partition = false;
+                break;
+            }
+        }
+        if single_partition {
+            return self.bulk_insert_batch_with_partition_inner(
+                db,
+                table,
+                &first_key,
+                batch,
+                flush_immediately,
+            );
+        }
+
         let mut key_order = Vec::new();
         let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
         for row_idx in 0..batch.num_rows() {

@@ -314,9 +314,20 @@ impl Engine {
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
         let _op_guard = self.begin_operation();
         if sql.as_bytes().first().map(|b| b.to_ascii_uppercase()) == Some(b'I') {
-            if let Some(result) = crate::sql::parser::fast_insert::try_fast_parse_insert(sql) {
-                let stmt = result?;
-                return self.execute_stmt(session, &stmt);
+            if let Some(result) = super::dml_insert::try_exec_fast_insert_sql(
+                self,
+                &session.database,
+                sql,
+                session.timezone_offset_hours,
+                session.active_txn_id(),
+                session.bulk_import_mode,
+                &session.username,
+            ) {
+                let result = result;
+                if result.is_ok() && session.active_txn_id() > 0 {
+                    session.mark_txn_write();
+                }
+                return result;
             }
         }
         let stmts = Parser::parse(sql)?;
@@ -1408,6 +1419,127 @@ mod tests {
             ScalarValue::Int32(Some(v)) => v as i64,
             value => panic!("unexpected value {:?}", value),
         }
+    }
+
+    #[test]
+    fn fast_insert_sql_materializes_generic_multi_values() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+
+        engine.execute(
+            &mut session,
+            "CREATE TABLE t (id INT64, name VARCHAR, amount DECIMAL(9,2), active BOOL)",
+        )?;
+        engine.execute(
+            &mut session,
+            "INSERT INTO t (id, name, amount, active) VALUES (1, 'alpha', 12.34, true), (2, 'it''s', -5.60, 0)",
+        )?;
+
+        assert_eq!(
+            first_i64(
+                engine.execute(&mut session, "SELECT id FROM t ORDER BY id")?,
+                0,
+                0
+            ),
+            1
+        );
+        assert_eq!(
+            first_text(
+                engine.execute(&mut session, "SELECT name FROM t WHERE id = 2")?,
+                0,
+                0,
+            ),
+            "it's"
+        );
+        assert_eq!(
+            first_i64(
+                engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+                0,
+                0
+            ),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fast_insert_sql_materializes_missing_nullable_and_literal_default_columns() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+
+        engine.execute(
+            &mut session,
+            "CREATE TABLE t (id INT64, name VARCHAR, tag VARCHAR DEFAULT 'new', note VARCHAR)",
+        )?;
+        engine.execute(
+            &mut session,
+            "INSERT INTO t (id, name) VALUES (1, 'alpha'), (2, 'beta')",
+        )?;
+
+        assert_eq!(
+            first_text(
+                engine.execute(&mut session, "SELECT tag FROM t WHERE id = 1")?,
+                0,
+                0,
+            ),
+            "new"
+        );
+        assert_eq!(
+            first_i64(
+                engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE note IS NULL")?,
+                0,
+                0
+            ),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fast_insert_sql_materializes_missing_auto_increment_and_current_timestamp() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+
+        engine.execute(
+            &mut session,
+            "CREATE TABLE t (id INT64 AUTO_INCREMENT PRIMARY KEY, name VARCHAR, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+        )?;
+        engine.execute(
+            &mut session,
+            "INSERT INTO t (name) VALUES ('alpha'), ('beta')",
+        )?;
+
+        assert_eq!(
+            first_i64(
+                engine.execute(&mut session, "SELECT id FROM t ORDER BY id")?,
+                0,
+                0
+            ),
+            1
+        );
+        assert_eq!(
+            first_i64(
+                engine.execute(&mut session, "SELECT id FROM t ORDER BY id")?,
+                1,
+                0
+            ),
+            2
+        );
+        assert_eq!(
+            first_i64(
+                engine.execute(
+                    &mut session,
+                    "SELECT COUNT(*) FROM t WHERE created_at IS NOT NULL"
+                )?,
+                0,
+                0
+            ),
+            2
+        );
+        Ok(())
     }
 
     #[test]
