@@ -6,17 +6,19 @@ use crc32fast::Hasher;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::partition::partition::parse_partition_key;
-use crate::storage::partition::pruning::compute_segment_zone_maps_from_row_groups;
+use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::writer::encode_segment_footer;
 use crate::storage::segment::RowGroupMeta;
 use crate::types::batch::Schema;
 
-const SIDECAR_MAGIC: u32 = 0x4D58_4D54; // MXMT
+const SIDECAR_MAGIC: u32 = 0x4D58_4D54;
 const SIDECAR_VERSION_FULL_SNAPSHOT: u32 = 1;
 const SIDECAR_VERSION_JOURNAL: u32 = 2;
+const SIDECAR_VERSION_NAMED_JOURNAL: u32 = 3;
 const V1_RECORD_HEADER_SIZE: usize = 24;
 const V2_RECORD_HEADER_SIZE: usize = 32;
+const V3_RECORD_HEADER_SIZE: usize = 36;
 const RECORD_CRC_SIZE: usize = 4;
 const RECORD_KIND_FULL_SNAPSHOT: u32 = 1;
 const RECORD_KIND_ROW_GROUPS: u32 = 2;
@@ -25,6 +27,17 @@ const RECORD_KIND_ROW_GROUPS: u32 = 2;
 pub struct SidecarFooter {
     pub data_end: u64,
     pub footer: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentMetaSnapshot {
+    pub data_end: u64,
+    pub schema: Schema,
+    pub row_count: u64,
+    pub row_groups: Vec<RowGroupMeta>,
+    pub delete_bitmap: Vec<u8>,
+    pub deleted_row_count: u64,
+    pub segment_zone_maps: Vec<ZoneMap>,
 }
 
 pub fn sidecar_meta_path(segment_path: &Path) -> PathBuf {
@@ -43,22 +56,47 @@ fn legacy_sidecar_meta_path(segment_path: &Path) -> PathBuf {
 }
 
 pub fn read_latest_sidecar_footer(segment_path: &Path) -> Result<Option<SidecarFooter>> {
-    if let Some(sidecar) = read_latest_sidecar_footer_from(&sidecar_meta_path(segment_path))? {
+    if let Some(sidecar) =
+        read_latest_sidecar_footer_from(&sidecar_meta_path(segment_path), segment_path)?
+    {
         return Ok(Some(sidecar));
     }
 
     let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
     if legacy_meta_path != sidecar_meta_path(segment_path) {
-        return read_latest_sidecar_footer_from(&legacy_meta_path);
+        return read_latest_sidecar_footer_from(&legacy_meta_path, segment_path);
     }
 
     Ok(None)
 }
 
-fn read_latest_sidecar_footer_from(meta_path: &Path) -> Result<Option<SidecarFooter>> {
+pub fn read_latest_segment_meta(segment_path: &Path) -> Result<Option<SegmentMetaSnapshot>> {
+    let Some(sidecar) = read_latest_sidecar_footer(segment_path)? else {
+        return Ok(None);
+    };
+    let parsed = parse_segment_footer(&sidecar.footer)?;
+    Ok(Some(SegmentMetaSnapshot {
+        data_end: sidecar.data_end,
+        schema: parsed.schema,
+        row_count: parsed.row_count,
+        row_groups: parsed.row_groups,
+        delete_bitmap: parsed.delete_bitmap,
+        deleted_row_count: parsed.deleted_row_count,
+        segment_zone_maps: parsed.segment_zone_maps,
+    }))
+}
+
+fn read_latest_sidecar_footer_from(
+    meta_path: &Path,
+    segment_path: &Path,
+) -> Result<Option<SidecarFooter>> {
     if !meta_path.exists() {
         return Ok(None);
     }
+
+    let target_name = segment_name(segment_path);
+    let shared_partition_meta = sidecar_meta_path(segment_path) == meta_path
+        && legacy_sidecar_meta_path(segment_path) != meta_path;
 
     let mut file = fs::File::open(&meta_path)?;
     let mut buf = Vec::new();
@@ -81,17 +119,34 @@ fn read_latest_sidecar_footer_from(meta_path: &Path) -> Result<Option<SidecarFoo
             break;
         };
 
-        let record_end = offset + header.header_len + header.footer_len + RECORD_CRC_SIZE;
+        let record_end =
+            offset + header.header_len + header.name_len + header.footer_len + RECORD_CRC_SIZE;
         if record_end > buf.len() {
             break;
         }
 
-        let footer_start = offset + header.header_len;
+        let name_start = offset + header.header_len;
+        let name_end = name_start + header.name_len;
+        let footer_start = name_end;
         let footer_end = footer_start + header.footer_len;
         let stored_crc = u32::from_le_bytes(buf[footer_end..record_end].try_into().unwrap());
         let computed_crc = compute_crc(&buf[offset..footer_end]);
         if stored_crc != computed_crc {
             break;
+        }
+
+        let record_name = if header.name_len > 0 {
+            std::str::from_utf8(&buf[name_start..name_end]).ok()
+        } else {
+            None
+        };
+        if shared_partition_meta && record_name.is_some_and(|name| name != target_name) {
+            offset = record_end;
+            continue;
+        }
+        if shared_partition_meta && record_name.is_none() && latest.is_some() {
+            offset = record_end;
+            continue;
         }
 
         let footer = &buf[footer_start..footer_end];
@@ -142,13 +197,19 @@ pub fn append_sidecar_row_groups(
 
 pub fn append_record(segment_path: &Path, kind: u32, data_end: u64, footer: &[u8]) -> Result<()> {
     let meta_path = sidecar_meta_path(segment_path);
-    let mut record = Vec::with_capacity(V2_RECORD_HEADER_SIZE + footer.len() + RECORD_CRC_SIZE);
+    let name = segment_name(segment_path);
+    let name_bytes = name.as_bytes();
+    let mut record = Vec::with_capacity(
+        V3_RECORD_HEADER_SIZE + name_bytes.len() + footer.len() + RECORD_CRC_SIZE,
+    );
     record.extend_from_slice(&SIDECAR_MAGIC.to_le_bytes());
-    record.extend_from_slice(&SIDECAR_VERSION_JOURNAL.to_le_bytes());
+    record.extend_from_slice(&SIDECAR_VERSION_NAMED_JOURNAL.to_le_bytes());
     record.extend_from_slice(&kind.to_le_bytes());
     record.extend_from_slice(&0u32.to_le_bytes());
     record.extend_from_slice(&data_end.to_le_bytes());
     record.extend_from_slice(&(footer.len() as u64).to_le_bytes());
+    record.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+    record.extend_from_slice(name_bytes);
     record.extend_from_slice(footer);
     let crc = compute_crc(&record);
     record.extend_from_slice(&crc.to_le_bytes());
@@ -190,13 +251,19 @@ pub fn compact_sidecar_footer_if_needed(
         Err(err) => return Err(TaibaiError::Io(err)),
     }
 
-    let mut record = Vec::with_capacity(V2_RECORD_HEADER_SIZE + footer.len() + RECORD_CRC_SIZE);
+    let name = segment_name(segment_path);
+    let name_bytes = name.as_bytes();
+    let mut record = Vec::with_capacity(
+        V3_RECORD_HEADER_SIZE + name_bytes.len() + footer.len() + RECORD_CRC_SIZE,
+    );
     record.extend_from_slice(&SIDECAR_MAGIC.to_le_bytes());
-    record.extend_from_slice(&SIDECAR_VERSION_JOURNAL.to_le_bytes());
+    record.extend_from_slice(&SIDECAR_VERSION_NAMED_JOURNAL.to_le_bytes());
     record.extend_from_slice(&RECORD_KIND_FULL_SNAPSHOT.to_le_bytes());
     record.extend_from_slice(&0u32.to_le_bytes());
     record.extend_from_slice(&data_end.to_le_bytes());
     record.extend_from_slice(&(footer.len() as u64).to_le_bytes());
+    record.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+    record.extend_from_slice(name_bytes);
     record.extend_from_slice(footer);
     let crc = compute_crc(&record);
     record.extend_from_slice(&crc.to_le_bytes());
@@ -217,9 +284,10 @@ pub fn compact_sidecar_footer_if_needed(
 
 pub fn remove_sidecar_meta(segment_path: &Path) -> Result<()> {
     let meta_path = sidecar_meta_path(segment_path);
-    remove_file_if_exists(&meta_path)?;
     let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
-    if legacy_meta_path != meta_path {
+    if legacy_meta_path == meta_path {
+        remove_file_if_exists(&meta_path)?;
+    } else {
         remove_file_if_exists(&legacy_meta_path)?;
     }
     Ok(())
@@ -255,12 +323,13 @@ fn valid_record_count(path: &Path) -> Result<usize> {
         let Some(header) = record_header(&buf, offset, version) else {
             break;
         };
-        let record_end = offset + header.header_len + header.footer_len + RECORD_CRC_SIZE;
+        let record_end =
+            offset + header.header_len + header.name_len + header.footer_len + RECORD_CRC_SIZE;
         if record_end > buf.len() {
             break;
         }
 
-        let footer_end = offset + header.header_len + header.footer_len;
+        let footer_end = offset + header.header_len + header.name_len + header.footer_len;
         let stored_crc = u32::from_le_bytes(buf[footer_end..record_end].try_into().unwrap());
         if stored_crc != compute_crc(&buf[offset..footer_end]) {
             break;
@@ -327,11 +396,19 @@ fn compute_crc(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+fn segment_name(segment_path: &Path) -> String {
+    segment_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 struct RecordHeader {
     kind: u32,
     data_end: u64,
     footer_len: usize,
     header_len: usize,
+    name_len: usize,
 }
 
 fn record_header(buf: &[u8], offset: usize, version: u32) -> Option<RecordHeader> {
@@ -346,6 +423,7 @@ fn record_header(buf: &[u8], offset: usize, version: u32) -> Option<RecordHeader
                 data_end: u64::from_le_bytes(header[8..16].try_into().ok()?),
                 footer_len: u64::from_le_bytes(header[16..24].try_into().ok()?) as usize,
                 header_len: V1_RECORD_HEADER_SIZE,
+                name_len: 0,
             })
         }
         SIDECAR_VERSION_JOURNAL => {
@@ -358,6 +436,20 @@ fn record_header(buf: &[u8], offset: usize, version: u32) -> Option<RecordHeader
                 data_end: u64::from_le_bytes(header[16..24].try_into().ok()?),
                 footer_len: u64::from_le_bytes(header[24..32].try_into().ok()?) as usize,
                 header_len: V2_RECORD_HEADER_SIZE,
+                name_len: 0,
+            })
+        }
+        SIDECAR_VERSION_NAMED_JOURNAL => {
+            if offset + V3_RECORD_HEADER_SIZE > buf.len() {
+                return None;
+            }
+            let header = &buf[offset..offset + V3_RECORD_HEADER_SIZE];
+            Some(RecordHeader {
+                kind: u32::from_le_bytes(header[8..12].try_into().ok()?),
+                data_end: u64::from_le_bytes(header[16..24].try_into().ok()?),
+                footer_len: u64::from_le_bytes(header[24..32].try_into().ok()?) as usize,
+                name_len: u32::from_le_bytes(header[32..36].try_into().ok()?) as usize,
+                header_len: V3_RECORD_HEADER_SIZE,
             })
         }
         _ => None,

@@ -17,4 +17,4 @@ pub mod query;
 pub mod scan;
 pub mod wal_helper;
 
-pub use engine::{Engine, ExecResult};
+pub use engine::{AutoCompactConfig, Engine, ExecResult};

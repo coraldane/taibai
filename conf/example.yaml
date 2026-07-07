@@ -14,6 +14,11 @@ storage:
   flush_threshold_rows: 65536
   min_segment_seal_size_mb: 500  # Minimum segment size in MB before sealing
   max_segment_size_mb: 2048  # Target maximum segment size in MB before rotating
+  delete_cleanup_enabled: true  # Enable async cleanup for DELETE bitmaps without resorting
+  delete_cleanup_min_deleted_ratio: 0.30  # Cleanup segment groups when deleted rows reach 30%
+  delete_cleanup_min_deleted_rows: 8192  # Minimum deleted rows before cleanup
+  delete_bitmap_cleanup_interval_secs: 60  # Background cleanup interval; overrides delete_cleanup_interval_ms when set
+  delete_cleanup_max_segments_per_run: 8  # Limit cleanup work per round
 
 # Buffer settings
 buffer:

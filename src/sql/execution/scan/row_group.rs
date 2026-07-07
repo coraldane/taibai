@@ -1,6 +1,6 @@
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ZoneMap};
-use crate::storage::segment::SegmentReader;
+use crate::storage::segment::{RowGroupMeta, SegmentReader};
 use crate::types::scalar::ScalarValue;
 
 use super::spec::InPredicate;
@@ -26,6 +26,88 @@ pub fn prune_row_groups(
         let rg_zone_maps = reader.zone_maps(rg_idx);
         let rg_bloom_filters = reader.bloom_filters(rg_idx);
         let rg_value_sets = reader.value_sets(rg_idx);
+
+        if !predicate.matches_row_group(rg_zone_maps) {
+            continue;
+        }
+
+        let mut set_pass = true;
+        for (col_idx, val) in set_eq_checks {
+            if let Some(Some(values)) = rg_value_sets.get(*col_idx) {
+                if !values.contains(val) {
+                    set_pass = false;
+                    break;
+                }
+            }
+        }
+        if !set_pass {
+            continue;
+        }
+
+        for pred in set_in_checks {
+            if let Some(Some(values)) = rg_value_sets.get(pred.column_index) {
+                if !pred.values.iter().any(|value| values.contains(value)) {
+                    set_pass = false;
+                    break;
+                }
+            }
+        }
+        if !set_pass {
+            continue;
+        }
+
+        let mut bloom_pass = true;
+        for (col_idx, val) in eq_checks {
+            if let Some(bf) = rg_bloom_filters.get(*col_idx).and_then(|b| b.as_ref()) {
+                if !bf.might_contain(val) {
+                    bloom_pass = false;
+                    break;
+                }
+            }
+            if let Some(zm) = rg_zone_maps.get(*col_idx) {
+                if !zm.contains(val) {
+                    bloom_pass = false;
+                    break;
+                }
+            }
+        }
+        if !bloom_pass {
+            continue;
+        }
+
+        let mut in_pass = true;
+        for pred in in_checks {
+            if !check_in_predicate_row_group(pred, rg_zone_maps, rg_bloom_filters) {
+                in_pass = false;
+                break;
+            }
+        }
+        if !in_pass {
+            continue;
+        }
+
+        candidates.push(rg_idx);
+    }
+
+    RowGroupPruneResult {
+        candidate_indices: candidates,
+    }
+}
+
+pub fn prune_row_group_meta(
+    row_groups: &[RowGroupMeta],
+    predicate: &RowGroupPredicate,
+    eq_checks: &[(usize, ScalarValue)],
+    in_checks: &[&InPredicate],
+    set_eq_checks: &[(usize, ScalarValue)],
+    set_in_checks: &[&InPredicate],
+) -> RowGroupPruneResult {
+    let mut candidates = Vec::new();
+
+    for (rg_idx, rg) in row_groups.iter().enumerate() {
+        let rg_zone_maps = &rg.zone_maps;
+        let rg_bloom_filters = &rg.bloom_filters;
+        let rg_value_sets = &rg.value_sets;
 
         if !predicate.matches_row_group(rg_zone_maps) {
             continue;

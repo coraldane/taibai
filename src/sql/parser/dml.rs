@@ -6,7 +6,19 @@ use crate::sql::parser::parser::Parser;
 
 impl Parser {
     pub fn parse_insert(&mut self) -> Result<Statement> {
-        self.expect(&Token::Insert)?;
+        self.parse_insert_like(false)
+    }
+
+    pub fn parse_replace(&mut self) -> Result<Statement> {
+        self.parse_insert_like(true)
+    }
+
+    fn parse_insert_like(&mut self, replace: bool) -> Result<Statement> {
+        if replace {
+            self.expect(&Token::Replace)?;
+        } else {
+            self.expect(&Token::Insert)?;
+        }
         self.expect(&Token::Into)?;
         let table = self.parse_object_name()?;
 
@@ -49,11 +61,19 @@ impl Parser {
             }
         }
 
-        Ok(Statement::Insert {
-            table,
-            columns,
-            values: all_values,
-        })
+        if replace {
+            Ok(Statement::Replace {
+                table,
+                columns,
+                values: all_values,
+            })
+        } else {
+            Ok(Statement::Insert {
+                table,
+                columns,
+                values: all_values,
+            })
+        }
     }
 
     pub fn parse_update(&mut self) -> Result<Statement> {

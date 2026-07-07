@@ -250,6 +250,9 @@ pub fn read_row_group_with_strategy(
     reader: &SegmentReader,
     rg_idx: usize,
 ) -> Result<RecordBatch> {
+    if reader_schema_differs(reader.schema(), table_schema) {
+        return read_plain_row_group(spec, &plan.projection_cols, table_schema, reader, rg_idx);
+    }
     match plan.strategy {
         RowGroupReadStrategy::ClusterKeyRangeRead => {
             let bounds = plan
@@ -330,68 +333,94 @@ pub fn read_projected_row_group(
     reader: &SegmentReader,
     rg_idx: usize,
 ) -> Result<RecordBatch> {
-    let segment_col_count = reader.schema().num_columns();
-
     if projection_cols.is_empty() {
+        if reader_schema_differs(reader.schema(), table_schema) {
+            let all_cols: Vec<usize> = (0..table_schema.num_columns()).collect();
+            return read_row_group_with_schema_mapping(&all_cols, table_schema, reader, rg_idx);
+        }
         return reader.read_row_group(rg_idx);
     }
 
-    let valid_projection: Vec<usize> = projection_cols
-        .iter()
-        .filter(|&&idx| idx < segment_col_count)
-        .copied()
-        .collect();
-
-    if valid_projection.len() == projection_cols.len() {
-        reader.read_row_group_with_projection(rg_idx, projection_cols)
-    } else {
-        read_row_group_with_missing_columns(
-            projection_cols,
-            &valid_projection,
-            table_schema,
-            reader,
-            rg_idx,
-        )
+    if !reader_schema_differs(reader.schema(), table_schema) {
+        return reader.read_row_group_with_projection(rg_idx, projection_cols);
     }
+
+    read_row_group_with_schema_mapping(projection_cols, table_schema, reader, rg_idx)
 }
 
-fn read_row_group_with_missing_columns(
+fn read_row_group_with_schema_mapping(
     projection_cols: &[usize],
-    valid_projection: &[usize],
     table_schema: &Schema,
     reader: &SegmentReader,
     rg_idx: usize,
 ) -> Result<RecordBatch> {
-    let partial_batch = if valid_projection.is_empty() {
+    let row_count = reader.row_group_rows(rg_idx) as usize;
+    let mut segment_projection = Vec::new();
+    let mut segment_positions = Vec::with_capacity(projection_cols.len());
+    for &table_col_idx in projection_cols {
+        let table_col = &table_schema.columns[table_col_idx];
+        let pos = reader.schema().index_of(&table_col.name);
+        if let Some(segment_col_idx) = pos {
+            segment_positions.push(Some(segment_projection.len()));
+            segment_projection.push(segment_col_idx);
+        } else {
+            segment_positions.push(None);
+        }
+    }
+
+    let segment_batch = if segment_projection.is_empty() {
         None
     } else {
-        Some(reader.read_row_group_with_projection(rg_idx, valid_projection)?)
+        Some(reader.read_row_group_with_projection(rg_idx, &segment_projection)?)
     };
-    let row_count = partial_batch
-        .as_ref()
-        .map(|batch| batch.num_rows())
-        .unwrap_or_else(|| reader.row_group_rows(rg_idx) as usize);
-    let segment_col_count = reader.schema().num_columns();
+
     let mut columns = Vec::with_capacity(projection_cols.len());
     let mut col_defs = Vec::with_capacity(projection_cols.len());
-    let mut valid_idx = 0usize;
-
-    for &col_idx in projection_cols {
-        let col_def = &table_schema.columns[col_idx];
-        if col_idx < segment_col_count {
-            columns.push(partial_batch.as_ref().unwrap().columns[valid_idx].clone());
-            valid_idx += 1;
+    for (out_idx, &table_col_idx) in projection_cols.iter().enumerate() {
+        let col_def = &table_schema.columns[table_col_idx];
+        if let Some(segment_pos) = segment_positions[out_idx] {
+            columns.push(segment_batch.as_ref().unwrap().columns[segment_pos].clone());
         } else {
-            let mut null_col = ColumnArray::empty(col_def.data_type);
-            for _ in 0..row_count {
-                null_col.push(&ScalarValue::null_for_type(col_def.data_type))?;
-            }
-            columns.push(null_col);
+            columns.push(default_column_for_missing_schema_col(col_def, row_count)?);
         }
         col_defs.push(col_def.clone());
     }
 
     RecordBatch::try_new(Schema::new(col_defs), columns)
+}
+
+fn reader_schema_differs(reader_schema: &Schema, table_schema: &Schema) -> bool {
+    if reader_schema.num_columns() != table_schema.num_columns() {
+        return true;
+    }
+    reader_schema
+        .columns
+        .iter()
+        .zip(table_schema.columns.iter())
+        .any(|(left, right)| {
+            !left.name.eq_ignore_ascii_case(&right.name)
+                || left.data_type != right.data_type
+                || left.scale != right.scale
+                || left.precision != right.precision
+        })
+}
+
+fn default_column_for_missing_schema_col(
+    col_def: &crate::types::batch::ColumnDef,
+    row_count: usize,
+) -> Result<ColumnArray> {
+    let value = match &col_def.default_value {
+        Some(crate::types::batch::ColumnDefaultValue::Literal(value)) => value.clone(),
+        Some(crate::types::batch::ColumnDefaultValue::CurrentTimestamp) => {
+            ScalarValue::Timestamp(Some(now_micros()))
+        }
+        None => ScalarValue::null_for_type(col_def.data_type),
+    };
+    let mut column = ColumnArray::empty(col_def.data_type);
+    for _ in 0..row_count {
+        column.push(&value)?;
+    }
+    Ok(column)
 }
 
 pub fn apply_ttl_filter_and_projection(

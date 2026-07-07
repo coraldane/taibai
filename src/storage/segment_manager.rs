@@ -19,7 +19,9 @@ use crate::storage::bulk_payload::{
 };
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
-use crate::storage::segment::meta::remove_sidecar_meta;
+use crate::storage::segment::meta::{
+    read_latest_segment_meta, remove_sidecar_meta, SegmentMetaSnapshot,
+};
 use crate::storage::segment::{
     encode_segment_header, store, SegmentReader, SegmentWriter, SEGMENT_HEADER_SIZE,
 };
@@ -287,6 +289,25 @@ impl SegmentManager {
             .collect())
     }
 
+    pub fn cleanup_fully_deleted_segments(
+        &self,
+        db: &str,
+        table: &str,
+        table_dir: &Path,
+    ) -> Result<u64> {
+        self.with_table_mutation_lock(db, table, || {
+            let mut removed = 0u64;
+            for path in self.discover_inactive_segments(db, table, table_dir)? {
+                let reader = self.open_reader_cached(&path)?;
+                if reader.row_count() > 0 && reader.deleted_row_count() >= reader.row_count() {
+                    self.remove_segment_file(&path)?;
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        })
+    }
+
     pub fn find_unsealed_segment(
         table_dir: &Path,
         min_seal_size: u64,
@@ -435,12 +456,40 @@ impl SegmentManager {
         path: &Path,
         col_idx: usize,
     ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        if let Some(meta) = self.segment_meta(path).ok().flatten() {
+            let zm = meta.segment_zone_maps.get(col_idx)?;
+            if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
+                return None;
+            }
+            return Some(zm.clone());
+        }
         let reader = self.open_reader_cached(path).ok()?;
         let zm = reader.segment_zone_maps().get(col_idx)?;
         if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
             return None;
         }
         Some(zm.clone())
+    }
+
+    pub fn segment_meta(&self, path: &Path) -> Result<Option<SegmentMetaSnapshot>> {
+        if self.is_mutable_segment_path(path) {
+            return Ok(None);
+        }
+        if let Some(meta) = read_latest_segment_meta(path)? {
+            return Ok(Some(meta));
+        }
+        match SegmentReader::open(path) {
+            Ok(reader) => Ok(Some(SegmentMetaSnapshot {
+                data_end: reader.data_end(),
+                schema: reader.schema().clone(),
+                row_count: reader.row_count(),
+                row_groups: reader.footer_row_groups_info(),
+                delete_bitmap: reader.delete_bitmap().to_vec(),
+                deleted_row_count: reader.deleted_row_count(),
+                segment_zone_maps: reader.segment_zone_maps().to_vec(),
+            })),
+            Err(_) => Ok(None),
+        }
     }
 
     pub fn remove_segment_file(&self, path: &Path) -> Result<()> {
@@ -1457,6 +1506,42 @@ impl SegmentManager {
         Ok(written)
     }
 
+    pub fn flush_table_active(&self, db: &str, table: &str) -> Result<u64> {
+        let table_dir = self.table_dir(db, table);
+
+        let key = table_key(db, table);
+        let mut total = 0u64;
+        let tables = self.tables.read().unwrap();
+        if let Some(state) = tables.get(&key) {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            let keys_to_seal: Vec<String> = active_guard
+                .iter()
+                .filter(|(_, seg)| {
+                    seg.total_rows > 0 && seg.current_size >= self.min_segment_seal_size()
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            for key in keys_to_seal {
+                if let Some(seg) = active_guard.get_mut(&key) {
+                    seg.seal(&|path| self.invalidate_reader(path))?;
+                    total += seg.total_rows;
+                }
+                active_guard.remove(&key);
+            }
+
+            for (_, seg) in active_guard.iter_mut() {
+                if seg.total_rows > 0 || seg.buffered_rows > 0 {
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                    seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                    total += seg.total_rows;
+                }
+            }
+        }
+        self.clear_wal(&table_dir)?;
+        Ok(total)
+    }
+
     pub fn flush_all_active(&self) -> Result<u64> {
         self.sync_all_wals();
 
@@ -1474,10 +1559,7 @@ impl SegmentManager {
 
             for key in keys_to_seal {
                 if let Some(seg) = active_guard.get_mut(&key) {
-                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
-                    seg.write_final_footer()?;
-                    remove_sidecar_meta(&seg.path)?;
-                    self.invalidate_reader(&seg.path);
+                    seg.seal(&|path| self.invalidate_reader(path))?;
                     tracing::info!(
                         path = %seg.path.display(),
                         size_mb = seg.current_size / (1024 * 1024),
@@ -1485,7 +1567,6 @@ impl SegmentManager {
                         partition_key = key,
                         "sealing segment on flush (meets minimum size threshold)"
                     );
-                    seg.finalize()?;
                     total += seg.total_rows;
                 }
                 active_guard.remove(&key);

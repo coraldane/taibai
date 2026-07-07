@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
+use crate::storage::index::index_manager::{UniqueIndexEntry, UniqueRowLocation};
 use crate::storage::index::sort_key::SortKeyInserter;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::array::ColumnArray;
@@ -17,6 +18,45 @@ lazy_static::lazy_static! {
     static ref PRIMARY_KEY_INSERT_LOCK: Mutex<()> = Mutex::new(());
 }
 
+pub fn exec_replace(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    columns: &[String],
+    values: &[Vec<Expr>],
+    timezone_offset_hours: i32,
+    txn_id: u64,
+    bulk_import_mode: bool,
+) -> Result<ExecResult> {
+    let _unique_guard = PRIMARY_KEY_INSERT_LOCK.lock().unwrap();
+    let where_clause = build_replace_conflict_filter(engine, db, table, columns, values)?;
+    let deleted = if where_clause.is_some() {
+        match super::dml_delete::exec_delete(engine, db, table, &where_clause)? {
+            ExecResult::Ok { rows_affected } => rows_affected,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let inserted = match exec_insert_inner(
+        engine,
+        db,
+        table,
+        columns,
+        values,
+        timezone_offset_hours,
+        txn_id,
+        bulk_import_mode,
+        false,
+    )? {
+        ExecResult::Ok { rows_affected } => rows_affected,
+        other => return Ok(other),
+    };
+    Ok(ExecResult::Ok {
+        rows_affected: deleted + inserted,
+    })
+}
+
 pub fn exec_insert(
     engine: &Engine,
     db: &str,
@@ -26,6 +66,30 @@ pub fn exec_insert(
     timezone_offset_hours: i32,
     txn_id: u64,
     bulk_import_mode: bool,
+) -> Result<ExecResult> {
+    exec_insert_inner(
+        engine,
+        db,
+        table,
+        columns,
+        values,
+        timezone_offset_hours,
+        txn_id,
+        bulk_import_mode,
+        true,
+    )
+}
+
+fn exec_insert_inner(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    columns: &[String],
+    values: &[Vec<Expr>],
+    timezone_offset_hours: i32,
+    txn_id: u64,
+    bulk_import_mode: bool,
+    lock_unique_constraints: bool,
 ) -> Result<ExecResult> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
@@ -159,11 +223,12 @@ pub fn exec_insert(
     let unique_constraints = unique_constraints(&table_meta, &schema)?;
     let has_unique_checks = !unique_constraints.is_empty();
     let primary_key_indices = primary_key_indices(&schema);
-    let _pk_guard = if primary_key_indices.is_empty() && !has_unique_checks {
-        None
-    } else {
-        Some(PRIMARY_KEY_INSERT_LOCK.lock().unwrap())
-    };
+    let _pk_guard =
+        if !lock_unique_constraints || (primary_key_indices.is_empty() && !has_unique_checks) {
+            None
+        } else {
+            Some(PRIMARY_KEY_INSERT_LOCK.lock().unwrap())
+        };
 
     validate_unique_constraints(engine, db, table, &batch, &schema, &unique_constraints)?;
 
@@ -194,6 +259,8 @@ pub fn exec_insert(
     )?;
 
     let auto_increment_touched = !auto_inc_cols.is_empty();
+    let unique_index_entries =
+        build_unique_index_entries_for_batch(&table_meta, &schema, &batch, &unique_constraints)?;
 
     if bulk_import_mode {
         engine.exec_bulk_insert_partitioned_with_wal_control(
@@ -206,6 +273,8 @@ pub fn exec_insert(
     } else {
         write_batch_by_partition(engine, db, table, &table_meta, batch, schema, txn_id)?;
     }
+
+    append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
 
     engine.record_inserted_rows(
         db,
@@ -221,6 +290,129 @@ pub fn exec_insert(
     Ok(ExecResult::Ok {
         rows_affected: row_count,
     })
+}
+
+fn build_unique_index_entries_for_batch(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+    batch: &RecordBatch,
+    constraints: &[(String, Vec<usize>)],
+) -> Result<Vec<(String, Vec<UniqueIndexEntry>)>> {
+    let mut result = Vec::new();
+    for (index_name, indices) in constraints {
+        let columns = table_meta
+            .unique_indexes
+            .iter()
+            .find(|index| index.name == *index_name)
+            .map(|index| index.columns.clone())
+            .unwrap_or_default();
+        let mut entries = Vec::new();
+        for row_idx in 0..batch.num_rows() {
+            let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
+                continue;
+            };
+            entries.push(UniqueIndexEntry {
+                key,
+                location: UniqueRowLocation {
+                    segment_path: String::new(),
+                    row_id: row_idx as u64,
+                },
+            });
+        }
+        if !columns.is_empty() && !entries.is_empty() {
+            result.push((index_name.clone(), entries));
+        }
+    }
+    Ok(result)
+}
+
+fn append_unique_index_entries_after_insert(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    entries_by_index: Vec<(String, Vec<UniqueIndexEntry>)>,
+) -> Result<()> {
+    for (index_name, entries) in entries_by_index {
+        let _ =
+            engine
+                .index_manager()
+                .append_unique_index_entries(db, table, &index_name, entries)?;
+    }
+    Ok(())
+}
+
+fn build_replace_conflict_filter(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    columns: &[String],
+    values: &[Vec<Expr>],
+) -> Result<Option<Expr>> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs
+        .get(db)
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+    let table_meta = catalog
+        .get_table(table)
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+        .clone();
+    drop(catalogs);
+
+    let schema = Schema::new(table_meta.columns.clone());
+    let insert_indices = resolve_insert_columns(&schema, columns, values)?;
+    let unique_constraints = unique_constraints(&table_meta, &schema)?;
+    let mut predicates = Vec::new();
+    for (_, index_indices) in unique_constraints {
+        let mut value_positions = Vec::with_capacity(index_indices.len());
+        let mut complete = true;
+        for index_col in &index_indices {
+            match insert_indices.iter().position(|col| col == index_col) {
+                Some(pos) => value_positions.push((*index_col, pos)),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
+        for row in values {
+            let mut row_predicate = None;
+            for (col_idx, value_pos) in &value_positions {
+                let Expr::Literal(value) = &row[*value_pos] else {
+                    row_predicate = None;
+                    break;
+                };
+                if value.is_null() {
+                    row_predicate = None;
+                    break;
+                }
+                let eq = Expr::BinaryOp {
+                    left: Box::new(Expr::Column(schema.columns[*col_idx].name.clone())),
+                    op: crate::sql::parser::ast::BinOp::Eq,
+                    right: Box::new(Expr::Literal(value.clone())),
+                };
+                row_predicate = Some(match row_predicate {
+                    Some(existing) => Expr::BinaryOp {
+                        left: Box::new(existing),
+                        op: crate::sql::parser::ast::BinOp::And,
+                        right: Box::new(eq),
+                    },
+                    None => eq,
+                });
+            }
+            if let Some(predicate) = row_predicate {
+                predicates.push(predicate);
+            }
+        }
+    }
+
+    Ok(predicates.into_iter().reduce(|left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: crate::sql::parser::ast::BinOp::Or,
+        right: Box::new(right),
+    }))
 }
 
 fn write_batch_by_partition(
@@ -580,7 +772,96 @@ pub fn validate_unique_key_uniqueness(
             }
         }
     }
+    if new_batch.is_some() {
+        if let Some(data) = engine
+            .index_manager()
+            .load_unique_index_data(db, table, index_name)?
+        {
+            let index_columns = indices
+                .iter()
+                .map(|idx| schema.columns[*idx].name.clone())
+                .collect::<Vec<_>>();
+            if data.columns == index_columns {
+                for key in &keys {
+                    if engine
+                        .index_manager()
+                        .unique_key_exists(db, table, index_name, key)?
+                        .unwrap_or(false)
+                    {
+                        return Err(duplicate_unique_key_error(table, index_name, key));
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
     load_existing_unique_keys(engine, db, table, indices, index_name, &mut keys)
+}
+
+pub fn collect_unique_index_entries(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    indices: &[usize],
+    index_name: &str,
+) -> Result<Vec<UniqueIndexEntry>> {
+    let mut keys = HashSet::new();
+    let mut entries = Vec::new();
+    let table_dir = engine.data_dir().join(db).join(table);
+    if table_dir.exists() {
+        for seg_path in SegmentManager::discover_segments(&table_dir)? {
+            let reader = engine.segment_mgr().open_reader_cached(&seg_path)?;
+            for rg_idx in 0..reader.num_row_groups() {
+                let mut batch = reader.read_row_group_with_projection(rg_idx, indices)?;
+                let rg_start = reader.row_group_start_row(rg_idx);
+                if !reader.delete_bitmap().is_empty() {
+                    batch = crate::storage::segment::delete_bitmap::filter_batch(
+                        &batch,
+                        rg_start,
+                        reader.delete_bitmap(),
+                    )?;
+                }
+                let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
+                for row_idx in 0..batch.num_rows() {
+                    let Some(key) =
+                        unique_key_for_row(&batch, row_idx, &projected_indices, &batch.schema)
+                    else {
+                        continue;
+                    };
+                    if !keys.insert(key.clone()) {
+                        return Err(duplicate_unique_key_error(table, index_name, &key));
+                    }
+                    entries.push(UniqueIndexEntry {
+                        key,
+                        location: UniqueRowLocation {
+                            segment_path: seg_path.to_string_lossy().to_string(),
+                            row_id: rg_start + row_idx as u64,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    for memtable in engine.memtable_manager().get_by_table(db, table) {
+        if let Some(batch) = memtable.read() {
+            for row_idx in 0..batch.num_rows() {
+                let Some(key) = unique_key_for_row(&batch, row_idx, indices, &batch.schema) else {
+                    continue;
+                };
+                if !keys.insert(key.clone()) {
+                    return Err(duplicate_unique_key_error(table, index_name, &key));
+                }
+                entries.push(UniqueIndexEntry {
+                    key,
+                    location: UniqueRowLocation {
+                        segment_path: String::new(),
+                        row_id: row_idx as u64,
+                    },
+                });
+            }
+        }
+    }
+    Ok(entries)
 }
 
 fn load_existing_unique_keys(
@@ -596,7 +877,14 @@ fn load_existing_unique_keys(
         for seg_path in SegmentManager::discover_segments(&table_dir)? {
             let reader = engine.segment_mgr().open_reader_cached(&seg_path)?;
             for rg_idx in 0..reader.num_row_groups() {
-                let batch = reader.read_row_group_with_projection(rg_idx, indices)?;
+                let mut batch = reader.read_row_group_with_projection(rg_idx, indices)?;
+                if !reader.delete_bitmap().is_empty() {
+                    batch = crate::storage::segment::delete_bitmap::filter_batch(
+                        &batch,
+                        reader.row_group_start_row(rg_idx),
+                        reader.delete_bitmap(),
+                    )?;
+                }
                 check_existing_unique_batch(table, index_name, &batch, inserted_keys)?;
             }
         }

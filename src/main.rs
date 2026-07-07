@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use common::config::{RunMode, ServerConfig};
 use net::server::Server;
-use sql::execution::Engine;
+use sql::execution::{AutoCompactConfig, Engine};
 use storage::segment_manager::SegmentConfig;
 
 fn init_tracing(level: &str) {
@@ -113,10 +113,11 @@ where
         std::process::exit(1);
     }
 
-    let engine = match Engine::new_with_storage_config(
+    let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
         segment_config_from_server_config(&config),
+        auto_compact_config_from_server_config(&config),
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -149,6 +150,23 @@ fn segment_config_from_server_config(config: &ServerConfig) -> SegmentConfig {
         max_segment_size,
     }
 }
+fn auto_compact_config_from_server_config(config: &ServerConfig) -> AutoCompactConfig {
+    let interval = config
+        .storage
+        .delete_bitmap_cleanup_interval_secs
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| {
+            std::time::Duration::from_millis(config.storage.delete_cleanup_interval_ms.max(1))
+        });
+    AutoCompactConfig {
+        enabled: config.storage.delete_cleanup_enabled,
+        min_deleted_ratio: config.storage.delete_cleanup_min_deleted_ratio,
+        min_deleted_rows: config.storage.delete_cleanup_min_deleted_rows,
+        interval: interval.max(std::time::Duration::from_millis(1)),
+        max_tables_per_run: config.storage.delete_cleanup_max_segments_per_run.max(1),
+    }
+}
+
 async fn run_client(
     host: String,
     user: String,

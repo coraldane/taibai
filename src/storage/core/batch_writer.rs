@@ -167,14 +167,13 @@ impl BatchWriter {
 
     pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
         let committed_mts = self.memtable_mgr.commit_txn(txn_id);
-        let rows_flushed = committed_mts.len();
-        for mt in &committed_mts {
-            if mt.row_count() > 0 {
-                Self::flush_memtable(&self.segment_mgr, mt)?;
-            }
-        }
+        let rows_committed = committed_mts.iter().map(|mt| mt.row_count()).sum::<u64>();
         self.segment_mgr.commit_txn(txn_id)?;
-        tracing::debug!(txn_id, rows_flushed, "transaction committed and flushed");
+        tracing::debug!(
+            txn_id,
+            rows_committed,
+            "transaction committed to visible memtables"
+        );
         Ok(())
     }
 
@@ -249,14 +248,7 @@ impl BatchWriter {
                     }
                 }
                 Ok(WriteCommand::TxnCommit { txn_id }) => {
-                    let committed_mts = memtable_mgr.commit_txn(txn_id);
-                    for mt in committed_mts {
-                        if mt.row_count() > 0 {
-                            if let Err(e) = Self::flush_memtable(&segment_mgr, &mt) {
-                                tracing::warn!(error = %e, txn_id, "failed to flush memtable on commit");
-                            }
-                        }
-                    }
+                    memtable_mgr.commit_txn(txn_id);
                     if let Err(e) = segment_mgr.commit_txn(txn_id) {
                         tracing::warn!(error = %e, txn_id, "failed to commit transaction in storage");
                     }

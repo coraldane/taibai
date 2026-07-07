@@ -172,6 +172,15 @@ pub fn exec_update(
         return Ok(ExecResult::Ok { rows_affected: 0 });
     }
 
+    let unique_index_names = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    engine
+        .index_manager()
+        .remove_table_unique_index_snapshots(db, table, &unique_index_names);
+
     let mut catalogs = engine.catalogs().write().unwrap();
     if let Some(catalog) = catalogs.get_mut(db) {
         if let Some(_meta) = catalog.get_table_mut(table) {

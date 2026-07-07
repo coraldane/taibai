@@ -32,6 +32,30 @@ fn default_max_segment_size_mb() -> u32 {
     2048
 }
 
+fn default_delete_cleanup_enabled() -> bool {
+    true
+}
+
+fn default_delete_cleanup_min_deleted_ratio() -> f64 {
+    0.30
+}
+
+fn default_delete_cleanup_min_deleted_rows() -> u64 {
+    8192
+}
+
+fn default_delete_cleanup_interval_ms() -> u64 {
+    60_000
+}
+
+fn default_delete_bitmap_cleanup_interval_secs() -> Option<u64> {
+    None
+}
+
+fn default_delete_cleanup_max_segments_per_run() -> usize {
+    8
+}
+
 fn default_batch_size() -> usize {
     4096
 }
@@ -75,6 +99,18 @@ pub struct StorageSettings {
     pub min_segment_seal_size_mb: u32,
     #[serde(default = "default_max_segment_size_mb")]
     pub max_segment_size_mb: u32,
+    #[serde(default = "default_delete_cleanup_enabled")]
+    pub delete_cleanup_enabled: bool,
+    #[serde(default = "default_delete_cleanup_min_deleted_ratio")]
+    pub delete_cleanup_min_deleted_ratio: f64,
+    #[serde(default = "default_delete_cleanup_min_deleted_rows")]
+    pub delete_cleanup_min_deleted_rows: u64,
+    #[serde(default = "default_delete_cleanup_interval_ms")]
+    pub delete_cleanup_interval_ms: u64,
+    #[serde(default = "default_delete_bitmap_cleanup_interval_secs")]
+    pub delete_bitmap_cleanup_interval_secs: Option<u64>,
+    #[serde(default = "default_delete_cleanup_max_segments_per_run")]
+    pub delete_cleanup_max_segments_per_run: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +157,12 @@ impl Default for ServerConfig {
                 flush_threshold_rows: 65536,
                 min_segment_seal_size_mb: 500,
                 max_segment_size_mb: 2048,
+                delete_cleanup_enabled: default_delete_cleanup_enabled(),
+                delete_cleanup_min_deleted_ratio: default_delete_cleanup_min_deleted_ratio(),
+                delete_cleanup_min_deleted_rows: default_delete_cleanup_min_deleted_rows(),
+                delete_cleanup_interval_ms: default_delete_cleanup_interval_ms(),
+                delete_bitmap_cleanup_interval_secs: default_delete_bitmap_cleanup_interval_secs(),
+                delete_cleanup_max_segments_per_run: default_delete_cleanup_max_segments_per_run(),
             },
             buffer: BufferSettings { batch_size: 4096 },
             compression: CompressionSettings { enabled: true },

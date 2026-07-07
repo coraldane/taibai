@@ -152,6 +152,34 @@ impl ScanCursor {
 
     fn open_current_segment(&mut self) {
         let segment = &self.segments[self.segment_pos];
+        let meta_candidates = self
+            .runtime
+            .segment_mgr()
+            .segment_meta(segment)
+            .ok()
+            .flatten()
+            .map(|meta| {
+                let pred = self.spec.to_row_group_predicate();
+                if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
+                    return Vec::new();
+                }
+                super::row_group::prune_row_group_meta(
+                    &meta.row_groups,
+                    &pred,
+                    &super::row_group::build_bloom_check_list(&self.spec),
+                    &super::row_group::build_in_check_list(&self.spec),
+                    &super::row_group::build_set_check_list(&self.spec),
+                    &super::row_group::build_set_in_check_list(&self.spec),
+                )
+                .candidate_indices
+            });
+        if meta_candidates
+            .as_ref()
+            .is_some_and(|candidates| candidates.is_empty())
+        {
+            self.current_reader = None;
+            return;
+        }
         let reader = match self.runtime.segment_mgr().open_reader_cached(segment) {
             Ok(r) => r,
             Err(_) => {
@@ -159,9 +187,11 @@ impl ScanCursor {
                 return;
             }
         };
-        let candidates = strategy::prune_segment(&self.spec, &reader)
-            .map(|r: RowGroupPruneResult| r.candidate_indices)
-            .unwrap_or_default();
+        let candidates = meta_candidates.unwrap_or_else(|| {
+            strategy::prune_segment(&self.spec, &reader)
+                .map(|r: RowGroupPruneResult| r.candidate_indices)
+                .unwrap_or_default()
+        });
         self.current_candidates = candidates;
         self.candidate_pos = 0;
         self.current_reader = Some(reader);

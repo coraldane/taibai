@@ -31,6 +31,7 @@ pub struct ScanSpec {
     pub bloom_index_columns: Vec<usize>,
     pub minmax_index_columns: Vec<usize>,
     pub set_index_columns: Vec<usize>,
+    pub reader_txn_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +75,7 @@ impl ScanSpec {
             bloom_index_columns: Vec::new(),
             minmax_index_columns: Vec::new(),
             set_index_columns: Vec::new(),
+            reader_txn_id: 0,
         }
     }
 

@@ -113,6 +113,7 @@ impl MemTable {
     pub fn mark_committed(&self) {
         let mut guard = self.visibility.write().unwrap();
         *guard = TxnVisibility::Committed;
+        self.txn_id.store(0, Ordering::Release);
     }
 
     pub fn mark_aborted(&self) {

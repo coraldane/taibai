@@ -17,16 +17,36 @@ use super::scan::spec::compile_scan_spec;
 use super::scan::ScanExecutor;
 
 pub fn exec_select(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, None, None)
+    exec_select_with_txn(engine, db, stmt, 0)
 }
 
+pub fn exec_select_with_txn(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    reader_txn_id: u64,
+) -> Result<ExecResult> {
+    exec_select_inner(engine, db, stmt, None, None, reader_txn_id)
+}
+
+#[allow(dead_code)]
 pub fn exec_select_with_plan(
     engine: &Engine,
     db: &str,
     stmt: &Statement,
     cached_plan: LogicalPlan,
 ) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, None, Some(cached_plan))
+    exec_select_with_plan_and_txn(engine, db, stmt, cached_plan, 0)
+}
+
+pub fn exec_select_with_plan_and_txn(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    cached_plan: LogicalPlan,
+    reader_txn_id: u64,
+) -> Result<ExecResult> {
+    exec_select_inner(engine, db, stmt, None, Some(cached_plan), reader_txn_id)
 }
 
 pub fn exec_select_with_stats(
@@ -35,7 +55,7 @@ pub fn exec_select_with_stats(
     stmt: &Statement,
     stats: &mut HashMap<String, ScanStats>,
 ) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, Some(stats), None)
+    exec_select_inner(engine, db, stmt, Some(stats), None, 0)
 }
 
 fn exec_select_inner(
@@ -44,6 +64,7 @@ fn exec_select_inner(
     stmt: &Statement,
     stats: Option<&mut HashMap<String, ScanStats>>,
     cached_plan: Option<LogicalPlan>,
+    reader_txn_id: u64,
 ) -> Result<ExecResult> {
     let from = match stmt {
         Statement::Select { from, .. } => from,
@@ -56,7 +77,15 @@ fn exec_select_inner(
 
     match from {
         None => exec_literal_select(stmt),
-        Some(from_clause) => exec_table_select(engine, db, stmt, from_clause, stats, cached_plan),
+        Some(from_clause) => exec_table_select(
+            engine,
+            db,
+            stmt,
+            from_clause,
+            stats,
+            cached_plan,
+            reader_txn_id,
+        ),
     }
 }
 
@@ -101,6 +130,7 @@ fn exec_table_select(
     from_clause: &FromClause,
     stats: Option<&mut HashMap<String, ScanStats>>,
     cached_plan: Option<LogicalPlan>,
+    reader_txn_id: u64,
 ) -> Result<ExecResult> {
     let resolved_stmt;
     let (stmt, from_clause) = if cached_plan.is_none() {
@@ -157,7 +187,7 @@ fn exec_table_select(
 
     let is_count_star = detect_count_star(stmt, &table_names);
 
-    if stats.is_none() && !is_count_star && can_use_physical_pipeline(&plan) {
+    if reader_txn_id == 0 && stats.is_none() && !is_count_star && can_use_physical_pipeline(&plan) {
         let mut physical_ctx = PhysicalContext::new(
             engine,
             &table_refs,
@@ -185,6 +215,7 @@ fn exec_table_select(
         plan,
         is_count_star,
         stats,
+        reader_txn_id,
     )
 }
 
@@ -198,6 +229,7 @@ fn exec_table_select_materialized(
     plan: LogicalPlan,
     is_count_star: bool,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
+    reader_txn_id: u64,
 ) -> Result<ExecResult> {
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
@@ -209,6 +241,7 @@ fn exec_table_select_materialized(
 
         let mut spec = compile_scan_spec(&plan, table_name, &schema, &meta);
         spec.table_name = table_ref.table.clone();
+        spec.reader_txn_id = reader_txn_id;
 
         if is_count_star {
             spec.is_count_star = true;

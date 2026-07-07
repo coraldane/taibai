@@ -192,6 +192,32 @@ impl<'a> ScanExecutor<'a> {
             }
 
             for seg_path in &filtered_segments {
+                let meta = mgr.segment_meta(seg_path).ok().flatten();
+                let meta_candidate_indices = meta.as_ref().and_then(|meta| {
+                    let pred = self.spec.to_row_group_predicate();
+                    if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps)
+                    {
+                        return Some(Vec::new());
+                    }
+                    Some(
+                        super::row_group::prune_row_group_meta(
+                            &meta.row_groups,
+                            &pred,
+                            &super::row_group::build_bloom_check_list(self.spec),
+                            &super::row_group::build_in_check_list(self.spec),
+                            &super::row_group::build_set_check_list(self.spec),
+                            &super::row_group::build_set_in_check_list(self.spec),
+                        )
+                        .candidate_indices,
+                    )
+                });
+                if meta_candidate_indices
+                    .as_ref()
+                    .is_some_and(|candidates| candidates.is_empty())
+                {
+                    continue;
+                }
+
                 let reader = match mgr.open_reader_cached(seg_path) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -203,21 +229,27 @@ impl<'a> ScanExecutor<'a> {
                         .segments_opened += 1;
                 }
 
-                let Some(prune_result) = super::strategy::prune_segment(self.spec, &reader) else {
-                    continue;
+                let candidate_indices = if let Some(candidates) = meta_candidate_indices {
+                    candidates
+                } else {
+                    let Some(prune_result) = super::strategy::prune_segment(self.spec, &reader)
+                    else {
+                        continue;
+                    };
+                    prune_result.candidate_indices
                 };
 
                 if let Some(s) = self.stats.as_deref_mut() {
                     let stats_entry = s.entry(self.spec.table_name.clone()).or_default();
                     stats_entry.row_groups_total += reader.num_row_groups() as u64;
                     stats_entry.row_groups_pruned +=
-                        (reader.num_row_groups() - prune_result.candidate_indices.len()) as u64;
+                        (reader.num_row_groups() - candidate_indices.len()) as u64;
                     if scan_limit.is_none() {
-                        stats_entry.row_groups_read += prune_result.candidate_indices.len() as u64;
+                        stats_entry.row_groups_read += candidate_indices.len() as u64;
                     }
                 }
 
-                let mut candidate_indices = prune_result.candidate_indices;
+                let mut candidate_indices = candidate_indices;
                 if ordered_limit.is_some_and(|order| order.desc) {
                     candidate_indices.reverse();
                 }
