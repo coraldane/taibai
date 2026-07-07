@@ -531,6 +531,18 @@ pub fn exec_alter_table(
                     .with_primary_key(column.primary_key)
                     .with_default_value(default_value);
                 validate_column_constraints(std::slice::from_mut(&mut col_def))?;
+                if !col_def.nullable && col_def.default_value.is_none() {
+                    let existing_rows = catalog
+                        .get_table(name)
+                        .map(|meta| meta.row_count)
+                        .unwrap_or(0);
+                    if existing_rows > 0 {
+                        return Err(TaibaiError::Sql(format!(
+                            "cannot add NOT NULL column '{}' without default to non-empty table",
+                            col_def.name
+                        )));
+                    }
+                }
                 let added_auto_increment = col_def.auto_increment;
                 let added_column_name = col_def.name.clone();
                 catalog.add_column(name, col_def)?;
@@ -639,6 +651,28 @@ pub fn exec_alter_table(
                 }
             }
             AlterOperation::ModifyColumn { column } => {
+                let existing = catalog
+                    .get_table(name)
+                    .and_then(|meta| {
+                        meta.columns
+                            .iter()
+                            .find(|col| col.name.eq_ignore_ascii_case(&column.name))
+                    })
+                    .ok_or_else(|| {
+                        TaibaiError::Sql(format!(
+                            "column '{}' does not exist in table '{}'",
+                            column.name, name
+                        ))
+                    })?;
+                if existing.data_type != column.data_type
+                    || existing.scale != column.scale
+                    || existing.precision != column.precision
+                {
+                    return Err(TaibaiError::Sql(format!(
+                        "MODIFY COLUMN type changes require column rewrite and are not supported yet for '{}'",
+                        column.name
+                    )));
+                }
                 catalog.modify_column(
                     name,
                     &column.name,

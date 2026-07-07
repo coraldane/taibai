@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::common::error::Result;
 use crate::storage::core::memtable::{MemTableManager, MemTableState};
@@ -174,7 +174,11 @@ impl BatchWriter {
         log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
         let append_start = Instant::now();
         mt.append_owned(batch)?;
-        log_insert_profile("memtable_append", row_count as usize, append_start.elapsed());
+        log_insert_profile(
+            "memtable_append",
+            row_count as usize,
+            append_start.elapsed(),
+        );
 
         if txn_id == 0 && mt.row_count() >= self.config.max_rows_per_memtable {
             let _ = self.sender.try_send(WriteCommand::Flush {
@@ -330,7 +334,12 @@ impl BatchWriter {
             if partition_key.is_empty() {
                 segment_mgr.bulk_insert_batch_ref(&db, &table, &batch, true)?;
             } else {
-                segment_mgr.bulk_insert_batch_with_partition_ref(&db, &table, &partition_key, &batch)?;
+                segment_mgr.bulk_insert_batch_with_partition_ref(
+                    &db,
+                    &table,
+                    &partition_key,
+                    &batch,
+                )?;
             }
 
             if txn_id > 0 {

@@ -267,6 +267,11 @@ impl ActiveSegmentWriter {
         self.file.get_ref().sync_all()?;
 
         let footer = self.encode_footer()?;
+        self.file.write_all(&footer)?;
+        self.file.write_all(&self.data_end.to_le_bytes())?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+
         if self.sidecar_row_groups_flushed == 0
             || self.sidecar_row_groups_flushed > self.row_groups.len()
         {
@@ -299,7 +304,7 @@ impl ActiveSegmentWriter {
             );
         }
 
-        self.current_size = self.data_end;
+        self.current_size = self.data_end + footer.len() as u64 + 8;
         self.sidecar_row_groups_flushed = self.row_groups.len();
         self.dirty_meta = false;
         invalidate_reader(&self.path);
@@ -336,31 +341,21 @@ impl ActiveSegmentWriter {
             return Ok(());
         }
 
-        self.file.flush()?;
-        self.file.get_ref().set_len(self.data_end)?;
-        self.file.seek(SeekFrom::Start(self.data_end))?;
-
-        let footer = self.encode_footer()?;
-        self.file.write_all(&footer)?;
-        self.file.write_all(&self.data_end.to_le_bytes())?;
-        self.file.flush()?;
-        self.file.get_ref().sync_data()?;
-
-        self.current_size = self.data_end + footer.len() as u64 + 8;
-        invalidate_reader(&self.path);
-        Ok(())
+        self.flush_meta(invalidate_reader)
     }
 
     pub(super) fn write_final_footer(&mut self) -> Result<()> {
         self.file.flush()?;
         self.file.get_ref().set_len(self.data_end)?;
         self.file.seek(SeekFrom::Start(self.data_end))?;
+        self.file.get_ref().sync_all()?;
 
         let footer = self.encode_footer()?;
         self.file.write_all(&footer)?;
         self.file.write_all(&self.data_end.to_le_bytes())?;
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
+        append_sidecar_footer(&self.path, self.data_end, &footer)?;
 
         self.current_size = self.data_end + footer.len() as u64 + 8;
         self.sidecar_row_groups_flushed = self.row_groups.len();

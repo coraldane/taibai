@@ -153,7 +153,8 @@ fn try_exec_fast_insert_sql_inner(
     }
     let plan_key = sql[..pos].to_ascii_lowercase();
     let schema_signature = fast_insert_schema_signature(&schema);
-    let plan = match get_or_build_fast_insert_plan(&plan_key, &schema_signature, &schema, &columns) {
+    let plan = match get_or_build_fast_insert_plan(&plan_key, &schema_signature, &schema, &columns)
+    {
         Ok(plan) => plan,
         Err(e) => return FastInsertOutcome::Executed(Err(e)),
     };
@@ -193,7 +194,8 @@ fn try_exec_fast_insert_sql_inner(
                     None => return FastInsertOutcome::Unsupported,
                 };
                 let col_idx = col_indices[value_idx];
-                if let Err(e) = push_fast_insert_provided_value(&mut batch, &schema, col_idx, value) {
+                if let Err(e) = push_fast_insert_provided_value(&mut batch, &schema, col_idx, value)
+                {
                     return FastInsertOutcome::Executed(Err(e));
                 }
                 skip_spaces(bytes, &mut pos);
@@ -373,7 +375,12 @@ fn get_or_build_fast_insert_plan(
     schema: &Schema,
     columns: &[String],
 ) -> Result<Arc<FastInsertPlan>> {
-    if let Some(plan) = FAST_INSERT_PLAN_CACHE.lock().unwrap().get(plan_key).cloned() {
+    if let Some(plan) = FAST_INSERT_PLAN_CACHE
+        .lock()
+        .unwrap()
+        .get(plan_key)
+        .cloned()
+    {
         if plan.schema_signature == schema_signature {
             return Ok(plan);
         }
@@ -491,11 +498,7 @@ fn materialize_fast_insert_row(
                 }
                 batch.column_mut(col_idx).unwrap().push_null_value();
             } else {
-                push_fast_value_direct(
-                    batch.column_mut(col_idx).unwrap(),
-                    value,
-                    col.scale,
-                )?;
+                push_fast_value_direct(batch.column_mut(col_idx).unwrap(), value, col.scale)?;
             }
         } else {
             push_missing_insert_value(
@@ -739,12 +742,7 @@ fn parse_i64_bytes(text: &str, bytes: &[u8]) -> Result<i64> {
             .and_then(|v| v.checked_add((b - b'0') as i64))
         {
             Some(v) => v,
-            None => {
-                return Err(TaibaiError::Sql(format!(
-                    "value '{}' overflows",
-                    text
-                )))
-            }
+            None => return Err(TaibaiError::Sql(format!("value '{}' overflows", text))),
         };
         idx += 1;
     }
@@ -789,12 +787,7 @@ fn parse_u64_fast(value: FastValue<'_>) -> Result<u64> {
             .and_then(|v| v.checked_add((b - b'0') as u64))
         {
             Some(v) => v,
-            None => {
-                return Err(TaibaiError::Sql(format!(
-                    "value '{}' overflows",
-                    text
-                )))
-            }
+            None => return Err(TaibaiError::Sql(format!("value '{}' overflows", text))),
         };
         idx += 1;
     }
@@ -895,7 +888,8 @@ fn parse_decimal_bytes(text: &str, bytes: &[u8], scale: i32) -> Result<i64> {
         value = match value.checked_mul(10) {
             Some(v) => v,
             None => {
-                return Err(TaibaiError::Sql(format!(                    "decimal value '{}' overflows",
+                return Err(TaibaiError::Sql(format!(
+                    "decimal value '{}' overflows",
                     text
                 )))
             }
@@ -946,7 +940,6 @@ fn parse_decimal_bytes(text: &str, bytes: &[u8], scale: i32) -> Result<i64> {
         Ok(value)
     }
 }
-
 
 fn overflow_error(value: i64, ty: &str) -> TaibaiError {
     TaibaiError::Sql(format!("value '{}' overflows {}", value, ty))
@@ -1157,7 +1150,11 @@ fn exec_materialized_insert_batch(
 
     let total_start = Instant::now();
     let row_count = batch.num_rows() as u64;
-    log_insert_profile("cluster_sort", row_count as usize, std::time::Duration::ZERO);
+    log_insert_profile(
+        "cluster_sort",
+        row_count as usize,
+        std::time::Duration::ZERO,
+    );
 
     let constraint_start = Instant::now();
     let unique_constraints = unique_constraints(table_meta, &schema)?;
@@ -1201,7 +1198,11 @@ fn exec_materialized_insert_batch(
     let auto_increment_touched = !auto_inc_cols.is_empty();
     let unique_index_entries =
         build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?;
-    log_insert_profile("constraints", row_count as usize, constraint_start.elapsed());
+    log_insert_profile(
+        "constraints",
+        row_count as usize,
+        constraint_start.elapsed(),
+    );
 
     let write_start = Instant::now();
     if bulk_import_mode {
@@ -1374,7 +1375,11 @@ fn write_batch_by_partition(
 
     let partition_start = Instant::now();
     let single_partition = single_partition_key(table_meta, &batch);
-    log_insert_profile("partition_route", batch.num_rows(), partition_start.elapsed());
+    log_insert_profile(
+        "partition_route",
+        batch.num_rows(),
+        partition_start.elapsed(),
+    );
     if let Some(partition_key) = single_partition {
         engine.batch_writer().write_columns_with_txn(
             db,

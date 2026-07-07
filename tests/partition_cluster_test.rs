@@ -593,7 +593,6 @@ fn bulk_import_append_is_visible_to_count_before_flush() {
     engine.segment_mgr().shutdown();
 }
 
-
 #[test]
 fn deferred_direct_bulk_append_invalidates_cached_reader_for_count() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
@@ -651,7 +650,11 @@ fn deferred_direct_bulk_append_invalidates_cached_reader_for_count() {
                 DataType::Int32,
                 int32_col(&[20260629, 20260629, 20260629]),
             ),
-            ("security_id", DataType::VarChar, varchar_col(&["C", "D", "E"])),
+            (
+                "security_id",
+                DataType::VarChar,
+                varchar_col(&["C", "D", "E"]),
+            ),
             ("deal_time", DataType::Int32, int32_col(&[932, 933, 934])),
         ],
     );
@@ -676,7 +679,6 @@ fn deferred_direct_bulk_append_invalidates_cached_reader_for_count() {
     engine.segment_mgr().shutdown();
 }
 
-
 #[test]
 fn deferred_direct_bulk_first_value_partition_insert_is_countable_by_partition_column() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
@@ -699,7 +701,11 @@ fn deferred_direct_bulk_first_value_partition_insert_is_countable_by_partition_c
         "stock_pool",
         3,
         vec![
-            ("security_id", DataType::VarChar, varchar_col(&["A", "B", "C"])),
+            (
+                "security_id",
+                DataType::VarChar,
+                varchar_col(&["A", "B", "C"]),
+            ),
             (
                 "deal_date",
                 DataType::Int32,
@@ -728,7 +734,6 @@ fn deferred_direct_bulk_first_value_partition_insert_is_countable_by_partition_c
     engine.end_bulk_import();
     engine.segment_mgr().shutdown();
 }
-
 
 #[test]
 fn deferred_sql_bulk_insert_below_row_group_target_is_immediately_countable() {

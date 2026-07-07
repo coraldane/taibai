@@ -608,6 +608,8 @@ fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
             auto_increment: false,
             primary_key: false,
             default_value: None,
+            column_id: 0,
+            previous_names: Vec::new(),
         });
         offset += 4 + name.len() + 3;
     }
@@ -699,6 +701,8 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
             auto_increment: false,
             primary_key: false,
             default_value: None,
+            column_id: 0,
+            previous_names: Vec::new(),
         });
         offset += 4 + name.len() + 3;
     }

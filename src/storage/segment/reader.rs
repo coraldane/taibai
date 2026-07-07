@@ -54,7 +54,6 @@ pub struct SegmentReader {
 struct FooterSource {
     data_end: u64,
     footer: Vec<u8>,
-    is_sidecar: bool,
 }
 
 enum SegmentData {
@@ -239,27 +238,14 @@ impl SegmentReader {
             new_footer.extend_from_slice(delete_bitmap);
         }
 
-        if source.is_sidecar {
-            append_sidecar_footer(path, source.data_end, &new_footer)?;
-            return Ok(());
-        }
-
-        let mut file = fs::OpenOptions::new().write(true).read(true).open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut tail = [0u8; 8];
-        file.seek(SeekFrom::End(-8))?;
-        file.read_exact(&mut tail)?;
-        let footer_offset = u64::from_le_bytes(tail);
-
-        file.seek(SeekFrom::Start(footer_offset))?;
+        let mut file = fs::OpenOptions::new().write(true).open(path)?;
+        file.set_len(source.data_end)?;
+        file.seek(SeekFrom::Start(source.data_end))?;
         file.write_all(&new_footer)?;
-        file.write_all(&footer_offset.to_le_bytes())?;
-        let new_len = footer_offset + new_footer.len() as u64 + 8;
-        if new_len < file_len {
-            file.set_len(new_len)?;
-        }
+        file.write_all(&source.data_end.to_le_bytes())?;
+        file.flush()?;
         file.sync_all()?;
-        Ok(())
+        append_sidecar_footer(path, source.data_end, &new_footer)
     }
 
     fn read_footer_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -268,43 +254,56 @@ impl SegmentReader {
 
     fn read_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {
         if let Some(sidecar) = read_latest_sidecar_footer(path)? {
+            if let Some(file_len) = file_len_hint {
+                if sidecar.data_end > file_len {
+                    return Err(TaibaiError::Storage(format!(
+                        "invalid sidecar data_end {} (file size {}, file: {})",
+                        sidecar.data_end,
+                        file_len,
+                        path.display()
+                    )));
+                }
+            }
             return Ok(FooterSource {
                 data_end: sidecar.data_end,
                 footer: sidecar.footer,
-                is_sidecar: true,
             });
         }
 
+        Self::read_dat_footer_source(path, file_len_hint)
+    }
+
+    fn read_dat_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {
         let mut file = fs::File::open(path)?;
         let file_len = match file_len_hint {
             Some(len) => len,
             None => file.metadata()?.len(),
         };
-        if file_len < (SEGMENT_HEADER_SIZE as u64) + 8 {
+        if file_len < SEGMENT_HEADER_SIZE as u64 + 8 {
             return Err(TaibaiError::Storage(format!(
-                "segment file too small: {}",
-                file_len
+                "missing segment footer for {}",
+                path.display()
             )));
         }
-        let mut tail = [0u8; 8];
-        file.seek(SeekFrom::End(-8))?;
-        file.read_exact(&mut tail)?;
-        let footer_offset = u64::from_le_bytes(tail);
-        if footer_offset >= file_len - 8 {
+
+        file.seek(SeekFrom::Start(file_len - 8))?;
+        let mut offset_buf = [0u8; 8];
+        file.read_exact(&mut offset_buf)?;
+        let data_end = u64::from_le_bytes(offset_buf);
+        if data_end < SEGMENT_HEADER_SIZE as u64 || data_end > file_len - 8 {
             return Err(TaibaiError::Storage(format!(
-                "invalid footer offset {}",
-                footer_offset
+                "invalid segment footer offset {} (file size {}, file: {})",
+                data_end,
+                file_len,
+                path.display()
             )));
         }
-        let footer_len = (file_len - 8 - footer_offset) as usize;
-        let mut buf = vec![0u8; footer_len];
-        file.seek(SeekFrom::Start(footer_offset))?;
-        file.read_exact(&mut buf)?;
-        Ok(FooterSource {
-            data_end: footer_offset,
-            footer: buf,
-            is_sidecar: false,
-        })
+
+        let footer_len = (file_len - 8 - data_end) as usize;
+        let mut footer = vec![0u8; footer_len];
+        file.seek(SeekFrom::Start(data_end))?;
+        file.read_exact(&mut footer)?;
+        Ok(FooterSource { data_end, footer })
     }
 
     pub fn read_column(&self, row_group: usize, column_idx: usize) -> Result<ColumnArray> {
@@ -525,6 +524,8 @@ impl SegmentReader {
                     auto_increment: self.footer.schema.columns[idx].auto_increment,
                     primary_key: self.footer.schema.columns[idx].primary_key,
                     default_value: self.footer.schema.columns[idx].default_value.clone(),
+                    column_id: self.footer.schema.columns[idx].column_id,
+                    previous_names: self.footer.schema.columns[idx].previous_names.clone(),
                 })
                 .collect(),
         );

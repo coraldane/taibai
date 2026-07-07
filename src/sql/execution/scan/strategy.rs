@@ -359,7 +359,10 @@ fn read_row_group_with_schema_mapping(
     let mut segment_positions = Vec::with_capacity(projection_cols.len());
     for &table_col_idx in projection_cols {
         let table_col = &table_schema.columns[table_col_idx];
-        let pos = reader.schema().index_of(&table_col.name);
+        let pos = reader
+            .schema()
+            .index_of_column_id(table_col.column_id)
+            .or_else(|| reader.schema().index_of(&table_col.name));
         if let Some(segment_col_idx) = pos {
             segment_positions.push(Some(segment_projection.len()));
             segment_projection.push(segment_col_idx);

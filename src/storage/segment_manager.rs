@@ -20,7 +20,8 @@ use crate::storage::bulk_payload::{
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
 use crate::storage::segment::meta::{
-    read_latest_segment_meta, remove_sidecar_meta, SegmentMetaSnapshot,
+    append_sidecar_footer, read_latest_segment_meta, read_latest_sidecar_footer,
+    remove_sidecar_meta, sidecar_meta_path, SegmentMetaSnapshot,
 };
 use crate::storage::segment::{
     encode_segment_header, store, SegmentReader, SegmentWriter, SEGMENT_HEADER_SIZE,
@@ -39,8 +40,8 @@ use config::{
     FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
-    discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask, slice_batch_fast,
-    is_transient_footer_error,
+    discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
+    is_transient_footer_error, slice_batch_fast,
 };
 use reader_cache::ReaderCache;
 use state::TableSegmentState;
@@ -512,12 +513,39 @@ impl SegmentManager {
             )));
         }
 
+        let tmp_meta = sidecar_meta_path(tmp_path);
+        let final_meta = sidecar_meta_path(final_path);
+        let final_legacy_meta = final_path.with_extension("meta");
+        let shared_final_meta = final_meta != final_legacy_meta;
+        if final_meta.exists() && !shared_final_meta {
+            return Err(TaibaiError::Storage(format!(
+                "segment meta target already exists: {}",
+                final_meta.display()
+            )));
+        }
+        let replacement_meta = read_latest_sidecar_footer(tmp_path)?.ok_or_else(|| {
+            TaibaiError::Storage(format!(
+                "missing segment meta sidecar for replacement: {}",
+                tmp_meta.display()
+            ))
+        })?;
+
         std::fs::rename(tmp_path, final_path)?;
         for old_seg in old_segments {
             if old_seg != final_path {
                 self.remove_segment_file(old_seg)?;
             }
         }
+
+        if final_meta.exists() {
+            std::fs::remove_file(&final_meta)?;
+        }
+        append_sidecar_footer(
+            final_path,
+            replacement_meta.data_end,
+            &replacement_meta.footer,
+        )?;
+        remove_sidecar_meta(tmp_path)?;
         let _ = self.open_reader_cached(final_path);
         Ok(())
     }
@@ -817,6 +845,10 @@ impl SegmentManager {
             } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
                 seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            } else if !flush_immediately {
+                if seg.buffered_rows > 0 {
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                }
             } else if seg.buffered_rows > 0 {
                 seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                 seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
@@ -1224,8 +1256,6 @@ impl SegmentManager {
                 active_guard.remove(&group.partition_key);
             } else if flush_immediately {
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
-            } else {
-                seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
             }
             written += group.row_count as u64;
         }

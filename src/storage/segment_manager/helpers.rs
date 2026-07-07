@@ -274,7 +274,6 @@ pub(super) fn filter_batch_by_mask(
     RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
-
 pub(super) fn slice_batch_fast(
     batch: &RecordBatch,
     offset: usize,

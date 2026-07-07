@@ -334,6 +334,7 @@ impl Compactor {
         );
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
+            let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
             tracing::warn!(
                 db,
                 table,

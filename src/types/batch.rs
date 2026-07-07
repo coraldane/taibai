@@ -30,6 +30,10 @@ pub struct ColumnDef {
     pub primary_key: bool,
     #[serde(default)]
     pub default_value: Option<ColumnDefaultValue>,
+    #[serde(default)]
+    pub column_id: u32,
+    #[serde(default)]
+    pub previous_names: Vec<String>,
 }
 
 impl ColumnDef {
@@ -43,6 +47,8 @@ impl ColumnDef {
             auto_increment: false,
             primary_key: false,
             default_value: None,
+            column_id: 0,
+            previous_names: Vec::new(),
         }
     }
 
@@ -75,6 +81,19 @@ impl ColumnDef {
         self.default_value = default_value;
         self
     }
+
+    pub fn with_column_id(mut self, column_id: u32) -> Self {
+        self.column_id = column_id;
+        self
+    }
+}
+
+fn column_matches_name_or_alias(column: &ColumnDef, name: &str) -> bool {
+    column.name.eq_ignore_ascii_case(name)
+        || column
+            .previous_names
+            .iter()
+            .any(|previous| previous.eq_ignore_ascii_case(name))
 }
 
 /// Schema for a table: column names + types.
@@ -103,7 +122,14 @@ impl Schema {
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(name))
+            .position(|c| column_matches_name_or_alias(c, name))
+    }
+
+    pub fn index_of_column_id(&self, column_id: u32) -> Option<usize> {
+        if column_id == 0 {
+            return None;
+        }
+        self.columns.iter().position(|c| c.column_id == column_id)
     }
 
     /// Get a column definition by index.

@@ -34,12 +34,7 @@ pub struct MemTable {
 }
 
 impl MemTable {
-    pub fn new(
-        db: String,
-        table: String,
-        partition_key: String,
-        schema: Schema,
-        ) -> Self {
+    pub fn new(db: String, table: String, partition_key: String, schema: Schema) -> Self {
         Self {
             db,
             table,
@@ -59,7 +54,7 @@ impl MemTable {
         partition_key: String,
         schema: Schema,
         txn_id: u64,
-        ) -> Self {
+    ) -> Self {
         Self {
             db,
             table,
@@ -209,7 +204,6 @@ impl MemTable {
     }
 }
 
-
 pub struct MemTableManager {
     memtables: RwLock<Vec<Arc<MemTable>>>,
     max_rows_per_memtable: u64,
@@ -277,14 +271,14 @@ impl MemTableManager {
                 partition_key.to_string(),
                 schema.clone(),
                 txn_id,
-                ))
+            ))
         } else {
             Arc::new(MemTable::new(
                 db.to_string(),
                 table.to_string(),
                 partition_key.to_string(),
                 schema.clone(),
-                ))
+            ))
         };
         memtables.push(Arc::clone(&mt));
         mt

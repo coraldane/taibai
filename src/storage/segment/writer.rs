@@ -14,7 +14,7 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::constants::{FOOTER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
-use super::meta::remove_sidecar_meta;
+use super::meta::{append_sidecar_footer, remove_sidecar_meta};
 
 pub(crate) const VALUE_SET_EXTENSION_MAGIC: u32 = 0x5354_4958; // STIX
 pub(crate) const VALUE_SET_MAX_DISTINCT: usize = 1024;
@@ -188,14 +188,14 @@ impl SegmentWriter {
             self.flush_row_group()?;
         }
 
-        let footer_offset = self.file.metadata()?.len();
-
+        self.file.flush()?;
+        let data_end = self.file.metadata()?.len();
         let footer = self.encode_footer_with_deletes(delete_bitmap, deleted_row_count)?;
         self.file.write_all(&footer)?;
-
-        self.file.write_all(&footer_offset.to_le_bytes())?;
-
+        self.file.write_all(&data_end.to_le_bytes())?;
+        self.file.flush()?;
         self.file.sync_all()?;
+        append_sidecar_footer(&self.path, data_end, &footer)?;
 
         tracing::debug!(
             path = %self.path.display(),
@@ -337,6 +337,7 @@ pub fn encode_segment_footer(
         buf.push(if col.nullable { 1 } else { 0 });
         buf.push(col.scale as u8);
         buf.push(col.precision as u8);
+        buf.extend_from_slice(&col.column_id.to_le_bytes());
     }
 
     if !segment_zone_maps.is_empty() {
