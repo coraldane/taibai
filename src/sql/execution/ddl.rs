@@ -11,8 +11,8 @@ use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{
-    AlterOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef, PartitionStrategy,
-    Privilege, TtlDef, UniqueKeyDef,
+    AlterOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef,
+    PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
 };
 
 fn validate_hot_def(col_defs: &[ColumnDef], table: &str, hot_def: &HotDef) -> Result<()> {
@@ -37,7 +37,10 @@ fn validate_hot_def(col_defs: &[ColumnDef], table: &str, hot_def: &HotDef) -> Re
         ));
     }
     if let Some(idx_col) = &hot_def.index_column {
-        if !col_defs.iter().any(|c| c.name.eq_ignore_ascii_case(idx_col)) {
+        if !col_defs
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(idx_col))
+        {
             return Err(TaibaiError::Sql(format!(
                 "HOT INDEX column '{}' not found in table '{}'",
                 idx_col, table
@@ -519,6 +522,10 @@ pub fn exec_drop_table(
             let step_start = Instant::now();
             engine.segment_mgr().invalidate_readers_under(&table_dir);
             tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: invalidated readers");
+
+            let step_start = Instant::now();
+            engine.hot_store_manager().remove(db, name);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed resident hot store");
 
             let step_start = Instant::now();
             let cleared_rows = engine.batch_writer().clear_memtables(db, name);

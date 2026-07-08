@@ -1207,7 +1207,10 @@ fn exec_materialized_insert_batch(
     if txn_id == 0 {
         match engine.feed_hot_store(db, table, table_meta, &batch) {
             Ok(()) => {
-                if engine.hot_store_manager().soft_limit_exceeded_for(db, table) {
+                if engine
+                    .hot_store_manager()
+                    .soft_limit_exceeded_for(db, table)
+                {
                     let _ = engine.flush_table_buffers(db, table);
                 }
             }

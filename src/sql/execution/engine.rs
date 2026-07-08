@@ -959,9 +959,7 @@ impl Engine {
         self.batch_writer.memtable_manager()
     }
 
-    pub fn hot_store_manager(
-        &self,
-    ) -> &Arc<crate::storage::core::hot_store::HotStoreManager> {
+    pub fn hot_store_manager(&self) -> &Arc<crate::storage::core::hot_store::HotStoreManager> {
         &self.hot_store_mgr
     }
 
@@ -1143,7 +1141,11 @@ impl Engine {
     }
 
     pub fn close_of_day_flush_table(&self, db: &str, table: &str) -> Result<()> {
-        tracing::info!(db, table, "close-of-day: flushing table resident data to history");
+        tracing::info!(
+            db,
+            table,
+            "close-of-day: flushing table resident data to history"
+        );
         let table_meta = {
             let catalogs = self.catalogs.read().unwrap();
             let catalog = catalogs
@@ -1151,7 +1153,9 @@ impl Engine {
                 .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
             catalog
                 .get_table(table)
-                .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+                .ok_or_else(|| {
+                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table))
+                })?
                 .clone()
         };
         self.flush_table_buffers(db, table)?;
@@ -1159,7 +1163,9 @@ impl Engine {
         let stats = compactor.optimize_table(db, table, &table_meta)?;
         self.index_manager.mark_index_stale(db, table);
         self.hot_store_mgr.remove(db, table);
-        self.batch_writer.memtable_manager().remove_archived(db, table);
+        self.batch_writer
+            .memtable_manager()
+            .remove_archived(db, table);
         let today = chrono::Local::now().date_naive().to_string();
         {
             let mut catalogs = self.catalogs.write().unwrap();
@@ -1189,8 +1195,8 @@ impl Engine {
     /// Best-effort: unreadable segments are skipped.
     pub fn warmup_hot_stores(&self) {
         use crate::storage::core::hot_store::resolve_key_column;
-        use crate::storage::segment::reader::SegmentReader;
         use crate::storage::segment::delete_bitmap;
+        use crate::storage::segment::reader::SegmentReader;
 
         const WARMUP_ROW_BUDGET: u64 = 20_000_000;
 
@@ -1265,8 +1271,7 @@ impl Engine {
                             continue;
                         }
                         loaded_rows = loaded_rows.saturating_add(batch.num_rows() as u64);
-                        if let Err(e) =
-                            self.hot_store_mgr.try_append(db, table, table_meta, &batch)
+                        if let Err(e) = self.hot_store_mgr.try_append(db, table, table_meta, &batch)
                         {
                             tracing::warn!(db, table, error = %e, "warmup: feed hot store failed");
                         }

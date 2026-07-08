@@ -328,9 +328,7 @@ impl MemTableManager {
     pub fn remove_archived(&self, db: &str, table: &str) {
         let mut memtables = self.memtables.write().unwrap();
         memtables.retain(|mt| {
-            !(mt.db() == db
-                && mt.table() == table
-                && mt.state() == MemTableState::Archived)
+            !(mt.db() == db && mt.table() == table && mt.state() == MemTableState::Archived)
         });
     }
 

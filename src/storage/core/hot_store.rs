@@ -324,8 +324,7 @@ impl HotStore {
             }
         }
 
-        self.row_count
-            .store(base + added as u64, Ordering::Release);
+        self.row_count.store(base + added as u64, Ordering::Release);
 
         let used = self.estimated_memory_bytes();
         if used > self.memory_hard_limit {
@@ -387,8 +386,10 @@ impl HotStore {
         };
 
         if rows.is_empty() {
-            let col_defs: Vec<ColumnDef> =
-                proj.iter().map(|&i| self.schema.columns[i].clone()).collect();
+            let col_defs: Vec<ColumnDef> = proj
+                .iter()
+                .map(|&i| self.schema.columns[i].clone())
+                .collect();
             return Some(RecordBatch::new(Schema::new(col_defs)));
         }
 
@@ -407,14 +408,20 @@ impl HotStore {
     /// Count rows whose index-column value equals `key_value` without
     /// materialising the batch.
     pub fn count_by_key(&self, key_value: &ScalarValue) -> Option<u64> {
+        self.count_by_key_from(key_value, 0)
+    }
+
+    pub fn count_by_key_from(&self, key_value: &ScalarValue, min_offset: u64) -> Option<u64> {
         let pool = self.string_pool.read().unwrap();
         let key = scalar_to_key(key_value, &pool).ok()??;
         drop(pool);
-        self.value_index
-            .read()
-            .unwrap()
-            .get(&key)
-            .map(|v| v.len() as u64)
+        self.value_index.read().unwrap().get(&key).map(|v| {
+            if min_offset == 0 {
+                v.len() as u64
+            } else {
+                v.iter().filter(|&&o| (o as u64) >= min_offset).count() as u64
+            }
+        })
     }
 
     /// Rough resident-memory estimate in bytes.
@@ -540,9 +547,7 @@ impl HotStoreManager {
 
     pub fn get(&self, db: &str, table: &str) -> Option<Arc<HotStore>> {
         let stores = self.stores.read().unwrap();
-        stores
-            .get(&(db.to_string(), table.to_string()))
-            .cloned()
+        stores.get(&(db.to_string(), table.to_string())).cloned()
     }
 
     /// Return the hot store for a table, creating it lazily if the table is
@@ -726,12 +731,27 @@ mod tests {
         let schema = varchar_key_schema();
         let meta = varchar_key_meta(&schema);
         let mgr = HotStoreManager::new();
-        mgr.try_append("main", "events", &meta, &build_varchar_batch("A", &[1, 2], &[1.0, 2.0], &[1, 2]))
-            .unwrap();
-        mgr.try_append("main", "events", &meta, &build_varchar_batch("B", &[3], &[3.0], &[3]))
-            .unwrap();
-        mgr.try_append("main", "events", &meta, &build_varchar_batch("A", &[4], &[4.0], &[4]))
-            .unwrap();
+        mgr.try_append(
+            "main",
+            "events",
+            &meta,
+            &build_varchar_batch("A", &[1, 2], &[1.0, 2.0], &[1, 2]),
+        )
+        .unwrap();
+        mgr.try_append(
+            "main",
+            "events",
+            &meta,
+            &build_varchar_batch("B", &[3], &[3.0], &[3]),
+        )
+        .unwrap();
+        mgr.try_append(
+            "main",
+            "events",
+            &meta,
+            &build_varchar_batch("A", &[4], &[4.0], &[4]),
+        )
+        .unwrap();
 
         let store = mgr.get("main", "events").unwrap();
         assert_eq!(store.row_count(), 4);
@@ -771,11 +791,10 @@ mod tests {
         mgr.try_append("main", "kv", &meta, &batch).unwrap();
 
         let store = mgr.get("main", "kv").unwrap();
-        assert_eq!(
-            store.count_by_key(&ScalarValue::Int64(Some(10))),
-            Some(2)
-        );
-        let r = store.lookup(&ScalarValue::Int64(Some(10)), None, 0).unwrap();
+        assert_eq!(store.count_by_key(&ScalarValue::Int64(Some(10))), Some(2));
+        let r = store
+            .lookup(&ScalarValue::Int64(Some(10)), None, 0)
+            .unwrap();
         assert_eq!(r.num_rows(), 2);
         match r.column(0).unwrap() {
             ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![10, 10]),
@@ -796,10 +815,20 @@ mod tests {
             &build_varchar_batch("A", &[1, 2], &[1.0, 2.0], &[1, 2]),
         )
         .unwrap();
-        mgr.try_append("main", "events", &meta, &build_varchar_batch("B", &[3], &[3.0], &[3]))
-            .unwrap();
-        mgr.try_append("main", "events", &meta, &build_varchar_batch("A", &[4], &[4.0], &[4]))
-            .unwrap();
+        mgr.try_append(
+            "main",
+            "events",
+            &meta,
+            &build_varchar_batch("B", &[3], &[3.0], &[3]),
+        )
+        .unwrap();
+        mgr.try_append(
+            "main",
+            "events",
+            &meta,
+            &build_varchar_batch("A", &[4], &[4.0], &[4]),
+        )
+        .unwrap();
 
         let store = mgr.get("main", "events").unwrap();
         assert_eq!(store.row_count(), 4);

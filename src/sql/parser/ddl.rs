@@ -3,8 +3,8 @@ use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{
-    AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef,
-    PartitionStrategy, Privilege, Statement, TtlDef, UniqueKeyDef,
+    AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef,
+    PartitionDef, PartitionStrategy, Privilege, Statement, TtlDef, UniqueKeyDef,
 };
 use crate::sql::parser::lexer::Token;
 use crate::sql::parser::parser::{parse_data_type, Parser};

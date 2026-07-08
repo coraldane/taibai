@@ -4,6 +4,22 @@ use crate::types::batch::RecordBatch;
 
 use super::spec::ScanSpec;
 
+fn live_memtables_and_watermark(
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_name: &str,
+    reader_txn_id: u64,
+    store: &HotStore,
+) -> (bool, u64) {
+    let memtables = memtable_mgr
+        .get_readable_by_table(db, table_name)
+        .into_iter()
+        .filter(|mt| mt.is_visible_to(reader_txn_id))
+        .collect::<Vec<_>>();
+    let live_rows = memtables.iter().map(|mt| mt.row_count()).sum::<u64>();
+    (live_rows > 0, store.row_count().saturating_sub(live_rows))
+}
+
 pub fn scan_memtables(
     memtable_mgr: &MemTableManager,
     hot_mgr: &HotStoreManager,
@@ -84,7 +100,19 @@ fn try_hot_fast_path(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Optio
         .find(|(idx, _)| *idx == key_idx)
         .map(|(_, v)| v)?;
 
-    let batch = match store.lookup(key_value, None, watermark) {
+    let pure_key_lookup = spec.eq_predicates.len() == 1
+        && spec.eq_predicates[0].0 == key_idx
+        && spec.range_predicates.is_empty()
+        && spec.in_predicates.is_empty()
+        && spec.remaining_predicate.is_none();
+
+    let lookup_projection = if pure_key_lookup {
+        spec.projection.as_deref()
+    } else {
+        None
+    };
+
+    let batch = match store.lookup(key_value, lookup_projection, watermark) {
         Some(b) => b,
         None => {
             // Value never seen -> empty result, respecting the projection.
@@ -97,7 +125,7 @@ fn try_hot_fast_path(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Optio
         }
     };
 
-    let filtered = if spec.has_predicates() {
+    let filtered = if !pure_key_lookup && spec.has_predicates() {
         super::row_filter::apply_predicates(
             &batch,
             &spec.eq_predicates,
@@ -109,11 +137,44 @@ fn try_hot_fast_path(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Optio
         batch
     };
 
+    if pure_key_lookup {
+        return Some(filtered);
+    }
+
     let projected = match &spec.projection {
         Some(proj) => apply_projection(&filtered, proj),
         None => filtered,
     };
     Some(projected)
+}
+
+pub fn count_hot_memtable_rows(
+    memtable_mgr: &MemTableManager,
+    hot_mgr: &HotStoreManager,
+    db: &str,
+    table_name: &str,
+    spec: &ScanSpec,
+) -> Option<u64> {
+    if spec.reader_txn_id != 0
+        || spec.eq_predicates.len() != 1
+        || !spec.range_predicates.is_empty()
+        || !spec.in_predicates.is_empty()
+        || spec.remaining_predicate.is_some()
+    {
+        return None;
+    }
+    let store = hot_mgr.get(db, table_name)?;
+    let key_idx = store.key_column_index();
+    let (col_idx, key_value) = &spec.eq_predicates[0];
+    if *col_idx != key_idx {
+        return None;
+    }
+    let (has_live_memtable_data, watermark) =
+        live_memtables_and_watermark(memtable_mgr, db, table_name, spec.reader_txn_id, &store);
+    if !has_live_memtable_data {
+        return None;
+    }
+    store.count_by_key_from(key_value, watermark)
 }
 
 pub fn count_memtable_rows(

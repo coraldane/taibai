@@ -155,10 +155,59 @@ fn hot_clause_indexes_named_column_and_echoes() {
 
     let rows = collect_ts_values(
         engine
-            .execute(&mut session, "SELECT price FROM tick_hot WHERE security_id = 'A'")
+            .execute(
+                &mut session,
+                "SELECT price FROM tick_hot WHERE security_id = 'A'",
+            )
             .expect("select by hot index column"),
     );
     assert_eq!(rows, vec![10, 30]);
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn hot_count_by_index_column_uses_resident_index() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE tick_hot_count (
+                security_id VARCHAR NOT NULL,
+                trade_time TIMESTAMP,
+                price INT32
+            ) CLUSTER BY (trade_time) HOT BY (trade_time) INDEX (security_id)",
+        )
+        .expect("create hot count table");
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO tick_hot_count (security_id, trade_time, price) VALUES \
+             ('A', 1782718238000000, 10), \
+             ('B', 1782718238000001, 20), \
+             ('A', 1782718238000002, 30)",
+        )
+        .expect("insert rows");
+
+    let result = engine
+        .execute(
+            &mut session,
+            "SELECT COUNT(*) FROM tick_hot_count WHERE security_id = 'A'",
+        )
+        .expect("count by hot index column");
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    match batches[0].scalar(0, 0) {
+        Some(ScalarValue::Int64(Some(v))) => assert_eq!(v, 2),
+        other => panic!("expected count int64, got {:?}", other),
+    }
 
     engine.segment_mgr().shutdown();
 }
@@ -203,6 +252,54 @@ fn hot_clause_requires_timestamp_time_column() {
         msg.contains("must be TIMESTAMP"),
         "expected timestamp validation error, got: {msg}"
     );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn drop_table_removes_resident_hot_store_before_same_name_recreate() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ticks (
+                security_id VARCHAR NOT NULL,
+                trade_time TIMESTAMP NOT NULL,
+                local_time VARCHAR
+            ) CLUSTER BY (security_id) HOT BY (trade_time) INDEX (security_id)",
+        )
+        .expect("create old ticks");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO ticks VALUES ('A', 1783492992000000, '2026-07-08 14:43:12.139')",
+        )
+        .expect("insert old schema row");
+
+    engine
+        .execute(&mut session, "DROP TABLE ticks")
+        .expect("drop old ticks");
+    assert!(engine.hot_store_manager().get("main", "ticks").is_none());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ticks (
+                security_id VARCHAR NOT NULL,
+                trade_time TIMESTAMP NOT NULL,
+                local_time TIMESTAMP
+            ) CLUSTER BY (security_id) HOT BY (trade_time) INDEX (security_id)",
+        )
+        .expect("create new ticks");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO ticks VALUES ('A', 1783492992000000, 1783492992139000)",
+        )
+        .expect("insert new schema row");
 
     engine.segment_mgr().shutdown();
 }
