@@ -122,3 +122,97 @@ fn topn_limit_offset_applies_offset_after_sorting_join_results() {
         ]
     );
 }
+
+#[test]
+fn topn_pushdown_keeps_offset_semantics_when_left_join_multiplies_rows() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE fact_rows (
+                id VARCHAR,
+                bucket_id INT64,
+                score DOUBLE
+            )",
+        )
+        .expect("create fact");
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE dim_rows (
+                id VARCHAR,
+                label VARCHAR
+            )",
+        )
+        .expect("create dim");
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE dim_more (
+                id VARCHAR,
+                extra VARCHAR
+            )",
+        )
+        .expect("create dim_more");
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO fact_rows VALUES
+                ('A', 1, 5.0),
+                ('B', 1, 4.0),
+                ('C', 1, 3.0),
+                ('D', 1, 2.0),
+                ('E', 1, 1.0)",
+        )
+        .expect("insert fact");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO dim_rows VALUES
+                ('A', 'a1'),
+                ('A', 'a2'),
+                ('B', 'b1'),
+                ('C', 'c1'),
+                ('D', 'd1'),
+                ('E', 'e1')",
+        )
+        .expect("insert dim");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO dim_more VALUES
+                ('A', 'ma'),
+                ('B', 'mb'),
+                ('C', 'mc'),
+                ('D', 'md'),
+                ('E', 'me')",
+        )
+        .expect("insert dim_more");
+
+    let rows = collect_first_column(
+        engine
+            .execute(
+                &mut session,
+                "SELECT f.id, d.label, m.extra
+                 FROM fact_rows f
+                 LEFT JOIN dim_rows d ON f.id = d.id
+                 LEFT JOIN dim_more m ON f.id = m.id
+                 WHERE f.bucket_id = 1
+                 ORDER BY f.score DESC
+                 LIMIT 2 OFFSET 2",
+            )
+            .expect("select second page"),
+    );
+
+    assert_eq!(
+        rows,
+        vec![
+            ScalarValue::VarChar(Some("B".to_string())),
+            ScalarValue::VarChar(Some("C".to_string())),
+        ]
+    );
+}

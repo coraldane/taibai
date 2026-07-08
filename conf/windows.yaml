@@ -9,8 +9,8 @@ server:
 
 # Storage settings
 storage:
-  data_dir: "E:/data/taibai_data/"
-  # data_dir: "D:/Program Files/Taibai/data/"
+  # data_dir: "E:/data/taibai_data/"
+  data_dir: "D:/Program Files/Taibai/data/"
   default_database: "main"
   flush_threshold_rows: 65536
   min_segment_seal_size_mb: 500  # Minimum segment size in MB before sealing
