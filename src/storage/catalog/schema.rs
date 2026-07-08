@@ -94,6 +94,14 @@ pub struct TableMeta {
     pub created_at: i64,
     #[serde(default)]
     pub cluster_key: Vec<String>,
+    #[serde(default)]
+    pub hot_time_column: Option<String>,
+    #[serde(default)]
+    pub hot_close_time: Option<String>,
+    #[serde(default)]
+    pub hot_last_close_date: Option<String>,
+    #[serde(default)]
+    pub hot_index_column: Option<String>,
     #[serde(default = "default_row_group_size")]
     pub row_group_size: i32,
     #[serde(default)]
@@ -136,6 +144,10 @@ impl TableMeta {
             segment_count: 0,
             created_at: now,
             cluster_key: Vec::new(),
+            hot_time_column: None,
+            hot_close_time: None,
+            hot_last_close_date: None,
+            hot_index_column: None,
             row_group_size: 8192,
             partition_key: String::new(),
             partition_type: PartitionType::None,

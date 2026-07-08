@@ -11,9 +11,49 @@ use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{
-    AlterOperation, ColumnDefAst, DefaultValue, GrantObject, PartitionDef, PartitionStrategy,
+    AlterOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef, PartitionStrategy,
     Privilege, TtlDef, UniqueKeyDef,
 };
+
+fn validate_hot_def(col_defs: &[ColumnDef], table: &str, hot_def: &HotDef) -> Result<()> {
+    let time_col = col_defs
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&hot_def.time_column))
+        .ok_or_else(|| {
+            TaibaiError::Sql(format!(
+                "HOT BY column '{}' not found in table '{}'",
+                hot_def.time_column, table
+            ))
+        })?;
+    if !matches!(time_col.data_type, DataType::Timestamp) {
+        return Err(TaibaiError::Sql(format!(
+            "HOT BY column '{}' must be TIMESTAMP, got {:?}",
+            hot_def.time_column, time_col.data_type
+        )));
+    }
+    if hot_def.index_column.is_none() {
+        return Err(TaibaiError::Sql(
+            "HOT INDEX column is required; use HOT BY (...) INDEX (...)".into(),
+        ));
+    }
+    if let Some(idx_col) = &hot_def.index_column {
+        if !col_defs.iter().any(|c| c.name.eq_ignore_ascii_case(idx_col)) {
+            return Err(TaibaiError::Sql(format!(
+                "HOT INDEX column '{}' not found in table '{}'",
+                idx_col, table
+            )));
+        }
+    }
+    if let Some(close_time) = &hot_def.close_time {
+        if chrono::NaiveTime::parse_from_str(close_time.trim(), "%H:%M").is_err() {
+            return Err(TaibaiError::Sql(format!(
+                "HOT CLOSE AT time '{}' must use HH:MM format",
+                close_time
+            )));
+        }
+    }
+    Ok(())
+}
 
 pub fn exec_create_table(
     engine: &Engine,
@@ -26,6 +66,7 @@ pub fn exec_create_table(
     cluster_by: &Option<Vec<String>>,
     partition_by: &Option<PartitionDef>,
     ttl: &Option<TtlDef>,
+    hot: &Option<HotDef>,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
@@ -64,6 +105,10 @@ pub fn exec_create_table(
         validate_ttl_columns(&col_defs, ttl_def)?;
     }
 
+    if let Some(hot_def) = hot {
+        validate_hot_def(&col_defs, name, hot_def)?;
+    }
+
     catalog.create_table(name, col_defs)?;
 
     if let Some(meta) = catalog.get_table_mut(name) {
@@ -72,6 +117,11 @@ pub fn exec_create_table(
         }
         if let Some(ref keys) = cluster_by {
             meta.cluster_key = keys.clone();
+        }
+        if let Some(hot_def) = hot {
+            meta.hot_time_column = Some(hot_def.time_column.clone());
+            meta.hot_close_time = hot_def.close_time.clone();
+            meta.hot_index_column = hot_def.index_column.clone();
         }
         if let Some(ref pdef) = partition_by {
             meta.partition_key = pdef.column.clone();
@@ -1439,6 +1489,18 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
             " CLUSTER BY ({})",
             table_meta.cluster_key.join(", ")
         ));
+    }
+
+    if table_meta.hot_time_column.is_some() {
+        let time_col = table_meta.hot_time_column.as_ref().unwrap();
+        let mut hot_str = format!(" HOT BY ({})", time_col);
+        if let Some(idx_col) = &table_meta.hot_index_column {
+            hot_str.push_str(&format!(" INDEX ({})", idx_col));
+        }
+        if let Some(close_time) = &table_meta.hot_close_time {
+            hot_str.push_str(&format!(" CLOSE AT '{}'", close_time));
+        }
+        create_sql.push_str(&hot_str);
     }
 
     if table_meta.is_partitioned() {

@@ -3,7 +3,7 @@ use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{
-    AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, GrantObject, PartitionDef,
+    AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef,
     PartitionStrategy, Privilege, Statement, TtlDef, UniqueKeyDef,
 };
 use crate::sql::parser::lexer::Token;
@@ -194,6 +194,7 @@ impl Parser {
         let mut cluster_by: Option<Vec<String>> = None;
         let mut partition_by: Option<PartitionDef> = None;
         let mut ttl: Option<TtlDef> = None;
+        let mut hot: Option<HotDef> = None;
 
         loop {
             if self.peek() == &Token::Cluster && cluster_by.is_none() {
@@ -268,6 +269,8 @@ impl Parser {
                 });
             } else if is_ttl_token(self.peek()) && ttl.is_none() {
                 ttl = Some(self.parse_ttl_def()?);
+            } else if self.peek() == &Token::Hot && hot.is_none() {
+                hot = Some(self.parse_hot_def()?);
             } else {
                 break;
             }
@@ -282,6 +285,7 @@ impl Parser {
             cluster_by,
             partition_by,
             ttl,
+            hot,
         })
     }
 
@@ -308,6 +312,58 @@ impl Parser {
         }
         self.expect(&Token::RightParen)?;
         Ok(UniqueKeyDef { name, columns })
+    }
+
+    fn parse_hot_def(&mut self) -> Result<HotDef> {
+        self.advance();
+        self.expect(&Token::By)?;
+        self.expect(&Token::LeftParen)?;
+        let time_column = self.expect_ident()?;
+        self.expect(&Token::RightParen)?;
+        let mut index_column = None;
+        let mut close_time = None;
+        loop {
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("INDEX")) {
+                self.advance();
+                self.expect(&Token::LeftParen)?;
+                let col = self.expect_ident()?;
+                self.expect(&Token::RightParen)?;
+                index_column = Some(col);
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("CLOSE")) {
+                self.advance();
+                match self.peek() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("AT") => {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(TaibaiError::Sql(format!(
+                            "expected AT in HOT CLOSE clause, got {}",
+                            other
+                        )))
+                    }
+                }
+                close_time = Some(match self.advance() {
+                    Token::StringLit(s) | Token::Ident(s) => s,
+                    other => {
+                        return Err(TaibaiError::Sql(format!(
+                            "expected close time in HOT CLOSE AT clause, got {}",
+                            other
+                        )))
+                    }
+                });
+            } else if self.peek() == &Token::Keep {
+                return Err(TaibaiError::Sql(
+                    "HOT KEEP N DAYS is no longer supported; use HOT BY (...) INDEX (...) [CLOSE AT 'HH:MM']".into(),
+                ));
+            } else {
+                break;
+            }
+        }
+        Ok(HotDef {
+            time_column,
+            index_column,
+            close_time,
+        })
     }
 
     fn parse_ttl_def(&mut self) -> Result<TtlDef> {

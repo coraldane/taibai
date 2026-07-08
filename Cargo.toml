@@ -8,7 +8,7 @@ members = [
 
 [package]
 name = "taibai"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 autotests = false
 description = "A columnar database server wire-compatible with taibai-go"
@@ -118,3 +118,7 @@ path = "tests/transaction_integration_test.rs"
 [[test]]
 name = "dml_modify_integration_test"
 path = "tests/update_test.rs"
+
+[[test]]
+name = "hot_store_fast_path_test"
+path = "tests/hot_store_fast_path_test.rs"

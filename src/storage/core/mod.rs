@@ -3,3 +3,4 @@ pub mod buffer_pool;
 pub mod compactor;
 pub mod memtable;
 pub mod wal;
+pub mod hot_store;

@@ -1359,4 +1359,101 @@ impl ColumnArray {
             }
         }
     }
+
+    /// Gather rows at the given indices (random access). All indices must be
+    /// `< self.len()`. This is the workhorse for the per-symbol inverted index
+    /// gather path: instead of scanning the whole column it copies only the
+    /// requested rows, turning a full-scan into an O(matched) operation.
+    pub fn take(&self, indices: &[u32]) -> ColumnArray {
+        macro_rules! take_copy_column {
+            ($variant:ident, $data:expr, $bitmap:expr) => {{
+                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &idx in indices {
+                    let i = idx as usize;
+                    new_data.push($data[i]);
+                    if $bitmap.is_null(i) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::$variant {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }};
+        }
+
+        match self {
+            ColumnArray::Bool { data, bitmap } => take_copy_column!(Bool, data, bitmap),
+            ColumnArray::Int8 { data, bitmap } => take_copy_column!(Int8, data, bitmap),
+            ColumnArray::Int16 { data, bitmap } => take_copy_column!(Int16, data, bitmap),
+            ColumnArray::Int32 { data, bitmap } => take_copy_column!(Int32, data, bitmap),
+            ColumnArray::Int64 { data, bitmap } => take_copy_column!(Int64, data, bitmap),
+            ColumnArray::UInt8 { data, bitmap } => take_copy_column!(UInt8, data, bitmap),
+            ColumnArray::UInt16 { data, bitmap } => take_copy_column!(UInt16, data, bitmap),
+            ColumnArray::UInt32 { data, bitmap } => take_copy_column!(UInt32, data, bitmap),
+            ColumnArray::UInt64 { data, bitmap } => take_copy_column!(UInt64, data, bitmap),
+            ColumnArray::Float32 { data, bitmap } => take_copy_column!(Float32, data, bitmap),
+            ColumnArray::Float64 { data, bitmap } => take_copy_column!(Float64, data, bitmap),
+            ColumnArray::Decimal { data, bitmap } => take_copy_column!(Decimal, data, bitmap),
+            ColumnArray::Date { data, bitmap } => take_copy_column!(Date, data, bitmap),
+            ColumnArray::Time { data, bitmap } => take_copy_column!(Time, data, bitmap),
+            ColumnArray::Timestamp { data, bitmap } => take_copy_column!(Timestamp, data, bitmap),
+            ColumnArray::Interval { data, bitmap } => take_copy_column!(Interval, data, bitmap),
+            ColumnArray::VarChar { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &idx in indices {
+                    let i = idx as usize;
+                    new_data.push(data[i].clone());
+                    if bitmap.is_null(i) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::VarChar {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }
+            ColumnArray::Blob { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &idx in indices {
+                    let i = idx as usize;
+                    new_data.push(data[i].clone());
+                    if bitmap.is_null(i) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::Blob {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }
+            ColumnArray::Vector { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &idx in indices {
+                    let i = idx as usize;
+                    new_data.push(data[i].clone());
+                    if bitmap.is_null(i) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::Vector {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }
+        }
+    }
+
 }

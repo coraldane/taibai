@@ -98,6 +98,7 @@ pub enum Statement {
         cluster_by: Option<Vec<String>>,
         partition_by: Option<PartitionDef>,
         ttl: Option<TtlDef>,
+        hot: Option<HotDef>,
     },
     DropTable {
         name: ObjectName,
@@ -304,6 +305,13 @@ pub struct PartitionDef {
     pub column: String,
     pub strategy: PartitionStrategy,
     pub param: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotDef {
+    pub time_column: String,
+    pub index_column: Option<String>,
+    pub close_time: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

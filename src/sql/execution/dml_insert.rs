@@ -1204,6 +1204,22 @@ fn exec_materialized_insert_batch(
         constraint_start.elapsed(),
     );
 
+    if txn_id == 0 {
+        match engine.feed_hot_store(db, table, table_meta, &batch) {
+            Ok(()) => {
+                if engine.hot_store_manager().soft_limit_exceeded_for(db, table) {
+                    let _ = engine.flush_table_buffers(db, table);
+                }
+            }
+            Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
+                engine.reclaim_hot_store_pressure(db, table);
+                if let Err(e) = engine.feed_hot_store(db, table, table_meta, &batch) {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let write_start = Instant::now();
     if bulk_import_mode {
         engine

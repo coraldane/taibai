@@ -43,6 +43,7 @@ pub struct Engine {
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
+    hot_store_mgr: Arc<crate::storage::core::hot_store::HotStoreManager>,
 }
 
 struct CatalogSaveState {
@@ -286,6 +287,7 @@ impl Engine {
             Arc::clone(&segment_mgr),
             data_dir.to_path_buf(),
         ));
+        let hot_store_mgr = Arc::new(crate::storage::core::hot_store::HotStoreManager::new());
         let catalogs = Arc::new(RwLock::new(catalogs));
         start_delete_bitmap_cleanup_thread(
             Arc::clone(&segment_mgr),
@@ -294,7 +296,7 @@ impl Engine {
             auto_compact_config,
         );
 
-        Ok(Self {
+        let engine = Self {
             data_dir: data_dir.to_path_buf(),
             catalogs,
             catalog_save_state: Mutex::new(CatalogSaveState {
@@ -308,7 +310,10 @@ impl Engine {
             auth_manager,
             auto_increment_mgr,
             index_manager,
-        })
+            hot_store_mgr,
+        };
+        engine.warmup_hot_stores();
+        Ok(engine)
     }
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
@@ -424,6 +429,7 @@ impl Engine {
                 cluster_by,
                 partition_by,
                 ttl,
+                hot,
             } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
@@ -438,6 +444,7 @@ impl Engine {
                     cluster_by,
                     partition_by,
                     ttl,
+                    hot,
                 );
                 result
             }
@@ -952,6 +959,55 @@ impl Engine {
         self.batch_writer.memtable_manager()
     }
 
+    pub fn hot_store_manager(
+        &self,
+    ) -> &Arc<crate::storage::core::hot_store::HotStoreManager> {
+        &self.hot_store_mgr
+    }
+
+    pub fn feed_hot_store(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: &crate::types::batch::RecordBatch,
+    ) -> crate::common::error::Result<()> {
+        self.hot_store_mgr.try_append(db, table, table_meta, batch)
+    }
+
+    /// Reclaim resident memory under hot-store backpressure (design §3.1 hard
+    /// valve): drop the already-persisted append-prefix from the store, then
+    /// checkpoint-flush (seal active segments + clear WAL). Persisted rows stay
+    /// queryable via the segment scan; only the in-memory mirror is released.
+    pub fn reclaim_hot_store_pressure(&self, db: &str, table: &str) -> bool {
+        let store_rows = self
+            .hot_store_mgr
+            .get(db, table)
+            .map(|s| s.row_count())
+            .unwrap_or(0);
+        let live = self
+            .batch_writer
+            .memtable_manager()
+            .get_by_table(db, table)
+            .iter()
+            .map(|mt| mt.row_count())
+            .sum::<u64>();
+        let prefix = store_rows.saturating_sub(live);
+        if prefix > 0 {
+            let dropped = self.hot_store_mgr.compact_prefix(db, table, prefix);
+            tracing::warn!(
+                db,
+                table,
+                dropped,
+                "hot store backpressure: reclaimed persisted prefix"
+            );
+        }
+        if let Err(e) = self.flush_table_buffers(db, table) {
+            tracing::warn!(db, table, error = %e, "hot store backpressure: checkpoint flush failed");
+        }
+        prefix > 0
+    }
+
     pub fn auth_manager(&self) -> &Arc<AuthManager> {
         &self.auth_manager
     }
@@ -1070,6 +1126,173 @@ impl Engine {
         }
 
         Ok(0)
+    }
+
+    /// Close-of-day archival (design §4.2): flush every live memtable, seal all
+    /// active segments (and clear WALs), then evict every resident hot store and
+    /// drop Archived memtables. After this the day's data is fully handed off to
+    /// the history layer; the next trading day starts with empty resident state.
+    /// Intended to be triggered by an external scheduler at market close.
+    pub fn close_of_day_flush(&self) -> Result<()> {
+        tracing::info!("close-of-day: flushing all resident data to history");
+        self.flush_all_buffers()?;
+        self.hot_store_mgr.evict_all();
+        self.batch_writer.memtable_manager().remove_all_archived();
+        tracing::info!("close-of-day: complete, resident state evicted");
+        Ok(())
+    }
+
+    pub fn close_of_day_flush_table(&self, db: &str, table: &str) -> Result<()> {
+        tracing::info!(db, table, "close-of-day: flushing table resident data to history");
+        let table_meta = {
+            let catalogs = self.catalogs.read().unwrap();
+            let catalog = catalogs
+                .get(db)
+                .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+            catalog
+                .get_table(table)
+                .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+                .clone()
+        };
+        self.flush_table_buffers(db, table)?;
+        let compactor = Compactor::new(Arc::clone(&self.segment_mgr), self.data_dir.clone());
+        let stats = compactor.optimize_table(db, table, &table_meta)?;
+        self.index_manager.mark_index_stale(db, table);
+        self.hot_store_mgr.remove(db, table);
+        self.batch_writer.memtable_manager().remove_archived(db, table);
+        let today = chrono::Local::now().date_naive().to_string();
+        {
+            let mut catalogs = self.catalogs.write().unwrap();
+            if let Some(catalog) = catalogs.get_mut(db) {
+                if let Some(meta) = catalog.get_table_mut(table) {
+                    meta.hot_last_close_date = Some(today);
+                }
+                let meta_dir = self.data_dir.join("meta");
+                catalog.save(&meta_dir)?;
+            }
+        }
+        tracing::info!(
+            db,
+            table,
+            rows_written = stats.rows_written,
+            rows_dropped = stats.rows_dropped,
+            "close-of-day: table resident state evicted and optimized"
+        );
+        Ok(())
+    }
+
+    /// Rebuild resident hot stores from on-disk segments after a restart (design
+    /// gap fix). Without this, already-flushed data would not be resident and
+    /// point lookups would fall back to the segment scan until new writes refill
+    /// the store. For each hot-eligible table we load the most recently written
+    /// segments (up to a row budget) so the inverted index is warm again.
+    /// Best-effort: unreadable segments are skipped.
+    pub fn warmup_hot_stores(&self) {
+        use crate::storage::core::hot_store::resolve_key_column;
+        use crate::storage::segment::reader::SegmentReader;
+        use crate::storage::segment::delete_bitmap;
+
+        const WARMUP_ROW_BUDGET: u64 = 20_000_000;
+
+        let catalogs = self.catalogs.read().unwrap();
+        for (db, catalog) in catalogs.iter() {
+            for (table, table_meta) in catalog.tables.iter() {
+                if resolve_key_column(table_meta).is_none() {
+                    continue;
+                }
+                let table_dir = self.segment_mgr.table_dir(db, table);
+                if !table_dir.exists() {
+                    continue;
+                }
+                let segments = match SegmentManager::discover_segments(&table_dir) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(db, table, error = %e, "warmup: discover segments failed");
+                        continue;
+                    }
+                };
+                if segments.is_empty() {
+                    continue;
+                }
+
+                let mut mtimed: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+                for seg in &segments {
+                    if let Ok(meta) = std::fs::metadata(seg) {
+                        if let Ok(mtime) = meta.modified() {
+                            mtimed.push((mtime, seg.clone()));
+                        }
+                    }
+                }
+                mtimed.sort_by(|a, b| b.cmp(a));
+                if mtimed.is_empty() {
+                    continue;
+                }
+
+                let mut loaded_rows: u64 = 0;
+                for (_, seg_path) in &mtimed {
+                    if loaded_rows >= WARMUP_ROW_BUDGET {
+                        break;
+                    }
+                    let reader = match SegmentReader::open(seg_path) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(path = %seg_path.display(), error = %e, "warmup: open segment failed");
+                            continue;
+                        }
+                    };
+                    let num_cols = reader.schema().num_columns();
+                    let projection: Vec<usize> = (0..num_cols).collect();
+                    let del_bitmap = reader.delete_bitmap();
+                    let has_deletes = !del_bitmap.is_empty();
+                    for rg in 0..reader.num_row_groups() {
+                        let batch = match reader.read_row_group_with_projection(rg, &projection) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "warmup: read row group failed");
+                                continue;
+                            }
+                        };
+                        let first_row_id = reader.row_group_start_row(rg);
+                        let batch = if has_deletes {
+                            match delete_bitmap::filter_batch(&batch, first_row_id, del_bitmap) {
+                                Ok(b) => b,
+                                Err(_) => batch,
+                            }
+                        } else {
+                            batch
+                        };
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        loaded_rows = loaded_rows.saturating_add(batch.num_rows() as u64);
+                        if let Err(e) =
+                            self.hot_store_mgr.try_append(db, table, table_meta, &batch)
+                        {
+                            tracing::warn!(db, table, error = %e, "warmup: feed hot store failed");
+                        }
+                    }
+                }
+                if loaded_rows > 0 {
+                    tracing::info!(
+                        db,
+                        table,
+                        loaded_rows,
+                        "warmup: rebuilt resident hot store from segments"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Graceful shutdown (design §4.3): flush every live memtable, seal active
+    /// segments and clear WALs so a restart loses nothing. Safe to call once.
+    pub fn shutdown(&mut self) -> Result<()> {
+        tracing::info!("engine shutdown: flushing resident data");
+        if let Err(e) = self.flush_all_buffers() {
+            tracing::warn!(error = %e, "engine shutdown: flush_all_buffers failed");
+        }
+        self.batch_writer.stop();
+        Ok(())
     }
 
     pub(crate) fn catalogs(&self) -> &Arc<RwLock<HashMap<String, DatabaseCatalog>>> {
@@ -1329,6 +1552,76 @@ impl Engine {
         if result > 0 {}
         Ok(result)
     }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Best-effort graceful shutdown so a process exit does not lose the
+        // resident write buffer (design §4.3). Idempotent with explicit shutdown().
+        let _ = self.shutdown();
+    }
+}
+
+fn parse_hh_mm(s: &str) -> Option<(u32, u32)> {
+    use chrono::{NaiveTime, Timelike};
+    let t = NaiveTime::parse_from_str(s.trim(), "%H:%M").ok()?;
+    Some((t.hour(), t.minute()))
+}
+
+/// Start the background scheduler that flushes HOT tables once per day when
+/// each table's `HOT ... CLOSE AT` time is reached. Tables without an explicit
+/// close time default to 15:30 local time.
+pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHandle<()> {
+    use chrono::{Local, Timelike};
+    use std::collections::HashSet;
+    std::thread::Builder::new()
+        .name("taibai-close-of-day".into())
+        .spawn(move || {
+            let mut last_fired: HashSet<(String, String, chrono::NaiveDate)> = HashSet::new();
+            loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let now = Local::now();
+                let today = now.date_naive();
+                let today_str = today.to_string();
+                last_fired.retain(|(_, _, d)| *d == today);
+                let hot_tables = {
+                    let catalogs = engine.catalogs.read().unwrap();
+                    let mut tables = Vec::new();
+                    for (db, catalog) in catalogs.iter() {
+                        for (table, meta) in catalog.tables.iter() {
+                            if meta.hot_time_column.is_some() {
+                                tables.push((
+                                    db.clone(),
+                                    table.clone(),
+                                    meta.hot_close_time.as_deref().unwrap_or("15:30").to_string(),
+                                    meta.hot_last_close_date.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    tables
+                };
+                for (db, table, close_time, last_close_date) in hot_tables {
+                    let Some((target_h, target_m)) = parse_hh_mm(&close_time).or(Some((15, 30))) else {
+                        continue;
+                    };
+                    let key = (db.clone(), table.clone(), today);
+                    if last_fired.contains(&key) || last_close_date.as_deref() == Some(today_str.as_str()) {
+                        continue;
+                    }
+                    let reached = now.hour() > target_h
+                        || (now.hour() == target_h && now.minute() >= target_m);
+                    if reached {
+                        tracing::info!(db, table, close_time, "close-of-day scheduler: firing table archival flush");
+                        if let Err(e) = engine.close_of_day_flush_table(&db, &table) {
+                            tracing::warn!(db, table, error = %e, "close-of-day scheduler: table flush failed");
+                        }
+                        last_fired.insert(key);
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn close-of-day scheduler")
 }
 
 struct EngineOperationGuard<'a> {

@@ -12,6 +12,12 @@ pub enum MemTableState {
     Pending,
     Flushing,
     Flushed,
+    /// Persisted to a segment but kept resident for same-day queries. Unlike
+    /// `Flushed`, an `Archived` memtable is NOT removed by `remove_flushed()`;
+    /// it stays readable until an explicit close-of-day clears it. This realises
+    /// the design's "checkpoint flush copies (does not move) and keeps the data
+    /// resident" semantics for tables that are NOT accelerated by a hot store.
+    Archived,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +91,7 @@ impl MemTable {
             0 => MemTableState::Pending,
             1 => MemTableState::Flushing,
             2 => MemTableState::Flushed,
+            3 => MemTableState::Archived,
             _ => MemTableState::Pending,
         }
     }
@@ -185,6 +192,14 @@ impl MemTable {
     pub fn take_batch(&self) -> Option<RecordBatch> {
         let mut guard = self.batch.write().unwrap();
         guard.take()
+    }
+
+    /// Copy the current batch without moving it out. Used by the checkpoint
+    /// flush path so the data stays resident (then the memtable is marked
+    /// `Archived`), in contrast to `take_batch()` which empties the memtable.
+    pub fn read_snapshot(&self) -> Option<RecordBatch> {
+        let guard = self.batch.read().unwrap();
+        guard.clone()
     }
 
     pub fn restore_batch(&self, batch: RecordBatch) {
@@ -306,6 +321,23 @@ impl MemTableManager {
             })
             .cloned()
             .collect()
+    }
+
+    /// Drop memtables that have reached the `Archived` state for a table. Called
+    /// at close-of-day after the data is safely archived to history segments.
+    pub fn remove_archived(&self, db: &str, table: &str) {
+        let mut memtables = self.memtables.write().unwrap();
+        memtables.retain(|mt| {
+            !(mt.db() == db
+                && mt.table() == table
+                && mt.state() == MemTableState::Archived)
+        });
+    }
+
+    /// Drop every `Archived` memtable across all tables (full close-of-day).
+    pub fn remove_all_archived(&self) {
+        let mut memtables = self.memtables.write().unwrap();
+        memtables.retain(|mt| mt.state() != MemTableState::Archived);
     }
 
     pub fn get_by_txn(&self, txn_id: u64) -> Vec<Arc<MemTable>> {

@@ -129,6 +129,9 @@ where
     let config = Arc::new(config);
     let engine = Arc::new(engine);
     let _ = rayon::ThreadPoolBuilder::new().build_global();
+    crate::sql::execution::engine::start_close_of_day_scheduler(engine.clone());
+    tracing::info!("close-of-day scheduler started");
+
     let server = Server::new(config, engine.clone());
 
     if let Err(e) = server.run_with_shutdown(shutdown).await {

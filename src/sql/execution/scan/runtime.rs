@@ -11,6 +11,7 @@ pub struct ScanRuntime {
     data_dir: PathBuf,
     segment_mgr: Arc<SegmentManager>,
     memtable_manager: Arc<MemTableManager>,
+    hot_store_manager: Arc<crate::storage::core::hot_store::HotStoreManager>,
 }
 
 impl ScanRuntime {
@@ -19,6 +20,7 @@ impl ScanRuntime {
             data_dir: engine.data_dir().to_path_buf(),
             segment_mgr: Arc::clone(engine.segment_mgr()),
             memtable_manager: Arc::clone(engine.memtable_manager()),
+            hot_store_manager: Arc::clone(engine.hot_store_manager()),
         }
     }
 
@@ -32,5 +34,9 @@ impl ScanRuntime {
 
     pub fn memtable_manager(&self) -> &Arc<MemTableManager> {
         &self.memtable_manager
+    }
+
+    pub fn hot_store_manager(&self) -> &Arc<crate::storage::core::hot_store::HotStoreManager> {
+        &self.hot_store_manager
     }
 }

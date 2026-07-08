@@ -1,3 +1,4 @@
+use crate::storage::core::hot_store::{HotStore, HotStoreManager};
 use crate::storage::core::memtable::MemTableManager;
 use crate::types::batch::RecordBatch;
 
@@ -5,6 +6,7 @@ use super::spec::ScanSpec;
 
 pub fn scan_memtables(
     memtable_mgr: &MemTableManager,
+    hot_mgr: &HotStoreManager,
     db: &str,
     table_name: &str,
     spec: &ScanSpec,
@@ -14,6 +16,26 @@ pub fn scan_memtables(
         .into_iter()
         .filter(|mt| mt.is_visible_to(spec.reader_txn_id))
         .collect::<Vec<_>>();
+
+    // Hot-store fast path. The store mirrors auto-commit (txn_id == 0) inserts
+    // and has no MVCC, so it is only safe for a committed read snapshot and
+    // only when there is live memtable data to accelerate. To avoid
+    // double-counting rows already persisted to segments, we derive a watermark
+    // = (rows ever appended to the store) - (rows still in live memtables); the
+    // leading rows below that watermark have been flushed and are served by the
+    // segment scan, so the gather here skips them. This prefix invariant holds
+    // for the single-active-partition ingestion pattern (e.g. today's ticks).
+    let has_live_memtable_data = memtables.iter().any(|mt| mt.row_count() > 0);
+    if has_live_memtable_data && spec.reader_txn_id == 0 {
+        if let Some(store) = hot_mgr.get(db, table_name) {
+            let live_rows = memtables.iter().map(|mt| mt.row_count()).sum::<u64>();
+            let watermark = store.row_count().saturating_sub(live_rows);
+            if let Some(batch) = try_hot_fast_path(&store, spec, watermark) {
+                return vec![batch];
+            }
+        }
+    }
+
     let mut batches = Vec::new();
 
     for mt in &memtables {
@@ -46,6 +68,52 @@ pub fn scan_memtables(
     }
 
     batches
+}
+
+/// Per-value inverted-index gather fast path. Triggered when the scan carries
+/// an equality predicate on the leading cluster-key column. Gathers only the
+/// matching rows via the index instead of scanning the whole resident set.
+/// `watermark` excludes already-flushed rows (served by the segment scan).
+/// Returns `None` when the fast path does not apply (no such predicate),
+/// letting the caller fall back to the generic memtable scan.
+fn try_hot_fast_path(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Option<RecordBatch> {
+    let key_idx = store.key_column_index();
+    let key_value = spec
+        .eq_predicates
+        .iter()
+        .find(|(idx, _)| *idx == key_idx)
+        .map(|(_, v)| v)?;
+
+    let batch = match store.lookup(key_value, None, watermark) {
+        Some(b) => b,
+        None => {
+            // Value never seen -> empty result, respecting the projection.
+            let schema = store.schema().clone();
+            let proj = spec
+                .projection
+                .clone()
+                .unwrap_or_else(|| (0..schema.num_columns()).collect());
+            return Some(apply_projection(&RecordBatch::new(schema), &proj));
+        }
+    };
+
+    let filtered = if spec.has_predicates() {
+        super::row_filter::apply_predicates(
+            &batch,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        )
+    } else {
+        batch
+    };
+
+    let projected = match &spec.projection {
+        Some(proj) => apply_projection(&filtered, proj),
+        None => filtered,
+    };
+    Some(projected)
 }
 
 pub fn count_memtable_rows(

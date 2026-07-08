@@ -214,6 +214,7 @@ impl ScanCursor {
         memtable_spec.projection = Some(self.plan.projection_cols.clone());
         self.memtable_batches = memtable::scan_memtables(
             self.runtime.memtable_manager(),
+            self.runtime.hot_store_manager(),
             &self.db,
             &self.spec.table_name,
             &memtable_spec,

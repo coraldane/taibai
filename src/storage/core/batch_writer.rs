@@ -107,13 +107,25 @@ impl BatchWriter {
 
         let flush_stop = Arc::clone(&stop);
         let flush_interval = config.flush_interval_secs;
+        const NOMINAL_BYTES_PER_ROW: u64 = 64;
+        let flush_row_high_water = (config.max_total_memory / NOMINAL_BYTES_PER_ROW).max(1);
         let flush_mgr = Arc::clone(&segment_mgr);
         let flush_mt_mgr = Arc::clone(&memtable_mgr);
         let flush_handle = std::thread::Builder::new()
             .name("taibai-bw-flush".into())
             .spawn(move || {
                 while !flush_stop.load(Ordering::Acquire) {
-                    std::thread::sleep(std::time::Duration::from_secs(flush_interval));
+                    for _ in 0..flush_interval {
+                        if flush_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if flush_mt_mgr.total_row_count() >= flush_row_high_water {
+                            if let Err(e) = Self::flush_all_pending(&flush_mgr, &flush_mt_mgr) {
+                                tracing::warn!(error = %e, "pressure memtable flush failed");
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
                     if flush_stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -299,6 +311,23 @@ impl BatchWriter {
         let flushable = memtable_mgr.get_flushable();
         for mt in flushable {
             Self::flush_memtable(segment_mgr, &mt)?;
+        }
+        memtable_mgr.remove_flushed();
+        Ok(())
+    }
+
+    /// Flush *every* pending memtable regardless of age or size. Used under
+    /// memory pressure (design §4.1 WAL/resident-memory high-water), in contrast
+    /// to `flush_pending_memtables` which only drains memtables that are full or
+    /// old. Transactional memtables are left untouched.
+    fn flush_all_pending(
+        segment_mgr: &Arc<SegmentManager>,
+        memtable_mgr: &MemTableManager,
+    ) -> Result<()> {
+        for mt in memtable_mgr.get_all_pending() {
+            if !mt.is_transactional() {
+                Self::flush_memtable(segment_mgr, &mt)?;
+            }
         }
         memtable_mgr.remove_flushed();
         Ok(())
