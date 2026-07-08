@@ -157,6 +157,11 @@ pub enum Statement {
         columns: Vec<String>,
         values: Vec<Vec<Expr>>,
     },
+    Replace {
+        table: ObjectName,
+        columns: Vec<String>,
+        values: Vec<Vec<Expr>>,
+    },
     Update {
         table: ObjectName,
         assignments: Vec<Assignment>,
@@ -194,6 +199,13 @@ pub enum Statement {
     },
     ShowIndexes {
         table: ObjectName,
+    },
+    ShowUniqueIndexStatus {
+        table: ObjectName,
+    },
+    RebuildUniqueIndex {
+        table: ObjectName,
+        index_name: Option<String>,
     },
     ShowCreateTable {
         table: ObjectName,

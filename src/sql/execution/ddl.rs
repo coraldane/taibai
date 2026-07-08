@@ -149,8 +149,13 @@ pub fn exec_drop_index(
         .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
     if has_unique_index {
         table_meta.drop_unique_index(index_name)?;
+        engine
+            .index_manager()
+            .remove_unique_index_snapshot(db, table, index_name);
+        engine.index_manager().mark_index_stale(db, table);
     } else {
         table_meta.drop_secondary_index(index_name)?;
+        engine.index_manager().mark_index_stale(db, table);
     }
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
@@ -234,6 +239,149 @@ fn resolve_unique_index_columns(schema: &Schema, columns: &[String]) -> Result<V
         indices.push(idx);
     }
     Ok(indices)
+}
+
+pub fn exec_show_unique_index_status(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs
+        .get(db)
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+    let table_meta = catalog
+        .get_table(table)
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+        .clone();
+    drop(catalogs);
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("table", DataType::VarChar),
+        ColumnDef::new("index_name", DataType::VarChar),
+        ColumnDef::new("columns", DataType::VarChar),
+        ColumnDef::new("status", DataType::VarChar),
+        ColumnDef::new("message", DataType::VarChar),
+    ]);
+    let mut batch = RecordBatch::new(schema.clone());
+    let table_schema = Schema::new(table_meta.columns.clone());
+
+    for index in &table_meta.unique_indexes {
+        let indices = resolve_unique_index_columns(&table_schema, &index.columns);
+        let status = indices.and_then(|indices| {
+            super::dml_insert::validate_unique_key_uniqueness(
+                engine,
+                db,
+                table,
+                &table_schema,
+                &indices,
+                &index.name,
+                None,
+            )?;
+            engine
+                .index_manager()
+                .load_unique_index_snapshot(db, table, &index.name)
+        });
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(table.to_string())))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(index.name.clone())))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(index.columns.join(","))))?;
+        match status {
+            Ok(snapshot) => {
+                let message = snapshot
+                    .map(|snapshot| format!("persisted keys={}", snapshot.key_count))
+                    .unwrap_or_else(|| "not persisted; run REBUILD UNIQUE INDEX".to_string());
+                batch
+                    .column_mut(3)
+                    .unwrap()
+                    .push(&ScalarValue::VarChar(Some("READY".to_string())))?;
+                batch
+                    .column_mut(4)
+                    .unwrap()
+                    .push(&ScalarValue::VarChar(Some(message)))?;
+            }
+            Err(err) => {
+                batch
+                    .column_mut(3)
+                    .unwrap()
+                    .push(&ScalarValue::VarChar(Some("INVALID".to_string())))?;
+                batch
+                    .column_mut(4)
+                    .unwrap()
+                    .push(&ScalarValue::VarChar(Some(err.to_string())))?;
+            }
+        }
+    }
+
+    Ok(ExecResult::Query {
+        schema,
+        batches: vec![batch],
+    })
+}
+
+pub fn exec_rebuild_unique_index(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    index_name: Option<&str>,
+) -> Result<ExecResult> {
+    let catalogs = engine.catalogs().read().unwrap();
+    let catalog = catalogs
+        .get(db)
+        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+    let table_meta = catalog
+        .get_table(table)
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+        .clone();
+    drop(catalogs);
+
+    let table_schema = Schema::new(table_meta.columns.clone());
+    engine.flush_all_buffers()?;
+    let mut rebuilt = 0u64;
+    engine
+        .segment_mgr()
+        .with_table_mutation_lock(db, table, || {
+            for index in &table_meta.unique_indexes {
+                if index_name
+                    .map(|name| !index.name.eq_ignore_ascii_case(name))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let indices = resolve_unique_index_columns(&table_schema, &index.columns)?;
+                let entries = super::dml_insert::collect_unique_index_entries(
+                    engine,
+                    db,
+                    table,
+                    &indices,
+                    &index.name,
+                )?;
+                engine.index_manager().persist_unique_index_entries(
+                    db,
+                    table,
+                    &index.name,
+                    &index.columns,
+                    entries,
+                )?;
+                rebuilt += 1;
+            }
+            Ok(())
+        })?;
+
+    if rebuilt == 0 && index_name.is_some() {
+        return Err(TaibaiError::Sql(format!(
+            "unique index '{}' does not exist",
+            index_name.unwrap()
+        )));
+    }
+    engine.index_manager().mark_index_stale(db, table);
+    Ok(ExecResult::Ok {
+        rows_affected: rebuilt,
+    })
 }
 
 pub fn exec_drop_table(
@@ -383,6 +531,18 @@ pub fn exec_alter_table(
                     .with_primary_key(column.primary_key)
                     .with_default_value(default_value);
                 validate_column_constraints(std::slice::from_mut(&mut col_def))?;
+                if !col_def.nullable && col_def.default_value.is_none() {
+                    let existing_rows = catalog
+                        .get_table(name)
+                        .map(|meta| meta.row_count)
+                        .unwrap_or(0);
+                    if existing_rows > 0 {
+                        return Err(TaibaiError::Sql(format!(
+                            "cannot add NOT NULL column '{}' without default to non-empty table",
+                            col_def.name
+                        )));
+                    }
+                }
                 let added_auto_increment = col_def.auto_increment;
                 let added_column_name = col_def.name.clone();
                 catalog.add_column(name, col_def)?;
@@ -462,8 +622,13 @@ pub fn exec_alter_table(
                     .any(|idx| idx.name.eq_ignore_ascii_case(index_name))
                 {
                     table_meta.drop_unique_index(index_name)?;
+                    engine
+                        .index_manager()
+                        .remove_unique_index_snapshot(db, name, index_name);
+                    engine.index_manager().mark_index_stale(db, name);
                 } else {
                     table_meta.drop_secondary_index(index_name)?;
+                    engine.index_manager().mark_index_stale(db, name);
                 }
             }
             AlterOperation::RenameColumn { old_name, new_name } => {
@@ -486,6 +651,28 @@ pub fn exec_alter_table(
                 }
             }
             AlterOperation::ModifyColumn { column } => {
+                let existing = catalog
+                    .get_table(name)
+                    .and_then(|meta| {
+                        meta.columns
+                            .iter()
+                            .find(|col| col.name.eq_ignore_ascii_case(&column.name))
+                    })
+                    .ok_or_else(|| {
+                        TaibaiError::Sql(format!(
+                            "column '{}' does not exist in table '{}'",
+                            column.name, name
+                        ))
+                    })?;
+                if existing.data_type != column.data_type
+                    || existing.scale != column.scale
+                    || existing.precision != column.precision
+                {
+                    return Err(TaibaiError::Sql(format!(
+                        "MODIFY COLUMN type changes require column rewrite and are not supported yet for '{}'",
+                        column.name
+                    )));
+                }
                 catalog.modify_column(
                     name,
                     &column.name,
@@ -1538,7 +1725,7 @@ pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult
 
 pub fn exec_flush_table(engine: &Engine, db: &str, table: &Option<String>) -> Result<ExecResult> {
     if let Some(table_name) = table {
-        engine.flush_all_buffers()?;
+        engine.flush_table_buffers(db, table_name)?;
         tracing::info!(db, table = table_name, "FLUSH TABLE executed");
     } else {
         engine.flush_all_buffers()?;

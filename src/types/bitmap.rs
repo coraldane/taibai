@@ -131,15 +131,33 @@ impl NullBitmap {
     }
 
     pub fn extend(&mut self, other: &NullBitmap) {
+        if other.is_all_valid() {
+            let needed = Self::u64_count(self.len + other.len);
+            self.len += other.len;
+            while self.data.len() < needed {
+                self.data.push(0);
+            }
+            return;
+        }
         let old_len = self.len;
         self.len += other.len;
         let needed = Self::u64_count(self.len);
         while self.data.len() < needed {
             self.data.push(0);
         }
-        for i in 0..other.len {
-            if other.is_null(i) {
-                self.set_null(old_len + i);
+        let other_offset = old_len % 64;
+        if other_offset == 0 {
+            let dst_start = old_len / 64;
+            for (i, &word) in other.data.iter().enumerate() {
+                if dst_start + i < self.data.len() {
+                    self.data[dst_start + i] |= word;
+                }
+            }
+        } else {
+            for i in 0..other.len {
+                if other.is_null(i) {
+                    self.set_null(old_len + i);
+                }
             }
         }
     }

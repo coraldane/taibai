@@ -1,5 +1,4 @@
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -7,14 +6,12 @@ use std::time::Instant;
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::schema::TableMeta;
-use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::partition::parse_partition_key;
 use crate::storage::segment::{store, SegmentWriter};
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
-use crate::types::scalar::ScalarValue;
 
 const COMPACT_ROW_GROUP_SIZE: usize = 8192;
 // Gather more rows than one output row group at a time. SegmentWriter still
@@ -93,6 +90,19 @@ impl Compactor {
             };
 
             for (partition_key, files) in group_segments_by_partition(segment_files) {
+                if files.len() == 1 {
+                    let reader = self.segment_mgr.open_reader_cached(&files[0])?;
+                    if reader.deleted_row_count() == 0 {
+                        tracing::info!(
+                            db,
+                            table,
+                            partition_key = partition_key.as_deref().unwrap_or("<none>"),
+                            segment = %files[0].display(),
+                            "skipping clean single-segment optimization"
+                        );
+                        continue;
+                    }
+                }
                 let part_stats = self.compact_segment_group(
                     db,
                     table,
@@ -239,9 +249,7 @@ impl Compactor {
         schema: &Schema,
         cluster_key_indices: &[usize],
     ) -> Result<CompactStats> {
-        let mut key_batches = Vec::new();
         let mut source_row_groups = Vec::new();
-        let mut row_orders = Vec::new();
         let mut row_refs = Vec::new();
         let mut deleted_rows = 0u64;
         let partition_label = partition_key.unwrap_or("<unpartitioned>");
@@ -260,41 +268,21 @@ impl Compactor {
             let mut segment_row_base = 0u64;
             for rg_idx in 0..reader.num_row_groups() {
                 let batch_idx = source_row_groups.len();
-                let row_count = if cluster_key_indices.is_empty() {
-                    reader.row_group_rows(rg_idx) as usize
-                } else {
-                    let key_batch = reader.read_columns_fast(rg_idx, cluster_key_indices)?;
-                    let row_count = key_batch.num_rows();
-                    key_batches.push(key_batch);
-                    row_count
-                };
-                let mut row_order = Vec::new();
+                let row_count = reader.row_group_rows(rg_idx) as usize;
                 for row_idx in 0..row_count {
                     let row_id = segment_row_base + row_idx as u64;
                     if reader.is_row_deleted(row_id) {
                         deleted_rows += 1;
                         continue;
                     }
-                    if cluster_key_indices.is_empty() {
-                        row_refs.push(RowRef { batch_idx, row_idx });
-                    } else {
-                        row_order.push(row_idx);
-                    }
-                }
-                if !cluster_key_indices.is_empty() {
-                    sort_row_group_order(batch_idx, &mut row_order, &key_batches);
+                    row_refs.push(RowRef { batch_idx, row_idx });
                 }
                 segment_row_base += row_count as u64;
                 source_row_groups.push(SourceRowGroup {
                     segment_path: seg_path.clone(),
                     row_group_idx: rg_idx,
                 });
-                row_orders.push(row_order);
             }
-        }
-
-        if !cluster_key_indices.is_empty() {
-            row_refs = merge_sorted_row_groups(&key_batches, &row_orders);
         }
 
         if row_refs.is_empty() {
@@ -334,19 +322,19 @@ impl Compactor {
             "compact partition writing replacement segment"
         );
 
-        let write_result = self.write_sorted_segment(
+        let write_result = self.write_compacted_segment(
             db,
             table,
             partition_label,
             &tmp_path,
             schema,
             cluster_key_indices,
-            &key_batches,
             &source_row_groups,
             &row_refs,
         );
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
+            let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
             tracing::warn!(
                 db,
                 table,
@@ -382,7 +370,7 @@ impl Compactor {
         })
     }
 
-    fn write_sorted_segment(
+    fn write_compacted_segment(
         &self,
         db: &str,
         table: &str,
@@ -390,7 +378,6 @@ impl Compactor {
         path: &Path,
         schema: &Schema,
         cluster_key_indices: &[usize],
-        key_batches: &[RecordBatch],
         source_row_groups: &[SourceRowGroup],
         row_refs: &[RowRef],
     ) -> Result<()> {
@@ -401,11 +388,10 @@ impl Compactor {
             cluster_key_indices,
         )?;
         let mut rows_written = 0usize;
-        let non_key_projection = non_key_projection(schema.num_columns(), cluster_key_indices);
-        let projected_positions =
-            projected_column_positions(schema.num_columns(), &non_key_projection);
-        let key_positions = key_column_positions(schema.num_columns(), cluster_key_indices);
-        let mut row_group_cache = RowGroupCache::new(source_row_groups.len(), non_key_projection);
+        let projection = (0..schema.num_columns()).collect::<Vec<_>>();
+        let projected_positions = projected_column_positions(schema.num_columns(), &projection);
+        let key_positions = vec![None; schema.num_columns()];
+        let mut row_group_cache = RowGroupCache::new(source_row_groups.len(), projection);
 
         tracing::info!(
             db,
@@ -419,9 +405,9 @@ impl Compactor {
         );
 
         for chunk in row_refs.chunks(WRITE_GATHER_CHUNK_ROWS) {
-            let batch = self.gather_sorted_chunk(
+            let batch = self.gather_compacted_chunk(
                 schema,
-                key_batches,
+                &[],
                 &key_positions,
                 &projected_positions,
                 source_row_groups,
@@ -455,13 +441,13 @@ impl Compactor {
             cache_hits = row_group_cache.hits(),
             cache_misses = row_group_cache.misses(),
             cached_row_groups = row_group_cache.len(),
-            "compact write gathered sorted rows"
+            "compact write gathered rows"
         );
 
         writer.seal()
     }
 
-    fn gather_sorted_chunk(
+    fn gather_compacted_chunk(
         &self,
         schema: &Schema,
         key_batches: &[RecordBatch],
@@ -616,158 +602,11 @@ impl RowGroupCache {
     }
 }
 
-#[derive(Debug, Clone)]
-struct MergeEntry {
-    key: Vec<ScalarValue>,
-    ordinal: u64,
-    batch_idx: usize,
-    row_idx: usize,
-}
-
-impl PartialEq for MergeEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.ordinal == other.ordinal
-    }
-}
-
-impl Eq for MergeEntry {}
-
-impl PartialOrd for MergeEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MergeEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare_merge_keys(&other.key, &self.key).then_with(|| other.ordinal.cmp(&self.ordinal))
-    }
-}
-
-fn sort_row_group_order(batch_idx: usize, row_order: &mut [usize], key_batches: &[RecordBatch]) {
-    row_order.sort_unstable_by(|left, right| {
-        compare_rows_in_batch(key_batches, batch_idx, *left, *right).then_with(|| left.cmp(right))
-    });
-}
-
-fn merge_sorted_row_groups(key_batches: &[RecordBatch], row_orders: &[Vec<usize>]) -> Vec<RowRef> {
-    let total_rows = row_orders.iter().map(Vec::len).sum();
-    let mut row_refs = Vec::with_capacity(total_rows);
-    let mut heap = BinaryHeap::new();
-    let mut cursors = vec![0usize; row_orders.len()];
-    let mut next_ordinal = 0u64;
-
-    for batch_idx in 0..key_batches.len() {
-        if let Some(&row_idx) = row_orders.get(batch_idx).and_then(|rows| rows.first()) {
-            heap.push(MergeEntry {
-                key: row_key(&key_batches[batch_idx], row_idx),
-                ordinal: next_ordinal,
-                batch_idx,
-                row_idx,
-            });
-            next_ordinal += 1;
-        }
-    }
-
-    while let Some(entry) = heap.pop() {
-        row_refs.push(RowRef {
-            batch_idx: entry.batch_idx,
-            row_idx: entry.row_idx,
-        });
-
-        cursors[entry.batch_idx] += 1;
-        if let Some(&row_idx) = row_orders
-            .get(entry.batch_idx)
-            .and_then(|rows| rows.get(cursors[entry.batch_idx]))
-        {
-            heap.push(MergeEntry {
-                key: row_key(&key_batches[entry.batch_idx], row_idx),
-                ordinal: next_ordinal,
-                batch_idx: entry.batch_idx,
-                row_idx,
-            });
-            next_ordinal += 1;
-        }
-    }
-
-    row_refs
-}
-
-fn compare_rows_in_batch(
-    key_batches: &[RecordBatch],
-    batch_idx: usize,
-    left_row: usize,
-    right_row: usize,
-) -> Ordering {
-    let key_count = key_batches
-        .get(batch_idx)
-        .map(|batch| batch.num_columns())
-        .unwrap_or(0);
-    for key_pos in 0..key_count {
-        let left_val = scalar_at_row(key_batches, batch_idx, left_row, key_pos);
-        let right_val = scalar_at_row(key_batches, batch_idx, right_row, key_pos);
-        let cmp = compare_scalars_for_sort(&left_val, &right_val);
-        if cmp != Ordering::Equal {
-            return cmp;
-        }
-    }
-    Ordering::Equal
-}
-
-fn scalar_at_row(
-    batches: &[RecordBatch],
-    batch_idx: usize,
-    row_idx: usize,
-    col_idx: usize,
-) -> ScalarValue {
-    batches[batch_idx]
-        .scalar(row_idx, col_idx)
-        .unwrap_or_else(|| {
-            ScalarValue::null_for_type(batches[batch_idx].schema.columns[col_idx].data_type)
-        })
-}
-
-fn row_key(batch: &RecordBatch, row_idx: usize) -> Vec<ScalarValue> {
-    (0..batch.num_columns())
-        .map(|col_idx| {
-            batch.scalar(row_idx, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
-            })
-        })
-        .collect()
-}
-
-fn compare_merge_keys(left: &[ScalarValue], right: &[ScalarValue]) -> Ordering {
-    for (left_val, right_val) in left.iter().zip(right.iter()) {
-        let cmp = compare_scalars_for_sort(left_val, right_val);
-        if cmp != Ordering::Equal {
-            return cmp;
-        }
-    }
-    left.len().cmp(&right.len())
-}
-
-fn non_key_projection(num_columns: usize, cluster_key_indices: &[usize]) -> Vec<usize> {
-    (0..num_columns)
-        .filter(|idx| !cluster_key_indices.contains(idx))
-        .collect()
-}
-
 fn projected_column_positions(num_columns: usize, projection: &[usize]) -> Vec<Option<usize>> {
     let mut positions = vec![None; num_columns];
     for (projected_pos, &col_idx) in projection.iter().enumerate() {
         if col_idx < num_columns {
             positions[col_idx] = Some(projected_pos);
-        }
-    }
-    positions
-}
-
-fn key_column_positions(num_columns: usize, cluster_key_indices: &[usize]) -> Vec<Option<usize>> {
-    let mut positions = vec![None; num_columns];
-    for (key_pos, &col_idx) in cluster_key_indices.iter().enumerate() {
-        if col_idx < num_columns {
-            positions[col_idx] = Some(key_pos);
         }
     }
     positions
@@ -1119,6 +958,7 @@ mod tests {
     use crate::storage::catalog::schema::PartitionType;
     use crate::storage::segment::SegmentReader;
     use crate::types::batch::ColumnDef;
+    use crate::types::scalar::ScalarValue;
 
     const TEST_ROW_GROUP_SIZE: usize = 8192;
 
@@ -1184,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn optimize_table_merges_and_sorts_segments() -> Result<()> {
+    fn optimize_table_preserves_row_order() -> Result<()> {
         let tmp = tempfile::tempdir().unwrap();
         let table_dir = tmp.path().join("default").join("t");
         std::fs::create_dir_all(&table_dir)?;
@@ -1211,7 +1051,7 @@ mod tests {
 
         let segments = SegmentManager::discover_segments(&table_dir)?;
         assert_eq!(segments.len(), 1);
-        assert_eq!(read_ids(&segments[0])?, vec![1, 2, 3, 4]);
+        assert_eq!(read_ids(&segments[0])?, vec![3, 1, 4, 2]);
         Ok(())
     }
 
@@ -1327,8 +1167,57 @@ mod tests {
         );
         assert_eq!(
             read_ids(&table_dir.join("p2024_0003.dat"))?,
-            vec![1, 2, 3, 4]
+            vec![3, 1, 4, 2]
         );
+        Ok(())
+    }
+    #[test]
+    fn cleanup_fully_deleted_segments_removes_inactive_segment() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("default").join("t");
+        std::fs::create_dir_all(&table_dir)?;
+
+        let schema = test_schema();
+        let seg_path = table_dir.join("seg_00001.dat");
+        write_segment(&seg_path, &schema, &[(1, "a"), (2, "b")])?;
+
+        let segment_mgr = SegmentManager::new(tmp.path())?;
+        segment_mgr.rewrite_delete_footer(&seg_path, &[0b0000_0011], 2)?;
+        let removed = segment_mgr.cleanup_fully_deleted_segments("default", "t", &table_dir)?;
+
+        assert_eq!(removed, 1);
+        assert!(!seg_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_materializes_value_sets_in_rewritten_segment() -> Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_dir = tmp.path().join("default").join("t");
+        std::fs::create_dir_all(&table_dir)?;
+
+        let schema = test_schema();
+        write_segment(
+            &table_dir.join("seg_00001.dat"),
+            &schema,
+            &[(2, "b"), (1, "a")],
+        )?;
+        write_segment(&table_dir.join("seg_00002.dat"), &schema, &[(3, "c")])?;
+
+        let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+        let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
+        compactor.optimize_table("default", "t", &test_meta(&schema))?;
+
+        let segments = SegmentManager::discover_segments(&table_dir)?;
+        assert_eq!(segments.len(), 1);
+        let reader = SegmentReader::open(&segments[0])?;
+        let value_sets = reader.value_sets(0);
+        assert!(value_sets[0]
+            .as_ref()
+            .is_some_and(|values| values.len() == 3));
+        assert!(value_sets[1]
+            .as_ref()
+            .is_some_and(|values| values.len() == 3));
         Ok(())
     }
 }

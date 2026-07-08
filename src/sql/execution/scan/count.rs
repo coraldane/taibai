@@ -79,16 +79,19 @@ fn count_no_predicate(
     mut stats: Option<&mut HashMap<String, ScanStats>>,
 ) -> Result<()> {
     for seg_path in segment_files {
-        match segment_mgr.open_reader_cached(seg_path) {
-            Ok(reader) => {
-                let count = reader.row_count();
-                let deleted = reader.deleted_row_count();
-                *total_rows += count.saturating_sub(deleted);
+        match segment_mgr.segment_meta(seg_path)? {
+            Some(meta) => {
+                *total_rows += meta.row_count.saturating_sub(meta.deleted_row_count);
+            }
+            None => {
+                let reader = segment_mgr.open_reader_cached(seg_path)?;
+                *total_rows += reader
+                    .row_count()
+                    .saturating_sub(reader.deleted_row_count());
                 if let Some(ref mut s) = stats {
                     s.entry("count".to_string()).or_default().segments_opened += 1;
                 }
             }
-            Err(e) => return Err(e),
         }
     }
     Ok(())
@@ -106,11 +109,12 @@ fn count_with_single_eq(
     let pred = spec.to_row_group_predicate();
 
     for seg_path in segment_files {
-        let reader = segment_mgr.open_reader_cached(seg_path)?;
-
-        if !row_group::prune_segment_by_zone_map(&pred, reader.segment_zone_maps()) {
-            continue;
+        if let Some(meta) = segment_mgr.segment_meta(seg_path)? {
+            if !row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
+                continue;
+            }
         }
+        let reader = segment_mgr.open_reader_cached(seg_path)?;
 
         match reader.count_matching_rows_fast(col_idx, value) {
             Ok(count) => *total_rows += count,
@@ -139,11 +143,25 @@ fn count_with_predicates(
     let filter_columns = spec.all_predicate_columns();
 
     for seg_path in segment_files {
-        let reader = segment_mgr.open_reader_cached(seg_path)?;
-
-        if !row_group::prune_segment_by_zone_map(pred, reader.segment_zone_maps()) {
-            continue;
+        let meta = segment_mgr.segment_meta(seg_path)?;
+        if let Some(meta) = &meta {
+            if !row_group::prune_segment_by_zone_map(pred, &meta.segment_zone_maps) {
+                continue;
+            }
+            let prune_result = row_group::prune_row_group_meta(
+                &meta.row_groups,
+                pred,
+                bloom_checks,
+                in_checks,
+                set_checks,
+                set_in_checks,
+            );
+            if prune_result.candidate_indices.is_empty() {
+                continue;
+            }
         }
+
+        let reader = segment_mgr.open_reader_cached(seg_path)?;
 
         let prune_result = row_group::prune_row_groups(
             &reader,

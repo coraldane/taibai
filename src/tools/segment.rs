@@ -63,11 +63,10 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
     let file_created = metadata.created().ok();
     let file_modified = metadata.modified().ok();
 
-    if file_size < (SEGMENT_HEADER_SIZE as u64) + 8 {
+    if file_size < SEGMENT_HEADER_SIZE as u64 {
         return Err(TaibaiError::Storage(format!(
             "segment file too small: {} bytes (need >= {})",
-            file_size,
-            SEGMENT_HEADER_SIZE + 8
+            file_size, SEGMENT_HEADER_SIZE
         )));
     }
 
@@ -92,27 +91,21 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         )));
     }
 
-    let footer_data = if let Some(sidecar) = read_latest_sidecar_footer(path)? {
-        sidecar.footer
-    } else {
-        let mut footer_offset_buf = [0u8; 8];
-        tmp_file.seek(SeekFrom::End(-8))?;
-        tmp_file.read_exact(&mut footer_offset_buf)?;
-        let footer_offset = u64::from_le_bytes(footer_offset_buf);
-
-        if footer_offset < SEGMENT_HEADER_SIZE as u64 || footer_offset >= file_size - 8 {
-            return Err(TaibaiError::Storage(format!(
-                "invalid footer offset: {} (file size {}, header size {})",
-                footer_offset, file_size, SEGMENT_HEADER_SIZE
-            )));
-        }
-
-        let footer_size = (file_size - footer_offset - 8) as usize;
-        let mut footer_data = vec![0u8; footer_size];
-        tmp_file.seek(SeekFrom::Start(footer_offset))?;
-        tmp_file.read_exact(&mut footer_data)?;
-        footer_data
+    let Some(sidecar) = read_latest_sidecar_footer(path)? else {
+        return Err(TaibaiError::Storage(format!(
+            "missing segment meta sidecar for {}",
+            path.display()
+        )));
     };
+    if sidecar.data_end > file_size {
+        return Err(TaibaiError::Storage(format!(
+            "invalid sidecar data_end {} (file size {}, file: {})",
+            sidecar.data_end,
+            file_size,
+            path.display()
+        )));
+    }
+    let footer_data = sidecar.footer;
 
     let mut cursor = Cursor::new(footer_data.as_slice());
 
@@ -141,6 +134,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         let nullable = read_u8(&mut cursor)? != 0;
         let scale = read_u8(&mut cursor)? as i32;
         let precision = read_u8(&mut cursor)? as i32;
+        let column_id = read_u32_le(&mut cursor)?;
         columns.push(ColumnDef {
             name,
             data_type: DataType::from_u8(dtype_byte)?,
@@ -150,6 +144,8 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             auto_increment: false,
             primary_key: false,
             default_value: None,
+            column_id,
+            previous_names: Vec::new(),
         });
     }
     let schema = Schema::new(columns);

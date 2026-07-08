@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::catalog::schema::{PartitionType, TableMeta};
+use crate::storage::index::index_manager::UniqueRowLocation;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::pruning::ZoneMap;
 use crate::storage::partition::{
@@ -49,6 +50,7 @@ pub fn exec_delete(
 
     let mgr = engine.segment_mgr();
     let mut total_deleted: u64 = 0;
+    let mut unique_index_tombstones: Vec<UniqueRowLocation> = Vec::new();
     let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
     let predicate_projection = resolved_where_clause
         .as_ref()
@@ -119,6 +121,10 @@ pub fn exec_delete(
                             if matches
                                 && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
                             {
+                                unique_index_tombstones.push(UniqueRowLocation {
+                                    segment_path: seg_path.to_string_lossy().into_owned(),
+                                    row_id: row_id + i as u64,
+                                });
                                 newly_deleted += 1;
                             }
                         }
@@ -126,6 +132,10 @@ pub fn exec_delete(
                     } else {
                         for i in 0..rg_rows {
                             if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
+                                unique_index_tombstones.push(UniqueRowLocation {
+                                    segment_path: seg_path.to_string_lossy().into_owned(),
+                                    row_id: row_id + i,
+                                });
                                 newly_deleted += 1;
                             }
                         }
@@ -148,6 +158,16 @@ pub fn exec_delete(
     })?;
 
     if total_deleted > 0 {
+        let unique_index_tombstones = collect_unique_index_tombstones(&mgr, &table_dir)?;
+        for index in &table_meta.unique_indexes {
+            engine.index_manager().append_unique_index_tombstones(
+                db,
+                table,
+                &index.name,
+                unique_index_tombstones.clone(),
+            )?;
+        }
+
         let mut catalogs = engine.catalogs().write().unwrap();
         if let Some(catalog) = catalogs.get_mut(db) {
             if let Some(meta) = catalog.get_table_mut(table) {
@@ -161,6 +181,29 @@ pub fn exec_delete(
     Ok(ExecResult::Ok {
         rows_affected: total_deleted,
     })
+}
+
+fn collect_unique_index_tombstones(
+    mgr: &SegmentManager,
+    table_dir: &std::path::Path,
+) -> Result<Vec<UniqueRowLocation>> {
+    let mut tombstones = Vec::new();
+    for seg_path in SegmentManager::discover_segments(table_dir)? {
+        let reader = mgr.open_reader(&seg_path)?;
+        let bitmap = reader.delete_bitmap();
+        if bitmap.is_empty() {
+            continue;
+        }
+        for row_id in 0..reader.row_count() {
+            if delete_bitmap::is_deleted(bitmap, row_id) {
+                tombstones.push(UniqueRowLocation {
+                    segment_path: seg_path.to_string_lossy().into_owned(),
+                    row_id,
+                });
+            }
+        }
+    }
+    Ok(tombstones)
 }
 
 fn resolve_in_subqueries(
@@ -548,6 +591,9 @@ fn cluster_segment_range(
     mgr: &SegmentManager,
     bounds: &ClusterKeyBounds,
 ) -> Result<Option<(usize, usize)>> {
+    if !cluster_segment_zone_maps_are_ordered(segments, mgr, bounds.column_index)? {
+        return Ok(None);
+    }
     let start = match &bounds.lower {
         Some((value, inclusive)) => {
             let Some(start) = first_segment_with_max_at_least(
@@ -584,6 +630,29 @@ fn cluster_segment_range(
         None => segments.len().saturating_sub(1),
     };
     Ok(Some((start, end)))
+}
+
+fn cluster_segment_zone_maps_are_ordered(
+    segments: &[PathBuf],
+    mgr: &SegmentManager,
+    col_idx: usize,
+) -> Result<bool> {
+    let mut previous_max: Option<ScalarValue> = None;
+    for segment in segments {
+        let Some(zm) = segment_cluster_zone_map(mgr, segment, col_idx)? else {
+            return Ok(false);
+        };
+        if compare_scalars_for_sort(&zm.min_value, &zm.max_value) == std::cmp::Ordering::Greater {
+            return Ok(false);
+        }
+        if let Some(prev) = &previous_max {
+            if compare_scalars_for_sort(prev, &zm.min_value) == std::cmp::Ordering::Greater {
+                return Ok(false);
+            }
+        }
+        previous_max = Some(zm.max_value);
+    }
+    Ok(true)
 }
 
 fn first_segment_with_max_at_least(

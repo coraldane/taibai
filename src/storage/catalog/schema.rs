@@ -43,6 +43,9 @@ fn default_partition_key_idx() -> i32 {
 fn default_auto_increment_next_value() -> u64 {
     1
 }
+fn default_next_column_id() -> u32 {
+    1
+}
 
 /// Time-to-live policy for a table. Rows are visible while
 /// `column + duration_secs` is greater than the current time.
@@ -111,6 +114,12 @@ pub struct TableMeta {
     pub secondary_indexes: Vec<SecondaryIndexMeta>,
     #[serde(default = "default_auto_increment_next_value")]
     pub auto_increment_next_value: u64,
+    #[serde(default = "default_next_column_id")]
+    pub next_column_id: u32,
+    #[serde(default)]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub dropped_columns: Vec<ColumnDef>,
 }
 
 impl TableMeta {
@@ -119,7 +128,7 @@ impl TableMeta {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        Self {
+        let mut meta = Self {
             name: name.to_string(),
             database: database.to_string(),
             columns,
@@ -137,7 +146,39 @@ impl TableMeta {
             unique_indexes: Vec::new(),
             secondary_indexes: Vec::new(),
             auto_increment_next_value: 1,
+            next_column_id: 1,
+            schema_version: 1,
+            dropped_columns: Vec::new(),
+        };
+        meta.ensure_column_ids();
+        meta
+    }
+
+    pub fn ensure_column_ids(&mut self) {
+        let mut max_id = self.next_column_id.saturating_sub(1);
+        for column in self.columns.iter().chain(self.dropped_columns.iter()) {
+            max_id = max_id.max(column.column_id);
         }
+        for column in &mut self.columns {
+            if column.column_id == 0 {
+                max_id = max_id.saturating_add(1);
+                column.column_id = max_id;
+            }
+        }
+        self.next_column_id = max_id.saturating_add(1).max(1);
+    }
+
+    fn assign_column_id(&mut self, column: &mut ColumnDef) {
+        if column.column_id == 0 {
+            column.column_id = self.next_column_id.max(1);
+            self.next_column_id = column.column_id.saturating_add(1);
+        } else {
+            self.next_column_id = self.next_column_id.max(column.column_id.saturating_add(1));
+        }
+    }
+
+    fn bump_schema_version(&mut self) {
+        self.schema_version = self.schema_version.saturating_add(1).max(1);
     }
 
     pub fn update_partition_key_idx(&mut self) {
@@ -411,6 +452,7 @@ impl DatabaseCatalog {
                 table.update_partition_key_idx();
                 table.update_ttl_column_idx();
                 table.ensure_auto_increment_next_value();
+                table.ensure_column_ids();
             }
             Ok(catalog)
         } else if let Some(catalog) = Self::load_legacy_catalog(meta_dir, db_name)? {
@@ -467,6 +509,7 @@ impl DatabaseCatalog {
             table.database = db_name.to_string();
             table.update_partition_key_idx();
             table.update_ttl_column_idx();
+            table.ensure_column_ids();
         }
         Ok(Some(catalog))
     }
@@ -518,7 +561,7 @@ impl DatabaseCatalog {
         Ok(())
     }
 
-    pub fn add_column(&mut self, table_name: &str, column: ColumnDef) -> Result<()> {
+    pub fn add_column(&mut self, table_name: &str, mut column: ColumnDef) -> Result<()> {
         let table = self
             .tables
             .get_mut(table_name)
@@ -529,7 +572,9 @@ impl DatabaseCatalog {
                 column.name, table_name
             )));
         }
+        table.assign_column_id(&mut column);
         table.columns.push(column);
+        table.bump_schema_version();
         Ok(())
     }
 
@@ -548,7 +593,10 @@ impl DatabaseCatalog {
                     column_name, table_name
                 ))
             })?;
-        table.columns.remove(idx);
+        let mut dropped = table.columns.remove(idx);
+        dropped.previous_names.clear();
+        table.dropped_columns.push(dropped);
+        table.bump_schema_version();
         if table.columns.iter().all(|c| !c.auto_increment) {
             table.auto_increment_next_value = 1;
         }
@@ -560,6 +608,7 @@ impl DatabaseCatalog {
             table.ttl = None;
         } else {
             table.update_ttl_column_idx();
+            table.ensure_column_ids();
         }
         table.update_partition_key_idx();
         Ok(())
@@ -591,7 +640,15 @@ impl DatabaseCatalog {
                     old_name, table_name
                 ))
             })?;
+        if !col
+            .previous_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&col.name))
+        {
+            col.previous_names.push(col.name.clone());
+        }
         col.name = new_name.to_string();
+        table.bump_schema_version();
         table.update_ttl_column_idx();
         Ok(())
     }
@@ -621,6 +678,7 @@ impl DatabaseCatalog {
         col.data_type = data_type;
         col.scale = scale;
         col.precision = precision;
+        table.bump_schema_version();
         Ok(())
     }
 }

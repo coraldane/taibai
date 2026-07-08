@@ -50,6 +50,7 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
         let nullable = read_u8(&mut cursor)? != 0;
         let scale = read_u8(&mut cursor)? as i32;
         let precision = read_u8(&mut cursor)? as i32;
+        let column_id = read_u32_le(&mut cursor)?;
         columns.push(ColumnDef {
             name,
             data_type: DataType::from_u8(dtype_byte)?,
@@ -59,6 +60,8 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
             auto_increment: false,
             primary_key: false,
             default_value: None,
+            column_id,
+            previous_names: Vec::new(),
         });
     }
     let schema = Schema::new(columns);
@@ -225,6 +228,7 @@ pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
         let _nullable = read_u8(&mut cursor)?;
         let _scale = read_u8(&mut cursor)?;
         let _precision = read_u8(&mut cursor)?;
+        let _column_id = read_u32_le(&mut cursor)?;
     }
 
     let has_seg_zm = read_u8(&mut cursor).unwrap_or(0);
@@ -314,7 +318,7 @@ mod tests {
     fn parses_footer_with_u8_decimal_meta() {
         let mut footer = Vec::new();
         footer.extend_from_slice(&SEGMENT_MAGIC.to_le_bytes());
-        footer.extend_from_slice(&1u32.to_le_bytes());
+        footer.extend_from_slice(&crate::storage::segment::SEGMENT_VERSION.to_le_bytes());
         footer.extend_from_slice(&0u64.to_le_bytes());
         footer.extend_from_slice(&1u64.to_le_bytes());
         footer.extend_from_slice(&1u32.to_le_bytes());
@@ -329,6 +333,7 @@ mod tests {
         footer.push(0);
         footer.push(0);
         footer.push(0);
+        footer.extend_from_slice(&1u32.to_le_bytes());
 
         footer.extend_from_slice(&32u64.to_le_bytes());
         footer.extend_from_slice(&8u64.to_le_bytes());
@@ -368,6 +373,8 @@ mod tests {
             auto_increment: false,
             primary_key: false,
             default_value: None,
+            column_id: 1,
+            previous_names: Vec::new(),
         }]);
         let row_groups = vec![
             RowGroupMeta {

@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::common::error::Result;
 use crate::storage::core::memtable::{MemTableManager, MemTableState};
@@ -11,6 +12,21 @@ use crate::types::batch::{RecordBatch, Schema};
 const DEFAULT_MAX_ROWS_PER_MEMTABLE: u64 = 500_000;
 const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 const DEFAULT_MAX_TOTAL_MEMORY: u64 = 512 * 1024 * 1024;
+
+fn insert_profile_enabled() -> bool {
+    matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
+    if insert_profile_enabled() {
+        eprintln!(
+            "[insert-profile] stage={} rows={} elapsed_us={}",
+            stage,
+            rows,
+            elapsed.as_micros()
+        );
+    }
+}
 
 enum WriteCommand {
     WriteColumns {
@@ -151,10 +167,18 @@ impl BatchWriter {
         if row_count == 0 {
             return Ok(0);
         }
+        let get_start = Instant::now();
         let mt =
             self.memtable_mgr
                 .get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
-        mt.append(&batch)?;
+        log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
+        let append_start = Instant::now();
+        mt.append_owned(batch)?;
+        log_insert_profile(
+            "memtable_append",
+            row_count as usize,
+            append_start.elapsed(),
+        );
 
         if txn_id == 0 && mt.row_count() >= self.config.max_rows_per_memtable {
             let _ = self.sender.try_send(WriteCommand::Flush {
@@ -167,14 +191,13 @@ impl BatchWriter {
 
     pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
         let committed_mts = self.memtable_mgr.commit_txn(txn_id);
-        let rows_flushed = committed_mts.len();
-        for mt in &committed_mts {
-            if mt.row_count() > 0 {
-                Self::flush_memtable(&self.segment_mgr, mt)?;
-            }
-        }
+        let rows_committed = committed_mts.iter().map(|mt| mt.row_count()).sum::<u64>();
         self.segment_mgr.commit_txn(txn_id)?;
-        tracing::debug!(txn_id, rows_flushed, "transaction committed and flushed");
+        tracing::debug!(
+            txn_id,
+            rows_committed,
+            "transaction committed to visible memtables"
+        );
         Ok(())
     }
 
@@ -249,14 +272,7 @@ impl BatchWriter {
                     }
                 }
                 Ok(WriteCommand::TxnCommit { txn_id }) => {
-                    let committed_mts = memtable_mgr.commit_txn(txn_id);
-                    for mt in committed_mts {
-                        if mt.row_count() > 0 {
-                            if let Err(e) = Self::flush_memtable(&segment_mgr, &mt) {
-                                tracing::warn!(error = %e, txn_id, "failed to flush memtable on commit");
-                            }
-                        }
-                    }
+                    memtable_mgr.commit_txn(txn_id);
                     if let Err(e) = segment_mgr.commit_txn(txn_id) {
                         tracing::warn!(error = %e, txn_id, "failed to commit transaction in storage");
                     }
@@ -296,7 +312,7 @@ impl BatchWriter {
             return Ok(());
         }
         mt.set_state(MemTableState::Flushing);
-        let batch = match mt.read() {
+        let batch = match mt.take_batch() {
             Some(b) if b.num_rows() > 0 => b,
             _ => {
                 mt.set_state(MemTableState::Flushed);
@@ -310,18 +326,31 @@ impl BatchWriter {
         let table_dir = segment_mgr.table_dir(&db, &table);
         std::fs::create_dir_all(&table_dir)?;
 
-        if txn_id > 0 {
-            segment_mgr.write_txn_wal(&table_dir, txn_id, &batch)?;
-        }
+        let write_result = (|| -> Result<()> {
+            if txn_id > 0 {
+                segment_mgr.write_txn_wal(&table_dir, txn_id, &batch)?;
+            }
 
-        if partition_key.is_empty() {
-            segment_mgr.bulk_insert_batch(&db, &table, batch, true)?;
-        } else {
-            segment_mgr.bulk_insert_batch_with_partition(&db, &table, &partition_key, batch)?;
-        }
+            if partition_key.is_empty() {
+                segment_mgr.bulk_insert_batch_ref(&db, &table, &batch, true)?;
+            } else {
+                segment_mgr.bulk_insert_batch_with_partition_ref(
+                    &db,
+                    &table,
+                    &partition_key,
+                    &batch,
+                )?;
+            }
 
-        if txn_id > 0 {
-            segment_mgr.sync_table_wal(&table_dir)?;
+            if txn_id > 0 {
+                segment_mgr.sync_table_wal(&table_dir)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            mt.restore_batch(batch);
+            mt.set_state(MemTableState::Pending);
+            return Err(e);
         }
 
         tracing::debug!(

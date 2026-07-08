@@ -26,7 +26,7 @@ fn batch(start: i64, rows: i64) -> RecordBatch {
 }
 
 #[test]
-fn active_flush_writes_sidecar_without_dat_footer() {
+fn active_flush_writes_sidecar_and_dat_footer() {
     let dir = TempDir::new().unwrap();
     let mgr = SegmentManager::new(dir.path()).unwrap();
 
@@ -43,10 +43,7 @@ fn active_flush_writes_sidecar_without_dat_footer() {
 
     let reader = SegmentReader::open(seg_path).unwrap();
     assert_eq!(reader.row_count(), 3);
-    assert_eq!(
-        std::fs::metadata(seg_path).unwrap().len(),
-        reader.data_end()
-    );
+    assert!(std::fs::metadata(seg_path).unwrap().len() > reader.data_end());
 }
 
 #[test]
@@ -157,7 +154,7 @@ fn sidecar_compaction_replaces_journal_with_full_snapshot() {
 }
 
 #[test]
-fn seal_merges_sidecar_back_into_dat_footer() {
+fn seal_writes_sidecar_and_dat_footer() {
     let dir = TempDir::new().unwrap();
     let mgr = SegmentManager::with_config(
         dir.path(),
@@ -175,13 +172,15 @@ fn seal_merges_sidecar_back_into_dat_footer() {
     let segments = SegmentManager::discover_segments(&table_dir).unwrap();
     let seg_path = &segments[0];
     assert!(sidecar_meta_path(seg_path).exists());
+    let len_before_seal = std::fs::metadata(seg_path).unwrap().len();
 
     mgr.flush_all_active().unwrap();
 
-    assert!(!sidecar_meta_path(seg_path).exists());
+    assert!(sidecar_meta_path(seg_path).exists());
     let reader = SegmentReader::open(seg_path).unwrap();
     assert_eq!(reader.row_count(), 3);
-    assert!(std::fs::metadata(seg_path).unwrap().len() > reader.data_end());
+    assert_eq!(std::fs::metadata(seg_path).unwrap().len(), len_before_seal);
+    assert!(len_before_seal > reader.data_end());
 }
 
 #[test]

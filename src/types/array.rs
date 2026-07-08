@@ -663,6 +663,87 @@ impl ColumnArray {
         Ok(())
     }
 
+    pub fn push_null_value(&mut self) {
+        match self {
+            ColumnArray::Bool { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Int8 { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Int16 { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Int32 { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Int64 { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::UInt8 { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::UInt16 { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::UInt32 { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::UInt64 { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Float32 { data, bitmap } => {
+                data.push(0.0);
+                bitmap.push_null();
+            }
+            ColumnArray::Float64 { data, bitmap } => {
+                data.push(0.0);
+                bitmap.push_null();
+            }
+            ColumnArray::Decimal { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Date { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Time { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Timestamp { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::Interval { data, bitmap } => {
+                data.push(0);
+                bitmap.push_null();
+            }
+            ColumnArray::VarChar { data, bitmap } => {
+                data.push(String::new());
+                bitmap.push_null();
+            }
+            ColumnArray::Blob { data, bitmap } => {
+                data.push(Vec::new());
+                bitmap.push_null();
+            }
+            ColumnArray::Vector { data, bitmap } => {
+                data.push(Vec::new());
+                bitmap.push_null();
+            }
+        }
+    }
+
     /// Build a ColumnArray from a slice of ScalarValues.
     /// All values must match the requested DataType.
     pub fn from_scalar_values(dt: DataType, values: &[ScalarValue]) -> Result<Self> {

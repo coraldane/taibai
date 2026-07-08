@@ -19,7 +19,10 @@ use crate::storage::bulk_payload::{
 };
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
-use crate::storage::segment::meta::remove_sidecar_meta;
+use crate::storage::segment::meta::{
+    append_sidecar_footer, read_latest_segment_meta, read_latest_sidecar_footer,
+    remove_sidecar_meta, sidecar_meta_path, SegmentMetaSnapshot,
+};
 use crate::storage::segment::{
     encode_segment_header, store, SegmentReader, SegmentWriter, SEGMENT_HEADER_SIZE,
 };
@@ -38,7 +41,7 @@ use config::{
 };
 use helpers::{
     discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
-    is_transient_footer_error,
+    is_transient_footer_error, slice_batch_fast,
 };
 use reader_cache::ReaderCache;
 use state::TableSegmentState;
@@ -287,6 +290,25 @@ impl SegmentManager {
             .collect())
     }
 
+    pub fn cleanup_fully_deleted_segments(
+        &self,
+        db: &str,
+        table: &str,
+        table_dir: &Path,
+    ) -> Result<u64> {
+        self.with_table_mutation_lock(db, table, || {
+            let mut removed = 0u64;
+            for path in self.discover_inactive_segments(db, table, table_dir)? {
+                let reader = self.open_reader_cached(&path)?;
+                if reader.row_count() > 0 && reader.deleted_row_count() >= reader.row_count() {
+                    self.remove_segment_file(&path)?;
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        })
+    }
+
     pub fn find_unsealed_segment(
         table_dir: &Path,
         min_seal_size: u64,
@@ -435,12 +457,40 @@ impl SegmentManager {
         path: &Path,
         col_idx: usize,
     ) -> Option<crate::storage::partition::pruning::ZoneMap> {
+        if let Some(meta) = self.segment_meta(path).ok().flatten() {
+            let zm = meta.segment_zone_maps.get(col_idx)?;
+            if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
+                return None;
+            }
+            return Some(zm.clone());
+        }
         let reader = self.open_reader_cached(path).ok()?;
         let zm = reader.segment_zone_maps().get(col_idx)?;
         if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
             return None;
         }
         Some(zm.clone())
+    }
+
+    pub fn segment_meta(&self, path: &Path) -> Result<Option<SegmentMetaSnapshot>> {
+        if self.is_mutable_segment_path(path) {
+            return Ok(None);
+        }
+        if let Some(meta) = read_latest_segment_meta(path)? {
+            return Ok(Some(meta));
+        }
+        match SegmentReader::open(path) {
+            Ok(reader) => Ok(Some(SegmentMetaSnapshot {
+                data_end: reader.data_end(),
+                schema: reader.schema().clone(),
+                row_count: reader.row_count(),
+                row_groups: reader.footer_row_groups_info(),
+                delete_bitmap: reader.delete_bitmap().to_vec(),
+                deleted_row_count: reader.deleted_row_count(),
+                segment_zone_maps: reader.segment_zone_maps().to_vec(),
+            })),
+            Err(_) => Ok(None),
+        }
     }
 
     pub fn remove_segment_file(&self, path: &Path) -> Result<()> {
@@ -463,12 +513,39 @@ impl SegmentManager {
             )));
         }
 
+        let tmp_meta = sidecar_meta_path(tmp_path);
+        let final_meta = sidecar_meta_path(final_path);
+        let final_legacy_meta = final_path.with_extension("meta");
+        let shared_final_meta = final_meta != final_legacy_meta;
+        if final_meta.exists() && !shared_final_meta {
+            return Err(TaibaiError::Storage(format!(
+                "segment meta target already exists: {}",
+                final_meta.display()
+            )));
+        }
+        let replacement_meta = read_latest_sidecar_footer(tmp_path)?.ok_or_else(|| {
+            TaibaiError::Storage(format!(
+                "missing segment meta sidecar for replacement: {}",
+                tmp_meta.display()
+            ))
+        })?;
+
         std::fs::rename(tmp_path, final_path)?;
         for old_seg in old_segments {
             if old_seg != final_path {
                 self.remove_segment_file(old_seg)?;
             }
         }
+
+        if final_meta.exists() {
+            std::fs::remove_file(&final_meta)?;
+        }
+        append_sidecar_footer(
+            final_path,
+            replacement_meta.data_end,
+            &replacement_meta.footer,
+        )?;
+        remove_sidecar_meta(tmp_path)?;
         let _ = self.open_reader_cached(final_path);
         Ok(())
     }
@@ -678,6 +755,16 @@ impl SegmentManager {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, "", &batch, true)
+    }
+
+    pub fn bulk_insert_batch_ref(
+        &self,
+        db: &str,
+        table: &str,
+        batch: &RecordBatch,
+        _disable_wal: bool,
+    ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
     }
 
@@ -688,7 +775,7 @@ impl SegmentManager {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, false)
+        self.bulk_insert_batch_with_partition_inner(db, table, "", &batch, false)
     }
 
     pub fn bulk_insert_batch_with_partition(
@@ -697,6 +784,16 @@ impl SegmentManager {
         table: &str,
         partition_key: &str,
         batch: RecordBatch,
+    ) -> Result<u64> {
+        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, &batch, true)
+    }
+
+    pub fn bulk_insert_batch_with_partition_ref(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: &RecordBatch,
     ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, true)
     }
@@ -708,7 +805,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: RecordBatch,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, false)
+        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, &batch, false)
     }
 
     fn bulk_insert_batch_with_partition_inner(
@@ -716,7 +813,7 @@ impl SegmentManager {
         db: &str,
         table: &str,
         partition_key: &str,
-        batch: RecordBatch,
+        batch: &RecordBatch,
         flush_immediately: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
@@ -748,6 +845,15 @@ impl SegmentManager {
             } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
                 seg.flush_buffer(&|path| self.invalidate_reader(path))?;
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            } else if !flush_immediately {
+                if seg.buffered_rows > 0 {
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                }
+            } else if seg.buffered_rows > 0 {
+                seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
+            } else {
+                seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
             }
         }
 
@@ -1406,7 +1512,7 @@ impl SegmentManager {
                 db,
                 table,
                 "",
-                batch,
+                &batch,
                 flush_immediately,
             );
         }
@@ -1418,11 +1524,73 @@ impl SegmentManager {
                     db,
                     table,
                     "",
-                    batch,
+                    &batch,
                     flush_immediately,
                 )
             }
         };
+        let partition_strategy = table_meta.partition_strategy();
+        let first_val = batch.scalar(0, pk_idx).unwrap_or(ScalarValue::Int64(None));
+        let first_key = compute_partition_key_from_scalar(&partition_strategy, &first_val);
+        let mut single_partition = true;
+        for row_idx in 1..batch.num_rows() {
+            let val = batch
+                .scalar(row_idx, pk_idx)
+                .unwrap_or(ScalarValue::Int64(None));
+            let key = compute_partition_key_from_scalar(&partition_strategy, &val);
+            if key != first_key {
+                single_partition = false;
+                break;
+            }
+        }
+        if single_partition {
+            return self.bulk_insert_batch_with_partition_inner(
+                db,
+                table,
+                &first_key,
+                &batch,
+                flush_immediately,
+            );
+        }
+
+        let mut ranges: Vec<(String, usize, usize)> = Vec::new();
+        let mut contiguous = true;
+        let mut current_key = first_key.clone();
+        let mut current_start = 0usize;
+        let mut seen_keys = HashSet::new();
+        seen_keys.insert(first_key.clone());
+        for row_idx in 1..batch.num_rows() {
+            let val = batch
+                .scalar(row_idx, pk_idx)
+                .unwrap_or(ScalarValue::Int64(None));
+            let key = compute_partition_key_from_scalar(&partition_strategy, &val);
+            if key != current_key {
+                if seen_keys.contains(&key) {
+                    contiguous = false;
+                    break;
+                }
+                ranges.push((current_key, current_start, row_idx - current_start));
+                seen_keys.insert(key.clone());
+                current_key = key;
+                current_start = row_idx;
+            }
+        }
+        if contiguous {
+            ranges.push((current_key, current_start, batch.num_rows() - current_start));
+            let mut written = 0;
+            for (partition_key, start, len) in ranges {
+                let part_batch = slice_batch_fast(&batch, start, len)?;
+                written += self.bulk_insert_batch_with_partition_inner(
+                    db,
+                    table,
+                    &partition_key,
+                    &part_batch,
+                    flush_immediately,
+                )?;
+            }
+            return Ok(written);
+        }
+
         let mut key_order = Vec::new();
         let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
         for row_idx in 0..batch.num_rows() {
@@ -1450,11 +1618,47 @@ impl SegmentManager {
                 db,
                 table,
                 &partition_key,
-                part_batch,
+                &part_batch,
                 flush_immediately,
             )?;
         }
         Ok(written)
+    }
+
+    pub fn flush_table_active(&self, db: &str, table: &str) -> Result<u64> {
+        let table_dir = self.table_dir(db, table);
+
+        let key = table_key(db, table);
+        let mut total = 0u64;
+        let tables = self.tables.read().unwrap();
+        if let Some(state) = tables.get(&key) {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            let keys_to_seal: Vec<String> = active_guard
+                .iter()
+                .filter(|(_, seg)| {
+                    seg.total_rows > 0 && seg.current_size >= self.min_segment_seal_size()
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            for key in keys_to_seal {
+                if let Some(seg) = active_guard.get_mut(&key) {
+                    seg.seal(&|path| self.invalidate_reader(path))?;
+                    total += seg.total_rows;
+                }
+                active_guard.remove(&key);
+            }
+
+            for (_, seg) in active_guard.iter_mut() {
+                if seg.total_rows > 0 || seg.buffered_rows > 0 {
+                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+                    seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                    total += seg.total_rows;
+                }
+            }
+        }
+        self.clear_wal(&table_dir)?;
+        Ok(total)
     }
 
     pub fn flush_all_active(&self) -> Result<u64> {
@@ -1474,10 +1678,7 @@ impl SegmentManager {
 
             for key in keys_to_seal {
                 if let Some(seg) = active_guard.get_mut(&key) {
-                    seg.flush_buffer(&|path| self.invalidate_reader(path))?;
-                    seg.write_final_footer()?;
-                    remove_sidecar_meta(&seg.path)?;
-                    self.invalidate_reader(&seg.path);
+                    seg.seal(&|path| self.invalidate_reader(path))?;
                     tracing::info!(
                         path = %seg.path.display(),
                         size_mb = seg.current_size / (1024 * 1024),
@@ -1485,7 +1686,6 @@ impl SegmentManager {
                         partition_key = key,
                         "sealing segment on flush (meets minimum size threshold)"
                     );
-                    seg.finalize()?;
                     total += seg.total_rows;
                 }
                 active_guard.remove(&key);

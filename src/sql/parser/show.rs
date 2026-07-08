@@ -30,6 +30,37 @@ impl Parser {
                 let table = self.parse_object_name()?;
                 Ok(Statement::ShowColumns { table })
             }
+            Token::Ident(word) if word.eq_ignore_ascii_case("UNIQUE") => {
+                self.advance();
+                match self.peek() {
+                    Token::Ident(word)
+                        if word.eq_ignore_ascii_case("INDEX")
+                            || word.eq_ignore_ascii_case("INDEXES") =>
+                    {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(TaibaiError::Sql(format!(
+                            "expected INDEX after SHOW UNIQUE, got {}",
+                            other
+                        )))
+                    }
+                }
+                match self.peek() {
+                    Token::Ident(word) if word.eq_ignore_ascii_case("STATUS") => {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(TaibaiError::Sql(format!(
+                            "expected STATUS after SHOW UNIQUE INDEX, got {}",
+                            other
+                        )))
+                    }
+                }
+                self.expect(&Token::From)?;
+                let table = self.parse_object_name()?;
+                Ok(Statement::ShowUniqueIndexStatus { table })
+            }
             Token::Ident(word)
                 if word.eq_ignore_ascii_case("INDEX") || word.eq_ignore_ascii_case("INDEXES") =>
             {
@@ -159,6 +190,50 @@ impl Parser {
             None
         };
         Ok(Statement::OptimizeTable { table, partition })
+    }
+
+    pub fn parse_rebuild(&mut self) -> Result<Statement> {
+        self.expect(&Token::Rebuild)?;
+        match self.peek() {
+            Token::Ident(word) if word.eq_ignore_ascii_case("UNIQUE") => self.advance(),
+            other => {
+                return Err(TaibaiError::Sql(format!(
+                    "expected UNIQUE after REBUILD, got {}",
+                    other
+                )))
+            }
+        };
+        match self.peek() {
+            Token::Ident(word)
+                if word.eq_ignore_ascii_case("INDEX") || word.eq_ignore_ascii_case("INDEXES") =>
+            {
+                self.advance();
+            }
+            other => {
+                return Err(TaibaiError::Sql(format!(
+                    "expected INDEX after REBUILD UNIQUE, got {}",
+                    other
+                )))
+            }
+        }
+        let index_name = if matches!(self.peek(), Token::Ident(word) if !word.eq_ignore_ascii_case("ON"))
+        {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        match self.peek() {
+            Token::On => self.advance(),
+            Token::Ident(word) if word.eq_ignore_ascii_case("ON") => self.advance(),
+            other => {
+                return Err(TaibaiError::Sql(format!(
+                    "expected ON after REBUILD UNIQUE INDEX, got {}",
+                    other
+                )))
+            }
+        };
+        let table = self.parse_object_name()?;
+        Ok(Statement::RebuildUniqueIndex { table, index_name })
     }
 
     pub fn parse_pause(&mut self) -> Result<Statement> {

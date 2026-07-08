@@ -4,13 +4,13 @@ members = [
     "examples/batch_import",
     "examples/multi_insert",
     "examples/prepare_test",
-    "examples/stock_topn_query",
 ]
 
 [package]
 name = "taibai"
-version = "0.1.3"
+version = "0.1.5"
 edition = "2021"
+autotests = false
 description = "A columnar database server wire-compatible with taibai-go"
 
 [lib]
@@ -58,3 +58,63 @@ tempfile = "3"
 
 [build-dependencies]
 chrono = "0.4"
+
+[[test]]
+name = "concurrency_stability_test"
+path = "tests/concurrency_stability_test.rs"
+
+[[test]]
+name = "constraints_test"
+path = "tests/constraints_test.rs"
+
+[[test]]
+name = "data_types_test"
+path = "tests/data_types_test.rs"
+
+[[test]]
+name = "delete_test"
+path = "tests/delete_test.rs"
+
+[[test]]
+name = "join_scan_spec_test"
+path = "tests/join_scan_spec_test.rs"
+
+[[test]]
+name = "multi_database_test"
+path = "tests/multi_database_test.rs"
+
+[[test]]
+name = "partition_cluster_test"
+path = "tests/partition_cluster_test.rs"
+
+[[test]]
+name = "query_predicate_test"
+path = "tests/query_predicate_test.rs"
+
+[[test]]
+name = "scalar_functions_test"
+path = "tests/scalar_functions_test.rs"
+
+[[test]]
+name = "secondary_index_test"
+path = "tests/secondary_index_test.rs"
+
+[[test]]
+name = "segment_sequence_test"
+path = "tests/segment_sequence_test.rs"
+
+[[test]]
+name = "segment_sidecar_meta_test"
+path = "tests/segment_sidecar_meta_test.rs"
+
+[[test]]
+name = "topn_offset_test"
+path = "tests/topn_offset_test.rs"
+
+[[test]]
+name = "transaction_integration_test"
+path = "tests/transaction_integration_test.rs"
+
+[[test]]
+name = "dml_modify_integration_test"
+path = "tests/update_test.rs"

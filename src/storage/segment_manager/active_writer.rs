@@ -9,7 +9,6 @@ use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::meta::{
     append_sidecar_footer, append_sidecar_row_groups, compact_sidecar_footer_if_needed,
-    remove_sidecar_meta,
 };
 use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
 use crate::storage::segment::{encode_segment_footer, RowGroupMeta};
@@ -268,6 +267,11 @@ impl ActiveSegmentWriter {
         self.file.get_ref().sync_all()?;
 
         let footer = self.encode_footer()?;
+        self.file.write_all(&footer)?;
+        self.file.write_all(&self.data_end.to_le_bytes())?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+
         if self.sidecar_row_groups_flushed == 0
             || self.sidecar_row_groups_flushed > self.row_groups.len()
         {
@@ -300,7 +304,7 @@ impl ActiveSegmentWriter {
             );
         }
 
-        self.current_size = self.data_end;
+        self.current_size = self.data_end + footer.len() as u64 + 8;
         self.sidecar_row_groups_flushed = self.row_groups.len();
         self.dirty_meta = false;
         invalidate_reader(&self.path);
@@ -317,9 +321,8 @@ impl ActiveSegmentWriter {
 
     pub(super) fn seal(&mut self, invalidate_reader: &dyn Fn(&Path)) -> Result<()> {
         self.flush_buffer(invalidate_reader)?;
-        self.write_final_footer()?;
+        self.flush_meta(invalidate_reader)?;
         self.finalize()?;
-        remove_sidecar_meta(&self.path)?;
         invalidate_reader(&self.path);
 
         tracing::info!(
@@ -333,16 +336,26 @@ impl ActiveSegmentWriter {
         Ok(())
     }
 
+    pub(super) fn flush_visible_footer(&mut self, invalidate_reader: &dyn Fn(&Path)) -> Result<()> {
+        if !self.dirty_meta {
+            return Ok(());
+        }
+
+        self.flush_meta(invalidate_reader)
+    }
+
     pub(super) fn write_final_footer(&mut self) -> Result<()> {
         self.file.flush()?;
         self.file.get_ref().set_len(self.data_end)?;
         self.file.seek(SeekFrom::Start(self.data_end))?;
+        self.file.get_ref().sync_all()?;
 
         let footer = self.encode_footer()?;
         self.file.write_all(&footer)?;
         self.file.write_all(&self.data_end.to_le_bytes())?;
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
+        append_sidecar_footer(&self.path, self.data_end, &footer)?;
 
         self.current_size = self.data_end + footer.len() as u64 + 8;
         self.sidecar_row_groups_flushed = self.row_groups.len();
