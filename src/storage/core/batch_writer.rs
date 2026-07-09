@@ -341,7 +341,7 @@ impl BatchWriter {
             return Ok(());
         }
         mt.set_state(MemTableState::Flushing);
-        let batch = match mt.take_batch() {
+        let batch = match mt.read_snapshot() {
             Some(b) if b.num_rows() > 0 => b,
             _ => {
                 mt.set_state(MemTableState::Flushed);
@@ -377,7 +377,6 @@ impl BatchWriter {
             Ok(())
         })();
         if let Err(e) = write_result {
-            mt.restore_batch(batch);
             mt.set_state(MemTableState::Pending);
             return Err(e);
         }
@@ -388,6 +387,7 @@ impl BatchWriter {
             txn_id,
             "memtable flushed to active segment"
         );
+        let _ = mt.take_batch();
         mt.set_state(MemTableState::Flushed);
         Ok(())
     }

@@ -92,7 +92,7 @@ pub fn prune_segments_by_partition(
         .collect()
 }
 
-fn extract_partition_eq_value(
+pub(crate) fn extract_partition_eq_value(
     spec: &ScanSpec,
     pi: &PartitionScanInfo,
     meta: &TableMeta,
@@ -102,7 +102,7 @@ fn extract_partition_eq_value(
     scalar_to_partition_key(val, meta)
 }
 
-fn scalar_to_partition_key(value: &ScalarValue, meta: &TableMeta) -> Option<String> {
+pub(crate) fn scalar_to_partition_key(value: &ScalarValue, meta: &TableMeta) -> Option<String> {
     match meta.partition_type {
         crate::storage::catalog::schema::PartitionType::Day => {
             crate::storage::partition::compute_partition_key(value, PartitionStrategy::Day).ok()

@@ -7,13 +7,14 @@ use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
 use crate::storage::catalog::auto_increment::AutoIncrementCounter;
 use crate::storage::index::index_manager::{UniqueIndexEntry, UniqueRowLocation};
+use crate::storage::index::sort_key::SortKeyInserter;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::eval_expr_to_scalar_with_scale_timezone;
+use super::helpers::{eval_expr_to_scalar_with_scale_timezone, sort_batch_by_key};
 use crate::sql::parser::ast::Expr;
 
 lazy_static::lazy_static! {
@@ -1386,9 +1387,7 @@ fn write_batch_by_partition(
     txn_id: u64,
 ) -> Result<()> {
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
-        engine
-            .batch_writer()
-            .write_columns_with_txn(db, table, "", batch, schema, txn_id)?;
+        write_partition_batch(engine, db, table, table_meta, "", batch, schema, txn_id)?;
         return Ok(());
     }
 
@@ -1400,9 +1399,11 @@ fn write_batch_by_partition(
         partition_start.elapsed(),
     );
     if let Some(partition_key) = single_partition {
-        engine.batch_writer().write_columns_with_txn(
+        write_partition_batch(
+            engine,
             db,
             table,
+            table_meta,
             &partition_key,
             batch,
             schema,
@@ -1414,9 +1415,11 @@ fn write_batch_by_partition(
     if let Some(ranges) = partition_ranges_if_contiguous(table_meta, &batch) {
         for (partition_key, start, end) in ranges {
             let part_batch = slice_batch_fast(&batch, start, end)?;
-            engine.batch_writer().write_columns_with_txn(
+            write_partition_batch(
+                engine,
                 db,
                 table,
+                table_meta,
                 &partition_key,
                 part_batch,
                 schema.clone(),
@@ -1432,9 +1435,11 @@ fn write_batch_by_partition(
             .first()
             .map(|(key, _)| key.clone())
             .unwrap_or_default();
-        engine.batch_writer().write_columns_with_txn(
+        write_partition_batch(
+            engine,
             db,
             table,
+            table_meta,
             &partition_key,
             batch,
             schema,
@@ -1446,9 +1451,11 @@ fn write_batch_by_partition(
     for (partition_key, mask) in groups {
         let match_count = mask.iter().filter(|keep| **keep).count();
         let part_batch = filter_batch_by_mask(&batch, &mask, match_count)?;
-        engine.batch_writer().write_columns_with_txn(
+        write_partition_batch(
+            engine,
             db,
             table,
+            table_meta,
             &partition_key,
             part_batch,
             schema.clone(),
@@ -1456,6 +1463,51 @@ fn write_batch_by_partition(
         )?;
     }
     Ok(())
+}
+
+fn write_partition_batch(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    partition_key: &str,
+    batch: RecordBatch,
+    schema: Schema,
+    txn_id: u64,
+) -> Result<()> {
+    let batch = sort_batch_for_cluster_key(table_meta, batch)?;
+    engine.batch_writer().write_columns_with_txn(
+        db,
+        table,
+        partition_key,
+        batch,
+        schema,
+        txn_id,
+    )?;
+    Ok(())
+}
+
+fn sort_batch_for_cluster_key(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    batch: RecordBatch,
+) -> Result<RecordBatch> {
+    if table_meta.cluster_key.is_empty() || batch.num_rows() <= 1 {
+        return Ok(batch);
+    }
+
+    let mut key_indices = Vec::with_capacity(table_meta.cluster_key.len());
+    for key_col in &table_meta.cluster_key {
+        let idx = batch.schema.index_of(key_col).ok_or_else(|| {
+            TaibaiError::Sql(format!("cluster key column '{}' not found", key_col))
+        })?;
+        key_indices.push(idx);
+    }
+    let desc = vec![false; key_indices.len()];
+    let inserter = SortKeyInserter::new(key_indices, desc);
+    if inserter.is_sorted(&batch) {
+        return Ok(batch);
+    }
+    sort_batch_by_key(&batch, &inserter)
 }
 
 fn single_partition_key(

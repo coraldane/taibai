@@ -56,7 +56,7 @@ impl<'a> ScanPlanner<'a> {
         let strip_ttl_column = self.extend_projection_for_ttl(&mut projection_cols);
 
         let cluster_key_bounds = self.cluster_key_bounds();
-        let ordered_limit = self.ordered_cluster_limit();
+        let ordered_limit = self.ordered_cluster_order();
         let strategy = self.select_strategy(&predicate_cols, &projection_cols, &cluster_key_bounds);
 
         ScanPlan {
@@ -97,16 +97,14 @@ impl<'a> ScanPlanner<'a> {
         {
             return None;
         }
-        if self.spec.has_order_by && self.ordered_cluster_limit().is_none() {
+        if self.spec.has_order_by && self.ordered_cluster_order().is_none() {
             return None;
         }
         Some(limit)
     }
 
-    fn ordered_cluster_limit(&self) -> Option<OrderedClusterLimit> {
-        let limit = self.spec.limit?;
-        if limit == 0
-            || !self.spec.has_order_by
+    fn ordered_cluster_order(&self) -> Option<OrderedClusterLimit> {
+        if !self.spec.has_order_by
             || self.spec.has_aggregate
             || self.spec.has_group_by
             || self.spec.has_join
@@ -588,6 +586,32 @@ mod tests {
         let plan = ScanPlanner::new(&spec, &schema, &meta).build();
 
         assert_eq!(plan.scan_limit, Some(121));
+        assert_eq!(
+            plan.ordered_limit,
+            Some(OrderedClusterLimit {
+                order_column_index: 1,
+                desc: true
+            })
+        );
+    }
+
+    #[test]
+    fn ordered_cluster_order_does_not_require_limit() {
+        let schema = clustered_schema();
+        let meta = clustered_meta(&schema);
+        let mut spec = ScanSpec::new("test_table");
+        spec.cluster_key = Some(meta.cluster_key.clone());
+        spec.eq_predicates
+            .push((0, ScalarValue::VarChar(Some("k1".to_string()))));
+        spec.has_order_by = true;
+        spec.order_by.push(ScanSortKey {
+            column_index: 1,
+            desc: true,
+        });
+
+        let plan = ScanPlanner::new(&spec, &schema, &meta).build();
+
+        assert_eq!(plan.scan_limit, None);
         assert_eq!(
             plan.ordered_limit,
             Some(OrderedClusterLimit {

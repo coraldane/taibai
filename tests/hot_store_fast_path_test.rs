@@ -23,6 +23,38 @@ fn collect_ts_values(result: ExecResult) -> Vec<i32> {
     out
 }
 
+fn collect_i32_values_in_order(result: ExecResult) -> Vec<i32> {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result, got {:?}", result);
+    };
+    let mut out = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            match batch.scalar(row_idx, 0) {
+                Some(ScalarValue::Int32(Some(v))) => out.push(v),
+                other => panic!("expected int32, got {:?}", other),
+            }
+        }
+    }
+    out
+}
+
+fn explain_text(result: ExecResult) -> String {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result, got {:?}", result);
+    };
+    let mut out = String::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            if let Some(ScalarValue::VarChar(Some(line))) = batch.scalar(row_idx, 0) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 /// End-to-end check that the hot-store fast path stays correct across a flush.
 ///
 /// The hot store mirrors auto-commit inserts but is never cleared on flush, so
@@ -101,6 +133,82 @@ fn hot_fast_path_does_not_double_count_after_flush() {
         rows,
         vec![1, 2, 3],
         "post-flush point lookup must union segment + live rows without duplication"
+    );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn restart_warmup_serves_resident_partition_point_lookup_without_segment_scan() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE stock_tick (
+                    security_id VARCHAR,
+                    deal_date INT64,
+                    deal_time INT32,
+                    gmt_trade TIMESTAMP,
+                    price INT32
+                ) CLUSTER BY (security_id, deal_date, deal_time)
+                  HOT BY (gmt_trade) INDEX (security_id)
+                  PARTITION BY deal_date",
+            )
+            .expect("create stock_tick");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO stock_tick VALUES
+                    ('688256.SH', 20260709, 103904, 1783564744000000, 10),
+                    ('688256.SH', 20260709, 103913, 1783564753000000, 30),
+                    ('000001.SZ', 20260709, 103999, 1783564799000000, 99),
+                    ('688256.SH', 20260709, 103910, 1783564750000000, 20)",
+            )
+            .expect("insert rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE stock_tick")
+            .expect("flush rows");
+        engine.shutdown().expect("shutdown engine");
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    let store = engine
+        .hot_store_manager()
+        .get("main", "stock_tick")
+        .expect("warmup should rebuild hot store");
+    assert!(store.is_resident_for_partition(Some("20260709")));
+
+    let rows = collect_i32_values_in_order(
+        engine
+            .execute(
+                &mut session,
+                "SELECT price FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'
+                 ORDER BY deal_time DESC",
+            )
+            .expect("resident hot point lookup"),
+    );
+    assert_eq!(rows, vec![30, 20, 10]);
+
+    let plan = explain_text(
+        engine
+            .execute(
+                &mut session,
+                "EXPLAIN ANALYZE SELECT price FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'
+                 ORDER BY deal_time DESC",
+            )
+            .expect("explain analyze resident hot point lookup"),
+    );
+    assert!(
+        !plan.contains("segments      :"),
+        "resident hot lookup should skip segment scan, got:\n{}",
+        plan
     );
 
     engine.segment_mgr().shutdown();

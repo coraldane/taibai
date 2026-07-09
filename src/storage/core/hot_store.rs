@@ -11,8 +11,8 @@
 //! (integer, float, boolean, varchar, date/time/...). No business-specific
 //! assumptions are baked in.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::common::error::{Result, TaibaiError};
@@ -217,6 +217,8 @@ pub struct HotStore {
     key_column_index: usize,
     columns: RwLock<Vec<ColumnArray>>,
     row_count: AtomicU64,
+    fully_resident: AtomicBool,
+    resident_partitions: RwLock<HashSet<String>>,
     string_pool: RwLock<StringPool>,
     value_index: RwLock<HashMap<ValueKey, Vec<u32>>>,
     memory_soft_limit: u64,
@@ -231,6 +233,8 @@ impl HotStore {
             key_column_index,
             columns: RwLock::new(columns),
             row_count: AtomicU64::new(0),
+            fully_resident: AtomicBool::new(false),
+            resident_partitions: RwLock::new(HashSet::new()),
             string_pool: RwLock::new(StringPool::new()),
             value_index: RwLock::new(HashMap::new()),
             memory_soft_limit: 6 * 1024 * 1024 * 1024,
@@ -248,6 +252,35 @@ impl HotStore {
 
     pub fn row_count(&self) -> u64 {
         self.row_count.load(Ordering::Acquire)
+    }
+
+    pub fn mark_full_resident(&self) {
+        self.fully_resident.store(true, Ordering::Release);
+    }
+
+    pub fn mark_partition_resident(&self, partition_key: String) {
+        self.resident_partitions
+            .write()
+            .unwrap()
+            .insert(partition_key);
+    }
+
+    pub fn clear_resident_coverage(&self) {
+        self.fully_resident.store(false, Ordering::Release);
+        self.resident_partitions.write().unwrap().clear();
+    }
+
+    pub fn is_resident_for_partition(&self, partition_key: Option<&str>) -> bool {
+        if self.fully_resident.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(partition_key) = partition_key else {
+            return false;
+        };
+        self.resident_partitions
+            .read()
+            .unwrap()
+            .contains(partition_key)
     }
 
     /// Number of distinct key values currently indexed.
@@ -622,6 +655,12 @@ impl HotStoreManager {
     pub fn remove(&self, db: &str, table: &str) {
         let mut stores = self.stores.write().unwrap();
         stores.remove(&(db.to_string(), table.to_string()));
+    }
+
+    pub fn clear_resident_coverage(&self, db: &str, table: &str) {
+        if let Some(store) = self.get(db, table) {
+            store.clear_resident_coverage();
+        }
     }
 }
 

@@ -1195,8 +1195,10 @@ impl Engine {
     /// Best-effort: unreadable segments are skipped.
     pub fn warmup_hot_stores(&self) {
         use crate::storage::core::hot_store::resolve_key_column;
+        use crate::storage::partition::parse_partition_key;
         use crate::storage::segment::delete_bitmap;
         use crate::storage::segment::reader::SegmentReader;
+        use std::collections::{HashMap, HashSet};
 
         const WARMUP_ROW_BUDGET: u64 = 20_000_000;
 
@@ -1235,14 +1237,19 @@ impl Engine {
                 }
 
                 let mut loaded_rows: u64 = 0;
+                let mut loaded_segments: HashSet<std::path::PathBuf> = HashSet::new();
+                let mut failed_segments: HashSet<std::path::PathBuf> = HashSet::new();
+                let mut budget_exhausted = false;
                 for (_, seg_path) in &mtimed {
                     if loaded_rows >= WARMUP_ROW_BUDGET {
+                        budget_exhausted = true;
                         break;
                     }
                     let reader = match SegmentReader::open(seg_path) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::warn!(path = %seg_path.display(), error = %e, "warmup: open segment failed");
+                            failed_segments.insert(seg_path.clone());
                             continue;
                         }
                     };
@@ -1250,11 +1257,18 @@ impl Engine {
                     let projection: Vec<usize> = (0..num_cols).collect();
                     let del_bitmap = reader.delete_bitmap();
                     let has_deletes = !del_bitmap.is_empty();
+                    let mut segment_loaded = true;
                     for rg in 0..reader.num_row_groups() {
+                        if loaded_rows >= WARMUP_ROW_BUDGET {
+                            budget_exhausted = true;
+                            segment_loaded = false;
+                            break;
+                        }
                         let batch = match reader.read_row_group_with_projection(rg, &projection) {
                             Ok(b) => b,
                             Err(e) => {
                                 tracing::warn!(error = %e, "warmup: read row group failed");
+                                segment_loaded = false;
                                 continue;
                             }
                         };
@@ -1274,6 +1288,47 @@ impl Engine {
                         if let Err(e) = self.hot_store_mgr.try_append(db, table, table_meta, &batch)
                         {
                             tracing::warn!(db, table, error = %e, "warmup: feed hot store failed");
+                            segment_loaded = false;
+                        }
+                    }
+                    if segment_loaded {
+                        loaded_segments.insert(seg_path.clone());
+                    } else {
+                        failed_segments.insert(seg_path.clone());
+                    }
+                }
+
+                if let Some(store) = self.hot_store_mgr.get(db, table) {
+                    if !budget_exhausted
+                        && failed_segments.is_empty()
+                        && loaded_segments.len() == segments.len()
+                    {
+                        store.mark_full_resident();
+                    } else if table_meta.is_partitioned() {
+                        let mut by_partition: HashMap<String, Vec<std::path::PathBuf>> =
+                            HashMap::new();
+                        for seg in &segments {
+                            let Some(name) = seg.file_name().and_then(|name| name.to_str()) else {
+                                continue;
+                            };
+                            let Some(partition_key) = parse_partition_key(name) else {
+                                continue;
+                            };
+                            by_partition
+                                .entry(partition_key)
+                                .or_default()
+                                .push(seg.clone());
+                        }
+                        for (partition_key, partition_segments) in by_partition {
+                            if partition_segments
+                                .iter()
+                                .all(|seg| loaded_segments.contains(seg))
+                                && partition_segments
+                                    .iter()
+                                    .all(|seg| !failed_segments.contains(seg))
+                            {
+                                store.mark_partition_resident(partition_key);
+                            }
                         }
                     }
                 }
@@ -1408,13 +1463,17 @@ impl Engine {
         disable_wal: bool,
     ) -> Result<u64> {
         self.validate_batch_unique_indexes(db, table, &batch)?;
-        if self.is_bulk_mode() {
+        let result = if self.is_bulk_mode() {
             self.segment_mgr
                 .bulk_insert_batch_deferred(db, table, batch, disable_wal)
         } else {
             self.segment_mgr
                 .bulk_insert_batch(db, table, batch, disable_wal)
+        }?;
+        if result > 0 {
+            self.hot_store_mgr.clear_resident_coverage(db, table);
         }
+        Ok(result)
     }
 
     pub fn exec_bulk_insert_partitioned_with_wal_control(
@@ -1426,7 +1485,7 @@ impl Engine {
         disable_wal: bool,
     ) -> Result<u64> {
         self.validate_batch_unique_indexes(db, table, &batch)?;
-        if self.is_bulk_mode() {
+        let result = if self.is_bulk_mode() {
             self.segment_mgr
                 .bulk_insert_batch_partitioned_deferred(db, table, table_meta, batch)
         } else if table_meta.is_partitioned() {
@@ -1435,7 +1494,11 @@ impl Engine {
         } else {
             self.segment_mgr
                 .bulk_insert_batch(db, table, batch, disable_wal)
+        }?;
+        if result > 0 {
+            self.hot_store_mgr.clear_resident_coverage(db, table);
         }
+        Ok(result)
     }
 
     pub fn exec_bulk_insert_payload_with_wal_control(
@@ -1509,6 +1572,9 @@ impl Engine {
             catalog,
             !bulk_import_mode,
         )?;
+        if result > 0 {
+            self.hot_store_mgr.clear_resident_coverage(db, &table_name);
+        }
         drop(catalogs);
 
         if result > 0 && !unique_index_names.is_empty() {

@@ -1,6 +1,7 @@
 use crate::storage::core::hot_store::{HotStore, HotStoreManager};
 use crate::storage::core::memtable::MemTableManager;
 use crate::types::batch::RecordBatch;
+use crate::types::scalar::ScalarValue;
 
 use super::spec::ScanSpec;
 
@@ -46,7 +47,7 @@ pub fn scan_memtables(
         if let Some(store) = hot_mgr.get(db, table_name) {
             let live_rows = memtables.iter().map(|mt| mt.row_count()).sum::<u64>();
             let watermark = store.row_count().saturating_sub(live_rows);
-            if let Some(batch) = try_hot_fast_path(&store, spec, watermark) {
+            if let Some(batch) = scan_hot_store_by_key(&store, spec, watermark) {
                 return vec![batch];
             }
         }
@@ -55,31 +56,41 @@ pub fn scan_memtables(
     let mut batches = Vec::new();
 
     for mt in &memtables {
-        if let Some(mt_batch) = mt.read() {
+        if let Some(mt_batch) = mt
+            .read_with(|source| {
+                if source.num_rows() == 0 {
+                    return None;
+                }
+
+                let filtered = if spec.has_predicates() {
+                    super::row_filter::apply_predicates(
+                        source,
+                        &spec.eq_predicates,
+                        &spec.range_predicates,
+                        &spec.in_predicates,
+                        spec.remaining_predicate.as_ref(),
+                    )
+                } else {
+                    source.clone()
+                };
+
+                if filtered.num_rows() == 0 {
+                    return None;
+                }
+
+                let ordered = apply_order_if_cluster_prefix_matches(filtered, spec);
+                Some(if let Some(proj) = &spec.projection {
+                    apply_projection(&ordered, proj)
+                } else {
+                    ordered
+                })
+            })
+            .flatten()
+        {
             if mt_batch.num_rows() == 0 {
                 continue;
             }
-
-            let mt_batch = if spec.has_predicates() {
-                super::row_filter::apply_predicates(
-                    &mt_batch,
-                    &spec.eq_predicates,
-                    &spec.range_predicates,
-                    &spec.in_predicates,
-                    spec.remaining_predicate.as_ref(),
-                )
-            } else {
-                mt_batch.clone()
-            };
-            if mt_batch.num_rows() == 0 {
-                continue;
-            }
-
-            if let Some(proj) = &spec.projection {
-                batches.push(apply_projection(&mt_batch, proj));
-            } else {
-                batches.push(mt_batch);
-            }
+            batches.push(mt_batch);
         }
     }
 
@@ -92,7 +103,11 @@ pub fn scan_memtables(
 /// `watermark` excludes already-flushed rows (served by the segment scan).
 /// Returns `None` when the fast path does not apply (no such predicate),
 /// letting the caller fall back to the generic memtable scan.
-fn try_hot_fast_path(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Option<RecordBatch> {
+pub fn scan_hot_store_by_key(
+    store: &HotStore,
+    spec: &ScanSpec,
+    watermark: u64,
+) -> Option<RecordBatch> {
     let key_idx = store.key_column_index();
     let key_value = spec
         .eq_predicates
@@ -141,9 +156,10 @@ fn try_hot_fast_path(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Optio
         return Some(filtered);
     }
 
+    let ordered = apply_order_if_cluster_prefix_matches(filtered, spec);
     let projected = match &spec.projection {
-        Some(proj) => apply_projection(&filtered, proj),
-        None => filtered,
+        Some(proj) => apply_projection(&ordered, proj),
+        None => ordered,
     };
     Some(projected)
 }
@@ -191,9 +207,9 @@ pub fn count_memtable_rows(
     let mut total: u64 = 0;
 
     for mt in &memtables {
-        if let Some(mt_batch) = mt.read() {
+        if let Some(count) = mt.read_with(|mt_batch| {
             if mt_batch.num_rows() == 0 {
-                continue;
+                return 0;
             }
 
             if spec.eq_predicates.len() == 1
@@ -204,7 +220,9 @@ pub fn count_memtable_rows(
                 let (col_idx, value) = &spec.eq_predicates[0];
                 if let Some(col) = mt_batch.column(*col_idx) {
                     let mask = col.eq_vec(value);
-                    total += mask.iter().filter(|&&m| m).count() as u64;
+                    mask.iter().filter(|&&m| m).count() as u64
+                } else {
+                    0
                 }
             } else if spec.has_predicates() {
                 let filtered = super::row_filter::apply_predicates(
@@ -214,10 +232,12 @@ pub fn count_memtable_rows(
                     &spec.in_predicates,
                     spec.remaining_predicate.as_ref(),
                 );
-                total += filtered.num_rows() as u64;
+                filtered.num_rows() as u64
             } else {
-                total += mt_batch.num_rows() as u64;
+                mt_batch.num_rows() as u64
             }
+        }) {
+            total += count;
         }
     }
 
@@ -237,4 +257,91 @@ fn apply_projection(batch: &RecordBatch, projection: &[usize]) -> RecordBatch {
     }
     let schema = crate::types::batch::Schema::new(col_defs);
     RecordBatch::try_new(schema, columns).unwrap_or_else(|_| batch.clone())
+}
+
+fn apply_order_if_cluster_prefix_matches(batch: RecordBatch, spec: &ScanSpec) -> RecordBatch {
+    let Some(order) = ordered_cluster_order_for_batch(&batch, spec) else {
+        return batch;
+    };
+    if is_batch_ordered_by(&batch, order.column_index, order.desc) {
+        return batch;
+    }
+    if is_batch_ordered_by(&batch, order.column_index, !order.desc) {
+        return reverse_batch(&batch).unwrap_or(batch);
+    }
+    batch
+}
+
+struct BatchOrder {
+    column_index: usize,
+    desc: bool,
+}
+
+fn ordered_cluster_order_for_batch(batch: &RecordBatch, spec: &ScanSpec) -> Option<BatchOrder> {
+    if !spec.has_order_by
+        || spec.has_aggregate
+        || spec.has_group_by
+        || spec.has_join
+        || spec.remaining_predicate.is_some()
+        || spec.order_by.len() != 1
+    {
+        return None;
+    }
+
+    let cluster_key = spec.cluster_key.as_ref()?;
+    let order = spec.order_by.first()?;
+    let order_col_name = batch.schema.columns.get(order.column_index)?.name.as_str();
+    let order_key_pos = cluster_key
+        .iter()
+        .position(|key| key.eq_ignore_ascii_case(order_col_name))?;
+    if order_key_pos == 0 {
+        return None;
+    }
+
+    for key in cluster_key.iter().take(order_key_pos) {
+        let key_idx = batch.schema.index_of(key)?;
+        spec.eq_predicates.iter().find(|(idx, _)| *idx == key_idx)?;
+    }
+
+    Some(BatchOrder {
+        column_index: order.column_index,
+        desc: order.desc,
+    })
+}
+
+fn is_batch_ordered_by(batch: &RecordBatch, column_index: usize, desc: bool) -> bool {
+    if batch.num_rows() <= 1 {
+        return true;
+    }
+    for row in 1..batch.num_rows() {
+        let Some(prev) = batch.scalar(row - 1, column_index) else {
+            return false;
+        };
+        let Some(curr) = batch.scalar(row, column_index) else {
+            return false;
+        };
+        let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(&prev, &curr);
+        let violation = if desc {
+            cmp == std::cmp::Ordering::Less
+        } else {
+            cmp == std::cmp::Ordering::Greater
+        };
+        if violation {
+            return false;
+        }
+    }
+    true
+}
+
+fn reverse_batch(batch: &RecordBatch) -> Option<RecordBatch> {
+    let mut out = RecordBatch::with_capacity(batch.schema.clone(), batch.num_rows());
+    for row in (0..batch.num_rows()).rev() {
+        for col_idx in 0..batch.num_columns() {
+            let value = batch.scalar(row, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(out.schema.columns[col_idx].data_type)
+            });
+            out.column_mut(col_idx)?.push(&value).ok()?;
+        }
+    }
+    Some(out)
 }

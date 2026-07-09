@@ -156,6 +156,13 @@ impl<'a> ScanExecutor<'a> {
             super::strategy::ScanPlanner::new(self.spec, &self.table_schema, &self.table_meta)
                 .build();
         let mut scan_limit = plan.scan_limit;
+
+        if let Some(batch) = self.try_resident_hot_scan(&plan)? {
+            output.set_limit(scan_limit);
+            output.push(batch);
+            return Ok(());
+        }
+
         let memtables_present = !self
             .runtime
             .memtable_manager()
@@ -253,7 +260,7 @@ impl<'a> ScanExecutor<'a> {
                     stats_entry.row_groups_total += reader.num_row_groups() as u64;
                     stats_entry.row_groups_pruned +=
                         (reader.num_row_groups() - candidate_indices.len()) as u64;
-                    if scan_limit.is_none() {
+                    if scan_limit.is_none() && ordered_limit.is_none() {
                         stats_entry.row_groups_read += candidate_indices.len() as u64;
                     }
                 }
@@ -263,7 +270,7 @@ impl<'a> ScanExecutor<'a> {
                     candidate_indices.reverse();
                 }
 
-                if scan_limit.is_some() {
+                if scan_limit.is_some() || ordered_limit.is_some() {
                     for rg_idx in &candidate_indices {
                         self.record_row_group_read(&reader, *rg_idx, &plan);
                         let mut batch = match super::strategy::read_row_group_with_strategy(
@@ -360,6 +367,56 @@ impl<'a> ScanExecutor<'a> {
         }
 
         Ok(())
+    }
+
+    fn try_resident_hot_scan(
+        &self,
+        plan: &super::strategy::ScanPlan,
+    ) -> Result<Option<RecordBatch>> {
+        if self.spec.reader_txn_id != 0 {
+            return Ok(None);
+        }
+        let Some(store) = self
+            .runtime
+            .hot_store_manager()
+            .get(self.db, &self.spec.table_name)
+        else {
+            return Ok(None);
+        };
+        if store.row_count() == 0 {
+            return Ok(None);
+        }
+
+        let target_partition = if self.table_meta.is_partitioned() {
+            let Some(pi) = self.spec.partition_info.as_ref() else {
+                return Ok(None);
+            };
+            let Some(partition_key) =
+                partition::extract_partition_eq_value(self.spec, pi, &self.table_meta)
+            else {
+                return Ok(None);
+            };
+            Some(partition_key)
+        } else {
+            None
+        };
+
+        if !store.is_resident_for_partition(target_partition.as_deref()) {
+            return Ok(None);
+        }
+
+        let mut hot_spec = self.spec.clone();
+        hot_spec.projection = Some(plan.projection_cols.clone());
+        let Some(batch) = memtable::scan_hot_store_by_key(&store, &hot_spec, 0) else {
+            return Ok(None);
+        };
+        let batch = super::strategy::apply_ttl_filter_and_projection(
+            batch,
+            &self.table_meta,
+            &plan.projection_cols,
+            plan.strip_ttl_column,
+        )?;
+        Ok(Some(batch))
     }
 
     fn ordered_cluster_segments_are_monotonic(&self, segments: &[PathBuf], col_idx: usize) -> bool {

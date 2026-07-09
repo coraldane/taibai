@@ -189,6 +189,11 @@ impl MemTable {
         guard.clone()
     }
 
+    pub fn read_with<R>(&self, f: impl FnOnce(&RecordBatch) -> R) -> Option<R> {
+        let guard = self.batch.read().unwrap();
+        guard.as_ref().map(f)
+    }
+
     pub fn take_batch(&self) -> Option<RecordBatch> {
         let mut guard = self.batch.write().unwrap();
         guard.take()

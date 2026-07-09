@@ -1,6 +1,7 @@
 use crate::common::error::Result;
 use crate::sql::execution::operators::filter::{eval_expr_column, remap_expr_for_batch};
 use crate::sql::planner::{LogicalExpr, SortKey};
+use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -68,9 +69,18 @@ impl ExecutionOp for SortExec {
             })
             .collect();
 
-        let mut rows = Vec::with_capacity(total_rows);
+        let mut evaluated_keys_by_batch = Vec::with_capacity(all_batches.len());
         for batch in &all_batches {
-            let evaluated_keys = evaluate_batch_sort_keys(&sort_exprs, batch)?;
+            evaluated_keys_by_batch.push(evaluate_batch_sort_keys(&sort_exprs, batch)?);
+        }
+
+        if batches_are_sorted(&all_batches, &evaluated_keys_by_batch, &sort_exprs) {
+            let batch = concat_batches(&all_batches, output_schema)?;
+            return trim_sorted_batch(batch, self.limit);
+        }
+
+        let mut rows = Vec::with_capacity(total_rows);
+        for (batch, evaluated_keys) in all_batches.iter().zip(evaluated_keys_by_batch.iter()) {
             for row in 0..batch.num_rows() {
                 let values: Vec<ScalarValue> = (0..batch.num_columns())
                     .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
@@ -113,6 +123,56 @@ fn evaluate_batch_sort_keys(
         .collect()
 }
 
+fn batches_are_sorted(
+    batches: &[RecordBatch],
+    evaluated_keys_by_batch: &[Vec<Vec<ScalarValue>>],
+    sort_exprs: &[(LogicalExpr, bool)],
+) -> bool {
+    let mut previous: Option<Vec<ScalarValue>> = None;
+    for (batch, evaluated_keys) in batches.iter().zip(evaluated_keys_by_batch.iter()) {
+        for row in 0..batch.num_rows() {
+            let current: Vec<ScalarValue> = evaluated_keys
+                .iter()
+                .map(|values| values[row].clone())
+                .collect();
+            if let Some(prev) = &previous {
+                if compare_key_values(prev, &current, sort_exprs) == std::cmp::Ordering::Greater {
+                    return false;
+                }
+            }
+            previous = Some(current);
+        }
+    }
+    true
+}
+
+fn concat_batches(batches: &[RecordBatch], schema: Schema) -> Result<RecordBatch> {
+    let mut columns: Vec<ColumnArray> = schema
+        .columns
+        .iter()
+        .map(|col| ColumnArray::empty(col.data_type))
+        .collect();
+    for batch in batches {
+        for (idx, col) in batch.columns.iter().enumerate() {
+            columns[idx].extend(col)?;
+        }
+    }
+    RecordBatch::try_new(schema, columns)
+}
+
+fn trim_sorted_batch(batch: RecordBatch, limit: Option<usize>) -> Result<Option<RecordBatch>> {
+    let Some(limit) = limit else {
+        return Ok(Some(batch));
+    };
+    let end = limit.min(batch.num_rows());
+    let columns = batch
+        .columns
+        .iter()
+        .map(|col| col.slice_fast(0, end))
+        .collect();
+    Ok(Some(RecordBatch::try_new(batch.schema, columns)?))
+}
+
 fn topn_sort(rows: &mut [SortRow], sort_exprs: &[(LogicalExpr, bool)], limit: usize) {
     if rows.len() <= limit {
         rows.sort_by(|a, b| compare_rows(a, b, sort_exprs));
@@ -128,8 +188,16 @@ fn compare_rows(
     b: &SortRow,
     sort_exprs: &[(LogicalExpr, bool)],
 ) -> std::cmp::Ordering {
+    compare_key_values(&a.keys, &b.keys, sort_exprs)
+}
+
+fn compare_key_values(
+    a: &[ScalarValue],
+    b: &[ScalarValue],
+    sort_exprs: &[(LogicalExpr, bool)],
+) -> std::cmp::Ordering {
     for (idx, (_, desc)) in sort_exprs.iter().enumerate() {
-        let cmp = compare_scalars(&a.keys[idx], &b.keys[idx]);
+        let cmp = compare_scalars(&a[idx], &b[idx]);
         let cmp = if *desc { cmp.reverse() } else { cmp };
         if cmp != std::cmp::Ordering::Equal {
             return cmp;

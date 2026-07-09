@@ -530,6 +530,18 @@ pub fn cluster_key_range_read(
     let Some(key_col) = key_batch.column(0) else {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     };
+    if !is_sorted_ascending(key_col) {
+        return predicate_first_read(
+            reader,
+            rg_idx,
+            predicate_cols,
+            projection_cols,
+            eq_predicates,
+            range_predicates,
+            in_predicates,
+            remaining_predicate,
+        );
+    }
 
     let start = match &bounds.lower {
         Some((value, inclusive)) => {
@@ -837,6 +849,22 @@ fn upper_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
         }
     }
     lo
+}
+
+fn is_sorted_ascending(col: &ColumnArray) -> bool {
+    if col.len() <= 1 {
+        return true;
+    }
+    for row_idx in 1..col.len() {
+        let prev = col.scalar(row_idx - 1);
+        let current = col.scalar(row_idx);
+        if crate::storage::index::sort_key::compare_scalars_for_sort(&current, &prev)
+            == std::cmp::Ordering::Less
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn selected_live_rows(
@@ -1236,5 +1264,70 @@ mod tests {
         assert_eq!(filtered.num_rows(), 2);
         assert_eq!(filtered.scalar(0, 1).unwrap(), ScalarValue::Int64(Some(3)));
         assert_eq!(filtered.scalar(1, 1).unwrap(), ScalarValue::Int64(Some(4)));
+    }
+
+    #[test]
+    fn cluster_key_range_read_falls_back_when_key_column_is_unsorted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seg_00001.dat");
+        let schema = Schema::new(vec![
+            ColumnDef::new("security_id", DataType::VarChar),
+            ColumnDef::new("deal_date", DataType::Int64),
+            ColumnDef::new("price", DataType::Float64),
+        ]);
+
+        let mut batch = RecordBatch::new(schema.clone());
+        for (security_id, deal_date, price) in
+            [("688256.SH", 20260709, 11.1), ("000001.SZ", 20260709, 12.2)]
+        {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(security_id.to_string())))
+                .unwrap();
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(deal_date)))
+                .unwrap();
+            batch
+                .column_mut(2)
+                .unwrap()
+                .push(&ScalarValue::Float64(Some(price)))
+                .unwrap();
+        }
+
+        {
+            let mut writer = SegmentWriter::create(&path, schema, 8192).unwrap();
+            writer.write_batch(&batch).unwrap();
+            writer.seal().unwrap();
+        }
+
+        let reader = SegmentReader::open(&path).unwrap();
+        let result = cluster_key_range_read(
+            &reader,
+            0,
+            &ClusterKeyBounds {
+                column_index: 0,
+                lower: Some((ScalarValue::VarChar(Some("688256.SH".to_string())), true)),
+                upper: Some((ScalarValue::VarChar(Some("688256.SH".to_string())), true)),
+            },
+            &[0],
+            &[0, 1],
+            &[
+                (0, ScalarValue::VarChar(Some("688256.SH".to_string()))),
+                (1, ScalarValue::Int64(Some(20260709))),
+            ],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(
+            result.scalar(0, 0).unwrap(),
+            ScalarValue::VarChar(Some("688256.SH".to_string()))
+        );
     }
 }

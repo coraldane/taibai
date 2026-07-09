@@ -103,7 +103,8 @@ fn build_operator_with_limit(
         }
         LogicalPlan::Sort(sort) => {
             let schema = get_scan_schema(&sort.input);
-            let input = build_operator_with_limit(*sort.input, ctx, None)?;
+            let input_plan = annotate_single_scan_with_order(*sort.input, sort.sort_keys.clone());
+            let input = build_operator_with_limit(input_plan, ctx, None)?;
             Ok(Box::new(SortExec::new(sort.sort_keys, input, schema)))
         }
         LogicalPlan::Limit(limit) => {
@@ -333,6 +334,43 @@ fn annotate_single_scan_with_ordered_limit(
         return plan;
     }
     annotate_scan(plan, &sort_keys, limit)
+}
+
+fn annotate_single_scan_with_order(
+    plan: LogicalPlan,
+    sort_keys: Vec<crate::sql::planner::SortKey>,
+) -> LogicalPlan {
+    if single_scan(&plan).is_none() {
+        return plan;
+    }
+    annotate_scan_order(plan, &sort_keys)
+}
+
+fn annotate_scan_order(
+    plan: LogicalPlan,
+    sort_keys: &[crate::sql::planner::SortKey],
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Scan(mut scan) => {
+            if scan.pushed_order.is_none() {
+                scan.pushed_order = Some(sort_keys.to_vec());
+            }
+            LogicalPlan::Scan(scan)
+        }
+        LogicalPlan::Filter(mut filter) => {
+            filter.input = Box::new(annotate_scan_order(*filter.input, sort_keys));
+            LogicalPlan::Filter(filter)
+        }
+        LogicalPlan::Project(mut project) => {
+            project.input = Box::new(annotate_scan_order(*project.input, sort_keys));
+            LogicalPlan::Project(project)
+        }
+        LogicalPlan::Limit(mut limit_plan) => {
+            limit_plan.input = Box::new(annotate_scan_order(*limit_plan.input, sort_keys));
+            LogicalPlan::Limit(limit_plan)
+        }
+        other => other,
+    }
 }
 
 fn annotate_scan(
