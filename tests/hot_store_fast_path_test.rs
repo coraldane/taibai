@@ -1,8 +1,54 @@
 use tempfile::TempDir;
 
 use taibai::net::session::Session;
+use taibai::protocol::types::DataType;
 use taibai::sql::execution::engine::{Engine, ExecResult};
 use taibai::types::scalar::ScalarValue;
+
+fn bulk_payload(table: &str, row_count: u32, columns: Vec<(&str, DataType, Vec<u8>)>) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    payload.extend_from_slice(table.as_bytes());
+    payload.extend_from_slice(&row_count.to_le_bytes());
+    payload.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+
+    for (name, dtype, data) in columns {
+        payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(dtype as u8);
+        payload.push(0);
+        payload.push(0);
+        payload.extend_from_slice(&row_count.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&data);
+    }
+    payload
+}
+
+fn int32_col(values: &[i32]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for value in values {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    data
+}
+
+fn int64_col(values: &[i64]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for value in values {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    data
+}
+
+fn varchar_col(values: &[&str]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for value in values {
+        data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        data.extend_from_slice(value.as_bytes());
+    }
+    data
+}
 
 /// Collect the `ts` (INT32) values returned by a query as a multiset (Vec),
 /// preserving duplicates so that double-counting regressions are caught.
@@ -208,6 +254,106 @@ fn restart_warmup_serves_resident_partition_point_lookup_without_segment_scan() 
     assert!(
         !plan.contains("segments      :"),
         "resident hot lookup should skip segment scan, got:\n{}",
+        plan
+    );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn direct_bulk_keeps_resident_hot_partition_query_off_segments() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE stock_tick (
+                    security_id VARCHAR,
+                    deal_date INT64,
+                    deal_time INT32,
+                    gmt_trade TIMESTAMP,
+                    price INT32
+                ) CLUSTER BY (security_id, deal_date, deal_time)
+                  HOT BY (gmt_trade) INDEX (security_id)
+                  PARTITION BY deal_date",
+            )
+            .expect("create stock_tick");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO stock_tick VALUES
+                    ('688256.SH', 20260709, 103904, 1783564744000000, 10),
+                    ('688256.SH', 20260709, 103910, 1783564750000000, 20)",
+            )
+            .expect("insert seed rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE stock_tick")
+            .expect("flush seed rows");
+        engine.shutdown().expect("shutdown engine");
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    assert!(engine
+        .hot_store_manager()
+        .get("main", "stock_tick")
+        .expect("warmup should rebuild hot store")
+        .is_resident_for_partition(Some("20260709")));
+
+    let payload = bulk_payload(
+        "stock_tick",
+        1,
+        vec![
+            (
+                "security_id",
+                DataType::VarChar,
+                varchar_col(&["688256.SH"]),
+            ),
+            ("deal_date", DataType::Int64, int64_col(&[20260709])),
+            ("deal_time", DataType::Int32, int32_col(&[103913])),
+            (
+                "gmt_trade",
+                DataType::Timestamp,
+                int64_col(&[1783564753000000]),
+            ),
+            ("price", DataType::Int32, int32_col(&[30])),
+        ],
+    );
+    assert_eq!(
+        engine
+            .exec_bulk_insert_payload_with_wal_control("main", &payload, false)
+            .expect("direct bulk insert"),
+        1
+    );
+
+    let rows = collect_i32_values_in_order(
+        engine
+            .execute(
+                &mut session,
+                "SELECT price FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'
+                 ORDER BY deal_time DESC",
+            )
+            .expect("resident hot point lookup after direct bulk"),
+    );
+    assert_eq!(rows, vec![30, 20, 10]);
+
+    let plan = explain_text(
+        engine
+            .execute(
+                &mut session,
+                "EXPLAIN ANALYZE SELECT price FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'
+                 ORDER BY deal_time DESC",
+            )
+            .expect("explain analyze after direct bulk"),
+    );
+    assert!(
+        !plan.contains("segments      :"),
+        "resident hot lookup should still skip segment scan after direct bulk, got:\n{}",
         plan
     );
 

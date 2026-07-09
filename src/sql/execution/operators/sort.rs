@@ -75,6 +75,9 @@ impl ExecutionOp for SortExec {
         }
 
         if batches_are_sorted(&all_batches, &evaluated_keys_by_batch, &sort_exprs) {
+            if self.limit.is_none() && all_batches.len() == 1 {
+                return Ok(all_batches.into_iter().next());
+            }
             let batch = concat_batches(&all_batches, output_schema)?;
             return trim_sorted_batch(batch, self.limit);
         }

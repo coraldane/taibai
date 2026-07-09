@@ -1526,6 +1526,20 @@ impl Engine {
 
         let mut explicit_auto_increment_max = None;
         let mut unique_index_names = Vec::new();
+        let table_meta_for_hot = catalog.get_table(&table_name).cloned();
+        let hot_payload_should_feed = !bulk_import_mode
+            && table_meta_for_hot.as_ref().is_some_and(|meta| {
+                crate::storage::core::hot_store::resolve_key_column(meta).is_some()
+            });
+        let resident_coverage_before_bulk = if hot_payload_should_feed {
+            let snapshot = self
+                .hot_store_mgr
+                .resident_coverage_snapshot(db, &table_name);
+            self.hot_store_mgr.clear_resident_coverage(db, &table_name);
+            snapshot
+        } else {
+            None
+        };
         if let Some(table_meta) = catalog.get_table(&table_name) {
             unique_index_names = table_meta
                 .unique_indexes
@@ -1565,17 +1579,36 @@ impl Engine {
             }
         }
 
-        let result = self.segment_mgr.bulk_insert_payload_with_catalog(
+        let result = match self.segment_mgr.bulk_insert_payload_with_catalog(
             db,
             payload,
             disable_wal,
             catalog,
             !bulk_import_mode,
-        )?;
-        if result > 0 {
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                if let Some(snapshot) = resident_coverage_before_bulk {
+                    self.hot_store_mgr
+                        .restore_resident_coverage(db, &table_name, snapshot);
+                }
+                return Err(e);
+            }
+        };
+        drop(catalogs);
+        if result > 0 && hot_payload_should_feed {
+            if let Some(table_meta) = table_meta_for_hot.as_ref() {
+                self.feed_hot_store_after_direct_bulk(
+                    db,
+                    &table_name,
+                    table_meta,
+                    payload,
+                    resident_coverage_before_bulk,
+                );
+            }
+        } else if result > 0 {
             self.hot_store_mgr.clear_resident_coverage(db, &table_name);
         }
-        drop(catalogs);
 
         if result > 0 && !unique_index_names.is_empty() {
             self.index_manager.remove_table_unique_index_snapshots(
@@ -1622,6 +1655,50 @@ impl Engine {
         }
         if result > 0 {}
         Ok(result)
+    }
+
+    fn feed_hot_store_after_direct_bulk(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        payload: &[u8],
+        resident_coverage_before_bulk: Option<
+            crate::storage::core::hot_store::ResidentCoverageSnapshot,
+        >,
+    ) {
+        let feed_result = (|| -> Result<()> {
+            let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
+            let schema = Schema::new(table_meta.columns.clone());
+            let batch =
+                crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)?;
+            match self.feed_hot_store(db, table, table_meta, &batch) {
+                Ok(()) => Ok(()),
+                Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
+                    self.reclaim_hot_store_pressure(db, table);
+                    self.feed_hot_store(db, table, table_meta, &batch)
+                }
+                Err(e) => Err(e),
+            }
+        })();
+
+        match feed_result {
+            Ok(()) => {
+                if let Some(snapshot) = resident_coverage_before_bulk {
+                    self.hot_store_mgr
+                        .restore_resident_coverage(db, table, snapshot);
+                }
+            }
+            Err(e) => {
+                self.hot_store_mgr.clear_resident_coverage(db, table);
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %e,
+                    "direct bulk insert persisted, but feeding hot store failed; resident fast path disabled"
+                );
+            }
+        }
     }
 }
 

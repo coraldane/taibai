@@ -22,6 +22,12 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
+#[derive(Debug, Clone, Default)]
+pub struct ResidentCoverageSnapshot {
+    fully_resident: bool,
+    resident_partitions: HashSet<String>,
+}
+
 /// Interning pool for variable-length key values. A distinct string is stored
 /// once and addressed by a `u32` id, so that building the inverted index never
 /// re-clones a string for every row (only on first sight of a new value).
@@ -215,28 +221,36 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
 pub struct HotStore {
     schema: Schema,
     key_column_index: usize,
+    partition_column_index: Option<usize>,
     columns: RwLock<Vec<ColumnArray>>,
     row_count: AtomicU64,
     fully_resident: AtomicBool,
     resident_partitions: RwLock<HashSet<String>>,
     string_pool: RwLock<StringPool>,
     value_index: RwLock<HashMap<ValueKey, Vec<u32>>>,
+    value_partition_index: RwLock<HashMap<(ValueKey, ValueKey), Vec<u32>>>,
     memory_soft_limit: u64,
     memory_hard_limit: u64,
 }
 
 impl HotStore {
-    pub fn new(schema: Schema, key_column_index: usize) -> Self {
+    pub fn new(
+        schema: Schema,
+        key_column_index: usize,
+        partition_column_index: Option<usize>,
+    ) -> Self {
         let columns = build_initial_columns(&schema);
         Self {
             schema,
             key_column_index,
+            partition_column_index,
             columns: RwLock::new(columns),
             row_count: AtomicU64::new(0),
             fully_resident: AtomicBool::new(false),
             resident_partitions: RwLock::new(HashSet::new()),
             string_pool: RwLock::new(StringPool::new()),
             value_index: RwLock::new(HashMap::new()),
+            value_partition_index: RwLock::new(HashMap::new()),
             memory_soft_limit: 6 * 1024 * 1024 * 1024,
             memory_hard_limit: 8 * 1024 * 1024 * 1024,
         }
@@ -268,6 +282,19 @@ impl HotStore {
     pub fn clear_resident_coverage(&self) {
         self.fully_resident.store(false, Ordering::Release);
         self.resident_partitions.write().unwrap().clear();
+    }
+
+    pub fn resident_coverage_snapshot(&self) -> ResidentCoverageSnapshot {
+        ResidentCoverageSnapshot {
+            fully_resident: self.fully_resident.load(Ordering::Acquire),
+            resident_partitions: self.resident_partitions.read().unwrap().clone(),
+        }
+    }
+
+    pub fn restore_resident_coverage(&self, snapshot: ResidentCoverageSnapshot) {
+        self.fully_resident
+            .store(snapshot.fully_resident, Ordering::Release);
+        *self.resident_partitions.write().unwrap() = snapshot.resident_partitions;
     }
 
     pub fn is_resident_for_partition(&self, partition_key: Option<&str>) -> bool {
@@ -334,9 +361,19 @@ impl HotStore {
         let key_col = batch.column(self.key_column_index).ok_or_else(|| {
             TaibaiError::Internal("hot store: missing key column in batch".into())
         })?;
-        let keys = {
+        let (keys, partition_keys) = {
             let mut pool = self.string_pool.write().unwrap();
-            collect_keys(key_col, &mut pool)?
+            let keys = collect_keys(key_col, &mut pool)?;
+            let partition_keys = match self.partition_column_index {
+                Some(partition_idx) => {
+                    let partition_col = batch.column(partition_idx).ok_or_else(|| {
+                        TaibaiError::Internal("hot store: missing partition column in batch".into())
+                    })?;
+                    Some(collect_keys(partition_col, &mut pool)?)
+                }
+                None => None,
+            };
+            (keys, partition_keys)
         };
 
         // Extend every column in its native type.
@@ -354,6 +391,14 @@ impl HotStore {
             let mut idx = self.value_index.write().unwrap();
             for (j, key) in keys.iter().enumerate() {
                 idx.entry(*key).or_default().push(base_u32 + j as u32);
+            }
+        }
+        if let Some(partition_keys) = &partition_keys {
+            let mut idx = self.value_partition_index.write().unwrap();
+            for (j, (key, partition_key)) in keys.iter().zip(partition_keys.iter()).enumerate() {
+                idx.entry((*key, *partition_key))
+                    .or_default()
+                    .push(base_u32 + j as u32);
             }
         }
 
@@ -390,27 +435,34 @@ impl HotStore {
     pub fn lookup(
         &self,
         key_value: &ScalarValue,
+        partition_value: Option<&ScalarValue>,
         projection: Option<&[usize]>,
         min_offset: u64,
+        reverse: bool,
     ) -> Option<RecordBatch> {
-        let key = {
+        let (key, partition_key) = {
             let pool = self.string_pool.read().unwrap();
-            match scalar_to_key(key_value, &pool).ok()? {
+            let key = match scalar_to_key(key_value, &pool).ok()? {
                 Some(k) => k,
                 None => return None,
-            }
+            };
+            let partition_key = match partition_value {
+                Some(value) => scalar_to_key(value, &pool).ok()?,
+                None => None,
+            };
+            (key, partition_key)
         };
         let rows = {
-            let idx = self.value_index.read().unwrap();
-            let raw = idx.get(&key)?;
-            if min_offset == 0 {
-                raw.clone()
+            let partition_index;
+            let value_index;
+            let raw = if let Some(partition_key) = partition_key {
+                partition_index = self.value_partition_index.read().unwrap();
+                partition_index.get(&(key, partition_key))?
             } else {
-                raw.iter()
-                    .filter(|&&o| (o as u64) >= min_offset)
-                    .copied()
-                    .collect()
-            }
+                value_index = self.value_index.read().unwrap();
+                value_index.get(&key)?
+            };
+            copy_offsets(raw, min_offset, reverse)
         };
 
         let proj: Vec<usize> = match projection {
@@ -517,6 +569,23 @@ impl HotStore {
             }
             idx.retain(|_, v| !v.is_empty());
         }
+        {
+            let mut idx = self.value_partition_index.write().unwrap();
+            let n_u32 = n as u32;
+            for offsets in idx.values_mut() {
+                let mut write_pos = 0usize;
+                let len = offsets.len();
+                for read_pos in 0..len {
+                    let o = offsets[read_pos];
+                    if o >= n_u32 {
+                        offsets[write_pos] = o - n_u32;
+                        write_pos += 1;
+                    }
+                }
+                offsets.truncate(write_pos);
+            }
+            idx.retain(|_, v| !v.is_empty());
+        }
         self.row_count.fetch_sub(n as u64, Ordering::Release);
         n as u64
     }
@@ -566,6 +635,27 @@ fn build_initial_columns(schema: &Schema) -> Vec<ColumnArray> {
         .collect()
 }
 
+fn copy_offsets(raw: &[u32], min_offset: u64, reverse: bool) -> Vec<u32> {
+    if min_offset == 0 {
+        if reverse {
+            raw.iter().rev().copied().collect()
+        } else {
+            raw.to_vec()
+        }
+    } else if reverse {
+        raw.iter()
+            .rev()
+            .filter(|&&o| (o as u64) >= min_offset)
+            .copied()
+            .collect()
+    } else {
+        raw.iter()
+            .filter(|&&o| (o as u64) >= min_offset)
+            .copied()
+            .collect()
+    }
+}
+
 /// Registry of resident hot stores, keyed by `(db, table)`.
 pub struct HotStoreManager {
     stores: RwLock<HashMap<(String, String), Arc<HotStore>>>,
@@ -604,7 +694,8 @@ impl HotStoreManager {
             return Some(Arc::clone(existing));
         }
         let schema = Schema::new(table_meta.columns.clone());
-        let store = Arc::new(HotStore::new(schema, key_idx));
+        let partition_idx = table_meta.get_partition_column_index_cached();
+        let store = Arc::new(HotStore::new(schema, key_idx, partition_idx));
         stores.insert((db.to_string(), table.to_string()), Arc::clone(&store));
         Some(store)
     }
@@ -660,6 +751,26 @@ impl HotStoreManager {
     pub fn clear_resident_coverage(&self, db: &str, table: &str) {
         if let Some(store) = self.get(db, table) {
             store.clear_resident_coverage();
+        }
+    }
+
+    pub fn resident_coverage_snapshot(
+        &self,
+        db: &str,
+        table: &str,
+    ) -> Option<ResidentCoverageSnapshot> {
+        self.get(db, table)
+            .map(|store| store.resident_coverage_snapshot())
+    }
+
+    pub fn restore_resident_coverage(
+        &self,
+        db: &str,
+        table: &str,
+        snapshot: ResidentCoverageSnapshot,
+    ) {
+        if let Some(store) = self.get(db, table) {
+            store.restore_resident_coverage(snapshot);
         }
     }
 }
@@ -731,7 +842,13 @@ mod tests {
         assert_eq!(store.row_count(), 3);
 
         let result = store
-            .lookup(&ScalarValue::VarChar(Some("alpha".into())), None, 0)
+            .lookup(
+                &ScalarValue::VarChar(Some("alpha".into())),
+                None,
+                None,
+                0,
+                false,
+            )
             .unwrap();
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.num_columns(), 4);
@@ -757,7 +874,13 @@ mod tests {
 
         let store = mgr.get("main", "events").unwrap();
         assert!(store
-            .lookup(&ScalarValue::VarChar(Some("zzz".into())), None, 0)
+            .lookup(
+                &ScalarValue::VarChar(Some("zzz".into())),
+                None,
+                None,
+                0,
+                false
+            )
             .is_none());
         assert_eq!(
             store.count_by_key(&ScalarValue::VarChar(Some("zzz".into()))),
@@ -800,10 +923,85 @@ mod tests {
             Some(3)
         );
         let a = store
-            .lookup(&ScalarValue::VarChar(Some("A".into())), Some(&[1, 3]), 0)
+            .lookup(
+                &ScalarValue::VarChar(Some("A".into())),
+                None,
+                Some(&[1, 3]),
+                0,
+                false,
+            )
             .unwrap();
         assert_eq!(a.num_rows(), 3);
         assert_eq!(a.num_columns(), 2);
+    }
+
+    #[test]
+    fn lookup_uses_key_partition_index_and_reverse_offsets() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("symbol", DataType::VarChar),
+            ColumnDef::new("deal_date", DataType::Int64),
+            ColumnDef::new("deal_time", DataType::Int32),
+            ColumnDef::new("price", DataType::Int32),
+        ]);
+        let mut meta = TableMeta::new("main", "ticks", schema.columns.clone());
+        meta.cluster_key = vec![
+            "symbol".to_string(),
+            "deal_date".to_string(),
+            "deal_time".to_string(),
+        ];
+        meta.partition_key = "deal_date".to_string();
+        meta.partition_type = crate::storage::catalog::schema::PartitionType::Value;
+        meta.hot_time_column = Some("deal_time".to_string());
+        meta.hot_index_column = Some("symbol".to_string());
+        meta.update_partition_key_idx();
+
+        let mgr = HotStoreManager::new();
+        let mut batch = RecordBatch::new(schema);
+        for (symbol, deal_date, deal_time, price) in [
+            ("A", 20260708, 93000, 1),
+            ("A", 20260709, 93001, 10),
+            ("A", 20260709, 93002, 20),
+            ("B", 20260709, 93003, 99),
+        ] {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::VarChar(Some(symbol.to_string())))
+                .unwrap();
+            batch
+                .column_mut(1)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(deal_date)))
+                .unwrap();
+            batch
+                .column_mut(2)
+                .unwrap()
+                .push(&ScalarValue::Int32(Some(deal_time)))
+                .unwrap();
+            batch
+                .column_mut(3)
+                .unwrap()
+                .push(&ScalarValue::Int32(Some(price)))
+                .unwrap();
+        }
+        mgr.try_append("main", "ticks", &meta, &batch).unwrap();
+
+        let out = mgr
+            .get("main", "ticks")
+            .unwrap()
+            .lookup(
+                &ScalarValue::VarChar(Some("A".to_string())),
+                Some(&ScalarValue::Int64(Some(20260709))),
+                Some(&[3]),
+                0,
+                true,
+            )
+            .unwrap();
+        assert_eq!(out.num_rows(), 2);
+        match out.column(0).unwrap() {
+            ColumnArray::Int32 { data, .. } => assert_eq!(data, &vec![20, 10]),
+            _ => panic!("expected projected price column"),
+        }
     }
 
     #[test]
@@ -832,7 +1030,7 @@ mod tests {
         let store = mgr.get("main", "kv").unwrap();
         assert_eq!(store.count_by_key(&ScalarValue::Int64(Some(10))), Some(2));
         let r = store
-            .lookup(&ScalarValue::Int64(Some(10)), None, 0)
+            .lookup(&ScalarValue::Int64(Some(10)), None, None, 0, false)
             .unwrap();
         assert_eq!(r.num_rows(), 2);
         match r.column(0).unwrap() {
@@ -874,14 +1072,26 @@ mod tests {
 
         // No watermark: all three A rows.
         let all = store
-            .lookup(&ScalarValue::VarChar(Some("A".into())), Some(&[3]), 0)
+            .lookup(
+                &ScalarValue::VarChar(Some("A".into())),
+                None,
+                Some(&[3]),
+                0,
+                false,
+            )
             .unwrap();
         assert_eq!(all.num_rows(), 3);
 
         // Watermark 3 simulates "offsets [0,3) already persisted to segments";
         // only the live A row at offset 3 is gathered (volume = 4).
         let live = store
-            .lookup(&ScalarValue::VarChar(Some("A".into())), Some(&[3]), 3)
+            .lookup(
+                &ScalarValue::VarChar(Some("A".into())),
+                None,
+                Some(&[3]),
+                3,
+                false,
+            )
             .unwrap();
         assert_eq!(live.num_rows(), 1);
         match live.column(0).unwrap() {
@@ -891,7 +1101,13 @@ mod tests {
 
         // Watermark past every A offset -> empty result (segment scan covers them).
         let none = store
-            .lookup(&ScalarValue::VarChar(Some("A".into())), Some(&[3]), 4)
+            .lookup(
+                &ScalarValue::VarChar(Some("A".into())),
+                None,
+                Some(&[3]),
+                4,
+                false,
+            )
             .unwrap();
         assert_eq!(none.num_rows(), 0);
     }

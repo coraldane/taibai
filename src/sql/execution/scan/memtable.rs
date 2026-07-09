@@ -114,20 +114,35 @@ pub fn scan_hot_store_by_key(
         .iter()
         .find(|(idx, _)| *idx == key_idx)
         .map(|(_, v)| v)?;
+    let partition_col_idx = spec
+        .partition_info
+        .as_ref()
+        .and_then(|pi| pi.partition_key_col_idx);
+    let partition_value = partition_col_idx.and_then(|idx| spec.eq_value_for_column(idx));
 
-    let pure_key_lookup = spec.eq_predicates.len() == 1
-        && spec.eq_predicates[0].0 == key_idx
+    let indexed_lookup = spec
+        .eq_predicates
+        .iter()
+        .all(|(idx, _)| *idx == key_idx || Some(*idx) == partition_col_idx)
         && spec.range_predicates.is_empty()
         && spec.in_predicates.is_empty()
         && spec.remaining_predicate.is_none();
 
-    let lookup_projection = if pure_key_lookup {
+    let lookup_projection = if indexed_lookup {
         spec.projection.as_deref()
     } else {
         None
     };
 
-    let batch = match store.lookup(key_value, lookup_projection, watermark) {
+    let reverse_lookup =
+        ordered_cluster_order_for_schema(store.schema(), spec).is_some_and(|order| order.desc);
+    let batch = match store.lookup(
+        key_value,
+        partition_value,
+        lookup_projection,
+        watermark,
+        reverse_lookup,
+    ) {
         Some(b) => b,
         None => {
             // Value never seen -> empty result, respecting the projection.
@@ -140,7 +155,7 @@ pub fn scan_hot_store_by_key(
         }
     };
 
-    let filtered = if !pure_key_lookup && spec.has_predicates() {
+    let filtered = if !indexed_lookup && spec.has_predicates() {
         super::row_filter::apply_predicates(
             &batch,
             &spec.eq_predicates,
@@ -152,7 +167,7 @@ pub fn scan_hot_store_by_key(
         batch
     };
 
-    if pure_key_lookup {
+    if indexed_lookup {
         return Some(filtered);
     }
 
@@ -278,6 +293,13 @@ struct BatchOrder {
 }
 
 fn ordered_cluster_order_for_batch(batch: &RecordBatch, spec: &ScanSpec) -> Option<BatchOrder> {
+    ordered_cluster_order_for_schema(&batch.schema, spec)
+}
+
+fn ordered_cluster_order_for_schema(
+    schema: &crate::types::batch::Schema,
+    spec: &ScanSpec,
+) -> Option<BatchOrder> {
     if !spec.has_order_by
         || spec.has_aggregate
         || spec.has_group_by
@@ -290,7 +312,7 @@ fn ordered_cluster_order_for_batch(batch: &RecordBatch, spec: &ScanSpec) -> Opti
 
     let cluster_key = spec.cluster_key.as_ref()?;
     let order = spec.order_by.first()?;
-    let order_col_name = batch.schema.columns.get(order.column_index)?.name.as_str();
+    let order_col_name = schema.columns.get(order.column_index)?.name.as_str();
     let order_key_pos = cluster_key
         .iter()
         .position(|key| key.eq_ignore_ascii_case(order_col_name))?;
@@ -299,7 +321,7 @@ fn ordered_cluster_order_for_batch(batch: &RecordBatch, spec: &ScanSpec) -> Opti
     }
 
     for key in cluster_key.iter().take(order_key_pos) {
-        let key_idx = batch.schema.index_of(key)?;
+        let key_idx = schema.index_of(key)?;
         spec.eq_predicates.iter().find(|(idx, _)| *idx == key_idx)?;
     }
 
