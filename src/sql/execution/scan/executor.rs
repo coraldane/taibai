@@ -70,6 +70,14 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_count_star(&mut self) -> Result<Vec<RecordBatch>> {
+        if let Some(count) = self.try_resident_hot_count()? {
+            let result = count::build_count_star_result(count);
+            return match result {
+                crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
+                _ => Ok(Vec::new()),
+            };
+        }
+
         if self.table_meta.ttl.is_some() {
             let mut ttl_spec = self.spec.clone();
             ttl_spec.is_count_star = false;
@@ -417,6 +425,42 @@ impl<'a> ScanExecutor<'a> {
             plan.strip_ttl_column,
         )?;
         Ok(Some(batch))
+    }
+
+    fn try_resident_hot_count(&self) -> Result<Option<u64>> {
+        if self.spec.reader_txn_id != 0 || self.table_meta.ttl.is_some() {
+            return Ok(None);
+        }
+        let Some(store) = self
+            .runtime
+            .hot_store_manager()
+            .get(self.db, &self.spec.table_name)
+        else {
+            return Ok(None);
+        };
+        if store.row_count() == 0 {
+            return Ok(None);
+        }
+
+        let target_partition = if self.table_meta.is_partitioned() {
+            let Some(pi) = self.spec.partition_info.as_ref() else {
+                return Ok(None);
+            };
+            let Some(partition_key) =
+                partition::extract_partition_eq_value(self.spec, pi, &self.table_meta)
+            else {
+                return Ok(None);
+            };
+            Some(partition_key)
+        } else {
+            None
+        };
+
+        if !store.is_resident_for_partition(target_partition.as_deref()) {
+            return Ok(None);
+        }
+
+        Ok(memtable::count_hot_store_by_key(&store, self.spec, 0))
     }
 
     fn ordered_cluster_segments_are_monotonic(&self, segments: &[PathBuf], col_idx: usize) -> bool {

@@ -85,6 +85,20 @@ fn collect_i32_values_in_order(result: ExecResult) -> Vec<i32> {
     out
 }
 
+fn collect_count(result: ExecResult) -> i64 {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result, got {:?}", result);
+    };
+    batches
+        .first()
+        .and_then(|batch| batch.scalar(0, 0))
+        .and_then(|value| match value {
+            ScalarValue::Int64(Some(v)) => Some(v),
+            _ => None,
+        })
+        .expect("count(*) result")
+}
+
 fn explain_text(result: ExecResult) -> String {
     let ExecResult::Query { batches, .. } = result else {
         panic!("expected query result, got {:?}", result);
@@ -257,6 +271,32 @@ fn restart_warmup_serves_resident_partition_point_lookup_without_segment_scan() 
         plan
     );
 
+    let count = collect_count(
+        engine
+            .execute(
+                &mut session,
+                "SELECT count(*) FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'",
+            )
+            .expect("resident hot count"),
+    );
+    assert_eq!(count, 3);
+
+    let count_plan = explain_text(
+        engine
+            .execute(
+                &mut session,
+                "EXPLAIN ANALYZE SELECT count(*) FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'",
+            )
+            .expect("explain analyze resident hot count"),
+    );
+    assert!(
+        !count_plan.contains("segments      :"),
+        "resident hot count should skip segment scan, got:\n{}",
+        count_plan
+    );
+
     engine.segment_mgr().shutdown();
 }
 
@@ -354,6 +394,93 @@ fn direct_bulk_keeps_resident_hot_partition_query_off_segments() {
     assert!(
         !plan.contains("segments      :"),
         "resident hot lookup should still skip segment scan after direct bulk, got:\n{}",
+        plan
+    );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn sql_bulk_import_keeps_resident_hot_partition_query_off_segments() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE stock_tick (
+                    security_id VARCHAR,
+                    deal_date INT64,
+                    deal_time INT32,
+                    gmt_trade TIMESTAMP,
+                    price INT32
+                ) CLUSTER BY (security_id, deal_date, deal_time)
+                  HOT BY (gmt_trade) INDEX (security_id)
+                  PARTITION BY deal_date",
+            )
+            .expect("create stock_tick");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO stock_tick VALUES
+                    ('688256.SH', 20260709, 103904, 1783564744000000, 10),
+                    ('688256.SH', 20260709, 103910, 1783564750000000, 20)",
+            )
+            .expect("insert seed rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE stock_tick")
+            .expect("flush seed rows");
+        engine.shutdown().expect("shutdown engine");
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    assert!(engine
+        .hot_store_manager()
+        .get("main", "stock_tick")
+        .expect("warmup should rebuild hot store")
+        .is_resident_for_partition(Some("20260709")));
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO stock_tick VALUES
+                ('688256.SH', 20260709, 103913, 1783564753000000, 30)",
+        )
+        .expect("bulk-mode SQL insert");
+    session.bulk_import_mode = false;
+    assert_eq!(engine.end_bulk_import(), 0);
+    engine.flush_all_buffers().expect("flush bulk rows");
+
+    let rows = collect_i32_values_in_order(
+        engine
+            .execute(
+                &mut session,
+                "SELECT price FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'
+                 ORDER BY deal_time DESC",
+            )
+            .expect("resident hot point lookup after SQL bulk insert"),
+    );
+    assert_eq!(rows, vec![30, 20, 10]);
+
+    let plan = explain_text(
+        engine
+            .execute(
+                &mut session,
+                "EXPLAIN ANALYZE SELECT price FROM stock_tick
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'
+                 ORDER BY deal_time DESC",
+            )
+            .expect("explain analyze after SQL bulk insert"),
+    );
+    assert!(
+        !plan.contains("segments      :"),
+        "resident hot lookup should still skip segment scan after SQL bulk insert, got:\n{}",
         plan
     );
 

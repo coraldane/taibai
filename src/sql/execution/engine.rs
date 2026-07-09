@@ -1463,15 +1463,54 @@ impl Engine {
         disable_wal: bool,
     ) -> Result<u64> {
         self.validate_batch_unique_indexes(db, table, &batch)?;
-        let result = if self.is_bulk_mode() {
+        let table_meta_for_hot = {
+            let catalogs = self.catalogs.read().unwrap();
+            catalogs
+                .get(db)
+                .and_then(|catalog| catalog.get_table(table))
+                .cloned()
+        };
+        let resident_coverage_before_bulk = table_meta_for_hot
+            .as_ref()
+            .and_then(|meta| self.begin_hot_bulk_write(db, table, meta));
+        let hot_batch = if resident_coverage_before_bulk.is_some() {
+            Some(batch.clone())
+        } else {
+            None
+        };
+        let result = match if self.is_bulk_mode() {
             self.segment_mgr
                 .bulk_insert_batch_deferred(db, table, batch, disable_wal)
         } else {
             self.segment_mgr
                 .bulk_insert_batch(db, table, batch, disable_wal)
-        }?;
+        } {
+            Ok(result) => result,
+            Err(e) => {
+                if let Some(snapshot) = resident_coverage_before_bulk {
+                    self.hot_store_mgr
+                        .restore_resident_coverage(db, table, snapshot);
+                }
+                return Err(e);
+            }
+        };
         if result > 0 {
-            self.hot_store_mgr.clear_resident_coverage(db, table);
+            if let (Some(table_meta), Some(batch)) =
+                (table_meta_for_hot.as_ref(), hot_batch.as_ref())
+            {
+                self.feed_hot_store_after_batch(
+                    db,
+                    table,
+                    table_meta,
+                    batch,
+                    resident_coverage_before_bulk,
+                );
+            } else {
+                self.hot_store_mgr.clear_resident_coverage(db, table);
+            }
+        } else if let Some(snapshot) = resident_coverage_before_bulk {
+            self.hot_store_mgr
+                .restore_resident_coverage(db, table, snapshot);
         }
         Ok(result)
     }
@@ -1485,7 +1524,13 @@ impl Engine {
         disable_wal: bool,
     ) -> Result<u64> {
         self.validate_batch_unique_indexes(db, table, &batch)?;
-        let result = if self.is_bulk_mode() {
+        let resident_coverage_before_bulk = self.begin_hot_bulk_write(db, table, table_meta);
+        let hot_batch = if resident_coverage_before_bulk.is_some() {
+            Some(batch.clone())
+        } else {
+            None
+        };
+        let result = match if self.is_bulk_mode() {
             self.segment_mgr
                 .bulk_insert_batch_partitioned_deferred(db, table, table_meta, batch)
         } else if table_meta.is_partitioned() {
@@ -1494,9 +1539,31 @@ impl Engine {
         } else {
             self.segment_mgr
                 .bulk_insert_batch(db, table, batch, disable_wal)
-        }?;
+        } {
+            Ok(result) => result,
+            Err(e) => {
+                if let Some(snapshot) = resident_coverage_before_bulk {
+                    self.hot_store_mgr
+                        .restore_resident_coverage(db, table, snapshot);
+                }
+                return Err(e);
+            }
+        };
         if result > 0 {
-            self.hot_store_mgr.clear_resident_coverage(db, table);
+            if let Some(batch) = hot_batch.as_ref() {
+                self.feed_hot_store_after_batch(
+                    db,
+                    table,
+                    table_meta,
+                    batch,
+                    resident_coverage_before_bulk,
+                );
+            } else {
+                self.hot_store_mgr.clear_resident_coverage(db, table);
+            }
+        } else if let Some(snapshot) = resident_coverage_before_bulk {
+            self.hot_store_mgr
+                .restore_resident_coverage(db, table, snapshot);
         }
         Ok(result)
     }
@@ -1531,15 +1598,6 @@ impl Engine {
             && table_meta_for_hot.as_ref().is_some_and(|meta| {
                 crate::storage::core::hot_store::resolve_key_column(meta).is_some()
             });
-        let resident_coverage_before_bulk = if hot_payload_should_feed {
-            let snapshot = self
-                .hot_store_mgr
-                .resident_coverage_snapshot(db, &table_name);
-            self.hot_store_mgr.clear_resident_coverage(db, &table_name);
-            snapshot
-        } else {
-            None
-        };
         if let Some(table_meta) = catalog.get_table(&table_name) {
             unique_index_names = table_meta
                 .unique_indexes
@@ -1579,6 +1637,15 @@ impl Engine {
             }
         }
 
+        let resident_coverage_before_bulk = if hot_payload_should_feed {
+            self.begin_hot_bulk_write(
+                db,
+                &table_name,
+                table_meta_for_hot.as_ref().expect("checked hot table meta"),
+            )
+        } else {
+            None
+        };
         let result = match self.segment_mgr.bulk_insert_payload_with_catalog(
             db,
             payload,
@@ -1655,6 +1722,61 @@ impl Engine {
         }
         if result > 0 {}
         Ok(result)
+    }
+
+    fn begin_hot_bulk_write(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+    ) -> Option<crate::storage::core::hot_store::ResidentCoverageSnapshot> {
+        if crate::storage::core::hot_store::resolve_key_column(table_meta).is_none() {
+            return None;
+        }
+        let snapshot = self
+            .hot_store_mgr
+            .resident_coverage_snapshot(db, table)
+            .unwrap_or_default();
+        self.hot_store_mgr.clear_resident_coverage(db, table);
+        Some(snapshot)
+    }
+
+    fn feed_hot_store_after_batch(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: &RecordBatch,
+        resident_coverage_before_bulk: Option<
+            crate::storage::core::hot_store::ResidentCoverageSnapshot,
+        >,
+    ) {
+        let feed_result = match self.feed_hot_store(db, table, table_meta, batch) {
+            Ok(()) => Ok(()),
+            Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
+                self.reclaim_hot_store_pressure(db, table);
+                self.feed_hot_store(db, table, table_meta, batch)
+            }
+            Err(e) => Err(e),
+        };
+
+        match feed_result {
+            Ok(()) => {
+                if let Some(snapshot) = resident_coverage_before_bulk {
+                    self.hot_store_mgr
+                        .restore_resident_coverage(db, table, snapshot);
+                }
+            }
+            Err(e) => {
+                self.hot_store_mgr.clear_resident_coverage(db, table);
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %e,
+                    "bulk insert persisted, but feeding hot store failed; resident fast path disabled"
+                );
+            }
+        }
     }
 
     fn feed_hot_store_after_direct_bulk(

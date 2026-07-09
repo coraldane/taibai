@@ -186,26 +186,44 @@ pub fn count_hot_memtable_rows(
     table_name: &str,
     spec: &ScanSpec,
 ) -> Option<u64> {
+    let store = hot_mgr.get(db, table_name)?;
+    let (key_value, partition_value) = hot_count_key_partition_values(&store, spec)?;
+    let (has_live_memtable_data, watermark) =
+        live_memtables_and_watermark(memtable_mgr, db, table_name, spec.reader_txn_id, &store);
+    if !has_live_memtable_data {
+        return None;
+    }
+    store.count_by_key_partition_from(key_value, partition_value, watermark)
+}
+
+pub fn count_hot_store_by_key(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Option<u64> {
+    let (key_value, partition_value) = hot_count_key_partition_values(store, spec)?;
+    store.count_by_key_partition_from(key_value, partition_value, watermark)
+}
+
+fn hot_count_key_partition_values<'a>(
+    store: &HotStore,
+    spec: &'a ScanSpec,
+) -> Option<(&'a ScalarValue, Option<&'a ScalarValue>)> {
     if spec.reader_txn_id != 0
-        || spec.eq_predicates.len() != 1
         || !spec.range_predicates.is_empty()
         || !spec.in_predicates.is_empty()
         || spec.remaining_predicate.is_some()
     {
         return None;
     }
-    let store = hot_mgr.get(db, table_name)?;
     let key_idx = store.key_column_index();
-    let (col_idx, key_value) = &spec.eq_predicates[0];
-    if *col_idx != key_idx {
+    let partition_col_idx = store.partition_column_index();
+    if !spec
+        .eq_predicates
+        .iter()
+        .all(|(idx, _)| *idx == key_idx || Some(*idx) == partition_col_idx)
+    {
         return None;
     }
-    let (has_live_memtable_data, watermark) =
-        live_memtables_and_watermark(memtable_mgr, db, table_name, spec.reader_txn_id, &store);
-    if !has_live_memtable_data {
-        return None;
-    }
-    store.count_by_key_from(key_value, watermark)
+    let key_value = spec.eq_value_for_column(key_idx)?;
+    let partition_value = partition_col_idx.and_then(|idx| spec.eq_value_for_column(idx));
+    Some((key_value, partition_value))
 }
 
 pub fn count_memtable_rows(

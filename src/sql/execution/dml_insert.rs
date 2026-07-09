@@ -1205,7 +1205,7 @@ fn exec_materialized_insert_batch(
         constraint_start.elapsed(),
     );
 
-    if txn_id == 0 {
+    if txn_id == 0 && !bulk_import_mode {
         match engine.feed_hot_store(db, table, table_meta, &batch) {
             Ok(()) => {
                 if engine

@@ -260,6 +260,10 @@ impl HotStore {
         self.key_column_index
     }
 
+    pub fn partition_column_index(&self) -> Option<usize> {
+        self.partition_column_index
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -497,15 +501,38 @@ impl HotStore {
     }
 
     pub fn count_by_key_from(&self, key_value: &ScalarValue, min_offset: u64) -> Option<u64> {
+        self.count_by_key_partition_from(key_value, None, min_offset)
+    }
+
+    pub fn count_by_key_partition_from(
+        &self,
+        key_value: &ScalarValue,
+        partition_value: Option<&ScalarValue>,
+        min_offset: u64,
+    ) -> Option<u64> {
         let pool = self.string_pool.read().unwrap();
         let key = scalar_to_key(key_value, &pool).ok()??;
+        let partition_key = match partition_value {
+            Some(value) => scalar_to_key(value, &pool).ok()?,
+            None => None,
+        };
         drop(pool);
-        self.value_index.read().unwrap().get(&key).map(|v| {
-            if min_offset == 0 {
-                v.len() as u64
-            } else {
-                v.iter().filter(|&&o| (o as u64) >= min_offset).count() as u64
-            }
+        let partition_index;
+        let value_index;
+        let offsets = if let Some(partition_key) = partition_key {
+            partition_index = self.value_partition_index.read().unwrap();
+            partition_index.get(&(key, partition_key))?
+        } else {
+            value_index = self.value_index.read().unwrap();
+            value_index.get(&key)?
+        };
+        Some(if min_offset == 0 {
+            offsets.len() as u64
+        } else {
+            offsets
+                .iter()
+                .filter(|&&o| (o as u64) >= min_offset)
+                .count() as u64
         })
     }
 
