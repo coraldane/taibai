@@ -14,6 +14,7 @@ use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
 use crate::storage::core::compactor::Compactor;
 use crate::storage::core::memtable::MemTableManager;
 use crate::storage::index::index_manager::IndexManager;
+use crate::storage::partition::{parse_partition_key, PartitionStrategy};
 use crate::storage::segment_manager::{SegmentConfig, SegmentManager};
 
 use crate::sql::parser::ast::Statement;
@@ -44,6 +45,12 @@ pub struct Engine {
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
     hot_store_mgr: Arc<crate::storage::core::hot_store::HotStoreManager>,
+}
+
+enum HotResidentMark {
+    None,
+    FullTable,
+    Partitions(Vec<String>),
 }
 
 struct CatalogSaveState {
@@ -977,7 +984,129 @@ impl Engine {
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: &crate::types::batch::RecordBatch,
     ) -> crate::common::error::Result<()> {
-        self.hot_store_mgr.try_append(db, table, table_meta, batch)
+        let resident_mark = self.hot_resident_mark_for_append(db, table, table_meta, batch);
+        self.hot_store_mgr
+            .try_append(db, table, table_meta, batch)?;
+        self.apply_hot_resident_mark(db, table, resident_mark);
+        Ok(())
+    }
+
+    fn hot_resident_mark_for_append(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: &crate::types::batch::RecordBatch,
+    ) -> HotResidentMark {
+        if crate::storage::core::hot_store::resolve_key_column(table_meta).is_none()
+            || batch.num_rows() == 0
+        {
+            return HotResidentMark::None;
+        }
+
+        let table_dir = self.segment_mgr.table_dir(db, table);
+        if !table_meta.is_partitioned() {
+            return if !Self::table_has_any_segment(&table_dir) {
+                HotResidentMark::FullTable
+            } else {
+                HotResidentMark::None
+            };
+        }
+
+        let Some(partition_col_idx) =
+            table_meta.get_partition_column_index_cached().or_else(|| {
+                table_meta
+                    .columns
+                    .iter()
+                    .position(|col| col.name.eq_ignore_ascii_case(&table_meta.partition_key))
+            })
+        else {
+            return HotResidentMark::None;
+        };
+
+        let mut partitions = std::collections::HashSet::new();
+        for row_idx in 0..batch.num_rows() {
+            let Some(value) = batch.scalar(row_idx, partition_col_idx) else {
+                continue;
+            };
+            let Some(key) = Self::hot_partition_key_for_value(table_meta, &value) else {
+                continue;
+            };
+            partitions.insert(key);
+        }
+        if partitions.is_empty() {
+            return HotResidentMark::None;
+        }
+
+        let markable = partitions
+            .into_iter()
+            .filter(|partition| !Self::partition_has_segment(&table_dir, partition))
+            .collect::<Vec<_>>();
+        if markable.is_empty() {
+            HotResidentMark::None
+        } else {
+            HotResidentMark::Partitions(markable)
+        }
+    }
+
+    fn apply_hot_resident_mark(&self, db: &str, table: &str, mark: HotResidentMark) {
+        let Some(store) = self.hot_store_mgr.get(db, table) else {
+            return;
+        };
+        match mark {
+            HotResidentMark::None => {}
+            HotResidentMark::FullTable => store.mark_full_resident(),
+            HotResidentMark::Partitions(partitions) => {
+                for partition in partitions {
+                    store.mark_partition_resident(partition);
+                }
+            }
+        }
+    }
+
+    fn hot_partition_key_for_value(
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        value: &crate::types::scalar::ScalarValue,
+    ) -> Option<String> {
+        match table_meta.partition_type {
+            crate::storage::catalog::schema::PartitionType::Value => value.to_text(),
+            crate::storage::catalog::schema::PartitionType::Day => {
+                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Day).ok()
+            }
+            crate::storage::catalog::schema::PartitionType::Month => {
+                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Month)
+                    .ok()
+            }
+            crate::storage::catalog::schema::PartitionType::Year => {
+                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Year)
+                    .ok()
+            }
+            _ => None,
+        }
+    }
+
+    fn table_has_any_segment(table_dir: &std::path::Path) -> bool {
+        SegmentManager::discover_segments(table_dir)
+            .map(|segments| !segments.is_empty())
+            .unwrap_or(true)
+    }
+
+    fn partition_has_segment(table_dir: &std::path::Path, partition_key: &str) -> bool {
+        if !table_dir.exists() {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(table_dir) else {
+            return true;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if parse_partition_key(&name).as_deref() == Some(partition_key) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Reclaim resident memory under hot-store backpressure (design §3.1 hard

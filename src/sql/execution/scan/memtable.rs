@@ -1,3 +1,4 @@
+use crate::storage::catalog::schema::TableMeta;
 use crate::storage::core::hot_store::{HotStore, HotStoreManager};
 use crate::storage::core::memtable::MemTableManager;
 use crate::types::batch::RecordBatch;
@@ -19,6 +20,61 @@ fn live_memtables_and_watermark(
         .collect::<Vec<_>>();
     let live_rows = memtables.iter().map(|mt| mt.row_count()).sum::<u64>();
     (live_rows > 0, store.row_count().saturating_sub(live_rows))
+}
+
+pub fn scan_resident_hot_store(
+    hot_mgr: &HotStoreManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<RecordBatch> {
+    if spec.reader_txn_id != 0 {
+        return None;
+    }
+    let store = hot_mgr.get(db, &spec.table_name)?;
+    if store.row_count() == 0 {
+        return None;
+    }
+    if !resident_hot_covers(&store, table_meta, spec) {
+        return None;
+    }
+    scan_hot_store_by_key(&store, spec, 0)
+}
+
+pub fn count_resident_hot_store(
+    hot_mgr: &HotStoreManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<u64> {
+    if spec.reader_txn_id != 0 || table_meta.ttl.is_some() {
+        return None;
+    }
+    let store = hot_mgr.get(db, &spec.table_name)?;
+    if store.row_count() == 0 {
+        return None;
+    }
+    if !resident_hot_covers(&store, table_meta, spec) {
+        return None;
+    }
+    count_hot_store_by_key(&store, spec, 0)
+}
+
+fn resident_hot_covers(store: &HotStore, table_meta: &TableMeta, spec: &ScanSpec) -> bool {
+    let target_partition = if table_meta.is_partitioned() {
+        let Some(pi) = spec.partition_info.as_ref() else {
+            return false;
+        };
+        let Some(partition_key) =
+            super::partition::extract_partition_eq_value(spec, pi, table_meta)
+        else {
+            return false;
+        };
+        Some(partition_key)
+    } else {
+        None
+    };
+    store.is_resident_for_partition(target_partition.as_deref())
 }
 
 pub fn scan_memtables(
@@ -45,8 +101,13 @@ pub fn scan_memtables(
     let has_live_memtable_data = memtables.iter().any(|mt| mt.row_count() > 0);
     if has_live_memtable_data && spec.reader_txn_id == 0 {
         if let Some(store) = hot_mgr.get(db, table_name) {
-            let live_rows = memtables.iter().map(|mt| mt.row_count()).sum::<u64>();
-            let watermark = store.row_count().saturating_sub(live_rows);
+            let (_, watermark) = live_memtables_and_watermark(
+                memtable_mgr,
+                db,
+                table_name,
+                spec.reader_txn_id,
+                &store,
+            );
             if let Some(batch) = scan_hot_store_by_key(&store, spec, watermark) {
                 return vec![batch];
             }

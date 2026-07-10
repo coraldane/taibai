@@ -381,41 +381,14 @@ impl<'a> ScanExecutor<'a> {
         &self,
         plan: &super::strategy::ScanPlan,
     ) -> Result<Option<RecordBatch>> {
-        if self.spec.reader_txn_id != 0 {
-            return Ok(None);
-        }
-        let Some(store) = self
-            .runtime
-            .hot_store_manager()
-            .get(self.db, &self.spec.table_name)
-        else {
-            return Ok(None);
-        };
-        if store.row_count() == 0 {
-            return Ok(None);
-        }
-
-        let target_partition = if self.table_meta.is_partitioned() {
-            let Some(pi) = self.spec.partition_info.as_ref() else {
-                return Ok(None);
-            };
-            let Some(partition_key) =
-                partition::extract_partition_eq_value(self.spec, pi, &self.table_meta)
-            else {
-                return Ok(None);
-            };
-            Some(partition_key)
-        } else {
-            None
-        };
-
-        if !store.is_resident_for_partition(target_partition.as_deref()) {
-            return Ok(None);
-        }
-
         let mut hot_spec = self.spec.clone();
         hot_spec.projection = Some(plan.projection_cols.clone());
-        let Some(batch) = memtable::scan_hot_store_by_key(&store, &hot_spec, 0) else {
+        let Some(batch) = memtable::scan_resident_hot_store(
+            self.runtime.hot_store_manager(),
+            self.db,
+            &self.table_meta,
+            &hot_spec,
+        ) else {
             return Ok(None);
         };
         let batch = super::strategy::apply_ttl_filter_and_projection(
@@ -428,39 +401,12 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn try_resident_hot_count(&self) -> Result<Option<u64>> {
-        if self.spec.reader_txn_id != 0 || self.table_meta.ttl.is_some() {
-            return Ok(None);
-        }
-        let Some(store) = self
-            .runtime
-            .hot_store_manager()
-            .get(self.db, &self.spec.table_name)
-        else {
-            return Ok(None);
-        };
-        if store.row_count() == 0 {
-            return Ok(None);
-        }
-
-        let target_partition = if self.table_meta.is_partitioned() {
-            let Some(pi) = self.spec.partition_info.as_ref() else {
-                return Ok(None);
-            };
-            let Some(partition_key) =
-                partition::extract_partition_eq_value(self.spec, pi, &self.table_meta)
-            else {
-                return Ok(None);
-            };
-            Some(partition_key)
-        } else {
-            None
-        };
-
-        if !store.is_resident_for_partition(target_partition.as_deref()) {
-            return Ok(None);
-        }
-
-        Ok(memtable::count_hot_store_by_key(&store, self.spec, 0))
+        Ok(memtable::count_resident_hot_store(
+            self.runtime.hot_store_manager(),
+            self.db,
+            &self.table_meta,
+            self.spec,
+        ))
     }
 
     fn ordered_cluster_segments_are_monotonic(&self, segments: &[PathBuf], col_idx: usize) -> bool {

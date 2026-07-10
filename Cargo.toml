@@ -4,6 +4,7 @@ members = [
     "examples/batch_import",
     "examples/multi_insert",
     "examples/prepare_test",
+    "examples/hot_insert",
 ]
 
 [package]

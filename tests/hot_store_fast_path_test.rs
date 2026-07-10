@@ -85,6 +85,22 @@ fn collect_i32_values_in_order(result: ExecResult) -> Vec<i32> {
     out
 }
 
+fn collect_i32_column_values(result: ExecResult, col_idx: usize) -> Vec<i32> {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result, got {:?}", result);
+    };
+    let mut out = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            match batch.scalar(row_idx, col_idx) {
+                Some(ScalarValue::Int32(Some(v))) => out.push(v),
+                other => panic!("expected int32 at column {}, got {:?}", col_idx, other),
+            }
+        }
+    }
+    out
+}
+
 fn collect_count(result: ExecResult) -> i64 {
     let ExecResult::Query { batches, .. } = result else {
         panic!("expected query result, got {:?}", result);
@@ -296,6 +312,139 @@ fn restart_warmup_serves_resident_partition_point_lookup_without_segment_scan() 
         "resident hot count should skip segment scan, got:\n{}",
         count_plan
     );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn physical_cursor_select_star_uses_resident_hot_partition() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE hot_tick (
+                    security_id VARCHAR,
+                    deal_date INT64,
+                    deal_time INT32,
+                    gmt_trade TIMESTAMP,
+                    price INT32
+                ) CLUSTER BY (security_id, deal_date, deal_time)
+                  HOT BY (gmt_trade) INDEX (security_id)
+                  PARTITION BY deal_date",
+            )
+            .expect("create hot_tick");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO hot_tick VALUES
+                    ('688256.SH', 20260710, 103904, 1783651144000000, 10),
+                    ('688256.SH', 20260710, 103913, 1783651153000000, 30),
+                    ('000001.SZ', 20260710, 103999, 1783651199000000, 99)",
+            )
+            .expect("insert rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE hot_tick")
+            .expect("flush rows");
+        engine.shutdown().expect("shutdown engine");
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    assert!(engine
+        .hot_store_manager()
+        .get("main", "hot_tick")
+        .expect("warmup should rebuild hot store")
+        .is_resident_for_partition(Some("20260710")));
+
+    let table_dir = engine.segment_mgr().table_dir("main", "hot_tick");
+    for entry in std::fs::read_dir(&table_dir).expect("read table dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("dat") {
+            std::fs::rename(&path, path.with_extension("dat.hidden"))
+                .expect("hide segment to prove resident hot path");
+        }
+    }
+
+    let mut prices = collect_i32_column_values(
+        engine
+            .execute(
+                &mut session,
+                "SELECT * FROM hot_tick t
+                 WHERE t.deal_date = 20260710 AND t.security_id = '688256.SH'",
+            )
+            .expect("resident hot select star"),
+        4,
+    );
+    prices.sort();
+    assert_eq!(prices, vec![10, 30]);
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn ordinary_insert_marks_new_hot_partition_resident_after_flush() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE hot_tick (
+                security_id VARCHAR,
+                deal_date INT64,
+                deal_time INT32,
+                gmt_trade TIMESTAMP,
+                price INT32
+            ) CLUSTER BY (security_id, deal_date, deal_time)
+              HOT BY (gmt_trade) INDEX (security_id)
+              PARTITION BY deal_date",
+        )
+        .expect("create hot_tick");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO hot_tick VALUES
+                ('688256.SH', 20260710, 103904, 1783651144000000, 10),
+                ('688256.SH', 20260710, 103913, 1783651153000000, 30),
+                ('000001.SZ', 20260710, 103999, 1783651199000000, 99)",
+        )
+        .expect("insert rows");
+    assert!(engine
+        .hot_store_manager()
+        .get("main", "hot_tick")
+        .expect("insert should create hot store")
+        .is_resident_for_partition(Some("20260710")));
+
+    engine
+        .execute(&mut session, "FLUSH TABLE hot_tick")
+        .expect("flush rows");
+
+    let table_dir = engine.segment_mgr().table_dir("main", "hot_tick");
+    for entry in std::fs::read_dir(&table_dir).expect("read table dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("dat") {
+            std::fs::rename(&path, path.with_extension("dat.hidden"))
+                .expect("hide segment to prove resident hot path");
+        }
+    }
+
+    let mut prices = collect_i32_column_values(
+        engine
+            .execute(
+                &mut session,
+                "SELECT * FROM hot_tick t
+                 WHERE t.deal_date = 20260710 AND t.security_id = '688256.SH'",
+            )
+            .expect("resident hot select star after flush"),
+        4,
+    );
+    prices.sort();
+    assert_eq!(prices, vec![10, 30]);
 
     engine.segment_mgr().shutdown();
 }
