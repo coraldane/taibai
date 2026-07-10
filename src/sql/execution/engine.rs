@@ -192,6 +192,7 @@ impl Engine {
             default_database,
             SegmentConfig::default(),
             AutoCompactConfig::default(),
+            8 * 1024 * 1024 * 1024,
         )
     }
     pub fn new_with_storage_config(
@@ -204,6 +205,7 @@ impl Engine {
             default_database,
             segment_config,
             AutoCompactConfig::default(),
+            8 * 1024 * 1024 * 1024,
         )
     }
 
@@ -212,6 +214,7 @@ impl Engine {
         default_database: &str,
         segment_config: SegmentConfig,
         auto_compact_config: AutoCompactConfig,
+        hot_store_memory_limit_bytes: u64,
     ) -> Result<Self> {
         let mut catalogs = HashMap::new();
         let meta_dir = data_dir.join("meta");
@@ -287,7 +290,11 @@ impl Engine {
             Arc::clone(&segment_mgr),
             data_dir.to_path_buf(),
         ));
-        let hot_store_mgr = Arc::new(crate::storage::core::hot_store::HotStoreManager::new());
+        let hot_store_mgr = Arc::new(
+            crate::storage::core::hot_store::HotStoreManager::with_memory_limit_bytes(
+                hot_store_memory_limit_bytes,
+            ),
+        );
         let catalogs = Arc::new(RwLock::new(catalogs));
         start_delete_bitmap_cleanup_thread(
             Arc::clone(&segment_mgr),

@@ -56,6 +56,10 @@ fn default_delete_cleanup_max_segments_per_run() -> usize {
     8
 }
 
+fn default_hot_store_memory_limit_mb() -> u64 {
+    8192
+}
+
 fn default_batch_size() -> usize {
     4096
 }
@@ -111,6 +115,8 @@ pub struct StorageSettings {
     pub delete_bitmap_cleanup_interval_secs: Option<u64>,
     #[serde(default = "default_delete_cleanup_max_segments_per_run")]
     pub delete_cleanup_max_segments_per_run: usize,
+    #[serde(default = "default_hot_store_memory_limit_mb")]
+    pub hot_store_memory_limit_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +169,7 @@ impl Default for ServerConfig {
                 delete_cleanup_interval_ms: default_delete_cleanup_interval_ms(),
                 delete_bitmap_cleanup_interval_secs: default_delete_bitmap_cleanup_interval_secs(),
                 delete_cleanup_max_segments_per_run: default_delete_cleanup_max_segments_per_run(),
+                hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
             },
             buffer: BufferSettings { batch_size: 4096 },
             compression: CompressionSettings { enabled: true },

@@ -19,6 +19,7 @@ storage:
   delete_cleanup_min_deleted_rows: 8192  # Minimum deleted rows before cleanup
   delete_bitmap_cleanup_interval_secs: 60  # Background cleanup interval; overrides delete_cleanup_interval_ms when set
   delete_cleanup_max_segments_per_run: 8  # Limit cleanup work per round
+  hot_store_memory_limit_mb: 8192  # Unified resident hot store memory limit in MB
 
 # Buffer settings
 buffer:

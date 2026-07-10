@@ -238,6 +238,7 @@ impl HotStore {
         schema: Schema,
         key_column_index: usize,
         partition_column_index: Option<usize>,
+        memory_limit_bytes: u64,
     ) -> Self {
         let columns = build_initial_columns(&schema);
         Self {
@@ -251,8 +252,8 @@ impl HotStore {
             string_pool: RwLock::new(StringPool::new()),
             value_index: RwLock::new(HashMap::new()),
             value_partition_index: RwLock::new(HashMap::new()),
-            memory_soft_limit: 6 * 1024 * 1024 * 1024,
-            memory_hard_limit: 8 * 1024 * 1024 * 1024,
+            memory_soft_limit: memory_limit_bytes,
+            memory_hard_limit: memory_limit_bytes,
         }
     }
 
@@ -686,12 +687,18 @@ fn copy_offsets(raw: &[u32], min_offset: u64, reverse: bool) -> Vec<u32> {
 /// Registry of resident hot stores, keyed by `(db, table)`.
 pub struct HotStoreManager {
     stores: RwLock<HashMap<(String, String), Arc<HotStore>>>,
+    memory_limit_bytes: u64,
 }
 
 impl HotStoreManager {
     pub fn new() -> Self {
+        Self::with_memory_limit_bytes(8 * 1024 * 1024 * 1024)
+    }
+
+    pub fn with_memory_limit_bytes(memory_limit_bytes: u64) -> Self {
         Self {
             stores: RwLock::new(HashMap::new()),
+            memory_limit_bytes,
         }
     }
 
@@ -722,7 +729,12 @@ impl HotStoreManager {
         }
         let schema = Schema::new(table_meta.columns.clone());
         let partition_idx = table_meta.get_partition_column_index_cached();
-        let store = Arc::new(HotStore::new(schema, key_idx, partition_idx));
+        let store = Arc::new(HotStore::new(
+            schema,
+            key_idx,
+            partition_idx,
+            self.memory_limit_bytes,
+        ));
         stores.insert((db.to_string(), table.to_string()), Arc::clone(&store));
         Some(store)
     }

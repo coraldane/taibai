@@ -118,6 +118,7 @@ where
         &config.storage.default_database,
         segment_config_from_server_config(&config),
         auto_compact_config_from_server_config(&config),
+        config.storage.hot_store_memory_limit_mb.saturating_mul(1024 * 1024),
     ) {
         Ok(e) => e,
         Err(e) => {
