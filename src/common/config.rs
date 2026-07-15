@@ -1,11 +1,52 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::net::tls::TlsMode;
 
 fn default_port() -> u16 {
     5151
+}
+
+/// Process-global runtime limits consulted by query operators (aggregation,
+/// streaming scans, ...). Populated once at startup from `BufferSettings` via
+/// [`set_query_limits`]. Operators read via [`query_limits`]; before startup
+/// the [`QueryLimits::default`] values apply.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryLimits {
+    /// Soft per-query memory ceiling in MB. Surfaced to operators so future
+    /// streaming-scan enforcement can consult it; currently the
+    /// `max_aggregate_groups` cap is the primary OOM safeguard for grouped
+    /// aggregation, while no-GROUP-BY aggregation is already O(1) memory.
+    #[allow(dead_code)]
+    pub query_memory_limit_mb: u64,
+    pub max_aggregate_groups: usize,
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            query_memory_limit_mb: default_query_memory_limit_mb(),
+            max_aggregate_groups: default_max_aggregate_groups(),
+        }
+    }
+}
+
+static QUERY_LIMITS: OnceLock<QueryLimits> = OnceLock::new();
+
+/// Install the process-wide query limits. Called once during startup.
+/// Returns an error if called more than once (limits are immutable thereafter).
+pub fn set_query_limits(limits: QueryLimits) -> Result<(), QueryLimits> {
+    QUERY_LIMITS.set(limits)
+}
+
+/// Read the process-wide query limits (defaults if unset).
+pub fn query_limits() -> QueryLimits {
+    *QUERY_LIMITS.get().unwrap_or(&QueryLimits {
+        query_memory_limit_mb: default_query_memory_limit_mb(),
+        max_aggregate_groups: default_max_aggregate_groups(),
+    })
 }
 
 fn default_max_message_size() -> usize {
@@ -62,6 +103,14 @@ fn default_hot_store_memory_limit_mb() -> u64 {
 
 fn default_batch_size() -> usize {
     4096
+}
+
+fn default_query_memory_limit_mb() -> u64 {
+    4096
+}
+
+fn default_max_aggregate_groups() -> usize {
+    1_000_000
 }
 
 fn default_log_level() -> String {
@@ -123,6 +172,15 @@ pub struct StorageSettings {
 pub struct BufferSettings {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Soft per-query memory ceiling in MB. Aggregation/streaming operators
+    /// abort the query (rather than OOM-crash the process) when an internal
+    /// estimate of rows-since-start times average row width crosses this.
+    #[serde(default = "default_query_memory_limit_mb")]
+    pub query_memory_limit_mb: u64,
+    /// Maximum number of GROUP BY distinct keys before a grouped aggregate
+    /// errors out. Caps memory for high-cardinality GROUP BY queries.
+    #[serde(default = "default_max_aggregate_groups")]
+    pub max_aggregate_groups: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +229,11 @@ impl Default for ServerConfig {
                 delete_cleanup_max_segments_per_run: default_delete_cleanup_max_segments_per_run(),
                 hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
             },
-            buffer: BufferSettings { batch_size: 4096 },
+            buffer: BufferSettings {
+                batch_size: 4096,
+                query_memory_limit_mb: default_query_memory_limit_mb(),
+                max_aggregate_groups: default_max_aggregate_groups(),
+            },
             compression: CompressionSettings { enabled: true },
             tls: TlsConfigYaml::default(),
             log: LogSettings {

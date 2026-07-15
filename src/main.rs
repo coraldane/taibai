@@ -131,6 +131,12 @@ where
     };
 
     let config = Arc::new(config);
+    // Publish process-global query runtime limits for operators (aggregation,
+    // streaming scans) to consult.
+    let _ = crate::common::config::set_query_limits(crate::common::config::QueryLimits {
+        query_memory_limit_mb: config.buffer.query_memory_limit_mb,
+        max_aggregate_groups: config.buffer.max_aggregate_groups,
+    });
     let engine = Arc::new(engine);
     let _ = rayon::ThreadPoolBuilder::new().build_global();
     crate::sql::execution::engine::start_close_of_day_scheduler(engine.clone());

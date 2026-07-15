@@ -26,6 +26,10 @@ path = "src/main.rs"
 name = "segment"
 path = "src/bin/segment_checker.rs"
 
+[[bin]]
+name = "tonglian-compare"
+path = "src/bin/tonglian_compare.rs"
+
 
 
 [dependencies]
@@ -53,6 +57,7 @@ lazy_static = "1.4"
 rayon = "1.10"
 chrono = "0.4"
 windows-service = "0.7"
+csv = "1"
 
 [dev-dependencies]
 tempfile = "3"
@@ -123,3 +128,7 @@ path = "tests/update_test.rs"
 [[test]]
 name = "hot_store_fast_path_test"
 path = "tests/hot_store_fast_path_test.rs"
+
+[[test]]
+name = "aggregate_streaming_test"
+path = "tests/aggregate_streaming_test.rs"

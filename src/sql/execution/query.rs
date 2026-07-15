@@ -186,8 +186,32 @@ fn exec_table_select(
     };
 
     let is_count_star = detect_count_star(stmt, &table_names);
+    // Simple metadata-aggregate fast path: COUNT/MIN/MAX without GROUP BY.
+    // Only detected on a single-table, committed-read query with no stats sink.
+    let simple_metadata_aggregates = if reader_txn_id == 0
+        && stats.is_none()
+        && !is_count_star
+        && table_names.len() == 1
+        && detect_simple_metadata_aggregate(stmt, &table_names)
+    {
+        extract_simple_metadata_aggregates(&plan)
+    } else {
+        None
+    };
+    let is_simple_metadata = simple_metadata_aggregates.is_some();
+    eprintln!(
+        "QRY detect: is_simple={} agg_count={} is_count_star={}",
+        is_simple_metadata,
+        simple_metadata_aggregates.as_ref().map(|v| v.len()).unwrap_or(0),
+        is_count_star
+    );
 
-    if reader_txn_id == 0 && stats.is_none() && !is_count_star && can_use_physical_pipeline(&plan) {
+    if reader_txn_id == 0
+        && stats.is_none()
+        && !is_count_star
+        && !is_simple_metadata
+        && can_use_physical_pipeline(&plan)
+    {
         let mut physical_ctx = PhysicalContext::new(
             engine,
             &table_refs,
@@ -214,6 +238,7 @@ fn exec_table_select(
         table_metas,
         plan,
         is_count_star,
+        simple_metadata_aggregates,
         stats,
         reader_txn_id,
     )
@@ -228,6 +253,7 @@ fn exec_table_select_materialized(
     table_metas: HashMap<String, crate::storage::catalog::schema::TableMeta>,
     plan: LogicalPlan,
     is_count_star: bool,
+    simple_metadata_aggregates: Option<Vec<crate::sql::planner::AggregateExpr>>,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
@@ -246,6 +272,9 @@ fn exec_table_select_materialized(
         if is_count_star {
             spec.is_count_star = true;
         }
+        if simple_metadata_aggregates.is_some() {
+            spec.simple_metadata_aggregates = simple_metadata_aggregates.clone();
+        }
 
         let mut executor = ScanExecutor::new(&spec, engine, schema, meta, &table_ref.database);
         if let Some(ref mut s) = stats {
@@ -259,6 +288,19 @@ fn exec_table_select_materialized(
         );
 
         if spec.is_count_star {
+            let result_schema = if let Some(b) = batches.first() {
+                b.schema.clone()
+            } else {
+                Schema::new(vec![ColumnDef::new("count(*)", DataType::Int64)])
+            };
+            return Ok(ExecResult::Query {
+                schema: result_schema,
+                batches,
+            });
+        }
+        if spec.simple_metadata_aggregates.is_some() {
+            // The scan executor already produced the single aggregate result row
+            // via the metadata fast path; do not feed it through the pipeline.
             let result_schema = if let Some(b) = batches.first() {
                 b.schema.clone()
             } else {
@@ -559,6 +601,75 @@ fn detect_count_star(stmt: &Statement, table_names: &[String]) -> bool {
                 && matches!(&args[0], Expr::Column(col) if col == "*")
         }
         _ => false,
+    }
+}
+
+/// Detect a "simple" aggregate query answerable from row-group metadata:
+/// single table, no GROUP BY/HAVING, and every select item is a non-distinct
+/// `COUNT(*)` / `COUNT(col)` / `MIN(col)` / `MAX(col)`.
+fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) -> bool {
+    let (select_list, group_by, having) = match stmt {
+        Statement::Select {
+            select_list,
+            group_by,
+            having,
+            ..
+        } => (select_list, group_by, having),
+        _ => return false,
+    };
+    if !group_by.is_empty() || having.is_some() || table_names.len() != 1 {
+        return false;
+    }
+    if select_list.is_empty() {
+        return false;
+    }
+    select_list.iter().all(|item| match item {
+        SelectItem::Expr(
+            Expr::Function {
+                name,
+                args,
+                distinct: false,
+            },
+            _,
+        ) => {
+            let ok_func = name.eq_ignore_ascii_case("count")
+                || name.eq_ignore_ascii_case("min")
+                || name.eq_ignore_ascii_case("max");
+            ok_func
+                && args.len() == 1
+                && match &args[0] {
+                    Expr::Column(col) if col == "*" => name.eq_ignore_ascii_case("count"),
+                    Expr::Column(_) => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    })
+}
+
+/// Pull the aggregate expressions out of the plan root (must be an
+/// `Aggregate` with no GROUP BY). Returns None on any shape mismatch so the
+/// caller falls back to the normal path.
+fn extract_simple_metadata_aggregates(plan: &LogicalPlan) -> Option<Vec<crate::sql::planner::AggregateExpr>> {
+    match plan {
+        LogicalPlan::Aggregate(agg) if agg.group_by.is_empty() && !agg.distinct => {
+            // Restrict to COUNT/MIN/MAX to match detect_simple_metadata_aggregate.
+            let all_supported = agg.aggregates.iter().all(|a| {
+                !a.distinct
+                    && matches!(
+                        a.func,
+                        crate::sql::planner::AggFunc::Count
+                            | crate::sql::planner::AggFunc::Min
+                            | crate::sql::planner::AggFunc::Max
+                    )
+            });
+            if all_supported {
+                Some(agg.aggregates.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

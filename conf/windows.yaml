@@ -4,7 +4,7 @@
 # Server settings
 server:
   host: "0.0.0.0"
-  port: 5152
+  port: 5151
   max_message_size: 67108864  # 64MB
 
 # Storage settings
@@ -26,6 +26,12 @@ storage:
 # Buffer settings
 buffer:
   batch_size: 4096  # Batch size for query processing
+  # Soft per-query memory ceiling in MB. Streaming aggregation aborts the query
+  # (rather than OOM-crashing the process) when this is exceeded.
+  query_memory_limit_mb: 4096
+  # Maximum number of GROUP BY distinct keys before a grouped aggregate errors.
+  # Caps memory for high-cardinality GROUP BY queries.
+  max_aggregate_groups: 1000000
 
 # Compression settings
 compression:

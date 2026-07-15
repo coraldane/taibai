@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
-use crate::sql::planner::{LogicalExpr, LogicalPlan, TimeRange};
+use crate::sql::planner::{AggregateExpr, LogicalExpr, LogicalPlan, TimeRange};
 use crate::storage::catalog::schema::{SecondaryIndexType, TableMeta};
 use crate::storage::partition::pruning::RangeClause;
 use crate::types::batch::Schema;
@@ -32,6 +32,11 @@ pub struct ScanSpec {
     pub minmax_index_columns: Vec<usize>,
     pub set_index_columns: Vec<usize>,
     pub reader_txn_id: u64,
+
+    /// Simple metadata-only aggregate fast path (COUNT/MIN/MAX, no GROUP BY).
+    /// When set, the scan executor answers the query from row-group zone maps
+    /// / footers instead of streaming the data.
+    pub simple_metadata_aggregates: Option<Vec<AggregateExpr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +81,7 @@ impl ScanSpec {
             minmax_index_columns: Vec::new(),
             set_index_columns: Vec::new(),
             reader_txn_id: 0,
+            simple_metadata_aggregates: None,
         }
     }
 

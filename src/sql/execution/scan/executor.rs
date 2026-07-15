@@ -63,6 +63,9 @@ impl<'a> ScanExecutor<'a> {
     }
 
     pub fn execute(&mut self) -> Result<Vec<RecordBatch>> {
+        if let Some(aggs) = self.spec.simple_metadata_aggregates.clone() {
+            return self.execute_simple_metadata_aggregate(&aggs);
+        }
         if self.spec.is_count_star {
             return self.execute_count_star();
         }
@@ -145,6 +148,47 @@ impl<'a> ScanExecutor<'a> {
             crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Metadata-driven fast path for simple aggregate queries (no GROUP BY,
+    /// select list is only COUNT/MIN/MAX). Answers from row-group zone maps /
+    /// footers without streaming the data.
+    fn execute_simple_metadata_aggregate(
+        &mut self,
+        aggs: &[crate::sql::planner::AggregateExpr],
+    ) -> Result<Vec<RecordBatch>> {
+        let table_dir = self
+            .runtime
+            .data_dir()
+            .join(self.db)
+            .join(&self.spec.table_name);
+        let batch = if table_dir.exists() {
+            super::aggregate_meta::compute_simple_aggregate(
+                self.spec,
+                aggs,
+                &self.table_meta,
+                &self.table_schema,
+                &table_dir,
+                self.runtime.segment_mgr(),
+                self.runtime.memtable_manager(),
+                self.runtime.hot_store_manager(),
+                self.db,
+            )?
+        } else {
+            // No persisted segments; only memtable/hot store rows.
+            super::aggregate_meta::compute_simple_aggregate(
+                self.spec,
+                aggs,
+                &self.table_meta,
+                &self.table_schema,
+                std::path::Path::new(""),
+                self.runtime.segment_mgr(),
+                self.runtime.memtable_manager(),
+                self.runtime.hot_store_manager(),
+                self.db,
+            )?
+        };
+        Ok(vec![batch])
     }
 
     fn execute_scan(&mut self) -> Result<Vec<RecordBatch>> {

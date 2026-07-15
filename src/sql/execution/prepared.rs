@@ -2,9 +2,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::common::error::{Result, TaibaiError};
-use crate::sql::parser::ast::{
-    Expr, FromClause, JoinExpr, Statement, TableRef, WindowFunc,
-};
+use crate::sql::parser::ast::{Expr, FromClause, JoinExpr, Statement, TableRef, WindowFunc};
 use crate::sql::parser::parser::Parser;
 use crate::sql::planner::LogicalPlan;
 use crate::types::scalar::ScalarValue;
@@ -892,11 +890,13 @@ mod tests {
             Statement::Select { limit, offset, .. } => {
                 assert!(
                     matches!(limit, Some(Expr::Literal(ScalarValue::Int64(Some(20))))),
-                    "limit not bound: {:?}", limit
+                    "limit not bound: {:?}",
+                    limit
                 );
                 assert!(
                     matches!(offset, Some(Expr::Literal(ScalarValue::Int64(Some(5))))),
-                    "offset not bound: {:?}", offset
+                    "offset not bound: {:?}",
+                    offset
                 );
             }
             _ => panic!("expected Select"),
@@ -905,17 +905,19 @@ mod tests {
 
     #[test]
     fn test_bind_group_by_having() {
-        let mut stmt =
-            parse_one("SELECT a, count(*) FROM t GROUP BY ? HAVING count(*) > ?");
+        let mut stmt = parse_one("SELECT a, count(*) FROM t GROUP BY ? HAVING count(*) > ?");
         let params = [ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(10))];
         bind_params(&mut stmt, &params).expect("bind failed");
 
         match stmt {
-            Statement::Select { group_by, having, .. } => {
+            Statement::Select {
+                group_by, having, ..
+            } => {
                 assert_eq!(group_by.len(), 1);
                 assert!(
                     matches!(&group_by[0], Expr::Literal(ScalarValue::Int64(Some(1)))),
-                    "group_by not bound: {:?}", group_by[0]
+                    "group_by not bound: {:?}",
+                    group_by[0]
                 );
                 // having should no longer contain a placeholder
                 if let Some(h) = &having {
@@ -938,11 +940,15 @@ mod tests {
             Statement::Select { order_by, .. } => {
                 assert_eq!(order_by.len(), 1);
                 assert!(
-                    matches!(&order_by[0], OrderByItem {
-                        expr: Expr::Literal(ScalarValue::Int64(Some(1))),
-                        desc: true
-                    }),
-                    "order_by not bound: {:?}", order_by[0]
+                    matches!(
+                        &order_by[0],
+                        OrderByItem {
+                            expr: Expr::Literal(ScalarValue::Int64(Some(1))),
+                            desc: true
+                        }
+                    ),
+                    "order_by not bound: {:?}",
+                    order_by[0]
                 );
             }
             _ => panic!("expected Select"),
@@ -962,7 +968,8 @@ mod tests {
                 ..
             } => assert!(
                 matches!(&*right, Expr::Literal(ScalarValue::Int64(Some(42)))),
-                "where not bound: {:?}", right
+                "where not bound: {:?}",
+                right
             ),
             _ => panic!("expected Select with where"),
         }
@@ -987,7 +994,10 @@ mod tests {
         match stmt {
             Statement::Union { right, .. } => match &*right {
                 Statement::Select {
-                    order_by, limit, offset, ..
+                    order_by,
+                    limit,
+                    offset,
+                    ..
                 } => {
                     assert_eq!(order_by.len(), 1);
                     assert!(matches!(
@@ -1072,23 +1082,18 @@ mod tests {
     #[test]
     fn test_bind_scalar_subquery() {
         // Placeholder inside a scalar subquery in WHERE (Expr::Subquery).
-        let mut stmt = parse_one(
-            "SELECT * FROM t WHERE total > (SELECT SUM(x) FROM t2 WHERE y = ?)",
-        );
+        let mut stmt =
+            parse_one("SELECT * FROM t WHERE total > (SELECT SUM(x) FROM t2 WHERE y = ?)");
         let params = [ScalarValue::Int64(Some(10))];
         bind_params(&mut stmt, &params).expect("bind failed");
-        assert!(
-            !has_placeholders(&stmt),
-            "subquery placeholder not bound"
-        );
+        assert!(!has_placeholders(&stmt), "subquery placeholder not bound");
     }
 
     #[test]
     fn test_bind_in_subquery() {
         // Placeholder inside `x IN (SELECT ... WHERE ?)` — the Subquery sits in
         // Expr::In.values, exercising the In + Subquery recursion together.
-        let mut stmt =
-            parse_one("SELECT * FROM t WHERE id IN (SELECT id FROM t2 WHERE z = ?)");
+        let mut stmt = parse_one("SELECT * FROM t WHERE id IN (SELECT id FROM t2 WHERE z = ?)");
         let params = [ScalarValue::Int64(Some(42))];
         bind_params(&mut stmt, &params).expect("bind failed");
         assert!(
@@ -1100,12 +1105,8 @@ mod tests {
     #[test]
     fn test_bind_window_function() {
         // Placeholders in PARTITION BY and ORDER BY of a window function.
-        let mut stmt =
-            parse_one("SELECT *, ROW_NUMBER() OVER (PARTITION BY ? ORDER BY ?) FROM t");
-        let params = [
-            ScalarValue::Int64(Some(1)),
-            ScalarValue::Int64(Some(2)),
-        ];
+        let mut stmt = parse_one("SELECT *, ROW_NUMBER() OVER (PARTITION BY ? ORDER BY ?) FROM t");
+        let params = [ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2))];
         bind_params(&mut stmt, &params).expect("bind failed");
         assert!(
             !has_placeholders(&stmt),

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::common::error::Result;
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::sql::execution::operators::filter::{remap_aggregate_for_batch, remap_expr_for_batch};
 use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
@@ -19,6 +19,8 @@ pub struct HashAggregateExec {
     pub having: Option<LogicalExpr>,
     /// Whether to apply DISTINCT on the output
     pub distinct: bool,
+    /// Upper bound on the number of GROUP BY groups before the query errors.
+    pub max_groups: usize,
     done: bool,
 }
 
@@ -36,6 +38,7 @@ impl HashAggregateExec {
             input_schema,
             having: None,
             distinct: false,
+            max_groups: crate::common::config::query_limits().max_aggregate_groups,
             done: false,
         }
     }
@@ -49,6 +52,258 @@ impl HashAggregateExec {
         self.distinct = true;
         self
     }
+
+    pub fn with_max_groups(mut self, max_groups: usize) -> Self {
+        self.max_groups = max_groups.max(1);
+        self
+    }
+}
+
+/// Streaming accumulator for a single aggregate function over a single group.
+/// Memory usage is O(1) per accumulator (except DISTINCT which needs a value set).
+enum Accumulator {
+    /// `COUNT(*)` counts all rows; `COUNT(col)` counts non-null of `col`.
+    Count { count: u64, col: CountKind },
+    Min(Option<ScalarValue>),
+    Max(Option<ScalarValue>),
+    SumI(Option<i64>),
+    SumF(Option<f64>),
+    /// Average tracks running sum + non-null count.
+    Avg { sum: f64, count: u64, any: bool },
+    /// DISTINCT sets need to remember seen values. Only used for
+    /// COUNT/SUM/AVG DISTINCT over a single column.
+    Distinct {
+        func: AggFunc,
+        seen: std::collections::HashSet<String>,
+        is_count_star: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum CountKind {
+    /// COUNT(*) — every row counts.
+    Star,
+    /// COUNT(col) — only non-null values of this column count.
+    Column(usize),
+}
+
+impl Accumulator {
+    fn new_for(agg: &AggregateExpr, input_col_type: DataType) -> Result<Self> {
+        let col_idx = match &*agg.arg {
+            LogicalExpr::Column(idx) => Some(*idx),
+            _ => None,
+        };
+        if agg.distinct {
+            let is_count_star = matches!(agg.func, AggFunc::Count) && col_idx.is_none();
+            return Ok(Accumulator::Distinct {
+                func: agg.func,
+                seen: std::collections::HashSet::new(),
+                is_count_star,
+            });
+        }
+        Ok(match agg.func {
+            AggFunc::Count => Accumulator::Count {
+                count: 0,
+                col: match col_idx {
+                    Some(i) => CountKind::Column(i),
+                    None => CountKind::Star,
+                },
+            },
+            AggFunc::Min => Accumulator::Min(None),
+            AggFunc::Max => Accumulator::Max(None),
+            AggFunc::Sum => match input_col_type {
+                DataType::Float32 | DataType::Float64 => Accumulator::SumF(None),
+                _ => Accumulator::SumI(None),
+            },
+            AggFunc::Avg => Accumulator::Avg {
+                sum: 0.0,
+                count: 0,
+                any: false,
+            },
+        })
+    }
+
+    /// Update the accumulator from one input batch. `col_idx_opt` is the
+    /// argument column index (None for wildcard). Column indices are relative
+    /// to `batch` (physical) columns.
+    fn update(&mut self, batch: &RecordBatch, col_idx_opt: Option<usize>) -> Result<()> {
+        match self {
+            Accumulator::Count { count, col } => match *col {
+                CountKind::Star => *count += batch.num_rows() as u64,
+                CountKind::Column(c) => {
+                    if let Some(col_arr) = batch.column(c) {
+                        *count += col_arr.col_count_non_null();
+                    }
+                }
+            },
+            Accumulator::Min(best) => {
+                if let Some(c) = col_idx_opt {
+                    if let Some(col_arr) = batch.column(c) {
+                        if let Some(m) = col_arr.col_min() {
+                            *best = Some(match best.take() {
+                                Some(b) => {
+                                    if compare_scalars(&m, &b) == std::cmp::Ordering::Less {
+                                        m
+                                    } else {
+                                        b
+                                    }
+                                }
+                                None => m,
+                            });
+                        }
+                    }
+                }
+            }
+            Accumulator::Max(best) => {
+                if let Some(c) = col_idx_opt {
+                    if let Some(col_arr) = batch.column(c) {
+                        if let Some(m) = col_arr.col_max() {
+                            *best = Some(match best.take() {
+                                Some(b) => {
+                                    if compare_scalars(&m, &b) == std::cmp::Ordering::Greater {
+                                        m
+                                    } else {
+                                        b
+                                    }
+                                }
+                                None => m,
+                            });
+                        }
+                    }
+                }
+            }
+            Accumulator::SumI(acc) => {
+                if let Some(c) = col_idx_opt {
+                    if let Some(col_arr) = batch.column(c) {
+                        if let Some(part) = col_arr.col_sum_i64() {
+                            *acc = Some(match acc.take() {
+                                Some(prev) => prev.wrapping_add(part),
+                                None => part,
+                            });
+                        }
+                    }
+                }
+            }
+            Accumulator::SumF(acc) => {
+                if let Some(c) = col_idx_opt {
+                    if let Some(col_arr) = batch.column(c) {
+                        if let Some(part) = col_arr.col_sum_f64() {
+                            *acc = Some(match acc.take() {
+                                Some(prev) => prev + part,
+                                None => part,
+                            });
+                        } else if let Some(part) = col_arr.col_sum_i64() {
+                            *acc = Some(match acc.take() {
+                                Some(prev) => prev + part as f64,
+                                None => part as f64,
+                            });
+                        }
+                    }
+                }
+            }
+            Accumulator::Avg { sum, count, any } => {
+                if let Some(c) = col_idx_opt {
+                    if let Some(col_arr) = batch.column(c) {
+                        let n = col_arr.col_count_non_null();
+                        if n > 0 {
+                            let part = col_arr
+                                .col_sum_f64()
+                                .or_else(|| col_arr.col_sum_i64().map(|x| x as f64))
+                                .unwrap_or(0.0);
+                            *sum += part;
+                            *count += n;
+                            *any = true;
+                        }
+                    }
+                }
+            }
+            Accumulator::Distinct {
+                func: _,
+                seen,
+                is_count_star,
+            } => {
+                // For DISTINCT we must inspect per-row values.
+                match col_idx_opt {
+                    Some(c) => {
+                        if let Some(col_arr) = batch.column(c) {
+                            for i in 0..col_arr.len() {
+                                if col_arr.bitmap().is_null(i) {
+                                    continue;
+                                }
+                                let s = col_arr.scalar(i).to_string();
+                                seen.insert(s);
+                            }
+                        }
+                    }
+                    None => {
+                        // COUNT(DISTINCT *) — count distinct full rows.
+                        for row in 0..batch.num_rows() {
+                            let s = (0..batch.num_columns())
+                                .map(|col| {
+                                    batch
+                                        .scalar(row, col)
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_default()
+                                })
+                                .collect::<Vec<_>>()
+                                .join("|");
+                            seen.insert(s);
+                        }
+                    }
+                }
+                let _ = is_count_star;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize into a result scalar. `col_type` is the argument column type
+    /// (used to choose null representation / sum type).
+    fn finalize(&self, col_type: DataType) -> ScalarValue {
+        match self {
+            Accumulator::Count { count, .. } => ScalarValue::Int64(Some(*count as i64)),
+            Accumulator::Min(v) => v.clone().unwrap_or_else(|| null_scalar_of_type(col_type)),
+            Accumulator::Max(v) => v.clone().unwrap_or_else(|| null_scalar_of_type(col_type)),
+            Accumulator::SumI(v) => match col_type {
+                DataType::Float32 | DataType::Float64 => ScalarValue::Float64(v.map(|x| x as f64)),
+                _ => ScalarValue::Int64(*v),
+            },
+            Accumulator::SumF(v) => ScalarValue::Float64(*v),
+            Accumulator::Avg { sum, count, any } => {
+                if *any && *count > 0 {
+                    ScalarValue::Float64(Some(*sum / *count as f64))
+                } else {
+                    ScalarValue::Float64(None)
+                }
+            }
+            Accumulator::Distinct { func, seen, .. } => match func {
+                AggFunc::Count => ScalarValue::Int64(Some(seen.len() as i64)),
+                AggFunc::Sum => {
+                    let parsed: Vec<f64> = seen
+                        .iter()
+                        .filter_map(|s| s.parse::<f64>().ok())
+                        .collect();
+                    if parsed.is_empty() {
+                        ScalarValue::Int64(None)
+                    } else {
+                        ScalarValue::Int64(Some(parsed.iter().map(|x| *x as i64).sum()))
+                    }
+                }
+                AggFunc::Avg => {
+                    let parsed: Vec<f64> = seen
+                        .iter()
+                        .filter_map(|s| s.parse::<f64>().ok())
+                        .collect();
+                    if parsed.is_empty() {
+                        ScalarValue::Float64(None)
+                    } else {
+                        ScalarValue::Float64(Some(parsed.iter().sum::<f64>() / parsed.len() as f64))
+                    }
+                }
+                _ => ScalarValue::Int64(Some(seen.len() as i64)),
+            },
+        }
+    }
 }
 
 impl ExecutionOp for HashAggregateExec {
@@ -58,214 +313,289 @@ impl ExecutionOp for HashAggregateExec {
         }
         self.done = true;
 
-        // Collect all input rows
-        let mut all_rows: Vec<Vec<ScalarValue>> = Vec::new();
-        let mut physical_schema = None;
+        // Stream input batches; do NOT materialize all rows.
+        let mut physical_schema: Option<Schema> = None;
+
+        // Resolve group-by / aggregate column indices lazily after we see the
+        // first batch (physical schema may differ from logical schema due to
+        // projection pushdown).
+        let mut group_by: Vec<LogicalExpr> = self.group_by.clone();
+        let mut aggregates: Vec<AggregateExpr> = self.aggregates.clone();
+        let mut remapped = false;
+
+        if self.group_by.is_empty() {
+            // ----- No GROUP BY: a single set of accumulators -----------------
+            let mut accums: Vec<Accumulator> = Vec::with_capacity(self.aggregates.len());
+            // Pre-create using the logical (input) schema types; col indices are
+            // remapped below once the physical schema is known.
+            for agg in &self.aggregates {
+                let col_type = match &*agg.arg {
+                    LogicalExpr::Column(idx) => self
+                        .input_schema
+                        .columns
+                        .get(*idx)
+                        .map(|c| c.data_type)
+                        .unwrap_or(DataType::Int64),
+                    _ => DataType::Int64,
+                };
+                accums.push(Accumulator::new_for(agg, col_type)?);
+            }
+
+            while let Some(batch) = self.input.next_batch()? {
+                if physical_schema.is_none() {
+                    physical_schema = Some(batch.schema.clone());
+                }
+                if !remapped {
+                    let phys = physical_schema.as_ref().unwrap_or(&self.input_schema);
+                    aggregates = self
+                        .aggregates
+                        .iter()
+                        .map(|a| remap_aggregate_for_batch(a, &self.input_schema, phys))
+                        .collect();
+                    remapped = true;
+                }
+                for (acc, agg) in accums.iter_mut().zip(aggregates.iter()) {
+                    let col_idx = match &*agg.arg {
+                        LogicalExpr::Column(idx) => Some(*idx),
+                        _ => None,
+                    };
+                    acc.update(&batch, col_idx)?;
+                }
+            }
+
+            let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
+            let result = self.finalize_no_group_by(&accums, &aggregates, &physical_schema)?;
+            return Ok(Some(result));
+        }
+
+        // ----- GROUP BY: per-group accumulators in a hash map ---------------
+        // `groups` maps the stringified key to its accumulators; `group_keys`
+        // preserves insertion order alongside the original (typed) group-by
+        // scalar values so the output keeps the correct column types.
+        let mut groups: HashMap<Vec<String>, Vec<Accumulator>> = HashMap::new();
+        let mut group_keys: Vec<(Vec<String>, Vec<ScalarValue>)> = Vec::new();
+
         while let Some(batch) = self.input.next_batch()? {
-            tracing::debug!(
-                "aggregate: input batch schema = {:?}",
-                batch
-                    .schema
-                    .columns
-                    .iter()
-                    .map(|c| (c.name.clone(), c.data_type))
-                    .collect::<Vec<_>>()
-            );
-            tracing::debug!("aggregate: input batch num_rows = {}", batch.num_rows());
             if physical_schema.is_none() {
                 physical_schema = Some(batch.schema.clone());
             }
-            for row in 0..batch.num_rows() {
-                let vals: Vec<ScalarValue> = (0..batch.num_columns())
-                    .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
+            if !remapped {
+                let phys = physical_schema.as_ref().unwrap_or(&self.input_schema);
+                group_by = self
+                    .group_by
+                    .iter()
+                    .map(|e| remap_expr_for_batch(e, &self.input_schema, phys))
                     .collect();
-                all_rows.push(vals);
+                aggregates = self
+                    .aggregates
+                    .iter()
+                    .map(|a| remap_aggregate_for_batch(a, &self.input_schema, phys))
+                    .collect();
+                remapped = true;
             }
-        }
-        let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
-        tracing::debug!(
-            "aggregate: physical_schema = {:?}",
-            physical_schema
-                .columns
+            let gb_indices: Vec<usize> = group_by
                 .iter()
-                .map(|c| (c.name.clone(), c.data_type))
-                .collect::<Vec<_>>()
-        );
-        let group_by: Vec<LogicalExpr> = self
-            .group_by
-            .iter()
-            .map(|expr| remap_expr_for_batch(expr, &self.input_schema, &physical_schema))
-            .collect();
-        tracing::debug!("aggregate: remapped group_by = {:?}", group_by.len());
-        let aggregates: Vec<AggregateExpr> = self
-            .aggregates
-            .iter()
-            .map(|agg| remap_aggregate_for_batch(agg, &self.input_schema, &physical_schema))
-            .collect();
-        tracing::debug!("aggregate: remapped aggregates = {:?}", aggregates.len());
-
-        // Group by key
-        let mut groups: HashMap<Vec<String>, Vec<Vec<ScalarValue>>> = HashMap::new();
-        let mut group_order: Vec<Vec<String>> = Vec::new();
-        for row in &all_rows {
-            let key: Vec<String> = group_by
-                .iter()
-                .map(|expr| eval_group_key(expr, row))
+                .map(|e| match e {
+                    LogicalExpr::Column(i) => *i,
+                    _ => 0,
+                })
                 .collect();
-            if !groups.contains_key(&key) {
-                group_order.push(key.clone());
-            }
-            groups.entry(key).or_default().push(row.clone());
-        }
-        tracing::debug!(
-            "aggregate: all_rows count={}, groups count={}, group_order count={}",
-            all_rows.len(),
-            groups.len(),
-            group_order.len()
-        );
 
-        // Build output schema
-        let mut col_defs = Vec::new();
-        for expr in &group_by {
-            if let LogicalExpr::Column(idx) = expr {
-                if let Some(cd) = physical_schema.columns.get(*idx) {
-                    col_defs.push(
-                        ColumnDef::new(&cd.name, cd.data_type)
-                            .with_scale(cd.scale)
-                            .with_precision(cd.precision),
-                    );
+            for row in 0..batch.num_rows() {
+                let key_scalars: Vec<ScalarValue> = gb_indices
+                    .iter()
+                    .map(|&c| {
+                        batch
+                            .scalar(row, c)
+                            .unwrap_or_else(|| ScalarValue::Int64(None))
+                    })
+                    .collect();
+                let key: Vec<String> =
+                    key_scalars.iter().map(|v| v.to_string()).collect();
+
+                if !groups.contains_key(&key) {
+                    if groups.len() >= self.max_groups {
+                        return Err(TaibaiError::Sql(format!(
+                            "aggregate group count exceeds limit {}; \
+                             consider refining GROUP BY to reduce cardinality",
+                            self.max_groups
+                        )));
+                    }
+                    let accums: Result<Vec<Accumulator>> = self
+                        .aggregates
+                        .iter()
+                        .map(|agg| {
+                            let col_type = match &*agg.arg {
+                                LogicalExpr::Column(idx) => self
+                                    .input_schema
+                                    .columns
+                                    .get(*idx)
+                                    .map(|c| c.data_type)
+                                    .unwrap_or(DataType::Int64),
+                                _ => DataType::Int64,
+                            };
+                            Accumulator::new_for(agg, col_type)
+                        })
+                        .collect();
+                    group_keys.push((key.clone(), key_scalars));
+                    groups.insert(key.clone(), accums?);
+                }
+
+                let accums = groups.get_mut(&key).unwrap();
+                for (acc, agg) in accums.iter_mut().zip(aggregates.iter()) {
+                    let col_idx = match &*agg.arg {
+                        LogicalExpr::Column(idx) => Some(*idx),
+                        _ => None,
+                    };
+                    // Build a single-row view so each accumulator sees only this
+                    // group's current row. Memory is O(1) per update.
+                    if let Some(single) = slice_batch_single_row(&batch, row) {
+                        acc.update(&single, col_idx)?;
+                    }
                 }
             }
         }
-        for agg in &aggregates {
-            let name = format_aggregate_name(agg, &physical_schema);
-            let dt = aggregate_result_type(agg, &physical_schema);
-            tracing::debug!(
-                "aggregate result type: agg={:?}, name={}, dt={:?}",
-                agg.func,
-                name,
-                dt
-            );
-            col_defs.push(ColumnDef::new(&name, dt));
-        }
-        let schema = Schema::new(col_defs.clone());
-        tracing::debug!(
-            "aggregate: result schema columns = {:?}",
-            schema
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.data_type))
-                .collect::<Vec<_>>()
-        );
 
-        // Compute aggregations
-        tracing::debug!(
-            "aggregate: starting aggregation loop, group_order len={}",
-            group_order.len()
-        );
-        let mut result_batch = RecordBatch::new(schema);
-        tracing::debug!(
-            "aggregate: batch columns after new = {:?}",
-            result_batch
-                .columns
-                .iter()
-                .map(|c| c.data_type())
-                .collect::<Vec<_>>()
-        );
-        for key in &group_order {
-            tracing::debug!("aggregate: processing group key={:?}", key);
-            let rows = groups.get(key).unwrap();
-            tracing::debug!("aggregate: rows in this group={}", rows.len());
-            let mut row_vals = Vec::new();
-            for expr in &group_by {
-                if let LogicalExpr::Column(idx) = expr {
-                    row_vals.push(
-                        rows.first()
-                            .and_then(|r| r.get(*idx))
-                            .cloned()
-                            .unwrap_or(ScalarValue::Int64(None)),
-                    );
-                }
-            }
-            tracing::debug!("aggregate: row_vals after group_by={}", row_vals.len());
-            for agg in &aggregates {
-                let val = compute_aggregate(agg, rows, &physical_schema);
-                tracing::debug!(
-                    "aggregate: computed value for {:?}: type={:?}, val={}",
-                    agg.func,
-                    val.data_type(),
-                    val
-                );
-                row_vals.push(val);
-            }
-            tracing::debug!("aggregate: row_vals total={}", row_vals.len());
-            tracing::debug!(
-                "aggregate: result_batch.num_columns={}",
-                result_batch.num_columns()
-            );
-            for (col_idx, val) in row_vals.iter().enumerate() {
-                let col = result_batch.columns.get(col_idx);
-                tracing::debug!(
-                    "aggregate push attempt: col_idx={}, val_type={:?}, col_type={:?}, val={}",
-                    col_idx,
-                    val.data_type(),
-                    col.map(|c| c.data_type()),
-                    val
-                );
-                if let Some(col_arr) = col {
-                    tracing::debug!(
-                        "aggregate push: column array type = {:?}",
-                        col_arr.data_type()
-                    );
-                }
-                result_batch.column_mut(col_idx).unwrap().push(val)?;
-            }
-        }
-
-        tracing::debug!(
-            "aggregate: after push, batch columns = {:?}",
-            result_batch
-                .columns
-                .iter()
-                .map(|c| c.data_type())
-                .collect::<Vec<_>>()
-        );
-        tracing::debug!(
-            "aggregate: returning result_batch with {} rows",
-            result_batch.num_rows()
-        );
-        tracing::debug!(
-            "aggregate: result_batch schema = {:?}",
-            result_batch
-                .schema
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.data_type))
-                .collect::<Vec<_>>()
-        );
-
-        // Apply DISTINCT if needed
-        if self.distinct {
-            tracing::debug!("aggregate: applying DISTINCT");
-            result_batch = apply_distinct(result_batch);
-        }
-
-        // Apply HAVING filter if present
-        if let Some(ref having_pred) = self.having {
-            tracing::debug!("aggregate: applying HAVING filter");
-            result_batch = apply_having(result_batch, having_pred)?;
-        }
-
-        tracing::debug!("aggregate: final result_batch ready, returning");
-        Ok(Some(result_batch))
+        let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
+        let result = self.finalize_grouped(
+            &group_keys,
+            &groups,
+            &aggregates,
+            &physical_schema,
+        )?;
+        Ok(Some(result))
     }
 }
 
-fn eval_group_key(expr: &LogicalExpr, row: &[ScalarValue]) -> String {
-    match expr {
-        LogicalExpr::Column(idx) => row.get(*idx).map(|v| v.to_string()).unwrap_or_default(),
-        _ => String::new(),
+impl HashAggregateExec {
+    fn finalize_no_group_by(
+        &self,
+        accums: &[Accumulator],
+        aggregates: &[AggregateExpr],
+        physical_schema: &Schema,
+    ) -> Result<RecordBatch> {
+        let mut col_defs = Vec::new();
+        for agg in aggregates {
+            let name = format_aggregate_name(agg, physical_schema);
+            let dt = aggregate_result_type(agg, physical_schema);
+            col_defs.push(ColumnDef::new(&name, dt));
+        }
+        let schema = Schema::new(col_defs);
+        let mut result_batch = RecordBatch::new(schema);
+
+        for (i, (acc, agg)) in accums.iter().zip(aggregates.iter()).enumerate() {
+            let col_type = arg_column_type(agg, physical_schema);
+            let val = acc.finalize(col_type);
+            result_batch
+                .column_mut(i)
+                .ok_or_else(|| TaibaiError::Internal("aggregate column missing".into()))?
+                .push(&val)?;
+        }
+
+        if self.distinct {
+            result_batch = apply_distinct(result_batch);
+        }
+        if let Some(ref having_pred) = self.having {
+            result_batch = apply_having(result_batch, having_pred)?;
+        }
+        Ok(result_batch)
     }
+
+    fn finalize_grouped(
+        &self,
+        group_keys: &[(Vec<String>, Vec<ScalarValue>)],
+        groups: &HashMap<Vec<String>, Vec<Accumulator>>,
+        aggregates: &[AggregateExpr],
+        physical_schema: &Schema,
+    ) -> Result<RecordBatch> {
+        let mut col_defs = Vec::new();
+        let ngb = self.group_by.len();
+        // group-by output columns keep their original physical types
+        for (i, _) in self.group_by.iter().enumerate() {
+            // Recover the type from the first representative scalar instead of
+            // relying on physical_schema (the remapped logical indices already
+            // match physical_schema here, so both are fine).
+            let dt = self
+                .group_by
+                .get(i)
+                .and_then(|e| match e {
+                    LogicalExpr::Column(idx) => physical_schema.columns.get(*idx),
+                    _ => None,
+                })
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::VarChar);
+            let name = self
+                .group_by
+                .get(i)
+                .and_then(|e| match e {
+                    LogicalExpr::Column(idx) => physical_schema.columns.get(*idx),
+                    _ => None,
+                })
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("col_{}", i));
+            col_defs.push(ColumnDef::new(&name, dt));
+        }
+        for agg in aggregates {
+            let name = format_aggregate_name(agg, physical_schema);
+            let dt = aggregate_result_type(agg, physical_schema);
+            col_defs.push(ColumnDef::new(&name, dt));
+        }
+        let schema = Schema::new(col_defs);
+        let mut result_batch = RecordBatch::new(schema);
+
+        for (key, scalars) in group_keys {
+            // group-by columns: use the original typed scalars.
+            for (i, s) in scalars.iter().enumerate() {
+                result_batch
+                    .column_mut(i)
+                    .ok_or_else(|| TaibaiError::Internal("aggregate column missing".into()))?
+                    .push(s)?;
+            }
+            if let Some(accums) = groups.get(key) {
+                for (i, (acc, agg)) in accums.iter().zip(aggregates.iter()).enumerate() {
+                    let col_type = arg_column_type(agg, physical_schema);
+                    let val = acc.finalize(col_type);
+                    result_batch
+                        .column_mut(ngb + i)
+                        .ok_or_else(|| TaibaiError::Internal("aggregate column missing".into()))?
+                        .push(&val)?;
+                }
+            }
+        }
+
+        if self.distinct {
+            result_batch = apply_distinct(result_batch);
+        }
+        if let Some(ref having_pred) = self.having {
+            result_batch = apply_having(result_batch, having_pred)?;
+        }
+        Ok(result_batch)
+    }
+}
+
+fn arg_column_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
+    match &*agg.arg {
+        LogicalExpr::Column(idx) => schema
+            .columns
+            .get(*idx)
+            .map(|c| c.data_type)
+            .unwrap_or(DataType::Int64),
+        _ => DataType::Int64,
+    }
+}
+
+/// Build a single-row RecordBatch containing only `row` from `batch`.
+fn slice_batch_single_row(batch: &RecordBatch, row: usize) -> Option<RecordBatch> {
+    let ncols = batch.num_columns();
+    let mut cols = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        let col = batch.column(c)?;
+        let sv = col.scalar(row);
+        let mut new_col = ColumnArray::empty(col.data_type());
+        new_col.push(&sv).ok()?;
+        cols.push(new_col);
+    }
+    Some(RecordBatch::try_new(batch.schema.clone(), cols).ok()?)
 }
 
 pub fn format_aggregate_name(agg: &AggregateExpr, schema: &Schema) -> String {
@@ -313,7 +643,7 @@ fn null_scalar_of_type(dt: DataType) -> ScalarValue {
     }
 }
 
-fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
+pub fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     match agg.func {
         AggFunc::Count => DataType::Int64,
         AggFunc::Sum => match &*agg.arg {
