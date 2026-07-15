@@ -198,6 +198,20 @@ impl ScanCursor {
     }
 
     fn initialize(&mut self) -> Result<()> {
+        let mut hot_spec = self.spec.clone();
+        hot_spec.projection = Some(self.plan.projection_cols.clone());
+        if let Some(batch) = memtable::scan_resident_hot_store(
+            self.runtime.hot_store_manager(),
+            &self.db,
+            &self.table_meta,
+            &hot_spec,
+        ) {
+            self.segments.clear();
+            self.memtable_batches = vec![batch];
+            self.initialized = true;
+            return Ok(());
+        }
+
         let table_dir = self
             .runtime
             .data_dir()
@@ -214,6 +228,7 @@ impl ScanCursor {
         memtable_spec.projection = Some(self.plan.projection_cols.clone());
         self.memtable_batches = memtable::scan_memtables(
             self.runtime.memtable_manager(),
+            self.runtime.hot_store_manager(),
             &self.db,
             &self.spec.table_name,
             &memtable_spec,

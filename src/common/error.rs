@@ -10,6 +10,9 @@ pub enum TaibaiError {
     Sql(String),
     Internal(String),
     Network(String),
+    /// Backpressure: a bounded resource (e.g. the resident hot store) is over its
+    /// hard limit. Callers may retry after reclaiming, or propagate to the client.
+    ResourceBusy(String),
 }
 
 pub type Result<T> = std::result::Result<T, TaibaiError>;
@@ -25,6 +28,7 @@ impl fmt::Display for TaibaiError {
             TaibaiError::Sql(msg) => write!(f, "SQL error: {msg}"),
             TaibaiError::Internal(msg) => write!(f, "internal error: {msg}"),
             TaibaiError::Network(msg) => write!(f, "network error: {msg}"),
+            TaibaiError::ResourceBusy(msg) => write!(f, "resource busy: {msg}"),
         }
     }
 }

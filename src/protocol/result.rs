@@ -43,9 +43,12 @@ pub fn encode_binary_result_batches(schema: &Schema, batches: &[RecordBatch]) ->
     for col_idx in 0..num_cols {
         let mut null_bitmap = Vec::with_capacity(num_rows);
         for batch in batches {
-            if let Some(col) = batch.column(col_idx) {
-                for row in 0..batch.num_rows() {
-                    null_bitmap.push(if col.bitmap().is_null(row) { 1 } else { 0 });
+            match batch.column(col_idx) {
+                Some(col) => {
+                    null_bitmap.extend_from_slice(&col.bitmap().null_flag_bytes());
+                }
+                None => {
+                    null_bitmap.extend(std::iter::repeat_n(0u8, batch.num_rows()));
                 }
             }
         }

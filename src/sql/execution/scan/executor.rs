@@ -63,6 +63,9 @@ impl<'a> ScanExecutor<'a> {
     }
 
     pub fn execute(&mut self) -> Result<Vec<RecordBatch>> {
+        if let Some(aggs) = self.spec.simple_metadata_aggregates.clone() {
+            return self.execute_simple_metadata_aggregate(&aggs);
+        }
         if self.spec.is_count_star {
             return self.execute_count_star();
         }
@@ -70,6 +73,14 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_count_star(&mut self) -> Result<Vec<RecordBatch>> {
+        if let Some(count) = self.try_resident_hot_count()? {
+            let result = count::build_count_star_result(count);
+            return match result {
+                crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
+                _ => Ok(Vec::new()),
+            };
+        }
+
         if self.table_meta.ttl.is_some() {
             let mut ttl_spec = self.spec.clone();
             ttl_spec.is_count_star = false;
@@ -102,12 +113,21 @@ impl<'a> ScanExecutor<'a> {
             .join(self.db)
             .join(&self.spec.table_name);
         if !table_dir.exists() {
-            let count = memtable::count_memtable_rows(
+            let count = memtable::count_hot_memtable_rows(
                 self.runtime.memtable_manager(),
+                self.runtime.hot_store_manager(),
                 self.db,
                 &self.spec.table_name,
                 self.spec,
-            );
+            )
+            .unwrap_or_else(|| {
+                memtable::count_memtable_rows(
+                    self.runtime.memtable_manager(),
+                    self.db,
+                    &self.spec.table_name,
+                    self.spec,
+                )
+            });
             let result = count::build_count_star_result(count);
             return match result {
                 crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
@@ -130,6 +150,47 @@ impl<'a> ScanExecutor<'a> {
         }
     }
 
+    /// Metadata-driven fast path for simple aggregate queries (no GROUP BY,
+    /// select list is only COUNT/MIN/MAX). Answers from row-group zone maps /
+    /// footers without streaming the data.
+    fn execute_simple_metadata_aggregate(
+        &mut self,
+        aggs: &[crate::sql::planner::AggregateExpr],
+    ) -> Result<Vec<RecordBatch>> {
+        let table_dir = self
+            .runtime
+            .data_dir()
+            .join(self.db)
+            .join(&self.spec.table_name);
+        let batch = if table_dir.exists() {
+            super::aggregate_meta::compute_simple_aggregate(
+                self.spec,
+                aggs,
+                &self.table_meta,
+                &self.table_schema,
+                &table_dir,
+                self.runtime.segment_mgr(),
+                self.runtime.memtable_manager(),
+                self.runtime.hot_store_manager(),
+                self.db,
+            )?
+        } else {
+            // No persisted segments; only memtable/hot store rows.
+            super::aggregate_meta::compute_simple_aggregate(
+                self.spec,
+                aggs,
+                &self.table_meta,
+                &self.table_schema,
+                std::path::Path::new(""),
+                self.runtime.segment_mgr(),
+                self.runtime.memtable_manager(),
+                self.runtime.hot_store_manager(),
+                self.db,
+            )?
+        };
+        Ok(vec![batch])
+    }
+
     fn execute_scan(&mut self) -> Result<Vec<RecordBatch>> {
         let mut output = LimitedBatchSink::new(None);
         self.execute_scan_into(&mut output)?;
@@ -147,6 +208,13 @@ impl<'a> ScanExecutor<'a> {
             super::strategy::ScanPlanner::new(self.spec, &self.table_schema, &self.table_meta)
                 .build();
         let mut scan_limit = plan.scan_limit;
+
+        if let Some(batch) = self.try_resident_hot_scan(&plan)? {
+            output.set_limit(scan_limit);
+            output.push(batch);
+            return Ok(());
+        }
+
         let memtables_present = !self
             .runtime
             .memtable_manager()
@@ -244,7 +312,7 @@ impl<'a> ScanExecutor<'a> {
                     stats_entry.row_groups_total += reader.num_row_groups() as u64;
                     stats_entry.row_groups_pruned +=
                         (reader.num_row_groups() - candidate_indices.len()) as u64;
-                    if scan_limit.is_none() {
+                    if scan_limit.is_none() && ordered_limit.is_none() {
                         stats_entry.row_groups_read += candidate_indices.len() as u64;
                     }
                 }
@@ -254,7 +322,7 @@ impl<'a> ScanExecutor<'a> {
                     candidate_indices.reverse();
                 }
 
-                if scan_limit.is_some() {
+                if scan_limit.is_some() || ordered_limit.is_some() {
                     for rg_idx in &candidate_indices {
                         self.record_row_group_read(&reader, *rg_idx, &plan);
                         let mut batch = match super::strategy::read_row_group_with_strategy(
@@ -334,6 +402,7 @@ impl<'a> ScanExecutor<'a> {
 
         for batch in memtable::scan_memtables(
             self.runtime.memtable_manager(),
+            self.runtime.hot_store_manager(),
             self.db,
             &self.spec.table_name,
             &memtable_spec,
@@ -350,6 +419,38 @@ impl<'a> ScanExecutor<'a> {
         }
 
         Ok(())
+    }
+
+    fn try_resident_hot_scan(
+        &self,
+        plan: &super::strategy::ScanPlan,
+    ) -> Result<Option<RecordBatch>> {
+        let mut hot_spec = self.spec.clone();
+        hot_spec.projection = Some(plan.projection_cols.clone());
+        let Some(batch) = memtable::scan_resident_hot_store(
+            self.runtime.hot_store_manager(),
+            self.db,
+            &self.table_meta,
+            &hot_spec,
+        ) else {
+            return Ok(None);
+        };
+        let batch = super::strategy::apply_ttl_filter_and_projection(
+            batch,
+            &self.table_meta,
+            &plan.projection_cols,
+            plan.strip_ttl_column,
+        )?;
+        Ok(Some(batch))
+    }
+
+    fn try_resident_hot_count(&self) -> Result<Option<u64>> {
+        Ok(memtable::count_resident_hot_store(
+            self.runtime.hot_store_manager(),
+            self.db,
+            &self.table_meta,
+            self.spec,
+        ))
     }
 
     fn ordered_cluster_segments_are_monotonic(&self, segments: &[PathBuf], col_idx: usize) -> bool {

@@ -118,6 +118,10 @@ where
         &config.storage.default_database,
         segment_config_from_server_config(&config),
         auto_compact_config_from_server_config(&config),
+        config
+            .storage
+            .hot_store_memory_limit_mb
+            .saturating_mul(1024 * 1024),
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -127,8 +131,17 @@ where
     };
 
     let config = Arc::new(config);
+    // Publish process-global query runtime limits for operators (aggregation,
+    // streaming scans) to consult.
+    let _ = crate::common::config::set_query_limits(crate::common::config::QueryLimits {
+        query_memory_limit_mb: config.buffer.query_memory_limit_mb,
+        max_aggregate_groups: config.buffer.max_aggregate_groups,
+    });
     let engine = Arc::new(engine);
     let _ = rayon::ThreadPoolBuilder::new().build_global();
+    crate::sql::execution::engine::start_close_of_day_scheduler(engine.clone());
+    tracing::info!("close-of-day scheduler started");
+
     let server = Server::new(config, engine.clone());
 
     if let Err(e) = server.run_with_shutdown(shutdown).await {

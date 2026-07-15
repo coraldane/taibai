@@ -1,5 +1,5 @@
 use crate::sql::parser::ast::JoinType;
-use crate::sql::planner::{LogicalExpr, LogicalPlan, ScanPlan, SortKey, TopNPlan};
+use crate::sql::planner::{JoinPlan, LogicalExpr, LogicalPlan, ScanPlan, SortKey, TopNPlan};
 
 use super::Rule;
 
@@ -214,6 +214,32 @@ fn push_topn_to_scan(plan: LogicalPlan) -> (LogicalPlan, bool) {
                         topn.input = Box::new(LogicalPlan::Filter(new_filter));
                         (LogicalPlan::TopN(topn), false)
                     }
+                    LogicalPlan::Join(ref join)
+                        if can_push_topn_to_filtered_left_join(
+                            &topn.sort_keys,
+                            &filter.predicate,
+                            join,
+                            topn_limit.saturating_add(topn_offset),
+                        ) =>
+                    {
+                        let filter_pred = filter.predicate.clone();
+                        let mut new_join = join.clone();
+                        let original_left = new_join.left;
+                        new_join.left = Box::new(LogicalPlan::TopN(TopNPlan {
+                            sort_keys: topn.sort_keys.clone(),
+                            limit: topn_limit.saturating_add(topn_offset),
+                            offset: 0,
+                            input: original_left,
+                        }));
+                        let (new_right, _) = push_topn_to_scan(*new_join.right);
+                        new_join.right = Box::new(new_right);
+                        topn.input =
+                            Box::new(LogicalPlan::Filter(crate::sql::planner::FilterPlan {
+                                predicate: filter_pred,
+                                input: Box::new(LogicalPlan::Join(new_join)),
+                            }));
+                        (LogicalPlan::TopN(topn), true)
+                    }
                     ref other => {
                         let filter_pred = filter.predicate.clone();
                         let other_plan = other.clone();
@@ -232,23 +258,23 @@ fn push_topn_to_scan(plan: LogicalPlan) -> (LogicalPlan, bool) {
                 let topn_limit = topn.limit;
                 let topn_offset = topn.offset;
                 if let LogicalPlan::Join(join) = &other {
-                    if can_push_topn_to_left_join(&sort_keys, join) {
+                    if can_push_topn_to_left_join(
+                        &sort_keys,
+                        join,
+                        topn_limit.saturating_add(topn_offset),
+                    ) {
                         let mut new_join = join.clone();
+                        let original_left = new_join.left;
                         new_join.left = Box::new(LogicalPlan::TopN(TopNPlan {
                             sort_keys: sort_keys.clone(),
                             limit: topn_limit.saturating_add(topn_offset),
                             offset: 0,
-                            input: new_join.left,
+                            input: original_left,
                         }));
-                        let (new_left, left_changed) = push_topn_to_scan(*new_join.left);
-                        let (new_right, right_changed) = push_topn_to_scan(*new_join.right);
-                        new_join.left = Box::new(new_left);
+                        let (new_right, _) = push_topn_to_scan(*new_join.right);
                         new_join.right = Box::new(new_right);
                         topn.input = Box::new(LogicalPlan::Join(new_join));
-                        return (
-                            LogicalPlan::TopN(topn),
-                            true || left_changed || right_changed,
-                        );
+                        return (LogicalPlan::TopN(topn), true);
                     }
                 }
                 let (new_input, changed) = push_topn_to_scan(other);
@@ -320,14 +346,112 @@ fn can_push_topn_to_scan(topn: &TopNPlan, scan: &ScanPlan) -> bool {
     can_push_order_to_scan(&topn.sort_keys, scan)
 }
 
-fn can_push_topn_to_left_join(sort_keys: &[SortKey], join: &crate::sql::planner::JoinPlan) -> bool {
+fn can_push_topn_to_left_join(sort_keys: &[SortKey], join: &JoinPlan, pushed_limit: usize) -> bool {
     if !matches!(join.join_type, JoinType::Left) {
+        return false;
+    }
+    if contains_equivalent_topn(&join.left, sort_keys, pushed_limit) {
         return false;
     }
 
     sort_keys
         .iter()
         .all(|sk| expr_columns_within(&sk.expr, join.left_schema.columns.len()))
+}
+
+fn can_push_topn_to_filtered_left_join(
+    sort_keys: &[SortKey],
+    predicate: &LogicalExpr,
+    join: &JoinPlan,
+    pushed_limit: usize,
+) -> bool {
+    can_push_topn_to_left_join(sort_keys, join, pushed_limit)
+        && expr_columns_within(predicate, join.left_schema.columns.len())
+        && contains_filter_predicate(&join.left, predicate)
+}
+
+fn contains_equivalent_topn(
+    plan: &LogicalPlan,
+    sort_keys: &[SortKey],
+    pushed_limit: usize,
+) -> bool {
+    match plan {
+        LogicalPlan::TopN(topn) => {
+            topn.offset == 0 && topn.limit <= pushed_limit && topn.sort_keys == sort_keys
+                || contains_equivalent_topn(&topn.input, sort_keys, pushed_limit)
+        }
+        LogicalPlan::Filter(filter) => {
+            contains_equivalent_topn(&filter.input, sort_keys, pushed_limit)
+        }
+        LogicalPlan::Project(project) => {
+            contains_equivalent_topn(&project.input, sort_keys, pushed_limit)
+        }
+        LogicalPlan::Sort(sort) => contains_equivalent_topn(&sort.input, sort_keys, pushed_limit),
+        LogicalPlan::Limit(limit) => {
+            contains_equivalent_topn(&limit.input, sort_keys, pushed_limit)
+        }
+        LogicalPlan::Aggregate(agg) => {
+            contains_equivalent_topn(&agg.input, sort_keys, pushed_limit)
+        }
+        LogicalPlan::Distinct(distinct) => {
+            contains_equivalent_topn(&distinct.input, sort_keys, pushed_limit)
+        }
+        LogicalPlan::Window(window) => {
+            contains_equivalent_topn(&window.input, sort_keys, pushed_limit)
+        }
+        LogicalPlan::Join(join) => {
+            contains_equivalent_topn(&join.left, sort_keys, pushed_limit)
+                || contains_equivalent_topn(&join.right, sort_keys, pushed_limit)
+        }
+        LogicalPlan::SemiJoin(semi) => {
+            contains_equivalent_topn(&semi.left, sort_keys, pushed_limit)
+                || contains_equivalent_topn(&semi.right, sort_keys, pushed_limit)
+        }
+        _ => false,
+    }
+}
+
+fn contains_filter_predicate(plan: &LogicalPlan, predicate: &LogicalExpr) -> bool {
+    match plan {
+        LogicalPlan::Scan(scan) => scan
+            .pushed_filter
+            .as_ref()
+            .is_some_and(|existing| expr_contains_conjunct(existing, predicate)),
+        LogicalPlan::Filter(filter) => {
+            expr_contains_conjunct(&filter.predicate, predicate)
+                || contains_filter_predicate(&filter.input, predicate)
+        }
+        LogicalPlan::Project(project) => contains_filter_predicate(&project.input, predicate),
+        LogicalPlan::Sort(sort) => contains_filter_predicate(&sort.input, predicate),
+        LogicalPlan::Limit(limit) => contains_filter_predicate(&limit.input, predicate),
+        LogicalPlan::TopN(topn) => contains_filter_predicate(&topn.input, predicate),
+        LogicalPlan::Aggregate(agg) => contains_filter_predicate(&agg.input, predicate),
+        LogicalPlan::Distinct(distinct) => contains_filter_predicate(&distinct.input, predicate),
+        LogicalPlan::Window(window) => contains_filter_predicate(&window.input, predicate),
+        LogicalPlan::Join(join) => {
+            contains_filter_predicate(&join.left, predicate)
+                || contains_filter_predicate(&join.right, predicate)
+        }
+        LogicalPlan::SemiJoin(semi) => {
+            contains_filter_predicate(&semi.left, predicate)
+                || contains_filter_predicate(&semi.right, predicate)
+        }
+        LogicalPlan::Empty => false,
+    }
+}
+
+fn expr_contains_conjunct(existing: &LogicalExpr, predicate: &LogicalExpr) -> bool {
+    if existing == predicate {
+        return true;
+    }
+    match existing {
+        LogicalExpr::BinaryOp {
+            op: crate::sql::parser::ast::BinOp::And,
+            left,
+            right,
+        } => expr_contains_conjunct(left, predicate) || expr_contains_conjunct(right, predicate),
+        _ => false,
+    }
 }
 
 fn expr_columns_within(expr: &LogicalExpr, upper_bound: usize) -> bool {
@@ -406,5 +530,115 @@ fn is_selective_predicate(expr: &LogicalExpr) -> bool {
         LogicalExpr::Between { .. } => true,
         LogicalExpr::Like { .. } => false,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::sql::optimizer::Optimizer;
+    use crate::sql::parser::parser::Parser;
+    use crate::sql::planner::plan_select;
+    use crate::types::batch::{ColumnDef, Schema};
+    use std::collections::HashMap;
+
+    #[test]
+    fn pushes_topn_below_left_filter_before_dimension_joins() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "fact_prices".to_string(),
+            Schema::new(vec![
+                ColumnDef::new("entity_id", DataType::VarChar),
+                ColumnDef::new("bucket_id", DataType::Int64),
+                ColumnDef::new("measure_a", DataType::Float64),
+                ColumnDef::new("measure_b", DataType::Float64),
+                ColumnDef::new("rank_score", DataType::Float64),
+                ColumnDef::new("amount", DataType::Float64),
+            ]),
+        );
+        schemas.insert(
+            "dim_names".to_string(),
+            Schema::new(vec![
+                ColumnDef::new("bucket_id", DataType::Int64),
+                ColumnDef::new("entity_id", DataType::VarChar),
+                ColumnDef::new("name", DataType::VarChar),
+            ]),
+        );
+        schemas.insert(
+            "dim_profiles".to_string(),
+            Schema::new(vec![
+                ColumnDef::new("entity_id", DataType::VarChar),
+                ColumnDef::new("group_name", DataType::VarChar),
+                ColumnDef::new("scope_name", DataType::VarChar),
+            ]),
+        );
+        schemas.insert(
+            "fact_metrics".to_string(),
+            Schema::new(vec![
+                ColumnDef::new("bucket_id", DataType::Int64),
+                ColumnDef::new("entity_id", DataType::VarChar),
+                ColumnDef::new("metric_a", DataType::Float64),
+                ColumnDef::new("metric_b", DataType::Float64),
+            ]),
+        );
+
+        let stmt = Parser::parse(
+            "SELECT f.entity_id, n.name,
+                    f.measure_a, f.measure_b, f.rank_score, f.amount,
+                    COALESCE(p.group_name, ''), COALESCE(p.scope_name, ''),
+                    m.metric_a, m.metric_b
+             FROM fact_prices f
+             LEFT JOIN dim_names n ON n.bucket_id = f.bucket_id AND n.entity_id = f.entity_id
+             LEFT JOIN dim_profiles p ON p.entity_id = f.entity_id
+             LEFT JOIN fact_metrics m ON m.bucket_id = 42 AND f.entity_id = m.entity_id
+             WHERE f.bucket_id = 42
+             ORDER BY f.rank_score DESC
+             LIMIT 20 OFFSET 80",
+        )
+        .unwrap()
+        .remove(0);
+        let plan = plan_select(&stmt, &schemas).unwrap();
+        let optimized = Optimizer::new().optimize(plan);
+
+        assert!(
+            has_join_with_left_topn(&optimized, 100),
+            "expected TopN(limit+offset) to be pushed below the residual left-side filter"
+        );
+    }
+
+    fn has_join_with_left_topn(plan: &LogicalPlan, expected_limit: usize) -> bool {
+        match plan {
+            LogicalPlan::Join(join) => {
+                leading_topn_limit(&join.left) == Some(expected_limit)
+                    || has_join_with_left_topn(&join.left, expected_limit)
+                    || has_join_with_left_topn(&join.right, expected_limit)
+            }
+            LogicalPlan::Filter(filter) => has_join_with_left_topn(&filter.input, expected_limit),
+            LogicalPlan::Project(project) => {
+                has_join_with_left_topn(&project.input, expected_limit)
+            }
+            LogicalPlan::Sort(sort) => has_join_with_left_topn(&sort.input, expected_limit),
+            LogicalPlan::Limit(limit) => has_join_with_left_topn(&limit.input, expected_limit),
+            LogicalPlan::TopN(topn) => has_join_with_left_topn(&topn.input, expected_limit),
+            LogicalPlan::Aggregate(agg) => has_join_with_left_topn(&agg.input, expected_limit),
+            LogicalPlan::Distinct(distinct) => {
+                has_join_with_left_topn(&distinct.input, expected_limit)
+            }
+            LogicalPlan::Window(window) => has_join_with_left_topn(&window.input, expected_limit),
+            LogicalPlan::SemiJoin(semi) => {
+                has_join_with_left_topn(&semi.left, expected_limit)
+                    || has_join_with_left_topn(&semi.right, expected_limit)
+            }
+            LogicalPlan::Scan(_) | LogicalPlan::Empty => false,
+        }
+    }
+
+    fn leading_topn_limit(plan: &LogicalPlan) -> Option<usize> {
+        match plan {
+            LogicalPlan::TopN(topn) if topn.offset == 0 => Some(topn.limit),
+            LogicalPlan::Filter(filter) => leading_topn_limit(&filter.input),
+            _ => None,
+        }
     }
 }

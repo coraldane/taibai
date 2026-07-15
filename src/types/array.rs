@@ -1106,6 +1106,294 @@ impl ColumnArray {
         deleted_count
     }
 
+    /// Column-wide minimum over non-null values (vectorized, no per-cell boxing).
+    /// Returns None when the column has no non-null values.
+    pub fn col_min(&self) -> Option<ScalarValue> {
+        let n = self.len();
+        let bitmap = self.bitmap();
+        macro_rules! numeric_min {
+            ($data:expr, $variant:ident) => {{
+                let mut best: Option<_> = None;
+                for (i, v) in $data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        best = Some(match best {
+                            Some(b) if &b <= v => b,
+                            _ => *v,
+                        });
+                    }
+                }
+                best.map(|v| ScalarValue::$variant(Some(v)))
+            }};
+        }
+        match self {
+            ColumnArray::Int64 { data, .. } => numeric_min!(data, Int64),
+            ColumnArray::Int32 { data, .. } => numeric_min!(data, Int32),
+            ColumnArray::Int16 { data, .. } => numeric_min!(data, Int16),
+            ColumnArray::Int8 { data, .. } => numeric_min!(data, Int8),
+            ColumnArray::UInt64 { data, .. } => numeric_min!(data, UInt64),
+            ColumnArray::UInt32 { data, .. } => numeric_min!(data, UInt32),
+            ColumnArray::UInt16 { data, .. } => numeric_min!(data, UInt16),
+            ColumnArray::UInt8 { data, .. } => numeric_min!(data, UInt8),
+            ColumnArray::Float64 { data, .. } => {
+                let mut best: Option<f64> = None;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        best = Some(match best {
+                            Some(b) => b.min(*v),
+                            None => *v,
+                        });
+                    }
+                }
+                best.map(|v| ScalarValue::Float64(Some(v)))
+            }
+            ColumnArray::Float32 { data, .. } => {
+                let mut best: Option<f32> = None;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        best = Some(match best {
+                            Some(b) => b.min(*v),
+                            None => *v,
+                        });
+                    }
+                }
+                best.map(|v| ScalarValue::Float32(Some(v)))
+            }
+            ColumnArray::Decimal { data, .. } => numeric_min!(data, Decimal),
+            ColumnArray::Date { data, .. } => numeric_min!(data, Date),
+            ColumnArray::Time { data, .. } => numeric_min!(data, Time),
+            ColumnArray::Timestamp { data, .. } => numeric_min!(data, Timestamp),
+            ColumnArray::Interval { data, .. } => numeric_min!(data, Interval),
+            ColumnArray::Bool { data, .. } => {
+                let mut saw_false = false;
+                let mut saw_true = false;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        if *v != 0 {
+                            saw_true = true;
+                        } else {
+                            saw_false = true;
+                        }
+                    }
+                }
+                if saw_false {
+                    Some(ScalarValue::Bool(Some(false)))
+                } else if saw_true {
+                    Some(ScalarValue::Bool(Some(true)))
+                } else {
+                    None
+                }
+            }
+            ColumnArray::VarChar { data, .. } => {
+                let mut best: Option<&String> = None;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        best = Some(match best {
+                            Some(b) if b <= v => b,
+                            _ => v,
+                        });
+                    }
+                }
+                best.map(|v| ScalarValue::VarChar(Some(v.clone())))
+            }
+            ColumnArray::Blob { .. } | ColumnArray::Vector { .. } => None,
+        }
+    }
+
+    /// Column-wide maximum over non-null values (vectorized, no per-cell boxing).
+    pub fn col_max(&self) -> Option<ScalarValue> {
+        let n = self.len();
+        let bitmap = self.bitmap();
+        macro_rules! numeric_max {
+            ($data:expr, $variant:ident) => {{
+                let mut best: Option<_> = None;
+                for (i, v) in $data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        best = Some(match best {
+                            Some(b) if &b >= v => b,
+                            _ => *v,
+                        });
+                    }
+                }
+                best.map(|v| ScalarValue::$variant(Some(v)))
+            }};
+        }
+        match self {
+            ColumnArray::Int64 { data, .. } => numeric_max!(data, Int64),
+            ColumnArray::Int32 { data, .. } => numeric_max!(data, Int32),
+            ColumnArray::Int16 { data, .. } => numeric_max!(data, Int16),
+            ColumnArray::Int8 { data, .. } => numeric_max!(data, Int8),
+            ColumnArray::UInt64 { data, .. } => numeric_max!(data, UInt64),
+            ColumnArray::UInt32 { data, .. } => numeric_max!(data, UInt32),
+            ColumnArray::UInt16 { data, .. } => numeric_max!(data, UInt16),
+            ColumnArray::UInt8 { data, .. } => numeric_max!(data, UInt8),
+            ColumnArray::Float64 { data, .. } => {
+                let mut best: Option<f64> = None;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        best = Some(match best {
+                            Some(b) => b.max(*v),
+                            None => *v,
+                        });
+                    }
+                }
+                best.map(|v| ScalarValue::Float64(Some(v)))
+            }
+            ColumnArray::Float32 { data, .. } => {
+                let mut best: Option<f32> = None;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        best = Some(match best {
+                            Some(b) => b.max(*v),
+                            None => *v,
+                        });
+                    }
+                }
+                best.map(|v| ScalarValue::Float32(Some(v)))
+            }
+            ColumnArray::Decimal { data, .. } => numeric_max!(data, Decimal),
+            ColumnArray::Date { data, .. } => numeric_max!(data, Date),
+            ColumnArray::Time { data, .. } => numeric_max!(data, Time),
+            ColumnArray::Timestamp { data, .. } => numeric_max!(data, Timestamp),
+            ColumnArray::Interval { data, .. } => numeric_max!(data, Interval),
+            ColumnArray::Bool { data, .. } => {
+                let mut saw_false = false;
+                let mut saw_true = false;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        if *v != 0 {
+                            saw_true = true;
+                        } else {
+                            saw_false = true;
+                        }
+                    }
+                }
+                if saw_true {
+                    Some(ScalarValue::Bool(Some(true)))
+                } else if saw_false {
+                    Some(ScalarValue::Bool(Some(false)))
+                } else {
+                    None
+                }
+            }
+            ColumnArray::VarChar { data, .. } => {
+                let mut best: Option<&String> = None;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        best = Some(match best {
+                            Some(b) if b >= v => b,
+                            _ => v,
+                        });
+                    }
+                }
+                best.map(|v| ScalarValue::VarChar(Some(v.clone())))
+            }
+            ColumnArray::Blob { .. } | ColumnArray::Vector { .. } => None,
+        }
+    }
+
+    /// Count of non-null values in this column (vectorized).
+    pub fn col_count_non_null(&self) -> u64 {
+        let n = self.len();
+        let bitmap = self.bitmap();
+        let mut count: u64 = 0;
+        for i in 0..n {
+            if !bitmap.is_null(i) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Column-wide sum as i64 for integer columns (vectorized). Returns None if
+    /// all values are null or the column type is not integer.
+    pub fn col_sum_i64(&self) -> Option<i64> {
+        let n = self.len();
+        let bitmap = self.bitmap();
+        macro_rules! int_sum {
+            ($data:expr, $cast:ty) => {{
+                let mut sum: i64 = 0;
+                let mut any = false;
+                for (i, v) in $data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        sum = sum.wrapping_add(*v as $cast as i64);
+                        any = true;
+                    }
+                }
+                if any {
+                    Some(sum)
+                } else {
+                    None
+                }
+            }};
+        }
+        match self {
+            ColumnArray::Int64 { data, .. } => int_sum!(data, i64),
+            ColumnArray::Int32 { data, .. } => int_sum!(data, i64),
+            ColumnArray::Int16 { data, .. } => int_sum!(data, i64),
+            ColumnArray::Int8 { data, .. } => int_sum!(data, i64),
+            ColumnArray::UInt64 { data, .. } => {
+                let mut sum: i64 = 0;
+                let mut any = false;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        sum = sum.wrapping_add(i64::try_from(*v).unwrap_or(i64::MAX));
+                        any = true;
+                    }
+                }
+                if any {
+                    Some(sum)
+                } else {
+                    None
+                }
+            }
+            ColumnArray::UInt32 { data, .. } => int_sum!(data, i64),
+            ColumnArray::UInt16 { data, .. } => int_sum!(data, i64),
+            ColumnArray::UInt8 { data, .. } => int_sum!(data, i64),
+            ColumnArray::Decimal { data, .. } => int_sum!(data, i64),
+            _ => None,
+        }
+    }
+
+    /// Column-wide sum as f64 for float columns (vectorized). Returns None if
+    /// all values are null or the column type is not float.
+    pub fn col_sum_f64(&self) -> Option<f64> {
+        let n = self.len();
+        let bitmap = self.bitmap();
+        match self {
+            ColumnArray::Float64 { data, .. } => {
+                let mut sum = 0.0f64;
+                let mut any = false;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        sum += *v;
+                        any = true;
+                    }
+                }
+                if any {
+                    Some(sum)
+                } else {
+                    None
+                }
+            }
+            ColumnArray::Float32 { data, .. } => {
+                let mut sum = 0.0f64;
+                let mut any = false;
+                for (i, v) in data.iter().enumerate().take(n) {
+                    if !bitmap.is_null(i) {
+                        sum += *v as f64;
+                        any = true;
+                    }
+                }
+                if any {
+                    Some(sum)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn eq_vec(&self, value: &ScalarValue) -> Vec<bool> {
         let num_rows = self.len();
         let bitmap = self.bitmap();
@@ -1356,6 +1644,102 @@ impl ColumnArray {
                     new_col.push(&self.scalar(i)).unwrap();
                 }
                 new_col
+            }
+        }
+    }
+
+    /// Gather rows at the given indices (random access). All indices must be
+    /// `< self.len()`. This is the workhorse for the per-symbol inverted index
+    /// gather path: instead of scanning the whole column it copies only the
+    /// requested rows, turning a full-scan into an O(matched) operation.
+    pub fn take(&self, indices: &[u32]) -> ColumnArray {
+        macro_rules! take_copy_column {
+            ($variant:ident, $data:expr, $bitmap:expr) => {{
+                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &idx in indices {
+                    let i = idx as usize;
+                    new_data.push($data[i]);
+                    if $bitmap.is_null(i) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::$variant {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }};
+        }
+
+        match self {
+            ColumnArray::Bool { data, bitmap } => take_copy_column!(Bool, data, bitmap),
+            ColumnArray::Int8 { data, bitmap } => take_copy_column!(Int8, data, bitmap),
+            ColumnArray::Int16 { data, bitmap } => take_copy_column!(Int16, data, bitmap),
+            ColumnArray::Int32 { data, bitmap } => take_copy_column!(Int32, data, bitmap),
+            ColumnArray::Int64 { data, bitmap } => take_copy_column!(Int64, data, bitmap),
+            ColumnArray::UInt8 { data, bitmap } => take_copy_column!(UInt8, data, bitmap),
+            ColumnArray::UInt16 { data, bitmap } => take_copy_column!(UInt16, data, bitmap),
+            ColumnArray::UInt32 { data, bitmap } => take_copy_column!(UInt32, data, bitmap),
+            ColumnArray::UInt64 { data, bitmap } => take_copy_column!(UInt64, data, bitmap),
+            ColumnArray::Float32 { data, bitmap } => take_copy_column!(Float32, data, bitmap),
+            ColumnArray::Float64 { data, bitmap } => take_copy_column!(Float64, data, bitmap),
+            ColumnArray::Decimal { data, bitmap } => take_copy_column!(Decimal, data, bitmap),
+            ColumnArray::Date { data, bitmap } => take_copy_column!(Date, data, bitmap),
+            ColumnArray::Time { data, bitmap } => take_copy_column!(Time, data, bitmap),
+            ColumnArray::Timestamp { data, bitmap } => take_copy_column!(Timestamp, data, bitmap),
+            ColumnArray::Interval { data, bitmap } => take_copy_column!(Interval, data, bitmap),
+            ColumnArray::VarChar { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &idx in indices {
+                    let i = idx as usize;
+                    new_data.push(data[i].clone());
+                    if bitmap.is_null(i) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::VarChar {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }
+            ColumnArray::Blob { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &idx in indices {
+                    let i = idx as usize;
+                    new_data.push(data[i].clone());
+                    if bitmap.is_null(i) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::Blob {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }
+            ColumnArray::Vector { data, bitmap } => {
+                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &idx in indices {
+                    let i = idx as usize;
+                    new_data.push(data[i].clone());
+                    if bitmap.is_null(i) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::Vector {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
             }
         }
     }

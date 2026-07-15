@@ -255,6 +255,57 @@ fn select_limit_falls_back_when_cluster_segment_order_is_not_monotonic() {
 }
 
 #[test]
+fn clustered_eq_prefix_order_by_next_key_desc_after_flush() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE stock_ticks (
+                security_id VARCHAR,
+                deal_date INT64,
+                deal_time INT32
+            ) CLUSTER BY (security_id, deal_date, deal_time) PARTITION BY deal_date",
+        )
+        .expect("create stock_ticks");
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO stock_ticks VALUES
+                ('688256.SH', 20260709, 103910),
+                ('688256.SH', 20260709, 103904),
+                ('000001.SZ', 20260709, 103999),
+                ('688256.SH', 20260709, 103913),
+                ('688256.SH', 20260708, 103916),
+                ('688256.SH', 20260709, 103907)",
+        )
+        .expect("insert stock tick rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE stock_ticks")
+        .expect("flush stock tick rows");
+
+    let rows = collect_i32_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT deal_time FROM stock_ticks
+                 WHERE security_id = '688256.SH' AND deal_date = 20260709
+                 ORDER BY deal_time DESC",
+            )
+            .expect("select stock tick rows"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![103913], vec![103910], vec![103907], vec![103904],]
+    );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
 fn bulk_import_mode_defers_direct_payload_metadata_flush() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");

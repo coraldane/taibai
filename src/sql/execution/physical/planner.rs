@@ -103,7 +103,8 @@ fn build_operator_with_limit(
         }
         LogicalPlan::Sort(sort) => {
             let schema = get_scan_schema(&sort.input);
-            let input = build_operator_with_limit(*sort.input, ctx, None)?;
+            let input_plan = annotate_single_scan_with_order(*sort.input, sort.sort_keys.clone());
+            let input = build_operator_with_limit(input_plan, ctx, None)?;
             Ok(Box::new(SortExec::new(sort.sort_keys, input, schema)))
         }
         LogicalPlan::Limit(limit) => {
@@ -140,6 +141,17 @@ fn build_operator_with_limit(
         }
         LogicalPlan::Aggregate(agg) => {
             let input_schema = get_scan_schema(&agg.input);
+            // Projection pushdown: if the aggregate feeds directly off a Scan,
+            // restrict the scan to only the columns referenced by GROUP BY and
+            // the aggregate arguments. The existing `remap_aggregate_for_batch`
+            // / `remap_expr_for_batch` logic rewrites indices to the projected
+            // batch schema. Predicate columns are still read because the scan
+            // spec compilation expands projection to include them.
+            let plan = LogicalPlan::Aggregate(pushdown_aggregate_projection(agg));
+            let agg = match plan {
+                LogicalPlan::Aggregate(a) => a,
+                other => return build_operator_with_limit(other, ctx, limit_hint),
+            };
             let input = build_operator_with_limit(*agg.input, ctx, None)?;
             Ok(Box::new(HashAggregateExec::new(
                 agg.group_by,
@@ -335,6 +347,43 @@ fn annotate_single_scan_with_ordered_limit(
     annotate_scan(plan, &sort_keys, limit)
 }
 
+fn annotate_single_scan_with_order(
+    plan: LogicalPlan,
+    sort_keys: Vec<crate::sql::planner::SortKey>,
+) -> LogicalPlan {
+    if single_scan(&plan).is_none() {
+        return plan;
+    }
+    annotate_scan_order(plan, &sort_keys)
+}
+
+fn annotate_scan_order(
+    plan: LogicalPlan,
+    sort_keys: &[crate::sql::planner::SortKey],
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Scan(mut scan) => {
+            if scan.pushed_order.is_none() {
+                scan.pushed_order = Some(sort_keys.to_vec());
+            }
+            LogicalPlan::Scan(scan)
+        }
+        LogicalPlan::Filter(mut filter) => {
+            filter.input = Box::new(annotate_scan_order(*filter.input, sort_keys));
+            LogicalPlan::Filter(filter)
+        }
+        LogicalPlan::Project(mut project) => {
+            project.input = Box::new(annotate_scan_order(*project.input, sort_keys));
+            LogicalPlan::Project(project)
+        }
+        LogicalPlan::Limit(mut limit_plan) => {
+            limit_plan.input = Box::new(annotate_scan_order(*limit_plan.input, sort_keys));
+            LogicalPlan::Limit(limit_plan)
+        }
+        other => other,
+    }
+}
+
 fn annotate_scan(
     plan: LogicalPlan,
     sort_keys: &[crate::sql::planner::SortKey],
@@ -379,5 +428,72 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::Distinct(d) => get_scan_schema(&d.input),
         LogicalPlan::Window(w) => get_scan_schema(&w.input),
         LogicalPlan::Empty => Schema::new(vec![ColumnDef::new("count(*)", DataType::Int64)]),
+    }
+}
+
+/// Collect all column indices referenced by the aggregate's GROUP BY keys and
+/// aggregate arguments. Returns None if any expression is non-column (in which
+/// case projection pushdown is skipped for safety).
+fn collect_aggregate_columns(
+    agg: &crate::sql::planner::AggregatePlan,
+) -> Option<Vec<usize>> {
+    let mut cols: Vec<usize> = Vec::new();
+    for e in &agg.group_by {
+        if let LogicalExpr::Column(i) = e {
+            cols.push(*i);
+        } else {
+            return None;
+        }
+    }
+    for a in &agg.aggregates {
+        match &*a.arg {
+            LogicalExpr::Column(i) => cols.push(*i),
+            LogicalExpr::Wildcard => {}
+            _ => return None,
+        }
+    }
+    cols.sort_unstable();
+    cols.dedup();
+    Some(cols)
+}
+
+/// If the aggregate reads directly from a Scan, install a projection on that
+/// scan covering only the GROUP BY + aggregate-argument columns. This is only
+/// done when the referenced column set is a strict subset of the table schema
+/// (i.e. there is something to save) and at least one column is referenced.
+fn pushdown_aggregate_projection(
+    mut agg: crate::sql::planner::AggregatePlan,
+) -> crate::sql::planner::AggregatePlan {
+    let total_cols = match &*agg.input {
+        LogicalPlan::Scan(s) => s.schema.columns.len(),
+        LogicalPlan::Filter(f) => match &*f.input {
+            LogicalPlan::Scan(s) => s.schema.columns.len(),
+            _ => return agg,
+        },
+        _ => return agg,
+    };
+    let Some(cols) = collect_aggregate_columns(&agg) else {
+        return agg;
+    };
+    if cols.is_empty() || cols.len() >= total_cols {
+        return agg;
+    }
+    agg.input = Box::new(set_scan_projection(*agg.input, &cols));
+    agg
+}
+
+fn set_scan_projection(plan: LogicalPlan, cols: &[usize]) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Scan(mut s) => {
+            if s.projection.is_none() {
+                s.projection = Some(cols.to_vec());
+            }
+            LogicalPlan::Scan(s)
+        }
+        LogicalPlan::Filter(mut f) => {
+            f.input = Box::new(set_scan_projection(*f.input, cols));
+            LogicalPlan::Filter(f)
+        }
+        other => other,
     }
 }

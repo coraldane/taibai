@@ -284,10 +284,12 @@ pub fn compact_sidecar_footer_if_needed(
 
 pub fn remove_sidecar_meta(segment_path: &Path) -> Result<()> {
     let meta_path = sidecar_meta_path(segment_path);
+    remove_file_if_exists(&meta_path)?;
     let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
-    if legacy_meta_path == meta_path {
-        remove_file_if_exists(&meta_path)?;
-    } else {
+    if legacy_meta_path != meta_path {
+        // 分区段的当前 sidecar 为共享的 `p{key}.meta`，而旧版路径为
+        // `p{key}_{seq}.meta`。两者都必须清理，否则分区元数据文件
+        // 会在 truncate / drop partition 之后残留。
         remove_file_if_exists(&legacy_meta_path)?;
     }
     Ok(())

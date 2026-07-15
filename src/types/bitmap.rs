@@ -130,6 +130,23 @@ impl NullBitmap {
         buf
     }
 
+    /// Expand the bit-packed null map into one byte per row, where each byte is
+    /// `1` when the row is NULL and `0` otherwise. The all-valid case (common
+    /// for `NOT NULL` tick columns) is a single bulk memset instead of a per-row
+    /// branch, which is what makes 5000-row result serialization cheap.
+    pub fn null_flag_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.len];
+        if self.is_all_valid() {
+            return out;
+        }
+        for i in 0..self.len {
+            if self.is_null(i) {
+                out[i] = 1;
+            }
+        }
+        out
+    }
+
     pub fn extend(&mut self, other: &NullBitmap) {
         if other.is_all_valid() {
             let needed = Self::u64_count(self.len + other.len);

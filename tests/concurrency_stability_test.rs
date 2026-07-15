@@ -6,6 +6,8 @@ use tempfile::TempDir;
 use taibai::net::session::Session;
 use taibai::sql::execution::engine::{Engine, ExecResult};
 use taibai::storage::core::memtable::MemTableState;
+use taibai::storage::segment::SegmentReader;
+use taibai::storage::segment_manager::SegmentManager;
 
 fn session() -> Session {
     Session::new("root".to_string(), "main".to_string())
@@ -23,6 +25,23 @@ fn count_star(result: ExecResult) -> i64 {
             _ => None,
         })
         .expect("count(*) value")
+}
+
+fn first_column_values(result: ExecResult) -> Vec<String> {
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    let mut values = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            if let Some(taibai::types::scalar::ScalarValue::VarChar(Some(value))) =
+                batch.scalar(row_idx, 0)
+            {
+                values.push(value);
+            }
+        }
+    }
+    values
 }
 
 fn rows_affected(result: ExecResult) -> u64 {
@@ -180,6 +199,108 @@ fn flushing_memtable_rows_remain_countable() {
         )
         .expect("count flushing rows");
     assert_eq!(count_star(count), 2);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn flushing_memtable_rows_remain_selectable_by_point_lookup() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut setup = session();
+    engine
+        .execute(
+            &mut setup,
+            "CREATE TABLE ticks (
+                security_id VARCHAR NOT NULL,
+                deal_date INT64 NOT NULL,
+                price DOUBLE
+            ) PARTITION BY DAY(deal_date) CLUSTER BY (security_id, deal_date)",
+        )
+        .expect("create table");
+    engine
+        .execute(
+            &mut setup,
+            "INSERT INTO ticks VALUES
+                ('688256.SH', 20260709, 11.1),
+                ('000001.SZ', 20260709, 12.2)",
+        )
+        .expect("insert rows");
+
+    for memtable in engine.memtable_manager().get_by_table("main", "ticks") {
+        memtable.set_state(MemTableState::Flushing);
+    }
+
+    let mut verifier = session();
+    let rows = first_column_values(
+        engine
+            .execute(
+                &mut verifier,
+                "SELECT security_id FROM ticks
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'",
+            )
+            .expect("select flushing row"),
+    );
+    assert_eq!(rows, vec!["688256.SH".to_string()]);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn flushed_memtable_rows_remain_selectable_by_point_lookup() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut setup = session();
+    engine
+        .execute(
+            &mut setup,
+            "CREATE TABLE ticks (
+                security_id VARCHAR NOT NULL,
+                deal_date INT64 NOT NULL,
+                price DOUBLE
+            ) PARTITION BY DAY(deal_date) CLUSTER BY (security_id, deal_date)",
+        )
+        .expect("create table");
+    engine
+        .execute(
+            &mut setup,
+            "INSERT INTO ticks VALUES
+                ('688256.SH', 20260709, 11.1),
+                ('000001.SZ', 20260709, 12.2)",
+        )
+        .expect("insert rows");
+    engine
+        .execute(&mut setup, "FLUSH TABLE ticks")
+        .expect("flush table");
+    let segments = SegmentManager::discover_segments(&temp_dir.path().join("main").join("ticks"))
+        .expect("discover flushed segments");
+    assert!(
+        segments.iter().any(|path| path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("p20260709_"))),
+        "expected a 20260709 partition segment after flush, got {:?}",
+        segments
+    );
+    let segment_rows = segments
+        .iter()
+        .map(|path| {
+            SegmentReader::open(path)
+                .expect("open flushed segment")
+                .row_count()
+        })
+        .sum::<u64>();
+    assert_eq!(segment_rows, 2);
+
+    let mut verifier = session();
+    let rows = first_column_values(
+        engine
+            .execute(
+                &mut verifier,
+                "SELECT security_id FROM ticks
+                 WHERE deal_date = 20260709 AND security_id = '688256.SH'",
+            )
+            .expect("select flushed row"),
+    );
+    assert_eq!(rows, vec!["688256.SH".to_string()]);
     engine.segment_mgr().shutdown();
 }
 

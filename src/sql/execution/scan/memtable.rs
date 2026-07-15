@@ -1,10 +1,85 @@
+use crate::storage::catalog::schema::TableMeta;
+use crate::storage::core::hot_store::{HotStore, HotStoreManager};
 use crate::storage::core::memtable::MemTableManager;
 use crate::types::batch::RecordBatch;
+use crate::types::scalar::ScalarValue;
 
 use super::spec::ScanSpec;
 
+fn live_memtables_and_watermark(
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_name: &str,
+    reader_txn_id: u64,
+    store: &HotStore,
+) -> (bool, u64) {
+    let memtables = memtable_mgr
+        .get_readable_by_table(db, table_name)
+        .into_iter()
+        .filter(|mt| mt.is_visible_to(reader_txn_id))
+        .collect::<Vec<_>>();
+    let live_rows = memtables.iter().map(|mt| mt.row_count()).sum::<u64>();
+    (live_rows > 0, store.row_count().saturating_sub(live_rows))
+}
+
+pub fn scan_resident_hot_store(
+    hot_mgr: &HotStoreManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<RecordBatch> {
+    if spec.reader_txn_id != 0 {
+        return None;
+    }
+    let store = hot_mgr.get(db, &spec.table_name)?;
+    if store.row_count() == 0 {
+        return None;
+    }
+    if !resident_hot_covers(&store, table_meta, spec) {
+        return None;
+    }
+    scan_hot_store_by_key(&store, spec, 0)
+}
+
+pub fn count_resident_hot_store(
+    hot_mgr: &HotStoreManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<u64> {
+    if spec.reader_txn_id != 0 || table_meta.ttl.is_some() {
+        return None;
+    }
+    let store = hot_mgr.get(db, &spec.table_name)?;
+    if store.row_count() == 0 {
+        return None;
+    }
+    if !resident_hot_covers(&store, table_meta, spec) {
+        return None;
+    }
+    count_hot_store_by_key(&store, spec, 0)
+}
+
+fn resident_hot_covers(store: &HotStore, table_meta: &TableMeta, spec: &ScanSpec) -> bool {
+    let target_partition = if table_meta.is_partitioned() {
+        let Some(pi) = spec.partition_info.as_ref() else {
+            return false;
+        };
+        let Some(partition_key) =
+            super::partition::extract_partition_eq_value(spec, pi, table_meta)
+        else {
+            return false;
+        };
+        Some(partition_key)
+    } else {
+        None
+    };
+    store.is_resident_for_partition(target_partition.as_deref())
+}
+
 pub fn scan_memtables(
     memtable_mgr: &MemTableManager,
+    hot_mgr: &HotStoreManager,
     db: &str,
     table_name: &str,
     spec: &ScanSpec,
@@ -14,38 +89,202 @@ pub fn scan_memtables(
         .into_iter()
         .filter(|mt| mt.is_visible_to(spec.reader_txn_id))
         .collect::<Vec<_>>();
-    let mut batches = Vec::new();
 
-    for mt in &memtables {
-        if let Some(mt_batch) = mt.read() {
-            if mt_batch.num_rows() == 0 {
-                continue;
-            }
-
-            let mt_batch = if spec.has_predicates() {
-                super::row_filter::apply_predicates(
-                    &mt_batch,
-                    &spec.eq_predicates,
-                    &spec.range_predicates,
-                    &spec.in_predicates,
-                    spec.remaining_predicate.as_ref(),
-                )
-            } else {
-                mt_batch.clone()
-            };
-            if mt_batch.num_rows() == 0 {
-                continue;
-            }
-
-            if let Some(proj) = &spec.projection {
-                batches.push(apply_projection(&mt_batch, proj));
-            } else {
-                batches.push(mt_batch);
+    // Hot-store fast path. The store mirrors auto-commit (txn_id == 0) inserts
+    // and has no MVCC, so it is only safe for a committed read snapshot and
+    // only when there is live memtable data to accelerate. To avoid
+    // double-counting rows already persisted to segments, we derive a watermark
+    // = (rows ever appended to the store) - (rows still in live memtables); the
+    // leading rows below that watermark have been flushed and are served by the
+    // segment scan, so the gather here skips them. This prefix invariant holds
+    // for the single-active-partition ingestion pattern (e.g. today's ticks).
+    let has_live_memtable_data = memtables.iter().any(|mt| mt.row_count() > 0);
+    if has_live_memtable_data && spec.reader_txn_id == 0 {
+        if let Some(store) = hot_mgr.get(db, table_name) {
+            let (_, watermark) = live_memtables_and_watermark(
+                memtable_mgr,
+                db,
+                table_name,
+                spec.reader_txn_id,
+                &store,
+            );
+            if let Some(batch) = scan_hot_store_by_key(&store, spec, watermark) {
+                return vec![batch];
             }
         }
     }
 
+    let mut batches = Vec::new();
+
+    for mt in &memtables {
+        if let Some(mt_batch) = mt
+            .read_with(|source| {
+                if source.num_rows() == 0 {
+                    return None;
+                }
+
+                let filtered = if spec.has_predicates() {
+                    super::row_filter::apply_predicates(
+                        source,
+                        &spec.eq_predicates,
+                        &spec.range_predicates,
+                        &spec.in_predicates,
+                        spec.remaining_predicate.as_ref(),
+                    )
+                } else {
+                    source.clone()
+                };
+
+                if filtered.num_rows() == 0 {
+                    return None;
+                }
+
+                let ordered = apply_order_if_cluster_prefix_matches(filtered, spec);
+                Some(if let Some(proj) = &spec.projection {
+                    apply_projection(&ordered, proj)
+                } else {
+                    ordered
+                })
+            })
+            .flatten()
+        {
+            if mt_batch.num_rows() == 0 {
+                continue;
+            }
+            batches.push(mt_batch);
+        }
+    }
+
     batches
+}
+
+/// Per-value inverted-index gather fast path. Triggered when the scan carries
+/// an equality predicate on the leading cluster-key column. Gathers only the
+/// matching rows via the index instead of scanning the whole resident set.
+/// `watermark` excludes already-flushed rows (served by the segment scan).
+/// Returns `None` when the fast path does not apply (no such predicate),
+/// letting the caller fall back to the generic memtable scan.
+pub fn scan_hot_store_by_key(
+    store: &HotStore,
+    spec: &ScanSpec,
+    watermark: u64,
+) -> Option<RecordBatch> {
+    let key_idx = store.key_column_index();
+    let key_value = spec
+        .eq_predicates
+        .iter()
+        .find(|(idx, _)| *idx == key_idx)
+        .map(|(_, v)| v)?;
+    let partition_col_idx = spec
+        .partition_info
+        .as_ref()
+        .and_then(|pi| pi.partition_key_col_idx);
+    let partition_value = partition_col_idx.and_then(|idx| spec.eq_value_for_column(idx));
+
+    let indexed_lookup = spec
+        .eq_predicates
+        .iter()
+        .all(|(idx, _)| *idx == key_idx || Some(*idx) == partition_col_idx)
+        && spec.range_predicates.is_empty()
+        && spec.in_predicates.is_empty()
+        && spec.remaining_predicate.is_none();
+
+    let lookup_projection = if indexed_lookup {
+        spec.projection.as_deref()
+    } else {
+        None
+    };
+
+    let reverse_lookup =
+        ordered_cluster_order_for_schema(store.schema(), spec).is_some_and(|order| order.desc);
+    let batch = match store.lookup(
+        key_value,
+        partition_value,
+        lookup_projection,
+        watermark,
+        reverse_lookup,
+    ) {
+        Some(b) => b,
+        None => {
+            // Value never seen -> empty result, respecting the projection.
+            let schema = store.schema().clone();
+            let proj = spec
+                .projection
+                .clone()
+                .unwrap_or_else(|| (0..schema.num_columns()).collect());
+            return Some(apply_projection(&RecordBatch::new(schema), &proj));
+        }
+    };
+
+    let filtered = if !indexed_lookup && spec.has_predicates() {
+        super::row_filter::apply_predicates(
+            &batch,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+            &spec.in_predicates,
+            spec.remaining_predicate.as_ref(),
+        )
+    } else {
+        batch
+    };
+
+    if indexed_lookup {
+        return Some(filtered);
+    }
+
+    let ordered = apply_order_if_cluster_prefix_matches(filtered, spec);
+    let projected = match &spec.projection {
+        Some(proj) => apply_projection(&ordered, proj),
+        None => ordered,
+    };
+    Some(projected)
+}
+
+pub fn count_hot_memtable_rows(
+    memtable_mgr: &MemTableManager,
+    hot_mgr: &HotStoreManager,
+    db: &str,
+    table_name: &str,
+    spec: &ScanSpec,
+) -> Option<u64> {
+    let store = hot_mgr.get(db, table_name)?;
+    let (key_value, partition_value) = hot_count_key_partition_values(&store, spec)?;
+    let (has_live_memtable_data, watermark) =
+        live_memtables_and_watermark(memtable_mgr, db, table_name, spec.reader_txn_id, &store);
+    if !has_live_memtable_data {
+        return None;
+    }
+    store.count_by_key_partition_from(key_value, partition_value, watermark)
+}
+
+pub fn count_hot_store_by_key(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Option<u64> {
+    let (key_value, partition_value) = hot_count_key_partition_values(store, spec)?;
+    store.count_by_key_partition_from(key_value, partition_value, watermark)
+}
+
+fn hot_count_key_partition_values<'a>(
+    store: &HotStore,
+    spec: &'a ScanSpec,
+) -> Option<(&'a ScalarValue, Option<&'a ScalarValue>)> {
+    if spec.reader_txn_id != 0
+        || !spec.range_predicates.is_empty()
+        || !spec.in_predicates.is_empty()
+        || spec.remaining_predicate.is_some()
+    {
+        return None;
+    }
+    let key_idx = store.key_column_index();
+    let partition_col_idx = store.partition_column_index();
+    if !spec
+        .eq_predicates
+        .iter()
+        .all(|(idx, _)| *idx == key_idx || Some(*idx) == partition_col_idx)
+    {
+        return None;
+    }
+    let key_value = spec.eq_value_for_column(key_idx)?;
+    let partition_value = partition_col_idx.and_then(|idx| spec.eq_value_for_column(idx));
+    Some((key_value, partition_value))
 }
 
 pub fn count_memtable_rows(
@@ -62,9 +301,9 @@ pub fn count_memtable_rows(
     let mut total: u64 = 0;
 
     for mt in &memtables {
-        if let Some(mt_batch) = mt.read() {
+        if let Some(count) = mt.read_with(|mt_batch| {
             if mt_batch.num_rows() == 0 {
-                continue;
+                return 0;
             }
 
             if spec.eq_predicates.len() == 1
@@ -75,7 +314,9 @@ pub fn count_memtable_rows(
                 let (col_idx, value) = &spec.eq_predicates[0];
                 if let Some(col) = mt_batch.column(*col_idx) {
                     let mask = col.eq_vec(value);
-                    total += mask.iter().filter(|&&m| m).count() as u64;
+                    mask.iter().filter(|&&m| m).count() as u64
+                } else {
+                    0
                 }
             } else if spec.has_predicates() {
                 let filtered = super::row_filter::apply_predicates(
@@ -85,10 +326,12 @@ pub fn count_memtable_rows(
                     &spec.in_predicates,
                     spec.remaining_predicate.as_ref(),
                 );
-                total += filtered.num_rows() as u64;
+                filtered.num_rows() as u64
             } else {
-                total += mt_batch.num_rows() as u64;
+                mt_batch.num_rows() as u64
             }
+        }) {
+            total += count;
         }
     }
 
@@ -108,4 +351,98 @@ fn apply_projection(batch: &RecordBatch, projection: &[usize]) -> RecordBatch {
     }
     let schema = crate::types::batch::Schema::new(col_defs);
     RecordBatch::try_new(schema, columns).unwrap_or_else(|_| batch.clone())
+}
+
+fn apply_order_if_cluster_prefix_matches(batch: RecordBatch, spec: &ScanSpec) -> RecordBatch {
+    let Some(order) = ordered_cluster_order_for_batch(&batch, spec) else {
+        return batch;
+    };
+    if is_batch_ordered_by(&batch, order.column_index, order.desc) {
+        return batch;
+    }
+    if is_batch_ordered_by(&batch, order.column_index, !order.desc) {
+        return reverse_batch(&batch).unwrap_or(batch);
+    }
+    batch
+}
+
+struct BatchOrder {
+    column_index: usize,
+    desc: bool,
+}
+
+fn ordered_cluster_order_for_batch(batch: &RecordBatch, spec: &ScanSpec) -> Option<BatchOrder> {
+    ordered_cluster_order_for_schema(&batch.schema, spec)
+}
+
+fn ordered_cluster_order_for_schema(
+    schema: &crate::types::batch::Schema,
+    spec: &ScanSpec,
+) -> Option<BatchOrder> {
+    if !spec.has_order_by
+        || spec.has_aggregate
+        || spec.has_group_by
+        || spec.has_join
+        || spec.remaining_predicate.is_some()
+        || spec.order_by.len() != 1
+    {
+        return None;
+    }
+
+    let cluster_key = spec.cluster_key.as_ref()?;
+    let order = spec.order_by.first()?;
+    let order_col_name = schema.columns.get(order.column_index)?.name.as_str();
+    let order_key_pos = cluster_key
+        .iter()
+        .position(|key| key.eq_ignore_ascii_case(order_col_name))?;
+    if order_key_pos == 0 {
+        return None;
+    }
+
+    for key in cluster_key.iter().take(order_key_pos) {
+        let key_idx = schema.index_of(key)?;
+        spec.eq_predicates.iter().find(|(idx, _)| *idx == key_idx)?;
+    }
+
+    Some(BatchOrder {
+        column_index: order.column_index,
+        desc: order.desc,
+    })
+}
+
+fn is_batch_ordered_by(batch: &RecordBatch, column_index: usize, desc: bool) -> bool {
+    if batch.num_rows() <= 1 {
+        return true;
+    }
+    for row in 1..batch.num_rows() {
+        let Some(prev) = batch.scalar(row - 1, column_index) else {
+            return false;
+        };
+        let Some(curr) = batch.scalar(row, column_index) else {
+            return false;
+        };
+        let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(&prev, &curr);
+        let violation = if desc {
+            cmp == std::cmp::Ordering::Less
+        } else {
+            cmp == std::cmp::Ordering::Greater
+        };
+        if violation {
+            return false;
+        }
+    }
+    true
+}
+
+fn reverse_batch(batch: &RecordBatch) -> Option<RecordBatch> {
+    let mut out = RecordBatch::with_capacity(batch.schema.clone(), batch.num_rows());
+    for row in (0..batch.num_rows()).rev() {
+        for col_idx in 0..batch.num_columns() {
+            let value = batch.scalar(row, col_idx).unwrap_or_else(|| {
+                ScalarValue::null_for_type(out.schema.columns[col_idx].data_type)
+            });
+            out.column_mut(col_idx)?.push(&value).ok()?;
+        }
+    }
+    Some(out)
 }
