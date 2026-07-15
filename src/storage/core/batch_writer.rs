@@ -179,26 +179,28 @@ impl BatchWriter {
         if row_count == 0 {
             return Ok(0);
         }
-        let get_start = Instant::now();
-        let mt =
-            self.memtable_mgr
-                .get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
-        log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
-        let append_start = Instant::now();
-        mt.append_owned(batch)?;
-        log_insert_profile(
-            "memtable_append",
-            row_count as usize,
-            append_start.elapsed(),
-        );
+        self.segment_mgr.with_table_mutation_lock(db, table, || {
+            let get_start = Instant::now();
+            let mt =
+                self.memtable_mgr
+                    .get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
+            log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
+            let append_start = Instant::now();
+            mt.append_owned(batch)?;
+            log_insert_profile(
+                "memtable_append",
+                row_count as usize,
+                append_start.elapsed(),
+            );
 
-        if txn_id == 0 && mt.row_count() >= self.config.max_rows_per_memtable {
-            let _ = self.sender.try_send(WriteCommand::Flush {
-                db: db.to_string(),
-                table: table.to_string(),
-            });
-        }
-        Ok(row_count)
+            if txn_id == 0 && mt.row_count() >= self.config.max_rows_per_memtable {
+                let _ = self.sender.try_send(WriteCommand::Flush {
+                    db: db.to_string(),
+                    table: table.to_string(),
+                });
+            }
+            Ok(row_count)
+        })
     }
 
     pub fn commit_txn(&self, txn_id: u64) -> Result<()> {

@@ -98,7 +98,8 @@ impl SegmentManager {
                         continue;
                     }
                     let db_name = db_entry.file_name().to_string_lossy().to_string();
-                    if db_name == "meta" || db_name == "wal" {
+                    if db_name == "meta" || db_name == "wal" || db_name == ".taibai-drop-databases"
+                    {
                         continue;
                     }
                     let db_dir = data_dir.join(&db_name);
@@ -107,11 +108,21 @@ impl SegmentManager {
                             if !tbl_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                                 continue;
                             }
+                            let table_name = tbl_entry.file_name().to_string_lossy().to_string();
+                            if matches!(
+                                table_name.as_str(),
+                                ".taibai-drop-tombstones"
+                                    | ".taibai-truncate-tombstones"
+                                    | ".taibai-partition-tombstones"
+                                    | ".taibai-rename-tombstones"
+                            ) {
+                                continue;
+                            }
                             let tbl_dir = tbl_entry.path();
                             cleanup_incomplete_compaction_files(&tbl_dir);
                             let max_seq = discover_max_seq(&tbl_dir);
                             let partition_seq = discover_max_partition_seq(&tbl_dir);
-                            let key = table_key(&db_name, &tbl_entry.file_name().to_string_lossy());
+                            let key = table_key(&db_name, &table_name);
                             tables.insert(
                                 key,
                                 Arc::new(TableSegmentState::with_partition_seq(
@@ -581,6 +592,30 @@ impl SegmentManager {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
         let _guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, table)?;
+        f()
+    }
+
+    pub fn with_database_mutation_locks<T>(
+        &self,
+        db: &str,
+        tables: &[String],
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut keys = tables
+            .iter()
+            .map(|table| table_key(db, table))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        let states = keys
+            .iter()
+            .map(|key| self.get_or_create_state(key))
+            .collect::<Vec<_>>();
+        let _guards = states
+            .iter()
+            .map(|state| state.mutation_lock.lock().unwrap())
+            .collect::<Vec<_>>();
         f()
     }
 

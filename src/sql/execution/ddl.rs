@@ -1,11 +1,15 @@
-use std::collections::HashMap;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
-use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType, SecondaryIndexType};
-use crate::storage::segment::meta::remove_sidecar_meta;
+use crate::storage::catalog::schema::{
+    DatabaseCatalog, PartitionType, SecondaryIndexType, TableMeta,
+};
 use crate::types::batch::{ColumnDef, ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -14,6 +18,588 @@ use crate::sql::parser::ast::{
     AlterOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef,
     PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
 };
+
+const FILE_DELETE_MAX_ATTEMPTS: usize = 5;
+const FILE_DELETE_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const DROP_TOMBSTONE_DIR: &str = ".taibai-drop-tombstones";
+const DATABASE_DROP_TOMBSTONE_DIR: &str = ".taibai-drop-databases";
+const TRUNCATE_TOMBSTONE_DIR: &str = ".taibai-truncate-tombstones";
+const PARTITION_TOMBSTONE_DIR: &str = ".taibai-partition-tombstones";
+const RENAME_TOMBSTONE_DIR: &str = ".taibai-rename-tombstones";
+const BEFORE_META_FILE: &str = "before.json";
+const COMMITTED_FILE: &str = "committed";
+const RENAME_TARGET_FILE: &str = "new-name";
+const STAGED_DATA_DIR: &str = "data";
+const FRESH_DATA_DIR: &str = "fresh";
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_DROP_CLEANUP_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static FORCE_DDL_CLEANUP_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn is_retryable_delete_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+    ) || matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+fn retry_delete<T, F>(operation: &str, path: &Path, mut delete: F) -> io::Result<()>
+where
+    F: FnMut(&Path) -> std::result::Result<(), T>,
+    T: Into<io::Error>,
+{
+    let mut delay = FILE_DELETE_INITIAL_DELAY;
+    for attempt in 1..=FILE_DELETE_MAX_ATTEMPTS {
+        match delete(path).map_err(Into::into) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if attempt < FILE_DELETE_MAX_ATTEMPTS && is_retryable_delete_error(&error) =>
+            {
+                tracing::warn!(
+                    operation,
+                    path = %path.display(),
+                    attempt,
+                    max_attempts = FILE_DELETE_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %error,
+                    "file deletion failed; retrying"
+                );
+                thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{} '{}' failed after {} attempt(s): {}",
+                        operation,
+                        path.display(),
+                        attempt,
+                        error
+                    ),
+                ));
+            }
+        }
+    }
+    unreachable!("delete retry loop always returns")
+}
+
+fn remove_file_with_retry(path: &Path) -> io::Result<()> {
+    retry_delete("remove file", path, |path| std::fs::remove_file(path))
+}
+
+fn remove_dir_all_with_retry(path: &Path) -> io::Result<()> {
+    retry_delete("remove directory", path, |path| {
+        std::fs::remove_dir_all(path)
+    })
+}
+
+fn remove_staged_table_directory(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FORCE_DROP_CLEANUP_FAILURE.with(|force| force.replace(false)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "forced staged-directory cleanup failure",
+        ));
+    }
+    remove_dir_all_with_retry(path)
+}
+
+fn remove_committed_operation_directory(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FORCE_DDL_CLEANUP_FAILURE.with(|force| force.replace(false)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "forced committed-operation cleanup failure",
+        ));
+    }
+    remove_dir_all_with_retry(path)
+}
+
+fn stage_table_directory(path: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("table path '{}' is not a directory", path.display()),
+        ));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("table path '{}' has no parent directory", path.display()),
+        )
+    })?;
+    let table_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("table path '{}' has no table name", path.display()),
+        )
+    })?;
+    let tombstone_root = parent.join(DROP_TOMBSTONE_DIR);
+    std::fs::create_dir_all(&tombstone_root)?;
+    let tombstone = tombstone_root.join(table_name);
+    if tombstone.exists() {
+        remove_dir_all_with_retry(&tombstone)?;
+    }
+    std::fs::rename(path, &tombstone)?;
+    Ok(Some(tombstone))
+}
+
+fn restore_staged_table_directory(tombstone: &Path, table_dir: &Path) -> io::Result<()> {
+    std::fs::rename(tombstone, table_dir)?;
+    if let Some(root) = tombstone.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
+fn cleanup_pending_table_drop(data_dir: &Path, db: &str, table: &str) -> Result<bool> {
+    let tombstone = data_dir.join(db).join(DROP_TOMBSTONE_DIR).join(table);
+    if !tombstone.exists() {
+        return Ok(false);
+    }
+    remove_staged_table_directory(&tombstone).map_err(|error| {
+        TaibaiError::Storage(format!(
+            "table '{}.{}' is absent from the catalog, but pending physical cleanup for '{}' failed: {}",
+            db,
+            table,
+            tombstone.display(),
+            error
+        ))
+    })?;
+    if let Some(root) = tombstone.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(true)
+}
+
+fn stage_database_directory(data_dir: &Path, name: &str) -> io::Result<Option<std::path::PathBuf>> {
+    let database_dir = data_dir.join(name);
+    let metadata = match std::fs::metadata(&database_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "database path '{}' is not a directory",
+                database_dir.display()
+            ),
+        ));
+    }
+    let root = data_dir.join(DATABASE_DROP_TOMBSTONE_DIR);
+    std::fs::create_dir_all(&root)?;
+    let tombstone = root.join(name);
+    if tombstone.exists() {
+        remove_dir_all_with_retry(&tombstone)?;
+    }
+    std::fs::rename(&database_dir, &tombstone)?;
+    Ok(Some(tombstone))
+}
+
+fn restore_staged_database_directory(tombstone: &Path, database_dir: &Path) -> io::Result<()> {
+    std::fs::rename(tombstone, database_dir)?;
+    if let Some(root) = tombstone.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
+fn write_before_meta(operation_dir: &Path, table_meta: &TableMeta) -> Result<()> {
+    std::fs::create_dir_all(operation_dir)?;
+    let data = serde_json::to_vec_pretty(table_meta).map_err(|error| {
+        TaibaiError::Storage(format!("failed to serialize DDL journal: {error}"))
+    })?;
+    std::fs::write(operation_dir.join(BEFORE_META_FILE), data)?;
+    Ok(())
+}
+
+fn read_before_meta(operation_dir: &Path) -> Result<TableMeta> {
+    let data = std::fs::read(operation_dir.join(BEFORE_META_FILE))?;
+    serde_json::from_slice(&data)
+        .map_err(|error| TaibaiError::Storage(format!("failed to parse DDL journal: {error}")))
+}
+
+fn table_meta_matches(left: &TableMeta, right: &TableMeta) -> Result<bool> {
+    let left = serde_json::to_vec(left).map_err(|error| {
+        TaibaiError::Storage(format!("failed to compare table metadata: {error}"))
+    })?;
+    let right = serde_json::to_vec(right).map_err(|error| {
+        TaibaiError::Storage(format!("failed to compare table metadata: {error}"))
+    })?;
+    Ok(left == right)
+}
+
+fn mark_operation_committed(operation_dir: &Path) -> Result<()> {
+    std::fs::write(operation_dir.join(COMMITTED_FILE), b"committed")?;
+    Ok(())
+}
+
+fn rollback_staged_table_data(operation_dir: &Path, table_dir: &Path) -> Result<()> {
+    let staged_data = operation_dir.join(STAGED_DATA_DIR);
+    if staged_data.exists() {
+        if table_dir.exists() {
+            return Err(TaibaiError::Storage(format!(
+                "cannot restore staged table data '{}' because '{}' already exists",
+                staged_data.display(),
+                table_dir.display()
+            )));
+        }
+        std::fs::rename(&staged_data, table_dir)?;
+    }
+    let fresh_data = operation_dir.join(FRESH_DATA_DIR);
+    if fresh_data.exists() {
+        remove_dir_all_with_retry(&fresh_data)?;
+    }
+    let _ = std::fs::remove_file(operation_dir.join(BEFORE_META_FILE));
+    let _ = std::fs::remove_dir(operation_dir);
+    if let Some(root) = operation_dir.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
+fn restore_partition_files(operation_dir: &Path, table_dir: &Path) -> Result<()> {
+    let staged_data = operation_dir.join(STAGED_DATA_DIR);
+    if staged_data.exists() {
+        std::fs::create_dir_all(table_dir)?;
+        for entry in std::fs::read_dir(&staged_data)? {
+            let entry = entry?;
+            let destination = table_dir.join(entry.file_name());
+            if destination.exists() {
+                return Err(TaibaiError::Storage(format!(
+                    "cannot restore staged partition file '{}' because '{}' already exists",
+                    entry.path().display(),
+                    destination.display()
+                )));
+            }
+            std::fs::rename(entry.path(), destination)?;
+        }
+        let _ = std::fs::remove_dir(&staged_data);
+    }
+    let _ = std::fs::remove_file(operation_dir.join(BEFORE_META_FILE));
+    let _ = std::fs::remove_dir(operation_dir);
+    if let Some(root) = operation_dir.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
+fn stage_partition_files(
+    operation_dir: &Path,
+    table_dir: &Path,
+    partition_key: &str,
+) -> Result<()> {
+    let staged_data = operation_dir.join(STAGED_DATA_DIR);
+    std::fs::create_dir_all(&staged_data)?;
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    if table_dir.exists() {
+        for entry in std::fs::read_dir(table_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if !file_name.ends_with(".dat")
+                || crate::storage::partition::parse_partition_key(&file_name).as_deref()
+                    != Some(partition_key)
+            {
+                continue;
+            }
+            for candidate in [
+                path.clone(),
+                crate::storage::segment::meta::sidecar_meta_path(&path),
+                path.with_extension("meta"),
+            ] {
+                if candidate.exists() && seen.insert(candidate.clone()) {
+                    paths.push(candidate);
+                }
+            }
+        }
+    }
+
+    for path in paths {
+        let destination = staged_data.join(path.file_name().ok_or_else(|| {
+            TaibaiError::Storage(format!(
+                "partition file '{}' has no file name",
+                path.display()
+            ))
+        })?);
+        if let Err(error) = std::fs::rename(&path, &destination) {
+            restore_partition_files(operation_dir, table_dir)?;
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn recover_table_data_tombstones(
+    data_dir: &Path,
+    catalogs: &HashMap<String, DatabaseCatalog>,
+) -> Result<()> {
+    for (database_name, catalog) in catalogs {
+        let database_dir = data_dir.join(database_name);
+        for root_name in [TRUNCATE_TOMBSTONE_DIR, PARTITION_TOMBSTONE_DIR] {
+            let root = database_dir.join(root_name);
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let operation_dir = entry.path();
+                let table_name = entry.file_name().to_string_lossy().to_string();
+                let Some(current_meta) = catalog.get_table(&table_name) else {
+                    if let Err(error) = remove_dir_all_with_retry(&operation_dir) {
+                        tracing::warn!(path = %operation_dir.display(), error = %error, "failed to clean orphaned DDL tombstone");
+                    }
+                    continue;
+                };
+                let table_dir = database_dir.join(&table_name);
+                let before_meta_path = operation_dir.join(BEFORE_META_FILE);
+                if !before_meta_path.exists() {
+                    // The journal is written before any data is staged and is
+                    // only removed during rollback or committed cleanup. A
+                    // surviving operation directory without it is therefore a
+                    // partially cleaned committed operation.
+                    if root_name == TRUNCATE_TOMBSTONE_DIR && !table_dir.exists() {
+                        let fresh = operation_dir.join(FRESH_DATA_DIR);
+                        if fresh.exists() {
+                            std::fs::rename(&fresh, &table_dir)?;
+                        } else {
+                            std::fs::create_dir_all(&table_dir)?;
+                        }
+                    }
+                    if let Err(error) = remove_dir_all_with_retry(&operation_dir) {
+                        tracing::warn!(path = %operation_dir.display(), error = %error, "failed to finish partial committed DDL cleanup");
+                    }
+                    continue;
+                }
+                let before_meta = read_before_meta(&operation_dir)?;
+                let committed = operation_dir.join(COMMITTED_FILE).exists()
+                    || !table_meta_matches(current_meta, &before_meta)?;
+                if !committed {
+                    if root_name == TRUNCATE_TOMBSTONE_DIR {
+                        rollback_staged_table_data(&operation_dir, &table_dir)?;
+                    } else {
+                        restore_partition_files(&operation_dir, &table_dir)?;
+                    }
+                    tracing::info!(database = %database_name, table = %table_name, "rolled back interrupted DDL operation");
+                } else {
+                    if root_name == TRUNCATE_TOMBSTONE_DIR && !table_dir.exists() {
+                        let fresh = operation_dir.join(FRESH_DATA_DIR);
+                        if fresh.exists() {
+                            std::fs::rename(&fresh, &table_dir)?;
+                        } else {
+                            std::fs::create_dir_all(&table_dir)?;
+                        }
+                    }
+                    if let Err(error) = remove_dir_all_with_retry(&operation_dir) {
+                        tracing::warn!(path = %operation_dir.display(), error = %error, "failed to clean committed DDL tombstone");
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&root);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn recover_rename_tombstones(
+    data_dir: &Path,
+    catalogs: &HashMap<String, DatabaseCatalog>,
+) -> Result<()> {
+    for (database_name, catalog) in catalogs {
+        let database_dir = data_dir.join(database_name);
+        let root = database_dir.join(RENAME_TOMBSTONE_DIR);
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let operation_dir = entry.path();
+            let old_name = entry.file_name().to_string_lossy().to_string();
+            let new_name = std::fs::read_to_string(operation_dir.join(RENAME_TARGET_FILE))?;
+            let old_dir = database_dir.join(&old_name);
+            let new_dir = database_dir.join(&new_name);
+            if catalog.get_table(&old_name).is_some() && catalog.get_table(&new_name).is_none() {
+                if !old_dir.exists() && new_dir.exists() {
+                    std::fs::rename(&new_dir, &old_dir).map_err(|error| {
+                        TaibaiError::Storage(format!(
+                            "failed to roll back interrupted rename '{}.{}' to '{}': {}",
+                            database_name, old_name, new_name, error
+                        ))
+                    })?;
+                }
+                if !old_dir.exists() {
+                    return Err(TaibaiError::Storage(format!(
+                        "cannot recover interrupted rename '{}.{}': neither '{}' nor '{}' exists",
+                        database_name,
+                        old_name,
+                        old_dir.display(),
+                        new_dir.display()
+                    )));
+                }
+            } else if catalog.get_table(&new_name).is_some() && !new_dir.exists() {
+                if old_dir.exists() {
+                    std::fs::rename(&old_dir, &new_dir)?;
+                } else {
+                    return Err(TaibaiError::Storage(format!(
+                        "cannot finish committed rename '{}.{}': data directory '{}' is missing",
+                        database_name,
+                        new_name,
+                        new_dir.display()
+                    )));
+                }
+            }
+            remove_dir_all_with_retry(&operation_dir)?;
+        }
+        let _ = std::fs::remove_dir(&root);
+    }
+    Ok(())
+}
+
+pub(super) fn recover_database_drop_tombstones(data_dir: &Path) -> Result<()> {
+    let root = data_dir.join(DATABASE_DROP_TOMBSTONE_DIR);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let meta_dir = data_dir.join("meta");
+    for entry in entries {
+        let entry = entry?;
+        let tombstone = entry.path();
+        let database_name = entry.file_name().to_string_lossy().to_string();
+        let database_dir = data_dir.join(&database_name);
+        let catalog_file = DatabaseCatalog::catalog_path(&meta_dir, &database_name);
+        if catalog_file.exists() && !database_dir.exists() {
+            restore_staged_database_directory(&tombstone, &database_dir).map_err(|error| {
+                TaibaiError::Storage(format!(
+                    "failed to restore database '{}' from interrupted DROP at '{}': {}",
+                    database_name,
+                    tombstone.display(),
+                    error
+                ))
+            })?;
+            tracing::info!(database = %database_name, "restored database directory from interrupted drop");
+        } else if let Err(error) = remove_dir_all_with_retry(&tombstone) {
+            tracing::warn!(
+                database = %database_name,
+                path = %tombstone.display(),
+                error = %error,
+                "failed to clean committed database drop tombstone"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir(&root);
+    Ok(())
+}
+
+/// Recover a DROP interrupted on either side of the durable catalog update.
+/// A table still present in the catalog is restored; a committed DROP is cleaned.
+pub(super) fn recover_drop_tombstones(
+    data_dir: &Path,
+    catalogs: &HashMap<String, DatabaseCatalog>,
+) -> Result<()> {
+    let Ok(databases) = std::fs::read_dir(data_dir) else {
+        return Ok(());
+    };
+    for database in databases.flatten() {
+        if !database
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let database_name = database.file_name();
+        if database_name == "meta" || database_name == "wal" {
+            continue;
+        }
+        let database_name = database_name.to_string_lossy();
+        let database_dir = database.path();
+        let tombstone_root = database_dir.join(DROP_TOMBSTONE_DIR);
+        let Some(catalog) = catalogs.get(database_name.as_ref()) else {
+            tracing::warn!(
+                database = %database_name,
+                path = %tombstone_root.display(),
+                "skipping drop recovery because the database catalog is unavailable"
+            );
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&tombstone_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let table_name = entry.file_name().to_string_lossy().to_string();
+            let table_is_cataloged = catalog.get_table(&table_name).is_some();
+            let table_dir = database_dir.join(&table_name);
+            if table_is_cataloged {
+                if table_dir.exists() && !table_dir.is_dir() {
+                    return Err(TaibaiError::Storage(format!(
+                        "cannot recover table '{}.{}': cataloged table path '{}' is not a directory",
+                        database_name,
+                        table_name,
+                        table_dir.display()
+                    )));
+                }
+                if !table_dir.exists() {
+                    match restore_staged_table_directory(&path, &table_dir) {
+                        Ok(()) => tracing::info!(
+                            database = %database_name,
+                            table = %table_name,
+                            path = %table_dir.display(),
+                            "restored table directory from interrupted drop"
+                        ),
+                        Err(error) => {
+                            return Err(TaibaiError::Storage(format!(
+                                "failed to restore table '{}.{}' from interrupted DROP at '{}': {}",
+                                database_name,
+                                table_name,
+                                path.display(),
+                                error
+                            )))
+                        }
+                    }
+                } else if let Err(error) = remove_dir_all_with_retry(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to remove stale drop tombstone"
+                    );
+                }
+            } else {
+                match remove_dir_all_with_retry(&path) {
+                    Ok(()) => {
+                        tracing::info!(path = %path.display(), "removed stale drop tombstone")
+                    }
+                    Err(error) => tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to remove stale drop tombstone"
+                    ),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&tombstone_root);
+    }
+    Ok(())
+}
 
 fn validate_hot_def(col_defs: &[ColumnDef], table: &str, hot_def: &HotDef) -> Result<()> {
     let time_col = col_defs
@@ -445,68 +1031,39 @@ pub fn exec_drop_table(
 ) -> Result<ExecResult> {
     let total_start = Instant::now();
     tracing::info!(db, table = name, "drop table: start");
-
-    {
-        let stage_start = Instant::now();
-        let mut catalogs = engine.catalogs().write().unwrap();
-        tracing::info!(
-            db,
-            table = name,
-            elapsed_ms = stage_start.elapsed().as_millis(),
-            "drop table: acquired catalog write lock"
-        );
-
-        let catalog = get_existing_catalog(&mut catalogs, db)?;
-
-        if catalog.get_table(name).is_none() {
-            if if_exists {
-                tracing::info!(
-                    db,
-                    table = name,
-                    total_elapsed_ms = total_start.elapsed().as_millis(),
-                    "drop table: table missing, if exists ignored"
-                );
-                return Ok(ExecResult::Ok { rows_affected: 0 });
-            }
+    let table_dir = engine.data_dir().join(db).join(name);
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let catalog = get_existing_catalog(&mut catalogs, db)?;
+    let table_meta = match catalog.get_table(name) {
+        Some(table_meta) => table_meta.clone(),
+        None if cleanup_pending_table_drop(engine.data_dir(), db, name)? => {
+            tracing::info!(
+                db,
+                table = name,
+                "drop table: completed pending physical cleanup"
+            );
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
+        None if if_exists => {
+            tracing::info!(
+                db,
+                table = name,
+                total_elapsed_ms = total_start.elapsed().as_millis(),
+                "drop table: table missing, if exists ignored"
+            );
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
+        None => {
             return Err(TaibaiError::Sql(format!(
                 "table '{}.{}' does not exist",
                 db, name
-            )));
+            )))
         }
+    };
 
-        let stage_start = Instant::now();
-        catalog.drop_table(name)?;
-        engine.auto_increment_manager().unregister(db, name);
-        engine.index_manager().remove_index(db, name);
-        tracing::info!(
-            db,
-            table = name,
-            elapsed_ms = stage_start.elapsed().as_millis(),
-            "drop table: removed metadata managers"
-        );
-
-        let meta_dir = engine.data_dir().join("meta");
-        let stage_start = Instant::now();
-        catalog.save(&meta_dir)?;
-        tracing::info!(
-            db,
-            table = name,
-            elapsed_ms = stage_start.elapsed().as_millis(),
-            total_elapsed_ms = total_start.elapsed().as_millis(),
-            "drop table: saved catalog"
-        );
-    }
-    tracing::info!(
-        db,
-        table = name,
-        total_elapsed_ms = total_start.elapsed().as_millis(),
-        "drop table: released catalog write lock"
-    );
-
-    let table_dir = engine.data_dir().join(db).join(name);
     tracing::info!(db, table = name, path = %table_dir.display(), "drop table: waiting for table mutation lock");
     let stage_start = Instant::now();
-    engine
+    let tombstone = engine
         .segment_mgr()
         .with_table_mutation_lock(db, name, || {
             tracing::info!(db, table = name, elapsed_ms = stage_start.elapsed().as_millis(), "drop table: acquired table mutation lock");
@@ -524,6 +1081,36 @@ pub fn exec_drop_table(
             tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: invalidated readers");
 
             let step_start = Instant::now();
+            tracing::info!(db, table = name, path = %table_dir.display(), "drop table: staging table directory");
+            let tombstone = stage_table_directory(&table_dir).map_err(|error| {
+                tracing::error!(db, table = name, path = %table_dir.display(), error = %error, elapsed_ms = step_start.elapsed().as_millis(), "drop table: failed to stage table directory");
+                error
+            })?;
+            tracing::info!(db, table = name, path = %table_dir.display(), elapsed_ms = step_start.elapsed().as_millis(), "drop table: staged table directory");
+
+            catalog.drop_table(name)?;
+            let meta_dir = engine.data_dir().join("meta");
+            if let Err(save_error) = catalog.save(&meta_dir) {
+                catalog.tables.insert(name.to_string(), table_meta.clone());
+                if let Some(tombstone) = tombstone.as_deref() {
+                    if let Err(restore_error) =
+                        restore_staged_table_directory(tombstone, &table_dir)
+                    {
+                        return Err(TaibaiError::Storage(format!(
+                            "failed to save catalog after staging table '{}.{}': {}; additionally failed to restore '{}' to '{}': {}",
+                            db,
+                            name,
+                            save_error,
+                            tombstone.display(),
+                            table_dir.display(),
+                            restore_error
+                        )));
+                    }
+                }
+                return Err(save_error);
+            }
+
+            let step_start = Instant::now();
             engine.hot_store_manager().remove(db, name);
             tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed resident hot store");
 
@@ -531,19 +1118,59 @@ pub fn exec_drop_table(
             let cleared_rows = engine.batch_writer().clear_memtables(db, name);
             tracing::info!(db, table = name, cleared_rows, elapsed_ms = step_start.elapsed().as_millis(), "drop table: cleared memtables");
 
-            if table_dir.exists() {
-                let step_start = Instant::now();
-                tracing::info!(db, table = name, path = %table_dir.display(), "drop table: removing table directory");
-                std::fs::remove_dir_all(&table_dir).map_err(|err| {
-                    tracing::error!(db, table = name, path = %table_dir.display(), error = %err, elapsed_ms = step_start.elapsed().as_millis(), "drop table: failed to remove table directory");
-                    err
-                })?;
-                tracing::info!(db, table = name, path = %table_dir.display(), elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table directory");
-            } else {
-                tracing::info!(db, table = name, path = %table_dir.display(), "drop table: table directory missing");
-            }
-            Ok(())
+            Ok(tombstone)
         })?;
+    drop(catalogs);
+
+    engine.auto_increment_manager().unregister(db, name);
+    engine.index_manager().remove_index(db, name);
+    let unique_index_names = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    engine
+        .index_manager()
+        .remove_table_unique_index_snapshots(db, name, &unique_index_names);
+
+    let mut cleanup_error = None;
+    if let Some(tombstone) = tombstone {
+        let step_start = Instant::now();
+        tracing::info!(db, table = name, path = %tombstone.display(), "drop table: removing staged table directory");
+        if let Err(error) = remove_staged_table_directory(&tombstone) {
+            tracing::warn!(
+                db,
+                table = name,
+                path = %tombstone.display(),
+                error = %error,
+                elapsed_ms = step_start.elapsed().as_millis(),
+                "drop table: logical drop committed; staged directory cleanup deferred"
+            );
+            cleanup_error = Some(TaibaiError::Storage(format!(
+                "table '{}.{}' was removed from the catalog, but physical data cleanup failed for '{}': {}; cleanup will be retried when the engine restarts",
+                db,
+                name,
+                tombstone.display(),
+                error
+            )));
+        } else {
+            tracing::info!(db, table = name, path = %tombstone.display(), elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed staged table directory");
+            if let Some(root) = tombstone.parent() {
+                let _ = std::fs::remove_dir(root);
+            }
+        }
+    }
+
+    tracing::info!(
+        db,
+        table = name,
+        total_elapsed_ms = total_start.elapsed().as_millis(),
+        "drop table: saved catalog and removed metadata managers"
+    );
+
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
 
     tracing::info!(
         db,
@@ -555,12 +1182,265 @@ pub fn exec_drop_table(
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
+fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> Result<ExecResult> {
+    engine.batch_writer().flush_table(db, name)?;
+    engine.batch_writer().memtable_manager().remove_flushed();
+
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let catalog = get_existing_catalog(&mut catalogs, db)?;
+    if catalog.get_table(name).is_none() {
+        return Err(TaibaiError::Sql(format!(
+            "table '{}.{}' does not exist",
+            db, name
+        )));
+    }
+    if catalog.get_table(new_name).is_some() {
+        return Err(TaibaiError::Sql(format!(
+            "table '{}.{}' already exists",
+            db, new_name
+        )));
+    }
+
+    let catalog_before = catalog.clone();
+    let old_table_dir = engine.data_dir().join(db).join(name);
+    let new_table_dir = engine.data_dir().join(db).join(new_name);
+    let operation_dir = engine
+        .data_dir()
+        .join(db)
+        .join(RENAME_TOMBSTONE_DIR)
+        .join(name);
+    if operation_dir.exists() {
+        return Err(TaibaiError::Storage(format!(
+            "table '{}.{}' has a pending rename recovery at '{}'",
+            db,
+            name,
+            operation_dir.display()
+        )));
+    }
+    engine
+        .segment_mgr()
+        .with_table_mutation_lock(db, name, || {
+            if new_table_dir.exists() {
+                return Err(TaibaiError::Storage(format!(
+                    "cannot rename table '{}.{}': destination directory '{}' already exists",
+                    db,
+                    name,
+                    new_table_dir.display()
+                )));
+            }
+            engine.segment_mgr().remove_wal(&old_table_dir);
+            engine.segment_mgr().remove_table_state(db, name);
+            engine.segment_mgr().invalidate_readers_under(&old_table_dir);
+
+            std::fs::create_dir_all(&operation_dir)?;
+            std::fs::write(operation_dir.join(RENAME_TARGET_FILE), new_name.as_bytes())?;
+
+            let renamed = if old_table_dir.exists() {
+                std::fs::rename(&old_table_dir, &new_table_dir)?;
+                true
+            } else {
+                false
+            };
+            catalog.rename_table(name, new_name)?;
+            let meta_dir = engine.data_dir().join("meta");
+            if let Err(error) = catalog.save(&meta_dir) {
+                *catalog = catalog_before.clone();
+                if renamed {
+                    std::fs::rename(&new_table_dir, &old_table_dir).map_err(|restore_error| {
+                        TaibaiError::Storage(format!(
+                            "failed to persist rename of table '{}.{}': {}; additionally failed to restore directory '{}': {}",
+                            db,
+                            name,
+                            error,
+                            old_table_dir.display(),
+                            restore_error
+                        ))
+                    })?;
+                }
+                let _ = remove_dir_all_with_retry(&operation_dir);
+                return Err(error);
+            }
+            Ok(())
+        })?;
+
+    engine
+        .auto_increment_manager()
+        .rename_table(db, name, new_name);
+    engine.index_manager().rename_index(db, name, new_name);
+    let unique_index_names = catalog_before
+        .get_table(name)
+        .map(|meta| {
+            meta.unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    engine
+        .index_manager()
+        .remove_table_unique_index_snapshots(db, name, &unique_index_names);
+    engine
+        .index_manager()
+        .remove_table_unique_index_snapshots(db, new_name, &unique_index_names);
+    engine.hot_store_manager().remove(db, name);
+    if let Err(error) = remove_dir_all_with_retry(&operation_dir) {
+        tracing::warn!(
+            database = db,
+            table = name,
+            path = %operation_dir.display(),
+            error = %error,
+            "rename committed but recovery journal cleanup was deferred"
+        );
+    }
+    if let Some(root) = operation_dir.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
+fn exec_partition_change(
+    engine: &Engine,
+    db: &str,
+    name: &str,
+    partition_key: &str,
+    drop_partition: bool,
+) -> Result<ExecResult> {
+    engine.batch_writer().flush_table(db, name)?;
+    engine.batch_writer().memtable_manager().remove_flushed();
+
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let catalog = get_existing_catalog(&mut catalogs, db)?;
+    let before_meta = catalog
+        .get_table(name)
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name)))?
+        .clone();
+    let table_dir = engine.data_dir().join(db).join(name);
+    let operation_dir = engine
+        .data_dir()
+        .join(db)
+        .join(PARTITION_TOMBSTONE_DIR)
+        .join(name);
+    if operation_dir.exists() {
+        return Err(TaibaiError::Storage(format!(
+            "table '{}.{}' has a pending partition recovery at '{}'",
+            db,
+            name,
+            operation_dir.display()
+        )));
+    }
+
+    let operation_dir = engine
+        .segment_mgr()
+        .with_table_mutation_lock(db, name, || {
+            engine.segment_mgr().remove_wal(&table_dir);
+            engine.segment_mgr().remove_table_state(db, name);
+            engine.segment_mgr().invalidate_readers_under(&table_dir);
+            write_before_meta(&operation_dir, &before_meta)?;
+            stage_partition_files(&operation_dir, &table_dir, partition_key)?;
+
+            if let Some(meta) = catalog.get_table_mut(name) {
+                if drop_partition {
+                    if let Some(partition) = meta
+                        .partitions
+                        .iter()
+                        .find(|part| part.key == partition_key)
+                    {
+                        meta.row_count -= partition.row_count;
+                        meta.segment_count -= partition.segment_count;
+                    }
+                    meta.partitions.retain(|part| part.key != partition_key);
+                } else if let Some(partition) = meta
+                    .partitions
+                    .iter_mut()
+                    .find(|part| part.key == partition_key)
+                {
+                    meta.row_count -= partition.row_count;
+                    meta.segment_count -= partition.segment_count;
+                    partition.row_count = 0;
+                    partition.segment_count = 0;
+                }
+            }
+
+            let meta_dir = engine.data_dir().join("meta");
+            if let Err(error) = catalog.save(&meta_dir) {
+                catalog.tables.insert(name.to_string(), before_meta.clone());
+                restore_partition_files(&operation_dir, &table_dir)?;
+                return Err(error);
+            }
+            mark_operation_committed(&operation_dir)?;
+            engine.hot_store_manager().remove(db, name);
+            engine.index_manager().mark_index_stale(db, name);
+            let unique_index_names = before_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            engine.index_manager().remove_table_unique_index_snapshots(
+                db,
+                name,
+                &unique_index_names,
+            );
+            Ok(operation_dir.clone())
+        })?;
+    drop(catalogs);
+
+    if let Err(error) = remove_committed_operation_directory(&operation_dir) {
+        let operation = if drop_partition {
+            "DROP PARTITION"
+        } else {
+            "TRUNCATE PARTITION"
+        };
+        return Err(TaibaiError::Storage(format!(
+            "{} for '{}.{}' committed, but cleanup of staged partition data at '{}' failed: {}; cleanup will be retried when the engine restarts",
+            operation,
+            db,
+            name,
+            operation_dir.display(),
+            error
+        )));
+    }
+    if let Some(root) = operation_dir.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
 pub fn exec_alter_table(
     engine: &Engine,
     db: &str,
     name: &str,
     operations: &[AlterOperation],
 ) -> Result<ExecResult> {
+    if operations.len() != 1
+        && operations.iter().any(|operation| {
+            matches!(
+                operation,
+                AlterOperation::RenameTable { .. }
+                    | AlterOperation::DropPartition { .. }
+                    | AlterOperation::TruncatePartition { .. }
+            )
+        })
+    {
+        return Err(TaibaiError::Sql(
+            "RENAME TABLE, DROP PARTITION, and TRUNCATE PARTITION must be executed as a single ALTER operation"
+                .into(),
+        ));
+    }
+    if let [operation] = operations {
+        match operation {
+            AlterOperation::RenameTable { new_name } => {
+                return exec_rename_table(engine, db, name, new_name)
+            }
+            AlterOperation::DropPartition { partition_key } => {
+                return exec_partition_change(engine, db, name, partition_key, true)
+            }
+            AlterOperation::TruncatePartition { partition_key } => {
+                return exec_partition_change(engine, db, name, partition_key, false)
+            }
+            _ => {}
+        }
+    }
+
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = catalogs
         .get_mut(db)
@@ -739,76 +1619,16 @@ pub fn exec_alter_table(
                 )?;
                 engine.persist_auto_increment_next_value(db, name, false)?;
             }
-            AlterOperation::RenameTable { new_name } => {
-                let old_table_dir = engine.data_dir().join(db).join(name);
-                let new_table_dir = engine.data_dir().join(db).join(new_name);
-                catalog.rename_table(name, new_name)?;
-                engine
-                    .auto_increment_manager()
-                    .rename_table(db, name, new_name);
-                engine.index_manager().rename_index(db, name, new_name);
-                engine.segment_mgr().rename_table_state(db, name, new_name);
-                if old_table_dir.exists() && !new_table_dir.exists() {
-                    std::fs::rename(&old_table_dir, &new_table_dir)?;
-                }
+            AlterOperation::RenameTable { new_name: _ } => {
+                unreachable!("filesystem ALTER operations are handled before generic ALTER")
             }
             AlterOperation::DropPartition { partition_key } => {
-                let table_dir = engine.data_dir().join(db).join(name);
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, || {
-                        if table_dir.exists() {
-                            for e in std::fs::read_dir(&table_dir)?.flatten() {
-                                let file_name = e.file_name().to_string_lossy().to_string();
-                                if file_name.starts_with(&format!("p{}", partition_key))
-                                    && file_name.ends_with(".dat")
-                                {
-                                    engine.segment_mgr().invalidate_reader(&e.path());
-                                    let _ = remove_sidecar_meta(&e.path());
-                                    let _ = std::fs::remove_file(e.path());
-                                }
-                            }
-                        }
-                        Ok(())
-                    })?;
-                if let Some(meta) = catalog.get_table_mut(name) {
-                    if let Some(part) = meta.partitions.iter().find(|p| p.key == *partition_key) {
-                        meta.row_count -= part.row_count;
-                        meta.segment_count -= part.segment_count;
-                    }
-                    meta.partitions.retain(|p| p.key != *partition_key);
-                }
-                engine.index_manager().mark_index_stale(db, name);
+                let _ = partition_key;
+                unreachable!("filesystem ALTER operations are handled before generic ALTER")
             }
             AlterOperation::TruncatePartition { partition_key } => {
-                let table_dir = engine.data_dir().join(db).join(name);
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, || {
-                        if table_dir.exists() {
-                            for e in std::fs::read_dir(&table_dir)?.flatten() {
-                                let file_name = e.file_name().to_string_lossy().to_string();
-                                if file_name.starts_with(&format!("p{}", partition_key))
-                                    && file_name.ends_with(".dat")
-                                {
-                                    engine.segment_mgr().invalidate_reader(&e.path());
-                                    let _ = remove_sidecar_meta(&e.path());
-                                    let _ = std::fs::remove_file(e.path());
-                                }
-                            }
-                        }
-                        Ok(())
-                    })?;
-                if let Some(meta) = catalog.get_table_mut(name) {
-                    if let Some(part) = meta.partitions.iter_mut().find(|p| p.key == *partition_key)
-                    {
-                        meta.row_count -= part.row_count;
-                        meta.segment_count -= part.segment_count;
-                        part.row_count = 0;
-                        part.segment_count = 0;
-                    }
-                }
-                engine.index_manager().mark_index_stale(db, name);
+                let _ = partition_key;
+                unreachable!("filesystem ALTER operations are handled before generic ALTER")
             }
             AlterOperation::SetTtl { ttl } => {
                 let meta = catalog.get_table_mut(name).ok_or_else(|| {
@@ -988,59 +1808,100 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
         .get_mut(db)
         .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
-    if catalog.get_table(table).is_none() {
-        return Err(TaibaiError::Sql(format!(
-            "table '{}.{}' does not exist",
-            db, table
+    let before_meta = catalog
+        .get_table(table)
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+        .clone();
+
+    let table_dir = engine.data_dir().join(db).join(table);
+    let operation_dir = engine
+        .data_dir()
+        .join(db)
+        .join(TRUNCATE_TOMBSTONE_DIR)
+        .join(table);
+    if operation_dir.exists() {
+        return Err(TaibaiError::Storage(format!(
+            "table '{}.{}' has a pending TRUNCATE recovery at '{}'",
+            db,
+            table,
+            operation_dir.display()
         )));
     }
 
-    let table_dir = engine.data_dir().join(db).join(table);
-    engine
+    let operation_dir = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
             engine.segment_mgr().remove_wal(&table_dir);
-            engine.batch_writer().clear_memtables(db, table);
             engine.segment_mgr().remove_table_state(db, table);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
-            engine.index_manager().clear_index(db, table);
 
-            let wal_dir = table_dir.join("wal");
-            if wal_dir.exists() {
-                let _ = std::fs::remove_dir_all(&wal_dir);
+            write_before_meta(&operation_dir, &before_meta)?;
+            let fresh_data = operation_dir.join(FRESH_DATA_DIR);
+            std::fs::create_dir_all(&fresh_data)?;
+            if table_dir.exists() {
+                std::fs::rename(&table_dir, operation_dir.join(STAGED_DATA_DIR))?;
             }
 
-            if table_dir.exists() {
-                for e in std::fs::read_dir(&table_dir)?.flatten() {
-                    let path = e.path();
-                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if (file_name.starts_with("seg_") || file_name.starts_with("p"))
-                        && file_name.ends_with(".dat")
-                    {
-                        let _ = remove_sidecar_meta(&path);
-                        let _ = std::fs::remove_file(&path);
-                    }
+            if let Some(meta) = catalog.get_table_mut(table) {
+                meta.reset_auto_increment_next_value();
+                meta.row_count = 0;
+                meta.segment_count = 0;
+                for part in &mut meta.partitions {
+                    part.row_count = 0;
+                    part.segment_count = 0;
                 }
             }
-            Ok(())
+            let meta_dir = engine.data_dir().join("meta");
+            if let Err(error) = catalog.save(&meta_dir) {
+                catalog
+                    .tables
+                    .insert(table.to_string(), before_meta.clone());
+                rollback_staged_table_data(&operation_dir, &table_dir)?;
+                return Err(error);
+            }
+            mark_operation_committed(&operation_dir)?;
+
+            if let Err(error) = std::fs::rename(&fresh_data, &table_dir) {
+                return Err(TaibaiError::Storage(format!(
+                    "TRUNCATE TABLE '{}.{}' committed, but failed to activate the empty table directory '{}': {}; restart will retry recovery",
+                    db,
+                    table,
+                    table_dir.display(),
+                    error
+                )));
+            }
+
+            engine.batch_writer().clear_memtables(db, table);
+            engine.hot_store_manager().remove(db, table);
+            engine.index_manager().clear_index(db, table);
+            let unique_index_names = before_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            engine
+                .index_manager()
+                .remove_table_unique_index_snapshots(db, table, &unique_index_names);
+            Ok(operation_dir.clone())
         })?;
 
     if engine.auto_increment_manager().get(db, table).is_some() {
         engine.auto_increment_manager().reset(db, table, 1)?;
     }
+    drop(catalogs);
 
-    if let Some(meta) = catalog.get_table_mut(table) {
-        meta.reset_auto_increment_next_value();
-        meta.row_count = 0;
-        meta.segment_count = 0;
-        for part in &mut meta.partitions {
-            part.row_count = 0;
-            part.segment_count = 0;
-        }
+    if let Err(error) = remove_committed_operation_directory(&operation_dir) {
+        return Err(TaibaiError::Storage(format!(
+            "TRUNCATE TABLE '{}.{}' committed, but cleanup of previous data at '{}' failed: {}; cleanup will be retried when the engine restarts",
+            db,
+            table,
+            operation_dir.display(),
+            error
+        )));
     }
-
-    let meta_dir = engine.data_dir().join("meta");
-    catalog.save(&meta_dir)?;
+    if let Some(root) = operation_dir.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
 
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
@@ -1077,6 +1938,24 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
     let mut catalogs = engine.catalogs().write().unwrap();
 
     if !catalogs.contains_key(name) {
+        let tombstone = engine
+            .data_dir()
+            .join(DATABASE_DROP_TOMBSTONE_DIR)
+            .join(name);
+        if tombstone.exists() {
+            remove_dir_all_with_retry(&tombstone).map_err(|error| {
+                TaibaiError::Storage(format!(
+                    "database '{}' is absent from the catalog, but pending physical cleanup for '{}' failed: {}",
+                    name,
+                    tombstone.display(),
+                    error
+                ))
+            })?;
+            if let Some(root) = tombstone.parent() {
+                let _ = std::fs::remove_dir(root);
+            }
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
         if if_exists {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
@@ -1090,35 +1969,93 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
         return Err(TaibaiError::Sql("cannot drop default database".into()));
     }
 
-    let table_names = catalogs
+    let table_indexes = catalogs
         .get(name)
         .map(|catalog| {
             catalog
-                .table_names()
-                .into_iter()
-                .map(str::to_string)
+                .tables
+                .iter()
+                .map(|(table_name, table_meta)| {
+                    (
+                        table_name.clone(),
+                        table_meta
+                            .unique_indexes
+                            .iter()
+                            .map(|index| index.name.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    catalogs.remove(name);
 
-    for table_name in &table_names {
-        engine.batch_writer().clear_memtables(name, table_name);
-    }
-    engine.auto_increment_manager().unregister_database(name);
-    engine.segment_mgr().remove_database_state(name);
-    engine.index_manager().remove_database_indexes(name);
-
-    let db_dir = engine.data_dir().join(name);
-    engine.segment_mgr().invalidate_readers_under(&db_dir);
-    if db_dir.exists() {
-        let _ = std::fs::remove_dir_all(&db_dir);
-    }
-
+    let table_names = table_indexes
+        .iter()
+        .map(|(table_name, _)| table_name.clone())
+        .collect::<Vec<_>>();
+    let database_dir = engine.data_dir().join(name);
     let meta_dir = engine.data_dir().join("meta");
     let catalog_file = DatabaseCatalog::catalog_path(&meta_dir, name);
-    if catalog_file.exists() {
-        let _ = std::fs::remove_file(&catalog_file);
+    let tombstone = engine.segment_mgr().with_database_mutation_locks(
+        name,
+        &table_names,
+        || {
+            engine.segment_mgr().invalidate_readers_under(&database_dir);
+            engine.segment_mgr().remove_database_state(name);
+            let tombstone =
+                stage_database_directory(engine.data_dir(), name).map_err(|error| {
+                    TaibaiError::Storage(format!(
+                        "failed to stage database '{}' for DROP: {}",
+                        name, error
+                    ))
+                })?;
+
+            if let Err(error) = remove_file_with_retry(&catalog_file) {
+                if let Some(tombstone) = tombstone.as_deref() {
+                    restore_staged_database_directory(tombstone, &database_dir).map_err(
+                        |restore_error| {
+                            TaibaiError::Storage(format!(
+                                "failed to remove catalog for database '{}': {}; additionally failed to restore '{}': {}",
+                                name,
+                                error,
+                                tombstone.display(),
+                                restore_error
+                            ))
+                        },
+                    )?;
+                }
+                return Err(error.into());
+            }
+
+            catalogs.remove(name);
+            Ok(tombstone)
+        },
+    )?;
+
+    for (table_name, unique_index_names) in &table_indexes {
+        engine.batch_writer().clear_memtables(name, table_name);
+        engine.index_manager().remove_table_unique_index_snapshots(
+            name,
+            table_name,
+            unique_index_names,
+        );
+    }
+    engine.auto_increment_manager().unregister_database(name);
+    engine.index_manager().remove_database_indexes(name);
+    drop(catalogs);
+
+    if let Some(tombstone) = tombstone {
+        if let Err(error) = remove_committed_operation_directory(&tombstone) {
+            return Err(TaibaiError::Storage(format!(
+                "database '{}' was removed from the catalog, but physical data cleanup failed for '{}': {}; cleanup will be retried when the engine restarts",
+                name,
+                tombstone.display(),
+                error
+            )));
+        }
+        if let Some(root) = tombstone.parent() {
+            let _ = std::fs::remove_dir(root);
+        }
     }
 
     Ok(ExecResult::Ok { rows_affected: 0 })
@@ -1847,4 +2784,630 @@ pub fn exec_optimize_table(
     Ok(ExecResult::Ok {
         rows_affected: stats.rows_written,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::session::Session;
+    use std::cell::Cell;
+    use std::sync::{Arc, Barrier};
+    use tempfile::TempDir;
+
+    fn scalar_count(engine: &Engine, session: &mut Session, sql: &str) -> i64 {
+        match engine.execute(session, sql).expect("execute count query") {
+            ExecResult::Query { batches, .. } => match batches[0].scalar(0, 0) {
+                Some(ScalarValue::Int64(Some(value))) => value,
+                other => panic!("unexpected count value: {other:?}"),
+            },
+            other => panic!("unexpected count result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_retries_transient_errors_until_success() {
+        let attempts = Cell::new(0);
+        retry_delete("test delete", Path::new("test-path"), |_| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt < 3 {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "busy"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn delete_returns_error_after_retries_are_exhausted() {
+        let attempts = Cell::new(0);
+        let error = retry_delete("test delete", Path::new("test-path"), |_| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "busy"))
+        })
+        .unwrap_err();
+        assert_eq!(attempts.get(), FILE_DELETE_MAX_ATTEMPTS);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("failed after 5 attempt(s)"));
+    }
+
+    #[test]
+    fn delete_treats_not_found_as_success() {
+        let attempts = Cell::new(0);
+        retry_delete("test delete", Path::new("test-path"), |_| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+        })
+        .unwrap();
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn delete_does_not_retry_permanent_errors() {
+        let attempts = Cell::new(0);
+        let error = retry_delete("test delete", Path::new("test-path"), |_| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid"))
+        })
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn drop_table_staging_failure_keeps_catalog_entry() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(&mut session, "CREATE TABLE guarded_drop (id INT64)")
+            .expect("create table");
+        let table_dir = temp_dir.path().join("main").join("guarded_drop");
+        std::fs::remove_dir(&table_dir).expect("remove empty table directory");
+        std::fs::write(&table_dir, b"not a directory").expect("replace table path with a file");
+
+        let error = engine
+            .execute(&mut session, "DROP TABLE guarded_drop")
+            .expect_err("drop must fail before changing the catalog");
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "unexpected drop error: {error}"
+        );
+        assert!(engine.get_table_meta("main", "guarded_drop").is_some());
+
+        std::fs::remove_file(&table_dir).expect("remove invalid table path");
+        engine
+            .execute(&mut session, "DROP TABLE guarded_drop")
+            .expect("retry drop");
+        assert!(engine.get_table_meta("main", "guarded_drop").is_none());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn drop_table_removes_two_hundred_partition_files() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE partitioned_drop (id INT64) PARTITION BY id",
+            )
+            .expect("create partitioned table");
+        let database_dir = temp_dir.path().join("main");
+        let table_dir = database_dir.join("partitioned_drop");
+        for partition in 0..200 {
+            let path = table_dir.join(format!("p{partition}_0001.dat"));
+            std::fs::write(path, partition.to_string()).expect("write partition fixture");
+        }
+
+        engine
+            .execute(&mut session, "DROP TABLE partitioned_drop")
+            .expect("drop partitioned table");
+        assert!(!table_dir.exists());
+        assert!(engine.get_table_meta("main", "partitioned_drop").is_none());
+        assert!(
+            !database_dir.join(DROP_TOMBSTONE_DIR).exists(),
+            "drop tombstone should be removed after a successful cleanup"
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn engine_startup_removes_interrupted_drop_tombstones() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let tombstone = temp_dir
+            .path()
+            .join("main")
+            .join(DROP_TOMBSTONE_DIR)
+            .join("interrupted");
+        std::fs::create_dir_all(&tombstone).expect("create tombstone");
+        std::fs::write(tombstone.join("p1_0001.dat"), b"stale").expect("write stale data");
+
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        assert!(!tombstone.exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn engine_startup_restores_uncommitted_drop_tombstone() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let table_dir = temp_dir.path().join("main").join("recover_me");
+        {
+            let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+            let mut session = Session::new("root".to_string(), "main".to_string());
+            engine
+                .execute(&mut session, "CREATE TABLE recover_me (id INT64)")
+                .expect("create table");
+            engine.segment_mgr().shutdown();
+        }
+
+        let tombstone = temp_dir
+            .path()
+            .join("main")
+            .join(DROP_TOMBSTONE_DIR)
+            .join("recover_me");
+        std::fs::create_dir_all(tombstone.parent().unwrap()).expect("create tombstone root");
+        std::fs::rename(&table_dir, &tombstone).expect("simulate crash after staging");
+
+        let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+        assert!(table_dir.exists());
+        assert!(!tombstone.exists());
+        assert!(engine.get_table_meta("main", "recover_me").is_some());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn drop_table_reports_committed_physical_cleanup_failure_to_client() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE cleanup_error (id INT64)")
+            .expect("create table");
+
+        FORCE_DROP_CLEANUP_FAILURE.with(|force| force.set(true));
+        let error = engine
+            .execute(&mut session, "DROP TABLE cleanup_error")
+            .expect_err("physical cleanup failure must reach the client");
+        let message = error.to_string();
+        assert!(
+            message.contains("was removed from the catalog"),
+            "{message}"
+        );
+        assert!(
+            message.contains("physical data cleanup failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("retried when the engine restarts"),
+            "{message}"
+        );
+        assert!(engine.get_table_meta("main", "cleanup_error").is_none());
+        assert!(temp_dir
+            .path()
+            .join("main")
+            .join(DROP_TOMBSTONE_DIR)
+            .join("cleanup_error")
+            .exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn drop_database_reports_cleanup_failure_and_retry_finishes_cleanup() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE DATABASE doomed")
+            .expect("create database");
+        engine
+            .execute(&mut session, "CREATE TABLE doomed.t (id INT64)")
+            .expect("create table");
+
+        FORCE_DDL_CLEANUP_FAILURE.with(|force| force.set(true));
+        let error = engine
+            .execute(&mut session, "DROP DATABASE doomed")
+            .expect_err("cleanup failure must reach client");
+        let message = error.to_string();
+        assert!(message.contains("removed from the catalog"), "{message}");
+        assert!(
+            message.contains("physical data cleanup failed"),
+            "{message}"
+        );
+        assert!(!engine.database_exists("doomed"));
+
+        engine
+            .execute(&mut session, "DROP DATABASE doomed")
+            .expect("retry pending cleanup");
+        assert!(!temp_dir.path().join(DATABASE_DROP_TOMBSTONE_DIR).exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn truncate_cleanup_failure_keeps_empty_table_and_is_recovered_on_restart() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        {
+            let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+            let mut session = Session::new("root".to_string(), "main".to_string());
+            engine
+                .execute(&mut session, "CREATE TABLE truncate_me (id INT64)")
+                .expect("create table");
+            engine
+                .execute(&mut session, "INSERT INTO truncate_me VALUES (1), (2)")
+                .expect("insert rows");
+
+            FORCE_DDL_CLEANUP_FAILURE.with(|force| force.set(true));
+            let error = engine
+                .execute(&mut session, "TRUNCATE TABLE truncate_me")
+                .expect_err("cleanup failure must reach client");
+            assert!(error.to_string().contains("TRUNCATE TABLE"));
+            assert_eq!(
+                scalar_count(&engine, &mut session, "SELECT COUNT(*) FROM truncate_me"),
+                0
+            );
+            assert!(temp_dir
+                .path()
+                .join("main")
+                .join(TRUNCATE_TOMBSTONE_DIR)
+                .join("truncate_me")
+                .exists());
+            engine.segment_mgr().shutdown();
+        }
+
+        let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        assert_eq!(
+            scalar_count(&engine, &mut session, "SELECT COUNT(*) FROM truncate_me"),
+            0
+        );
+        assert!(!temp_dir
+            .path()
+            .join("main")
+            .join(TRUNCATE_TOMBSTONE_DIR)
+            .exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn drop_partition_matches_exact_partition_key() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE partition_keys (id INT64) PARTITION BY id",
+            )
+            .expect("create table");
+        engine
+            .execute(&mut session, "INSERT INTO partition_keys VALUES (1), (10)")
+            .expect("insert partitions");
+        engine
+            .execute(&mut session, "FLUSH TABLE partition_keys")
+            .expect("flush table");
+
+        exec_partition_change(&engine, "main", "partition_keys", "1", true)
+            .expect("drop exact partition");
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM partition_keys WHERE id = 1"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM partition_keys WHERE id = 10"
+            ),
+            1
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn rename_destination_failure_keeps_old_catalog_and_directory() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE old_name (id INT64)")
+            .expect("create table");
+        let database_dir = temp_dir.path().join("main");
+        let destination = database_dir.join("new_name");
+        std::fs::create_dir_all(&destination).expect("create conflicting destination");
+
+        engine
+            .execute(&mut session, "ALTER TABLE old_name RENAME TO new_name")
+            .expect_err("rename must fail before catalog mutation");
+        assert!(engine.get_table_meta("main", "old_name").is_some());
+        assert!(engine.get_table_meta("main", "new_name").is_none());
+        assert!(database_dir.join("old_name").exists());
+
+        std::fs::remove_dir(&destination).expect("remove destination conflict");
+        engine
+            .execute(&mut session, "ALTER TABLE old_name RENAME TO new_name")
+            .expect("rename table");
+        assert!(engine.get_table_meta("main", "old_name").is_none());
+        assert!(engine.get_table_meta("main", "new_name").is_some());
+        assert!(destination.exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn engine_startup_rolls_back_uncommitted_rename() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        {
+            let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+            let mut session = Session::new("root".to_string(), "main".to_string());
+            engine
+                .execute(&mut session, "CREATE TABLE rename_old (id INT64)")
+                .expect("create table");
+            engine.segment_mgr().shutdown();
+        }
+        let database_dir = temp_dir.path().join("main");
+        let old_dir = database_dir.join("rename_old");
+        let new_dir = database_dir.join("rename_new");
+        let operation_dir = database_dir.join(RENAME_TOMBSTONE_DIR).join("rename_old");
+        std::fs::create_dir_all(&operation_dir).expect("create rename journal");
+        std::fs::write(operation_dir.join(RENAME_TARGET_FILE), b"rename_new")
+            .expect("write rename target");
+        std::fs::rename(&old_dir, &new_dir).expect("simulate directory rename");
+
+        let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+        assert!(old_dir.exists());
+        assert!(!new_dir.exists());
+        assert!(engine.get_table_meta("main", "rename_old").is_some());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn engine_startup_restores_uncommitted_database_drop() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        {
+            let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+            let mut session = Session::new("root".to_string(), "main".to_string());
+            engine
+                .execute(&mut session, "CREATE DATABASE recover_db")
+                .expect("create database");
+            engine.segment_mgr().shutdown();
+        }
+        let database_dir = temp_dir.path().join("recover_db");
+        let tombstone = temp_dir
+            .path()
+            .join(DATABASE_DROP_TOMBSTONE_DIR)
+            .join("recover_db");
+        std::fs::create_dir_all(tombstone.parent().unwrap()).expect("create database tombstones");
+        std::fs::rename(&database_dir, &tombstone).expect("simulate staged database drop");
+
+        let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+        assert!(database_dir.exists());
+        assert!(engine.database_exists("recover_db"));
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn engine_startup_rolls_back_uncommitted_truncate() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let table_dir = temp_dir.path().join("main").join("truncate_recovery");
+        let operation_dir = temp_dir
+            .path()
+            .join("main")
+            .join(TRUNCATE_TOMBSTONE_DIR)
+            .join("truncate_recovery");
+        {
+            let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+            let mut session = Session::new("root".to_string(), "main".to_string());
+            engine
+                .execute(&mut session, "CREATE TABLE truncate_recovery (id INT64)")
+                .expect("create table");
+            engine
+                .execute(&mut session, "INSERT INTO truncate_recovery VALUES (7)")
+                .expect("insert row");
+            engine
+                .execute(&mut session, "FLUSH TABLE truncate_recovery")
+                .expect("flush table");
+            let before_meta = engine
+                .get_table_meta("main", "truncate_recovery")
+                .expect("table metadata");
+            engine.segment_mgr().remove_wal(&table_dir);
+            engine
+                .segment_mgr()
+                .remove_table_state("main", "truncate_recovery");
+            engine.segment_mgr().invalidate_readers_under(&table_dir);
+            write_before_meta(&operation_dir, &before_meta).expect("write truncate journal");
+            std::fs::create_dir_all(operation_dir.join(FRESH_DATA_DIR)).expect("create fresh data");
+            std::fs::rename(&table_dir, operation_dir.join(STAGED_DATA_DIR))
+                .expect("stage old table data");
+            engine.segment_mgr().shutdown();
+        }
+
+        let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_recovery"
+            ),
+            1
+        );
+        assert!(!operation_dir.exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn engine_startup_rolls_back_uncommitted_partition_drop() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let before_meta;
+        {
+            let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+            let mut session = Session::new("root".to_string(), "main".to_string());
+            engine
+                .execute(
+                    &mut session,
+                    "CREATE TABLE partition_recovery (id INT64) PARTITION BY id",
+                )
+                .expect("create table");
+            engine
+                .execute(
+                    &mut session,
+                    "INSERT INTO partition_recovery VALUES (1), (2)",
+                )
+                .expect("insert partitions");
+            engine
+                .execute(&mut session, "FLUSH TABLE partition_recovery")
+                .expect("flush table");
+            before_meta = engine
+                .get_table_meta("main", "partition_recovery")
+                .expect("table metadata");
+            engine.segment_mgr().shutdown();
+        }
+
+        let table_dir = temp_dir.path().join("main").join("partition_recovery");
+        let operation_dir = temp_dir
+            .path()
+            .join("main")
+            .join(PARTITION_TOMBSTONE_DIR)
+            .join("partition_recovery");
+        write_before_meta(&operation_dir, &before_meta).expect("write partition journal");
+        stage_partition_files(&operation_dir, &table_dir, "1").expect("stage partition files");
+
+        let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM partition_recovery WHERE id = 1"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM partition_recovery WHERE id = 2"
+            ),
+            1
+        );
+        assert!(!operation_dir.exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn engine_startup_fails_when_cataloged_table_cannot_be_restored() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        {
+            let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+            let mut session = Session::new("root".to_string(), "main".to_string());
+            engine
+                .execute(&mut session, "CREATE TABLE blocked_restore (id INT64)")
+                .expect("create table");
+            engine.segment_mgr().shutdown();
+        }
+        let table_dir = temp_dir.path().join("main").join("blocked_restore");
+        let tombstone = temp_dir
+            .path()
+            .join("main")
+            .join(DROP_TOMBSTONE_DIR)
+            .join("blocked_restore");
+        std::fs::create_dir_all(tombstone.parent().unwrap()).expect("create tombstone root");
+        std::fs::rename(&table_dir, &tombstone).expect("stage table directory");
+        std::fs::write(&table_dir, b"blocks directory restore").expect("create conflicting file");
+
+        let error = match Engine::new(temp_dir.path(), "main") {
+            Ok(_) => panic!("engine startup should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("is not a directory"));
+        assert!(tombstone.exists());
+    }
+
+    #[test]
+    fn rename_and_truncate_invalidate_unique_index_snapshots() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE unique_ddl (id INT64 UNIQUE)")
+            .expect("create unique table");
+        engine
+            .execute(&mut session, "INSERT INTO unique_ddl VALUES (1)")
+            .expect("insert unique row");
+        engine
+            .execute(&mut session, "FLUSH TABLE unique_ddl")
+            .expect("flush table");
+        engine
+            .execute(&mut session, "REBUILD UNIQUE INDEX uk_id ON unique_ddl")
+            .expect("rebuild unique index");
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE unique_ddl RENAME TO unique_ddl_new",
+            )
+            .expect("rename unique table");
+        engine
+            .execute(&mut session, "INSERT INTO unique_ddl_new VALUES (1)")
+            .expect_err("duplicate must still be rejected after rename");
+
+        engine
+            .execute(&mut session, "TRUNCATE TABLE unique_ddl_new")
+            .expect("truncate unique table");
+        engine
+            .execute(&mut session, "INSERT INTO unique_ddl_new VALUES (1)")
+            .expect("truncated unique key can be reused");
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn concurrent_insert_cannot_recreate_dropped_table_directory() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Arc::new(Engine::new(temp_dir.path(), "main").expect("create engine"));
+        let mut setup = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut setup, "CREATE TABLE concurrent_drop (id INT64)")
+            .expect("create table");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_engine = Arc::clone(&engine);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            let mut session = Session::new("root".to_string(), "main".to_string());
+            writer_barrier.wait();
+            for value in 0..500 {
+                if writer_engine
+                    .execute(
+                        &mut session,
+                        &format!("INSERT INTO concurrent_drop VALUES ({value})"),
+                    )
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        barrier.wait();
+        engine
+            .execute(&mut setup, "DROP TABLE concurrent_drop")
+            .expect("drop table during inserts");
+        writer.join().expect("join writer");
+
+        assert!(engine.get_table_meta("main", "concurrent_drop").is_none());
+        assert!(!temp_dir
+            .path()
+            .join("main")
+            .join("concurrent_drop")
+            .exists());
+        engine.segment_mgr().shutdown();
+    }
 }

@@ -223,6 +223,7 @@ impl Engine {
         auto_compact_config: AutoCompactConfig,
         hot_store_memory_limit_bytes: u64,
     ) -> Result<Self> {
+        super::ddl::recover_database_drop_tombstones(data_dir)?;
         let mut catalogs = HashMap::new();
         let meta_dir = data_dir.join("meta");
 
@@ -251,7 +252,10 @@ impl Engine {
                 for db_entry in dbs.flatten() {
                     if db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         let db_name = db_entry.file_name().to_string_lossy().to_string();
-                        if db_name == "meta" || db_name == "wal" {
+                        if db_name == "meta"
+                            || db_name == "wal"
+                            || db_name == ".taibai-drop-databases"
+                        {
                             continue;
                         }
                         if let std::collections::hash_map::Entry::Vacant(e) =
@@ -272,6 +276,10 @@ impl Engine {
             let catalog = DatabaseCatalog::load_or_create(&meta_dir, default_database)?;
             catalogs.insert(default_database.to_string(), catalog);
         }
+
+        super::ddl::recover_drop_tombstones(data_dir, &catalogs)?;
+        super::ddl::recover_table_data_tombstones(data_dir, &catalogs)?;
+        super::ddl::recover_rename_tombstones(data_dir, &catalogs)?;
 
         let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
         SegmentManager::start_flush_thread(&segment_mgr);
