@@ -343,6 +343,43 @@ fn stage_partition_files(
     Ok(())
 }
 
+fn resolve_partition_key(
+    table_meta: &TableMeta,
+    table_dir: &Path,
+    requested_key: &str,
+) -> Result<Option<String>> {
+    let mut existing_keys = table_meta
+        .partitions
+        .iter()
+        .map(|partition| partition.key.clone())
+        .collect::<HashSet<_>>();
+
+    if table_dir.exists() {
+        for entry in std::fs::read_dir(table_dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if let Some(key) = crate::storage::partition::parse_partition_key(&file_name) {
+                existing_keys.insert(key);
+            }
+        }
+    }
+
+    if existing_keys.contains(requested_key) {
+        return Ok(Some(requested_key.to_string()));
+    }
+
+    let unprefixed_key = requested_key
+        .strip_prefix('p')
+        .or_else(|| requested_key.strip_prefix('P'));
+    if let Some(key) = unprefixed_key.filter(|key| !key.is_empty()) {
+        if existing_keys.contains(key) {
+            return Ok(Some(key.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
 pub(super) fn recover_table_data_tombstones(
     data_dir: &Path,
     catalogs: &HashMap<String, DatabaseCatalog>,
@@ -1332,11 +1369,18 @@ fn exec_partition_change(
     let operation_dir = engine
         .segment_mgr()
         .with_table_mutation_lock(db, name, || {
+            let partition_key = resolve_partition_key(&before_meta, &table_dir, partition_key)?
+                .ok_or_else(|| {
+                    TaibaiError::Sql(format!(
+                        "partition '{}' does not exist in table '{}.{}'",
+                        partition_key, db, name
+                    ))
+                })?;
             engine.segment_mgr().remove_wal(&table_dir);
             engine.segment_mgr().remove_table_state(db, name);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
             write_before_meta(&operation_dir, &before_meta)?;
-            stage_partition_files(&operation_dir, &table_dir, partition_key)?;
+            stage_partition_files(&operation_dir, &table_dir, &partition_key)?;
 
             if let Some(meta) = catalog.get_table_mut(name) {
                 if drop_partition {
@@ -2804,6 +2848,20 @@ mod tests {
         }
     }
 
+    fn partition_segment_exists(table_dir: &Path, partition_key: &str) -> bool {
+        std::fs::read_dir(table_dir)
+            .expect("read table directory")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(crate::storage::partition::parse_partition_key)
+                    .as_deref()
+                    == Some(partition_key)
+            })
+    }
+
     #[test]
     fn delete_retries_transient_errors_until_success() {
         let attempts = Cell::new(0);
@@ -3109,6 +3167,150 @@ mod tests {
             ),
             1
         );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn alter_table_drop_partition_accepts_storage_name_and_removes_files() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE drop_partition_sql (id INT64) PARTITION BY id",
+            )
+            .expect("create table");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO drop_partition_sql VALUES (1), (10)",
+            )
+            .expect("insert partitions");
+        engine
+            .execute(&mut session, "FLUSH TABLE drop_partition_sql")
+            .expect("flush table");
+
+        let table_dir = temp_dir.path().join("main").join("drop_partition_sql");
+        assert!(partition_segment_exists(&table_dir, "1"));
+        assert!(partition_segment_exists(&table_dir, "10"));
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE drop_partition_sql DROP PARTITION p1",
+            )
+            .expect("drop p-prefixed partition");
+
+        assert!(!partition_segment_exists(&table_dir, "1"));
+        assert!(partition_segment_exists(&table_dir, "10"));
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM drop_partition_sql WHERE id = 1"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM drop_partition_sql WHERE id = 10"
+            ),
+            1
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn alter_table_truncate_partition_accepts_storage_name_and_removes_files() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE truncate_partition_sql (id INT64) PARTITION BY id",
+            )
+            .expect("create table");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO truncate_partition_sql VALUES (1), (10)",
+            )
+            .expect("insert partitions");
+        engine
+            .execute(&mut session, "FLUSH TABLE truncate_partition_sql")
+            .expect("flush table");
+
+        let table_dir = temp_dir.path().join("main").join("truncate_partition_sql");
+        assert!(partition_segment_exists(&table_dir, "1"));
+        assert!(partition_segment_exists(&table_dir, "10"));
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE truncate_partition_sql TRUNCATE PARTITION p1",
+            )
+            .expect("truncate p-prefixed partition");
+
+        assert!(!partition_segment_exists(&table_dir, "1"));
+        assert!(partition_segment_exists(&table_dir, "10"));
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_sql WHERE id = 1"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_sql WHERE id = 10"
+            ),
+            1
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn alter_table_partition_change_rejects_unknown_partition() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE unknown_partition (id INT64) PARTITION BY id",
+            )
+            .expect("create table");
+        engine
+            .execute(&mut session, "INSERT INTO unknown_partition VALUES (1)")
+            .expect("insert partition");
+
+        let error = engine
+            .execute(
+                &mut session,
+                "ALTER TABLE unknown_partition DROP PARTITION p2",
+            )
+            .expect_err("unknown partition must fail");
+        assert!(error.to_string().contains("partition 'p2' does not exist"));
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM unknown_partition"
+            ),
+            1
+        );
+        assert!(!temp_dir
+            .path()
+            .join("main")
+            .join(PARTITION_TOMBSTONE_DIR)
+            .exists());
         engine.segment_mgr().shutdown();
     }
 
