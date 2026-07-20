@@ -254,6 +254,14 @@ impl BatchWriter {
         self.memtable_mgr.clear_table(db, table)
     }
 
+    pub fn clear_partition_memtables(&self, db: &str, table: &str, partition_key: &str) -> u64 {
+        self.memtable_mgr.clear_partition(db, table, partition_key)
+    }
+
+    pub fn rename_memtables(&self, db: &str, old_table: &str, new_table: &str) -> u64 {
+        self.memtable_mgr.rename_table(db, old_table, new_table)
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.sender.send(WriteCommand::Shutdown);
@@ -354,33 +362,30 @@ impl BatchWriter {
         let table = mt.table().to_string();
         let partition_key = mt.partition_key().to_string();
         let txn_id = mt.txn_id();
-        let table_dir = segment_mgr.table_dir(&db, &table);
-        std::fs::create_dir_all(&table_dir)?;
-
-        let write_result = (|| -> Result<()> {
-            if txn_id > 0 {
-                segment_mgr.write_txn_wal(&table_dir, txn_id, &batch)?;
+        let wrote = match segment_mgr.flush_memtable_batch_if(
+            &db,
+            &table,
+            &partition_key,
+            &batch,
+            txn_id,
+            || mt.state() == MemTableState::Flushing,
+            || {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            },
+        ) {
+            Ok(wrote) => wrote,
+            Err(e) => {
+                if mt.state() == MemTableState::Flushing {
+                    mt.set_state(MemTableState::Pending);
+                }
+                return Err(e);
             }
-
-            if partition_key.is_empty() {
-                segment_mgr.bulk_insert_batch_ref(&db, &table, &batch, true)?;
-            } else {
-                segment_mgr.bulk_insert_batch_with_partition_ref(
-                    &db,
-                    &table,
-                    &partition_key,
-                    &batch,
-                )?;
-            }
-
-            if txn_id > 0 {
-                segment_mgr.sync_table_wal(&table_dir)?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = write_result {
-            mt.set_state(MemTableState::Pending);
-            return Err(e);
+        };
+        if !wrote {
+            let _ = mt.take_batch();
+            mt.set_state(MemTableState::Flushed);
+            return Ok(());
         }
 
         tracing::debug!(
@@ -389,8 +394,6 @@ impl BatchWriter {
             txn_id,
             "memtable flushed to active segment"
         );
-        let _ = mt.take_batch();
-        mt.set_state(MemTableState::Flushed);
         Ok(())
     }
 }

@@ -328,6 +328,15 @@ impl MemTableManager {
             .collect()
     }
 
+    pub fn partition_keys(&self, db: &str, table: &str) -> Vec<String> {
+        let memtables = self.memtables.read().unwrap();
+        memtables
+            .iter()
+            .filter(|mt| mt.db() == db && mt.table() == table)
+            .map(|mt| mt.partition_key().to_string())
+            .collect()
+    }
+
     /// Drop memtables that have reached the `Archived` state for a table. Called
     /// at close-of-day after the data is safely archived to history segments.
     pub fn remove_archived(&self, db: &str, table: &str) {
@@ -400,12 +409,78 @@ impl MemTableManager {
         memtables.retain(|mt| {
             if mt.db() == db && mt.table() == table {
                 cleared += mt.row_count();
+                mt.set_state(MemTableState::Flushed);
+                let _ = mt.take_batch();
                 false
             } else {
                 true
             }
         });
         cleared
+    }
+
+    pub fn clear_partition(&self, db: &str, table: &str, partition_key: &str) -> u64 {
+        let mut memtables = self.memtables.write().unwrap();
+        let mut cleared = 0u64;
+        memtables.retain(|mt| {
+            if mt.db() == db && mt.table() == table && mt.partition_key() == partition_key {
+                cleared += mt.row_count();
+                mt.set_state(MemTableState::Flushed);
+                let _ = mt.take_batch();
+                false
+            } else {
+                true
+            }
+        });
+        cleared
+    }
+
+    pub fn rename_table(&self, db: &str, old_table: &str, new_table: &str) -> u64 {
+        let mut memtables = self.memtables.write().unwrap();
+        let mut replacements = Vec::new();
+        let mut renamed_rows = 0u64;
+        memtables.retain(|mt| {
+            if mt.db() != db || mt.table() != old_table {
+                return true;
+            }
+
+            let old_state = mt.state();
+            mt.set_state(MemTableState::Flushed);
+            let Some(batch) = mt.take_batch() else {
+                return false;
+            };
+            if batch.num_rows() == 0 || mt.visibility() == TxnVisibility::Aborted {
+                return false;
+            }
+
+            let replacement = match mt.visibility() {
+                TxnVisibility::Uncommitted(txn_id) => Arc::new(MemTable::with_txn(
+                    db.to_string(),
+                    new_table.to_string(),
+                    mt.partition_key().to_string(),
+                    batch.schema.clone(),
+                    txn_id,
+                )),
+                TxnVisibility::Committed => Arc::new(MemTable::new(
+                    db.to_string(),
+                    new_table.to_string(),
+                    mt.partition_key().to_string(),
+                    batch.schema.clone(),
+                )),
+                TxnVisibility::Aborted => unreachable!("aborted memtable handled above"),
+            };
+            renamed_rows += batch.num_rows() as u64;
+            replacement.restore_batch(batch);
+            replacement.set_state(if old_state == MemTableState::Archived {
+                MemTableState::Archived
+            } else {
+                MemTableState::Pending
+            });
+            replacements.push(replacement);
+            false
+        });
+        memtables.extend(replacements);
+        renamed_rows
     }
 
     pub fn rollback_txn(&self, txn_id: u64) -> u64 {

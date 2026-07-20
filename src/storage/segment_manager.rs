@@ -862,6 +862,60 @@ impl SegmentManager {
         let _mutation_guard = state.mutation_lock.lock().unwrap();
         ensure_state_not_retired(&state, db, table)?;
 
+        self.append_batch_with_partition_locked(
+            &table_dir,
+            &state,
+            partition_key,
+            batch,
+            flush_immediately,
+        )?;
+
+        Ok(row_count)
+    }
+
+    pub(crate) fn flush_memtable_batch_if(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: &RecordBatch,
+        txn_id: u64,
+        should_write: impl FnOnce() -> bool,
+        on_written: impl FnOnce(),
+    ) -> Result<bool> {
+        if batch.num_rows() == 0 {
+            return Ok(false);
+        }
+
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, table)?;
+        if !should_write() {
+            return Ok(false);
+        }
+
+        let table_dir = self.data_dir.join(db).join(table);
+        std::fs::create_dir_all(&table_dir)?;
+        if txn_id > 0 {
+            self.write_txn_wal(&table_dir, txn_id, batch)?;
+        }
+        self.append_batch_with_partition_locked(&table_dir, &state, partition_key, batch, true)?;
+        if txn_id > 0 {
+            self.sync_table_wal(&table_dir)?;
+        }
+        on_written();
+        Ok(true)
+    }
+
+    fn append_batch_with_partition_locked(
+        &self,
+        table_dir: &Path,
+        state: &TableSegmentState,
+        partition_key: &str,
+        batch: &RecordBatch,
+        flush_immediately: bool,
+    ) -> Result<()> {
         {
             let mut active_guard = state.active_segments.lock().unwrap();
             self.get_or_create_active_segment_for_partition_locked(
@@ -891,8 +945,7 @@ impl SegmentManager {
                 seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
             }
         }
-
-        Ok(row_count)
+        Ok(())
     }
 
     fn get_or_create_active_segment_for_partition_locked(
@@ -1692,6 +1745,7 @@ impl SegmentManager {
                 }
             }
         }
+        drop(tables);
         self.clear_wal(&table_dir)?;
         Ok(total)
     }

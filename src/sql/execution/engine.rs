@@ -124,7 +124,11 @@ fn start_delete_bitmap_cleanup_thread(
                 config.min_deleted_ratio,
                 config.min_deleted_rows,
             ) {
-                Ok(true) => match compactor.optimize_table(&db, &table, &table_meta) {
+                Ok(true) => match compactor.compact_table_for_delete_cleanup(
+                    &db,
+                    &table,
+                    &table_meta,
+                ) {
                     Ok(stats) => {
                         if stats.rows_dropped > 0 || stats.segments_written > 0 {
                             compacted += 1;

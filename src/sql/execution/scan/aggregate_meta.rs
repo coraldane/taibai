@@ -122,8 +122,6 @@ fn compute_single_aggregate(
         Some(i) => i,
         None => return Ok(ScalarValue::Int64(None)),
     };
-    eprintln!("AGGMETA ENTRY func={:?} col_idx={}", agg.func, col_idx);
-
     // Discover + partition-prune candidate segments.
     let segment_files = partition::prune_segments_by_partition(
         SegmentManager::discover_segments(table_dir)?,

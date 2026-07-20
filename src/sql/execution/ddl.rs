@@ -347,12 +347,14 @@ fn resolve_partition_key(
     table_meta: &TableMeta,
     table_dir: &Path,
     requested_key: &str,
+    resident_partition_keys: &[String],
 ) -> Result<Option<String>> {
     let mut existing_keys = table_meta
         .partitions
         .iter()
         .map(|partition| partition.key.clone())
         .collect::<HashSet<_>>();
+    existing_keys.extend(resident_partition_keys.iter().cloned());
 
     if table_dir.exists() {
         for entry in std::fs::read_dir(table_dir)? {
@@ -1220,9 +1222,6 @@ pub fn exec_drop_table(
 }
 
 fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> Result<ExecResult> {
-    engine.batch_writer().flush_table(db, name)?;
-    engine.batch_writer().memtable_manager().remove_flushed();
-
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
     if catalog.get_table(name).is_none() {
@@ -1265,6 +1264,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
                     new_table_dir.display()
                 )));
             }
+            engine.segment_mgr().flush_table_active(db, name)?;
             engine.segment_mgr().remove_wal(&old_table_dir);
             engine.segment_mgr().remove_table_state(db, name);
             engine.segment_mgr().invalidate_readers_under(&old_table_dir);
@@ -1297,6 +1297,14 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
                 let _ = remove_dir_all_with_retry(&operation_dir);
                 return Err(error);
             }
+            let renamed_rows = engine.batch_writer().rename_memtables(db, name, new_name);
+            tracing::info!(
+                db,
+                old_table = name,
+                new_table = new_name,
+                renamed_rows,
+                "renamed resident memtables"
+            );
             Ok(())
         })?;
 
@@ -1342,9 +1350,6 @@ fn exec_partition_change(
     partition_key: &str,
     drop_partition: bool,
 ) -> Result<ExecResult> {
-    engine.batch_writer().flush_table(db, name)?;
-    engine.batch_writer().memtable_manager().remove_flushed();
-
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
     let before_meta = catalog
@@ -1369,13 +1374,27 @@ fn exec_partition_change(
     let operation_dir = engine
         .segment_mgr()
         .with_table_mutation_lock(db, name, || {
-            let partition_key = resolve_partition_key(&before_meta, &table_dir, partition_key)?
-                .ok_or_else(|| {
-                    TaibaiError::Sql(format!(
-                        "partition '{}' does not exist in table '{}.{}'",
-                        partition_key, db, name
-                    ))
-                })?;
+            let resident_partition_keys = engine
+                .batch_writer()
+                .memtable_manager()
+                .partition_keys(db, name);
+            let partition_key = resolve_partition_key(
+                &before_meta,
+                &table_dir,
+                partition_key,
+                &resident_partition_keys,
+            )?
+            .ok_or_else(|| {
+                TaibaiError::Sql(format!(
+                    "partition '{}' does not exist in table '{}.{}'",
+                    partition_key, db, name
+                ))
+            })?;
+
+            // Active writers cover all partitions, so persist their buffers and metadata before
+            // retiring the table state. Inserts append under this same table mutation lock and
+            // cannot race this flush or the partition file staging below.
+            engine.segment_mgr().flush_table_active(db, name)?;
             engine.segment_mgr().remove_wal(&table_dir);
             engine.segment_mgr().remove_table_state(db, name);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
@@ -1412,6 +1431,20 @@ fn exec_partition_change(
                 return Err(error);
             }
             mark_operation_committed(&operation_dir)?;
+            // Clear resident rows only after all fallible staging/catalog work has committed.
+            // A flush worker that already owns a target memtable observes the cancelled state
+            // under this same mutation lock before it is allowed to write its detached snapshot.
+            let cleared_rows =
+                engine
+                    .batch_writer()
+                    .clear_partition_memtables(db, name, &partition_key);
+            tracing::info!(
+                db,
+                table = name,
+                partition_key,
+                cleared_rows,
+                "partition change cleared resident memtables and flushed active segments"
+            );
             engine.hot_store_manager().remove(db, name);
             engine.index_manager().mark_index_stale(db, name);
             let unique_index_names = before_meta
@@ -2072,12 +2105,14 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
             }
 
             catalogs.remove(name);
+            for (table_name, _) in &table_indexes {
+                engine.batch_writer().clear_memtables(name, table_name);
+            }
             Ok(tombstone)
         },
     )?;
 
     for (table_name, unique_index_names) in &table_indexes {
-        engine.batch_writer().clear_memtables(name, table_name);
         engine.index_manager().remove_table_unique_index_snapshots(
             name,
             table_name,
@@ -3087,6 +3122,52 @@ mod tests {
     }
 
     #[test]
+    fn drop_database_cancels_detached_memtable_flushes() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE DATABASE drop_in_flight")
+            .expect("create database");
+        engine
+            .execute(&mut session, "CREATE TABLE drop_in_flight.t (id INT64)")
+            .expect("create table");
+        engine
+            .execute(&mut session, "INSERT INTO drop_in_flight.t VALUES (1)")
+            .expect("insert pending row");
+
+        let memtable = engine
+            .batch_writer()
+            .memtable_manager()
+            .get_by_table("drop_in_flight", "t")
+            .into_iter()
+            .next()
+            .expect("pending memtable");
+        memtable.set_state(crate::storage::core::memtable::MemTableState::Flushing);
+        let detached_batch = memtable.read_snapshot().expect("detached flush snapshot");
+
+        engine
+            .execute(&mut session, "DROP DATABASE drop_in_flight")
+            .expect("drop database during detached flush");
+
+        let wrote = engine
+            .segment_mgr()
+            .flush_memtable_batch_if(
+                "drop_in_flight",
+                "t",
+                "",
+                &detached_batch,
+                0,
+                || memtable.state() == crate::storage::core::memtable::MemTableState::Flushing,
+                || {},
+            )
+            .expect("cancel detached database flush");
+        assert!(!wrote);
+        assert!(!temp_dir.path().join("drop_in_flight").exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
     fn truncate_cleanup_failure_keeps_empty_table_and_is_recovered_on_restart() {
         let temp_dir = TempDir::new().expect("create temp dir");
         {
@@ -3270,6 +3351,208 @@ mod tests {
                 &engine,
                 &mut session,
                 "SELECT COUNT(*) FROM truncate_partition_sql WHERE id = 10"
+            ),
+            1
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn truncate_partition_clears_only_target_partition_memtables() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE truncate_partition_memtables (id INT64) PARTITION BY id",
+            )
+            .expect("create table");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO truncate_partition_memtables VALUES (1), (10)",
+            )
+            .expect("insert pending partitions");
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE truncate_partition_memtables TRUNCATE PARTITION p1",
+            )
+            .expect("truncate pending partition");
+
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_memtables WHERE id = 1"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_memtables WHERE id = 10"
+            ),
+            1
+        );
+
+        engine
+            .execute(&mut session, "FLUSH TABLE truncate_partition_memtables")
+            .expect("flush surviving partition");
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_memtables WHERE id = 1"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_memtables WHERE id = 10"
+            ),
+            1
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn truncate_partition_cancels_detached_in_flight_memtable_flush() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE truncate_partition_in_flight (id INT64) PARTITION BY id",
+            )
+            .expect("create table");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO truncate_partition_in_flight VALUES (1)",
+            )
+            .expect("insert pending partition");
+
+        let memtable = engine
+            .batch_writer()
+            .memtable_manager()
+            .get_by_table("main", "truncate_partition_in_flight")
+            .into_iter()
+            .next()
+            .expect("pending memtable");
+        memtable.set_state(crate::storage::core::memtable::MemTableState::Flushing);
+        let detached_batch = memtable.read_snapshot().expect("detached flush snapshot");
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE truncate_partition_in_flight TRUNCATE PARTITION p1",
+            )
+            .expect("truncate while flush is detached");
+
+        let wrote = engine
+            .segment_mgr()
+            .flush_memtable_batch_if(
+                "main",
+                "truncate_partition_in_flight",
+                "1",
+                &detached_batch,
+                0,
+                || memtable.state() == crate::storage::core::memtable::MemTableState::Flushing,
+                || {},
+            )
+            .expect("detached flush cancellation");
+        assert!(!wrote);
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_in_flight WHERE id = 1"
+            ),
+            0
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn truncate_partition_flushes_bulk_import_state_for_surviving_partitions() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE truncate_partition_bulk (id INT64) PARTITION BY id",
+            )
+            .expect("create table");
+
+        engine.begin_bulk_import();
+        session.bulk_import_mode = true;
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO truncate_partition_bulk VALUES (1)",
+            )
+            .expect("bulk insert target partition");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO truncate_partition_bulk VALUES (10)",
+            )
+            .expect("bulk insert surviving partition");
+
+        let table_dir = temp_dir.path().join("main").join("truncate_partition_bulk");
+        assert!(partition_segment_exists(&table_dir, "1"));
+        assert!(partition_segment_exists(&table_dir, "10"));
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE truncate_partition_bulk TRUNCATE PARTITION p1",
+            )
+            .expect("truncate partition during bulk import");
+
+        assert!(!partition_segment_exists(&table_dir, "1"));
+        assert!(partition_segment_exists(&table_dir, "10"));
+        let surviving_segments =
+            crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)
+                .expect("discover surviving segments");
+        let surviving_rows = surviving_segments
+            .iter()
+            .map(|path| {
+                engine
+                    .segment_mgr()
+                    .open_reader_cached(path)
+                    .expect("open surviving segment")
+                    .row_count()
+            })
+            .sum::<u64>();
+        assert_eq!(surviving_rows, 1);
+
+        session.bulk_import_mode = false;
+        engine.end_bulk_import();
+        engine
+            .flush_all_buffers()
+            .expect("finish bulk import flush");
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_bulk WHERE id = 1"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM truncate_partition_bulk WHERE id = 10"
             ),
             1
         );
@@ -3531,6 +3814,144 @@ mod tests {
         };
         assert!(error.to_string().contains("is not a directory"));
         assert!(tombstone.exists());
+    }
+
+    #[test]
+    fn rename_table_preserves_pending_memtables_under_new_name() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE rename_pending (id INT64)")
+            .expect("create table");
+        engine
+            .execute(&mut session, "INSERT INTO rename_pending VALUES (1)")
+            .expect("insert pending row");
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE rename_pending RENAME TO rename_pending_new",
+            )
+            .expect("rename table with pending row");
+
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM rename_pending_new"
+            ),
+            1
+        );
+        engine
+            .execute(&mut session, "FLUSH TABLE rename_pending_new")
+            .expect("flush renamed memtable");
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM rename_pending_new"
+            ),
+            1
+        );
+        assert!(!temp_dir.path().join("main").join("rename_pending").exists());
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn rename_table_cancels_detached_flush_for_old_name() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE rename_in_flight (id INT64)")
+            .expect("create table");
+        engine
+            .execute(&mut session, "INSERT INTO rename_in_flight VALUES (1)")
+            .expect("insert pending row");
+
+        let memtable = engine
+            .batch_writer()
+            .memtable_manager()
+            .get_by_table("main", "rename_in_flight")
+            .into_iter()
+            .next()
+            .expect("pending memtable");
+        memtable.set_state(crate::storage::core::memtable::MemTableState::Flushing);
+        let detached_batch = memtable.read_snapshot().expect("detached flush snapshot");
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE rename_in_flight RENAME TO rename_in_flight_new",
+            )
+            .expect("rename during detached flush");
+
+        let wrote = engine
+            .segment_mgr()
+            .flush_memtable_batch_if(
+                "main",
+                "rename_in_flight",
+                "",
+                &detached_batch,
+                0,
+                || memtable.state() == crate::storage::core::memtable::MemTableState::Flushing,
+                || {},
+            )
+            .expect("cancel detached old-name flush");
+        assert!(!wrote);
+        assert!(!temp_dir
+            .path()
+            .join("main")
+            .join("rename_in_flight")
+            .exists());
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM rename_in_flight_new"
+            ),
+            1
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    #[test]
+    fn rename_table_flushes_bulk_import_active_state() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE rename_bulk (id INT64)")
+            .expect("create table");
+
+        engine.begin_bulk_import();
+        session.bulk_import_mode = true;
+        engine
+            .execute(&mut session, "INSERT INTO rename_bulk VALUES (1)")
+            .expect("bulk insert row");
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE rename_bulk RENAME TO rename_bulk_new",
+            )
+            .expect("rename table during bulk import");
+
+        session.bulk_import_mode = false;
+        engine.end_bulk_import();
+        engine
+            .flush_all_buffers()
+            .expect("finish bulk import flush");
+        assert_eq!(
+            scalar_count(
+                &engine,
+                &mut session,
+                "SELECT COUNT(*) FROM rename_bulk_new"
+            ),
+            1
+        );
+        assert!(!temp_dir.path().join("main").join("rename_bulk").exists());
+        engine.segment_mgr().shutdown();
     }
 
     #[test]
