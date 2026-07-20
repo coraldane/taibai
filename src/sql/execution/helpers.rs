@@ -458,8 +458,17 @@ pub fn eval_constant_expr(expr: &Expr) -> Result<ScalarValue> {
             ScalarValue::Int32(Some(v)) => Ok(ScalarValue::Int32(Some(-v))),
             ScalarValue::Float64(Some(v)) => Ok(ScalarValue::Float64(Some(-v))),
             ScalarValue::Float32(Some(v)) => Ok(ScalarValue::Float32(Some(-v))),
-            _ => Ok(ScalarValue::Int64(None)),
+            value if value.is_null() => Ok(ScalarValue::Int64(None)),
+            value => Err(TaibaiError::Sql(format!(
+                "cannot negate non-numeric constant {:?}",
+                value
+            ))),
         },
+        Expr::BinaryOp { left, op, right } => {
+            let left = eval_constant_expr(left)?;
+            let right = eval_constant_expr(right)?;
+            eval_constant_binary(&left, *op, &right)
+        }
         Expr::Function { name, args, .. } => {
             let arg_values = args
                 .iter()
@@ -468,8 +477,59 @@ pub fn eval_constant_expr(expr: &Expr) -> Result<ScalarValue> {
             crate::sql::execution::functions::registry::FunctionRegistry::default()
                 .execute(name, &arg_values)
         }
-        _ => Ok(ScalarValue::Int64(None)),
+        _ => Err(TaibaiError::Sql(
+            "INSERT values must be constant expressions".to_string(),
+        )),
     }
+}
+
+fn eval_constant_binary(left: &ScalarValue, op: BinOp, right: &ScalarValue) -> Result<ScalarValue> {
+    if left.is_null() || right.is_null() {
+        return Ok(ScalarValue::Int64(None));
+    }
+
+    if let (Some(left), Some(right)) = (left.integer_i128(), right.integer_i128()) {
+        let value = match op {
+            BinOp::Add => left.checked_add(right),
+            BinOp::Sub => left.checked_sub(right),
+            BinOp::Mul => left.checked_mul(right),
+            BinOp::Div => {
+                if right == 0 {
+                    return Err(TaibaiError::Sql("division by zero".to_string()));
+                }
+                left.checked_div(right)
+            }
+            _ => None,
+        }
+        .ok_or_else(|| TaibaiError::Sql("integer constant expression overflow".to_string()))?;
+        return i64::try_from(value)
+            .map(|value| ScalarValue::Int64(Some(value)))
+            .map_err(|_| TaibaiError::Sql("integer constant expression overflow".to_string()));
+    }
+
+    let left = left.numeric_f64().ok_or_else(|| {
+        TaibaiError::Sql("constant arithmetic requires numeric operands".to_string())
+    })?;
+    let right = right.numeric_f64().ok_or_else(|| {
+        TaibaiError::Sql("constant arithmetic requires numeric operands".to_string())
+    })?;
+    let value = match op {
+        BinOp::Add => left + right,
+        BinOp::Sub => left - right,
+        BinOp::Mul => left * right,
+        BinOp::Div => {
+            if right == 0.0 {
+                return Err(TaibaiError::Sql("division by zero".to_string()));
+            }
+            left / right
+        }
+        _ => {
+            return Err(TaibaiError::Sql(
+                "unsupported operator in constant expression".to_string(),
+            ))
+        }
+    };
+    Ok(ScalarValue::Float64(Some(value)))
 }
 
 pub fn eval_expr_to_scalar(expr: &Expr, dt: &DataType) -> Result<ScalarValue> {
@@ -491,9 +551,14 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
     timezone_offset_hours: i32,
 ) -> Result<ScalarValue> {
     match expr {
-        Expr::Function { .. } => {
+        Expr::Function { .. } | Expr::BinaryOp { .. } | Expr::UnaryMinus(_) => {
             let value = eval_constant_expr(expr)?;
-            coerce_scalar_for_dtype(&value, *dt)
+            eval_expr_to_scalar_with_scale_timezone(
+                &Expr::Literal(value),
+                dt,
+                scale,
+                timezone_offset_hours,
+            )
         }
         Expr::Literal(v) if v.is_null() => Ok(ScalarValue::null_for_type(*dt)),
         Expr::Literal(v) => match (dt, v) {

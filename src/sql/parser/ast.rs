@@ -163,6 +163,11 @@ pub enum Statement {
         columns: Vec<String>,
         values: Vec<Vec<Expr>>,
     },
+    ReplaceSelect {
+        table: ObjectName,
+        columns: Vec<String>,
+        query: Box<Statement>,
+    },
     Update {
         table: ObjectName,
         assignments: Vec<Assignment>,

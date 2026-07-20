@@ -303,6 +303,14 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(ScalarValue::Int64(None)))
             }
+            Token::Default => {
+                self.advance();
+                Ok(Expr::Function {
+                    name: "__TAIBAI_DEFAULT__".to_string(),
+                    args: Vec::new(),
+                    distinct: false,
+                })
+            }
             Token::Exists => {
                 self.advance();
                 self.expect(&Token::LeftParen)?;

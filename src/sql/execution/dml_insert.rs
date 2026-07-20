@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -22,10 +24,27 @@ lazy_static::lazy_static! {
     static ref FAST_INSERT_PLAN_CACHE: Mutex<HashMap<String, Arc<FastInsertPlan>>> = Mutex::new(HashMap::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_REPLACE_INSERT_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_next_replace_insert_failure() {
+    FORCE_REPLACE_INSERT_FAILURE.with(|force| force.set(true));
+}
+
 struct FastInsertPlan {
     schema_signature: String,
     col_indices: Vec<usize>,
     provided_by_col: Vec<Option<usize>>,
+    missing_auto_inc: Vec<usize>,
+}
+
+struct MaterializedInsert {
+    table_meta: crate::storage::catalog::schema::TableMeta,
+    schema: Schema,
+    batch: RecordBatch,
     missing_auto_inc: Vec<usize>,
 }
 
@@ -271,6 +290,8 @@ fn try_exec_fast_insert_sql_inner(
         txn_id,
         bulk_import_mode,
         true,
+        true,
+        false,
         missing_auto_inc,
     ))
 }
@@ -650,6 +671,27 @@ fn push_missing_insert_value(
     col_idx: usize,
     timezone_offset_hours: i32,
 ) -> Result<()> {
+    let scalar = materialize_missing_insert_scalar(
+        engine,
+        db,
+        table,
+        auto_inc_counter,
+        schema,
+        col_idx,
+        timezone_offset_hours,
+    )?;
+    col.push(&scalar)
+}
+
+fn materialize_missing_insert_scalar(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    auto_inc_counter: &Option<Arc<AutoIncrementCounter>>,
+    schema: &Schema,
+    col_idx: usize,
+    timezone_offset_hours: i32,
+) -> Result<ScalarValue> {
     let scalar = if schema.columns[col_idx].auto_increment {
         let next_val = match auto_inc_counter {
             Some(counter) => counter.next_value(),
@@ -662,7 +704,7 @@ fn push_missing_insert_value(
         ScalarValue::null_for_type(schema.columns[col_idx].data_type)
     };
     validate_nullable(schema, col_idx, &scalar)?;
-    col.push(&scalar)
+    Ok(scalar)
 }
 
 fn materialize_auto_increment_value(schema: &Schema, col_idx: usize, next_val: u64) -> ScalarValue {
@@ -962,35 +1004,115 @@ pub fn exec_replace(
     values: &[Vec<Expr>],
     timezone_offset_hours: i32,
     txn_id: u64,
-    bulk_import_mode: bool,
+    _bulk_import_mode: bool,
 ) -> Result<ExecResult> {
+    if txn_id > 0 {
+        return Err(TaibaiError::Sql(
+            "REPLACE is not supported inside an explicit transaction".to_string(),
+        ));
+    }
+
     let _unique_guard = PRIMARY_KEY_INSERT_LOCK.lock().unwrap();
-    let where_clause = build_replace_conflict_filter(engine, db, table, columns, values)?;
-    let deleted = if where_clause.is_some() {
-        match super::dml_delete::exec_delete(engine, db, table, &where_clause)? {
-            ExecResult::Ok { rows_affected } => rows_affected,
-            _ => 0,
-        }
-    } else {
-        0
-    };
-    let inserted = match exec_insert_inner(
-        engine,
-        db,
-        table,
-        columns,
-        values,
-        timezone_offset_hours,
-        txn_id,
-        bulk_import_mode,
-        false,
-    )? {
-        ExecResult::Ok { rows_affected } => rows_affected,
-        other => return Ok(other),
-    };
-    Ok(ExecResult::Ok {
-        rows_affected: deleted + inserted,
-    })
+    let materialized =
+        materialize_insert_values(engine, db, table, columns, values, timezone_offset_hours)?;
+    let constraints = replace_constraint_indices(&materialized.table_meta, &materialized.schema)?;
+    let key_sets = replace_key_sets(&materialized.batch, &constraints);
+    let (survivors, replaced_inside_batch) =
+        collapse_replace_batch(&materialized.batch, &constraints)?;
+    let inserted_rows = materialized.batch.num_rows() as u64;
+    let original_row_count = materialized.table_meta.row_count;
+    let internal_txn_id = engine.alloc_txn_id();
+
+    // Flush before taking the statement-wide table lock. The delete and the
+    // staged insert then run under one lock, so DELETE/UPDATE cannot interleave.
+    engine.flush_all_buffers()?;
+    engine
+        .segment_mgr()
+        .with_table_mutation_lock(db, table, || {
+            let undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
+                engine, db, table, &key_sets,
+            )?;
+            let deleted = undo.deleted_rows();
+
+            #[cfg(test)]
+            if FORCE_REPLACE_INSERT_FAILURE.with(|force| force.replace(false)) {
+                rollback_replace_under_table_lock(
+                    engine,
+                    db,
+                    table,
+                    &materialized.table_meta,
+                    original_row_count,
+                    internal_txn_id,
+                    &undo,
+                )?;
+                return Err(TaibaiError::Internal(
+                    "forced REPLACE insert failure".to_string(),
+                ));
+            }
+
+            let insert_result = exec_materialized_insert_batch(
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                materialized.schema,
+                survivors,
+                internal_txn_id,
+                false,
+                false,
+                false,
+                true,
+                materialized.missing_auto_inc,
+            );
+            if let Err(error) = insert_result {
+                rollback_replace_under_table_lock(
+                    engine,
+                    db,
+                    table,
+                    &materialized.table_meta,
+                    original_row_count,
+                    internal_txn_id,
+                    &undo,
+                )?;
+                return Err(error);
+            }
+
+            let finalize_result = super::dml_delete::finalize_replace_delete_under_table_lock(
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                &undo,
+            )
+            .and_then(|_| engine.batch_writer().commit_txn(internal_txn_id));
+            if let Err(error) = finalize_result {
+                rollback_replace_under_table_lock(
+                    engine,
+                    db,
+                    table,
+                    &materialized.table_meta,
+                    original_row_count,
+                    internal_txn_id,
+                    &undo,
+                )?;
+                return Err(error);
+            }
+            // The resident hot store is append-only and cannot remove the rows
+            // replaced above. Drop it so subsequent reads use the authoritative
+            // segments plus the newly committed memtable.
+            engine.hot_store_manager().remove(db, table);
+
+            // Publish the committed replacement to an on-disk segment before
+            // releasing the table lock. A following DELETE/UPDATE must not miss
+            // rows that were still resident in the committed memtable.
+            engine
+                .batch_writer()
+                .flush_table_under_table_lock(db, table)?;
+
+            Ok(ExecResult::Ok {
+                rows_affected: deleted + inserted_rows + replaced_inside_batch,
+            })
+        })
 }
 
 pub fn exec_insert(
@@ -1027,6 +1149,33 @@ fn exec_insert_inner(
     bulk_import_mode: bool,
     lock_unique_constraints: bool,
 ) -> Result<ExecResult> {
+    let materialized =
+        materialize_insert_values(engine, db, table, columns, values, timezone_offset_hours)?;
+
+    exec_materialized_insert_batch(
+        engine,
+        db,
+        table,
+        &materialized.table_meta,
+        materialized.schema,
+        materialized.batch,
+        txn_id,
+        bulk_import_mode,
+        lock_unique_constraints,
+        true,
+        false,
+        materialized.missing_auto_inc,
+    )
+}
+
+fn materialize_insert_values(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    columns: &[String],
+    values: &[Vec<Expr>],
+    timezone_offset_hours: i32,
+) -> Result<MaterializedInsert> {
     let catalogs = engine.catalogs().read().unwrap();
     let catalog = catalogs
         .get(db)
@@ -1072,7 +1221,7 @@ fn exec_insert_inner(
 
     let mut batch = RecordBatch::with_capacity(schema.clone(), values.len());
 
-    if can_direct_materialize(&schema, &provided_by_col, &is_missing_auto_inc) {
+    if can_direct_materialize(&schema, &provided_by_col, &is_missing_auto_inc, values) {
         for row in values {
             for (col_idx, provided) in provided_by_col.iter().enumerate() {
                 let val_idx = provided.unwrap();
@@ -1096,12 +1245,24 @@ fn exec_insert_inner(
                 &provided_by_col,
                 timezone_offset_hours,
                 |col_idx, value_idx| {
-                    eval_expr_to_scalar_with_scale_timezone(
-                        &row[value_idx],
-                        &schema.columns[col_idx].data_type,
-                        schema.columns[col_idx].scale,
-                        timezone_offset_hours,
-                    )
+                    if is_default_value_expr(&row[value_idx]) {
+                        materialize_missing_insert_scalar(
+                            engine,
+                            db,
+                            table,
+                            &auto_inc_counter,
+                            &schema,
+                            col_idx,
+                            timezone_offset_hours,
+                        )
+                    } else {
+                        eval_expr_to_scalar_with_scale_timezone(
+                            &row[value_idx],
+                            &schema.columns[col_idx].data_type,
+                            schema.columns[col_idx].scale,
+                            timezone_offset_hours,
+                        )
+                    }
                 },
             )?;
         }
@@ -1109,18 +1270,12 @@ fn exec_insert_inner(
 
     drop(catalogs);
 
-    exec_materialized_insert_batch(
-        engine,
-        db,
-        table,
-        &table_meta,
+    Ok(MaterializedInsert {
+        table_meta,
         schema,
         batch,
-        txn_id,
-        bulk_import_mode,
-        lock_unique_constraints,
         missing_auto_inc,
-    )
+    })
 }
 
 fn exec_materialized_insert_batch(
@@ -1133,6 +1288,8 @@ fn exec_materialized_insert_batch(
     txn_id: u64,
     bulk_import_mode: bool,
     lock_unique_constraints: bool,
+    validate_existing_constraints: bool,
+    table_lock_held: bool,
     missing_auto_inc: Vec<usize>,
 ) -> Result<ExecResult> {
     let auto_inc_cols: Vec<usize> = schema
@@ -1168,7 +1325,11 @@ fn exec_materialized_insert_batch(
             Some(PRIMARY_KEY_INSERT_LOCK.lock().unwrap())
         };
 
-    validate_unique_constraints(engine, db, table, &batch, &schema, &unique_constraints)?;
+    if validate_existing_constraints {
+        validate_unique_constraints(engine, db, table, &batch, &schema, &unique_constraints)?;
+    } else {
+        validate_unique_constraints_in_batch(table, &batch, &schema, &unique_constraints)?;
+    }
 
     if !primary_key_indices.is_empty() {
         if generated_auto_increment_key_guarantees_uniqueness(
@@ -1176,7 +1337,7 @@ fn exec_materialized_insert_batch(
             &is_missing_auto_inc,
         ) {
             validate_primary_key_values_present(&batch, &schema, &primary_key_indices)?;
-        } else {
+        } else if validate_existing_constraints {
             validate_primary_key_uniqueness(
                 engine,
                 db,
@@ -1185,6 +1346,8 @@ fn exec_materialized_insert_batch(
                 &schema,
                 &primary_key_indices,
             )?;
+        } else {
+            validate_primary_key_uniqueness_in_batch(table, &batch, &schema, &primary_key_indices)?;
         }
     }
     advance_explicit_auto_increment_counters(
@@ -1229,7 +1392,16 @@ fn exec_materialized_insert_batch(
         engine
             .exec_bulk_insert_partitioned_with_wal_control(db, table, table_meta, batch, false)?;
     } else {
-        write_batch_by_partition(engine, db, table, table_meta, batch, schema, txn_id)?;
+        write_batch_by_partition(
+            engine,
+            db,
+            table,
+            table_meta,
+            batch,
+            schema,
+            txn_id,
+            table_lock_held,
+        )?;
     }
     log_insert_profile("write", row_count as usize, write_start.elapsed());
 
@@ -1303,78 +1475,147 @@ fn append_unique_index_entries_after_insert(
     Ok(())
 }
 
-fn build_replace_conflict_filter(
+fn replace_constraint_indices(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+) -> Result<Vec<Vec<usize>>> {
+    let mut constraints = Vec::new();
+    let primary_key = primary_key_indices(schema);
+    if !primary_key.is_empty() {
+        constraints.push(primary_key);
+    }
+    constraints.extend(
+        unique_constraints(table_meta, schema)?
+            .into_iter()
+            .map(|(_, indices)| indices),
+    );
+    Ok(constraints)
+}
+
+fn replace_key_sets(
+    batch: &RecordBatch,
+    constraints: &[Vec<usize>],
+) -> Vec<(Vec<usize>, HashSet<Vec<ScalarValue>>)> {
+    constraints
+        .iter()
+        .map(|indices| {
+            let keys = (0..batch.num_rows())
+                .filter_map(|row_idx| replace_key_for_row(batch, row_idx, indices))
+                .collect::<HashSet<_>>();
+            (indices.clone(), keys)
+        })
+        .filter(|(_, keys)| !keys.is_empty())
+        .collect()
+}
+
+fn rollback_replace_under_table_lock(
     engine: &Engine,
     db: &str,
     table: &str,
-    columns: &[String],
-    values: &[Vec<Expr>],
-) -> Result<Option<Expr>> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-        .clone();
-    drop(catalogs);
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    original_row_count: i64,
+    txn_id: u64,
+    undo: &super::dml_delete::ReplaceDeleteUndo,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    if let Err(error) = engine.batch_writer().rollback_txn(txn_id) {
+        errors.push(format!("rollback staged insert: {}", error));
+    }
+    if let Err(error) = super::dml_delete::restore_replace_delete_under_table_lock(engine, undo) {
+        errors.push(format!("restore deleted rows: {}", error));
+    }
 
-    let schema = Schema::new(table_meta.columns.clone());
-    let insert_indices = resolve_insert_columns(&schema, columns, values)?;
-    let unique_constraints = unique_constraints(&table_meta, &schema)?;
-    let mut predicates = Vec::new();
-    for (_, index_indices) in unique_constraints {
-        let mut value_positions = Vec::with_capacity(index_indices.len());
-        let mut complete = true;
-        for index_col in &index_indices {
-            match insert_indices.iter().position(|col| col == index_col) {
-                Some(pos) => value_positions.push((*index_col, pos)),
-                None => {
-                    complete = false;
-                    break;
+    for index in &table_meta.unique_indexes {
+        engine
+            .index_manager()
+            .remove_unique_index_snapshot(db, table, &index.name);
+    }
+
+    let catalog_restore: Result<()> = (|| {
+        let mut catalogs = engine.catalogs().write().unwrap();
+        if let Some(catalog) = catalogs.get_mut(db) {
+            if let Some(meta) = catalog.get_table_mut(table) {
+                meta.row_count = original_row_count;
+            }
+            catalog.save(&engine.data_dir().join("meta"))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = catalog_restore {
+        errors.push(format!("restore catalog: {}", error));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(TaibaiError::Internal(format!(
+            "REPLACE rollback failed: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+fn replace_key_for_row(
+    batch: &RecordBatch,
+    row_idx: usize,
+    indices: &[usize],
+) -> Option<Vec<ScalarValue>> {
+    let mut key = Vec::with_capacity(indices.len());
+    for &col_idx in indices {
+        let value = batch.scalar(row_idx, col_idx)?;
+        // As with MySQL unique indexes, a key containing NULL does not
+        // conflict. Primary-key columns have already been checked non-NULL.
+        if value.is_null() {
+            return None;
+        }
+        key.push(value);
+    }
+    Some(key)
+}
+
+fn collapse_replace_batch(
+    batch: &RecordBatch,
+    constraints: &[Vec<usize>],
+) -> Result<(RecordBatch, u64)> {
+    let row_count = batch.num_rows();
+    if row_count <= 1 || constraints.is_empty() {
+        return Ok((batch.clone(), 0));
+    }
+
+    let mut active = vec![true; row_count];
+    let mut owners = constraints
+        .iter()
+        .map(|_| HashMap::<Vec<ScalarValue>, usize>::new())
+        .collect::<Vec<_>>();
+    let mut replaced = 0u64;
+    for current in 0..row_count {
+        let mut conflicts = HashSet::new();
+        for (constraint_idx, indices) in constraints.iter().enumerate() {
+            let Some(key) = replace_key_for_row(batch, current, indices) else {
+                continue;
+            };
+            if let Some(prior) = owners[constraint_idx].insert(key, current) {
+                if active[prior] {
+                    conflicts.insert(prior);
                 }
             }
         }
-        if !complete {
-            continue;
-        }
-        for row in values {
-            let mut row_predicate = None;
-            for (col_idx, value_pos) in &value_positions {
-                let Expr::Literal(value) = &row[*value_pos] else {
-                    row_predicate = None;
-                    break;
+        for prior in conflicts {
+            active[prior] = false;
+            replaced += 1;
+            for (constraint_idx, indices) in constraints.iter().enumerate() {
+                let Some(key) = replace_key_for_row(batch, prior, indices) else {
+                    continue;
                 };
-                if value.is_null() {
-                    row_predicate = None;
-                    break;
+                if owners[constraint_idx].get(&key) == Some(&prior) {
+                    owners[constraint_idx].remove(&key);
                 }
-                let eq = Expr::BinaryOp {
-                    left: Box::new(Expr::Column(schema.columns[*col_idx].name.clone())),
-                    op: crate::sql::parser::ast::BinOp::Eq,
-                    right: Box::new(Expr::Literal(value.clone())),
-                };
-                row_predicate = Some(match row_predicate {
-                    Some(existing) => Expr::BinaryOp {
-                        left: Box::new(existing),
-                        op: crate::sql::parser::ast::BinOp::And,
-                        right: Box::new(eq),
-                    },
-                    None => eq,
-                });
-            }
-            if let Some(predicate) = row_predicate {
-                predicates.push(predicate);
             }
         }
     }
 
-    Ok(predicates.into_iter().reduce(|left, right| Expr::BinaryOp {
-        left: Box::new(left),
-        op: crate::sql::parser::ast::BinOp::Or,
-        right: Box::new(right),
-    }))
+    let survivors = active.iter().filter(|keep| **keep).count();
+    Ok((filter_batch_by_mask(batch, &active, survivors)?, replaced))
 }
 
 fn write_batch_by_partition(
@@ -1385,9 +1626,20 @@ fn write_batch_by_partition(
     batch: RecordBatch,
     schema: Schema,
     txn_id: u64,
+    table_lock_held: bool,
 ) -> Result<()> {
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
-        write_partition_batch(engine, db, table, table_meta, "", batch, schema, txn_id)?;
+        write_partition_batch(
+            engine,
+            db,
+            table,
+            table_meta,
+            "",
+            batch,
+            schema,
+            txn_id,
+            table_lock_held,
+        )?;
         return Ok(());
     }
 
@@ -1408,6 +1660,7 @@ fn write_batch_by_partition(
             batch,
             schema,
             txn_id,
+            table_lock_held,
         )?;
         return Ok(());
     }
@@ -1424,6 +1677,7 @@ fn write_batch_by_partition(
                 part_batch,
                 schema.clone(),
                 txn_id,
+                table_lock_held,
             )?;
         }
         return Ok(());
@@ -1444,6 +1698,7 @@ fn write_batch_by_partition(
             batch,
             schema,
             txn_id,
+            table_lock_held,
         )?;
         return Ok(());
     }
@@ -1460,6 +1715,7 @@ fn write_batch_by_partition(
             part_batch,
             schema.clone(),
             txn_id,
+            table_lock_held,
         )?;
     }
     Ok(())
@@ -1474,16 +1730,30 @@ fn write_partition_batch(
     batch: RecordBatch,
     schema: Schema,
     txn_id: u64,
+    table_lock_held: bool,
 ) -> Result<()> {
     let batch = sort_batch_for_cluster_key(table_meta, batch)?;
-    engine.batch_writer().write_columns_with_txn(
-        db,
-        table,
-        partition_key,
-        batch,
-        schema,
-        txn_id,
-    )?;
+    if table_lock_held {
+        engine
+            .batch_writer()
+            .write_columns_with_txn_under_table_lock(
+                db,
+                table,
+                partition_key,
+                batch,
+                schema,
+                txn_id,
+            )?;
+    } else {
+        engine.batch_writer().write_columns_with_txn(
+            db,
+            table,
+            partition_key,
+            batch,
+            schema,
+            txn_id,
+        )?;
+    }
     Ok(())
 }
 
@@ -1630,7 +1900,11 @@ fn can_direct_materialize(
     schema: &Schema,
     provided_by_col: &[Option<usize>],
     is_missing_auto_inc: &[bool],
+    values: &[Vec<Expr>],
 ) -> bool {
+    if values.iter().flatten().any(is_default_value_expr) {
+        return false;
+    }
     schema.columns.iter().enumerate().all(|(idx, col)| {
         provided_by_col[idx].is_some()
             && !is_missing_auto_inc[idx]
@@ -1638,6 +1912,14 @@ fn can_direct_materialize(
             && col.nullable
             && !col.primary_key
     })
+}
+
+fn is_default_value_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Function { name, args, .. }
+            if name == "__TAIBAI_DEFAULT__" && args.is_empty()
+    )
 }
 
 fn push_literal_fast(
@@ -1722,6 +2004,9 @@ fn resolve_insert_columns(
     values: &[Vec<Expr>],
 ) -> Result<Vec<usize>> {
     if columns.is_empty() {
+        if values.iter().all(|row| row.is_empty()) {
+            return Ok(Vec::new());
+        }
         for row in values {
             if row.len() != schema.columns.len() {
                 return Err(TaibaiError::Sql(format!(
@@ -1832,6 +2117,26 @@ fn validate_unique_constraints(
 ) -> Result<()> {
     for (name, indices) in constraints {
         validate_unique_key_uniqueness(engine, db, table, schema, indices, name, Some(batch))?;
+    }
+    Ok(())
+}
+
+fn validate_unique_constraints_in_batch(
+    table: &str,
+    batch: &RecordBatch,
+    schema: &Schema,
+    constraints: &[(String, Vec<usize>)],
+) -> Result<()> {
+    for (name, indices) in constraints {
+        let mut keys = HashSet::new();
+        for row_idx in 0..batch.num_rows() {
+            let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
+                continue;
+            };
+            if !keys.insert(key.clone()) {
+                return Err(duplicate_unique_key_error(table, name, &key));
+            }
+        }
     }
     Ok(())
 }
@@ -2132,6 +2437,22 @@ fn validate_primary_key_uniqueness(
     Ok(())
 }
 
+fn validate_primary_key_uniqueness_in_batch(
+    table: &str,
+    batch: &RecordBatch,
+    schema: &Schema,
+    primary_key_indices: &[usize],
+) -> Result<()> {
+    let mut keys = HashSet::new();
+    for row_idx in 0..batch.num_rows() {
+        let key = primary_key_for_row(batch, row_idx, primary_key_indices, schema)?;
+        if !keys.insert(key.clone()) {
+            return Err(duplicate_primary_key_error(table, &key));
+        }
+    }
+    Ok(())
+}
+
 fn advance_explicit_auto_increment_counters(
     engine: &Engine,
     db: &str,
@@ -2180,7 +2501,15 @@ fn load_existing_primary_keys(
         for seg_path in SegmentManager::discover_segments(&table_dir)? {
             let reader = engine.segment_mgr().open_reader_cached(&seg_path)?;
             for rg_idx in 0..reader.num_row_groups() {
-                let batch = reader.read_row_group_with_projection(rg_idx, primary_key_indices)?;
+                let mut batch =
+                    reader.read_row_group_with_projection(rg_idx, primary_key_indices)?;
+                if !reader.delete_bitmap().is_empty() {
+                    batch = crate::storage::segment::delete_bitmap::filter_batch(
+                        &batch,
+                        reader.row_group_start_row(rg_idx),
+                        reader.delete_bitmap(),
+                    )?;
+                }
                 check_existing_batch(table, &batch, inserted_keys)?;
             }
         }

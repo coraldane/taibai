@@ -359,6 +359,18 @@ fn non_admin_users_follow_database_table_permissions() {
     engine
         .execute(&mut alice, "INSERT INTO db1.t VALUES (8)")
         .expect("alice can insert with db1 wildcard table permission");
+    assert!(
+        engine
+            .execute(&mut alice, "REPLACE INTO db1.t VALUES (8)")
+            .is_err(),
+        "REPLACE also requires DELETE permission"
+    );
+    engine
+        .execute(&mut root, "GRANT DELETE ON TABLE db1.t TO alice")
+        .expect("grant delete");
+    engine
+        .execute(&mut alice, "REPLACE INTO db1.t VALUES (9)")
+        .expect("alice can replace after insert and delete grants");
 
     engine
         .execute(&mut root, "GRANT CREATE ON DATABASE db1 TO alice")

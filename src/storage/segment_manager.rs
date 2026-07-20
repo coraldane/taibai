@@ -891,6 +891,57 @@ impl SegmentManager {
         let state = self.get_or_create_state(&key);
         let _mutation_guard = state.mutation_lock.lock().unwrap();
         ensure_state_not_retired(&state, db, table)?;
+        self.flush_memtable_batch_under_table_lock_inner(
+            db,
+            table,
+            partition_key,
+            batch,
+            txn_id,
+            &state,
+            should_write,
+            on_written,
+        )
+    }
+
+    pub(crate) fn flush_memtable_batch_if_under_table_lock(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: &RecordBatch,
+        txn_id: u64,
+        should_write: impl FnOnce() -> bool,
+        on_written: impl FnOnce(),
+    ) -> Result<bool> {
+        if batch.num_rows() == 0 {
+            return Ok(false);
+        }
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        ensure_state_not_retired(&state, db, table)?;
+        self.flush_memtable_batch_under_table_lock_inner(
+            db,
+            table,
+            partition_key,
+            batch,
+            txn_id,
+            &state,
+            should_write,
+            on_written,
+        )
+    }
+
+    fn flush_memtable_batch_under_table_lock_inner(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: &RecordBatch,
+        txn_id: u64,
+        state: &TableSegmentState,
+        should_write: impl FnOnce() -> bool,
+        on_written: impl FnOnce(),
+    ) -> Result<bool> {
         if !should_write() {
             return Ok(false);
         }

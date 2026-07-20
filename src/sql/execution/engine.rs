@@ -587,6 +587,50 @@ impl Engine {
                 }
                 result
             }
+            Statement::ReplaceSelect {
+                table,
+                columns,
+                query,
+            } => {
+                let txn_id = session.active_txn_id();
+                if txn_id > 0 {
+                    return Err(TaibaiError::Sql(
+                        "REPLACE is not supported inside an explicit transaction".to_string(),
+                    ));
+                }
+                let query_result =
+                    super::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
+                let ExecResult::Query { batches, .. } = query_result else {
+                    return Err(TaibaiError::Internal(
+                        "REPLACE SELECT source did not return rows".to_string(),
+                    ));
+                };
+                let mut values = Vec::new();
+                for batch in batches {
+                    for row_idx in 0..batch.num_rows() {
+                        let mut row = Vec::with_capacity(batch.num_columns());
+                        for col_idx in 0..batch.num_columns() {
+                            let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
+                                TaibaiError::Internal(
+                                    "REPLACE SELECT result column is missing".to_string(),
+                                )
+                            })?;
+                            row.push(crate::sql::parser::ast::Expr::Literal(value));
+                        }
+                        values.push(row);
+                    }
+                }
+                super::dml_insert::exec_replace(
+                    self,
+                    table.effective_database(&session.database),
+                    &table.name,
+                    columns,
+                    &values,
+                    session.timezone_offset_hours,
+                    txn_id,
+                    session.bulk_import_mode,
+                )
+            }
             Statement::Update {
                 table,
                 assignments,
@@ -798,13 +842,41 @@ impl Engine {
             Statement::DropDatabase { name, .. } => {
                 self.require_database_permission(session, PermissionType::Drop, name)
             }
-            Statement::Insert { table, .. } | Statement::Replace { table, .. } => self
-                .require_table_permission(
+            Statement::Insert { table, .. } => self.require_table_permission(
+                session,
+                PermissionType::Insert,
+                table.effective_database(&session.database),
+                &table.name,
+            ),
+            Statement::Replace { table, .. } => {
+                self.require_table_permission(
                     session,
                     PermissionType::Insert,
                     table.effective_database(&session.database),
                     &table.name,
-                ),
+                )?;
+                self.require_table_permission(
+                    session,
+                    PermissionType::Delete,
+                    table.effective_database(&session.database),
+                    &table.name,
+                )
+            }
+            Statement::ReplaceSelect { table, query, .. } => {
+                self.require_table_permission(
+                    session,
+                    PermissionType::Insert,
+                    table.effective_database(&session.database),
+                    &table.name,
+                )?;
+                self.require_table_permission(
+                    session,
+                    PermissionType::Delete,
+                    table.effective_database(&session.database),
+                    &table.name,
+                )?;
+                self.ensure_permissions(session, query)
+            }
             Statement::Update { table, .. } => self.require_table_permission(
                 session,
                 PermissionType::Update,
@@ -2697,6 +2769,61 @@ mod tests {
         );
         assert_eq!(name, "new");
         assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_insert_failure_restores_deleted_rows_and_unique_state() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+
+        engine.execute(
+            &mut session,
+            "CREATE TABLE t (id INT64 PRIMARY KEY, code INT64, name VARCHAR, UNIQUE KEY uk_code (code))",
+        )?;
+        engine.execute(
+            &mut session,
+            "INSERT INTO t (id, code, name) VALUES (1, 10, 'old')",
+        )?;
+        engine.execute(&mut session, "REBUILD UNIQUE INDEX uk_code ON t")?;
+
+        crate::sql::execution::dml_insert::force_next_replace_insert_failure();
+        let failed = engine.execute(
+            &mut session,
+            "REPLACE INTO t (id, code, name) VALUES (1, 10, 'new')",
+        );
+        assert!(failed.is_err());
+
+        let name = first_text(
+            engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+            0,
+            0,
+        );
+        let count = first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0,
+        );
+        assert_eq!(name, "old");
+        assert_eq!(count, 1);
+        assert!(engine
+            .execute(
+                &mut session,
+                "INSERT INTO t (id, code, name) VALUES (2, 10, 'duplicate')",
+            )
+            .is_err());
+
+        engine.execute(
+            &mut session,
+            "REPLACE INTO t (id, code, name) VALUES (1, 10, 'new')",
+        )?;
+        let name = first_text(
+            engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+            0,
+            0,
+        );
+        assert_eq!(name, "new");
         Ok(())
     }
     #[test]

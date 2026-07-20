@@ -16,10 +16,15 @@ impl Parser {
     fn parse_insert_like(&mut self, replace: bool) -> Result<Statement> {
         if replace {
             self.expect(&Token::Replace)?;
+            // MySQL permits INTO to be omitted for REPLACE, while INSERT keeps
+            // requiring it in Taibai's grammar.
+            if self.peek() == &Token::Into {
+                self.advance();
+            }
         } else {
             self.expect(&Token::Insert)?;
+            self.expect(&Token::Into)?;
         }
-        self.expect(&Token::Into)?;
         let table = self.parse_object_name()?;
 
         let columns = if self.peek() == &Token::LeftParen {
@@ -39,17 +44,27 @@ impl Parser {
             Vec::new()
         };
 
+        if replace && self.peek() == &Token::Select {
+            return Ok(Statement::ReplaceSelect {
+                table,
+                columns,
+                query: Box::new(self.parse_select()?),
+            });
+        }
+
         self.expect(&Token::Values)?;
         let mut all_values = Vec::new();
         loop {
             self.expect(&Token::LeftParen)?;
             let mut row = Vec::new();
-            loop {
-                row.push(self.parse_expr()?);
-                if self.peek() == &Token::Comma {
-                    self.advance();
-                } else {
-                    break;
+            if self.peek() != &Token::RightParen {
+                loop {
+                    row.push(self.parse_expr()?);
+                    if self.peek() == &Token::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
                 }
             }
             self.expect(&Token::RightParen)?;

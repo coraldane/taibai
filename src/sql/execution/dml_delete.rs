@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::common::error::{Result, TaibaiError};
@@ -20,6 +21,146 @@ use super::helpers::{
     eval_where_clause_batch,
 };
 use crate::sql::parser::ast::{BinOp, Expr};
+
+pub(crate) struct ReplaceDeleteUndo {
+    segment_footers: Vec<(PathBuf, Vec<u8>, u64)>,
+    tombstones: Vec<UniqueRowLocation>,
+    deleted_rows: u64,
+}
+
+impl ReplaceDeleteUndo {
+    pub(crate) fn deleted_rows(&self) -> u64 {
+        self.deleted_rows
+    }
+}
+
+pub(crate) fn delete_replace_conflicts_under_table_lock(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Result<ReplaceDeleteUndo> {
+    let table_dir = engine.data_dir().join(db).join(table);
+    let mut undo = ReplaceDeleteUndo {
+        segment_footers: Vec::new(),
+        tombstones: Vec::new(),
+        deleted_rows: 0,
+    };
+    if !table_dir.exists() || key_sets.is_empty() {
+        return Ok(undo);
+    }
+
+    let mgr = engine.segment_mgr();
+    for seg_path in SegmentManager::discover_segments(&table_dir)? {
+        let reader = mgr.open_reader_cached(&seg_path)?;
+        let total_rows = reader.row_count();
+        if total_rows == 0 || reader.deleted_row_count() >= total_rows {
+            continue;
+        }
+        let old_bitmap = reader.delete_bitmap().to_vec();
+        let old_deleted = reader.deleted_row_count();
+        let mut new_bitmap = old_bitmap.clone();
+        new_bitmap.resize(total_rows.div_ceil(8) as usize, 0);
+        let mut row_id = 0u64;
+        let mut newly_deleted = 0u64;
+
+        for rg_idx in 0..reader.num_row_groups() {
+            let batch = reader.read_row_group(rg_idx)?;
+            for row_idx in 0..batch.num_rows() {
+                let absolute_row = row_id + row_idx as u64;
+                if delete_bitmap::is_deleted(&new_bitmap, absolute_row) {
+                    continue;
+                }
+                let conflicts = key_sets.iter().any(|(indices, keys)| {
+                    let mut key = Vec::with_capacity(indices.len());
+                    for &col_idx in indices {
+                        let Some(value) = batch.scalar(row_idx, col_idx) else {
+                            return false;
+                        };
+                        if value.is_null() {
+                            return false;
+                        }
+                        key.push(value);
+                    }
+                    keys.contains(&key)
+                });
+                if conflicts && delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row) {
+                    undo.tombstones.push(UniqueRowLocation {
+                        segment_path: seg_path.to_string_lossy().into_owned(),
+                        row_id: absolute_row,
+                    });
+                    newly_deleted += 1;
+                }
+            }
+            row_id += batch.num_rows() as u64;
+        }
+
+        if newly_deleted == 0 {
+            continue;
+        }
+        undo.segment_footers
+            .push((seg_path.clone(), old_bitmap, old_deleted));
+        if let Err(error) =
+            mgr.rewrite_delete_footer(&seg_path, &new_bitmap, old_deleted + newly_deleted)
+        {
+            let _ = restore_replace_delete_under_table_lock(engine, &undo);
+            return Err(error);
+        }
+        undo.deleted_rows += newly_deleted;
+    }
+    Ok(undo)
+}
+
+pub(crate) fn restore_replace_delete_under_table_lock(
+    engine: &Engine,
+    undo: &ReplaceDeleteUndo,
+) -> Result<()> {
+    let mut first_error = None;
+    for (path, bitmap, deleted_count) in undo.segment_footers.iter().rev() {
+        if let Err(error) = engine
+            .segment_mgr()
+            .rewrite_delete_footer(path, bitmap, *deleted_count)
+        {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn finalize_replace_delete_under_table_lock(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &TableMeta,
+    undo: &ReplaceDeleteUndo,
+) -> Result<()> {
+    if undo.deleted_rows == 0 {
+        return Ok(());
+    }
+    for index in &table_meta.unique_indexes {
+        engine.index_manager().append_unique_index_tombstones(
+            db,
+            table,
+            &index.name,
+            undo.tombstones.clone(),
+        )?;
+    }
+
+    let mut catalogs = engine.catalogs().write().unwrap();
+    if let Some(catalog) = catalogs.get_mut(db) {
+        if let Some(meta) = catalog.get_table_mut(table) {
+            meta.row_count = (meta.row_count - undo.deleted_rows as i64).max(0);
+            let meta_dir = engine.data_dir().join("meta");
+            catalog.save(&meta_dir)?;
+        }
+    }
+    Ok(())
+}
 
 pub fn exec_delete(
     engine: &Engine,

@@ -218,6 +218,7 @@ pub fn bind_params(stmt: &mut Statement, params: &[ScalarValue]) -> Result<()> {
                 }
             }
         }
+        Statement::ReplaceSelect { query, .. } => bind_params(query, params)?,
         Statement::Update {
             where_clause,
             assignments,
@@ -465,6 +466,9 @@ pub fn count_placeholders(stmt: &Statement) -> usize {
                 }
             }
         }
+        Statement::ReplaceSelect { query, .. } => {
+            count += count_placeholders(query);
+        }
         Statement::Update {
             where_clause,
             assignments,
@@ -695,6 +699,9 @@ pub fn has_placeholders(stmt: &Statement) -> bool {
                     check_expr_for_placeholders(val, &mut found);
                 }
             }
+        }
+        Statement::ReplaceSelect { query, .. } => {
+            found |= has_placeholders(query);
         }
         Statement::Update {
             where_clause,
@@ -1147,6 +1154,7 @@ mod tests {
             "EXPLAIN SELECT * FROM t WHERE id = ?",
             "INSERT INTO t (a) VALUES (?)",
             "REPLACE INTO t (a) VALUES (?)",
+            "REPLACE INTO t (a) SELECT a FROM s WHERE id = ?",
             "UPDATE t SET a = ? WHERE id = ?",
             "DELETE FROM t WHERE id = ?",
         ];
