@@ -26,7 +26,11 @@ pub struct ScanExec {
 
 impl ScanExec {
     pub fn new(batches: Vec<RecordBatch>, projection: Option<Vec<usize>>) -> Self {
-        Self { batches, pos: 0, projection }
+        Self {
+            batches,
+            pos: 0,
+            projection,
+        }
     }
 }
 
@@ -40,9 +44,8 @@ impl ExecutionOp for ScanExec {
 
         match &self.projection {
             Some(indices) => {
-                let schema_cols: Vec<&ColumnDef> = indices.iter()
-                    .map(|&i| &batch.schema.columns[i])
-                    .collect();
+                let schema_cols: Vec<&ColumnDef> =
+                    indices.iter().map(|&i| &batch.schema.columns[i]).collect();
                 let new_schema = Schema::new(schema_cols.iter().map(|c| (*c).clone()).collect());
                 let mut cols = Vec::with_capacity(indices.len());
                 for &idx in indices {
@@ -154,24 +157,32 @@ fn eval_comparison(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> bool 
     }
     match (left, right) {
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => cmp_i64(*l, op, *r),
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => cmp_i64(*l as i64, op, *r as i64),
-        (ScalarValue::Int16(Some(l)), ScalarValue::Int16(Some(r))) => cmp_i64(*l as i64, op, *r as i64),
-        (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => cmp_i64(*l as i64, op, *r as i64),
-        (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => cmp_u64(*l, op, *r),
-        (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => cmp_u64(*l as u64, op, *r as u64),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => cmp_f64(*l, op, *r),
-        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => cmp_f64(*l as f64, op, *r as f64),
-        (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => {
-            match op {
-                BinOp::Eq => l == r,
-                BinOp::Neq => l != r,
-                BinOp::Lt => l < r,
-                BinOp::Gt => l > r,
-                BinOp::Lte => l <= r,
-                BinOp::Gte => l >= r,
-                _ => false,
-            }
+        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => {
+            cmp_i64(*l as i64, op, *r as i64)
         }
+        (ScalarValue::Int16(Some(l)), ScalarValue::Int16(Some(r))) => {
+            cmp_i64(*l as i64, op, *r as i64)
+        }
+        (ScalarValue::Int8(Some(l)), ScalarValue::Int8(Some(r))) => {
+            cmp_i64(*l as i64, op, *r as i64)
+        }
+        (ScalarValue::UInt64(Some(l)), ScalarValue::UInt64(Some(r))) => cmp_u64(*l, op, *r),
+        (ScalarValue::UInt32(Some(l)), ScalarValue::UInt32(Some(r))) => {
+            cmp_u64(*l as u64, op, *r as u64)
+        }
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => cmp_f64(*l, op, *r),
+        (ScalarValue::Float32(Some(l)), ScalarValue::Float32(Some(r))) => {
+            cmp_f64(*l as f64, op, *r as f64)
+        }
+        (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => match op {
+            BinOp::Eq => l == r,
+            BinOp::Neq => l != r,
+            BinOp::Lt => l < r,
+            BinOp::Gt => l > r,
+            BinOp::Lte => l <= r,
+            BinOp::Gte => l >= r,
+            _ => false,
+        },
         // Cross-type: promote to i64
         (ScalarValue::Int64(Some(l)), ScalarValue::Int32(Some(r))) => cmp_i64(*l, op, *r as i64),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int64(Some(r))) => cmp_i64(*l as i64, op, *r),
@@ -180,25 +191,47 @@ fn eval_comparison(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> bool 
 }
 
 fn cmp_i64(l: i64, op: &BinOp, r: i64) -> bool {
-    match op { BinOp::Eq => l == r, BinOp::Neq => l != r, BinOp::Lt => l < r, BinOp::Gt => l > r, BinOp::Lte => l <= r, BinOp::Gte => l >= r, _ => false }
+    match op {
+        BinOp::Eq => l == r,
+        BinOp::Neq => l != r,
+        BinOp::Lt => l < r,
+        BinOp::Gt => l > r,
+        BinOp::Lte => l <= r,
+        BinOp::Gte => l >= r,
+        _ => false,
+    }
 }
 fn cmp_u64(l: u64, op: &BinOp, r: u64) -> bool {
-    match op { BinOp::Eq => l == r, BinOp::Neq => l != r, BinOp::Lt => l < r, BinOp::Gt => l > r, BinOp::Lte => l <= r, BinOp::Gte => l >= r, _ => false }
+    match op {
+        BinOp::Eq => l == r,
+        BinOp::Neq => l != r,
+        BinOp::Lt => l < r,
+        BinOp::Gt => l > r,
+        BinOp::Lte => l <= r,
+        BinOp::Gte => l >= r,
+        _ => false,
+    }
 }
 fn cmp_f64(l: f64, op: &BinOp, r: f64) -> bool {
-    match op { BinOp::Eq => l == r, BinOp::Neq => l != r, BinOp::Lt => l < r, BinOp::Gt => l > r, BinOp::Lte => l <= r, BinOp::Gte => l >= r, _ => false }
+    match op {
+        BinOp::Eq => l == r,
+        BinOp::Neq => l != r,
+        BinOp::Lt => l < r,
+        BinOp::Gt => l > r,
+        BinOp::Lte => l <= r,
+        BinOp::Gte => l >= r,
+        _ => false,
+    }
 }
 
 /// Evaluate an expression for every row in a batch, producing a Vec<ScalarValue>.
 pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<ScalarValue>> {
     let num_rows = batch.num_rows();
     match expr {
-        LogicalExpr::Column(idx) => {
-            Ok((0..num_rows).map(|i| batch.scalar(i, *idx).unwrap_or(ScalarValue::Int64(None))).collect())
-        }
-        LogicalExpr::Literal(v) => {
-            Ok(vec![v.clone(); num_rows])
-        }
+        LogicalExpr::Column(idx) => Ok((0..num_rows)
+            .map(|i| batch.scalar(i, *idx).unwrap_or(ScalarValue::Int64(None)))
+            .collect()),
+        LogicalExpr::Literal(v) => Ok(vec![v.clone(); num_rows]),
         LogicalExpr::BinaryOp { left, op, right } => {
             let lv = eval_expr_column(left, batch)?;
             let rv = eval_expr_column(right, batch)?;
@@ -210,20 +243,27 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
         }
         LogicalExpr::IsNull(inner) => {
             let vals = eval_expr_column(inner, batch)?;
-            Ok(vals.iter().map(|v| ScalarValue::Bool(Some(v.is_null()))).collect())
+            Ok(vals
+                .iter()
+                .map(|v| ScalarValue::Bool(Some(v.is_null())))
+                .collect())
         }
         LogicalExpr::IsNotNull(inner) => {
             let vals = eval_expr_column(inner, batch)?;
-            Ok(vals.iter().map(|v| ScalarValue::Bool(Some(!v.is_null()))).collect())
+            Ok(vals
+                .iter()
+                .map(|v| ScalarValue::Bool(Some(!v.is_null())))
+                .collect())
         }
         LogicalExpr::Not(inner) => {
             let vals = eval_expr_column(inner, batch)?;
-            Ok(vals.iter().map(|v| {
-                match v {
+            Ok(vals
+                .iter()
+                .map(|v| match v {
                     ScalarValue::Bool(Some(b)) => ScalarValue::Bool(Some(!b)),
                     _ => ScalarValue::Bool(None),
-                }
-            }).collect())
+                })
+                .collect())
         }
         _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
     }
@@ -234,37 +274,31 @@ fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Sc
         return ScalarValue::Int64(None);
     }
     match (left, right) {
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => {
-            match op {
-                BinOp::Add => ScalarValue::Int64(Some(l + r)),
-                BinOp::Sub => ScalarValue::Int64(Some(l - r)),
-                BinOp::Mul => ScalarValue::Int64(Some(l * r)),
-                BinOp::Div => ScalarValue::Int64(Some(l / r)),
-                BinOp::Eq => ScalarValue::Bool(Some(l == r)),
-                BinOp::Neq => ScalarValue::Bool(Some(l != r)),
-                BinOp::Lt => ScalarValue::Bool(Some(l < r)),
-                BinOp::Gt => ScalarValue::Bool(Some(l > r)),
-                BinOp::Lte => ScalarValue::Bool(Some(l <= r)),
-                BinOp::Gte => ScalarValue::Bool(Some(l >= r)),
-                BinOp::And | BinOp::Or => ScalarValue::Bool(None),
-            }
-        }
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
-            match op {
-                BinOp::Add => ScalarValue::Float64(Some(l + r)),
-                BinOp::Sub => ScalarValue::Float64(Some(l - r)),
-                BinOp::Mul => ScalarValue::Float64(Some(l * r)),
-                BinOp::Div => ScalarValue::Float64(Some(l / r)),
-                _ => ScalarValue::Bool(None),
-            }
-        }
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => {
-            match op {
-                BinOp::Add => ScalarValue::Int32(Some(l + r)),
-                BinOp::Sub => ScalarValue::Int32(Some(l - r)),
-                _ => ScalarValue::Bool(None),
-            }
-        }
+        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => match op {
+            BinOp::Add => ScalarValue::Int64(Some(l + r)),
+            BinOp::Sub => ScalarValue::Int64(Some(l - r)),
+            BinOp::Mul => ScalarValue::Int64(Some(l * r)),
+            BinOp::Div => ScalarValue::Int64(Some(l / r)),
+            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
+            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
+            BinOp::Lt => ScalarValue::Bool(Some(l < r)),
+            BinOp::Gt => ScalarValue::Bool(Some(l > r)),
+            BinOp::Lte => ScalarValue::Bool(Some(l <= r)),
+            BinOp::Gte => ScalarValue::Bool(Some(l >= r)),
+            BinOp::And | BinOp::Or => ScalarValue::Bool(None),
+        },
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => match op {
+            BinOp::Add => ScalarValue::Float64(Some(l + r)),
+            BinOp::Sub => ScalarValue::Float64(Some(l - r)),
+            BinOp::Mul => ScalarValue::Float64(Some(l * r)),
+            BinOp::Div => ScalarValue::Float64(Some(l / r)),
+            _ => ScalarValue::Bool(None),
+        },
+        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => match op {
+            BinOp::Add => ScalarValue::Int32(Some(l + r)),
+            BinOp::Sub => ScalarValue::Int32(Some(l - r)),
+            _ => ScalarValue::Bool(None),
+        },
         _ => ScalarValue::Int64(None),
     }
 }
@@ -306,7 +340,9 @@ impl ExecutionOp for ProjectExec {
 
                 for (i, expr) in self.expressions.iter().enumerate() {
                     let vals = eval_expr_column(expr, &batch)?;
-                    let alias = self.aliases[i].as_deref().unwrap_or_else(|| infer_expr_name(expr));
+                    let alias = self.aliases[i]
+                        .as_deref()
+                        .unwrap_or_else(|| infer_expr_name(expr));
                     let dt = infer_type(expr, &batch.schema);
 
                     let mut col = ColumnArray::empty(dt);
@@ -328,7 +364,11 @@ impl ExecutionOp for ProjectExec {
 
 pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
     match expr {
-        LogicalExpr::Column(idx) => schema.columns.get(*idx).map(|c| c.data_type).unwrap_or(DataType::Int64),
+        LogicalExpr::Column(idx) => schema
+            .columns
+            .get(*idx)
+            .map(|c| c.data_type)
+            .unwrap_or(DataType::Int64),
         LogicalExpr::Literal(v) => v.data_type(),
         LogicalExpr::BinaryOp { .. } => DataType::Int64,
         LogicalExpr::Aggregate(agg) => {
@@ -383,7 +423,12 @@ pub struct SortExec {
 
 impl SortExec {
     pub fn new(sort_keys: Vec<SortKey>, input: Box<dyn ExecutionOp>, schema: Schema) -> Self {
-        Self { sort_keys, input, schema, done: false }
+        Self {
+            sort_keys,
+            input,
+            schema,
+            done: false,
+        }
     }
 }
 
@@ -420,12 +465,12 @@ impl ExecutionOp for SortExec {
         }
 
         // Sort rows by sort keys
-        let sort_key_indices: Vec<(usize, bool)> = self.sort_keys.iter()
-            .map(|sk| {
-                match &sk.expr {
-                    LogicalExpr::Column(idx) => (*idx, sk.desc),
-                    _ => (0, sk.desc),
-                }
+        let sort_key_indices: Vec<(usize, bool)> = self
+            .sort_keys
+            .iter()
+            .map(|sk| match &sk.expr {
+                LogicalExpr::Column(idx) => (*idx, sk.desc),
+                _ => (0, sk.desc),
             })
             .collect();
 
@@ -453,17 +498,23 @@ impl ExecutionOp for SortExec {
 }
 
 fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
-    if a.is_null() && b.is_null() { return std::cmp::Ordering::Equal; }
-    if a.is_null() { return std::cmp::Ordering::Less; }
-    if b.is_null() { return std::cmp::Ordering::Greater; }
+    if a.is_null() && b.is_null() {
+        return std::cmp::Ordering::Equal;
+    }
+    if a.is_null() {
+        return std::cmp::Ordering::Less;
+    }
+    if b.is_null() {
+        return std::cmp::Ordering::Greater;
+    }
 
     match (a, b) {
-        _ if a.numeric_cmp(b).is_some() => a
-            .numeric_cmp(b)
-            .unwrap_or(std::cmp::Ordering::Equal),
+        _ if a.numeric_cmp(b).is_some() => a.numeric_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
         (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => l.cmp(r),
         (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => l.cmp(r),
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
+        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => {
+            l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => l.cmp(r),
         _ => std::cmp::Ordering::Equal,
     }
@@ -485,7 +536,15 @@ pub struct LimitExec {
 
 impl LimitExec {
     pub fn new(limit: usize, offset: usize, input: Box<dyn ExecutionOp>, schema: Schema) -> Self {
-        Self { limit, offset, input, schema, rows_returned: 0, skip_remaining: offset, done: false }
+        Self {
+            limit,
+            offset,
+            input,
+            schema,
+            rows_returned: 0,
+            skip_remaining: offset,
+            done: false,
+        }
     }
 }
 
@@ -561,8 +620,19 @@ pub struct HashAggregateExec {
 }
 
 impl HashAggregateExec {
-    pub fn new(group_by: Vec<LogicalExpr>, aggregates: Vec<AggregateExpr>, input: Box<dyn ExecutionOp>, input_schema: Schema) -> Self {
-        Self { group_by, aggregates, input, input_schema, done: false }
+    pub fn new(
+        group_by: Vec<LogicalExpr>,
+        aggregates: Vec<AggregateExpr>,
+        input: Box<dyn ExecutionOp>,
+        input_schema: Schema,
+    ) -> Self {
+        Self {
+            group_by,
+            aggregates,
+            input,
+            input_schema,
+            done: false,
+        }
     }
 }
 
@@ -588,12 +658,14 @@ impl ExecutionOp for HashAggregateExec {
         // Group by key
         let mut groups: HashMap<Vec<String>, Vec<Vec<ScalarValue>>> = HashMap::new();
         for row in &all_rows {
-            let key: Vec<String> = self.group_by.iter()
-                .map(|expr| {
-                    match expr {
-                        LogicalExpr::Column(idx) => row.get(*idx).map(|v| v.to_string()).unwrap_or_default(),
-                        _ => String::new(),
+            let key: Vec<String> = self
+                .group_by
+                .iter()
+                .map(|expr| match expr {
+                    LogicalExpr::Column(idx) => {
+                        row.get(*idx).map(|v| v.to_string()).unwrap_or_default()
                     }
+                    _ => String::new(),
                 })
                 .collect();
             groups.entry(key).or_default().push(row.clone());
@@ -601,14 +673,23 @@ impl ExecutionOp for HashAggregateExec {
 
         // Build output schema
         let mut col_defs = Vec::new();
-        tracing::debug!("HashAggregateExec: input_schema = {:?}", self.input_schema.columns.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>());
+        tracing::debug!(
+            "HashAggregateExec: input_schema = {:?}",
+            self.input_schema
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.data_type))
+                .collect::<Vec<_>>()
+        );
         for expr in &self.group_by {
             match expr {
                 LogicalExpr::Column(idx) => {
                     if let Some(cd) = self.input_schema.columns.get(*idx) {
-                        col_defs.push(ColumnDef::new(&cd.name, cd.data_type)
-                            .with_scale(cd.scale)
-                            .with_precision(cd.precision));
+                        col_defs.push(
+                            ColumnDef::new(&cd.name, cd.data_type)
+                                .with_scale(cd.scale)
+                                .with_precision(cd.precision),
+                        );
                     }
                 }
                 _ => {}
@@ -624,7 +705,12 @@ impl ExecutionOp for HashAggregateExec {
             };
             let arg_name = match &*agg.arg {
                 LogicalExpr::Wildcard => "*".to_string(),
-                LogicalExpr::Column(idx) => self.input_schema.columns.get(*idx).map(|c| c.name.clone()).unwrap_or_default(),
+                LogicalExpr::Column(idx) => self
+                    .input_schema
+                    .columns
+                    .get(*idx)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default(),
                 _ => "expr".to_string(),
             };
             let name = if agg.distinct {
@@ -643,9 +729,13 @@ impl ExecutionOp for HashAggregateExec {
             // Group-by columns
             for expr in &self.group_by {
                 if let LogicalExpr::Column(idx) = expr {
-                    let _val = rows.first().and_then(|r| r.get(*idx)).cloned().unwrap_or(ScalarValue::Int64(None));
+                    let _val = rows
+                        .first()
+                        .and_then(|r| r.get(*idx))
+                        .cloned()
+                        .unwrap_or(ScalarValue::Int64(None));
                     let _col_idx = batch.schema.columns.len(); // Will be set after
-                    // Actually push directly
+                                                               // Actually push directly
                 }
             }
 
@@ -653,7 +743,12 @@ impl ExecutionOp for HashAggregateExec {
             let mut row_vals = Vec::new();
             for expr in &self.group_by {
                 if let LogicalExpr::Column(idx) = expr {
-                    row_vals.push(rows.first().and_then(|r| r.get(*idx)).cloned().unwrap_or(ScalarValue::Int64(None)));
+                    row_vals.push(
+                        rows.first()
+                            .and_then(|r| r.get(*idx))
+                            .cloned()
+                            .unwrap_or(ScalarValue::Int64(None)),
+                    );
                 }
             }
             for agg in &self.aggregates {
@@ -670,7 +765,11 @@ impl ExecutionOp for HashAggregateExec {
     }
 }
 
-pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], schema: &Schema) -> ScalarValue {
+pub fn compute_aggregate(
+    agg: &AggregateExpr,
+    rows: &[Vec<ScalarValue>],
+    schema: &Schema,
+) -> ScalarValue {
     let col_idx = match &*agg.arg {
         LogicalExpr::Column(idx) => Some(*idx),
         LogicalExpr::Wildcard => None,
@@ -680,7 +779,10 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], schema:
     match agg.func {
         AggFunc::Count => {
             if let Some(idx) = col_idx {
-                let non_null = rows.iter().filter(|r| !r.get(idx).map(|v| v.is_null()).unwrap_or(true)).count();
+                let non_null = rows
+                    .iter()
+                    .filter(|r| !r.get(idx).map(|v| v.is_null()).unwrap_or(true))
+                    .count();
                 ScalarValue::Int64(Some(non_null as i64))
             } else {
                 ScalarValue::Int64(Some(rows.len() as i64))
@@ -688,14 +790,20 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], schema:
         }
         AggFunc::Sum => {
             if let Some(idx) = col_idx {
-                let input_type = schema.columns.get(idx).map(|c| c.data_type).unwrap_or(DataType::Int64);
+                let input_type = schema
+                    .columns
+                    .get(idx)
+                    .map(|c| c.data_type)
+                    .unwrap_or(DataType::Int64);
                 if matches!(input_type, DataType::Float32 | DataType::Float64) {
-                    let sum: f64 = rows.iter()
+                    let sum: f64 = rows
+                        .iter()
                         .filter_map(|r| r.get(idx).and_then(|v| scalar_to_f64(v)))
                         .sum();
                     ScalarValue::Float64(Some(sum))
                 } else {
-                    let sum: i64 = rows.iter()
+                    let sum: i64 = rows
+                        .iter()
                         .filter_map(|r| r.get(idx).and_then(|v| v.integer_i128()))
                         .filter_map(|v| i64::try_from(v).ok())
                         .sum();
@@ -707,11 +815,15 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], schema:
         }
         AggFunc::Avg => {
             if let Some(idx) = col_idx {
-                let vals: Vec<f64> = rows.iter()
+                let vals: Vec<f64> = rows
+                    .iter()
                     .filter_map(|r| r.get(idx).and_then(|v| scalar_to_f64(v)))
                     .collect();
-                if vals.is_empty() { ScalarValue::Float64(None) }
-                else { ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64)) }
+                if vals.is_empty() {
+                    ScalarValue::Float64(None)
+                } else {
+                    ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64))
+                }
             } else {
                 ScalarValue::Float64(None)
             }
@@ -723,7 +835,9 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], schema:
                     .filter(|v| !v.is_null())
                     .min_by(|a, b| compare_scalars(a, b))
                     .unwrap_or(ScalarValue::Int64(None))
-            } else { ScalarValue::Int64(None) }
+            } else {
+                ScalarValue::Int64(None)
+            }
         }
         AggFunc::Max => {
             if let Some(idx) = col_idx {
@@ -732,7 +846,9 @@ pub fn compute_aggregate(agg: &AggregateExpr, rows: &[Vec<ScalarValue>], schema:
                     .filter(|v| !v.is_null())
                     .max_by(|a, b| compare_scalars(a, b))
                     .unwrap_or(ScalarValue::Int64(None))
-            } else { ScalarValue::Int64(None) }
+            } else {
+                ScalarValue::Int64(None)
+            }
         }
     }
 }
@@ -839,7 +955,10 @@ impl HashJoinExec {
                 // Extract join key value for this row
                 let key_val = self.extract_join_key_left(&batch, row);
                 let key_str = key_val.to_string();
-                self.hash_table.entry(key_str).or_default().push(left_row_idx);
+                self.hash_table
+                    .entry(key_str)
+                    .or_default()
+                    .push(left_row_idx);
                 left_row_idx += 1;
             }
             self.left_batches.push(batch);
@@ -857,12 +976,12 @@ impl HashJoinExec {
         // For now, assume condition is a simple equality comparison like a.id = b.id
         // The left column is the first column in the condition
         match &self.condition {
-            LogicalExpr::BinaryOp { left, .. } => {
-                match &**left {
-                    LogicalExpr::Column(idx) => batch.scalar(row, *idx).unwrap_or(ScalarValue::Int64(None)),
-                    _ => ScalarValue::Int64(None),
+            LogicalExpr::BinaryOp { left, .. } => match &**left {
+                LogicalExpr::Column(idx) => {
+                    batch.scalar(row, *idx).unwrap_or(ScalarValue::Int64(None))
                 }
-            }
+                _ => ScalarValue::Int64(None),
+            },
             _ => ScalarValue::Int64(None),
         }
     }
@@ -870,12 +989,12 @@ impl HashJoinExec {
     /// Extract join key value from right batch row
     fn extract_join_key_right(&self, batch: &RecordBatch, row: usize) -> ScalarValue {
         match &self.condition {
-            LogicalExpr::BinaryOp { right, .. } => {
-                match &**right {
-                    LogicalExpr::Column(idx) => batch.scalar(row, *idx).unwrap_or(ScalarValue::Int64(None)),
-                    _ => ScalarValue::Int64(None),
+            LogicalExpr::BinaryOp { right, .. } => match &**right {
+                LogicalExpr::Column(idx) => {
+                    batch.scalar(row, *idx).unwrap_or(ScalarValue::Int64(None))
                 }
-            }
+                _ => ScalarValue::Int64(None),
+            },
             _ => ScalarValue::Int64(None),
         }
     }
@@ -908,10 +1027,18 @@ impl ExecutionOp for HashJoinExec {
                         // Build output row: left columns + right columns
                         let mut row_vals = Vec::new();
                         for col in 0..self.left_schema.columns.len() {
-                            row_vals.push(left_batch.scalar(row_in_batch, col).unwrap_or(ScalarValue::Int64(None)));
+                            row_vals.push(
+                                left_batch
+                                    .scalar(row_in_batch, col)
+                                    .unwrap_or(ScalarValue::Int64(None)),
+                            );
                         }
                         for col in 0..self.right_schema.columns.len() {
-                            row_vals.push(right_batch.scalar(right_row, col).unwrap_or(ScalarValue::Int64(None)));
+                            row_vals.push(
+                                right_batch
+                                    .scalar(right_row, col)
+                                    .unwrap_or(ScalarValue::Int64(None)),
+                            );
                         }
                         output_rows.push(row_vals);
 
@@ -951,7 +1078,11 @@ impl ExecutionOp for HashJoinExec {
 
                     let mut row_vals = Vec::new();
                     for col in 0..self.left_schema.columns.len() {
-                        row_vals.push(left_batch.scalar(row_in_batch, col).unwrap_or(ScalarValue::Int64(None)));
+                        row_vals.push(
+                            left_batch
+                                .scalar(row_in_batch, col)
+                                .unwrap_or(ScalarValue::Int64(None)),
+                        );
                     }
                     // Nulls for right columns
                     for _ in 0..self.right_schema.columns.len() {
@@ -994,7 +1125,7 @@ impl HashJoinExec {
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline builder: LogicalPlan → ExecutionOp tree
+// Pipeline builder: LogicalPlan 鈫?ExecutionOp tree
 // ---------------------------------------------------------------------------
 
 /// Build an execution pipeline from a logical plan.
@@ -1005,8 +1136,13 @@ pub fn build_pipeline(
 ) -> Result<Box<dyn ExecutionOp>> {
     match plan {
         LogicalPlan::Scan(scan) => {
-            let batches = table_batches.get(&scan.table_name).cloned().unwrap_or_default();
-            Ok(Box::new(ScanExec::new(batches, scan.projection).with_table_schema(scan.schema.clone())))
+            let batches = table_batches
+                .get(&scan.table_name)
+                .cloned()
+                .unwrap_or_default();
+            Ok(Box::new(
+                ScanExec::new(batches, scan.projection).with_table_schema(scan.schema.clone()),
+            ))
         }
         LogicalPlan::Filter(filter) => {
             let schema = get_scan_schema(&filter.input);
@@ -1035,12 +1171,22 @@ pub fn build_pipeline(
         LogicalPlan::Limit(limit) => {
             let schema = get_scan_schema(&limit.input);
             let input = build_pipeline(*limit.input, table_batches)?;
-            Ok(Box::new(LimitExec::new(limit.limit, limit.offset, input, schema)))
+            Ok(Box::new(LimitExec::new(
+                limit.limit,
+                limit.offset,
+                input,
+                schema,
+            )))
         }
         LogicalPlan::Aggregate(agg) => {
             let input_schema = get_scan_schema(&agg.input);
             let input = build_pipeline(*agg.input, table_batches)?;
-            Ok(Box::new(HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema)))
+            Ok(Box::new(HashAggregateExec::new(
+                agg.group_by,
+                agg.aggregates,
+                input,
+                input_schema,
+            )))
         }
         LogicalPlan::Join(join) => {
             let left = build_pipeline(*join.left, table_batches)?;
@@ -1055,9 +1201,7 @@ pub fn build_pipeline(
                 join.output_schema,
             )))
         }
-        LogicalPlan::Empty => {
-            Ok(Box::new(ScanExec::new(vec![], None)))
-        }
+        LogicalPlan::Empty => Ok(Box::new(ScanExec::new(vec![], None))),
     }
 }
 
@@ -1075,113 +1219,5 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::types::DataType;
-
-    fn make_test_batch() -> RecordBatch {
-        let schema = Schema::new(vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("name", DataType::VarChar),
-            ColumnDef::new("age", DataType::Int32),
-        ]);
-        let mut batch = RecordBatch::new(schema);
-        for i in 0..5i64 {
-            batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(i))).unwrap();
-            batch.column_mut(1).unwrap().push(&ScalarValue::VarChar(Some(format!("user_{}", i)))).unwrap();
-            batch.column_mut(2).unwrap().push(&ScalarValue::Int32(Some((20 + i as i32) * 2))).unwrap();
-        }
-        batch
-    }
-
-    #[test]
-    fn test_scan_exec() {
-        let batch = make_test_batch();
-        let mut exec = ScanExec::new(vec![batch], None);
-        let result = exec.next_batch().unwrap().unwrap();
-        assert_eq!(result.num_rows(), 5);
-        assert!(exec.next_batch().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_filter_exec() {
-        let batch = make_test_batch();
-        let schema = batch.schema.clone();
-        // Filter: age > 44 (ages are 40, 42, 44, 46, 48)
-        let predicate = LogicalExpr::BinaryOp {
-            left: Box::new(LogicalExpr::Column(2)),
-            op: BinOp::Gt,
-            right: Box::new(LogicalExpr::Literal(ScalarValue::Int32(Some(44)))),
-        };
-        let mut exec = FilterExec {
-            predicate,
-            input: Box::new(ScanExec::new(vec![batch], None)),
-            schema,
-        };
-        let result = exec.next_batch().unwrap().unwrap();
-        assert_eq!(result.num_rows(), 2); // ages 46 and 48
-    }
-
-    #[test]
-    fn test_sort_exec() {
-        let batch = make_test_batch();
-        let schema = batch.schema.clone();
-        let sort_keys = vec![SortKey {
-            expr: LogicalExpr::Column(0),
-            desc: true,
-        }];
-        let mut exec = SortExec::new(sort_keys, Box::new(ScanExec::new(vec![batch], None)), schema);
-        let result = exec.next_batch().unwrap().unwrap();
-        assert_eq!(result.num_rows(), 5);
-        // First row should be id=4 (sorted desc)
-        assert_eq!(result.scalar(0, 0).unwrap(), ScalarValue::Int64(Some(4)));
-        assert_eq!(result.scalar(4, 0).unwrap(), ScalarValue::Int64(Some(0)));
-    }
-
-    #[test]
-    fn test_limit_exec() {
-        let batch = make_test_batch();
-        let schema = batch.schema.clone();
-        let mut exec = LimitExec::new(2, 1, Box::new(ScanExec::new(vec![batch], None)), schema);
-        let result = exec.next_batch().unwrap().unwrap();
-        assert_eq!(result.num_rows(), 2);
-        // Should skip id=0, return id=1 and id=2
-        assert_eq!(result.scalar(0, 0).unwrap(), ScalarValue::Int64(Some(1)));
-        assert_eq!(result.scalar(1, 0).unwrap(), ScalarValue::Int64(Some(2)));
-    }
-
-    #[test]
-    fn test_hash_aggregate_count() {
-        let batch = make_test_batch();
-        let input_schema = batch.schema.clone();
-        let agg = AggregateExpr {
-            func: AggFunc::Count,
-            arg: Box::new(LogicalExpr::Wildcard),
-            distinct: false,
-        };
-        let mut exec = HashAggregateExec::new(
-            vec![],
-            vec![agg],
-            Box::new(ScanExec::new(vec![batch], None)),
-            input_schema,
-        );
-        let result = exec.next_batch().unwrap().unwrap();
-        assert_eq!(result.num_rows(), 1);
-        assert_eq!(result.scalar(0, 0).unwrap(), ScalarValue::Int64(Some(5)));
-    }
-
-    #[test]
-    fn test_project_exec() {
-        let batch = make_test_batch();
-        let input_schema = batch.schema.clone();
-        let mut exec = ProjectExec {
-            expressions: vec![LogicalExpr::Column(0), LogicalExpr::Column(1)],
-            aliases: vec![Some("id".into()), Some("name".into())],
-            input: Box::new(ScanExec::new(vec![batch], None)),
-            input_schema,
-        };
-        let result = exec.next_batch().unwrap().unwrap();
-        assert_eq!(result.num_columns(), 2);
-        assert_eq!(result.num_rows(), 5);
-    }
-}
+#[path = "operators_tests.rs"]
+mod tests;
