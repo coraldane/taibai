@@ -1,11 +1,15 @@
-use std::collections::HashMap;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
-use crate::storage::catalog::schema::{DatabaseCatalog, PartitionType, SecondaryIndexType};
-use crate::storage::segment::meta::remove_sidecar_meta;
+use crate::storage::catalog::schema::{
+    DatabaseCatalog, PartitionType, SecondaryIndexType, TableMeta,
+};
 use crate::types::batch::{ColumnDef, ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -14,6 +18,627 @@ use crate::sql::parser::ast::{
     AlterOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef,
     PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
 };
+
+const FILE_DELETE_MAX_ATTEMPTS: usize = 5;
+const FILE_DELETE_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const DROP_TOMBSTONE_DIR: &str = ".taibai-drop-tombstones";
+const DATABASE_DROP_TOMBSTONE_DIR: &str = ".taibai-drop-databases";
+const TRUNCATE_TOMBSTONE_DIR: &str = ".taibai-truncate-tombstones";
+const PARTITION_TOMBSTONE_DIR: &str = ".taibai-partition-tombstones";
+const RENAME_TOMBSTONE_DIR: &str = ".taibai-rename-tombstones";
+const BEFORE_META_FILE: &str = "before.json";
+const COMMITTED_FILE: &str = "committed";
+const RENAME_TARGET_FILE: &str = "new-name";
+const STAGED_DATA_DIR: &str = "data";
+const FRESH_DATA_DIR: &str = "fresh";
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_DROP_CLEANUP_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static FORCE_DDL_CLEANUP_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn is_retryable_delete_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::PermissionDenied
+    ) || matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+fn retry_delete<T, F>(operation: &str, path: &Path, mut delete: F) -> io::Result<()>
+where
+    F: FnMut(&Path) -> std::result::Result<(), T>,
+    T: Into<io::Error>,
+{
+    let mut delay = FILE_DELETE_INITIAL_DELAY;
+    for attempt in 1..=FILE_DELETE_MAX_ATTEMPTS {
+        match delete(path).map_err(Into::into) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if attempt < FILE_DELETE_MAX_ATTEMPTS && is_retryable_delete_error(&error) =>
+            {
+                tracing::warn!(
+                    operation,
+                    path = %path.display(),
+                    attempt,
+                    max_attempts = FILE_DELETE_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %error,
+                    "file deletion failed; retrying"
+                );
+                thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{} '{}' failed after {} attempt(s): {}",
+                        operation,
+                        path.display(),
+                        attempt,
+                        error
+                    ),
+                ));
+            }
+        }
+    }
+    unreachable!("delete retry loop always returns")
+}
+
+fn remove_file_with_retry(path: &Path) -> io::Result<()> {
+    retry_delete("remove file", path, |path| std::fs::remove_file(path))
+}
+
+fn remove_dir_all_with_retry(path: &Path) -> io::Result<()> {
+    retry_delete("remove directory", path, |path| {
+        std::fs::remove_dir_all(path)
+    })
+}
+
+fn remove_staged_table_directory(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FORCE_DROP_CLEANUP_FAILURE.with(|force| force.replace(false)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "forced staged-directory cleanup failure",
+        ));
+    }
+    remove_dir_all_with_retry(path)
+}
+
+fn remove_committed_operation_directory(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FORCE_DDL_CLEANUP_FAILURE.with(|force| force.replace(false)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "forced committed-operation cleanup failure",
+        ));
+    }
+    remove_dir_all_with_retry(path)
+}
+
+fn stage_table_directory(path: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("table path '{}' is not a directory", path.display()),
+        ));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("table path '{}' has no parent directory", path.display()),
+        )
+    })?;
+    let table_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("table path '{}' has no table name", path.display()),
+        )
+    })?;
+    let tombstone_root = parent.join(DROP_TOMBSTONE_DIR);
+    std::fs::create_dir_all(&tombstone_root)?;
+    let tombstone = tombstone_root.join(table_name);
+    if tombstone.exists() {
+        remove_dir_all_with_retry(&tombstone)?;
+    }
+    std::fs::rename(path, &tombstone)?;
+    Ok(Some(tombstone))
+}
+
+fn restore_staged_table_directory(tombstone: &Path, table_dir: &Path) -> io::Result<()> {
+    std::fs::rename(tombstone, table_dir)?;
+    if let Some(root) = tombstone.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
+fn cleanup_pending_table_drop(data_dir: &Path, db: &str, table: &str) -> Result<bool> {
+    let tombstone = data_dir.join(db).join(DROP_TOMBSTONE_DIR).join(table);
+    if !tombstone.exists() {
+        return Ok(false);
+    }
+    remove_staged_table_directory(&tombstone).map_err(|error| {
+        TaibaiError::Storage(format!(
+            "table '{}.{}' is absent from the catalog, but pending physical cleanup for '{}' failed: {}",
+            db,
+            table,
+            tombstone.display(),
+            error
+        ))
+    })?;
+    if let Some(root) = tombstone.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(true)
+}
+
+fn stage_database_directory(data_dir: &Path, name: &str) -> io::Result<Option<std::path::PathBuf>> {
+    let database_dir = data_dir.join(name);
+    let metadata = match std::fs::metadata(&database_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "database path '{}' is not a directory",
+                database_dir.display()
+            ),
+        ));
+    }
+    let root = data_dir.join(DATABASE_DROP_TOMBSTONE_DIR);
+    std::fs::create_dir_all(&root)?;
+    let tombstone = root.join(name);
+    if tombstone.exists() {
+        remove_dir_all_with_retry(&tombstone)?;
+    }
+    std::fs::rename(&database_dir, &tombstone)?;
+    Ok(Some(tombstone))
+}
+
+fn restore_staged_database_directory(tombstone: &Path, database_dir: &Path) -> io::Result<()> {
+    std::fs::rename(tombstone, database_dir)?;
+    if let Some(root) = tombstone.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
+fn write_before_meta(operation_dir: &Path, table_meta: &TableMeta) -> Result<()> {
+    std::fs::create_dir_all(operation_dir)?;
+    let data = serde_json::to_vec_pretty(table_meta).map_err(|error| {
+        TaibaiError::Storage(format!("failed to serialize DDL journal: {error}"))
+    })?;
+    std::fs::write(operation_dir.join(BEFORE_META_FILE), data)?;
+    Ok(())
+}
+
+fn read_before_meta(operation_dir: &Path) -> Result<TableMeta> {
+    let data = std::fs::read(operation_dir.join(BEFORE_META_FILE))?;
+    serde_json::from_slice(&data)
+        .map_err(|error| TaibaiError::Storage(format!("failed to parse DDL journal: {error}")))
+}
+
+fn table_meta_matches(left: &TableMeta, right: &TableMeta) -> Result<bool> {
+    let left = serde_json::to_vec(left).map_err(|error| {
+        TaibaiError::Storage(format!("failed to compare table metadata: {error}"))
+    })?;
+    let right = serde_json::to_vec(right).map_err(|error| {
+        TaibaiError::Storage(format!("failed to compare table metadata: {error}"))
+    })?;
+    Ok(left == right)
+}
+
+fn mark_operation_committed(operation_dir: &Path) -> Result<()> {
+    std::fs::write(operation_dir.join(COMMITTED_FILE), b"committed")?;
+    Ok(())
+}
+
+fn rollback_staged_table_data(operation_dir: &Path, table_dir: &Path) -> Result<()> {
+    let staged_data = operation_dir.join(STAGED_DATA_DIR);
+    if staged_data.exists() {
+        if table_dir.exists() {
+            return Err(TaibaiError::Storage(format!(
+                "cannot restore staged table data '{}' because '{}' already exists",
+                staged_data.display(),
+                table_dir.display()
+            )));
+        }
+        std::fs::rename(&staged_data, table_dir)?;
+    }
+    let fresh_data = operation_dir.join(FRESH_DATA_DIR);
+    if fresh_data.exists() {
+        remove_dir_all_with_retry(&fresh_data)?;
+    }
+    let _ = std::fs::remove_file(operation_dir.join(BEFORE_META_FILE));
+    let _ = std::fs::remove_dir(operation_dir);
+    if let Some(root) = operation_dir.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
+fn restore_partition_files(operation_dir: &Path, table_dir: &Path) -> Result<()> {
+    let staged_data = operation_dir.join(STAGED_DATA_DIR);
+    if staged_data.exists() {
+        std::fs::create_dir_all(table_dir)?;
+        for entry in std::fs::read_dir(&staged_data)? {
+            let entry = entry?;
+            let destination = table_dir.join(entry.file_name());
+            if destination.exists() {
+                return Err(TaibaiError::Storage(format!(
+                    "cannot restore staged partition file '{}' because '{}' already exists",
+                    entry.path().display(),
+                    destination.display()
+                )));
+            }
+            std::fs::rename(entry.path(), destination)?;
+        }
+        let _ = std::fs::remove_dir(&staged_data);
+    }
+    let _ = std::fs::remove_file(operation_dir.join(BEFORE_META_FILE));
+    let _ = std::fs::remove_dir(operation_dir);
+    if let Some(root) = operation_dir.parent() {
+        let _ = std::fs::remove_dir(root);
+    }
+    Ok(())
+}
+
+fn stage_partition_files(
+    operation_dir: &Path,
+    table_dir: &Path,
+    partition_key: &str,
+) -> Result<()> {
+    let staged_data = operation_dir.join(STAGED_DATA_DIR);
+    std::fs::create_dir_all(&staged_data)?;
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    if table_dir.exists() {
+        for entry in std::fs::read_dir(table_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if !file_name.ends_with(".dat")
+                || crate::storage::partition::parse_partition_key(&file_name).as_deref()
+                    != Some(partition_key)
+            {
+                continue;
+            }
+            for candidate in [
+                path.clone(),
+                crate::storage::segment::meta::sidecar_meta_path(&path),
+                path.with_extension("meta"),
+            ] {
+                if candidate.exists() && seen.insert(candidate.clone()) {
+                    paths.push(candidate);
+                }
+            }
+        }
+    }
+
+    for path in paths {
+        let destination = staged_data.join(path.file_name().ok_or_else(|| {
+            TaibaiError::Storage(format!(
+                "partition file '{}' has no file name",
+                path.display()
+            ))
+        })?);
+        if let Err(error) = std::fs::rename(&path, &destination) {
+            restore_partition_files(operation_dir, table_dir)?;
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn resolve_partition_key(
+    table_meta: &TableMeta,
+    table_dir: &Path,
+    requested_key: &str,
+    resident_partition_keys: &[String],
+) -> Result<Option<String>> {
+    let mut existing_keys = table_meta
+        .partitions
+        .iter()
+        .map(|partition| partition.key.clone())
+        .collect::<HashSet<_>>();
+    existing_keys.extend(resident_partition_keys.iter().cloned());
+
+    if table_dir.exists() {
+        for entry in std::fs::read_dir(table_dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if let Some(key) = crate::storage::partition::parse_partition_key(&file_name) {
+                existing_keys.insert(key);
+            }
+        }
+    }
+
+    if existing_keys.contains(requested_key) {
+        return Ok(Some(requested_key.to_string()));
+    }
+
+    let unprefixed_key = requested_key
+        .strip_prefix('p')
+        .or_else(|| requested_key.strip_prefix('P'));
+    if let Some(key) = unprefixed_key.filter(|key| !key.is_empty()) {
+        if existing_keys.contains(key) {
+            return Ok(Some(key.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+pub(super) fn recover_table_data_tombstones(
+    data_dir: &Path,
+    catalogs: &HashMap<String, DatabaseCatalog>,
+) -> Result<()> {
+    for (database_name, catalog) in catalogs {
+        let database_dir = data_dir.join(database_name);
+        for root_name in [TRUNCATE_TOMBSTONE_DIR, PARTITION_TOMBSTONE_DIR] {
+            let root = database_dir.join(root_name);
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let operation_dir = entry.path();
+                let table_name = entry.file_name().to_string_lossy().to_string();
+                let Some(current_meta) = catalog.get_table(&table_name) else {
+                    if let Err(error) = remove_dir_all_with_retry(&operation_dir) {
+                        tracing::warn!(path = %operation_dir.display(), error = %error, "failed to clean orphaned DDL tombstone");
+                    }
+                    continue;
+                };
+                let table_dir = database_dir.join(&table_name);
+                let before_meta_path = operation_dir.join(BEFORE_META_FILE);
+                if !before_meta_path.exists() {
+                    // The journal is written before any data is staged and is
+                    // only removed during rollback or committed cleanup. A
+                    // surviving operation directory without it is therefore a
+                    // partially cleaned committed operation.
+                    if root_name == TRUNCATE_TOMBSTONE_DIR && !table_dir.exists() {
+                        let fresh = operation_dir.join(FRESH_DATA_DIR);
+                        if fresh.exists() {
+                            std::fs::rename(&fresh, &table_dir)?;
+                        } else {
+                            std::fs::create_dir_all(&table_dir)?;
+                        }
+                    }
+                    if let Err(error) = remove_dir_all_with_retry(&operation_dir) {
+                        tracing::warn!(path = %operation_dir.display(), error = %error, "failed to finish partial committed DDL cleanup");
+                    }
+                    continue;
+                }
+                let before_meta = read_before_meta(&operation_dir)?;
+                let committed = operation_dir.join(COMMITTED_FILE).exists()
+                    || !table_meta_matches(current_meta, &before_meta)?;
+                if !committed {
+                    if root_name == TRUNCATE_TOMBSTONE_DIR {
+                        rollback_staged_table_data(&operation_dir, &table_dir)?;
+                    } else {
+                        restore_partition_files(&operation_dir, &table_dir)?;
+                    }
+                    tracing::info!(database = %database_name, table = %table_name, "rolled back interrupted DDL operation");
+                } else {
+                    if root_name == TRUNCATE_TOMBSTONE_DIR && !table_dir.exists() {
+                        let fresh = operation_dir.join(FRESH_DATA_DIR);
+                        if fresh.exists() {
+                            std::fs::rename(&fresh, &table_dir)?;
+                        } else {
+                            std::fs::create_dir_all(&table_dir)?;
+                        }
+                    }
+                    if let Err(error) = remove_dir_all_with_retry(&operation_dir) {
+                        tracing::warn!(path = %operation_dir.display(), error = %error, "failed to clean committed DDL tombstone");
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&root);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn recover_rename_tombstones(
+    data_dir: &Path,
+    catalogs: &HashMap<String, DatabaseCatalog>,
+) -> Result<()> {
+    for (database_name, catalog) in catalogs {
+        let database_dir = data_dir.join(database_name);
+        let root = database_dir.join(RENAME_TOMBSTONE_DIR);
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let operation_dir = entry.path();
+            let old_name = entry.file_name().to_string_lossy().to_string();
+            let new_name = std::fs::read_to_string(operation_dir.join(RENAME_TARGET_FILE))?;
+            let old_dir = database_dir.join(&old_name);
+            let new_dir = database_dir.join(&new_name);
+            if catalog.get_table(&old_name).is_some() && catalog.get_table(&new_name).is_none() {
+                if !old_dir.exists() && new_dir.exists() {
+                    std::fs::rename(&new_dir, &old_dir).map_err(|error| {
+                        TaibaiError::Storage(format!(
+                            "failed to roll back interrupted rename '{}.{}' to '{}': {}",
+                            database_name, old_name, new_name, error
+                        ))
+                    })?;
+                }
+                if !old_dir.exists() {
+                    return Err(TaibaiError::Storage(format!(
+                        "cannot recover interrupted rename '{}.{}': neither '{}' nor '{}' exists",
+                        database_name,
+                        old_name,
+                        old_dir.display(),
+                        new_dir.display()
+                    )));
+                }
+            } else if catalog.get_table(&new_name).is_some() && !new_dir.exists() {
+                if old_dir.exists() {
+                    std::fs::rename(&old_dir, &new_dir)?;
+                } else {
+                    return Err(TaibaiError::Storage(format!(
+                        "cannot finish committed rename '{}.{}': data directory '{}' is missing",
+                        database_name,
+                        new_name,
+                        new_dir.display()
+                    )));
+                }
+            }
+            remove_dir_all_with_retry(&operation_dir)?;
+        }
+        let _ = std::fs::remove_dir(&root);
+    }
+    Ok(())
+}
+
+pub(super) fn recover_database_drop_tombstones(data_dir: &Path) -> Result<()> {
+    let root = data_dir.join(DATABASE_DROP_TOMBSTONE_DIR);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let meta_dir = data_dir.join("meta");
+    for entry in entries {
+        let entry = entry?;
+        let tombstone = entry.path();
+        let database_name = entry.file_name().to_string_lossy().to_string();
+        let database_dir = data_dir.join(&database_name);
+        let catalog_file = DatabaseCatalog::catalog_path(&meta_dir, &database_name);
+        if catalog_file.exists() && !database_dir.exists() {
+            restore_staged_database_directory(&tombstone, &database_dir).map_err(|error| {
+                TaibaiError::Storage(format!(
+                    "failed to restore database '{}' from interrupted DROP at '{}': {}",
+                    database_name,
+                    tombstone.display(),
+                    error
+                ))
+            })?;
+            tracing::info!(database = %database_name, "restored database directory from interrupted drop");
+        } else if let Err(error) = remove_dir_all_with_retry(&tombstone) {
+            tracing::warn!(
+                database = %database_name,
+                path = %tombstone.display(),
+                error = %error,
+                "failed to clean committed database drop tombstone"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir(&root);
+    Ok(())
+}
+
+/// Recover a DROP interrupted on either side of the durable catalog update.
+/// A table still present in the catalog is restored; a committed DROP is cleaned.
+pub(super) fn recover_drop_tombstones(
+    data_dir: &Path,
+    catalogs: &HashMap<String, DatabaseCatalog>,
+) -> Result<()> {
+    let Ok(databases) = std::fs::read_dir(data_dir) else {
+        return Ok(());
+    };
+    for database in databases.flatten() {
+        if !database
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let database_name = database.file_name();
+        if database_name == "meta" || database_name == "wal" {
+            continue;
+        }
+        let database_name = database_name.to_string_lossy();
+        let database_dir = database.path();
+        let tombstone_root = database_dir.join(DROP_TOMBSTONE_DIR);
+        let Some(catalog) = catalogs.get(database_name.as_ref()) else {
+            tracing::warn!(
+                database = %database_name,
+                path = %tombstone_root.display(),
+                "skipping drop recovery because the database catalog is unavailable"
+            );
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&tombstone_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let table_name = entry.file_name().to_string_lossy().to_string();
+            let table_is_cataloged = catalog.get_table(&table_name).is_some();
+            let table_dir = database_dir.join(&table_name);
+            if table_is_cataloged {
+                if table_dir.exists() && !table_dir.is_dir() {
+                    return Err(TaibaiError::Storage(format!(
+                        "cannot recover table '{}.{}': cataloged table path '{}' is not a directory",
+                        database_name,
+                        table_name,
+                        table_dir.display()
+                    )));
+                }
+                if !table_dir.exists() {
+                    match restore_staged_table_directory(&path, &table_dir) {
+                        Ok(()) => tracing::info!(
+                            database = %database_name,
+                            table = %table_name,
+                            path = %table_dir.display(),
+                            "restored table directory from interrupted drop"
+                        ),
+                        Err(error) => {
+                            return Err(TaibaiError::Storage(format!(
+                                "failed to restore table '{}.{}' from interrupted DROP at '{}': {}",
+                                database_name,
+                                table_name,
+                                path.display(),
+                                error
+                            )))
+                        }
+                    }
+                } else if let Err(error) = remove_dir_all_with_retry(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to remove stale drop tombstone"
+                    );
+                }
+            } else {
+                match remove_dir_all_with_retry(&path) {
+                    Ok(()) => {
+                        tracing::info!(path = %path.display(), "removed stale drop tombstone")
+                    }
+                    Err(error) => tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to remove stale drop tombstone"
+                    ),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&tombstone_root);
+    }
+    Ok(())
+}
 
 fn validate_hot_def(col_defs: &[ColumnDef], table: &str, hot_def: &HotDef) -> Result<()> {
     let time_col = col_defs
@@ -58,1793 +683,10 @@ fn validate_hot_def(col_defs: &[ColumnDef], table: &str, hot_def: &HotDef) -> Re
     Ok(())
 }
 
-pub fn exec_create_table(
-    engine: &Engine,
-    db: &str,
-    name: &str,
-    columns: &[ColumnDefAst],
-    if_not_exists: bool,
-    primary_key: &[String],
-    unique_keys: &[UniqueKeyDef],
-    cluster_by: &Option<Vec<String>>,
-    partition_by: &Option<PartitionDef>,
-    ttl: &Option<TtlDef>,
-    hot: &Option<HotDef>,
-) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
-
-    if catalog.get_table(name).is_some() {
-        if if_not_exists {
-            return Ok(ExecResult::Ok { rows_affected: 0 });
-        }
-        return Err(TaibaiError::Sql(format!(
-            "table '{}.{}' already exists",
-            db, name
-        )));
-    }
-
-    let mut col_defs: Vec<ColumnDef> = columns
-        .iter()
-        .map(|c| {
-            let default_value = c.default_value.as_ref().map(|dv| match dv {
-                DefaultValue::CurrentTimestamp => ColumnDefaultValue::CurrentTimestamp,
-                DefaultValue::Literal(s) => ColumnDefaultValue::Literal(s.clone()),
-            });
-            ColumnDef::new(&c.name, c.data_type)
-                .with_nullable(c.nullable)
-                .with_scale(c.scale)
-                .with_precision(c.precision)
-                .with_auto_increment(c.auto_increment)
-                .with_primary_key(c.primary_key)
-                .with_default_value(default_value)
-        })
-        .collect();
-
-    apply_table_primary_key(&mut col_defs, primary_key)?;
-    validate_column_constraints(&mut col_defs)?;
-    let table_unique_indexes = build_table_unique_indexes(columns, &col_defs, unique_keys)?;
-    if let Some(ttl_def) = ttl {
-        validate_ttl_columns(&col_defs, ttl_def)?;
-    }
-
-    if let Some(hot_def) = hot {
-        validate_hot_def(&col_defs, name, hot_def)?;
-    }
-
-    catalog.create_table(name, col_defs)?;
-
-    if let Some(meta) = catalog.get_table_mut(name) {
-        for (index_name, columns) in table_unique_indexes {
-            meta.add_unique_index(&index_name, columns)?;
-        }
-        if let Some(ref keys) = cluster_by {
-            meta.cluster_key = keys.clone();
-        }
-        if let Some(hot_def) = hot {
-            meta.hot_time_column = Some(hot_def.time_column.clone());
-            meta.hot_close_time = hot_def.close_time.clone();
-            meta.hot_index_column = hot_def.index_column.clone();
-        }
-        if let Some(ref pdef) = partition_by {
-            meta.partition_key = pdef.column.clone();
-            meta.partition_type = match pdef.strategy {
-                PartitionStrategy::Day => PartitionType::Day,
-                PartitionStrategy::Year => PartitionType::Year,
-                PartitionStrategy::Month => PartitionType::Month,
-                PartitionStrategy::Value => PartitionType::Value,
-                PartitionStrategy::Hash(buckets) => {
-                    meta.partition_param = buckets;
-                    PartitionType::Hash
-                }
-                PartitionStrategy::Mod(divisor) => {
-                    meta.partition_param = divisor;
-                    PartitionType::Mod
-                }
-            };
-            meta.update_partition_key_idx();
-        }
-        if let Some(ttl_def) = ttl {
-            meta.set_ttl(&ttl_def.column, ttl_def.duration_secs);
-        }
-    }
-
-    let auto_inc_col = columns.iter().find(|c| c.auto_increment);
-    if let Some(ai_col) = auto_inc_col {
-        if let Some(meta) = catalog.get_table_mut(name) {
-            meta.auto_increment_next_value = 1;
-        }
-        engine
-            .auto_increment_manager()
-            .register(db, name, &ai_col.name, 1)?;
-    }
-
-    let table_dir = engine.data_dir().join(db).join(name);
-    std::fs::create_dir_all(&table_dir)?;
-
-    let meta_dir = engine.data_dir().join("meta");
-    catalog.save(&meta_dir)?;
-
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_drop_index(
-    engine: &Engine,
-    db: &str,
-    table: &str,
-    index_name: &str,
-    if_exists: bool,
-) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
-    let has_unique_index = table_meta
-        .unique_indexes
-        .iter()
-        .any(|idx| idx.name.eq_ignore_ascii_case(index_name));
-    let has_secondary_index = table_meta
-        .secondary_indexes
-        .iter()
-        .any(|idx| idx.name.eq_ignore_ascii_case(index_name));
-    if !has_unique_index && !has_secondary_index {
-        if if_exists {
-            return Ok(ExecResult::Ok { rows_affected: 0 });
-        }
-        return Err(TaibaiError::Sql(format!(
-            "index '{}' does not exist",
-            index_name
-        )));
-    }
-    let table_meta = catalog
-        .get_table_mut(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
-    if has_unique_index {
-        table_meta.drop_unique_index(index_name)?;
-        engine
-            .index_manager()
-            .remove_unique_index_snapshot(db, table, index_name);
-        engine.index_manager().mark_index_stale(db, table);
-    } else {
-        table_meta.drop_secondary_index(index_name)?;
-        engine.index_manager().mark_index_stale(db, table);
-    }
-    let meta_dir = engine.data_dir().join("meta");
-    catalog.save(&meta_dir)?;
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_create_index(
-    engine: &Engine,
-    db: &str,
-    table: &str,
-    index_name: &str,
-    columns: &[String],
-    unique: bool,
-    if_not_exists: bool,
-    index_type: Option<&str>,
-) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-        .clone();
-    let schema = Schema::new(table_meta.columns.clone());
-    let indices = resolve_unique_index_columns(&schema, columns)?;
-    let table_meta = catalog
-        .get_table_mut(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
-    if table_meta.has_index(index_name) {
-        if if_not_exists {
-            return Ok(ExecResult::Ok { rows_affected: 0 });
-        }
-        return Err(TaibaiError::Sql(format!(
-            "index '{}' already exists",
-            index_name
-        )));
-    }
-    if unique {
-        super::dml_insert::validate_unique_key_uniqueness(
-            engine, db, table, &schema, &indices, index_name, None,
-        )?;
-        table_meta.add_unique_index(index_name, columns.to_vec())?;
-    } else {
-        let index_type = parse_secondary_index_type(index_type)?;
-        table_meta.add_secondary_index(index_name, columns.to_vec(), index_type)?;
-    }
-    let meta_dir = engine.data_dir().join("meta");
-    catalog.save(&meta_dir)?;
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-fn parse_secondary_index_type(index_type: Option<&str>) -> Result<SecondaryIndexType> {
-    match index_type.unwrap_or("bloom").to_ascii_lowercase().as_str() {
-        "bloom" => Ok(SecondaryIndexType::Bloom),
-        "minmax" | "min_max" => Ok(SecondaryIndexType::MinMax),
-        "set" => Ok(SecondaryIndexType::Set),
-        other => Err(TaibaiError::Sql(format!(
-            "unsupported index type '{}'; supported types: bloom, minmax, set",
-            other
-        ))),
-    }
-}
-
-fn resolve_unique_index_columns(schema: &Schema, columns: &[String]) -> Result<Vec<usize>> {
-    if columns.is_empty() {
-        return Err(TaibaiError::Sql(
-            "index must contain at least one column".into(),
-        ));
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut indices = Vec::with_capacity(columns.len());
-    for column in columns {
-        let idx = schema
-            .index_of(column)
-            .ok_or_else(|| TaibaiError::Sql(format!("index column '{}' not found", column)))?;
-        if !seen.insert(idx) {
-            return Err(TaibaiError::Sql(format!(
-                "duplicate index column '{}'",
-                column
-            )));
-        }
-        indices.push(idx);
-    }
-    Ok(indices)
-}
-
-pub fn exec_show_unique_index_status(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-        .clone();
-    drop(catalogs);
-
-    let schema = Schema::new(vec![
-        ColumnDef::new("table", DataType::VarChar),
-        ColumnDef::new("index_name", DataType::VarChar),
-        ColumnDef::new("columns", DataType::VarChar),
-        ColumnDef::new("status", DataType::VarChar),
-        ColumnDef::new("message", DataType::VarChar),
-    ]);
-    let mut batch = RecordBatch::new(schema.clone());
-    let table_schema = Schema::new(table_meta.columns.clone());
-
-    for index in &table_meta.unique_indexes {
-        let indices = resolve_unique_index_columns(&table_schema, &index.columns);
-        let status = indices.and_then(|indices| {
-            super::dml_insert::validate_unique_key_uniqueness(
-                engine,
-                db,
-                table,
-                &table_schema,
-                &indices,
-                &index.name,
-                None,
-            )?;
-            engine
-                .index_manager()
-                .load_unique_index_snapshot(db, table, &index.name)
-        });
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(table.to_string())))?;
-        batch
-            .column_mut(1)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(index.name.clone())))?;
-        batch
-            .column_mut(2)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(index.columns.join(","))))?;
-        match status {
-            Ok(snapshot) => {
-                let message = snapshot
-                    .map(|snapshot| format!("persisted keys={}", snapshot.key_count))
-                    .unwrap_or_else(|| "not persisted; run REBUILD UNIQUE INDEX".to_string());
-                batch
-                    .column_mut(3)
-                    .unwrap()
-                    .push(&ScalarValue::VarChar(Some("READY".to_string())))?;
-                batch
-                    .column_mut(4)
-                    .unwrap()
-                    .push(&ScalarValue::VarChar(Some(message)))?;
-            }
-            Err(err) => {
-                batch
-                    .column_mut(3)
-                    .unwrap()
-                    .push(&ScalarValue::VarChar(Some("INVALID".to_string())))?;
-                batch
-                    .column_mut(4)
-                    .unwrap()
-                    .push(&ScalarValue::VarChar(Some(err.to_string())))?;
-            }
-        }
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_rebuild_unique_index(
-    engine: &Engine,
-    db: &str,
-    table: &str,
-    index_name: Option<&str>,
-) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-        .clone();
-    drop(catalogs);
-
-    let table_schema = Schema::new(table_meta.columns.clone());
-    engine.flush_all_buffers()?;
-    let mut rebuilt = 0u64;
-    engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, table, || {
-            for index in &table_meta.unique_indexes {
-                if index_name
-                    .map(|name| !index.name.eq_ignore_ascii_case(name))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let indices = resolve_unique_index_columns(&table_schema, &index.columns)?;
-                let entries = super::dml_insert::collect_unique_index_entries(
-                    engine,
-                    db,
-                    table,
-                    &indices,
-                    &index.name,
-                )?;
-                engine.index_manager().persist_unique_index_entries(
-                    db,
-                    table,
-                    &index.name,
-                    &index.columns,
-                    entries,
-                )?;
-                rebuilt += 1;
-            }
-            Ok(())
-        })?;
-
-    if rebuilt == 0 && index_name.is_some() {
-        return Err(TaibaiError::Sql(format!(
-            "unique index '{}' does not exist",
-            index_name.unwrap()
-        )));
-    }
-    engine.index_manager().mark_index_stale(db, table);
-    Ok(ExecResult::Ok {
-        rows_affected: rebuilt,
-    })
-}
-
-pub fn exec_drop_table(
-    engine: &Engine,
-    db: &str,
-    name: &str,
-    if_exists: bool,
-) -> Result<ExecResult> {
-    let total_start = Instant::now();
-    tracing::info!(db, table = name, "drop table: start");
-
-    {
-        let stage_start = Instant::now();
-        let mut catalogs = engine.catalogs().write().unwrap();
-        tracing::info!(
-            db,
-            table = name,
-            elapsed_ms = stage_start.elapsed().as_millis(),
-            "drop table: acquired catalog write lock"
-        );
-
-        let catalog = get_existing_catalog(&mut catalogs, db)?;
-
-        if catalog.get_table(name).is_none() {
-            if if_exists {
-                tracing::info!(
-                    db,
-                    table = name,
-                    total_elapsed_ms = total_start.elapsed().as_millis(),
-                    "drop table: table missing, if exists ignored"
-                );
-                return Ok(ExecResult::Ok { rows_affected: 0 });
-            }
-            return Err(TaibaiError::Sql(format!(
-                "table '{}.{}' does not exist",
-                db, name
-            )));
-        }
-
-        let stage_start = Instant::now();
-        catalog.drop_table(name)?;
-        engine.auto_increment_manager().unregister(db, name);
-        engine.index_manager().remove_index(db, name);
-        tracing::info!(
-            db,
-            table = name,
-            elapsed_ms = stage_start.elapsed().as_millis(),
-            "drop table: removed metadata managers"
-        );
-
-        let meta_dir = engine.data_dir().join("meta");
-        let stage_start = Instant::now();
-        catalog.save(&meta_dir)?;
-        tracing::info!(
-            db,
-            table = name,
-            elapsed_ms = stage_start.elapsed().as_millis(),
-            total_elapsed_ms = total_start.elapsed().as_millis(),
-            "drop table: saved catalog"
-        );
-    }
-    tracing::info!(
-        db,
-        table = name,
-        total_elapsed_ms = total_start.elapsed().as_millis(),
-        "drop table: released catalog write lock"
-    );
-
-    let table_dir = engine.data_dir().join(db).join(name);
-    tracing::info!(db, table = name, path = %table_dir.display(), "drop table: waiting for table mutation lock");
-    let stage_start = Instant::now();
-    engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, name, || {
-            tracing::info!(db, table = name, elapsed_ms = stage_start.elapsed().as_millis(), "drop table: acquired table mutation lock");
-
-            let step_start = Instant::now();
-            engine.segment_mgr().remove_wal(&table_dir);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed wal handle");
-
-            let step_start = Instant::now();
-            engine.segment_mgr().remove_table_state(db, name);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table state");
-
-            let step_start = Instant::now();
-            engine.segment_mgr().invalidate_readers_under(&table_dir);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: invalidated readers");
-
-            let step_start = Instant::now();
-            engine.hot_store_manager().remove(db, name);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed resident hot store");
-
-            let step_start = Instant::now();
-            let cleared_rows = engine.batch_writer().clear_memtables(db, name);
-            tracing::info!(db, table = name, cleared_rows, elapsed_ms = step_start.elapsed().as_millis(), "drop table: cleared memtables");
-
-            if table_dir.exists() {
-                let step_start = Instant::now();
-                tracing::info!(db, table = name, path = %table_dir.display(), "drop table: removing table directory");
-                std::fs::remove_dir_all(&table_dir).map_err(|err| {
-                    tracing::error!(db, table = name, path = %table_dir.display(), error = %err, elapsed_ms = step_start.elapsed().as_millis(), "drop table: failed to remove table directory");
-                    err
-                })?;
-                tracing::info!(db, table = name, path = %table_dir.display(), elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table directory");
-            } else {
-                tracing::info!(db, table = name, path = %table_dir.display(), "drop table: table directory missing");
-            }
-            Ok(())
-        })?;
-
-    tracing::info!(
-        db,
-        table = name,
-        total_elapsed_ms = total_start.elapsed().as_millis(),
-        "drop table: finished"
-    );
-
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_alter_table(
-    engine: &Engine,
-    db: &str,
-    name: &str,
-    operations: &[AlterOperation],
-) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = catalogs
-        .get_mut(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-
-    if catalog.get_table(name).is_none() {
-        return Err(TaibaiError::Sql(format!(
-            "table '{}.{}' does not exist",
-            db, name
-        )));
-    }
-
-    for op in operations {
-        match op {
-            AlterOperation::AddColumn { column } => {
-                let default_value = column.default_value.as_ref().map(|dv| match dv {
-                    DefaultValue::CurrentTimestamp => ColumnDefaultValue::CurrentTimestamp,
-                    DefaultValue::Literal(s) => ColumnDefaultValue::Literal(s.clone()),
-                });
-                let mut col_def = ColumnDef::new(&column.name, column.data_type)
-                    .with_nullable(column.nullable)
-                    .with_scale(column.scale)
-                    .with_precision(column.precision)
-                    .with_auto_increment(column.auto_increment)
-                    .with_primary_key(column.primary_key)
-                    .with_default_value(default_value);
-                validate_column_constraints(std::slice::from_mut(&mut col_def))?;
-                if !col_def.nullable && col_def.default_value.is_none() {
-                    let existing_rows = catalog
-                        .get_table(name)
-                        .map(|meta| meta.row_count)
-                        .unwrap_or(0);
-                    if existing_rows > 0 {
-                        return Err(TaibaiError::Sql(format!(
-                            "cannot add NOT NULL column '{}' without default to non-empty table",
-                            col_def.name
-                        )));
-                    }
-                }
-                let added_auto_increment = col_def.auto_increment;
-                let added_column_name = col_def.name.clone();
-                catalog.add_column(name, col_def)?;
-                if added_auto_increment {
-                    if let Some(meta) = catalog.get_table_mut(name) {
-                        meta.auto_increment_next_value = 1;
-                    }
-                    engine
-                        .auto_increment_manager()
-                        .register(db, name, &added_column_name, 1)?;
-                }
-            }
-            AlterOperation::DropColumn { name: col_name } => {
-                let dropped_auto_increment = catalog
-                    .get_table(name)
-                    .and_then(|meta| {
-                        meta.columns
-                            .iter()
-                            .find(|col| col.name.eq_ignore_ascii_case(col_name))
-                    })
-                    .is_some_and(|col| col.auto_increment);
-                catalog.drop_column(name, col_name)?;
-                if dropped_auto_increment {
-                    engine.auto_increment_manager().unregister(db, name);
-                }
-                if let Some(meta) = catalog.get_table_mut(name) {
-                    meta.unique_indexes.retain(|idx| {
-                        !idx.columns
-                            .iter()
-                            .any(|col| col.eq_ignore_ascii_case(col_name))
-                    });
-                    meta.secondary_indexes.retain(|idx| {
-                        !idx.columns
-                            .iter()
-                            .any(|col| col.eq_ignore_ascii_case(col_name))
-                    });
-                    meta.update_partition_key_idx();
-                    meta.update_ttl_column_idx();
-                }
-            }
-            AlterOperation::AddUniqueKey { key } => {
-                let table_meta = catalog
-                    .get_table(name)
-                    .ok_or_else(|| {
-                        TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
-                    })?
-                    .clone();
-                let schema = Schema::new(table_meta.columns.clone());
-                let index_name = key
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("uk_{}", table_meta.unique_indexes.len() + 1));
-                let indices = resolve_unique_index_columns(&schema, &key.columns)?;
-                super::dml_insert::validate_unique_key_uniqueness(
-                    engine,
-                    db,
-                    name,
-                    &schema,
-                    &indices,
-                    &index_name,
-                    None,
-                )?;
-                catalog
-                    .get_table_mut(name)
-                    .ok_or_else(|| {
-                        TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
-                    })?
-                    .add_unique_index(&index_name, key.columns.clone())?;
-            }
-            AlterOperation::DropIndex { name: index_name } => {
-                let table_meta = catalog.get_table_mut(name).ok_or_else(|| {
-                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
-                })?;
-                if table_meta
-                    .unique_indexes
-                    .iter()
-                    .any(|idx| idx.name.eq_ignore_ascii_case(index_name))
-                {
-                    table_meta.drop_unique_index(index_name)?;
-                    engine
-                        .index_manager()
-                        .remove_unique_index_snapshot(db, name, index_name);
-                    engine.index_manager().mark_index_stale(db, name);
-                } else {
-                    table_meta.drop_secondary_index(index_name)?;
-                    engine.index_manager().mark_index_stale(db, name);
-                }
-            }
-            AlterOperation::RenameColumn { old_name, new_name } => {
-                catalog.rename_column(name, old_name, new_name)?;
-                if let Some(meta) = catalog.get_table_mut(name) {
-                    for index in &mut meta.unique_indexes {
-                        for column in &mut index.columns {
-                            if column.eq_ignore_ascii_case(old_name) {
-                                *column = new_name.clone();
-                            }
-                        }
-                    }
-                    for index in &mut meta.secondary_indexes {
-                        for column in &mut index.columns {
-                            if column.eq_ignore_ascii_case(old_name) {
-                                *column = new_name.clone();
-                            }
-                        }
-                    }
-                }
-            }
-            AlterOperation::ModifyColumn { column } => {
-                let existing = catalog
-                    .get_table(name)
-                    .and_then(|meta| {
-                        meta.columns
-                            .iter()
-                            .find(|col| col.name.eq_ignore_ascii_case(&column.name))
-                    })
-                    .ok_or_else(|| {
-                        TaibaiError::Sql(format!(
-                            "column '{}' does not exist in table '{}'",
-                            column.name, name
-                        ))
-                    })?;
-                if existing.data_type != column.data_type
-                    || existing.scale != column.scale
-                    || existing.precision != column.precision
-                {
-                    return Err(TaibaiError::Sql(format!(
-                        "MODIFY COLUMN type changes require column rewrite and are not supported yet for '{}'",
-                        column.name
-                    )));
-                }
-                catalog.modify_column(
-                    name,
-                    &column.name,
-                    column.data_type,
-                    column.scale,
-                    column.precision,
-                )?;
-                engine.persist_auto_increment_next_value(db, name, false)?;
-            }
-            AlterOperation::RenameTable { new_name } => {
-                let old_table_dir = engine.data_dir().join(db).join(name);
-                let new_table_dir = engine.data_dir().join(db).join(new_name);
-                catalog.rename_table(name, new_name)?;
-                engine
-                    .auto_increment_manager()
-                    .rename_table(db, name, new_name);
-                engine.index_manager().rename_index(db, name, new_name);
-                engine.segment_mgr().rename_table_state(db, name, new_name);
-                if old_table_dir.exists() && !new_table_dir.exists() {
-                    std::fs::rename(&old_table_dir, &new_table_dir)?;
-                }
-            }
-            AlterOperation::DropPartition { partition_key } => {
-                let table_dir = engine.data_dir().join(db).join(name);
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, || {
-                        if table_dir.exists() {
-                            for e in std::fs::read_dir(&table_dir)?.flatten() {
-                                let file_name = e.file_name().to_string_lossy().to_string();
-                                if file_name.starts_with(&format!("p{}", partition_key))
-                                    && file_name.ends_with(".dat")
-                                {
-                                    engine.segment_mgr().invalidate_reader(&e.path());
-                                    let _ = remove_sidecar_meta(&e.path());
-                                    let _ = std::fs::remove_file(e.path());
-                                }
-                            }
-                        }
-                        Ok(())
-                    })?;
-                if let Some(meta) = catalog.get_table_mut(name) {
-                    if let Some(part) = meta.partitions.iter().find(|p| p.key == *partition_key) {
-                        meta.row_count -= part.row_count;
-                        meta.segment_count -= part.segment_count;
-                    }
-                    meta.partitions.retain(|p| p.key != *partition_key);
-                }
-                engine.index_manager().mark_index_stale(db, name);
-            }
-            AlterOperation::TruncatePartition { partition_key } => {
-                let table_dir = engine.data_dir().join(db).join(name);
-                engine
-                    .segment_mgr()
-                    .with_table_mutation_lock(db, name, || {
-                        if table_dir.exists() {
-                            for e in std::fs::read_dir(&table_dir)?.flatten() {
-                                let file_name = e.file_name().to_string_lossy().to_string();
-                                if file_name.starts_with(&format!("p{}", partition_key))
-                                    && file_name.ends_with(".dat")
-                                {
-                                    engine.segment_mgr().invalidate_reader(&e.path());
-                                    let _ = remove_sidecar_meta(&e.path());
-                                    let _ = std::fs::remove_file(e.path());
-                                }
-                            }
-                        }
-                        Ok(())
-                    })?;
-                if let Some(meta) = catalog.get_table_mut(name) {
-                    if let Some(part) = meta.partitions.iter_mut().find(|p| p.key == *partition_key)
-                    {
-                        meta.row_count -= part.row_count;
-                        meta.segment_count -= part.segment_count;
-                        part.row_count = 0;
-                        part.segment_count = 0;
-                    }
-                }
-                engine.index_manager().mark_index_stale(db, name);
-            }
-            AlterOperation::SetTtl { ttl } => {
-                let meta = catalog.get_table_mut(name).ok_or_else(|| {
-                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
-                })?;
-                validate_ttl_definition(meta, ttl)?;
-                meta.set_ttl(&ttl.column, ttl.duration_secs);
-            }
-            AlterOperation::DropTtl => {
-                let meta = catalog.get_table_mut(name).ok_or_else(|| {
-                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
-                })?;
-                meta.clear_ttl();
-            }
-        }
-    }
-
-    let meta_dir = engine.data_dir().join("meta");
-    catalog.save(&meta_dir)?;
-
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-fn build_table_unique_indexes(
-    ast_columns: &[ColumnDefAst],
-    columns: &[ColumnDef],
-    unique_keys: &[UniqueKeyDef],
-) -> Result<Vec<(String, Vec<String>)>> {
-    let mut indexes = Vec::new();
-    for col in ast_columns
-        .iter()
-        .filter(|col| col.unique && !col.primary_key)
-    {
-        indexes.push((format!("uk_{}", col.name), vec![col.name.clone()]));
-    }
-    for (idx, key) in unique_keys.iter().enumerate() {
-        let name = key
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("uk_{}", idx + 1));
-        if key.columns.is_empty() {
-            return Err(TaibaiError::Sql(
-                "unique key must contain at least one column".into(),
-            ));
-        }
-        for key_col in &key.columns {
-            if !columns
-                .iter()
-                .any(|col| col.name.eq_ignore_ascii_case(key_col))
-            {
-                return Err(TaibaiError::Sql(format!(
-                    "unique key column '{}' not found",
-                    key_col
-                )));
-            }
-        }
-        indexes.push((name, key.columns.clone()));
-    }
-    let mut seen = std::collections::HashSet::new();
-    for (name, _) in &indexes {
-        if !seen.insert(name.to_ascii_lowercase()) {
-            return Err(TaibaiError::Sql(format!("duplicate unique key '{}'", name)));
-        }
-    }
-    Ok(indexes)
-}
-
-fn validate_ttl_definition(
-    table_meta: &crate::storage::catalog::schema::TableMeta,
-    ttl: &TtlDef,
-) -> Result<()> {
-    validate_ttl_columns(&table_meta.columns, ttl)
-}
-
-fn validate_ttl_columns(columns: &[ColumnDef], ttl: &TtlDef) -> Result<()> {
-    if ttl.duration_secs <= 0 {
-        return Err(TaibaiError::Sql(
-            "TTL duration must be a positive number of seconds".into(),
-        ));
-    }
-
-    let column = columns
-        .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(&ttl.column))
-        .ok_or_else(|| TaibaiError::Sql(format!("TTL column '{}' not found", ttl.column)))?;
-
-    if column.data_type != DataType::Timestamp {
-        return Err(TaibaiError::Sql(format!(
-            "TTL column '{}' must be TIMESTAMP",
-            ttl.column
-        )));
-    }
-
-    Ok(())
-}
-
-fn apply_table_primary_key(columns: &mut [ColumnDef], primary_key: &[String]) -> Result<()> {
-    for pk_col in primary_key {
-        let column = columns
-            .iter_mut()
-            .find(|c| c.name.eq_ignore_ascii_case(pk_col))
-            .ok_or_else(|| {
-                TaibaiError::Sql(format!("primary key column '{}' not found", pk_col))
-            })?;
-        column.primary_key = true;
-    }
-    Ok(())
-}
-
-fn validate_column_constraints(columns: &mut [ColumnDef]) -> Result<()> {
-    let mut seen_names = std::collections::HashSet::new();
-    let mut seen_pk = std::collections::HashSet::new();
-
-    for col in columns {
-        let name_key = col.name.to_ascii_lowercase();
-        if !seen_names.insert(name_key.clone()) {
-            return Err(TaibaiError::Sql(format!("duplicate column '{}'", col.name)));
-        }
-        if col.primary_key {
-            if !seen_pk.insert(name_key) {
-                return Err(TaibaiError::Sql(format!(
-                    "duplicate primary key column '{}'",
-                    col.name
-                )));
-            }
-            col.nullable = false;
-        }
-        if let Some(default_value) = col.default_value.take() {
-            col.default_value = Some(normalize_default_value(
-                default_value,
-                col.data_type,
-                col.scale,
-                &col.name,
-            )?);
-        }
-    }
-    Ok(())
-}
-
-fn normalize_default_value(
-    default_value: ColumnDefaultValue,
-    data_type: DataType,
-    scale: i32,
-    column_name: &str,
-) -> Result<ColumnDefaultValue> {
-    match default_value {
-        ColumnDefaultValue::CurrentTimestamp => {
-            if data_type != DataType::Timestamp {
-                return Err(TaibaiError::Sql(format!(
-                    "CURRENT_TIMESTAMP default requires TIMESTAMP column '{}'",
-                    column_name
-                )));
-            }
-            Ok(ColumnDefaultValue::CurrentTimestamp)
-        }
-        ColumnDefaultValue::Literal(value) => {
-            let expr = crate::sql::parser::ast::Expr::Literal(value);
-            let scalar = super::helpers::eval_expr_to_scalar_with_scale_timezone(
-                &expr, &data_type, scale, 0,
-            )?;
-            if !scalar.is_null() && scalar.data_type() != data_type {
-                return Err(TaibaiError::Sql(format!(
-                    "default value for column '{}' has type {}, expected {}",
-                    column_name,
-                    scalar.data_type().display_name(),
-                    data_type.display_name()
-                )));
-            }
-            Ok(ColumnDefaultValue::Literal(scalar))
-        }
-    }
-}
-
-pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = catalogs
-        .get_mut(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-
-    if catalog.get_table(table).is_none() {
-        return Err(TaibaiError::Sql(format!(
-            "table '{}.{}' does not exist",
-            db, table
-        )));
-    }
-
-    let table_dir = engine.data_dir().join(db).join(table);
-    engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, table, || {
-            engine.segment_mgr().remove_wal(&table_dir);
-            engine.batch_writer().clear_memtables(db, table);
-            engine.segment_mgr().remove_table_state(db, table);
-            engine.segment_mgr().invalidate_readers_under(&table_dir);
-            engine.index_manager().clear_index(db, table);
-
-            let wal_dir = table_dir.join("wal");
-            if wal_dir.exists() {
-                let _ = std::fs::remove_dir_all(&wal_dir);
-            }
-
-            if table_dir.exists() {
-                for e in std::fs::read_dir(&table_dir)?.flatten() {
-                    let path = e.path();
-                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if (file_name.starts_with("seg_") || file_name.starts_with("p"))
-                        && file_name.ends_with(".dat")
-                    {
-                        let _ = remove_sidecar_meta(&path);
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-            }
-            Ok(())
-        })?;
-
-    if engine.auto_increment_manager().get(db, table).is_some() {
-        engine.auto_increment_manager().reset(db, table, 1)?;
-    }
-
-    if let Some(meta) = catalog.get_table_mut(table) {
-        meta.reset_auto_increment_next_value();
-        meta.row_count = 0;
-        meta.segment_count = 0;
-        for part in &mut meta.partitions {
-            part.row_count = 0;
-            part.segment_count = 0;
-        }
-    }
-
-    let meta_dir = engine.data_dir().join("meta");
-    catalog.save(&meta_dir)?;
-
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_create_database(
-    engine: &Engine,
-    name: &str,
-    if_not_exists: bool,
-) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-
-    if catalogs.contains_key(name) {
-        if if_not_exists {
-            return Ok(ExecResult::Ok { rows_affected: 0 });
-        }
-        return Err(TaibaiError::Sql(format!(
-            "database '{}' already exists",
-            name
-        )));
-    }
-
-    let db_dir = engine.data_dir().join(name);
-    std::fs::create_dir_all(&db_dir)?;
-
-    let meta_dir = engine.data_dir().join("meta");
-    let catalog = DatabaseCatalog::new(name);
-    catalog.save(&meta_dir)?;
-    catalogs.insert(name.to_string(), catalog);
-
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-
-    if !catalogs.contains_key(name) {
-        if if_exists {
-            return Ok(ExecResult::Ok { rows_affected: 0 });
-        }
-        return Err(TaibaiError::Sql(format!(
-            "database '{}' does not exist",
-            name
-        )));
-    }
-
-    if name == "default" {
-        return Err(TaibaiError::Sql("cannot drop default database".into()));
-    }
-
-    let table_names = catalogs
-        .get(name)
-        .map(|catalog| {
-            catalog
-                .table_names()
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    catalogs.remove(name);
-
-    for table_name in &table_names {
-        engine.batch_writer().clear_memtables(name, table_name);
-    }
-    engine.auto_increment_manager().unregister_database(name);
-    engine.segment_mgr().remove_database_state(name);
-    engine.index_manager().remove_database_indexes(name);
-
-    let db_dir = engine.data_dir().join(name);
-    engine.segment_mgr().invalidate_readers_under(&db_dir);
-    if db_dir.exists() {
-        let _ = std::fs::remove_dir_all(&db_dir);
-    }
-
-    let meta_dir = engine.data_dir().join("meta");
-    let catalog_file = DatabaseCatalog::catalog_path(&meta_dir, name);
-    if catalog_file.exists() {
-        let _ = std::fs::remove_file(&catalog_file);
-    }
-
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_create_user(engine: &Engine, name: &str, pwd: &str) -> Result<ExecResult> {
-    engine.auth_manager().create_user(name, pwd)?;
-    tracing::info!(user = name, "CREATE USER executed");
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_create_role(engine: &Engine, name: &str) -> Result<ExecResult> {
-    engine.auth_manager().create_role(name)?;
-    tracing::info!(role = name, "CREATE ROLE executed");
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_drop_user(engine: &Engine, name: &str, if_exists: bool) -> Result<ExecResult> {
-    engine.auth_manager().drop_user(name, if_exists)?;
-    tracing::info!(user = name, if_exists, "DROP USER executed");
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_drop_role(engine: &Engine, name: &str, if_exists: bool) -> Result<ExecResult> {
-    engine.auth_manager().drop_role(name, if_exists)?;
-    tracing::info!(role = name, if_exists, "DROP ROLE executed");
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_grant(
-    engine: &Engine,
-    privileges: &[Privilege],
-    on: &Option<GrantObject>,
-    to: &str,
-) -> Result<ExecResult> {
-    let perms: Vec<Permission> = privileges
-        .iter()
-        .map(|p| {
-            let perm_type = match p {
-                Privilege::All => PermissionType::All,
-                Privilege::Select => PermissionType::Select,
-                Privilege::Insert => PermissionType::Insert,
-                Privilege::Update => PermissionType::Update,
-                Privilege::Delete => PermissionType::Delete,
-                Privilege::Create => PermissionType::Create,
-                Privilege::Drop => PermissionType::Drop,
-                Privilege::Alter => PermissionType::Alter,
-                Privilege::Truncate => PermissionType::Truncate,
-                Privilege::Subscribe => PermissionType::Subscribe,
-            };
-            let (obj_type, obj_name) = match on {
-                Some(GrantObject::Table(t)) => (PermissionObjectType::Table, t.clone()),
-                Some(GrantObject::Database(d)) => (PermissionObjectType::Database, d.clone()),
-                Some(GrantObject::AllTables) => (PermissionObjectType::Table, "*".to_string()),
-                Some(GrantObject::AllDatabases) => {
-                    (PermissionObjectType::Database, "*".to_string())
-                }
-                None => (PermissionObjectType::Global, "*".to_string()),
-            };
-            Permission {
-                permission_type: perm_type,
-                object_type: obj_type,
-                object_name: obj_name,
-            }
-        })
-        .collect();
-    engine.auth_manager().grant(to, perms)?;
-    tracing::info!(privileges_count = privileges.len(), to, "GRANT executed");
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_revoke(
-    engine: &Engine,
-    privileges: &[Privilege],
-    on: &Option<GrantObject>,
-    from: &str,
-) -> Result<ExecResult> {
-    let perm_types: Vec<PermissionType> = privileges
-        .iter()
-        .map(|p| match p {
-            Privilege::All => PermissionType::All,
-            Privilege::Select => PermissionType::Select,
-            Privilege::Insert => PermissionType::Insert,
-            Privilege::Update => PermissionType::Update,
-            Privilege::Delete => PermissionType::Delete,
-            Privilege::Create => PermissionType::Create,
-            Privilege::Drop => PermissionType::Drop,
-            Privilege::Alter => PermissionType::Alter,
-            Privilege::Truncate => PermissionType::Truncate,
-            Privilege::Subscribe => PermissionType::Subscribe,
-        })
-        .collect();
-    let obj_name = match on {
-        Some(GrantObject::Table(t)) => Some(t.as_str()),
-        Some(GrantObject::Database(d)) => Some(d.as_str()),
-        Some(GrantObject::AllTables) => Some("*"),
-        Some(GrantObject::AllDatabases) => Some("*"),
-        None => None,
-    };
-    engine.auth_manager().revoke(from, &perm_types, obj_name)?;
-    tracing::info!(privileges_count = privileges.len(), from, "REVOKE executed");
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_show_tables(engine: &Engine, db: &str) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-    let schema = Schema::new(vec![ColumnDef::new("table_name", DataType::VarChar)]);
-
-    let mut batch = RecordBatch::new(schema.clone());
-    for name in catalog.table_names() {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(name.to_string())))?;
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_databases(engine: &Engine) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let schema = Schema::new(vec![ColumnDef::new("database", DataType::VarChar)]);
-
-    let mut batch = RecordBatch::new(schema.clone());
-    for name in catalogs.keys() {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(name.clone())))?;
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_columns(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
-
-    let schema = Schema::new(vec![
-        ColumnDef::new("column_name", DataType::VarChar),
-        ColumnDef::new("data_type", DataType::VarChar),
-        ColumnDef::new("nullable", DataType::Bool),
-    ]);
-
-    let mut batch = RecordBatch::new(schema.clone());
-    for col in &table_meta.columns {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(col.name.clone())))?;
-        batch
-            .column_mut(1)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(column_type_display(col))))?;
-        batch
-            .column_mut(2)
-            .unwrap()
-            .push(&ScalarValue::Bool(Some(col.nullable)))?;
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-fn column_type_display(col: &ColumnDef) -> String {
-    if col.data_type == DataType::Decimal && col.precision > 0 {
-        if col.scale > 0 {
-            format!("DECIMAL({},{})", col.precision, col.scale)
-        } else {
-            format!("DECIMAL({})", col.precision)
-        }
-    } else {
-        col.data_type.to_string()
-    }
-}
-
-pub fn exec_show_indexes(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
-
-    let schema = Schema::new(vec![
-        ColumnDef::new("Table", DataType::VarChar),
-        ColumnDef::new("Non_unique", DataType::Int64),
-        ColumnDef::new("Key_name", DataType::VarChar),
-        ColumnDef::new("Seq_in_index", DataType::Int64),
-        ColumnDef::new("Column_name", DataType::VarChar),
-        ColumnDef::new("Index_type", DataType::VarChar),
-    ]);
-
-    let mut batch = RecordBatch::new(schema.clone());
-    for (idx, col_name) in table_meta.cluster_key.iter().enumerate() {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(table.to_string())))?;
-        batch
-            .column_mut(1)
-            .unwrap()
-            .push(&ScalarValue::Int64(Some(0)))?;
-        batch
-            .column_mut(2)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some("cluster_key".to_string())))?;
-        batch
-            .column_mut(3)
-            .unwrap()
-            .push(&ScalarValue::Int64(Some((idx + 1) as i64)))?;
-        batch
-            .column_mut(4)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(col_name.clone())))?;
-        batch
-            .column_mut(5)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some("CLUSTER_BY".to_string())))?;
-    }
-
-    for unique_index in &table_meta.unique_indexes {
-        for (idx, col_name) in unique_index.columns.iter().enumerate() {
-            batch
-                .column_mut(0)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some(table.to_string())))?;
-            batch
-                .column_mut(1)
-                .unwrap()
-                .push(&ScalarValue::Int64(Some(0)))?;
-            batch
-                .column_mut(2)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some(unique_index.name.clone())))?;
-            batch
-                .column_mut(3)
-                .unwrap()
-                .push(&ScalarValue::Int64(Some((idx + 1) as i64)))?;
-            batch
-                .column_mut(4)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some(col_name.clone())))?;
-            batch
-                .column_mut(5)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some("UNIQUE".to_string())))?;
-        }
-    }
-
-    for secondary_index in &table_meta.secondary_indexes {
-        for (idx, col_name) in secondary_index.columns.iter().enumerate() {
-            batch
-                .column_mut(0)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some(table.to_string())))?;
-            batch
-                .column_mut(1)
-                .unwrap()
-                .push(&ScalarValue::Int64(Some(1)))?;
-            batch
-                .column_mut(2)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some(secondary_index.name.clone())))?;
-            batch
-                .column_mut(3)
-                .unwrap()
-                .push(&ScalarValue::Int64(Some((idx + 1) as i64)))?;
-            batch
-                .column_mut(4)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some(col_name.clone())))?;
-            batch
-                .column_mut(5)
-                .unwrap()
-                .push(&ScalarValue::VarChar(Some(
-                    secondary_index_type_display(secondary_index.index_type).to_string(),
-                )))?;
-        }
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-fn secondary_index_type_display(index_type: SecondaryIndexType) -> &'static str {
-    match index_type {
-        SecondaryIndexType::Bloom => "BLOOM",
-        SecondaryIndexType::MinMax => "MINMAX",
-        SecondaryIndexType::Set => "SET",
-    }
-}
-
-pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?;
-
-    let mut create_sql = format!("CREATE TABLE {} (\n", table);
-    for (i, col) in table_meta.columns.iter().enumerate() {
-        let nullable = if col.nullable { "" } else { " NOT NULL" };
-        let auto_inc = if col.auto_increment {
-            " AUTO_INCREMENT"
-        } else {
-            ""
-        };
-        let pk = if col.primary_key { " PRIMARY KEY" } else { "" };
-        let def_str = match &col.default_value {
-            Some(ColumnDefaultValue::CurrentTimestamp) => " DEFAULT CURRENT_TIMESTAMP".to_string(),
-            Some(ColumnDefaultValue::Literal(s)) => match s {
-                ScalarValue::VarChar(Some(v)) => format!(" DEFAULT '{}'", v),
-                ScalarValue::Int64(Some(v)) => format!(" DEFAULT {}", v),
-                ScalarValue::Float64(Some(v)) => format!(" DEFAULT {}", v),
-                ScalarValue::Int64(None) => " DEFAULT NULL".to_string(),
-                _ => "".to_string(),
-            },
-            None => "".to_string(),
-        };
-        if i < table_meta.columns.len() - 1 {
-            create_sql.push_str(&format!(
-                "  {} {}{}{}{}{},\n",
-                col.name,
-                column_type_display(col),
-                nullable,
-                auto_inc,
-                pk,
-                def_str
-            ));
-        } else {
-            create_sql.push_str(&format!(
-                "  {} {}{}{}{}{}\n",
-                col.name,
-                column_type_display(col),
-                nullable,
-                auto_inc,
-                pk,
-                def_str
-            ));
-        }
-    }
-    for unique_index in &table_meta.unique_indexes {
-        let cols = unique_index.columns.join(", ");
-        create_sql.push_str(&format!(",\n  UNIQUE KEY {} ({})", unique_index.name, cols));
-    }
-    create_sql.push(')');
-
-    if !table_meta.cluster_key.is_empty() {
-        create_sql.push_str(&format!(
-            " CLUSTER BY ({})",
-            table_meta.cluster_key.join(", ")
-        ));
-    }
-
-    if table_meta.hot_time_column.is_some() {
-        let time_col = table_meta.hot_time_column.as_ref().unwrap();
-        let mut hot_str = format!(" HOT BY ({})", time_col);
-        if let Some(idx_col) = &table_meta.hot_index_column {
-            hot_str.push_str(&format!(" INDEX ({})", idx_col));
-        }
-        if let Some(close_time) = &table_meta.hot_close_time {
-            hot_str.push_str(&format!(" CLOSE AT '{}'", close_time));
-        }
-        create_sql.push_str(&hot_str);
-    }
-
-    if table_meta.is_partitioned() {
-        let partition_str = match table_meta.partition_type {
-            PartitionType::Day => format!(" PARTITION BY DAY({})", table_meta.partition_key),
-            PartitionType::Year => format!(" PARTITION BY YEAR({})", table_meta.partition_key),
-            PartitionType::Month => format!(" PARTITION BY MONTH({})", table_meta.partition_key),
-            PartitionType::Value => format!(" PARTITION BY {}", table_meta.partition_key),
-            PartitionType::Hash => format!(
-                " PARTITION BY HASH({}, {})",
-                table_meta.partition_key, table_meta.partition_param
-            ),
-            PartitionType::Mod => format!(
-                " PARTITION BY MOD({}, {})",
-                table_meta.partition_key, table_meta.partition_param
-            ),
-            PartitionType::None => String::new(),
-        };
-        create_sql.push_str(&partition_str);
-    }
-
-    if let Some(ttl) = &table_meta.ttl {
-        create_sql.push_str(&format!(" TTL ({}, {})", ttl.column, ttl.duration_secs));
-    }
-
-    for secondary_index in &table_meta.secondary_indexes {
-        let cols = secondary_index.columns.join(", ");
-        create_sql.push_str(&format!(
-            ";\nCREATE INDEX {} ON {} ({}) TYPE {}",
-            secondary_index.name,
-            table,
-            cols,
-            secondary_index_type_display(secondary_index.index_type).to_ascii_lowercase()
-        ));
-    }
-
-    let schema = Schema::new(vec![
-        ColumnDef::new("Table", DataType::VarChar),
-        ColumnDef::new("Create Table", DataType::VarChar),
-    ]);
-
-    let mut batch = RecordBatch::new(schema.clone());
-    batch
-        .column_mut(0)
-        .unwrap()
-        .push(&ScalarValue::VarChar(Some(table.to_string())))?;
-    batch
-        .column_mut(1)
-        .unwrap()
-        .push(&ScalarValue::VarChar(Some(create_sql)))?;
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-fn get_existing_catalog<'a>(
-    catalogs: &'a mut HashMap<String, DatabaseCatalog>,
-    db: &str,
-) -> Result<&'a mut DatabaseCatalog> {
-    catalogs
-        .get_mut(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))
-}
-
-use crate::sql::parser::ast::AlterUserOperation;
-
-pub fn exec_alter_user(
-    engine: &Engine,
-    name: &str,
-    operations: &[AlterUserOperation],
-) -> Result<ExecResult> {
-    for op in operations {
-        match op {
-            AlterUserOperation::SetPassword { password } => {
-                engine.auth_manager().alter_user_password(name, password)?;
-            }
-            AlterUserOperation::Lock => {
-                engine.auth_manager().lock_user(name)?;
-            }
-            AlterUserOperation::Unlock => {
-                engine.auth_manager().unlock_user(name)?;
-            }
-        }
-    }
-    tracing::info!(
-        user = name,
-        operations_count = operations.len(),
-        "ALTER USER executed"
-    );
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_show_users(engine: &Engine) -> Result<ExecResult> {
-    let users = engine.auth_manager().list_users();
-    let schema = Schema::new(vec![ColumnDef::new("User", DataType::VarChar)]);
-    let mut batch = RecordBatch::new(schema.clone());
-    for user in users {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(user)))?;
-    }
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_roles(engine: &Engine) -> Result<ExecResult> {
-    let roles = engine.auth_manager().list_roles();
-    let schema = Schema::new(vec![ColumnDef::new("Role", DataType::VarChar)]);
-    let mut batch = RecordBatch::new(schema.clone());
-    for role in roles {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(role)))?;
-    }
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_grants(engine: &Engine, user: &Option<String>) -> Result<ExecResult> {
-    let user_name = user.clone().unwrap_or_else(|| "root".to_string());
-    let grants = engine.auth_manager().show_grants(&user_name);
-    let schema = Schema::new(vec![ColumnDef::new(
-        &format!("Grants for {}", user_name),
-        DataType::VarChar,
-    )]);
-    let mut batch = RecordBatch::new(schema.clone());
-    for grant in grants {
-        batch
-            .column_mut(0)
-            .unwrap()
-            .push(&ScalarValue::VarChar(Some(grant)))?;
-    }
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_partitions(
-    engine: &Engine,
-    db: &str,
-    table: &Option<String>,
-) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-
-    let schema = Schema::new(vec![
-        ColumnDef::new("Table", DataType::VarChar),
-        ColumnDef::new("Partition", DataType::VarChar),
-        ColumnDef::new("Rows", DataType::Int64),
-        ColumnDef::new("Segments", DataType::Int64),
-    ]);
-
-    let mut batch = RecordBatch::new(schema.clone());
-
-    if let Some(table_name) = table {
-        let table_name_owned: String = table_name.clone();
-        if let Some(meta) = catalog.get_table(&table_name_owned) {
-            for partition in &meta.partitions {
-                let col0 = batch.column_mut(0).unwrap();
-                col0.push(&ScalarValue::VarChar(Some(table_name_owned.clone())))?;
-                let col1 = batch.column_mut(1).unwrap();
-                col1.push(&ScalarValue::VarChar(Some(partition.key.clone())))?;
-                let col2 = batch.column_mut(2).unwrap();
-                col2.push(&ScalarValue::Int64(Some(partition.row_count)))?;
-                let col3 = batch.column_mut(3).unwrap();
-                col3.push(&ScalarValue::Int64(Some(partition.segment_count as i64)))?;
-            }
-        }
-    } else {
-        for table_name in catalog.table_names() {
-            let table_name_owned: String = table_name.to_string();
-            if let Some(meta) = catalog.get_table(&table_name_owned) {
-                for partition in &meta.partitions {
-                    let col0 = batch.column_mut(0).unwrap();
-                    col0.push(&ScalarValue::VarChar(Some(table_name_owned.clone())))?;
-                    let col1 = batch.column_mut(1).unwrap();
-                    col1.push(&ScalarValue::VarChar(Some(partition.key.clone())))?;
-                    let col2 = batch.column_mut(2).unwrap();
-                    col2.push(&ScalarValue::Int64(Some(partition.row_count)))?;
-                    let col3 = batch.column_mut(3).unwrap();
-                    col3.push(&ScalarValue::Int64(Some(partition.segment_count as i64)))?;
-                }
-            }
-        }
-    }
-
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_stats(engine: &Engine, db: &str) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let schema = Schema::new(vec![
-        ColumnDef::new("Table", DataType::VarChar),
-        ColumnDef::new("Rows", DataType::Int64),
-        ColumnDef::new("Size", DataType::Int64),
-        ColumnDef::new("LastUpdated", DataType::Timestamp),
-    ]);
-    let mut batch = RecordBatch::new(schema.clone());
-    if let Some(catalog) = catalogs.get(db) {
-        for table_name in catalog.table_names() {
-            if let Some(meta) = catalog.get_table(table_name) {
-                batch
-                    .column_mut(0)
-                    .unwrap()
-                    .push(&ScalarValue::VarChar(Some(table_name.to_string())))?;
-                batch
-                    .column_mut(1)
-                    .unwrap()
-                    .push(&ScalarValue::Int64(Some(meta.row_count)))?;
-                batch
-                    .column_mut(2)
-                    .unwrap()
-                    .push(&ScalarValue::Int64(Some(0)))?;
-                batch
-                    .column_mut(3)
-                    .unwrap()
-                    .push(&ScalarValue::Timestamp(Some(0)))?;
-            }
-        }
-    }
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_engines(_engine: &Engine) -> Result<ExecResult> {
-    let schema = Schema::new(vec![
-        ColumnDef::new("Engine", DataType::VarChar),
-        ColumnDef::new("Support", DataType::VarChar),
-        ColumnDef::new("Comment", DataType::VarChar),
-    ]);
-    let mut batch = RecordBatch::new(schema.clone());
-    batch
-        .column_mut(0)
-        .unwrap()
-        .push(&ScalarValue::VarChar(Some("COLUMNAR".to_string())))?;
-    batch
-        .column_mut(1)
-        .unwrap()
-        .push(&ScalarValue::VarChar(Some("DEFAULT".to_string())))?;
-    batch
-        .column_mut(2)
-        .unwrap()
-        .push(&ScalarValue::VarChar(Some(
-            "Columnar storage engine".to_string(),
-        )))?;
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult> {
-    let schema = Schema::new(vec![
-        ColumnDef::new("Id", DataType::Int64),
-        ColumnDef::new("User", DataType::VarChar),
-        ColumnDef::new("Database", DataType::VarChar),
-        ColumnDef::new("Command", DataType::VarChar),
-        ColumnDef::new("Time", DataType::Int64),
-        ColumnDef::new("State", DataType::VarChar),
-        ColumnDef::new("Info", DataType::VarChar),
-    ]);
-    let batch = RecordBatch::new(schema.clone());
-    Ok(ExecResult::Query {
-        schema,
-        batches: vec![batch],
-    })
-}
-
-pub fn exec_flush_table(engine: &Engine, db: &str, table: &Option<String>) -> Result<ExecResult> {
-    if let Some(table_name) = table {
-        engine.flush_table_buffers(db, table_name)?;
-        tracing::info!(db, table = table_name, "FLUSH TABLE executed");
-    } else {
-        engine.flush_all_buffers()?;
-        tracing::info!("FLUSH TABLES executed");
-    }
-    Ok(ExecResult::Ok { rows_affected: 0 })
-}
-
-pub fn exec_optimize_table(
-    engine: &Engine,
-    db: &str,
-    table: &str,
-    partition: Option<&str>,
-) -> Result<ExecResult> {
-    let catalogs = engine.catalogs().read().unwrap();
-    let catalog = catalogs
-        .get(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-
-    let table_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-        .clone();
-    drop(catalogs);
-
-    engine.flush_all_buffers()?;
-
-    let compactor = crate::storage::core::compactor::Compactor::new(
-        engine.segment_mgr().clone(),
-        engine.data_dir().to_path_buf(),
-    );
-
-    let stats = if let Some(partition) = partition {
-        compactor.optimize_partition(db, table, &table_meta, partition)?
-    } else {
-        compactor.optimize_table(db, table, &table_meta)?
-    };
-
-    engine.index_manager().mark_index_stale(db, table);
-
-    tracing::info!(
-        db,
-        table,
-        table_full_name = %format!("{}.{}", db, table),
-        partition_key = partition.unwrap_or("<all>"),
-        rows_written = stats.rows_written,
-        rows_dropped = stats.rows_dropped,
-        "OPTIMIZE TABLE executed"
-    );
-    Ok(ExecResult::Ok {
-        rows_affected: stats.rows_written,
-    })
-}
+include!("ddl/table.rs");
+include!("ddl/database_auth.rs");
+include!("ddl/introspection.rs");
+
+#[cfg(test)]
+#[path = "ddl_tests.rs"]
+mod tests;

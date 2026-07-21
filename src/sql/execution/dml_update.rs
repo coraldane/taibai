@@ -86,6 +86,13 @@ pub fn exec_update(
                 let batch = reader.read_row_group(rg_idx)?;
                 let mut new_batch = RecordBatch::new(batch.schema.clone());
                 for (row_idx, matches) in mask.into_iter().enumerate() {
+                    let absolute_row = reader.row_group_start_row(rg_idx) + row_idx as u64;
+                    if crate::storage::segment::delete_bitmap::is_deleted(
+                        reader.delete_bitmap(),
+                        absolute_row,
+                    ) {
+                        continue;
+                    }
                     for col_idx in 0..batch.num_columns() {
                         let val = if matches {
                             updated_value_for_column(
@@ -116,7 +123,19 @@ pub fn exec_update(
                 for (rg_idx, batch) in row_group_updates {
                     match batch {
                         Some(batch) => new_batches.push(batch),
-                        None => new_batches.push(reader.read_row_group(rg_idx)?),
+                        None => {
+                            let mut batch = reader.read_row_group(rg_idx)?;
+                            if !reader.delete_bitmap().is_empty() {
+                                batch = crate::storage::segment::delete_bitmap::filter_batch(
+                                    &batch,
+                                    reader.row_group_start_row(rg_idx),
+                                    reader.delete_bitmap(),
+                                )?;
+                            }
+                            if batch.num_rows() > 0 {
+                                new_batches.push(batch);
+                            }
+                        }
                     }
                 }
                 rewritten_segments.push((seg_path, new_batches));
@@ -138,7 +157,17 @@ pub fn exec_update(
                 }
                 let reader = mgr.open_reader(&seg_path)?;
                 for rg_idx in 0..reader.num_row_groups() {
-                    validation_batches.push(reader.read_row_group(rg_idx)?);
+                    let mut batch = reader.read_row_group(rg_idx)?;
+                    if !reader.delete_bitmap().is_empty() {
+                        batch = crate::storage::segment::delete_bitmap::filter_batch(
+                            &batch,
+                            reader.row_group_start_row(rg_idx),
+                            reader.delete_bitmap(),
+                        )?;
+                    }
+                    if batch.num_rows() > 0 {
+                        validation_batches.push(batch);
+                    }
                 }
             }
             for (_, batches) in &rewritten_segments {
@@ -156,6 +185,9 @@ pub fn exec_update(
         for (old_seg, batches) in rewritten_segments {
             mgr.remove_segment_file(&old_seg)?;
             for batch in batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
                 let seg_path = mgr.next_segment_path(&table_dir, "")?;
                 mgr.write_new_segment(&seg_path, batch.schema.clone(), 8192, &batch)?;
             }
@@ -201,16 +233,29 @@ fn build_update_mask(
     predicate_projection: &[usize],
     table_schema: &Schema,
 ) -> Result<Vec<bool>> {
-    let Some(where_expr) = where_clause.as_ref() else {
-        return Ok(vec![true; reader.row_group_rows(row_group_idx) as usize]);
-    };
-    let predicate_batch = if predicate_projection.is_empty() {
-        reader.read_row_group(row_group_idx)?
+    let mut mask = if let Some(where_expr) = where_clause.as_ref() {
+        let predicate_batch = if predicate_projection.is_empty() {
+            reader.read_row_group(row_group_idx)?
+        } else {
+            reader.read_row_group_with_projection(row_group_idx, predicate_projection)?
+        };
+        eval_where_clause_batch(where_expr, &predicate_batch, &predicate_batch.schema)
+            .or_else(|_| eval_where_clause_batch(where_expr, &predicate_batch, table_schema))?
     } else {
-        reader.read_row_group_with_projection(row_group_idx, predicate_projection)?
+        vec![true; reader.row_group_rows(row_group_idx) as usize]
     };
-    eval_where_clause_batch(where_expr, &predicate_batch, &predicate_batch.schema)
-        .or_else(|_| eval_where_clause_batch(where_expr, &predicate_batch, table_schema))
+    if !reader.delete_bitmap().is_empty() {
+        let first_row = reader.row_group_start_row(row_group_idx);
+        for (row_idx, matches) in mask.iter_mut().enumerate() {
+            if crate::storage::segment::delete_bitmap::is_deleted(
+                reader.delete_bitmap(),
+                first_row + row_idx as u64,
+            ) {
+                *matches = false;
+            }
+        }
+    }
+    Ok(mask)
 }
 
 fn segment_may_match(

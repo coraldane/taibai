@@ -199,12 +199,6 @@ fn exec_table_select(
         None
     };
     let is_simple_metadata = simple_metadata_aggregates.is_some();
-    eprintln!(
-        "QRY detect: is_simple={} agg_count={} is_count_star={}",
-        is_simple_metadata,
-        simple_metadata_aggregates.as_ref().map(|v| v.len()).unwrap_or(0),
-        is_count_star
-    );
 
     if reader_txn_id == 0
         && stats.is_none()

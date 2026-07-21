@@ -179,6 +179,31 @@ impl BatchWriter {
         if row_count == 0 {
             return Ok(0);
         }
+        self.segment_mgr.with_table_mutation_lock(db, table, || {
+            self.write_columns_with_txn_under_table_lock(
+                db,
+                table,
+                partition_key,
+                batch,
+                schema,
+                txn_id,
+            )
+        })
+    }
+
+    pub(crate) fn write_columns_with_txn_under_table_lock(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+        schema: Schema,
+        txn_id: u64,
+    ) -> Result<u64> {
+        let row_count = batch.num_rows() as u64;
+        if row_count == 0 {
+            return Ok(0);
+        }
         let get_start = Instant::now();
         let mt =
             self.memtable_mgr
@@ -239,6 +264,15 @@ impl BatchWriter {
         Ok(())
     }
 
+    pub(crate) fn flush_table_under_table_lock(&self, db: &str, table: &str) -> Result<()> {
+        let mts = self.memtable_mgr.get_by_table(db, table);
+        for mt in mts {
+            Self::flush_memtable_inner(&self.segment_mgr, &mt, true)?;
+        }
+        self.memtable_mgr.remove_flushed();
+        Ok(())
+    }
+
     pub fn flush_all(&self) -> Result<()> {
         let mts = self.memtable_mgr.get_all_pending();
         for mt in mts {
@@ -250,6 +284,14 @@ impl BatchWriter {
 
     pub fn clear_memtables(&self, db: &str, table: &str) -> u64 {
         self.memtable_mgr.clear_table(db, table)
+    }
+
+    pub fn clear_partition_memtables(&self, db: &str, table: &str, partition_key: &str) -> u64 {
+        self.memtable_mgr.clear_partition(db, table, partition_key)
+    }
+
+    pub fn rename_memtables(&self, db: &str, old_table: &str, new_table: &str) -> u64 {
+        self.memtable_mgr.rename_table(db, old_table, new_table)
     }
 
     pub fn stop(&mut self) {
@@ -337,6 +379,14 @@ impl BatchWriter {
         segment_mgr: &Arc<SegmentManager>,
         mt: &Arc<crate::storage::core::memtable::MemTable>,
     ) -> Result<()> {
+        Self::flush_memtable_inner(segment_mgr, mt, false)
+    }
+
+    fn flush_memtable_inner(
+        segment_mgr: &Arc<SegmentManager>,
+        mt: &Arc<crate::storage::core::memtable::MemTable>,
+        table_lock_held: bool,
+    ) -> Result<()> {
         if mt.state() != MemTableState::Pending {
             return Ok(());
         }
@@ -352,33 +402,46 @@ impl BatchWriter {
         let table = mt.table().to_string();
         let partition_key = mt.partition_key().to_string();
         let txn_id = mt.txn_id();
-        let table_dir = segment_mgr.table_dir(&db, &table);
-        std::fs::create_dir_all(&table_dir)?;
-
-        let write_result = (|| -> Result<()> {
-            if txn_id > 0 {
-                segment_mgr.write_txn_wal(&table_dir, txn_id, &batch)?;
+        let flush_result = if table_lock_held {
+            segment_mgr.flush_memtable_batch_if_under_table_lock(
+                &db,
+                &table,
+                &partition_key,
+                &batch,
+                txn_id,
+                || mt.state() == MemTableState::Flushing,
+                || {
+                    let _ = mt.take_batch();
+                    mt.set_state(MemTableState::Flushed);
+                },
+            )
+        } else {
+            segment_mgr.flush_memtable_batch_if(
+                &db,
+                &table,
+                &partition_key,
+                &batch,
+                txn_id,
+                || mt.state() == MemTableState::Flushing,
+                || {
+                    let _ = mt.take_batch();
+                    mt.set_state(MemTableState::Flushed);
+                },
+            )
+        };
+        let wrote = match flush_result {
+            Ok(wrote) => wrote,
+            Err(e) => {
+                if mt.state() == MemTableState::Flushing {
+                    mt.set_state(MemTableState::Pending);
+                }
+                return Err(e);
             }
-
-            if partition_key.is_empty() {
-                segment_mgr.bulk_insert_batch_ref(&db, &table, &batch, true)?;
-            } else {
-                segment_mgr.bulk_insert_batch_with_partition_ref(
-                    &db,
-                    &table,
-                    &partition_key,
-                    &batch,
-                )?;
-            }
-
-            if txn_id > 0 {
-                segment_mgr.sync_table_wal(&table_dir)?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = write_result {
-            mt.set_state(MemTableState::Pending);
-            return Err(e);
+        };
+        if !wrote {
+            let _ = mt.take_batch();
+            mt.set_state(MemTableState::Flushed);
+            return Ok(());
         }
 
         tracing::debug!(
@@ -387,8 +450,6 @@ impl BatchWriter {
             txn_id,
             "memtable flushed to active segment"
         );
-        let _ = mt.take_batch();
-        mt.set_state(MemTableState::Flushed);
         Ok(())
     }
 }

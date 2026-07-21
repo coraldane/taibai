@@ -69,9 +69,17 @@ pub fn remap_expr_for_batch(
             logical_schema,
             batch_schema,
         ))),
-        LogicalExpr::Aggregate(agg) => {
-            LogicalExpr::Aggregate(remap_aggregate_for_batch(agg, logical_schema, batch_schema))
-        }
+        LogicalExpr::Aggregate(agg) => aggregate_output_name(agg, logical_schema)
+            .and_then(|expected| {
+                batch_schema
+                    .columns
+                    .iter()
+                    .position(|col| col.name.eq_ignore_ascii_case(&expected))
+            })
+            .map(LogicalExpr::Column)
+            .unwrap_or_else(|| {
+                LogicalExpr::Aggregate(remap_aggregate_for_batch(agg, logical_schema, batch_schema))
+            }),
         LogicalExpr::In {
             expr,
             values,
@@ -131,6 +139,23 @@ pub fn remap_expr_for_batch(
         },
         _ => expr.clone(),
     }
+}
+
+fn aggregate_output_name(agg: &AggregateExpr, logical_schema: &Schema) -> Option<String> {
+    let func = match agg.func {
+        crate::sql::planner::AggFunc::Count => "count",
+        crate::sql::planner::AggFunc::Sum => "sum",
+        crate::sql::planner::AggFunc::Avg => "avg",
+        crate::sql::planner::AggFunc::Min => "min",
+        crate::sql::planner::AggFunc::Max => "max",
+    };
+    let arg = match &*agg.arg {
+        LogicalExpr::Wildcard => "*".to_string(),
+        LogicalExpr::Column(idx) => logical_schema.columns.get(*idx)?.name.clone(),
+        _ => "expr".to_string(),
+    };
+    let distinct = if agg.distinct { "DISTINCT " } else { "" };
+    Some(format!("{}({}{})", func, distinct, arg))
 }
 
 pub fn remap_aggregate_for_batch(
@@ -344,16 +369,28 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
                 crate::sql::planner::AggFunc::Max => "MAX",
             };
 
-            let col_idx = batch.schema.columns.iter().position(|c| {
-                let name = c.name.to_ascii_uppercase();
-                name.starts_with(&format!("{}(", agg_type_prefix))
-                    || name == format!("{}(*)", agg_type_prefix)
-            });
+            let matches = batch
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, c)| {
+                    let name = c.name.to_ascii_uppercase();
+                    (name.starts_with(&format!("{}(", agg_type_prefix))
+                        || name == format!("{}(*)", agg_type_prefix))
+                    .then_some(idx)
+                })
+                .collect::<Vec<_>>();
 
-            if let Some(idx) = col_idx {
+            if let [idx] = matches.as_slice() {
                 Ok((0..num_rows)
-                    .map(|i| batch.scalar(i, idx).unwrap_or(ScalarValue::Int64(None)))
+                    .map(|i| batch.scalar(i, *idx).unwrap_or(ScalarValue::Int64(None)))
                     .collect())
+            } else if matches.len() > 1 {
+                Err(crate::common::error::TaibaiError::Internal(format!(
+                    "ambiguous {} aggregate output; projection was not resolved to an exact column",
+                    agg_type_prefix
+                )))
             } else {
                 Ok(vec![ScalarValue::Int64(None); num_rows])
             }

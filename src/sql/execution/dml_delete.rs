@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::common::error::{Result, TaibaiError};
@@ -20,6 +21,146 @@ use super::helpers::{
     eval_where_clause_batch,
 };
 use crate::sql::parser::ast::{BinOp, Expr};
+
+pub(crate) struct ReplaceDeleteUndo {
+    segment_footers: Vec<(PathBuf, Vec<u8>, u64)>,
+    tombstones: Vec<UniqueRowLocation>,
+    deleted_rows: u64,
+}
+
+impl ReplaceDeleteUndo {
+    pub(crate) fn deleted_rows(&self) -> u64 {
+        self.deleted_rows
+    }
+}
+
+pub(crate) fn delete_replace_conflicts_under_table_lock(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Result<ReplaceDeleteUndo> {
+    let table_dir = engine.data_dir().join(db).join(table);
+    let mut undo = ReplaceDeleteUndo {
+        segment_footers: Vec::new(),
+        tombstones: Vec::new(),
+        deleted_rows: 0,
+    };
+    if !table_dir.exists() || key_sets.is_empty() {
+        return Ok(undo);
+    }
+
+    let mgr = engine.segment_mgr();
+    for seg_path in SegmentManager::discover_segments(&table_dir)? {
+        let reader = mgr.open_reader_cached(&seg_path)?;
+        let total_rows = reader.row_count();
+        if total_rows == 0 || reader.deleted_row_count() >= total_rows {
+            continue;
+        }
+        let old_bitmap = reader.delete_bitmap().to_vec();
+        let old_deleted = reader.deleted_row_count();
+        let mut new_bitmap = old_bitmap.clone();
+        new_bitmap.resize(total_rows.div_ceil(8) as usize, 0);
+        let mut row_id = 0u64;
+        let mut newly_deleted = 0u64;
+
+        for rg_idx in 0..reader.num_row_groups() {
+            let batch = reader.read_row_group(rg_idx)?;
+            for row_idx in 0..batch.num_rows() {
+                let absolute_row = row_id + row_idx as u64;
+                if delete_bitmap::is_deleted(&new_bitmap, absolute_row) {
+                    continue;
+                }
+                let conflicts = key_sets.iter().any(|(indices, keys)| {
+                    let mut key = Vec::with_capacity(indices.len());
+                    for &col_idx in indices {
+                        let Some(value) = batch.scalar(row_idx, col_idx) else {
+                            return false;
+                        };
+                        if value.is_null() {
+                            return false;
+                        }
+                        key.push(value);
+                    }
+                    keys.contains(&key)
+                });
+                if conflicts && delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row) {
+                    undo.tombstones.push(UniqueRowLocation {
+                        segment_path: seg_path.to_string_lossy().into_owned(),
+                        row_id: absolute_row,
+                    });
+                    newly_deleted += 1;
+                }
+            }
+            row_id += batch.num_rows() as u64;
+        }
+
+        if newly_deleted == 0 {
+            continue;
+        }
+        undo.segment_footers
+            .push((seg_path.clone(), old_bitmap, old_deleted));
+        if let Err(error) =
+            mgr.rewrite_delete_footer(&seg_path, &new_bitmap, old_deleted + newly_deleted)
+        {
+            let _ = restore_replace_delete_under_table_lock(engine, &undo);
+            return Err(error);
+        }
+        undo.deleted_rows += newly_deleted;
+    }
+    Ok(undo)
+}
+
+pub(crate) fn restore_replace_delete_under_table_lock(
+    engine: &Engine,
+    undo: &ReplaceDeleteUndo,
+) -> Result<()> {
+    let mut first_error = None;
+    for (path, bitmap, deleted_count) in undo.segment_footers.iter().rev() {
+        if let Err(error) = engine
+            .segment_mgr()
+            .rewrite_delete_footer(path, bitmap, *deleted_count)
+        {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn finalize_replace_delete_under_table_lock(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &TableMeta,
+    undo: &ReplaceDeleteUndo,
+) -> Result<()> {
+    if undo.deleted_rows == 0 {
+        return Ok(());
+    }
+    for index in &table_meta.unique_indexes {
+        engine.index_manager().append_unique_index_tombstones(
+            db,
+            table,
+            &index.name,
+            undo.tombstones.clone(),
+        )?;
+    }
+
+    let mut catalogs = engine.catalogs().write().unwrap();
+    if let Some(catalog) = catalogs.get_mut(db) {
+        if let Some(meta) = catalog.get_table_mut(table) {
+            meta.row_count = (meta.row_count - undo.deleted_rows as i64).max(0);
+            let meta_dir = engine.data_dir().join("meta");
+            catalog.save(&meta_dir)?;
+        }
+    }
+    Ok(())
+}
 
 pub fn exec_delete(
     engine: &Engine,
@@ -817,91 +958,5 @@ fn expr_matches_column(expr: &Expr, column: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::protocol::types::DataType;
-    use crate::storage::catalog::schema::{PartitionType, TableMeta};
-    use crate::types::batch::ColumnDef;
-    use crate::types::scalar::ScalarValue;
-
-    use super::*;
-
-    fn partitioned_meta() -> (Schema, TableMeta) {
-        let columns = vec![
-            ColumnDef::new("id", DataType::Int64),
-            ColumnDef::new("partition_key", DataType::Int32),
-        ];
-        let mut meta = TableMeta::new("main", "test_table", columns.clone());
-        meta.partition_key = "partition_key".to_string();
-        meta.partition_type = PartitionType::Year;
-        meta.update_partition_key_idx();
-        (Schema::new(columns), meta)
-    }
-
-    #[test]
-    fn delete_partition_eq_key_uses_partition_function() {
-        let (schema, meta) = partitioned_meta();
-        let where_clause = Some(Expr::BinaryOp {
-            left: Box::new(Expr::Column("partition_key".to_string())),
-            op: BinOp::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Int64(Some(20260108)))),
-        });
-
-        assert_eq!(
-            delete_partition_eq_key(&where_clause, &schema, &meta),
-            Some("2026".to_string())
-        );
-    }
-
-    #[test]
-    fn prune_segments_by_partition_keeps_only_matching_partition_files() {
-        let (schema, meta) = partitioned_meta();
-        let where_clause = Some(Expr::BinaryOp {
-            left: Box::new(Expr::Column("partition_key".to_string())),
-            op: BinOp::Eq,
-            right: Box::new(Expr::Literal(ScalarValue::Int64(Some(20260108)))),
-        });
-        let files = vec![
-            PathBuf::from("p2025_0001.dat"),
-            PathBuf::from("p2026_0002.dat"),
-            PathBuf::from("seg_00003.dat"),
-        ];
-
-        let pruned = prune_segments_by_partition(files, &where_clause, &schema, &meta);
-
-        assert_eq!(
-            pruned,
-            vec![
-                PathBuf::from("p2026_0002.dat"),
-                PathBuf::from("seg_00003.dat")
-            ]
-        );
-    }
-
-    #[test]
-    fn cluster_key_eq_predicate_builds_exact_bounds() {
-        let (schema, mut meta) = partitioned_meta();
-        meta.cluster_key = vec!["partition_key".to_string(), "id".to_string()];
-        let predicate = crate::storage::segment::RowGroupPredicate::new(vec![
-            crate::storage::segment::RangeClause {
-                column_index: schema.index_of("partition_key").unwrap(),
-                op: RangeOp::Eq,
-                value: ScalarValue::Int64(Some(20260108)),
-            },
-        ]);
-
-        let bounds = cluster_key_bounds(&schema, &meta, &predicate).expect("bounds");
-
-        assert_eq!(
-            bounds.column_index,
-            schema.index_of("partition_key").unwrap()
-        );
-        assert_eq!(
-            bounds.lower,
-            Some((ScalarValue::Int64(Some(20260108)), true))
-        );
-        assert_eq!(
-            bounds.upper,
-            Some((ScalarValue::Int64(Some(20260108)), true))
-        );
-    }
-}
+#[path = "dml_delete_tests.rs"]
+mod tests;
