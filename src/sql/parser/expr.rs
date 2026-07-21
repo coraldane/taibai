@@ -63,6 +63,16 @@ impl Parser {
                 op,
                 right: Box::new(right),
             })
+        } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("IS")) {
+            self.advance();
+            if self.peek() == &Token::Not {
+                self.advance();
+                self.expect(&Token::Null)?;
+                Ok(Expr::IsNotNull(Box::new(left)))
+            } else {
+                self.expect(&Token::Null)?;
+                Ok(Expr::IsNull(Box::new(left)))
+            }
         } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "BETWEEN") {
             self.advance();
             let low = self.parse_addition()?;
@@ -377,16 +387,6 @@ impl Parser {
                             args,
                             distinct,
                         })
-                    }
-                } else if self.peek() == &Token::Ident("IS".into()) {
-                    self.advance();
-                    if self.peek() == &Token::Not {
-                        self.advance();
-                        self.expect(&Token::Null)?;
-                        Ok(Expr::IsNotNull(Box::new(Expr::Column(name))))
-                    } else {
-                        self.expect(&Token::Null)?;
-                        Ok(Expr::IsNull(Box::new(Expr::Column(name))))
                     }
                 } else {
                     Ok(Expr::Column(name))
