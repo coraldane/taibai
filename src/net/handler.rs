@@ -47,6 +47,10 @@ impl Handler {
                 );
             }
             if session.had_writes {
+                // Make cleanup idempotent. Multiple error/close paths may try
+                // to clean the same connection, but its buffers only need one
+                // disconnect flush attempt.
+                session.had_writes = false;
                 if self.engine.is_bulk_mode() {
                     tracing::info!(
                         session_id = %session.session_id_string(),

@@ -228,6 +228,19 @@ impl Parser {
 
         let mut joins = Vec::new();
         loop {
+            // SQL's comma-separated FROM list is the legacy spelling of a
+            // cross join. Represent it with the same JoinClause used by
+            // explicit CROSS JOIN so planning and execution share one path.
+            if self.peek() == &Token::Comma {
+                self.advance();
+                joins.push(JoinClause {
+                    join_type: JoinType::Cross,
+                    right: self.parse_table_ref()?,
+                    condition: None,
+                });
+                continue;
+            }
+
             let is_join = matches!(
                 self.peek(),
                 Token::Join | Token::Inner | Token::Left | Token::Right | Token::Cross

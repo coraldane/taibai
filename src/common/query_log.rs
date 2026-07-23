@@ -1,11 +1,14 @@
 use chrono::Utc;
+use crossbeam_channel::{bounded, Sender};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-static QUERY_LOG_FILE: OnceLock<Mutex<QueryLogState>> = OnceLock::new();
+const QUERY_LOG_QUEUE_CAPACITY: usize = 8192;
+
+static QUERY_LOG_SENDER: OnceLock<Sender<Vec<u8>>> = OnceLock::new();
 
 struct QueryLogState {
     path: PathBuf,
@@ -22,16 +25,32 @@ pub fn init(path: &Path, max_size_mb: u64) -> std::io::Result<()> {
         rotate_path(path)?;
     }
     let file = OpenOptions::new().create(true).append(true).open(path)?;
-    let _ = QUERY_LOG_FILE.set(Mutex::new(QueryLogState {
+    let mut state = QueryLogState {
         path: path.to_path_buf(),
         file: Some(file),
         max_bytes,
-    }));
+    };
+    let (sender, receiver) = bounded::<Vec<u8>>(QUERY_LOG_QUEUE_CAPACITY);
+    std::thread::Builder::new()
+        .name("taibai-query-log".into())
+        .spawn(move || {
+            while let Ok(line) = receiver.recv() {
+                if let Err(error) = state.write(&line) {
+                    eprintln!("taibai query log write failed: {error}");
+                }
+            }
+        })?;
+    QUERY_LOG_SENDER.set(sender).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "query log is already initialized",
+        )
+    })?;
     Ok(())
 }
 
 pub fn log_query(user: &str, database: &str, sql: &str, status: &str, elapsed: Duration) {
-    let Some(file) = QUERY_LOG_FILE.get() else {
+    let Some(sender) = QUERY_LOG_SENDER.get() else {
         return;
     };
     let line = format!(
@@ -43,9 +62,10 @@ pub fn log_query(user: &str, database: &str, sql: &str, status: &str, elapsed: D
         elapsed.as_millis(),
         escape_field(sql)
     );
-    if let Ok(mut state) = file.lock() {
-        let _ = state.write(line.as_bytes());
-    }
+    // Query logging is diagnostic and must never apply backpressure to query
+    // execution. If the disk writer falls behind, drop the log entry instead
+    // of blocking a Tokio or request-worker thread.
+    let _ = sender.try_send(line.into_bytes());
 }
 
 impl QueryLogState {

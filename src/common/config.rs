@@ -9,6 +9,25 @@ fn default_port() -> u16 {
     5151
 }
 
+fn default_max_connections() -> usize {
+    1024
+}
+
+fn default_max_concurrent_requests() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(8))
+        .unwrap_or(4)
+        .max(4)
+}
+
+fn default_connection_idle_timeout_secs() -> u64 {
+    300
+}
+
+fn default_tls_handshake_timeout_secs() -> u64 {
+    10
+}
+
 /// Process-global runtime limits consulted by query operators (aggregation,
 /// streaming scans, ...). Populated once at startup from `BufferSettings` via
 /// [`set_query_limits`]. Operators read via [`query_limits`]; before startup
@@ -138,6 +157,21 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
+    /// Maximum number of established client sockets. Excess connections are
+    /// accepted and closed immediately so the OS accept queue keeps draining.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Maximum number of CPU/disk-heavy protocol requests executing at once.
+    /// These requests run outside Tokio's networking worker threads.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    /// Disconnect clients that send no protocol frame for this many seconds.
+    /// Set to 0 to disable the idle timeout.
+    #[serde(default = "default_connection_idle_timeout_secs")]
+    pub connection_idle_timeout_secs: u64,
+    /// Maximum time allowed for an incoming TLS handshake. Set to 0 to disable.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub tls_handshake_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +248,10 @@ impl Default for ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 5151,
                 max_message_size: 64 * 1024 * 1024,
+                max_connections: default_max_connections(),
+                max_concurrent_requests: default_max_concurrent_requests(),
+                connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
+                tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
             },
             storage: StorageSettings {
                 data_dir: "./data".to_string(),

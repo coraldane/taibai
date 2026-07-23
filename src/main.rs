@@ -13,10 +13,73 @@ use net::server::Server;
 use sql::execution::{AutoCompactConfig, Engine};
 use storage::segment_manager::SegmentConfig;
 
+#[derive(Clone)]
+struct AsyncTracingWriter {
+    sender: crossbeam_channel::Sender<Vec<u8>>,
+}
+
+impl std::io::Write for AsyncTracingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Tracing must not stall networking or query workers when the log disk
+        // is slow. Dropping diagnostics is preferable to freezing the server.
+        let _ = self.sender.try_send(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn spawn_async_tracing_writer<W>(
+    output: W,
+    thread_name: &str,
+) -> std::io::Result<AsyncTracingWriter>
+where
+    W: std::io::Write + Send + 'static,
+{
+    use std::io::Write;
+
+    let (sender, receiver) = crossbeam_channel::bounded::<Vec<u8>>(8192);
+    std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            let mut writer = std::io::BufWriter::new(output);
+            loop {
+                match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(bytes) => {
+                        if let Err(error) = writer.write_all(&bytes) {
+                            eprintln!("taibai log write failed: {error}");
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        let _ = writer.flush();
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        let _ = writer.flush();
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(AsyncTracingWriter { sender })
+}
+
 fn init_tracing(level: &str) {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter(level))
-        .try_init();
+    match spawn_async_tracing_writer(std::io::stdout(), "taibai-console-log") {
+        Ok(async_writer) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(env_filter(level))
+                .with_writer(move || async_writer.clone())
+                .try_init();
+        }
+        Err(error) => {
+            eprintln!("failed to start asynchronous console logger: {error}");
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(env_filter(level))
+                .try_init();
+        }
+    }
 }
 
 fn init_file_tracing(level: &str, log_file: &std::path::Path) -> std::io::Result<()> {
@@ -27,10 +90,11 @@ fn init_file_tracing(level: &str, log_file: &std::path::Path) -> std::io::Result
         .create(true)
         .append(true)
         .open(log_file)?;
+    let async_writer = spawn_async_tracing_writer(file, "taibai-server-log")?;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter(level))
         .with_ansi(false)
-        .with_writer(file)
+        .with_writer(move || async_writer.clone())
         .try_init();
     Ok(())
 }

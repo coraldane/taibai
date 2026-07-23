@@ -69,3 +69,54 @@ fn join_scan_spec_only_collects_filters_for_the_target_table() {
         ScalarValue::VarChar(Some("Ping An Bank".to_string()))
     );
 }
+
+#[test]
+fn comma_separated_from_tables_support_cross_and_filtered_joins() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(&mut session, "CREATE TABLE a (id INT64, name VARCHAR)")
+        .expect("create a");
+    engine
+        .execute(&mut session, "CREATE TABLE b (id INT64, label VARCHAR)")
+        .expect("create b");
+    engine
+        .execute(&mut session, "INSERT INTO a VALUES (1, 'one'), (2, 'two')")
+        .expect("insert a");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO b VALUES (1, 'first'), (3, 'third')",
+        )
+        .expect("insert b");
+
+    let cross = engine
+        .execute(&mut session, "SELECT COUNT(*) FROM a, b")
+        .expect("comma cross join");
+    let ExecResult::Query { batches, .. } = cross else {
+        panic!("expected cross join query");
+    };
+    assert_eq!(batches[0].scalar(0, 0), Some(ScalarValue::Int64(Some(4))));
+
+    let filtered = engine
+        .execute(
+            &mut session,
+            "SELECT a.name, b.label FROM a, b WHERE a.id = b.id",
+        )
+        .expect("filtered comma join");
+    let ExecResult::Query { batches, .. } = filtered else {
+        panic!("expected filtered join query");
+    };
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(
+        batches[0].scalar(0, 0),
+        Some(ScalarValue::VarChar(Some("one".to_string())))
+    );
+    assert_eq!(
+        batches[0].scalar(0, 1),
+        Some(ScalarValue::VarChar(Some("first".to_string())))
+    );
+}

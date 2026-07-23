@@ -51,4 +51,8 @@ log:
         config.log.query_file.as_deref(),
         Some(expected_query_file.as_str())
     );
+    assert_eq!(config.server.max_connections, 1024);
+    assert!(config.server.max_concurrent_requests >= 4);
+    assert_eq!(config.server.connection_idle_timeout_secs, 300);
+    assert_eq!(config.server.tls_handshake_timeout_secs, 10);
 }

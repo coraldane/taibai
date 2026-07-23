@@ -6,6 +6,10 @@ server:
   host: "0.0.0.0"
   port: 5151
   max_message_size: 67108864  # 64MB
+  max_connections: 1024  # Hard cap for established client sockets
+  max_concurrent_requests: 8  # Heavy queries/writes executed outside networking threads
+  connection_idle_timeout_secs: 300  # 0 disables idle connection cleanup
+  tls_handshake_timeout_secs: 10  # 0 disables the TLS handshake timeout
 
 # Storage settings
 storage:
