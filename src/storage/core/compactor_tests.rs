@@ -60,6 +60,18 @@ fn write_segment(path: &Path, schema: &Schema, rows: &[(i64, &str)]) -> Result<(
     writer.seal()
 }
 
+fn write_segment_with_row_group_size(
+    path: &Path,
+    schema: &Schema,
+    rows: &[(i64, &str)],
+    row_group_size: usize,
+) -> Result<()> {
+    let batch = make_batch(schema, rows)?;
+    let mut writer = SegmentWriter::create(path, schema.clone(), row_group_size)?;
+    writer.write_batch(&batch)?;
+    writer.seal()
+}
+
 fn read_ids(path: &Path) -> Result<Vec<i64>> {
     let reader = SegmentReader::open(path)?;
     let mut ids = Vec::new();
@@ -130,6 +142,37 @@ fn optimize_table_sorts_clean_single_segment_when_clustered() -> Result<()> {
     let segments = SegmentManager::discover_segments(&table_dir)?;
     assert_eq!(segments.len(), 1);
     assert_eq!(read_ids(&segments[0])?, vec![1, 2, 3]);
+    Ok(())
+}
+
+#[test]
+fn optimize_interleaved_rows_across_more_than_cache_capacity() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = test_schema();
+    // Forty source row groups exceed the legacy 32-entry cache. Every group
+    // contains interleaved keys, matching time-ordered tick ingestion where a
+    // clustered output chunk touches nearly every source group.
+    let owned_rows = (0..160)
+        .map(|row| {
+            let key = (row * 37) % 160;
+            (key as i64, format!("value-{row}"))
+        })
+        .collect::<Vec<_>>();
+    let rows = owned_rows
+        .iter()
+        .map(|(id, name)| (*id, name.as_str()))
+        .collect::<Vec<_>>();
+    write_segment_with_row_group_size(&table_dir.join("seg_00001.dat"), &schema, &rows, 4)?;
+
+    let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+    let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
+    compactor.optimize_table("default", "t", &test_meta(&schema))?;
+
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(read_ids(&segments[0])?, (0..160).collect::<Vec<_>>());
     Ok(())
 }
 

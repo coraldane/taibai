@@ -336,14 +336,57 @@ impl Engine {
                 })?
                 .clone()
         };
+
+        // Capture the write set before flush/seal retires its active writers.
+        // A table-level OPTIMIZE here used to rewrite every historical
+        // partition on every close, even when only today's partition changed.
+        let mut dirty_partitions = std::collections::BTreeSet::new();
+        dirty_partitions.extend(self.segment_mgr.active_partition_keys(db, table));
+        dirty_partitions.extend(
+            self.batch_writer
+                .memtable_manager()
+                .get_readable_by_table(db, table)
+                .into_iter()
+                .map(|memtable| memtable.partition_key().to_string()),
+        );
         self.flush_table_buffers(db, table)?;
-        let compactor = Compactor::new(Arc::clone(&self.segment_mgr), self.data_dir.clone());
-        let stats = compactor.optimize_table(db, table, &table_meta)?;
-        self.index_manager.mark_index_stale(db, table);
+        // flush_table_buffers intentionally keeps small segments active during
+        // normal operation. At close-of-day they must be sealed so compaction
+        // sees the complete write set for each dirty partition.
+        dirty_partitions.extend(self.segment_mgr.active_partition_keys(db, table));
+        self.segment_mgr.seal_table_active(db, table)?;
+        // Once flush succeeds, segments are the source of truth. Release the
+        // in-memory mirror before OPTIMIZE so clustered compaction can use the
+        // same memory budget to decode every source row group exactly once.
+        // Queries remain correct and fall back to the still-live old segments
+        // until the atomic replacement completes.
         self.hot_store_mgr.remove(db, table);
         self.batch_writer
             .memtable_manager()
             .remove_archived(db, table);
+        tracing::info!(
+            db,
+            table,
+            dirty_partitions = ?dirty_partitions,
+            "close-of-day: resident state evicted before optimization"
+        );
+        let compactor = Compactor::new(Arc::clone(&self.segment_mgr), self.data_dir.clone());
+        let mut stats = crate::storage::core::compactor::CompactStats::default();
+        if table_meta.is_partitioned() {
+            for partition_key in &dirty_partitions {
+                let partition_stats =
+                    compactor.optimize_partition(db, table, &table_meta, partition_key)?;
+                stats.segments_read += partition_stats.segments_read;
+                stats.segments_written += partition_stats.segments_written;
+                stats.rows_written += partition_stats.rows_written;
+                stats.rows_dropped += partition_stats.rows_dropped;
+            }
+        } else if !dirty_partitions.is_empty() {
+            stats = compactor.optimize_table(db, table, &table_meta)?;
+        }
+        if stats.segments_written > 0 {
+            self.index_manager.mark_index_stale(db, table);
+        }
         let today = chrono::Local::now().date_naive().to_string();
         {
             let mut catalogs = self.catalogs.write().unwrap();
@@ -360,6 +403,7 @@ impl Engine {
             table,
             rows_written = stats.rows_written,
             rows_dropped = stats.rows_dropped,
+            partitions_optimized = dirty_partitions.len(),
             "close-of-day: table resident state evicted and optimized"
         );
         Ok(())

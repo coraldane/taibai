@@ -921,6 +921,54 @@ impl ColumnArray {
             _ => unreachable!("column type checked before extend"),
         }
     }
+
+    /// Append an owned column. Variable-width buffers are moved instead of
+    /// cloned, which is important when compaction concatenates many decoded
+    /// row groups into one global column.
+    pub fn append_owned(&mut self, other: ColumnArray) -> Result<()> {
+        match other {
+            ColumnArray::VarChar {
+                mut data,
+                bitmap: other_bitmap,
+            } => match self {
+                ColumnArray::VarChar { data: dst, bitmap } => {
+                    dst.append(&mut data);
+                    bitmap.extend(&other_bitmap);
+                    Ok(())
+                }
+                _ => Err(TaibaiError::Internal(
+                    "cannot append VARCHAR to a different column type".to_string(),
+                )),
+            },
+            ColumnArray::Blob {
+                mut data,
+                bitmap: other_bitmap,
+            } => match self {
+                ColumnArray::Blob { data: dst, bitmap } => {
+                    dst.append(&mut data);
+                    bitmap.extend(&other_bitmap);
+                    Ok(())
+                }
+                _ => Err(TaibaiError::Internal(
+                    "cannot append BLOB to a different column type".to_string(),
+                )),
+            },
+            ColumnArray::Vector {
+                mut data,
+                bitmap: other_bitmap,
+            } => match self {
+                ColumnArray::Vector { data: dst, bitmap } => {
+                    dst.append(&mut data);
+                    bitmap.extend(&other_bitmap);
+                    Ok(())
+                }
+                _ => Err(TaibaiError::Internal(
+                    "cannot append VECTOR to a different column type".to_string(),
+                )),
+            },
+            other => self.extend(&other),
+        }
+    }
 }
 
 #[cfg(test)]

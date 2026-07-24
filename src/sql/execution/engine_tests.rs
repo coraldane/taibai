@@ -706,3 +706,47 @@ fn committed_transaction_remains_visible_without_immediate_segment_flush() -> Re
     assert!(segments.is_empty());
     Ok(())
 }
+
+#[test]
+fn close_of_day_only_optimizes_partitions_written_since_last_close() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE daily_partitioned (trade_date INT64, seq INT64) PARTITION BY trade_date",
+    )?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO daily_partitioned (trade_date, seq) VALUES (1, 2), (1, 1)",
+    )?;
+    engine.close_of_day_flush_table("main", "daily_partitioned")?;
+
+    let table_dir = dir.path().join("main").join("daily_partitioned");
+    let first_partition_path = SegmentManager::discover_segments(&table_dir)?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("p1_"))
+        })
+        .expect("first partition segment after initial close");
+    let first_partition_bytes = std::fs::read(&first_partition_path)?;
+
+    engine.execute(
+        &mut session,
+        "INSERT INTO daily_partitioned (trade_date, seq) VALUES (2, 2), (2, 1)",
+    )?;
+    engine.close_of_day_flush_table("main", "daily_partitioned")?;
+
+    assert!(first_partition_path.exists());
+    assert_eq!(std::fs::read(&first_partition_path)?, first_partition_bytes);
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert!(segments.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("p2_"))
+    }));
+    Ok(())
+}

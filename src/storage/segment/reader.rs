@@ -357,32 +357,26 @@ impl SegmentReader {
             })
             .collect();
 
-        let pool = crate::storage::core::buffer_pool::global_batch_pool();
-        let mut results = Vec::with_capacity(column_indices.len());
+        use rayon::prelude::*;
+        let results = column_indices
+            .par_iter()
+            .map(|&col_idx| -> Result<Option<(usize, ColumnArray)>> {
+                if col_idx >= col_offsets.len() {
+                    return Ok(None);
+                }
 
-        for &col_idx in column_indices {
-            if col_idx >= col_offsets.len() {
-                continue;
-            }
+                let col_offset = col_offsets[col_idx];
+                let col_len = rg.column_compressed_sizes[col_idx] as usize;
+                let compressed = &all_data[col_offset..col_offset + col_len];
+                let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
+                    .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
+                let col_def = &self.footer.schema.columns[col_idx];
+                let col_array = decode_column(&decompressed, rg.row_count as usize, col_def)?;
+                Ok(Some((col_idx, col_array)))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-            let col_offset = col_offsets[col_idx];
-            let col_len = rg.column_compressed_sizes[col_idx] as usize;
-            let compressed = &all_data[col_offset..col_offset + col_len];
-
-            let mut buf = pool.acquire();
-            buf.reserve(col_len * 3);
-
-            let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-                .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
-
-            pool.release(buf);
-
-            let col_def = &self.footer.schema.columns[col_idx];
-            let col_array = decode_column(&decompressed, rg.row_count as usize, col_def)?;
-            results.push((col_idx, col_array));
-        }
-
-        Ok(results)
+        Ok(results.into_iter().flatten().collect())
     }
 
     pub fn read_columns_filtered(

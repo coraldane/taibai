@@ -182,6 +182,41 @@ impl SegmentManager {
         Ok(total)
     }
 
+    /// Flush and seal every non-empty active segment for one table, regardless
+    /// of the normal minimum segment size. Close-of-day optimization needs the
+    /// segments to become immutable so they are visible to the compactor.
+    pub fn seal_table_active(&self, db: &str, table: &str) -> Result<u64> {
+        let table_dir = self.table_dir(db, table);
+        let key = table_key(db, table);
+        let mut total = 0u64;
+        let tables = self.tables.read().unwrap();
+        if let Some(state) = tables.get(&key) {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            let keys_to_seal = active_guard
+                .iter()
+                .filter(|(_, segment)| segment.total_rows > 0 || segment.buffered_rows > 0)
+                .map(|(partition_key, _)| partition_key.clone())
+                .collect::<Vec<_>>();
+
+            for partition_key in keys_to_seal {
+                if let Some(segment) = active_guard.get_mut(&partition_key) {
+                    segment.seal(&|path| self.invalidate_reader(path))?;
+                    total += segment.total_rows;
+                    tracing::info!(
+                        path = %segment.path.display(),
+                        rows = segment.total_rows,
+                        partition_key,
+                        "sealing active segment for close-of-day optimization"
+                    );
+                }
+                active_guard.remove(&partition_key);
+            }
+        }
+        drop(tables);
+        self.clear_wal(&table_dir)?;
+        Ok(total)
+    }
+
     pub fn flush_all_active(&self) -> Result<u64> {
         self.sync_all_wals();
 

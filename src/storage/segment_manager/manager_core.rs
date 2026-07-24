@@ -639,6 +639,23 @@ impl SegmentManager {
         }
     }
 
+    /// Return partition keys that currently have buffered or persisted rows in
+    /// an active writer. Callers that need to act on the just-written
+    /// partitions must capture this before sealing removes those writers.
+    pub fn active_partition_keys(&self, db: &str, table: &str) -> Vec<String> {
+        let key = table_key(db, table);
+        let tables = self.tables.read().unwrap();
+        let Some(state) = tables.get(&key) else {
+            return Vec::new();
+        };
+        let active_segments = state.active_segments.lock().unwrap();
+        active_segments
+            .iter()
+            .filter(|(_, segment)| segment.total_rows > 0 || segment.buffered_rows > 0)
+            .map(|(partition_key, _)| partition_key.clone())
+            .collect()
+    }
+
     pub fn remove_wal(&self, table_dir: &Path) {
         let Ok(key) = self.table_state_key_from_dir(table_dir) else {
             return;

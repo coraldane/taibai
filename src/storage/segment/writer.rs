@@ -3,6 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::codec::column_codec::encode_column;
 use crate::storage::codec::io_util::encode_len_prefixed_str;
@@ -176,6 +178,132 @@ impl SegmentWriter {
         }
 
         self.total_rows += batch.num_rows() as u64;
+        Ok(())
+    }
+
+    /// Write complete row groups while encoding and compressing their columns
+    /// in parallel. Compaction produces row-group-aligned batches and can use
+    /// this path without the incremental buffering required by normal inserts.
+    pub fn write_batch_parallel(&mut self, batch: &crate::types::batch::RecordBatch) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        if self.current_group.is_some() {
+            self.flush_row_group()?;
+        }
+
+        let mut offset = 0usize;
+        while offset < batch.num_rows() {
+            let row_count = (batch.num_rows() - offset).min(self.row_group_size);
+            self.write_complete_row_group_parallel(batch, offset, row_count)?;
+            offset += row_count;
+        }
+        self.total_rows += batch.num_rows() as u64;
+        Ok(())
+    }
+
+    fn write_complete_row_group_parallel(
+        &mut self,
+        batch: &crate::types::batch::RecordBatch,
+        row_offset: usize,
+        row_count: usize,
+    ) -> Result<()> {
+        struct EncodedColumn {
+            compressed: Vec<u8>,
+            uncompressed_size: u64,
+            zone_map: ZoneMap,
+            bloom_filter: Option<BloomFilter>,
+            value_set: Option<Vec<ScalarValue>>,
+        }
+
+        let encoded_columns = (0..self.schema.num_columns())
+            .into_par_iter()
+            .map(|col_idx| -> Result<EncodedColumn> {
+                let col = batch.column(col_idx).ok_or_else(|| {
+                    TaibaiError::Storage(format!("missing column {} in write batch", col_idx))
+                })?;
+                let dtype = self.schema.columns[col_idx].data_type;
+                let mut min_value = None;
+                let mut max_value = None;
+                let mut null_count = 0u64;
+                update_zone_map(
+                    col,
+                    row_offset,
+                    row_count,
+                    &mut min_value,
+                    &mut max_value,
+                    &mut null_count,
+                );
+
+                let mut bloom_filter = self.bloom_columns[col_idx].then(BloomFilter::with_defaults);
+                let mut value_set = Some(HashSet::new());
+                for row_idx in row_offset..row_offset + row_count {
+                    let value = col.scalar(row_idx);
+                    if let Some(filter) = &mut bloom_filter {
+                        filter.add(&value);
+                    }
+                    if !value.is_null() {
+                        if let Some(values) = &mut value_set {
+                            values.insert(value);
+                            if values.len() > VALUE_SET_MAX_DISTINCT {
+                                value_set = None;
+                            }
+                        }
+                    }
+                }
+
+                let encoded = encode_column(col, row_offset, row_count)?;
+                let uncompressed_size = encoded.len() as u64;
+                let compressed = zstd::bulk::compress(&encoded, 3)
+                    .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+                let value_set = value_set.map(|values| {
+                    let mut values = values.into_iter().collect::<Vec<_>>();
+                    values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+                    values
+                });
+
+                Ok(EncodedColumn {
+                    compressed,
+                    uncompressed_size,
+                    zone_map: ZoneMap {
+                        min_value: min_value.unwrap_or_else(|| null_for_dtype(dtype)),
+                        max_value: max_value.unwrap_or_else(|| null_for_dtype(dtype)),
+                        null_count,
+                        row_count: row_count as u64,
+                    },
+                    bloom_filter: bloom_filter.filter(|filter| !filter.is_empty()),
+                    value_set,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let file_offset = self.file.metadata()?.len();
+        let mut compressed_sizes = Vec::with_capacity(encoded_columns.len());
+        let mut uncompressed_sizes = Vec::with_capacity(encoded_columns.len());
+        let mut zone_maps = Vec::with_capacity(encoded_columns.len());
+        let mut bloom_filters = Vec::with_capacity(encoded_columns.len());
+        let mut value_sets = Vec::with_capacity(encoded_columns.len());
+        for encoded in encoded_columns {
+            let compressed_size = encoded.compressed.len() as u64;
+            self.file.write_all(&encoded.compressed)?;
+            compressed_sizes.push(compressed_size);
+            uncompressed_sizes.push(encoded.uncompressed_size);
+            zone_maps.push(encoded.zone_map);
+            bloom_filters.push(encoded.bloom_filter);
+            value_sets.push(encoded.value_set);
+        }
+
+        self.row_groups.push(crate::storage::segment::RowGroupMeta {
+            offset: file_offset,
+            length: compressed_sizes.iter().sum(),
+            row_count: row_count as u64,
+            zone_maps,
+            column_compressed_sizes: compressed_sizes.clone(),
+            compressed_sizes,
+            uncompressed_sizes,
+            bloom_filters,
+            value_sets,
+        });
         Ok(())
     }
 
