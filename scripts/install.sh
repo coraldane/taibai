@@ -27,7 +27,7 @@ Examples:
 Installation directories:
   <prefix>/bin/     - Binary files
   <prefix>/conf/    - Configuration files
-  <prefix>/log/     - Log files
+  <prefix>/logs/    - Log files
   <prefix>/run/     - PID files
   <prefix>/data/    - Data files
 EOF
@@ -67,7 +67,7 @@ ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 
 BIN_DIR="$PREFIX/bin"
 CONF_DIR="$PREFIX/conf"
-LOG_DIR="$PREFIX/log"
+LOG_DIR="$PREFIX/logs"
 RUN_DIR="$PREFIX/run"
 DATA_DIR="${DATA_DIR:-$PREFIX/data}"
 

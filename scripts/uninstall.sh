@@ -90,7 +90,7 @@ remove_files() {
     
     BIN_DIR="$PREFIX/bin"
     CONF_DIR="$PREFIX/conf"
-    LOG_DIR="$PREFIX/log"
+    LOG_DIR="$PREFIX/logs"
     RUN_DIR="$PREFIX/run"
     DATA_DIR="$PREFIX/data"
     
