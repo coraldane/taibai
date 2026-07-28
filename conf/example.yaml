@@ -23,6 +23,14 @@ storage:
   delete_cleanup_min_deleted_rows: 8192  # Minimum deleted rows before cleanup
   delete_bitmap_cleanup_interval_secs: 60  # Background cleanup interval; overrides delete_cleanup_interval_ms when set
   delete_cleanup_max_segments_per_run: 8  # Limit cleanup work per round
+  fragmentation_cleanup_enabled: true  # Merge excessive tiny row groups automatically
+  fragmentation_min_row_groups: 32  # Start considering a table fragmented at this count
+  fragmentation_max_overhead_ratio: 2.0  # Actual RGs / ideal RGs required to compact
+  fragmentation_min_small_row_group_ratio: 0.50  # Fraction of RGs below 25% target size
+  fragmentation_cooldown_secs: 3600  # Avoid repeatedly rewriting the same table
+  fragmentation_scan_interval_secs: 300  # Row-group health scan cadence
+  low_rate_memtable_max_rows: 1024  # Rows eligible for durable low-rate tail buffering
+  low_rate_memtable_max_age_secs: 604800  # Keep durable low-rate tails for up to 7 days
   hot_store_memory_limit_mb: 8192  # Unified resident hot store memory limit in MB
   row_group_target_rows: 131072  # Physical page/row-group target
 

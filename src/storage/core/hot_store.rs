@@ -815,6 +815,7 @@ fn build_initial_columns(schema: &Schema) -> Vec<ColumnArray> {
 /// Registry of resident hot stores, keyed by `(db, table)`.
 pub struct HotStoreManager {
     stores: RwLock<HashMap<(String, String), Arc<HotStore>>>,
+    invalidated: RwLock<HashSet<(String, String)>>,
     memory_limit_bytes: u64,
 }
 
@@ -826,6 +827,7 @@ impl HotStoreManager {
     pub fn with_memory_limit_bytes(memory_limit_bytes: u64) -> Self {
         Self {
             stores: RwLock::new(HashMap::new()),
+            invalidated: RwLock::new(HashSet::new()),
             memory_limit_bytes,
         }
     }
@@ -844,15 +846,19 @@ impl HotStoreManager {
         table: &str,
         table_meta: &TableMeta,
     ) -> Option<Arc<HotStore>> {
+        let table_key = (db.to_string(), table.to_string());
+        if self.invalidated.read().unwrap().contains(&table_key) {
+            return None;
+        }
         let key_idx = resolve_key_column(table_meta)?;
         {
             let stores = self.stores.read().unwrap();
-            if let Some(existing) = stores.get(&(db.to_string(), table.to_string())) {
+            if let Some(existing) = stores.get(&table_key) {
                 return Some(Arc::clone(existing));
             }
         }
         let mut stores = self.stores.write().unwrap();
-        if let Some(existing) = stores.get(&(db.to_string(), table.to_string())) {
+        if let Some(existing) = stores.get(&table_key) {
             return Some(Arc::clone(existing));
         }
         let schema = Schema::new(table_meta.columns.clone());
@@ -863,7 +869,7 @@ impl HotStoreManager {
             partition_idx,
             self.memory_limit_bytes,
         ));
-        stores.insert((db.to_string(), table.to_string()), Arc::clone(&store));
+        stores.insert(table_key, Arc::clone(&store));
         Some(store)
     }
 
@@ -911,8 +917,19 @@ impl HotStoreManager {
     }
 
     pub fn remove(&self, db: &str, table: &str) {
+        let table_key = (db.to_string(), table.to_string());
         let mut stores = self.stores.write().unwrap();
-        stores.remove(&(db.to_string(), table.to_string()));
+        stores.remove(&table_key);
+        self.invalidated.write().unwrap().remove(&table_key);
+    }
+
+    /// Drop an append-only hot store after an in-place mutation and keep it
+    /// disabled until restart. Recreating it from only subsequent INSERTs
+    /// would hide older live memtable rows behind an incomplete fast path.
+    pub fn invalidate(&self, db: &str, table: &str) {
+        let table_key = (db.to_string(), table.to_string());
+        self.stores.write().unwrap().remove(&table_key);
+        self.invalidated.write().unwrap().insert(table_key);
     }
 
     pub fn clear_resident_coverage(&self, db: &str, table: &str) {

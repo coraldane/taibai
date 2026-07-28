@@ -8,6 +8,34 @@ fn session() -> Session {
     Session::new("root".to_string(), "main".to_string())
 }
 
+#[test]
+fn auto_compaction_detects_low_rate_row_group_fragmentation() {
+    let config = AutoCompactConfig::default();
+    let fragmented = TablePhysicalHealth {
+        live_rows: 40,
+        deleted_rows: 0,
+        row_groups: 40,
+        small_row_groups: 40,
+    };
+    assert!(fragmented.needs_fragmentation_cleanup(8192, &config));
+
+    let compact = TablePhysicalHealth {
+        live_rows: 40,
+        deleted_rows: 0,
+        row_groups: 1,
+        small_row_groups: 1,
+    };
+    assert!(!compact.needs_fragmentation_cleanup(8192, &config));
+
+    let legitimately_large = TablePhysicalHealth {
+        live_rows: 8192 * 40,
+        deleted_rows: 0,
+        row_groups: 40,
+        small_row_groups: 0,
+    };
+    assert!(!legitimately_large.needs_fragmentation_cleanup(8192, &config));
+}
+
 fn bulk_payload(table: &str, row_count: u32, columns: Vec<(&str, DataType, Vec<u8>)>) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(table.len() as u16).to_le_bytes());

@@ -226,6 +226,38 @@ fn default_delete_cleanup_max_segments_per_run() -> usize {
     8
 }
 
+fn default_fragmentation_cleanup_enabled() -> bool {
+    true
+}
+
+fn default_fragmentation_min_row_groups() -> usize {
+    32
+}
+
+fn default_fragmentation_max_overhead_ratio() -> f64 {
+    2.0
+}
+
+fn default_fragmentation_min_small_row_group_ratio() -> f64 {
+    0.50
+}
+
+fn default_fragmentation_cooldown_secs() -> u64 {
+    3600
+}
+
+fn default_fragmentation_scan_interval_secs() -> u64 {
+    300
+}
+
+fn default_low_rate_memtable_max_rows() -> u64 {
+    1024
+}
+
+fn default_low_rate_memtable_max_age_secs() -> u64 {
+    7 * 24 * 60 * 60
+}
+
 fn default_hot_store_memory_limit_mb() -> u64 {
     8192
 }
@@ -391,6 +423,22 @@ pub struct StorageSettings {
     pub delete_bitmap_cleanup_interval_secs: Option<u64>,
     #[serde(default = "default_delete_cleanup_max_segments_per_run")]
     pub delete_cleanup_max_segments_per_run: usize,
+    #[serde(default = "default_fragmentation_cleanup_enabled")]
+    pub fragmentation_cleanup_enabled: bool,
+    #[serde(default = "default_fragmentation_min_row_groups")]
+    pub fragmentation_min_row_groups: usize,
+    #[serde(default = "default_fragmentation_max_overhead_ratio")]
+    pub fragmentation_max_overhead_ratio: f64,
+    #[serde(default = "default_fragmentation_min_small_row_group_ratio")]
+    pub fragmentation_min_small_row_group_ratio: f64,
+    #[serde(default = "default_fragmentation_cooldown_secs")]
+    pub fragmentation_cooldown_secs: u64,
+    #[serde(default = "default_fragmentation_scan_interval_secs")]
+    pub fragmentation_scan_interval_secs: u64,
+    #[serde(default = "default_low_rate_memtable_max_rows")]
+    pub low_rate_memtable_max_rows: u64,
+    #[serde(default = "default_low_rate_memtable_max_age_secs")]
+    pub low_rate_memtable_max_age_secs: u64,
     #[serde(default = "default_hot_store_memory_limit_mb")]
     pub hot_store_memory_limit_mb: u64,
     #[serde(default = "default_row_group_target_rows")]
@@ -552,6 +600,15 @@ impl Default for ServerConfig {
                 delete_cleanup_interval_ms: default_delete_cleanup_interval_ms(),
                 delete_bitmap_cleanup_interval_secs: default_delete_bitmap_cleanup_interval_secs(),
                 delete_cleanup_max_segments_per_run: default_delete_cleanup_max_segments_per_run(),
+                fragmentation_cleanup_enabled: default_fragmentation_cleanup_enabled(),
+                fragmentation_min_row_groups: default_fragmentation_min_row_groups(),
+                fragmentation_max_overhead_ratio: default_fragmentation_max_overhead_ratio(),
+                fragmentation_min_small_row_group_ratio:
+                    default_fragmentation_min_small_row_group_ratio(),
+                fragmentation_cooldown_secs: default_fragmentation_cooldown_secs(),
+                fragmentation_scan_interval_secs: default_fragmentation_scan_interval_secs(),
+                low_rate_memtable_max_rows: default_low_rate_memtable_max_rows(),
+                low_rate_memtable_max_age_secs: default_low_rate_memtable_max_age_secs(),
                 hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
                 row_group_target_rows: default_row_group_target_rows(),
             },

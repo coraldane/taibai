@@ -310,6 +310,25 @@ impl Engine {
         Ok(0)
     }
 
+    /// Graceful process checkpoint that preserves durable low-rate memtables.
+    /// Explicit FLUSH/CLOSE OF DAY still use `flush_all_buffers` and therefore
+    /// materialize every row when the operator asks for it.
+    pub fn flush_shutdown_buffers(&self) -> Result<u64> {
+        if let Err(e) = self.batch_writer.flush_all_for_shutdown() {
+            tracing::warn!(error = %e, "shutdown buffer flush failed");
+        }
+
+        self.segment_mgr.flush_all_active()?;
+        {
+            let mut catalogs = self.catalogs.write().unwrap();
+            let meta_dir = self.data_dir.join("meta");
+            for (_, catalog) in catalogs.iter_mut() {
+                let _ = catalog.save(&meta_dir);
+            }
+        }
+        Ok(0)
+    }
+
     /// Close-of-day archival (design 鎼?.2): flush every live memtable, seal all
     /// active segments (and clear WALs), then evict every resident hot store and
     /// drop Archived memtables. After this the day's data is fully handed off to
@@ -572,12 +591,13 @@ impl Engine {
         }
     }
 
-    /// Graceful shutdown (design 鎼?.3): flush every live memtable, seal active
-    /// segments and clear WALs so a restart loses nothing. Safe to call once.
+    /// Graceful shutdown checkpoint.
+    /// Physical writers are sealed, while restart-safe low-rate tails remain
+    /// in memtable form so routine restarts do not create tiny segments.
     pub fn shutdown(&mut self) -> Result<()> {
-        tracing::info!("engine shutdown: flushing resident data");
-        if let Err(e) = self.flush_all_buffers() {
-            tracing::warn!(error = %e, "engine shutdown: flush_all_buffers failed");
+        tracing::info!("engine shutdown: checkpointing resident data");
+        if let Err(e) = self.flush_shutdown_buffers() {
+            tracing::warn!(error = %e, "engine shutdown checkpoint failed");
         }
         self.batch_writer.stop();
         Ok(())

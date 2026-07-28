@@ -3,6 +3,8 @@ use tempfile::TempDir;
 use taibai::net::session::Session;
 use taibai::protocol::types::DataType;
 use taibai::sql::execution::engine::{Engine, ExecResult};
+use taibai::storage::core::durable_tail;
+use taibai::storage::segment_manager::SegmentManager;
 use taibai::types::array::ColumnArray;
 use taibai::types::batch::{ColumnDef, RecordBatch, Schema};
 use taibai::types::scalar::ScalarValue;
@@ -157,5 +159,330 @@ fn update_preserves_unmatched_row_groups_in_rewritten_segment() {
     );
     values.sort_unstable();
     assert_eq!(values, vec![10, 20, 40, 50, 99]);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn update_mutates_target_memtable_without_flushing_other_tables() {
+    let (temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE target (id INT32, value INT32)")
+        .expect("create target table");
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE unrelated (id INT32, value INT32)",
+        )
+        .expect("create unrelated table");
+    engine
+        .execute(&mut session, "INSERT INTO target VALUES (1, 10)")
+        .expect("insert target row");
+    engine
+        .execute(&mut session, "INSERT INTO unrelated VALUES (1, 20)")
+        .expect("insert unrelated row");
+
+    let updated = engine
+        .execute(&mut session, "UPDATE target SET value = 99 WHERE id = 1")
+        .expect("update resident row");
+    match updated {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+        other => panic!("expected ok, got {:?}", other),
+    }
+    for value in 100..125 {
+        let updated = engine
+            .execute(
+                &mut session,
+                &format!("UPDATE target SET value = {} WHERE id = 1", value),
+            )
+            .expect("repeat resident update");
+        match updated {
+            ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+            other => panic!("expected ok, got {:?}", other),
+        }
+    }
+    assert_eq!(
+        collect_i32(
+            engine
+                .execute(&mut session, "SELECT value FROM target")
+                .expect("select updated row"),
+            0,
+        ),
+        vec![124]
+    );
+
+    let target_dir = temp_dir.path().join("main").join("target");
+    let unrelated_dir = temp_dir.path().join("main").join("unrelated");
+    let target_schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int32),
+        ColumnDef::new("value", DataType::Int32),
+    ]);
+    let tails =
+        durable_tail::recover(&target_dir, &target_schema).expect("recover updated durable tail");
+    assert_eq!(tails.len(), 1);
+    assert_eq!(
+        tails[0].batch.scalar(0, 1),
+        Some(ScalarValue::Int32(Some(124)))
+    );
+    assert!(SegmentManager::discover_segments(&target_dir)
+        .expect("discover target segments")
+        .is_empty());
+    assert!(SegmentManager::discover_segments(&unrelated_dir)
+        .expect("discover unrelated segments")
+        .is_empty());
+
+    engine
+        .execute(&mut session, "FLUSH TABLE target")
+        .expect("flush target table");
+    let target_segments =
+        SegmentManager::discover_segments(&target_dir).expect("discover flushed target segments");
+    assert_eq!(target_segments.len(), 1);
+    let reader = engine
+        .segment_mgr()
+        .open_reader(&target_segments[0])
+        .expect("open flushed target segment");
+    assert_eq!(reader.num_row_groups(), 1);
+    assert_eq!(reader.row_count(), 1);
+    assert!(durable_tail::recover(&target_dir, &target_schema)
+        .expect("verify durable tail cleared")
+        .is_empty());
+    assert!(SegmentManager::discover_segments(&unrelated_dir)
+        .expect("discover unrelated segments after target flush")
+        .is_empty());
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn updated_memtable_is_persisted_by_graceful_restart() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+            .expect("create table");
+        engine
+            .execute(&mut session, "INSERT INTO t VALUES (1, 10)")
+            .expect("insert row");
+        engine
+            .execute(&mut session, "UPDATE t SET value = 99 WHERE id = 1")
+            .expect("update resident row");
+        engine.shutdown().expect("graceful shutdown");
+    }
+
+    let table_dir = temp_dir.path().join("main").join("t");
+    let schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int32),
+        ColumnDef::new("value", DataType::Int32),
+    ]);
+    assert!(SegmentManager::discover_segments(&table_dir)
+        .expect("discover segments after shutdown")
+        .is_empty());
+    assert_eq!(
+        durable_tail::recover(&table_dir, &schema)
+            .expect("recover shutdown tail")
+            .len(),
+        1
+    );
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("reopen engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    assert_eq!(
+        collect_i32(
+            engine
+                .execute(&mut session, "SELECT value FROM t")
+                .expect("select after restart"),
+            0,
+        ),
+        vec![99]
+    );
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn engine_startup_recovers_durable_low_rate_tail() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int32),
+        ColumnDef::new("value", DataType::Int32),
+    ]);
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+        engine
+            .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+            .expect("create table");
+        engine.shutdown().expect("shutdown empty engine");
+    }
+
+    let mut tail_batch = RecordBatch::new(schema.clone());
+    tail_batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::Int32(Some(1)))
+        .unwrap();
+    tail_batch
+        .column_mut(1)
+        .unwrap()
+        .push(&ScalarValue::Int32(Some(99)))
+        .unwrap();
+    let table_dir = temp_dir.path().join("main").join("t");
+    durable_tail::persist(&table_dir, uuid::Uuid::new_v4(), "", &tail_batch)
+        .expect("persist simulated crash tail");
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("reopen engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    assert_eq!(
+        collect_i32(
+            engine
+                .execute(&mut session, "SELECT value FROM t")
+                .expect("select recovered tail"),
+            0,
+        ),
+        vec![99]
+    );
+    assert!(SegmentManager::discover_segments(&table_dir)
+        .expect("discover segments before recovered tail flush")
+        .is_empty());
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn update_invalidates_hot_store_for_following_inserts() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ticks (symbol VARCHAR, value INT32) CLUSTER BY (symbol)",
+        )
+        .expect("create clustered table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO ticks VALUES ('A', 10), ('B', 20)",
+        )
+        .expect("insert hot rows");
+    engine
+        .execute(
+            &mut session,
+            "UPDATE ticks SET value = 99 WHERE symbol = 'A'",
+        )
+        .expect("update hot row");
+    engine
+        .execute(&mut session, "INSERT INTO ticks VALUES ('C', 30)")
+        .expect("insert after hot store invalidation");
+
+    let mut values = collect_i32(
+        engine
+            .execute(&mut session, "SELECT value FROM ticks")
+            .expect("select all resident rows"),
+        0,
+    );
+    values.sort_unstable();
+    assert_eq!(values, vec![20, 30, 99]);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn delete_and_replace_do_not_flush_unrelated_low_rate_table() {
+    let (temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE low_rate (id INT32)")
+        .expect("create low-rate table");
+    engine
+        .execute(&mut session, "CREATE TABLE deleted (id INT32)")
+        .expect("create delete target");
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE replaced (id INT32 PRIMARY KEY, value INT32)",
+        )
+        .expect("create replace target");
+    engine
+        .execute(&mut session, "INSERT INTO low_rate VALUES (1)")
+        .expect("insert low-rate row");
+    engine
+        .execute(&mut session, "INSERT INTO deleted VALUES (1)")
+        .expect("insert delete target");
+    engine
+        .execute(&mut session, "INSERT INTO replaced VALUES (1, 10)")
+        .expect("insert replace target");
+
+    engine
+        .execute(&mut session, "DELETE FROM deleted WHERE id = 1")
+        .expect("delete target row");
+    engine
+        .execute(&mut session, "REPLACE INTO replaced VALUES (1, 20)")
+        .expect("replace target row");
+
+    let low_rate_dir = temp_dir.path().join("main").join("low_rate");
+    assert!(SegmentManager::discover_segments(&low_rate_dir)
+        .expect("discover unrelated low-rate segments")
+        .is_empty());
+    assert_eq!(
+        collect_i32(
+            engine
+                .execute(&mut session, "SELECT id FROM low_rate")
+                .expect("select unrelated low-rate row"),
+            0,
+        ),
+        vec![1]
+    );
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn crossing_low_rate_tail_limit_atomically_materializes_one_segment() {
+    let (temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE low_rate (id INT32)")
+        .expect("create low-rate table");
+    let values = (0..1024)
+        .map(|value| format!("({value})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(
+            &mut session,
+            &format!("INSERT INTO low_rate VALUES {values}"),
+        )
+        .expect("fill durable low-rate tail");
+
+    let table_dir = temp_dir.path().join("main").join("low_rate");
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int32)]);
+    assert_eq!(
+        durable_tail::recover(&table_dir, &schema)
+            .expect("recover full low-rate tail")
+            .len(),
+        1
+    );
+    assert!(SegmentManager::discover_segments(&table_dir)
+        .expect("discover pre-threshold segments")
+        .is_empty());
+
+    engine
+        .execute(&mut session, "INSERT INTO low_rate VALUES (1024)")
+        .expect("cross low-rate tail threshold");
+    let segments =
+        SegmentManager::discover_segments(&table_dir).expect("discover materialized segment");
+    assert_eq!(segments.len(), 1);
+    let reader = engine
+        .segment_mgr()
+        .open_reader(&segments[0])
+        .expect("open materialized segment");
+    assert_eq!(reader.row_count(), 1025);
+    assert_eq!(reader.num_row_groups(), 1);
+    assert!(durable_tail::recover(&table_dir, &schema)
+        .expect("verify materialized tail cleared")
+        .is_empty());
+    assert_eq!(
+        collect_i32(
+            engine
+                .execute(&mut session, "SELECT id FROM low_rate")
+                .expect("read materialized rows"),
+            0,
+        )
+        .len(),
+        1025
+    );
     engine.segment_mgr().shutdown();
 }

@@ -25,6 +25,14 @@ storage:
   delete_cleanup_interval_ms: 1000  # Background cleanup interval (legacy millisecond setting)
   delete_bitmap_cleanup_interval_secs: 1  # Background cleanup interval; overrides delete_cleanup_interval_ms when set
   delete_cleanup_max_segments_per_run: 8  # Limit IO per cleanup round
+  fragmentation_cleanup_enabled: true
+  fragmentation_min_row_groups: 32
+  fragmentation_max_overhead_ratio: 2.0
+  fragmentation_min_small_row_group_ratio: 0.50
+  fragmentation_cooldown_secs: 3600
+  fragmentation_scan_interval_secs: 300
+  low_rate_memtable_max_rows: 1024
+  low_rate_memtable_max_age_secs: 604800
   hot_store_memory_limit_mb: 28192  # Unified resident hot store memory limit in MB
 
 # Buffer settings

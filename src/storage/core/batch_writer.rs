@@ -6,12 +6,15 @@ use std::time::Instant;
 
 use crate::common::error::Result;
 use crate::storage::core::memtable::{MemTableManager, MemTableState};
+use crate::storage::segment::meta::remove_sidecar_meta;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 
 const DEFAULT_MAX_ROWS_PER_MEMTABLE: u64 = 500_000;
 const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 const DEFAULT_MAX_TOTAL_MEMORY: u64 = 512 * 1024 * 1024;
+const DEFAULT_LOW_RATE_MAX_ROWS: u64 = 1024;
+const DEFAULT_LOW_RATE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
 fn insert_profile_enabled() -> bool {
     matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"))
@@ -55,6 +58,8 @@ pub struct BatchWriterConfig {
     pub flush_interval_secs: u64,
     pub max_total_memory: u64,
     pub worker_count: usize,
+    pub low_rate_max_rows: u64,
+    pub low_rate_max_age_secs: u64,
 }
 
 impl Default for BatchWriterConfig {
@@ -64,6 +69,8 @@ impl Default for BatchWriterConfig {
             flush_interval_secs: DEFAULT_FLUSH_INTERVAL_SECS,
             max_total_memory: DEFAULT_MAX_TOTAL_MEMORY,
             worker_count: 2,
+            low_rate_max_rows: DEFAULT_LOW_RATE_MAX_ROWS,
+            low_rate_max_age_secs: DEFAULT_LOW_RATE_MAX_AGE_SECS,
         }
     }
 }
@@ -83,6 +90,8 @@ impl BatchWriter {
         let memtable_mgr = Arc::new(MemTableManager::new(
             config.max_rows_per_memtable,
             config.flush_interval_secs,
+            config.low_rate_max_rows,
+            config.low_rate_max_age_secs,
         ));
         let (sender, receiver) = crossbeam_channel::bounded(8192);
         let stop = Arc::new(AtomicBool::new(false));
@@ -211,6 +220,27 @@ impl BatchWriter {
         log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
         let append_start = Instant::now();
         mt.append_owned(batch)?;
+        if txn_id == 0 {
+            if let Err(error) = self.persist_memtable_tail(&mt) {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "durable tail write failed; flushing target memtable"
+                );
+                Self::flush_memtable_inner(&self.segment_mgr, &mt, true)?;
+            } else if mt.row_count() > self.config.low_rate_max_rows
+                && crate::storage::core::durable_tail::has_tail(
+                    &self.segment_mgr.table_dir(db, table),
+                    mt.id(),
+                )
+            {
+                // Crossing the durable low-rate bound materializes one
+                // reasonably sized segment instead of growing the tail
+                // without limit.
+                Self::flush_memtable_inner(&self.segment_mgr, &mt, true)?;
+            }
+        }
         log_insert_profile(
             "memtable_append",
             row_count as usize,
@@ -227,7 +257,45 @@ impl BatchWriter {
     }
 
     pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
+        self.commit_txn_inner(txn_id, false)
+    }
+
+    pub(crate) fn commit_txn_under_table_lock(&self, txn_id: u64) -> Result<()> {
+        self.commit_txn_inner(txn_id, true)
+    }
+
+    fn commit_txn_inner(&self, txn_id: u64, table_lock_held: bool) -> Result<()> {
         let committed_mts = self.memtable_mgr.commit_txn(txn_id);
+        for memtable in &committed_mts {
+            let persist = || {
+                if let Err(error) = self.persist_memtable_tail(memtable) {
+                    tracing::warn!(
+                        db = memtable.db(),
+                        table = memtable.table(),
+                        error = %error,
+                        "committed durable tail write failed; flushing target memtable"
+                    );
+                    Self::flush_memtable_inner(&self.segment_mgr, memtable, true)?;
+                } else if memtable.row_count() > self.config.low_rate_max_rows
+                    && crate::storage::core::durable_tail::has_tail(
+                        &self.segment_mgr.table_dir(memtable.db(), memtable.table()),
+                        memtable.id(),
+                    )
+                {
+                    Self::flush_memtable_inner(&self.segment_mgr, memtable, true)?;
+                }
+                Ok(())
+            };
+            if table_lock_held {
+                persist()?;
+            } else {
+                self.segment_mgr.with_table_mutation_lock(
+                    memtable.db(),
+                    memtable.table(),
+                    persist,
+                )?;
+            }
+        }
         let rows_committed = committed_mts.iter().map(|mt| mt.row_count()).sum::<u64>();
         self.segment_mgr.commit_txn(txn_id)?;
         tracing::debug!(
@@ -282,16 +350,78 @@ impl BatchWriter {
         Ok(())
     }
 
+    /// Flush buffers that have no durable low-rate tail. Durable tails remain
+    /// resident-on-disk and are restored as memtables at the next startup, so
+    /// a routine service restart does not manufacture a tiny row group.
+    pub fn flush_all_for_shutdown(&self) -> Result<()> {
+        let mts = self.memtable_mgr.get_all_pending();
+        for mt in mts {
+            let table_dir = self.segment_mgr.table_dir(mt.db(), mt.table());
+            if crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()) {
+                continue;
+            }
+            Self::flush_memtable(&self.segment_mgr, &mt)?;
+        }
+        self.memtable_mgr.remove_flushed();
+        Ok(())
+    }
+
     pub fn clear_memtables(&self, db: &str, table: &str) -> u64 {
-        self.memtable_mgr.clear_table(db, table)
+        let memtables = self.memtable_mgr.get_by_table(db, table);
+        let cleared = self.memtable_mgr.clear_table(db, table);
+        let table_dir = self.segment_mgr.table_dir(db, table);
+        for memtable in memtables {
+            let _ = crate::storage::core::durable_tail::clear(&table_dir, memtable.id());
+        }
+        cleared
     }
 
     pub fn clear_partition_memtables(&self, db: &str, table: &str, partition_key: &str) -> u64 {
-        self.memtable_mgr.clear_partition(db, table, partition_key)
+        let memtables = self
+            .memtable_mgr
+            .get_by_table(db, table)
+            .into_iter()
+            .filter(|memtable| memtable.partition_key() == partition_key)
+            .collect::<Vec<_>>();
+        let cleared = self.memtable_mgr.clear_partition(db, table, partition_key);
+        let table_dir = self.segment_mgr.table_dir(db, table);
+        for memtable in memtables {
+            let _ = crate::storage::core::durable_tail::clear(&table_dir, memtable.id());
+        }
+        cleared
     }
 
     pub fn rename_memtables(&self, db: &str, old_table: &str, new_table: &str) -> u64 {
         self.memtable_mgr.rename_table(db, old_table, new_table)
+    }
+
+    pub(crate) fn persist_memtable_tail(
+        &self,
+        memtable: &crate::storage::core::memtable::MemTable,
+    ) -> Result<()> {
+        if memtable.state() != MemTableState::Pending {
+            return Ok(());
+        }
+        if memtable.is_transactional()
+            || memtable.visibility() != crate::storage::core::memtable::TxnVisibility::Committed
+        {
+            return Ok(());
+        }
+        let table_dir = self.segment_mgr.table_dir(memtable.db(), memtable.table());
+        if memtable.row_count() > self.config.low_rate_max_rows
+            && !crate::storage::core::durable_tail::has_tail(&table_dir, memtable.id())
+        {
+            return Ok(());
+        }
+        let Some(batch) = memtable.read_snapshot() else {
+            return Ok(());
+        };
+        crate::storage::core::durable_tail::persist(
+            &table_dir,
+            memtable.id(),
+            memtable.partition_key(),
+            &batch,
+        )
     }
 
     pub fn stop(&mut self) {
@@ -387,6 +517,20 @@ impl BatchWriter {
         mt: &Arc<crate::storage::core::memtable::MemTable>,
         table_lock_held: bool,
     ) -> Result<()> {
+        let db = mt.db().to_string();
+        let table = mt.table().to_string();
+        if table_lock_held {
+            return Self::flush_memtable_under_table_lock(segment_mgr, mt);
+        }
+        segment_mgr.with_table_mutation_lock(&db, &table, || {
+            Self::flush_memtable_under_table_lock(segment_mgr, mt)
+        })
+    }
+
+    fn flush_memtable_under_table_lock(
+        segment_mgr: &Arc<SegmentManager>,
+        mt: &Arc<crate::storage::core::memtable::MemTable>,
+    ) -> Result<()> {
         if mt.state() != MemTableState::Pending {
             return Ok(());
         }
@@ -402,33 +546,30 @@ impl BatchWriter {
         let table = mt.table().to_string();
         let partition_key = mt.partition_key().to_string();
         let txn_id = mt.txn_id();
-        let flush_result = if table_lock_held {
-            segment_mgr.flush_memtable_batch_if_under_table_lock(
+        let table_dir = segment_mgr.table_dir(&db, &table);
+        if crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()) {
+            return Self::flush_durable_memtable_under_table_lock(
+                segment_mgr,
+                mt,
+                &batch,
                 &db,
                 &table,
                 &partition_key,
-                &batch,
                 txn_id,
-                || mt.state() == MemTableState::Flushing,
-                || {
-                    let _ = mt.take_batch();
-                    mt.set_state(MemTableState::Flushed);
-                },
-            )
-        } else {
-            segment_mgr.flush_memtable_batch_if(
-                &db,
-                &table,
-                &partition_key,
-                &batch,
-                txn_id,
-                || mt.state() == MemTableState::Flushing,
-                || {
-                    let _ = mt.take_batch();
-                    mt.set_state(MemTableState::Flushed);
-                },
-            )
-        };
+            );
+        }
+        let flush_result = segment_mgr.flush_memtable_batch_if_under_table_lock(
+            &db,
+            &table,
+            &partition_key,
+            &batch,
+            txn_id,
+            || mt.state() == MemTableState::Flushing,
+            || {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            },
+        );
         let wrote = match flush_result {
             Ok(wrote) => wrote,
             Err(e) => {
@@ -444,11 +585,82 @@ impl BatchWriter {
             return Ok(());
         }
 
+        crate::storage::core::durable_tail::clear(&segment_mgr.table_dir(&db, &table), mt.id())?;
+
         tracing::debug!(
             table = %table,
             rows = mt.row_count(),
             txn_id,
             "memtable flushed to active segment"
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flush_durable_memtable_under_table_lock(
+        segment_mgr: &Arc<SegmentManager>,
+        mt: &Arc<crate::storage::core::memtable::MemTable>,
+        batch: &RecordBatch,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        txn_id: u64,
+    ) -> Result<()> {
+        let table_dir = segment_mgr.table_dir(db, table);
+        let final_path = if partition_key.is_empty() {
+            segment_mgr.next_segment_path(&table_dir, "")?
+        } else {
+            segment_mgr.next_partition_segment_path(&table_dir, partition_key)?
+        };
+        let segment_file_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                crate::common::error::TaibaiError::Storage(
+                    "durable tail segment path has no file name".into(),
+                )
+            })?;
+        let intent = crate::storage::core::durable_tail::begin_flush(
+            &table_dir,
+            mt.id(),
+            segment_file_name,
+        )?;
+        let tmp_path = table_dir.join(format!(".tail_flush_{}.tmp", mt.id().simple()));
+
+        let write_result = (|| {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_sidecar_meta(&tmp_path);
+            segment_mgr.write_standalone_active_encoded_segment(&tmp_path, batch)?;
+            std::fs::rename(&tmp_path, &final_path)?;
+            // The sealed segment contains its footer. The temporary sidecar is
+            // unnecessary and is deliberately not renamed to a shared
+            // partition sidecar path.
+            let _ = remove_sidecar_meta(&tmp_path);
+            segment_mgr.open_reader(&final_path)?;
+            Ok(())
+        })();
+
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_sidecar_meta(&tmp_path);
+            let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+            mt.set_state(MemTableState::Pending);
+            return Err(error);
+        }
+
+        let _ = mt.take_batch();
+        mt.set_state(MemTableState::Flushed);
+        if let Err(error) = crate::storage::core::durable_tail::finish_flush(&table_dir, intent) {
+            // The segment and intent are both durable. Recovery will suppress
+            // the source tail even if this best-effort cleanup is interrupted.
+            tracing::warn!(db, table, error = %error, "durable tail flush cleanup deferred to recovery");
+        }
+        tracing::debug!(
+            table,
+            rows = batch.num_rows(),
+            txn_id,
+            path = %final_path.display(),
+            "durable memtable tail flushed to sealed segment"
         );
         Ok(())
     }

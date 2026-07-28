@@ -90,7 +90,16 @@ impl Engine {
         let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
-        let batch_writer = BatchWriter::new(BatchWriterConfig::default(), Arc::clone(&segment_mgr));
+        let batch_writer = BatchWriter::new(
+            BatchWriterConfig {
+                low_rate_max_rows: auto_compact_config.low_rate_max_rows,
+                low_rate_max_age_secs: auto_compact_config.low_rate_max_age.as_secs(),
+                ..BatchWriterConfig::default()
+            },
+            Arc::clone(&segment_mgr),
+        );
+        let recovered_tail_tables =
+            recover_durable_memtable_tails(data_dir, &catalogs, &batch_writer)?;
 
         let auth_manager = Arc::new(AuthManager::new(data_dir)?);
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
@@ -119,7 +128,7 @@ impl Engine {
         let performance_baselines =
             Arc::new(crate::common::performance_baseline::PerformanceBaselineStore::load(data_dir));
         let catalogs = Arc::new(RwLock::new(catalogs));
-        start_delete_bitmap_cleanup_thread(
+        start_auto_compaction_thread(
             Arc::clone(&segment_mgr),
             data_dir.to_path_buf(),
             Arc::clone(&catalogs),
@@ -144,6 +153,9 @@ impl Engine {
             performance_baselines,
         };
         engine.warmup_hot_stores();
+        for (db, table) in recovered_tail_tables {
+            engine.hot_store_mgr.invalidate(&db, &table);
+        }
         Ok(engine)
     }
 
@@ -448,6 +460,7 @@ impl Engine {
                     &table.name,
                     assignments,
                     where_clause,
+                    session.active_txn_id(),
                 );
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();

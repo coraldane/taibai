@@ -182,7 +182,7 @@ pub fn exec_delete(
 
     let resolved_where_clause = resolve_in_subqueries(engine, db, where_clause)?;
 
-    engine.flush_all_buffers()?;
+    engine.flush_table_buffers(db, table)?;
 
     let table_dir = engine.data_dir().join(db).join(table);
     if !table_dir.exists() {

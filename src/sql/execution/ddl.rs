@@ -97,6 +97,43 @@ fn remove_dir_all_with_retry(path: &Path) -> io::Result<()> {
     })
 }
 
+fn rename_directory_with_retry(source: &Path, destination: &Path) -> io::Result<()> {
+    let mut delay = FILE_DELETE_INITIAL_DELAY;
+    for attempt in 1..=FILE_DELETE_MAX_ATTEMPTS {
+        match std::fs::rename(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < FILE_DELETE_MAX_ATTEMPTS && is_retryable_delete_error(&error) =>
+            {
+                tracing::warn!(
+                    source = %source.display(),
+                    destination = %destination.display(),
+                    attempt,
+                    max_attempts = FILE_DELETE_MAX_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    error = %error,
+                    "directory rename failed; retrying"
+                );
+                thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "rename directory '{}' to '{}' failed after {} attempt(s): {}",
+                        source.display(),
+                        destination.display(),
+                        attempt,
+                        error
+                    ),
+                ));
+            }
+        }
+    }
+    unreachable!("rename retry loop always returns")
+}
+
 fn remove_staged_table_directory(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if FORCE_DROP_CLEANUP_FAILURE.with(|force| force.replace(false)) {
@@ -150,7 +187,7 @@ fn stage_table_directory(path: &Path) -> io::Result<Option<std::path::PathBuf>> 
     if tombstone.exists() {
         remove_dir_all_with_retry(&tombstone)?;
     }
-    std::fs::rename(path, &tombstone)?;
+    rename_directory_with_retry(path, &tombstone)?;
     Ok(Some(tombstone))
 }
 

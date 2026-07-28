@@ -27,7 +27,7 @@ pub fn exec_replace(
 
     // Flush before taking the statement-wide table lock. The delete and the
     // staged insert then run under one lock, so DELETE/UPDATE cannot interleave.
-    engine.flush_all_buffers()?;
+    engine.flush_table_buffers(db, table)?;
     engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
@@ -86,7 +86,11 @@ pub fn exec_replace(
                 &materialized.table_meta,
                 &undo,
             )
-            .and_then(|_| engine.batch_writer().commit_txn(internal_txn_id));
+            .and_then(|_| {
+                engine
+                    .batch_writer()
+                    .commit_txn_under_table_lock(internal_txn_id)
+            });
             if let Err(error) = finalize_result {
                 rollback_replace_under_table_lock(
                     engine,

@@ -305,6 +305,43 @@ impl SegmentManager {
         })
     }
 
+    /// Build a standalone sealed segment with the same encoding and row-group
+    /// policy used by the normal active writer. The caller chooses a temporary
+    /// non-discoverable path and can atomically rename it after `seal` returns.
+    pub(crate) fn write_standalone_active_encoded_segment(
+        &self,
+        path: &Path,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        remove_sidecar_meta(path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(&encode_segment_header())?;
+        let mut writer = ActiveSegmentWriter {
+            file: std::io::BufWriter::with_capacity(SEGMENT_BUFWRITER_CAP, file),
+            path: path.to_path_buf(),
+            schema: batch.schema.clone(),
+            row_groups: Vec::new(),
+            current_size: SEGMENT_HEADER_SIZE as u64,
+            total_rows: 0,
+            delete_bitmap: Vec::new(),
+            deleted_row_count: 0,
+            buffered_batch: None,
+            buffered_rows: 0,
+            dirty_meta: false,
+            data_end: SEGMENT_HEADER_SIZE as u64,
+            sidecar_row_groups_flushed: 0,
+            last_write_at: Instant::now(),
+            row_group_target_rows: self.config.row_group_target_rows.max(1),
+        };
+        writer.append_batch(batch, &|segment_path| self.invalidate_reader(segment_path))?;
+        writer.seal(&|segment_path| self.invalidate_reader(segment_path))?;
+        Ok(())
+    }
+
     pub fn find_unsealed_partition_segment(
         table_dir: &Path,
         partition_key: &str,

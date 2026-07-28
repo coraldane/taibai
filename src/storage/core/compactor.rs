@@ -66,7 +66,7 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        self.compact_table(db, table, table_meta, true)
+        self.compact_table(db, table, table_meta, true, false)
     }
 
     /// Rewrite segments to purge delete bitmaps without paying the cost of a
@@ -78,7 +78,19 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        self.compact_table(db, table, table_meta, false)
+        self.compact_table(db, table, table_meta, false, false)
+    }
+
+    /// Repair row-group/segment fragmentation, including a fragmented active
+    /// segment. Pending memtables stay resident; only this table's active
+    /// writer is sealed before the immutable rewrite.
+    pub fn compact_table_for_fragmentation(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &TableMeta,
+    ) -> Result<CompactStats> {
+        self.compact_table(db, table, table_meta, false, true)
     }
 
     fn compact_table(
@@ -87,6 +99,7 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
         sort_by_cluster_key: bool,
+        seal_active: bool,
     ) -> Result<CompactStats> {
         let start_time = Instant::now();
         let table_dir = self.data_dir.join(db).join(table);
@@ -104,6 +117,10 @@ impl Compactor {
             &[]
         };
         let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+            if seal_active {
+                self.segment_mgr
+                    .seal_table_active_under_table_lock(db, table)?;
+            }
             let segment_files = self
                 .segment_mgr
                 .discover_inactive_segments(db, table, &table_dir)?;
@@ -139,13 +156,18 @@ impl Compactor {
                     let _io_permit = crate::common::work_limiter::acquire_io();
 
                     // A clean single segment can only be skipped when this
-                    // operation has no physical ordering requirement. During
-                    // a user OPTIMIZE, CLUSTER BY may have been added after the
-                    // segment was written, or multiple sorted insert batches
-                    // may have been appended out of global order.
+                    // operation has no physical ordering requirement and its
+                    // row groups are already compact. A segment can contain
+                    // thousands of tiny row groups after many small flushes;
+                    // skipping it makes OPTIMIZE unable to repair the main
+                    // source of read amplification.
                     if sort_key_indices.is_empty() && files.len() == 1 {
                         let reader = self.segment_mgr.open_reader_cached(&files[0])?;
-                        if reader.deleted_row_count() == 0 {
+                        let compact_row_groups =
+                            reader.row_count().div_ceil(COMPACT_ROW_GROUP_SIZE as u64) as usize;
+                        let needs_row_group_compaction =
+                            reader.num_row_groups() > compact_row_groups.max(1);
+                        if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
                             tracing::info!(
                                 db,
                                 table,
@@ -782,7 +804,10 @@ impl RowGroupCache {
         }
 
         self.misses += 1;
-        let reader = segment_mgr.open_reader(&source.segment_path)?;
+        // Reuse the parsed footer and mmap for every row group in the same
+        // segment. Reopening here is especially expensive for fragmented
+        // segments because their footer can be almost as large as the data.
+        let reader = segment_mgr.open_reader_cached(&source.segment_path)?;
         let batch =
             reader.read_row_group_with_projection(source.row_group_idx, &self.projection)?;
         self.batches.insert(key.clone(), batch);

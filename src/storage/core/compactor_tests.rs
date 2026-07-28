@@ -308,6 +308,81 @@ fn optimize_table_without_cluster_key_preserves_row_order() -> Result<()> {
 }
 
 #[test]
+fn optimize_table_rewrites_fragmented_clean_single_segment() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = test_schema();
+    let rows = (0..32)
+        .map(|id| (id, format!("value-{id}")))
+        .collect::<Vec<_>>();
+    let borrowed_rows = rows
+        .iter()
+        .map(|(id, name)| (*id, name.as_str()))
+        .collect::<Vec<_>>();
+    write_segment_with_row_group_size(
+        &table_dir.join("seg_00001.dat"),
+        &schema,
+        &borrowed_rows,
+        1,
+    )?;
+
+    let before = SegmentReader::open(&table_dir.join("seg_00001.dat"))?;
+    assert_eq!(before.num_row_groups(), 32);
+
+    let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+    let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &test_meta_without_cluster(&schema))?;
+
+    assert_eq!(stats.segments_read, 1);
+    assert_eq!(stats.segments_written, 1);
+    assert_eq!(stats.rows_written, 32);
+
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments.len(), 1);
+    let reader = SegmentReader::open(&segments[0])?;
+    assert_eq!(reader.num_row_groups(), 1);
+    assert_eq!(read_ids(&segments[0])?, (0..32).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[test]
+fn background_fragmentation_compaction_seals_and_rewrites_active_segment() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    let schema = test_schema();
+    let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+
+    for id in 0..40 {
+        let name = format!("row-{id}");
+        let batch = make_batch(&schema, &[(id, name.as_str())])?;
+        segment_mgr.bulk_insert_batch_ref("default", "t", &batch, false)?;
+    }
+
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(SegmentReader::open(&segments[0])?.num_row_groups(), 40);
+    assert!(!segment_mgr.active_partition_keys("default", "t").is_empty());
+
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.compact_table_for_fragmentation(
+        "default",
+        "t",
+        &test_meta_without_cluster(&schema),
+    )?;
+    assert_eq!(stats.rows_written, 40);
+    assert!(segment_mgr.active_partition_keys("default", "t").is_empty());
+
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments.len(), 1);
+    let reader = SegmentReader::open(&segments[0])?;
+    assert_eq!(reader.row_count(), 40);
+    assert_eq!(reader.num_row_groups(), 1);
+    Ok(())
+}
+
+#[test]
 fn optimize_partition_only_rewrites_requested_partition() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let table_dir = tmp.path().join("default").join("t");

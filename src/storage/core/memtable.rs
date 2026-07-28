@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+use uuid::Uuid;
 
 use crate::common::error::Result;
 use crate::types::batch::{RecordBatch, Schema};
@@ -28,6 +29,7 @@ pub enum TxnVisibility {
 }
 
 pub struct MemTable {
+    id: Uuid,
     db: String,
     table: String,
     partition_key: String,
@@ -42,6 +44,7 @@ pub struct MemTable {
 impl MemTable {
     pub fn new(db: String, table: String, partition_key: String, schema: Schema) -> Self {
         Self {
+            id: Uuid::new_v4(),
             db,
             table,
             partition_key,
@@ -62,6 +65,7 @@ impl MemTable {
         txn_id: u64,
     ) -> Self {
         Self {
+            id: Uuid::new_v4(),
             db,
             table,
             partition_key,
@@ -214,6 +218,49 @@ impl MemTable {
         self.row_count.store(rows, Ordering::Release);
     }
 
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn recovered(
+        id: Uuid,
+        db: String,
+        table: String,
+        partition_key: String,
+        batch: RecordBatch,
+    ) -> Self {
+        let rows = batch.num_rows() as u64;
+        Self {
+            id,
+            db,
+            table,
+            partition_key,
+            batch: RwLock::new(Some(batch)),
+            state: AtomicU8::new(MemTableState::Pending as u8),
+            row_count: AtomicU64::new(rows),
+            created_at: Instant::now(),
+            txn_id: AtomicU64::new(0),
+            visibility: RwLock::new(TxnVisibility::Committed),
+        }
+    }
+
+    /// Replace a live memtable while the caller holds the table mutation lock.
+    /// Returns `false` if a concurrent flush has already moved the memtable out
+    /// of the pending state.
+    pub fn replace_pending_batch(&self, batch: RecordBatch) -> bool {
+        if self.state() != MemTableState::Pending {
+            return false;
+        }
+        let rows = batch.num_rows() as u64;
+        let mut guard = self.batch.write().unwrap();
+        if self.state() != MemTableState::Pending {
+            return false;
+        }
+        *guard = Some(batch);
+        self.row_count.store(rows, Ordering::Release);
+        true
+    }
+
     pub fn schema(&self) -> Option<Schema> {
         let guard = self.batch.read().unwrap();
         guard.as_ref().map(|b| b.schema.clone())
@@ -228,15 +275,47 @@ pub struct MemTableManager {
     memtables: RwLock<Vec<Arc<MemTable>>>,
     max_rows_per_memtable: u64,
     max_age_secs: u64,
+    low_rate_max_rows: u64,
+    low_rate_max_age_secs: u64,
 }
 
 impl MemTableManager {
-    pub fn new(max_rows_per_memtable: u64, max_age_secs: u64) -> Self {
+    pub fn new(
+        max_rows_per_memtable: u64,
+        max_age_secs: u64,
+        low_rate_max_rows: u64,
+        low_rate_max_age_secs: u64,
+    ) -> Self {
         Self {
             memtables: RwLock::new(Vec::new()),
             max_rows_per_memtable,
             max_age_secs,
+            low_rate_max_rows,
+            low_rate_max_age_secs: low_rate_max_age_secs.max(max_age_secs),
         }
+    }
+
+    pub fn restore_committed_tail(
+        &self,
+        id: Uuid,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+    ) -> Arc<MemTable> {
+        let mut memtables = self.memtables.write().unwrap();
+        if let Some(existing) = memtables.iter().find(|memtable| memtable.id() == id) {
+            return Arc::clone(existing);
+        }
+        let memtable = Arc::new(MemTable::recovered(
+            id,
+            db.to_string(),
+            table.to_string(),
+            partition_key.to_string(),
+            batch,
+        ));
+        memtables.push(Arc::clone(&memtable));
+        memtable
     }
 
     pub fn get_or_create(
@@ -380,10 +459,16 @@ impl MemTableManager {
         memtables
             .iter()
             .filter(|mt| {
-                mt.state() == MemTableState::Pending
-                    && !mt.is_transactional()
-                    && (mt.row_count() >= self.max_rows_per_memtable
-                        || mt.age_secs() >= self.max_age_secs)
+                if mt.state() != MemTableState::Pending || mt.is_transactional() {
+                    return false;
+                }
+                let rows = mt.row_count();
+                let age_limit = if rows <= self.low_rate_max_rows {
+                    self.low_rate_max_age_secs
+                } else {
+                    self.max_age_secs
+                };
+                rows >= self.max_rows_per_memtable || mt.age_secs() >= age_limit
             })
             .cloned()
             .collect()
@@ -539,5 +624,37 @@ impl MemTableManager {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::types::batch::ColumnDef;
+    use crate::types::scalar::ScalarValue;
+
+    fn batch(schema: &Schema, values: &[i64]) -> RecordBatch {
+        let mut batch = RecordBatch::new(schema.clone());
+        for value in values {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(*value)))
+                .unwrap();
+        }
+        batch
+    }
+
+    #[test]
+    fn low_rate_memtable_uses_extended_age_before_becoming_flushable() {
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let manager = MemTableManager::new(10_000, 0, 2, 3600);
+        let memtable = manager.get_or_create("main", "t", "", &schema);
+        memtable.append(&batch(&schema, &[1])).unwrap();
+        assert!(manager.get_flushable().is_empty());
+
+        memtable.append(&batch(&schema, &[2, 3])).unwrap();
+        assert_eq!(manager.get_flushable().len(), 1);
     }
 }

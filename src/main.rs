@@ -226,8 +226,8 @@ where
         tracing::error!(error = %e, "server error");
     }
 
-    match engine.flush_all_buffers() {
-        Ok(n) => tracing::info!(rows_flushed = n, "all active segments sealed"),
+    match engine.flush_shutdown_buffers() {
+        Ok(n) => tracing::info!(rows_flushed = n, "shutdown buffers checkpointed"),
         Err(e) => tracing::error!(error = %e, "failed to flush segments on shutdown"),
     }
 }
@@ -254,6 +254,23 @@ fn auto_compact_config_from_server_config(config: &ServerConfig) -> AutoCompactC
         enabled: config.storage.delete_cleanup_enabled,
         min_deleted_ratio: config.storage.delete_cleanup_min_deleted_ratio,
         min_deleted_rows: config.storage.delete_cleanup_min_deleted_rows,
+        fragmentation_enabled: config.storage.fragmentation_cleanup_enabled,
+        min_fragmented_row_groups: config.storage.fragmentation_min_row_groups.max(2),
+        max_row_group_overhead_ratio: config.storage.fragmentation_max_overhead_ratio.max(1.0),
+        min_small_row_group_ratio: config
+            .storage
+            .fragmentation_min_small_row_group_ratio
+            .clamp(0.0, 1.0),
+        fragmentation_cooldown: std::time::Duration::from_secs(
+            config.storage.fragmentation_cooldown_secs,
+        ),
+        fragmentation_scan_interval: std::time::Duration::from_secs(
+            config.storage.fragmentation_scan_interval_secs.max(1),
+        ),
+        low_rate_max_rows: config.storage.low_rate_memtable_max_rows.max(1),
+        low_rate_max_age: std::time::Duration::from_secs(
+            config.storage.low_rate_memtable_max_age_secs.max(30),
+        ),
         interval: interval.max(std::time::Duration::from_millis(1)),
         max_tables_per_run: config.storage.delete_cleanup_max_segments_per_run.max(1),
     }
