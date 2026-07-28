@@ -82,6 +82,7 @@ fn init_tracing(level: &str) {
     }
 }
 
+#[cfg(windows)]
 fn init_file_tracing(level: &str, log_file: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = log_file.parent() {
         std::fs::create_dir_all(parent)?;

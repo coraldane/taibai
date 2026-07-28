@@ -1,6 +1,37 @@
 use super::{PerformanceBaselineConfig, ServerConfig};
 
 #[test]
+fn minimal_config_uses_defaults_for_optional_sections() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.yaml");
+    std::fs::write(
+        &config_path,
+        r#"
+server:
+  host: "127.0.0.1"
+  port: 5252
+storage:
+  data_dir: "./data"
+"#,
+    )
+    .unwrap();
+
+    let config = ServerConfig::from_yaml_file(&config_path).unwrap();
+
+    assert_eq!(config.listen_addr(), "127.0.0.1:5252");
+    assert_eq!(
+        config.storage.data_dir,
+        temp.path().join("data").to_string_lossy()
+    );
+    assert_eq!(config.storage.default_database, "main");
+    assert_eq!(config.buffer.batch_size, 4096);
+    assert!(config.compression.enabled);
+    assert!(!config.tls.enabled);
+    assert_eq!(config.log.level, "info");
+    assert!(config.performance.max_entries > 0);
+}
+
+#[test]
 fn config_relative_storage_and_log_paths_resolve_from_config_file() {
     let temp = tempfile::tempdir().unwrap();
     let conf_dir = temp.path().join("conf");

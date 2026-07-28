@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::common::error::Result;
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::core::memtable::{MemTableManager, MemTableState};
 use crate::storage::segment::meta::remove_sidecar_meta;
 use crate::storage::segment_manager::SegmentManager;
@@ -212,6 +212,12 @@ impl BatchWriter {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
             return Ok(0);
+        }
+        if !self.segment_mgr.table_dir(db, table).is_dir() {
+            return Err(TaibaiError::Sql(format!(
+                "table '{}.{}' does not exist",
+                db, table
+            )));
         }
         let get_start = Instant::now();
         let mt =
@@ -547,6 +553,11 @@ impl BatchWriter {
         let partition_key = mt.partition_key().to_string();
         let txn_id = mt.txn_id();
         let table_dir = segment_mgr.table_dir(&db, &table);
+        if !table_dir.is_dir() {
+            let _ = mt.take_batch();
+            mt.set_state(MemTableState::Flushed);
+            return Ok(());
+        }
         if crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()) {
             return Self::flush_durable_memtable_under_table_lock(
                 segment_mgr,

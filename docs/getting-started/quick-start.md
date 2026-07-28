@@ -31,7 +31,7 @@ cargo build --release
 cargo run --release -- --config conf/example.yaml
 ```
 
-示例配置将数据写入仓库下的 `data` 目录，服务默认监听 `0.0.0.0:5151`。看到包含 `starting taibai server` 的日志表示服务已开始启动。
+示例配置将数据写入仓库下的 `data` 目录，服务默认监听 `0.0.0.0:5151`。模板保留了常用的连接、存储容量、查询内存和并行度参数；删除清理、碎片整理、TLS 和性能基线等高级参数未写出时使用内置默认值。看到包含 `starting taibai server` 的日志表示服务已开始启动。
 
 如果端口已占用，可复制 `conf/example.yaml` 后修改 `server.port`，并在后续客户端命令中使用相同端口。
 

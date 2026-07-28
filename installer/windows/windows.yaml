@@ -1,28 +1,26 @@
 server:
   host: "0.0.0.0"
   port: 5151
-  max_message_size: 67108864
+  max_connections: 1024
+  max_concurrent_requests: 8
+
 storage:
   data_dir: "../data"
   default_database: "main"
-  flush_threshold_rows: 65536
   min_segment_seal_size_mb: 500
+  max_segment_size_mb: 2048
+  hot_store_memory_limit_mb: 8192
+
 buffer:
-  batch_size: 4096
+  query_memory_limit_mb: 4096
+  execution_threads: 8
+  max_parallel_row_groups: 8
+  global_io_permits: 4
+  global_cpu_permits: 8
+
 compression:
   enabled: true
-tls:
-  enabled: false
-  cert_path: ""
-  key_path: ""
-auto_compact:
-  enabled: true
-  check_interval_secs: 60
-  idle_threshold_secs: 30
-  min_segments: 4
-  min_deleted_rows: 100000
-  max_tables_per_run: 1
+
 log:
   level: "info"
   file: "../logs/taibai.log"
-  query_file: "../logs/taibai-query.log"

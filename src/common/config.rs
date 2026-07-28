@@ -365,11 +365,17 @@ fn default_performance_environment() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_server_settings")]
     pub server: ServerSettings,
+    #[serde(default = "default_storage_settings")]
     pub storage: StorageSettings,
+    #[serde(default = "default_buffer_settings")]
     pub buffer: BufferSettings,
+    #[serde(default = "default_compression_settings")]
     pub compression: CompressionSettings,
+    #[serde(default)]
     pub tls: TlsConfigYaml,
+    #[serde(default = "default_log_settings")]
     pub log: LogSettings,
     #[serde(default)]
     pub performance: PerformanceBaselineSettings,
@@ -576,63 +582,82 @@ impl From<&PerformanceBaselineSettings> for PerformanceBaselineConfig {
     }
 }
 
+fn default_server_settings() -> ServerSettings {
+    ServerSettings {
+        host: "0.0.0.0".to_string(),
+        port: 5151,
+        max_message_size: 64 * 1024 * 1024,
+        max_connections: default_max_connections(),
+        max_concurrent_requests: default_max_concurrent_requests(),
+        connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
+        tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+    }
+}
+
+fn default_storage_settings() -> StorageSettings {
+    StorageSettings {
+        data_dir: "./data".to_string(),
+        default_database: "main".to_string(),
+        flush_threshold_rows: 65536,
+        min_segment_seal_size_mb: 500,
+        max_segment_size_mb: 2048,
+        delete_cleanup_enabled: default_delete_cleanup_enabled(),
+        delete_cleanup_min_deleted_ratio: default_delete_cleanup_min_deleted_ratio(),
+        delete_cleanup_min_deleted_rows: default_delete_cleanup_min_deleted_rows(),
+        delete_cleanup_interval_ms: default_delete_cleanup_interval_ms(),
+        delete_bitmap_cleanup_interval_secs: default_delete_bitmap_cleanup_interval_secs(),
+        delete_cleanup_max_segments_per_run: default_delete_cleanup_max_segments_per_run(),
+        fragmentation_cleanup_enabled: default_fragmentation_cleanup_enabled(),
+        fragmentation_min_row_groups: default_fragmentation_min_row_groups(),
+        fragmentation_max_overhead_ratio: default_fragmentation_max_overhead_ratio(),
+        fragmentation_min_small_row_group_ratio: default_fragmentation_min_small_row_group_ratio(),
+        fragmentation_cooldown_secs: default_fragmentation_cooldown_secs(),
+        fragmentation_scan_interval_secs: default_fragmentation_scan_interval_secs(),
+        low_rate_memtable_max_rows: default_low_rate_memtable_max_rows(),
+        low_rate_memtable_max_age_secs: default_low_rate_memtable_max_age_secs(),
+        hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
+        row_group_target_rows: default_row_group_target_rows(),
+    }
+}
+
+fn default_buffer_settings() -> BufferSettings {
+    BufferSettings {
+        batch_size: 4096,
+        query_memory_limit_mb: default_query_memory_limit_mb(),
+        max_aggregate_groups: default_max_aggregate_groups(),
+        execution_threads: default_execution_threads(),
+        max_parallel_row_groups: default_max_parallel_row_groups(),
+        parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
+        spill_batch_rows: default_spill_batch_rows(),
+        join_spill_partitions: default_join_spill_partitions(),
+        max_parallel_segments: default_max_parallel_segments(),
+        global_io_permits: default_global_io_permits(),
+        global_cpu_permits: default_global_cpu_permits(),
+    }
+}
+
+fn default_compression_settings() -> CompressionSettings {
+    CompressionSettings { enabled: true }
+}
+
+fn default_log_settings() -> LogSettings {
+    LogSettings {
+        level: "info".to_string(),
+        file: None,
+        query_file: None,
+        query_max_size_mb: default_query_log_max_size_mb(),
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            server: ServerSettings {
-                host: "0.0.0.0".to_string(),
-                port: 5151,
-                max_message_size: 64 * 1024 * 1024,
-                max_connections: default_max_connections(),
-                max_concurrent_requests: default_max_concurrent_requests(),
-                connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
-                tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
-            },
-            storage: StorageSettings {
-                data_dir: "./data".to_string(),
-                default_database: "main".to_string(),
-                flush_threshold_rows: 65536,
-                min_segment_seal_size_mb: 500,
-                max_segment_size_mb: 2048,
-                delete_cleanup_enabled: default_delete_cleanup_enabled(),
-                delete_cleanup_min_deleted_ratio: default_delete_cleanup_min_deleted_ratio(),
-                delete_cleanup_min_deleted_rows: default_delete_cleanup_min_deleted_rows(),
-                delete_cleanup_interval_ms: default_delete_cleanup_interval_ms(),
-                delete_bitmap_cleanup_interval_secs: default_delete_bitmap_cleanup_interval_secs(),
-                delete_cleanup_max_segments_per_run: default_delete_cleanup_max_segments_per_run(),
-                fragmentation_cleanup_enabled: default_fragmentation_cleanup_enabled(),
-                fragmentation_min_row_groups: default_fragmentation_min_row_groups(),
-                fragmentation_max_overhead_ratio: default_fragmentation_max_overhead_ratio(),
-                fragmentation_min_small_row_group_ratio:
-                    default_fragmentation_min_small_row_group_ratio(),
-                fragmentation_cooldown_secs: default_fragmentation_cooldown_secs(),
-                fragmentation_scan_interval_secs: default_fragmentation_scan_interval_secs(),
-                low_rate_memtable_max_rows: default_low_rate_memtable_max_rows(),
-                low_rate_memtable_max_age_secs: default_low_rate_memtable_max_age_secs(),
-                hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
-                row_group_target_rows: default_row_group_target_rows(),
-            },
-            buffer: BufferSettings {
-                batch_size: 4096,
-                query_memory_limit_mb: default_query_memory_limit_mb(),
-                max_aggregate_groups: default_max_aggregate_groups(),
-                execution_threads: default_execution_threads(),
-                max_parallel_row_groups: default_max_parallel_row_groups(),
-                parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
-                spill_batch_rows: default_spill_batch_rows(),
-                join_spill_partitions: default_join_spill_partitions(),
-                max_parallel_segments: default_max_parallel_segments(),
-                global_io_permits: default_global_io_permits(),
-                global_cpu_permits: default_global_cpu_permits(),
-            },
-            compression: CompressionSettings { enabled: true },
+            server: default_server_settings(),
+            storage: default_storage_settings(),
+            buffer: default_buffer_settings(),
+            compression: default_compression_settings(),
             tls: TlsConfigYaml::default(),
-            log: LogSettings {
-                level: "info".to_string(),
-                file: None,
-                query_file: None,
-                query_max_size_mb: default_query_log_max_size_mb(),
-            },
+            log: default_log_settings(),
             performance: PerformanceBaselineSettings::default(),
         }
     }

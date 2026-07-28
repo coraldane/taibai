@@ -313,6 +313,12 @@ fn exec_materialized_insert_batch(
     }
 
     let total_start = Instant::now();
+    if !engine.segment_mgr().table_dir(db, table).is_dir() {
+        return Err(TaibaiError::Sql(format!(
+            "table '{}.{}' does not exist",
+            db, table
+        )));
+    }
     let row_count = batch.num_rows() as u64;
     log_insert_profile(
         "cluster_sort",
