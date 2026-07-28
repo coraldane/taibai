@@ -30,7 +30,7 @@ use crate::sql::execution::scan::partition;
 use crate::sql::execution::scan::row_filter;
 use crate::sql::execution::scan::row_group;
 use crate::sql::execution::scan::spec::ScanSpec;
-use crate::sql::planner::{AggregateExpr, AggFunc, LogicalExpr};
+use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::segment::delete_bitmap;
 use crate::storage::segment_manager::SegmentManager;
@@ -184,7 +184,8 @@ fn compute_single_aggregate(
                         .take(rg_idx)
                         .map(|r| r.row_count)
                         .sum();
-                    batch = delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
+                    batch =
+                        delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
                 }
                 // Apply the scan's remaining predicate (if any) on the projected
                 // batch so MIN/MAX/COUNT only see matching rows.
@@ -207,11 +208,7 @@ fn compute_single_aggregate(
                 if let Some(zm) = zms.get(col_idx) {
                     eprintln!(
                         "AGGMETA func={:?} col_idx={} zm.min={:?} zm.max={:?} has_deletes={}",
-                        agg.func,
-                        col_idx,
-                        zm.min_value,
-                        zm.max_value,
-                        has_deletes
+                        agg.func, col_idx, zm.min_value, zm.max_value, has_deletes
                     );
                     acc.fold_zone_map(zm)?;
                 }
@@ -241,7 +238,15 @@ fn count_count_star(
     db: &str,
 ) -> Result<ScalarValue> {
     let stats: Option<&mut HashMap<String, crate::storage::segment::ScanStats>> = None;
-    let n = count::count_star(spec, table_meta, table_dir, segment_mgr, memtable_mgr, db, stats)?;
+    let n = count::count_star(
+        spec,
+        table_meta,
+        table_dir,
+        segment_mgr,
+        memtable_mgr,
+        db,
+        stats,
+    )?;
     Ok(ScalarValue::Int64(Some(n as i64)))
 }
 

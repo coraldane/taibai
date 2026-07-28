@@ -1,4 +1,4 @@
-use super::ServerConfig;
+use super::{PerformanceBaselineConfig, ServerConfig};
 
 #[test]
 fn config_relative_storage_and_log_paths_resolve_from_config_file() {
@@ -26,6 +26,19 @@ tls:
 log:
   level: "info"
   file: "../logs/taibai.log"
+performance:
+  max_entries: 0
+  warmup_samples: 0
+  ewma_alpha: 2.0
+  elapsed_regression_ratio: 0.5
+  elapsed_regression_min_ms: 7.0
+  memory_regression_ratio: 1.8
+  memory_regression_min_mb: 2
+  spill_regression_ratio: 2.5
+  row_error_regression_ratio: 3.0
+  row_error_regression_min: 4.0
+  environment: "  "
+  version_label: " release-candidate "
 "#,
     )
     .unwrap();
@@ -55,4 +68,18 @@ log:
     assert!(config.server.max_concurrent_requests >= 4);
     assert_eq!(config.server.connection_idle_timeout_secs, 300);
     assert_eq!(config.server.tls_handshake_timeout_secs, 10);
+
+    let performance = PerformanceBaselineConfig::from(&config.performance);
+    assert_eq!(performance.max_entries, 1);
+    assert_eq!(performance.warmup_samples, 1);
+    assert_eq!(performance.ewma_alpha, 1.0);
+    assert_eq!(performance.elapsed_regression_ratio, 1.0);
+    assert_eq!(performance.elapsed_regression_min_ms, 7.0);
+    assert_eq!(performance.memory_regression_ratio, 1.8);
+    assert_eq!(performance.memory_regression_min_bytes, 2 * 1024 * 1024);
+    assert_eq!(performance.spill_regression_ratio, 2.5);
+    assert_eq!(performance.row_error_regression_ratio, 3.0);
+    assert_eq!(performance.row_error_regression_min, 4.0);
+    assert_eq!(performance.environment, "default");
+    assert_eq!(performance.version, "release-candidate");
 }

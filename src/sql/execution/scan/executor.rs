@@ -320,6 +320,12 @@ impl<'a> ScanExecutor<'a> {
                 let mut candidate_indices = candidate_indices;
                 if ordered_limit.is_some_and(|order| order.desc) {
                     candidate_indices.reverse();
+                } else if scan_limit.is_some() && self.spec.has_predicates() {
+                    super::strategy::rank_row_groups_for_limit(
+                        self.spec,
+                        &reader,
+                        &mut candidate_indices,
+                    );
                 }
 
                 if scan_limit.is_some() || ordered_limit.is_some() {
@@ -354,22 +360,42 @@ impl<'a> ScanExecutor<'a> {
 
                 use rayon::prelude::*;
 
-                let mut rg_batches: Vec<(usize, RecordBatch)> = candidate_indices
-                    .par_iter()
-                    .enumerate()
-                    .filter_map(|(pos, rg_idx)| {
-                        super::strategy::read_row_group_with_strategy(
-                            self.spec,
-                            &plan,
-                            &self.table_schema,
-                            &reader,
-                            *rg_idx,
-                        )
-                        .ok()
-                        .filter(|batch| batch.num_rows() > 0)
-                        .map(|batch| (pos, batch))
-                    })
-                    .collect();
+                let limits = crate::common::config::query_limits();
+                let max_parallel = limits.max_parallel_row_groups.max(1);
+                let min_parallel = limits.parallel_scan_min_row_groups.max(2);
+                let read_one = |pos: usize, rg_idx: &usize| {
+                    super::strategy::read_row_group_with_strategy(
+                        self.spec,
+                        &plan,
+                        &self.table_schema,
+                        &reader,
+                        *rg_idx,
+                    )
+                    .ok()
+                    .filter(|batch| batch.num_rows() > 0)
+                    .map(|batch| (pos, batch))
+                };
+                let mut rg_batches: Vec<(usize, RecordBatch)> = if max_parallel == 1
+                    || candidate_indices.len() < min_parallel
+                {
+                    candidate_indices
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(pos, rg_idx)| read_one(pos, rg_idx))
+                        .collect()
+                } else {
+                    let mut batches = Vec::new();
+                    for (chunk_idx, chunk) in candidate_indices.chunks(max_parallel).enumerate() {
+                        let base = chunk_idx * max_parallel;
+                        let mut chunk_batches: Vec<(usize, RecordBatch)> = chunk
+                            .par_iter()
+                            .enumerate()
+                            .filter_map(|(pos, rg_idx)| read_one(base + pos, rg_idx))
+                            .collect();
+                        batches.append(&mut chunk_batches);
+                    }
+                    batches
+                };
                 rg_batches.sort_by_key(|(pos, _)| *pos);
 
                 let rows_scanned = rg_batches

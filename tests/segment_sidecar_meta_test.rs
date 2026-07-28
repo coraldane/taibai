@@ -161,6 +161,7 @@ fn seal_writes_sidecar_and_dat_footer() {
         SegmentConfig {
             min_segment_size: 1,
             max_segment_size: 1024 * 1024,
+            row_group_target_rows: 131_072,
         },
     )
     .unwrap();
@@ -235,6 +236,7 @@ fn small_inactive_segment_reuses_cached_owned_reader() {
         SegmentConfig {
             min_segment_size: 500 * 1024 * 1024,
             max_segment_size: 1024 * 1024 * 1024,
+            row_group_target_rows: 131_072,
         },
     )
     .unwrap();

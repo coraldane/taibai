@@ -301,6 +301,7 @@ impl SegmentManager {
             data_end: SEGMENT_HEADER_SIZE as u64,
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
+            row_group_target_rows: self.config.row_group_target_rows.max(1),
         })
     }
 
@@ -399,6 +400,7 @@ impl SegmentManager {
             data_end,
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
+            row_group_target_rows: self.config.row_group_target_rows.max(1),
         }))
     }
 }

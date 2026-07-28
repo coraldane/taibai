@@ -66,9 +66,11 @@ impl Parser {
             Token::Rollback => self.parse_rollback(),
             Token::Flush => self.parse_flush(),
             Token::Optimize => self.parse_optimize(),
+            Token::Analyze => self.parse_analyze_table(),
             Token::Rebuild => self.parse_rebuild(),
             Token::Pause => self.parse_pause(),
             Token::Resume => self.parse_resume(),
+            Token::Reset => self.parse_reset(),
             other => Err(TaibaiError::Sql(format!("unexpected token: {}", other))),
         }
     }

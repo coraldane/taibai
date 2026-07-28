@@ -130,6 +130,10 @@ impl NullBitmap {
         buf
     }
 
+    pub fn estimated_size_bytes(&self) -> usize {
+        self.data.capacity() * std::mem::size_of::<u64>()
+    }
+
     /// Expand the bit-packed null map into one byte per row, where each byte is
     /// `1` when the row is NULL and `0` otherwise. The all-valid case (common
     /// for `NOT NULL` tick columns) is a single bulk memset instead of a per-row

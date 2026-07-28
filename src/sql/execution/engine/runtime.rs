@@ -1,4 +1,10 @@
 impl Engine {
+    pub(crate) fn performance_baselines(
+        &self,
+    ) -> &Arc<crate::common::performance_baseline::PerformanceBaselineStore> {
+        &self.performance_baselines
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

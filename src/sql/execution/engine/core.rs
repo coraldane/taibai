@@ -116,6 +116,8 @@ impl Engine {
                 hot_store_memory_limit_bytes,
             ),
         );
+        let performance_baselines =
+            Arc::new(crate::common::performance_baseline::PerformanceBaselineStore::load(data_dir));
         let catalogs = Arc::new(RwLock::new(catalogs));
         start_delete_bitmap_cleanup_thread(
             Arc::clone(&segment_mgr),
@@ -139,6 +141,7 @@ impl Engine {
             auto_increment_mgr,
             index_manager,
             hot_store_mgr,
+            performance_baselines,
         };
         engine.warmup_hot_stores();
         Ok(engine)
@@ -553,8 +556,14 @@ impl Engine {
                 })
             }
             Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),
+            Statement::ShowPerformanceBaselines => {
+                super::performance::exec_show_performance_baselines(self, &session.database)
+            }
             Statement::ShowEngines => super::ddl::exec_show_engines(self),
             Statement::ShowProcesslist { full } => super::ddl::exec_show_processlist(self, *full),
+            Statement::ResetPerformanceBaselines => {
+                super::performance::exec_reset_performance_baselines(self, &session.database)
+            }
             Statement::AlterUser { name, operations } => {
                 super::ddl::exec_alter_user(self, name, operations)
             }
@@ -588,6 +597,11 @@ impl Engine {
                 table.effective_database(&session.database),
                 &table.name,
                 partition.as_deref(),
+            ),
+            Statement::AnalyzeTable { table } => super::ddl::exec_analyze_table(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
             ),
             Statement::PauseFlush => {
                 self.segment_mgr().pause_flush();
@@ -740,7 +754,7 @@ impl Engine {
                     )
                 }
             }
-            Statement::ShowStats => {
+            Statement::ShowStats | Statement::ShowPerformanceBaselines => {
                 self.require_database_permission(session, PermissionType::Select, &session.database)
             }
             Statement::FlushTable { table } => {
@@ -760,6 +774,7 @@ impl Engine {
                 }
             }
             Statement::OptimizeTable { table, .. }
+            | Statement::AnalyzeTable { table }
             | Statement::RebuildUniqueIndex { table, .. } => self.require_table_permission(
                 session,
                 PermissionType::Alter,
@@ -785,7 +800,8 @@ impl Engine {
             | Statement::ShowGrants { .. }
             | Statement::ShowProcesslist { .. }
             | Statement::PauseFlush
-            | Statement::ResumeFlush => self.require_global_admin(session),
+            | Statement::ResumeFlush
+            | Statement::ResetPerformanceBaselines => self.require_global_admin(session),
         }
     }
 

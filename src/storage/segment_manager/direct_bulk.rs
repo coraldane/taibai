@@ -148,7 +148,11 @@ impl SegmentManager {
         let table_dir = self.data_dir.join(db).join(req.table_name);
         std::fs::create_dir_all(&table_dir)?;
         let partition_groups = self.direct_bulk_partition_groups(req, table_meta)?;
-        let prepared_groups = self.prepare_direct_bulk_groups(req, partition_groups)?;
+        let prepared_groups = self.prepare_direct_bulk_groups(
+            req,
+            partition_groups,
+            self.config.row_group_target_rows.max(1),
+        )?;
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
         let build_value_sets = flush_immediately;
@@ -277,13 +281,15 @@ impl SegmentManager {
         &self,
         req: &'a DirectBulkRequest<'a>,
         partition_groups: Vec<(String, Vec<usize>)>,
+        row_group_target_rows: usize,
     ) -> Result<Vec<PreparedDirectBulkGroup<'a>>> {
         let mut prepared = Vec::with_capacity(partition_groups.len());
         for (partition_key, rows) in partition_groups {
             if rows.is_empty() {
                 continue;
             }
-            if self.direct_bulk_rows_are_full_range(&rows, req.row_count) {
+            for chunk in rows.chunks(row_group_target_rows.max(1)) {
+            if self.direct_bulk_rows_are_full_range(chunk, req.row_count) {
                 let columns: Vec<DirectBulkColumn<'a>> = req
                     .columns
                     .iter()
@@ -299,13 +305,13 @@ impl SegmentManager {
                     .collect();
                 let compressed_columns = self.compress_direct_bulk_columns(&columns)?;
                 prepared.push(PreparedDirectBulkGroup {
-                    partition_key,
+                    partition_key: partition_key.clone(),
                     row_count: req.row_count,
                     columns: PreparedDirectColumns::Borrowed(columns),
                     compressed_columns,
                 });
             } else {
-                let storage = self.direct_bulk_select_columns(req, &rows)?;
+                let storage = self.direct_bulk_select_columns(req, chunk)?;
                 let columns: Vec<DirectBulkColumn<'_>> = storage
                     .iter()
                     .map(|col| DirectBulkColumn {
@@ -320,11 +326,12 @@ impl SegmentManager {
                     .collect();
                 let compressed_columns = self.compress_direct_bulk_columns(&columns)?;
                 prepared.push(PreparedDirectBulkGroup {
-                    partition_key,
-                    row_count: rows.len(),
+                    partition_key: partition_key.clone(),
+                    row_count: chunk.len(),
                     columns: PreparedDirectColumns::Owned(storage),
                     compressed_columns,
                 });
+            }
             }
         }
         Ok(prepared)

@@ -45,6 +45,7 @@ pub struct Engine {
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
     hot_store_mgr: Arc<crate::storage::core::hot_store::HotStoreManager>,
+    performance_baselines: Arc<crate::common::performance_baseline::PerformanceBaselineStore>,
 }
 
 enum HotResidentMark {

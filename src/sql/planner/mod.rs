@@ -13,28 +13,17 @@ pub use types::*;
 
 #[derive(Debug, Clone)]
 pub struct TableBinding {
-    pub table_name: String,
     pub start: usize,
     pub end: usize,
 }
 
 impl TableBinding {
-    fn new(table_name: String, start: usize, end: usize) -> Self {
-        Self {
-            table_name,
-            start,
-            end,
-        }
+    fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
     }
 }
 
 pub type AliasMap = HashMap<String, TableBinding>;
-
-#[derive(Debug, Clone, Default)]
-pub struct JoinTableInfo {
-    pub left_tables: Vec<String>,
-    pub right_tables: Vec<String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct PlannerContext {
@@ -86,15 +75,10 @@ pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Resul
             }
         };
 
-    let (base_plan, schema, alias_map, _table_info) = if let Some(from_clause) = from {
+    let (base_plan, schema, alias_map) = if let Some(from_clause) = from {
         plan_from_clause(from_clause, &ctx.table_schemas)?
     } else {
-        (
-            LogicalPlan::Empty,
-            Schema::empty(),
-            AliasMap::new(),
-            JoinTableInfo::default(),
-        )
+        (LogicalPlan::Empty, Schema::empty(), AliasMap::new())
     };
 
     let mut plan: LogicalPlan = base_plan;
@@ -211,7 +195,7 @@ pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Resul
 fn plan_from_clause(
     from: &FromClause,
     table_schemas: &HashMap<String, Schema>,
-) -> Result<(LogicalPlan, Schema, AliasMap, JoinTableInfo)> {
+) -> Result<(LogicalPlan, Schema, AliasMap)> {
     match from {
         FromClause::Table(table_ref) => match table_ref {
             TableRef::Table { name, alias } => {
@@ -223,26 +207,21 @@ fn plan_from_clause(
                 let plan = LogicalPlan::Scan(ScanPlan::new(table_name.clone(), schema.clone()));
 
                 let mut alias_map = AliasMap::new();
-                let binding = TableBinding::new(table_name.clone(), 0, schema.columns.len());
+                let binding = TableBinding::new(0, schema.columns.len());
                 if let Some(a) = alias {
                     alias_map.insert(a.to_lowercase(), binding.clone());
                 }
                 alias_map.insert(name.name.to_lowercase(), binding.clone());
                 alias_map.insert(table_name.to_lowercase(), binding);
 
-                let table_info = JoinTableInfo {
-                    left_tables: vec![table_name.clone()],
-                    right_tables: Vec::new(),
-                };
-
-                Ok((plan, schema, alias_map, table_info))
+                Ok((plan, schema, alias_map))
             }
             TableRef::Subquery { query: _, alias: _ } => Err(TaibaiError::Sql(
                 "subquery in FROM not yet supported in planner".into(),
             )),
         },
         FromClause::Join(join_expr) => {
-            let (left_plan, left_schema, mut alias_map, mut table_info) =
+            let (left_plan, left_schema, mut alias_map) =
                 plan_from_clause(&join_expr.left, table_schemas)?;
 
             let mut current_plan = left_plan;
@@ -261,15 +240,12 @@ fn plan_from_clause(
 
                         let right_start = current_schema.columns.len();
                         let right_end = right_start + right_schema.columns.len();
-                        let binding =
-                            TableBinding::new(right_table.clone(), right_start, right_end);
+                        let binding = TableBinding::new(right_start, right_end);
                         if let Some(a) = alias {
                             alias_map.insert(a.to_lowercase(), binding.clone());
                         }
                         alias_map.insert(name.name.to_lowercase(), binding.clone());
                         alias_map.insert(right_table.to_lowercase(), binding);
-                        table_info.right_tables.push(right_table.clone());
-
                         let right_plan = LogicalPlan::Scan(ScanPlan::new(
                             right_table.clone(),
                             right_schema.clone(),
@@ -284,7 +260,6 @@ fn plan_from_clause(
                                 &current_schema,
                                 &right_schema,
                                 &alias_map,
-                                &table_info,
                             )?,
                             None => LogicalExpr::Literal(ScalarValue::Bool(Some(true))),
                         };
@@ -308,7 +283,7 @@ fn plan_from_clause(
                 }
             }
 
-            Ok((current_plan, current_schema, alias_map, table_info))
+            Ok((current_plan, current_schema, alias_map))
         }
     }
 }

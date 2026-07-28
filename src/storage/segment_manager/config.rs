@@ -1,7 +1,6 @@
 use std::sync::OnceLock;
 
 pub(super) const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
-pub(super) const SQL_INSERT_ROW_GROUP_TARGET_ROWS: usize = 500_000;
 pub(super) const FLUSH_CHECK_INTERVAL_SECS: u64 = 10;
 pub(super) const FLUSH_IDLE_THRESHOLD_SECS: u64 = 5;
 pub(super) const FLUSH_META_AFTER_ROW_GROUP: bool = false;
@@ -15,6 +14,7 @@ const DEFAULT_READER_CACHE_CAPACITY: usize = 1024;
 pub struct SegmentConfig {
     pub min_segment_size: u64,
     pub max_segment_size: u64,
+    pub row_group_target_rows: usize,
 }
 
 impl Default for SegmentConfig {
@@ -22,6 +22,7 @@ impl Default for SegmentConfig {
         Self {
             min_segment_size: DEFAULT_MIN_SEGMENT_SIZE,
             max_segment_size: DEFAULT_MAX_SEGMENT_SIZE,
+            row_group_target_rows: 131_072,
         }
     }
 }

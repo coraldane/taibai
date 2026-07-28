@@ -41,6 +41,10 @@ pub struct QueryLimits {
     #[allow(dead_code)]
     pub query_memory_limit_mb: u64,
     pub max_aggregate_groups: usize,
+    pub max_parallel_row_groups: usize,
+    pub parallel_scan_min_row_groups: usize,
+    pub spill_batch_rows: usize,
+    pub join_spill_partitions: usize,
 }
 
 impl Default for QueryLimits {
@@ -48,11 +52,16 @@ impl Default for QueryLimits {
         Self {
             query_memory_limit_mb: default_query_memory_limit_mb(),
             max_aggregate_groups: default_max_aggregate_groups(),
+            max_parallel_row_groups: default_max_parallel_row_groups(),
+            parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
+            spill_batch_rows: default_spill_batch_rows(),
+            join_spill_partitions: default_join_spill_partitions(),
         }
     }
 }
 
 static QUERY_LIMITS: OnceLock<QueryLimits> = OnceLock::new();
+static PERFORMANCE_BASELINE_CONFIG: OnceLock<PerformanceBaselineConfig> = OnceLock::new();
 
 /// Install the process-wide query limits. Called once during startup.
 /// Returns an error if called more than once (limits are immutable thereafter).
@@ -65,7 +74,99 @@ pub fn query_limits() -> QueryLimits {
     *QUERY_LIMITS.get().unwrap_or(&QueryLimits {
         query_memory_limit_mb: default_query_memory_limit_mb(),
         max_aggregate_groups: default_max_aggregate_groups(),
+        max_parallel_row_groups: default_max_parallel_row_groups(),
+        parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
+        spill_batch_rows: default_spill_batch_rows(),
+        join_spill_partitions: default_join_spill_partitions(),
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct PerformanceBaselineConfig {
+    pub max_entries: usize,
+    pub warmup_samples: u64,
+    pub ewma_alpha: f64,
+    pub elapsed_regression_ratio: f64,
+    pub elapsed_regression_min_ms: f64,
+    pub memory_regression_ratio: f64,
+    pub memory_regression_min_bytes: u64,
+    pub spill_regression_ratio: f64,
+    pub row_error_regression_ratio: f64,
+    pub row_error_regression_min: f64,
+    pub environment: String,
+    pub version: String,
+}
+
+impl Default for PerformanceBaselineConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: default_performance_max_entries(),
+            warmup_samples: default_performance_warmup_samples(),
+            ewma_alpha: default_performance_ewma_alpha(),
+            elapsed_regression_ratio: default_performance_elapsed_ratio(),
+            elapsed_regression_min_ms: default_performance_elapsed_min_ms(),
+            memory_regression_ratio: default_performance_memory_ratio(),
+            memory_regression_min_bytes: default_performance_memory_min_mb()
+                .saturating_mul(1024 * 1024),
+            spill_regression_ratio: default_performance_spill_ratio(),
+            row_error_regression_ratio: default_performance_row_error_ratio(),
+            row_error_regression_min: default_performance_row_error_min(),
+            environment: default_performance_environment(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+pub fn set_performance_baseline_config(
+    config: PerformanceBaselineConfig,
+) -> Result<(), PerformanceBaselineConfig> {
+    PERFORMANCE_BASELINE_CONFIG.set(config.sanitized())
+}
+
+pub fn performance_baseline_config() -> PerformanceBaselineConfig {
+    PERFORMANCE_BASELINE_CONFIG
+        .get()
+        .cloned()
+        .unwrap_or_default()
+}
+
+impl PerformanceBaselineConfig {
+    pub(crate) fn sanitized(mut self) -> Self {
+        self.max_entries = self.max_entries.max(1);
+        self.warmup_samples = self.warmup_samples.max(1);
+        self.ewma_alpha = finite_clamp(self.ewma_alpha, 0.01, 1.0, 0.20);
+        self.elapsed_regression_ratio =
+            finite_clamp(self.elapsed_regression_ratio, 1.0, 1000.0, 1.50);
+        self.elapsed_regression_min_ms =
+            finite_clamp(self.elapsed_regression_min_ms, 0.0, f64::MAX, 5.0);
+        self.memory_regression_ratio =
+            finite_clamp(self.memory_regression_ratio, 1.0, 1000.0, 1.50);
+        self.spill_regression_ratio = finite_clamp(self.spill_regression_ratio, 1.0, 1000.0, 2.0);
+        self.row_error_regression_ratio =
+            finite_clamp(self.row_error_regression_ratio, 1.0, 1000.0, 2.0);
+        self.row_error_regression_min =
+            finite_clamp(self.row_error_regression_min, 0.0, f64::MAX, 2.0);
+        self.environment = normalize_label(&self.environment, "default");
+        self.version = normalize_label(&self.version, env!("CARGO_PKG_VERSION"));
+        self
+    }
+}
+
+fn finite_clamp(value: f64, min: f64, max: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
+fn normalize_label(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.chars().take(128).collect()
+    }
 }
 
 fn default_max_message_size() -> usize {
@@ -132,12 +233,83 @@ fn default_max_aggregate_groups() -> usize {
     1_000_000
 }
 
+fn default_execution_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .max(1)
+}
+
+fn default_max_parallel_row_groups() -> usize {
+    default_execution_threads().min(8).max(1)
+}
+
+fn default_parallel_scan_min_row_groups() -> usize {
+    4
+}
+
+fn default_spill_batch_rows() -> usize {
+    4096
+}
+
+fn default_join_spill_partitions() -> usize {
+    16
+}
+
+fn default_row_group_target_rows() -> usize {
+    131_072
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
 
 fn default_query_log_max_size_mb() -> u64 {
     1024
+}
+
+fn default_performance_max_entries() -> usize {
+    1024
+}
+
+fn default_performance_warmup_samples() -> u64 {
+    3
+}
+
+fn default_performance_ewma_alpha() -> f64 {
+    0.20
+}
+
+fn default_performance_elapsed_ratio() -> f64 {
+    1.50
+}
+
+fn default_performance_elapsed_min_ms() -> f64 {
+    5.0
+}
+
+fn default_performance_memory_ratio() -> f64 {
+    1.50
+}
+
+fn default_performance_memory_min_mb() -> u64 {
+    1
+}
+
+fn default_performance_spill_ratio() -> f64 {
+    2.0
+}
+
+fn default_performance_row_error_ratio() -> f64 {
+    2.0
+}
+
+fn default_performance_row_error_min() -> f64 {
+    2.0
+}
+
+fn default_performance_environment() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +320,8 @@ pub struct ServerConfig {
     pub compression: CompressionSettings,
     pub tls: TlsConfigYaml,
     pub log: LogSettings,
+    #[serde(default)]
+    pub performance: PerformanceBaselineSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +374,8 @@ pub struct StorageSettings {
     pub delete_cleanup_max_segments_per_run: usize,
     #[serde(default = "default_hot_store_memory_limit_mb")]
     pub hot_store_memory_limit_mb: u64,
+    #[serde(default = "default_row_group_target_rows")]
+    pub row_group_target_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +391,16 @@ pub struct BufferSettings {
     /// errors out. Caps memory for high-cardinality GROUP BY queries.
     #[serde(default = "default_max_aggregate_groups")]
     pub max_aggregate_groups: usize,
+    #[serde(default = "default_execution_threads")]
+    pub execution_threads: usize,
+    #[serde(default = "default_max_parallel_row_groups")]
+    pub max_parallel_row_groups: usize,
+    #[serde(default = "default_parallel_scan_min_row_groups")]
+    pub parallel_scan_min_row_groups: usize,
+    #[serde(default = "default_spill_batch_rows")]
+    pub spill_batch_rows: usize,
+    #[serde(default = "default_join_spill_partitions")]
+    pub join_spill_partitions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +425,78 @@ pub struct LogSettings {
     pub query_file: Option<String>,
     #[serde(default = "default_query_log_max_size_mb")]
     pub query_max_size_mb: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceBaselineSettings {
+    #[serde(default = "default_performance_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_performance_warmup_samples")]
+    pub warmup_samples: u64,
+    #[serde(default = "default_performance_ewma_alpha")]
+    pub ewma_alpha: f64,
+    #[serde(default = "default_performance_elapsed_ratio")]
+    pub elapsed_regression_ratio: f64,
+    #[serde(default = "default_performance_elapsed_min_ms")]
+    pub elapsed_regression_min_ms: f64,
+    #[serde(default = "default_performance_memory_ratio")]
+    pub memory_regression_ratio: f64,
+    #[serde(default = "default_performance_memory_min_mb")]
+    pub memory_regression_min_mb: u64,
+    #[serde(default = "default_performance_spill_ratio")]
+    pub spill_regression_ratio: f64,
+    #[serde(default = "default_performance_row_error_ratio")]
+    pub row_error_regression_ratio: f64,
+    #[serde(default = "default_performance_row_error_min")]
+    pub row_error_regression_min: f64,
+    #[serde(default = "default_performance_environment")]
+    pub environment: String,
+    #[serde(default)]
+    pub version_label: Option<String>,
+}
+
+impl Default for PerformanceBaselineSettings {
+    fn default() -> Self {
+        Self {
+            max_entries: default_performance_max_entries(),
+            warmup_samples: default_performance_warmup_samples(),
+            ewma_alpha: default_performance_ewma_alpha(),
+            elapsed_regression_ratio: default_performance_elapsed_ratio(),
+            elapsed_regression_min_ms: default_performance_elapsed_min_ms(),
+            memory_regression_ratio: default_performance_memory_ratio(),
+            memory_regression_min_mb: default_performance_memory_min_mb(),
+            spill_regression_ratio: default_performance_spill_ratio(),
+            row_error_regression_ratio: default_performance_row_error_ratio(),
+            row_error_regression_min: default_performance_row_error_min(),
+            environment: default_performance_environment(),
+            version_label: None,
+        }
+    }
+}
+
+impl From<&PerformanceBaselineSettings> for PerformanceBaselineConfig {
+    fn from(settings: &PerformanceBaselineSettings) -> Self {
+        Self {
+            max_entries: settings.max_entries,
+            warmup_samples: settings.warmup_samples,
+            ewma_alpha: settings.ewma_alpha,
+            elapsed_regression_ratio: settings.elapsed_regression_ratio,
+            elapsed_regression_min_ms: settings.elapsed_regression_min_ms,
+            memory_regression_ratio: settings.memory_regression_ratio,
+            memory_regression_min_bytes: settings
+                .memory_regression_min_mb
+                .saturating_mul(1024 * 1024),
+            spill_regression_ratio: settings.spill_regression_ratio,
+            row_error_regression_ratio: settings.row_error_regression_ratio,
+            row_error_regression_min: settings.row_error_regression_min,
+            environment: settings.environment.clone(),
+            version: settings
+                .version_label
+                .clone()
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        }
+        .sanitized()
+    }
 }
 
 impl Default for ServerConfig {
@@ -266,11 +524,17 @@ impl Default for ServerConfig {
                 delete_bitmap_cleanup_interval_secs: default_delete_bitmap_cleanup_interval_secs(),
                 delete_cleanup_max_segments_per_run: default_delete_cleanup_max_segments_per_run(),
                 hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
+                row_group_target_rows: default_row_group_target_rows(),
             },
             buffer: BufferSettings {
                 batch_size: 4096,
                 query_memory_limit_mb: default_query_memory_limit_mb(),
                 max_aggregate_groups: default_max_aggregate_groups(),
+                execution_threads: default_execution_threads(),
+                max_parallel_row_groups: default_max_parallel_row_groups(),
+                parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
+                spill_batch_rows: default_spill_batch_rows(),
+                join_spill_partitions: default_join_spill_partitions(),
             },
             compression: CompressionSettings { enabled: true },
             tls: TlsConfigYaml::default(),
@@ -280,6 +544,7 @@ impl Default for ServerConfig {
                 query_file: None,
                 query_max_size_mb: default_query_log_max_size_mb(),
             },
+            performance: PerformanceBaselineSettings::default(),
         }
     }
 }

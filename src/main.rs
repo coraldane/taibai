@@ -177,6 +177,10 @@ where
         std::process::exit(1);
     }
 
+    let _ = crate::common::config::set_performance_baseline_config(
+        crate::common::config::PerformanceBaselineConfig::from(&config.performance),
+    );
+
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
@@ -200,9 +204,16 @@ where
     let _ = crate::common::config::set_query_limits(crate::common::config::QueryLimits {
         query_memory_limit_mb: config.buffer.query_memory_limit_mb,
         max_aggregate_groups: config.buffer.max_aggregate_groups,
+        max_parallel_row_groups: config.buffer.max_parallel_row_groups.max(1),
+        parallel_scan_min_row_groups: config.buffer.parallel_scan_min_row_groups.max(1),
+        spill_batch_rows: config.buffer.spill_batch_rows.max(1),
+        join_spill_partitions: config.buffer.join_spill_partitions.max(2),
     });
     let engine = Arc::new(engine);
-    let _ = rayon::ThreadPoolBuilder::new().build_global();
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.buffer.execution_threads.max(1))
+        .thread_name(|idx| format!("taibai-exec-{idx}"))
+        .build_global();
     crate::sql::execution::engine::start_close_of_day_scheduler(engine.clone());
     tracing::info!("close-of-day scheduler started");
 
@@ -225,6 +236,7 @@ fn segment_config_from_server_config(config: &ServerConfig) -> SegmentConfig {
     SegmentConfig {
         min_segment_size,
         max_segment_size,
+        row_group_target_rows: config.storage.row_group_target_rows.max(1),
     }
 }
 fn auto_compact_config_from_server_config(config: &ServerConfig) -> AutoCompactConfig {

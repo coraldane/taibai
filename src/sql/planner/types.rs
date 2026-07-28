@@ -3,6 +3,7 @@ use crate::sql::optimizer::partition_pruning::PartitionFilter;
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
@@ -205,7 +206,7 @@ pub struct AggregateExpr {
     pub distinct: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggFunc {
     Count,
     Sum,

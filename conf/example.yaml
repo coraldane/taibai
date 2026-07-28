@@ -24,10 +24,18 @@ storage:
   delete_bitmap_cleanup_interval_secs: 60  # Background cleanup interval; overrides delete_cleanup_interval_ms when set
   delete_cleanup_max_segments_per_run: 8  # Limit cleanup work per round
   hot_store_memory_limit_mb: 8192  # Unified resident hot store memory limit in MB
+  row_group_target_rows: 131072  # Physical page/row-group target
 
 # Buffer settings
 buffer:
   batch_size: 4096  # Batch size for query processing
+  query_memory_limit_mb: 4096
+  max_aggregate_groups: 1000000
+  execution_threads: 8
+  max_parallel_row_groups: 8
+  parallel_scan_min_row_groups: 4
+  spill_batch_rows: 4096
+  join_spill_partitions: 16
 
 # Compression settings
 compression:
@@ -46,3 +54,18 @@ log:
   # file: "../logs/taibai.log"
   # query_file: "../logs/taibai-query.log"  # Defaults to taibai-query.log next to log.file when omitted
   query_max_size_mb: 1024  # 0 disables query log rotation
+
+# EXPLAIN ANALYZE performance baseline settings
+performance:
+  max_entries: 1024
+  warmup_samples: 3
+  ewma_alpha: 0.20
+  elapsed_regression_ratio: 1.50
+  elapsed_regression_min_ms: 5.0
+  memory_regression_ratio: 1.50
+  memory_regression_min_mb: 1
+  spill_regression_ratio: 2.0
+  row_error_regression_ratio: 2.0
+  row_error_regression_min: 2.0
+  environment: "default"  # e.g. development, ci, staging, production
+  # version_label: "release-2026.07"  # Defaults to the Taibai package version

@@ -225,6 +225,7 @@ pub enum Statement {
         table: Option<ObjectName>,
     },
     ShowStats,
+    ShowPerformanceBaselines,
     ShowEngines,
     ShowProcesslist {
         full: bool,
@@ -244,8 +245,12 @@ pub enum Statement {
         table: ObjectName,
         partition: Option<String>,
     },
+    AnalyzeTable {
+        table: ObjectName,
+    },
     PauseFlush,
     ResumeFlush,
+    ResetPerformanceBaselines,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -11,6 +11,7 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
+use super::join_spill::PartitionedInnerJoin;
 use super::{ExecutionOp, RuntimeInFilter};
 
 /// Columnar Hash Join Executor
@@ -28,6 +29,9 @@ pub struct HashJoinExec {
     right_key_cols: Vec<usize>,
 
     // Build phase state
+    build_left: bool,
+    memory_limit_bytes: usize,
+    spill_state: Option<PartitionedInnerJoin>,
     hash_table: Option<JoinHashTable>,
     asof_index: Option<AsofJoinIndex>,
     // Probe phase state
@@ -75,14 +79,38 @@ impl HashJoinExec {
             output_schema,
             left_key_cols,
             right_key_cols,
+            build_left: true,
+            memory_limit_bytes: crate::common::config::query_limits()
+                .query_memory_limit_mb
+                .saturating_mul(1024 * 1024)
+                .min(usize::MAX as u64) as usize,
+            spill_state: None,
             hash_table: None,
             asof_index: None,
             probe_state: ProbeState::default(),
         }
     }
 
+    /// For commutative inner joins the physical planner can choose the
+    /// smaller input as the hash-table build side without changing SQL output
+    /// column order.
+    pub fn with_inner_build_left(mut self, build_left: bool) -> Self {
+        if self.join_type == JoinType::Inner {
+            self.build_left = build_left;
+        }
+        self
+    }
+
+    pub fn with_memory_limit_bytes(mut self, memory_limit_bytes: usize) -> Self {
+        self.memory_limit_bytes = memory_limit_bytes.max(1);
+        self
+    }
+
     /// Build phase: consume all left-side batches into the hash table.
     fn build(&mut self) -> Result<()> {
+        if self.join_type == JoinType::Inner {
+            return self.build_inner();
+        }
         match self.join_type {
             JoinType::Right | JoinType::Full => {
                 // For RIGHT/FULL join, build hash table from right side
@@ -122,6 +150,84 @@ impl HashJoinExec {
         self.probe_state.build_done = true;
         Ok(())
     }
+
+    fn build_inner(&mut self) -> Result<()> {
+        let (build_keys, probe_keys) = if self.build_left {
+            (self.left_key_cols.clone(), self.right_key_cols.clone())
+        } else {
+            (self.right_key_cols.clone(), self.left_key_cols.clone())
+        };
+        let mut table = JoinHashTable::new(build_keys.clone());
+        let mut estimated_bytes = 0usize;
+
+        loop {
+            let batch = if self.build_left {
+                self.left.next_batch()?
+            } else {
+                self.right.next_batch()?
+            };
+            let Some(batch) = batch else {
+                break;
+            };
+            estimated_bytes =
+                estimated_bytes.saturating_add(batch.estimated_size_bytes().saturating_mul(2));
+            super::profile::record_current_peak_memory(estimated_bytes);
+            table.insert_batch(batch);
+            if estimated_bytes >= self.memory_limit_bytes {
+                let initial_build_batches = std::mem::take(&mut table.build_data);
+                let limits = crate::common::config::query_limits();
+                self.spill_state = Some(if self.build_left {
+                    PartitionedInnerJoin::create(
+                        initial_build_batches,
+                        self.left.as_mut(),
+                        self.right.as_mut(),
+                        self.left_schema.clone(),
+                        self.right_schema.clone(),
+                        build_keys,
+                        probe_keys,
+                        true,
+                        self.condition.clone(),
+                        self.left_schema.clone(),
+                        self.right_schema.clone(),
+                        self.output_schema.clone(),
+                        self.memory_limit_bytes,
+                        limits.join_spill_partitions,
+                        limits.spill_batch_rows,
+                    )?
+                } else {
+                    PartitionedInnerJoin::create(
+                        initial_build_batches,
+                        self.right.as_mut(),
+                        self.left.as_mut(),
+                        self.right_schema.clone(),
+                        self.left_schema.clone(),
+                        build_keys,
+                        probe_keys,
+                        false,
+                        self.condition.clone(),
+                        self.left_schema.clone(),
+                        self.right_schema.clone(),
+                        self.output_schema.clone(),
+                        self.memory_limit_bytes,
+                        limits.join_spill_partitions,
+                        limits.spill_batch_rows,
+                    )?
+                });
+                self.probe_state.build_done = true;
+                return Ok(());
+            }
+        }
+
+        table.finalize();
+        if self.build_left {
+            self.inject_right_runtime_filter(&table);
+        } else {
+            self.inject_left_runtime_filter(&table);
+        }
+        self.hash_table = Some(table);
+        self.probe_state.build_done = true;
+        Ok(())
+    }
     fn inject_right_runtime_filter(&mut self, ht: &JoinHashTable) {
         if !matches!(
             self.join_type,
@@ -146,12 +252,35 @@ impl HashJoinExec {
             values,
         });
     }
+
+    fn inject_left_runtime_filter(&mut self, ht: &JoinHashTable) {
+        if self.left_key_cols.len() != 1 || self.right_key_cols.len() != 1 {
+            return;
+        }
+        let values: Vec<ScalarValue> = ht
+            .unique_key_values()
+            .into_iter()
+            .filter_map(|key| key.into_iter().next())
+            .filter(|value| !value.is_null())
+            .collect();
+        if values.is_empty() || values.len() > 1024 {
+            return;
+        }
+        self.left.add_runtime_in_filter(RuntimeInFilter {
+            column_index: self.left_key_cols[0],
+            values,
+        });
+    }
 }
 
 impl ExecutionOp for HashJoinExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         if !self.probe_state.build_done {
             self.build()?;
+        }
+
+        if let Some(spill) = self.spill_state.as_mut() {
+            return spill.next_batch();
         }
 
         match self.join_type {
@@ -172,6 +301,9 @@ impl HashJoinExec {
 
     /// Inner join: emit rows where both sides match.
     fn probe_inner(&mut self) -> Result<Option<RecordBatch>> {
+        if !self.build_left {
+            return self.probe_inner_build_right();
+        }
         loop {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
@@ -201,6 +333,38 @@ impl HashJoinExec {
                 continue;
             }
             return self.drain_buffer();
+        }
+    }
+
+    fn probe_inner_build_right(&mut self) -> Result<Option<RecordBatch>> {
+        loop {
+            if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
+                return self.drain_buffer();
+            }
+            let left_row = match self.get_next_left_row() {
+                Some(row) => row,
+                None => return Ok(None),
+            };
+            let key: Vec<ScalarValue> = self
+                .left_key_cols
+                .iter()
+                .map(|&index| left_row[index].clone())
+                .collect();
+            let matches = self.hash_table.as_ref().unwrap().probe(&key);
+            for pointer in &matches {
+                let right_row = {
+                    let table = self.hash_table.as_ref().unwrap();
+                    self.collect_build_row(table, pointer)
+                };
+                if self.join_rows_match(&left_row, &right_row)? {
+                    self.probe_state
+                        .output_buffer
+                        .push((left_row.clone(), Some(right_row)));
+                }
+            }
+            if !self.probe_state.output_buffer.is_empty() {
+                return self.drain_buffer();
+            }
         }
     }
 
@@ -648,15 +812,12 @@ impl HashJoinExec {
     }
 
     fn join_rows_match(&self, left_row: &[ScalarValue], right_row: &[ScalarValue]) -> Result<bool> {
-        match eval_join_expr(
+        join_rows_match_expr(
             &self.condition,
             left_row,
             right_row,
             self.left_schema.columns.len(),
-        )? {
-            ScalarValue::Bool(Some(v)) => Ok(v),
-            value => Ok(!value.is_null()),
-        }
+        )
     }
 
     fn drain_buffer(&mut self) -> Result<Option<RecordBatch>> {
@@ -757,6 +918,18 @@ fn collect_keys(
     }
 }
 
+pub(super) fn join_rows_match_expr(
+    condition: &LogicalExpr,
+    left_row: &[ScalarValue],
+    right_row: &[ScalarValue],
+    left_ncols: usize,
+) -> Result<bool> {
+    match eval_join_expr(condition, left_row, right_row, left_ncols)? {
+        ScalarValue::Bool(Some(value)) => Ok(value),
+        value => Ok(!value.is_null()),
+    }
+}
+
 fn eval_join_expr(
     expr: &LogicalExpr,
     left_row: &[ScalarValue],
@@ -841,5 +1014,93 @@ fn eval_join_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) 
         BinOp::Lte => ScalarValue::Bool(Some(cmp != Some(std::cmp::Ordering::Greater))),
         BinOp::Gte => ScalarValue::Bool(Some(cmp != Some(std::cmp::Ordering::Less))),
         _ => ScalarValue::Bool(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::sql::planner::merge_schemas;
+    use crate::types::batch::ColumnDef;
+
+    struct OneBatchExec(Option<RecordBatch>);
+
+    impl ExecutionOp for OneBatchExec {
+        fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+            Ok(self.0.take())
+        }
+    }
+
+    fn int_batch(schema: &Schema, values: &[i64]) -> RecordBatch {
+        let mut column = ColumnArray::empty(DataType::Int64);
+        for value in values {
+            column.push(&ScalarValue::Int64(Some(*value))).unwrap();
+        }
+        RecordBatch::try_new(schema.clone(), vec![column]).unwrap()
+    }
+
+    #[test]
+    fn inner_join_can_build_smaller_right_side_without_reordering_output() {
+        let left_schema = Schema::new(vec![ColumnDef::new("left_id", DataType::Int64)]);
+        let right_schema = Schema::new(vec![ColumnDef::new("right_id", DataType::Int64)]);
+        let condition = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(0)),
+            op: BinOp::Eq,
+            right: Box::new(LogicalExpr::Column(1)),
+        };
+        let mut join = HashJoinExec::new(
+            Box::new(OneBatchExec(Some(int_batch(&left_schema, &[1, 2, 3])))),
+            Box::new(OneBatchExec(Some(int_batch(&right_schema, &[2])))),
+            JoinType::Inner,
+            condition,
+            left_schema.clone(),
+            right_schema.clone(),
+            merge_schemas(&left_schema, &right_schema),
+        )
+        .with_inner_build_left(false);
+
+        let output = join.next_batch().unwrap().unwrap();
+        assert_eq!(output.schema.columns[0].name, "left_id");
+        assert_eq!(output.schema.columns[1].name, "right_id");
+        assert_eq!(output.scalar(0, 0), Some(ScalarValue::Int64(Some(2))));
+        assert_eq!(output.scalar(0, 1), Some(ScalarValue::Int64(Some(2))));
+        assert!(join.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn inner_join_spills_partitions_and_preserves_duplicate_matches() {
+        let left_schema = Schema::new(vec![ColumnDef::new("left_id", DataType::Int64)]);
+        let right_schema = Schema::new(vec![ColumnDef::new("right_id", DataType::Int64)]);
+        let condition = LogicalExpr::BinaryOp {
+            left: Box::new(LogicalExpr::Column(0)),
+            op: BinOp::Eq,
+            right: Box::new(LogicalExpr::Column(1)),
+        };
+        for build_left in [true, false] {
+            let mut join = HashJoinExec::new(
+                Box::new(OneBatchExec(Some(int_batch(&left_schema, &[1, 2, 2, 3])))),
+                Box::new(OneBatchExec(Some(int_batch(&right_schema, &[2, 2, 4])))),
+                JoinType::Inner,
+                condition.clone(),
+                left_schema.clone(),
+                right_schema.clone(),
+                merge_schemas(&left_schema, &right_schema),
+            )
+            .with_inner_build_left(build_left)
+            .with_memory_limit_bytes(1);
+
+            let mut rows = Vec::new();
+            while let Some(batch) = join.next_batch().unwrap() {
+                for row in 0..batch.num_rows() {
+                    rows.push((batch.scalar(row, 0), batch.scalar(row, 1)));
+                }
+            }
+            assert_eq!(rows.len(), 4);
+            assert!(rows.iter().all(|(left, right)| {
+                *left == Some(ScalarValue::Int64(Some(2)))
+                    && *right == Some(ScalarValue::Int64(Some(2)))
+            }));
+        }
     }
 }

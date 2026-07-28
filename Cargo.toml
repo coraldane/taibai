@@ -132,3 +132,15 @@ path = "tests/hot_store_fast_path_test.rs"
 [[test]]
 name = "aggregate_streaming_test"
 path = "tests/aggregate_streaming_test.rs"
+
+[[test]]
+name = "analyze_statistics_test"
+path = "tests/analyze_statistics_test.rs"
+
+[[test]]
+name = "join_reorder_statistics_test"
+path = "tests/join_reorder_statistics_test.rs"
+
+[[test]]
+name = "performance_baseline_test"
+path = "tests/performance_baseline_test.rs"

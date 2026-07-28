@@ -307,6 +307,65 @@ impl ColumnArray {
         self.len() == 0
     }
 
+    /// Estimated resident bytes, including owned variable-width payloads.
+    /// This deliberately favours a cheap, deterministic estimate over an
+    /// allocator-specific exact value and is used for query spill decisions.
+    pub fn estimated_size_bytes(&self) -> usize {
+        let bitmap = self.bitmap().estimated_size_bytes();
+        match self {
+            ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => {
+                bitmap + data.capacity()
+            }
+            ColumnArray::Int8 { data, .. } => bitmap + data.capacity(),
+            ColumnArray::Int16 { data, .. } => {
+                bitmap + data.capacity() * std::mem::size_of::<i16>()
+            }
+            ColumnArray::Int32 { data, .. } | ColumnArray::Date { data, .. } => {
+                bitmap + data.capacity() * std::mem::size_of::<i32>()
+            }
+            ColumnArray::Int64 { data, .. }
+            | ColumnArray::Decimal { data, .. }
+            | ColumnArray::Time { data, .. }
+            | ColumnArray::Timestamp { data, .. }
+            | ColumnArray::Interval { data, .. } => {
+                bitmap + data.capacity() * std::mem::size_of::<i64>()
+            }
+            ColumnArray::UInt16 { data, .. } => {
+                bitmap + data.capacity() * std::mem::size_of::<u16>()
+            }
+            ColumnArray::UInt32 { data, .. } => {
+                bitmap + data.capacity() * std::mem::size_of::<u32>()
+            }
+            ColumnArray::UInt64 { data, .. } => {
+                bitmap + data.capacity() * std::mem::size_of::<u64>()
+            }
+            ColumnArray::Float32 { data, .. } => {
+                bitmap + data.capacity() * std::mem::size_of::<f32>()
+            }
+            ColumnArray::Float64 { data, .. } => {
+                bitmap + data.capacity() * std::mem::size_of::<f64>()
+            }
+            ColumnArray::VarChar { data, .. } => {
+                bitmap
+                    + data.capacity() * std::mem::size_of::<String>()
+                    + data.iter().map(|value| value.capacity()).sum::<usize>()
+            }
+            ColumnArray::Blob { data, .. } => {
+                bitmap
+                    + data.capacity() * std::mem::size_of::<Vec<u8>>()
+                    + data.iter().map(Vec::capacity).sum::<usize>()
+            }
+            ColumnArray::Vector { data, .. } => {
+                bitmap
+                    + data.capacity() * std::mem::size_of::<Vec<f32>>()
+                    + data
+                        .iter()
+                        .map(|value| value.capacity() * std::mem::size_of::<f32>())
+                        .sum::<usize>()
+            }
+        }
+    }
+
     /// Returns a reference to the null bitmap.
     pub fn bitmap(&self) -> &NullBitmap {
         match self {

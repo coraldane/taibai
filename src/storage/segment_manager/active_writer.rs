@@ -14,7 +14,7 @@ use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
 use crate::storage::segment::{encode_segment_footer, RowGroupMeta};
 use crate::storage::segment_manager::config::{
     bulk_compression_level, FLUSH_META_AFTER_ROW_GROUP, SIDECAR_COMPACT_MIN_BYTES,
-    SIDECAR_COMPACT_MIN_RECORDS, SQL_INSERT_ROW_GROUP_TARGET_ROWS,
+    SIDECAR_COMPACT_MIN_RECORDS,
 };
 use crate::storage::segment_manager::helpers::{
     compute_value_sets_from_bulk_columns, compute_zone_maps_from_batch,
@@ -38,6 +38,7 @@ pub(super) struct ActiveSegmentWriter {
     pub(super) data_end: u64,
     pub(super) sidecar_row_groups_flushed: usize,
     pub(super) last_write_at: Instant,
+    pub(super) row_group_target_rows: usize,
 }
 
 impl ActiveSegmentWriter {
@@ -59,7 +60,7 @@ impl ActiveSegmentWriter {
             self.buffered_rows = batch.num_rows();
         }
 
-        while self.buffered_rows >= SQL_INSERT_ROW_GROUP_TARGET_ROWS {
+        while self.buffered_rows >= self.row_group_target_rows {
             if let Some(wk) = self.flush_buffer(invalidate_reader)? {
                 wal_keys_to_clear.push(wk);
             }
@@ -186,7 +187,7 @@ impl ActiveSegmentWriter {
         let compression_level = bulk_compression_level();
         let num_cols = buffered.num_columns();
 
-        let rows_to_flush = SQL_INSERT_ROW_GROUP_TARGET_ROWS.min(total_buffered);
+        let rows_to_flush = self.row_group_target_rows.min(total_buffered);
 
         let compressed_columns: Vec<(Vec<u8>, u64)> = (0..num_cols)
             .into_par_iter()
