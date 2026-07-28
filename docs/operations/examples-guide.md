@@ -294,5 +294,5 @@ security_id,deal_date,deal_time,pre_close,open_px,high_px,low_px,close_px,high_l
 
 启动 Taibai 服务：
 ```bash
-taibai-server --config conf/example.yaml
+taibai --config conf/example.yaml
 ```

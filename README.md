@@ -2,6 +2,10 @@
 
 Taibai 是一个用 Rust 编写的列式数据库服务端。
 
+> **项目状态：实验性。** 当前 `0.x` 版本适合数据库内核研究、功能验证和性能测试，尚未声明生产就绪。数据格式、协议、配置和 SQL 行为可能发生不兼容变化，详见[项目状态与限制](docs/user-guide/limitations.md)。
+
+第一次使用请从[五分钟快速开始](docs/getting-started/quick-start.md)开始。
+
 简单说，它是一个偏分析场景的数据库：适合写入大量数据，然后按列扫描、统计、聚合和查询。项目目前还在开发和完善中，更适合用来做数据库内核实验、功能验证和性能测试。
 
 ## 它能做什么
@@ -67,7 +71,7 @@ cargo run --release
 
 默认服务端口是 `5151`，默认数据库是 `main`。
 
-启动前建议先打开 `conf/example.yaml`，把 `storage.data_dir` 改成你本机实际存在的数据目录。
+启动前无需修改示例配置；`storage.data_dir` 默认使用仓库下的 `./data`。生产部署时应将它改为独立的持久化目录。
 
 ### 使用命令行客户端
 
@@ -92,7 +96,7 @@ cargo run --release -- client \
   --query "SHOW TABLES"
 ```
 
-默认 root 用户密码是 `taibai`。
+默认 root 用户密码是 `taibai`，仅用于本地开发。部署到共享或生产环境前必须修改默认凭据，并限制服务端口的网络访问。
 
 ## SQL 示例
 
@@ -188,17 +192,21 @@ log:
 | `examples/batch_import` | 批量导入示例，适合大批量 CSV 或行情数据写入 |
 | `examples/multi_insert` | 多行插入示例 |
 | `examples/prepare_test` | 预处理语句示例 |
-| `examples/stock_topn_query` | 股票行情 TopN 查询示例 |
+| `examples/hot_insert` | 热数据持续写入示例 |
 
 运行示例前，请先启动 Taibai 服务端，并根据示例源码调整连接参数。
 
 ## 更多文档
 
+- `docs/getting-started/quick-start.md`：五分钟快速开始。
 - `docs/overview/project-summary.md`：工程功能总览。
+- `docs/user-guide/limitations.md`：项目状态、兼容性和使用限制。
 - `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。
 - `docs/operations/data-import-flow.md`：数据导入流程。
 - `docs/operations/windows-installation.md`：Windows 图形安装包和系统服务安装说明。
 - `docs/reports/performance-verification-report.md`：性能验证报告。
+- `CONTRIBUTING.md`：开发环境、质量检查和贡献流程。
+- `SECURITY.md`：漏洞报告和部署安全注意事项。
 
 完整文档目录见 `docs/README.md`。
 
@@ -216,7 +224,7 @@ Windows 平台生成 MSI 安装包：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\windows\build.ps1 -AcceptWixEula
 ```
 
-生成的安装包位于 `target\release\Taibai-0.1.0.msi`。
+生成的安装包位于 `target\release\Taibai-<version>.msi`，其中 `<version>` 与 `Cargo.toml` 中的包版本一致。
 
 安装后的默认目录结构：
 
@@ -245,6 +253,15 @@ make stop
 - 看网络通信：从 `src/net/` 和 `src/protocol/` 开始。
 - 看数据类型：从 `src/types/` 开始。
 
+## 参与贡献
+
+提交改动前请阅读 `CONTRIBUTING.md` 和 `CODE_OF_CONDUCT.md`。安全漏洞请按 `SECURITY.md` 私密报告，不要创建公开 Issue。
+
 ## 许可证
 
-MIT OR Apache-2.0
+Taibai 按以下任一许可证提供：
+
+- Apache License, Version 2.0（`LICENSE-APACHE`）
+- MIT License（`LICENSE-MIT`）
+
+贡献内容同样按 `MIT OR Apache-2.0` 双许可证提供。
