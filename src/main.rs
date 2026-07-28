@@ -208,6 +208,9 @@ where
         parallel_scan_min_row_groups: config.buffer.parallel_scan_min_row_groups.max(1),
         spill_batch_rows: config.buffer.spill_batch_rows.max(1),
         join_spill_partitions: config.buffer.join_spill_partitions.max(2),
+        max_parallel_segments: config.buffer.max_parallel_segments.max(1),
+        global_io_permits: config.buffer.global_io_permits.max(1),
+        global_cpu_permits: config.buffer.global_cpu_permits.max(1),
     });
     let engine = Arc::new(engine);
     let _ = rayon::ThreadPoolBuilder::new()
@@ -566,7 +569,7 @@ fn append_column_cell(line: &mut String, col: &types::array::ColumnArray, row: u
         }
         types::array::ColumnArray::VarChar { data, .. } => line.push_str(&data[row]),
         types::array::ColumnArray::Blob { data, .. } => {
-            let _ = write!(line, "{:?}", data[row]);
+            let _ = write!(line, "{:?}", &data[row]);
         }
         types::array::ColumnArray::Vector { data, .. } => {
             let _ = write!(line, "{:?}", data[row]);

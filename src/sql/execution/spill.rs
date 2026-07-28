@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use crate::common::error::Result;
 use crate::storage::segment::meta::{remove_sidecar_meta, sidecar_meta_path};
@@ -17,6 +19,86 @@ pub struct SpillWriter {
     writer: Option<SegmentWriter>,
     spill: Option<SpillFile>,
     rows_written: u64,
+}
+
+/// Process-wide memory arbiter shared by all blocking operators and queries.
+/// Per-operator limits are still honored, while this additional ceiling stops
+/// concurrent Sort/GROUP BY/Hash Join instances from each consuming the full
+/// configured budget.
+pub struct MemoryManager {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+pub struct MemoryReservation {
+    manager: &'static MemoryManager,
+    bytes: usize,
+}
+
+impl MemoryManager {
+    fn global() -> &'static Self {
+        static MANAGER: OnceLock<MemoryManager> = OnceLock::new();
+        MANAGER.get_or_init(|| {
+            let limit = crate::common::config::query_limits()
+                .query_memory_limit_mb
+                .saturating_mul(1024 * 1024)
+                .min(usize::MAX as u64) as usize;
+            MemoryManager {
+                limit: limit.max(1),
+                used: AtomicUsize::new(0),
+            }
+        })
+    }
+
+    pub fn reservation() -> MemoryReservation {
+        MemoryReservation {
+            manager: Self::global(),
+            bytes: 0,
+        }
+    }
+}
+
+impl MemoryReservation {
+    /// Resize this operator's charge. Returns false when the shared budget is
+    /// under pressure; callers respond by spilling their current run.
+    pub fn try_resize(&mut self, target: usize) -> bool {
+        if target <= self.bytes {
+            self.manager
+                .used
+                .fetch_sub(self.bytes - target, Ordering::AcqRel);
+            self.bytes = target;
+            return true;
+        }
+        let increase = target - self.bytes;
+        let mut used = self.manager.used.load(Ordering::Acquire);
+        loop {
+            if used.saturating_add(increase) > self.manager.limit {
+                return false;
+            }
+            match self.manager.used.compare_exchange_weak(
+                used,
+                used + increase,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.bytes = target;
+                    return true;
+                }
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    pub fn release(&mut self) {
+        let _ = self.try_resize(0);
+    }
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl SpillFile {

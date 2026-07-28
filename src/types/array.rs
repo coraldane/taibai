@@ -3,6 +3,283 @@ use crate::protocol::types::DataType;
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
+/// Arrow-compatible variable-width UTF-8 storage. `offsets` always contains
+/// one more entry than there are values and `data` owns all string bytes in a
+/// single allocation.
+#[derive(Debug, Clone, Default)]
+pub struct Utf8Buffer {
+    offsets: Vec<u32>,
+    data: Vec<u8>,
+}
+
+impl Utf8Buffer {
+    pub fn new() -> Self {
+        Self {
+            offsets: vec![0],
+            data: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(values: usize) -> Self {
+        let mut offsets = Vec::with_capacity(values.saturating_add(1));
+        offsets.push(0);
+        Self {
+            offsets,
+            data: Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn capacity(&self) -> usize {
+        self.offsets.capacity().saturating_sub(1)
+    }
+    pub fn data_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+    pub fn values(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn value(&self, index: usize) -> &str {
+        let start = self.offsets[index] as usize;
+        let end = self.offsets[index + 1] as usize;
+        // Values enter through String/&str or the validated segment decoder.
+        unsafe { std::str::from_utf8_unchecked(&self.data[start..end]) }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&str> {
+        (index < self.len()).then(|| self.value(index))
+    }
+
+    pub fn push(&mut self, value: String) {
+        self.push_str(&value);
+    }
+
+    pub fn push_str(&mut self, value: &str) {
+        self.data.extend_from_slice(value.as_bytes());
+        self.offsets.push(self.data.len() as u32);
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        let base = self.data.len() as u32;
+        self.data.append(&mut other.data);
+        self.offsets
+            .extend(other.offsets.iter().skip(1).map(|offset| base + *offset));
+        other.offsets.clear();
+        other.offsets.push(0);
+    }
+
+    pub fn extend_from(&mut self, other: &Self) {
+        for value in other.iter() {
+            self.push_str(value);
+        }
+    }
+
+    /// Used only by compaction's position gatherer. Query execution builds
+    /// buffers append-only and never pays this relocation cost.
+    pub fn set(&mut self, index: usize, value: &str) {
+        let start = self.offsets[index] as usize;
+        let end = self.offsets[index + 1] as usize;
+        let old_len = end - start;
+        self.data.splice(start..end, value.bytes());
+        let delta = value.len() as isize - old_len as isize;
+        if delta != 0 {
+            for offset in self.offsets.iter_mut().skip(index + 1) {
+                *offset = (*offset as isize + delta) as u32;
+            }
+        }
+    }
+
+    pub fn iter(&self) -> Utf8Iter<'_> {
+        Utf8Iter {
+            buffer: self,
+            index: 0,
+        }
+    }
+}
+
+impl From<Vec<String>> for Utf8Buffer {
+    fn from(values: Vec<String>) -> Self {
+        let mut out = Self::with_capacity(values.len());
+        for value in values {
+            out.push(value);
+        }
+        out
+    }
+}
+
+impl std::ops::Index<usize> for Utf8Buffer {
+    type Output = str;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.value(index)
+    }
+}
+
+pub struct Utf8Iter<'a> {
+    buffer: &'a Utf8Buffer,
+    index: usize,
+}
+impl<'a> Iterator for Utf8Iter<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.buffer.len() {
+            return None;
+        }
+        let value = self.buffer.value(self.index);
+        self.index += 1;
+        Some(value)
+    }
+}
+
+impl<'a> IntoIterator for &'a Utf8Buffer {
+    type Item = &'a str;
+    type IntoIter = Utf8Iter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl PartialEq<Vec<String>> for Utf8Buffer {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a == b)
+    }
+}
+
+/// Arrow-compatible variable-width binary storage.
+#[derive(Debug, Clone, Default)]
+pub struct BinaryBuffer {
+    offsets: Vec<u32>,
+    data: Vec<u8>,
+}
+
+impl BinaryBuffer {
+    pub fn new() -> Self {
+        Self {
+            offsets: vec![0],
+            data: Vec::new(),
+        }
+    }
+    pub fn with_capacity(values: usize) -> Self {
+        let mut offsets = Vec::with_capacity(values.saturating_add(1));
+        offsets.push(0);
+        Self {
+            offsets,
+            data: Vec::new(),
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn capacity(&self) -> usize {
+        self.offsets.capacity().saturating_sub(1)
+    }
+    pub fn data_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+    pub fn values(&self) -> &[u8] {
+        &self.data
+    }
+    pub fn value(&self, index: usize) -> &[u8] {
+        &self.data[self.offsets[index] as usize..self.offsets[index + 1] as usize]
+    }
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        (index < self.len()).then(|| self.value(index))
+    }
+    pub fn push(&mut self, value: Vec<u8>) {
+        self.push_slice(&value);
+    }
+    pub fn push_slice(&mut self, value: &[u8]) {
+        self.data.extend_from_slice(value);
+        self.offsets.push(self.data.len() as u32);
+    }
+    pub fn append(&mut self, other: &mut Self) {
+        let base = self.data.len() as u32;
+        self.data.append(&mut other.data);
+        self.offsets
+            .extend(other.offsets.iter().skip(1).map(|offset| base + *offset));
+        other.offsets.clear();
+        other.offsets.push(0);
+    }
+    pub fn extend_from(&mut self, other: &Self) {
+        for value in other.iter() {
+            self.push_slice(value);
+        }
+    }
+    pub fn set(&mut self, index: usize, value: &[u8]) {
+        let start = self.offsets[index] as usize;
+        let end = self.offsets[index + 1] as usize;
+        let old_len = end - start;
+        self.data.splice(start..end, value.iter().copied());
+        let delta = value.len() as isize - old_len as isize;
+        if delta != 0 {
+            for offset in self.offsets.iter_mut().skip(index + 1) {
+                *offset = (*offset as isize + delta) as u32;
+            }
+        }
+    }
+    pub fn iter(&self) -> BinaryIter<'_> {
+        BinaryIter {
+            buffer: self,
+            index: 0,
+        }
+    }
+}
+
+impl From<Vec<Vec<u8>>> for BinaryBuffer {
+    fn from(values: Vec<Vec<u8>>) -> Self {
+        let mut out = Self::with_capacity(values.len());
+        for value in values {
+            out.push(value);
+        }
+        out
+    }
+}
+
+impl std::ops::Index<usize> for BinaryBuffer {
+    type Output = [u8];
+    fn index(&self, index: usize) -> &Self::Output {
+        self.value(index)
+    }
+}
+
+pub struct BinaryIter<'a> {
+    buffer: &'a BinaryBuffer,
+    index: usize,
+}
+impl<'a> Iterator for BinaryIter<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.buffer.len() {
+            return None;
+        }
+        let value = self.buffer.value(self.index);
+        self.index += 1;
+        Some(value)
+    }
+}
+
+impl<'a> IntoIterator for &'a BinaryBuffer {
+    type Item = &'a [u8];
+    type IntoIter = BinaryIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// A typed column array with null bitmap.
 /// Data is stored in typed vectors for cache efficiency; null values are
 /// marked in the bitmap but still occupy space in the data vector (simpler
@@ -74,11 +351,11 @@ pub enum ColumnArray {
         bitmap: NullBitmap,
     },
     VarChar {
-        data: Vec<String>,
+        data: Utf8Buffer,
         bitmap: NullBitmap,
     },
     Blob {
-        data: Vec<Vec<u8>>,
+        data: BinaryBuffer,
         bitmap: NullBitmap,
     },
     Vector {
@@ -88,6 +365,187 @@ pub enum ColumnArray {
 }
 
 impl ColumnArray {
+    /// Compare two positions without constructing `ScalarValue`s. NULL sorts
+    /// last, matching the SQL sort operator's existing semantics.
+    pub fn compare_at(&self, left: usize, right: usize) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let left_null = self.bitmap().is_null(left);
+        let right_null = self.bitmap().is_null(right);
+        match (left_null, right_null) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Greater,
+            (false, true) => return Ordering::Less,
+            _ => {}
+        }
+        macro_rules! cmp_ord {
+            ($data:expr) => {
+                $data[left].cmp(&$data[right])
+            };
+        }
+        macro_rules! cmp_float {
+            ($data:expr) => {
+                $data[left]
+                    .partial_cmp(&$data[right])
+                    .unwrap_or(Ordering::Equal)
+            };
+        }
+        match self {
+            ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => cmp_ord!(data),
+            ColumnArray::Int8 { data, .. } => cmp_ord!(data),
+            ColumnArray::Int16 { data, .. } => cmp_ord!(data),
+            ColumnArray::Int32 { data, .. } | ColumnArray::Date { data, .. } => cmp_ord!(data),
+            ColumnArray::Int64 { data, .. }
+            | ColumnArray::Decimal { data, .. }
+            | ColumnArray::Time { data, .. }
+            | ColumnArray::Timestamp { data, .. }
+            | ColumnArray::Interval { data, .. } => cmp_ord!(data),
+            ColumnArray::UInt16 { data, .. } => cmp_ord!(data),
+            ColumnArray::UInt32 { data, .. } => cmp_ord!(data),
+            ColumnArray::UInt64 { data, .. } => cmp_ord!(data),
+            ColumnArray::Float32 { data, .. } => cmp_float!(data),
+            ColumnArray::Float64 { data, .. } => cmp_float!(data),
+            ColumnArray::VarChar { data, .. } => data.value(left).cmp(data.value(right)),
+            ColumnArray::Blob { data, .. } => data.value(left).cmp(data.value(right)),
+            ColumnArray::Vector { data, .. } => data[left]
+                .partial_cmp(&data[right])
+                .unwrap_or(Ordering::Equal),
+        }
+    }
+
+    /// Typed comparison against a literal, used by filter/range kernels.
+    pub fn compare_scalar_at(&self, row: usize, value: &ScalarValue) -> Option<std::cmp::Ordering> {
+        if self.bitmap().is_null(row) || value.is_null() {
+            return None;
+        }
+        macro_rules! cmp {
+            ($data:expr, $v:expr) => {
+                Some($data[row].cmp($v))
+            };
+        }
+        macro_rules! cmp_float {
+            ($data:expr, $v:expr) => {
+                $data[row].partial_cmp($v)
+            };
+        }
+        match (self, value) {
+            (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => {
+                Some((data[row] != 0).cmp(v))
+            }
+            (ColumnArray::Int8 { data, .. }, ScalarValue::Int8(Some(v))) => cmp!(data, v),
+            (ColumnArray::Int16 { data, .. }, ScalarValue::Int16(Some(v))) => cmp!(data, v),
+            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => cmp!(data, v),
+            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => cmp!(data, v),
+            (ColumnArray::UInt8 { data, .. }, ScalarValue::UInt8(Some(v))) => cmp!(data, v),
+            (ColumnArray::UInt16 { data, .. }, ScalarValue::UInt16(Some(v))) => cmp!(data, v),
+            (ColumnArray::UInt32 { data, .. }, ScalarValue::UInt32(Some(v))) => cmp!(data, v),
+            (ColumnArray::UInt64 { data, .. }, ScalarValue::UInt64(Some(v))) => cmp!(data, v),
+            (ColumnArray::Float32 { data, .. }, ScalarValue::Float32(Some(v))) => {
+                cmp_float!(data, v)
+            }
+            (ColumnArray::Float64 { data, .. }, ScalarValue::Float64(Some(v))) => {
+                cmp_float!(data, v)
+            }
+            (ColumnArray::Decimal { data, .. }, ScalarValue::Decimal(Some(v))) => cmp!(data, v),
+            (ColumnArray::Date { data, .. }, ScalarValue::Date(Some(v))) => cmp!(data, v),
+            (ColumnArray::Time { data, .. }, ScalarValue::Time(Some(v))) => cmp!(data, v),
+            (ColumnArray::Timestamp { data, .. }, ScalarValue::Timestamp(Some(v))) => cmp!(data, v),
+            (ColumnArray::Interval { data, .. }, ScalarValue::Interval(Some(v))) => cmp!(data, v),
+            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => {
+                Some(data.value(row).cmp(v))
+            }
+            (ColumnArray::Blob { data, .. }, ScalarValue::Blob(Some(v))) => {
+                Some(data.value(row).cmp(v))
+            }
+            _ => self.numeric_f64_at(row)?.partial_cmp(&value.numeric_f64()?),
+        }
+    }
+
+    /// Append a stable, typed row-key representation directly from column
+    /// storage. Used by GROUP BY and hash join to avoid per-row boxing.
+    pub fn encode_key_at(&self, row: usize, out: &mut Vec<u8>) {
+        out.push(self.data_type() as u8);
+        if self.bitmap().is_null(row) {
+            out.push(0);
+            return;
+        }
+        out.push(1);
+        macro_rules! bytes {
+            ($data:expr) => {
+                out.extend_from_slice(&$data[row].to_le_bytes())
+            };
+        }
+        match self {
+            ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => out.push(data[row]),
+            ColumnArray::Int8 { data, .. } => out.push(data[row] as u8),
+            ColumnArray::Int16 { data, .. } => bytes!(data),
+            ColumnArray::Int32 { data, .. } | ColumnArray::Date { data, .. } => bytes!(data),
+            ColumnArray::Int64 { data, .. }
+            | ColumnArray::Decimal { data, .. }
+            | ColumnArray::Time { data, .. }
+            | ColumnArray::Timestamp { data, .. }
+            | ColumnArray::Interval { data, .. } => bytes!(data),
+            ColumnArray::UInt16 { data, .. } => bytes!(data),
+            ColumnArray::UInt32 { data, .. } => bytes!(data),
+            ColumnArray::UInt64 { data, .. } => bytes!(data),
+            ColumnArray::Float32 { data, .. } => {
+                out.extend_from_slice(&data[row].to_bits().to_le_bytes())
+            }
+            ColumnArray::Float64 { data, .. } => {
+                out.extend_from_slice(&data[row].to_bits().to_le_bytes())
+            }
+            ColumnArray::VarChar { data, .. } => {
+                let value = data.value(row);
+                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                out.extend_from_slice(value.as_bytes());
+            }
+            ColumnArray::Blob { data, .. } => {
+                let value = data.value(row);
+                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                out.extend_from_slice(value);
+            }
+            ColumnArray::Vector { data, .. } => {
+                out.extend_from_slice(&(data[row].len() as u32).to_le_bytes());
+                for value in &data[row] {
+                    out.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+            }
+        }
+    }
+
+    pub fn numeric_i64_at(&self, row: usize) -> Option<i64> {
+        if self.bitmap().is_null(row) {
+            return None;
+        }
+        match self {
+            ColumnArray::Int8 { data, .. } => Some(data[row] as i64),
+            ColumnArray::Int16 { data, .. } => Some(data[row] as i64),
+            ColumnArray::Int32 { data, .. } | ColumnArray::Date { data, .. } => {
+                Some(data[row] as i64)
+            }
+            ColumnArray::Int64 { data, .. }
+            | ColumnArray::Decimal { data, .. }
+            | ColumnArray::Time { data, .. }
+            | ColumnArray::Timestamp { data, .. }
+            | ColumnArray::Interval { data, .. } => Some(data[row]),
+            ColumnArray::UInt8 { data, .. } => Some(data[row] as i64),
+            ColumnArray::UInt16 { data, .. } => Some(data[row] as i64),
+            ColumnArray::UInt32 { data, .. } => Some(data[row] as i64),
+            ColumnArray::UInt64 { data, .. } => i64::try_from(data[row]).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn numeric_f64_at(&self, row: usize) -> Option<f64> {
+        if self.bitmap().is_null(row) {
+            return None;
+        }
+        match self {
+            ColumnArray::Float32 { data, .. } => Some(data[row] as f64),
+            ColumnArray::Float64 { data, .. } => Some(data[row]),
+            _ => self.numeric_i64_at(row).map(|value| value as f64),
+        }
+    }
+
     /// Create an empty ColumnArray for the given DataType.
     pub fn empty(dt: DataType) -> Self {
         match dt {
@@ -156,11 +614,11 @@ impl ColumnArray {
                 bitmap: NullBitmap::new_valid(0),
             },
             DataType::VarChar => ColumnArray::VarChar {
-                data: Vec::new(),
+                data: Utf8Buffer::new(),
                 bitmap: NullBitmap::new_valid(0),
             },
             DataType::Blob => ColumnArray::Blob {
-                data: Vec::new(),
+                data: BinaryBuffer::new(),
                 bitmap: NullBitmap::new_valid(0),
             },
             DataType::Vector => ColumnArray::Vector {
@@ -238,11 +696,11 @@ impl ColumnArray {
                 bitmap: bitmap(),
             },
             DataType::VarChar => ColumnArray::VarChar {
-                data: Vec::with_capacity(capacity),
+                data: Utf8Buffer::with_capacity(capacity),
                 bitmap: bitmap(),
             },
             DataType::Blob => ColumnArray::Blob {
-                data: Vec::with_capacity(capacity),
+                data: BinaryBuffer::with_capacity(capacity),
                 bitmap: bitmap(),
             },
             DataType::Vector => ColumnArray::Vector {
@@ -346,14 +804,10 @@ impl ColumnArray {
                 bitmap + data.capacity() * std::mem::size_of::<f64>()
             }
             ColumnArray::VarChar { data, .. } => {
-                bitmap
-                    + data.capacity() * std::mem::size_of::<String>()
-                    + data.iter().map(|value| value.capacity()).sum::<usize>()
+                bitmap + data.offsets.capacity() * std::mem::size_of::<u32>() + data.data_capacity()
             }
             ColumnArray::Blob { data, .. } => {
-                bitmap
-                    + data.capacity() * std::mem::size_of::<Vec<u8>>()
-                    + data.iter().map(Vec::capacity).sum::<usize>()
+                bitmap + data.offsets.capacity() * std::mem::size_of::<u32>() + data.data_capacity()
             }
             ColumnArray::Vector { data, .. } => {
                 bitmap
@@ -535,14 +989,14 @@ impl ColumnArray {
                 if bitmap.is_null(idx) {
                     ScalarValue::VarChar(None)
                 } else {
-                    ScalarValue::VarChar(Some(data[idx].clone()))
+                    ScalarValue::VarChar(Some(data.value(idx).to_owned()))
                 }
             }
             ColumnArray::Blob { data, bitmap } => {
                 if bitmap.is_null(idx) {
                     ScalarValue::Blob(None)
                 } else {
-                    ScalarValue::Blob(Some(data[idx].clone()))
+                    ScalarValue::Blob(Some(data.value(idx).to_vec()))
                 }
             }
             ColumnArray::Vector { data, bitmap } => {
@@ -951,7 +1405,7 @@ impl ColumnArray {
                     bitmap: other_bitmap,
                 },
             ) => {
-                data.extend(other_data.iter().cloned());
+                data.extend_from(other_data);
                 bitmap.extend(other_bitmap);
                 Ok(())
             }
@@ -962,7 +1416,7 @@ impl ColumnArray {
                     bitmap: other_bitmap,
                 },
             ) => {
-                data.extend(other_data.iter().cloned());
+                data.extend_from(other_data);
                 bitmap.extend(other_bitmap);
                 Ok(())
             }

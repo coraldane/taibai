@@ -4,6 +4,7 @@
 /// Stores data in columnar format using RecordBatch for cache efficiency.
 use std::collections::HashMap;
 
+use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
 
@@ -23,6 +24,18 @@ impl JoinKey {
 
     pub fn to_scalars(&self) -> Vec<ScalarValue> {
         self.0.iter().map(ScalarValueHashable::to_scalar).collect()
+    }
+
+    pub fn from_batch(batch: &RecordBatch, row: usize, columns: &[usize]) -> Option<Self> {
+        let mut values = Vec::with_capacity(columns.len());
+        for &column in columns {
+            let array = batch.column(column)?;
+            if array.bitmap().is_null(row) {
+                return None;
+            }
+            values.push(ScalarValueHashable::from_column(array, row));
+        }
+        Some(Self(values))
     }
 }
 
@@ -47,6 +60,30 @@ pub enum ScalarValueHashable {
 }
 
 impl ScalarValueHashable {
+    fn from_column(column: &ColumnArray, row: usize) -> Self {
+        match column {
+            ColumnArray::Bool { data, .. } => Self::Bool(Some(data[row] != 0)),
+            ColumnArray::Int8 { data, .. } => Self::Int8(Some(data[row])),
+            ColumnArray::Int16 { data, .. } => Self::Int16(Some(data[row])),
+            ColumnArray::Int32 { data, .. } => Self::Int32(Some(data[row])),
+            ColumnArray::Int64 { data, .. } | ColumnArray::Decimal { data, .. } => {
+                Self::Int64(Some(data[row]))
+            }
+            ColumnArray::UInt8 { data, .. } => Self::UInt8(Some(data[row])),
+            ColumnArray::UInt16 { data, .. } => Self::UInt16(Some(data[row])),
+            ColumnArray::UInt32 { data, .. } => Self::UInt32(Some(data[row])),
+            ColumnArray::UInt64 { data, .. } => Self::UInt64(Some(data[row])),
+            ColumnArray::Float32 { data, .. } => Self::FloatToI64(Some(data[row].to_bits() as i64)),
+            ColumnArray::Float64 { data, .. } => Self::FloatToI64(Some(data[row].to_bits() as i64)),
+            ColumnArray::VarChar { data, .. } => Self::VarChar(Some(data.value(row).to_owned())),
+            ColumnArray::Date { data, .. } => Self::Date(Some(data[row])),
+            ColumnArray::Time { data, .. } => Self::Time(Some(data[row])),
+            ColumnArray::Timestamp { data, .. } => Self::Timestamp(Some(data[row])),
+            ColumnArray::Interval { data, .. } => Self::Int64(Some(data[row])),
+            ColumnArray::Blob { .. } | ColumnArray::Vector { .. } => Self::Null,
+        }
+    }
+
     pub fn from_scalar(v: &ScalarValue) -> Self {
         match v {
             ScalarValue::Bool(b) => ScalarValueHashable::Bool(*b),
@@ -134,24 +171,12 @@ impl JoinHashTable {
         let num_rows = batch.num_rows();
 
         for row_idx in 0..num_rows {
-            let key_values: Vec<ScalarValue> = self
-                .key_columns
-                .iter()
-                .map(|&col_idx| {
-                    batch
-                        .scalar(row_idx, col_idx)
-                        .unwrap_or(ScalarValue::Int64(None))
-                })
-                .collect();
-
-            // Skip rows with NULL keys (NULL != NULL in SQL joins)
-            let has_null = key_values.iter().any(|v| v.is_null());
-            if has_null {
+            // Build typed keys directly from column buffers. NULL keys do not
+            // participate in SQL equality joins.
+            let Some(key) = JoinKey::from_batch(&batch, row_idx, &self.key_columns) else {
                 self.total_rows += 1;
                 continue;
-            }
-
-            let key = JoinKey::from_scalars(&key_values);
+            };
             let ptr = RowPointer { batch_idx, row_idx };
             self.table.entry(key).or_default().push(ptr);
             self.total_rows += 1;

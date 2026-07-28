@@ -212,6 +212,39 @@ fn lookup_uses_key_partition_index_and_reverse_offsets() {
         ColumnArray::Int32 { data, .. } => assert_eq!(data, &vec![20, 10]),
         _ => panic!("expected projected price column"),
     }
+
+    let store = mgr.get("main", "ticks").unwrap();
+    let filtered = store
+        .lookup_filtered(
+            &ScalarValue::VarChar(Some("A".to_string())),
+            Some(&ScalarValue::Int64(Some(20260709))),
+            Some(&[3]),
+            0,
+            true,
+            Some(1),
+            &[
+                (0, ScalarValue::VarChar(Some("A".to_string()))),
+                (1, ScalarValue::Int64(Some(20260709))),
+            ],
+            &[RangeClause {
+                column_index: 2,
+                op: RangeOp::Ge,
+                value: ScalarValue::Int32(Some(93001)),
+            }],
+        )
+        .unwrap();
+    assert_eq!(filtered.num_rows(), 1);
+    match filtered.column(0).unwrap() {
+        ColumnArray::Int32 { data, .. } => assert_eq!(data, &vec![20]),
+        _ => panic!("expected projected price column"),
+    }
+
+    // The persisted-prefix watermark is resolved by binary search over sorted
+    // append offsets rather than scanning the entire key posting list.
+    assert_eq!(
+        store.count_by_key_from(&ScalarValue::VarChar(Some("A".to_string())), 2),
+        Some(1)
+    );
 }
 
 #[test]

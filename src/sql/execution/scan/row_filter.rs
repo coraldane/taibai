@@ -131,8 +131,10 @@ fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut [bool]) {
             if !*m {
                 continue;
             }
-            let val = col.scalar(i);
-            let found = pred.values.iter().any(|v| scalar_eq(&val, v));
+            let found = pred.values.iter().any(|value| {
+                col.compare_scalar_at(i, value)
+                    .is_some_and(|ordering| ordering.is_eq())
+            });
             *m = found;
         }
     } else {
@@ -428,8 +430,10 @@ pub fn predicate_first_read(
                     if !*m {
                         continue;
                     }
-                    let val = col.scalar(i);
-                    let found = pred.values.iter().any(|v| scalar_eq(&val, v));
+                    let found = pred.values.iter().any(|value| {
+                        col.compare_scalar_at(i, value)
+                            .is_some_and(|ordering| ordering.is_eq())
+                    });
                     *m = found;
                 }
             }
@@ -805,7 +809,7 @@ fn repeated_scalar_column(
             bitmap,
         },
         ScalarValue::VarChar(Some(v)) => ColumnArray::VarChar {
-            data: vec![v.clone(); len],
+            data: vec![v.clone(); len].into(),
             bitmap,
         },
         _ => {
@@ -822,10 +826,7 @@ fn lower_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
     let mut hi = col.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let mid_val = col.scalar(mid);
-        if crate::storage::index::sort_key::compare_scalars_for_sort(&mid_val, value)
-            == std::cmp::Ordering::Less
-        {
+        if col.compare_scalar_at(mid, value) == Some(std::cmp::Ordering::Less) {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -839,10 +840,7 @@ fn upper_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
     let mut hi = col.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let mid_val = col.scalar(mid);
-        if crate::storage::index::sort_key::compare_scalars_for_sort(&mid_val, value)
-            == std::cmp::Ordering::Greater
-        {
+        if col.compare_scalar_at(mid, value) == Some(std::cmp::Ordering::Greater) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -856,11 +854,7 @@ fn is_sorted_ascending(col: &ColumnArray) -> bool {
         return true;
     }
     for row_idx in 1..col.len() {
-        let prev = col.scalar(row_idx - 1);
-        let current = col.scalar(row_idx);
-        if crate::storage::index::sort_key::compare_scalars_for_sort(&current, &prev)
-            == std::cmp::Ordering::Less
-        {
+        if col.compare_at(row_idx, row_idx - 1) == std::cmp::Ordering::Less {
             return false;
         }
     }

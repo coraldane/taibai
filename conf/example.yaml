@@ -36,6 +36,9 @@ buffer:
   parallel_scan_min_row_groups: 4
   spill_batch_rows: 4096
   join_spill_partitions: 16
+  max_parallel_segments: 4
+  global_io_permits: 4   # Shared by query scans and OPTIMIZE partition workers
+  global_cpu_permits: 8  # Shared by query kernels and OPTIMIZE partition workers
 
 # Compression settings
 compression:

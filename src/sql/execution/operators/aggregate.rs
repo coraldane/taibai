@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::sql::execution::operators::filter::{remap_aggregate_for_batch, remap_expr_for_batch};
-use crate::sql::execution::spill::SpillFile;
+use crate::sql::execution::spill::{MemoryManager, SpillFile};
 use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
 use crate::storage::segment::SegmentReader;
 use crate::types::array::ColumnArray;
@@ -112,6 +112,16 @@ enum CountKind {
     Star,
     /// COUNT(col) — only non-null values of this column count.
     Column(usize),
+}
+
+fn hex_key(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 impl Accumulator {
@@ -290,6 +300,101 @@ impl Accumulator {
         Ok(())
     }
 
+    fn update_row(
+        &mut self,
+        batch: &RecordBatch,
+        col_idx_opt: Option<usize>,
+        row: usize,
+    ) -> Result<()> {
+        match self {
+            Accumulator::Count { count, col } => match *col {
+                CountKind::Star => *count += 1,
+                CountKind::Column(column) => {
+                    if batch
+                        .column(column)
+                        .is_some_and(|col| !col.bitmap().is_null(row))
+                    {
+                        *count += 1;
+                    }
+                }
+            },
+            Accumulator::SumI(value) => {
+                if let Some(part) = col_idx_opt
+                    .and_then(|column| batch.column(column))
+                    .and_then(|col| col.numeric_i64_at(row))
+                {
+                    *value = Some(value.unwrap_or(0).wrapping_add(part));
+                }
+            }
+            Accumulator::SumF(value) => {
+                if let Some(part) = col_idx_opt
+                    .and_then(|column| batch.column(column))
+                    .and_then(|col| col.numeric_f64_at(row))
+                {
+                    *value = Some(value.unwrap_or(0.0) + part);
+                }
+            }
+            Accumulator::Avg { sum, count, any } => {
+                if let Some(part) = col_idx_opt
+                    .and_then(|column| batch.column(column))
+                    .and_then(|col| col.numeric_f64_at(row))
+                {
+                    *sum += part;
+                    *count += 1;
+                    *any = true;
+                }
+            }
+            Accumulator::Distinct { seen, .. } => {
+                let mut key = Vec::new();
+                if let Some(column) = col_idx_opt.and_then(|column| batch.column(column)) {
+                    if !column.bitmap().is_null(row) {
+                        column.encode_key_at(row, &mut key);
+                    }
+                } else {
+                    for column in &batch.columns {
+                        column.encode_key_at(row, &mut key);
+                    }
+                }
+                if !key.is_empty() {
+                    seen.insert(hex_key(&key));
+                }
+            }
+            // MIN/MAX keep an owned value per group, but avoid constructing a
+            // one-row RecordBatch and touching unrelated columns.
+            Accumulator::Min(best) => {
+                let Some(column) = col_idx_opt.and_then(|column| batch.column(column)) else {
+                    return Ok(());
+                };
+                if column.bitmap().is_null(row) {
+                    return Ok(());
+                }
+                let candidate = column.scalar(row);
+                let replace = best
+                    .as_ref()
+                    .is_none_or(|value| compare_scalars(&candidate, value).is_lt());
+                if replace {
+                    *best = Some(candidate);
+                }
+            }
+            Accumulator::Max(best) => {
+                let Some(column) = col_idx_opt.and_then(|column| batch.column(column)) else {
+                    return Ok(());
+                };
+                if column.bitmap().is_null(row) {
+                    return Ok(());
+                }
+                let candidate = column.scalar(row);
+                let replace = best
+                    .as_ref()
+                    .is_none_or(|value| compare_scalars(&candidate, value).is_gt());
+                if replace {
+                    *best = Some(candidate);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Finalize into a result scalar. `col_type` is the argument column type
     /// (used to choose null representation / sum type).
     fn finalize(&self, col_type: DataType) -> ScalarValue {
@@ -445,6 +550,7 @@ impl ExecutionOp for HashAggregateExec {
         let mut remapped = false;
 
         if self.group_by.is_empty() {
+            let mut memory = MemoryManager::reservation();
             // ----- No GROUP BY: a single set of accumulators -----------------
             let mut accums: Vec<Accumulator> = Vec::with_capacity(self.aggregates.len());
             // Pre-create using the logical (input) schema types; col indices are
@@ -492,8 +598,10 @@ impl ExecutionOp for HashAggregateExec {
                     .map(Accumulator::estimated_size_bytes)
                     .sum::<usize>();
                 super::profile::record_current_peak_memory(estimated_bytes);
-                if estimated_bytes >= self.memory_limit_bytes {
+                if estimated_bytes >= self.memory_limit_bytes || !memory.try_resize(estimated_bytes)
+                {
                     spill_distinct_accumulators(&mut accums, &mut distinct_spills, spill_rows)?;
+                    memory.release();
                 }
             }
 
@@ -522,10 +630,11 @@ impl ExecutionOp for HashAggregateExec {
         // `groups` maps the stringified key to its accumulators; `group_keys`
         // preserves insertion order alongside the original (typed) group-by
         // scalar values so the output keeps the correct column types.
-        let mut groups: HashMap<Vec<String>, Vec<Accumulator>> = HashMap::new();
-        let mut group_keys: Vec<(Vec<String>, Vec<ScalarValue>)> = Vec::new();
+        let mut groups: HashMap<Vec<u8>, Vec<Accumulator>> = HashMap::new();
+        let mut group_keys: Vec<(Vec<u8>, Vec<ScalarValue>)> = Vec::new();
         let mut estimated_group_bytes = 0usize;
         let mut spills = Vec::new();
+        let mut memory = MemoryManager::reservation();
         let spill_rows = crate::common::config::query_limits()
             .spill_batch_rows
             .max(1);
@@ -557,17 +666,23 @@ impl ExecutionOp for HashAggregateExec {
                 .collect();
 
             for row in 0..batch.num_rows() {
-                let key_scalars: Vec<ScalarValue> = gb_indices
-                    .iter()
-                    .map(|&c| {
-                        batch
-                            .scalar(row, c)
-                            .unwrap_or_else(|| ScalarValue::Int64(None))
-                    })
-                    .collect();
-                let key: Vec<String> = key_scalars.iter().map(|v| v.to_string()).collect();
+                let mut key = Vec::with_capacity(gb_indices.len() * 12);
+                for &column in &gb_indices {
+                    if let Some(array) = batch.column(column) {
+                        array.encode_key_at(row, &mut key);
+                    }
+                }
 
                 if !groups.contains_key(&key) {
+                    let key_scalars: Vec<ScalarValue> = gb_indices
+                        .iter()
+                        .map(|&column| {
+                            batch
+                                .column(column)
+                                .map(|array| array.scalar(row))
+                                .unwrap_or(ScalarValue::Int64(None))
+                        })
+                        .collect();
                     if groups.len() >= self.max_groups {
                         return Err(TaibaiError::Sql(format!(
                             "aggregate group count exceeds limit {}; \
@@ -592,8 +707,7 @@ impl ExecutionOp for HashAggregateExec {
                         })
                         .collect();
                     estimated_group_bytes = estimated_group_bytes.saturating_add(
-                        key.iter().map(|value| value.len()).sum::<usize>()
-                            + key.len() * std::mem::size_of::<String>()
+                        key.len()
                             + accums
                                 .as_ref()
                                 .map(|values| {
@@ -619,11 +733,7 @@ impl ExecutionOp for HashAggregateExec {
                         LogicalExpr::Column(idx) => Some(*idx),
                         _ => None,
                     };
-                    // Build a single-row view so each accumulator sees only this
-                    // group's current row. Memory is O(1) per update.
-                    if let Some(single) = slice_batch_single_row(&batch, row) {
-                        acc.update(&single, col_idx)?;
-                    }
+                    acc.update_row(&batch, col_idx, row)?;
                 }
                 let after_update = accums
                     .iter()
@@ -634,11 +744,14 @@ impl ExecutionOp for HashAggregateExec {
                     .saturating_add(after_update);
                 super::profile::record_current_peak_memory(estimated_group_bytes);
 
-                if estimated_group_bytes >= self.memory_limit_bytes {
+                if estimated_group_bytes >= self.memory_limit_bytes
+                    || !memory.try_resize(estimated_group_bytes)
+                {
                     spills.push(spill_group_run(&groups, &group_keys, spill_rows)?);
                     groups.clear();
                     group_keys.clear();
                     estimated_group_bytes = 0;
+                    memory.release();
                 }
             }
         }
@@ -709,8 +822,8 @@ impl HashAggregateExec {
 
     fn finalize_grouped(
         &self,
-        group_keys: &[(Vec<String>, Vec<ScalarValue>)],
-        groups: &HashMap<Vec<String>, Vec<Accumulator>>,
+        group_keys: &[(Vec<u8>, Vec<ScalarValue>)],
+        groups: &HashMap<Vec<u8>, Vec<Accumulator>>,
         aggregates: &[AggregateExpr],
         physical_schema: &Schema,
     ) -> Result<RecordBatch> {
@@ -838,8 +951,8 @@ fn aggregate_spill_schema() -> Schema {
 }
 
 fn spill_group_run(
-    groups: &HashMap<Vec<String>, Vec<Accumulator>>,
-    group_keys: &[(Vec<String>, Vec<ScalarValue>)],
+    groups: &HashMap<Vec<u8>, Vec<Accumulator>>,
+    group_keys: &[(Vec<u8>, Vec<ScalarValue>)],
     spill_rows: usize,
 ) -> Result<SpillFile> {
     let mut entries = Vec::with_capacity(groups.len());

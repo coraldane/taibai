@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use crate::common::error::Result;
 use crate::sql::execution::operators::filter::{eval_expr_column, remap_expr_for_batch};
-use crate::sql::execution::spill::SpillFile;
+use crate::sql::execution::spill::{MemoryManager, SpillFile};
 use crate::sql::planner::{LogicalExpr, SortKey};
 use crate::storage::segment::SegmentReader;
+use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -26,11 +27,6 @@ enum SortState {
     InMemory(Option<RecordBatch>),
     External(ExternalMerge),
     Done,
-}
-
-struct SortRow {
-    values: Vec<ScalarValue>,
-    keys: Vec<ScalarValue>,
 }
 
 impl SortExec {
@@ -66,6 +62,7 @@ impl SortExec {
         let mut output_schema = None;
         let mut sort_exprs = None;
         let mut spills = Vec::new();
+        let mut memory = MemoryManager::reservation();
         let spill_rows = crate::common::config::query_limits()
             .spill_batch_rows
             .max(1);
@@ -89,7 +86,7 @@ impl SortExec {
             buffered_bytes = buffered_bytes.saturating_add(batch.estimated_size_bytes());
             super::profile::record_current_peak_memory(buffered_bytes);
             buffered.push(batch);
-            if buffered_bytes >= self.memory_limit_bytes {
+            if buffered_bytes >= self.memory_limit_bytes || !memory.try_resize(buffered_bytes) {
                 let sorted = sort_batches(
                     &buffered,
                     output_schema.as_ref().unwrap().clone(),
@@ -103,6 +100,7 @@ impl SortExec {
                 )?);
                 buffered.clear();
                 buffered_bytes = 0;
+                memory.release();
             }
         }
 
@@ -171,41 +169,77 @@ fn sort_batches(
     if total_rows == 0 {
         return Ok(RecordBatch::new(output_schema));
     }
-    let mut rows = Vec::with_capacity(total_rows);
+    let mut columns = output_schema
+        .columns
+        .iter()
+        .map(|column| ColumnArray::with_capacity(column.data_type, total_rows))
+        .collect::<Vec<_>>();
     for batch in batches {
-        let evaluated_keys = evaluate_batch_sort_keys(sort_exprs, batch)?;
-        for row in 0..batch.num_rows() {
-            let values = (0..batch.num_columns())
-                .map(|column| {
-                    batch
-                        .scalar(row, column)
-                        .unwrap_or(ScalarValue::Int64(None))
-                })
-                .collect();
-            let keys = evaluated_keys
-                .iter()
-                .map(|values| values[row].clone())
-                .collect();
-            rows.push(SortRow { values, keys });
+        for (index, column) in batch.columns.iter().enumerate() {
+            columns[index].extend(column)?;
         }
     }
+    let merged = RecordBatch::try_new(output_schema.clone(), columns)?;
+    let evaluated_keys = evaluate_batch_sort_key_columns(sort_exprs, &merged)?;
+    let mut rows = (0..total_rows as u32).collect::<Vec<_>>();
+    let compare = |left: &u32, right: &u32| {
+        compare_key_rows(&evaluated_keys, *left as usize, *right as usize, sort_exprs)
+    };
     if let Some(limit) = limit {
-        topn_sort(&mut rows, sort_exprs, limit);
+        if limit > 0 && rows.len() > limit {
+            rows.select_nth_unstable_by(limit, compare);
+            rows.truncate(limit);
+        }
+        rows.sort_by(compare);
         rows.truncate(limit);
     } else {
-        rows.sort_by(|left, right| compare_rows(left, right, sort_exprs));
+        rows.sort_by(compare);
     }
-    rows_to_batch(&rows, output_schema)
+    let output = merged
+        .columns
+        .iter()
+        .map(|column| column.take(&rows))
+        .collect();
+    RecordBatch::try_new(output_schema, output)
 }
 
-fn rows_to_batch(rows: &[SortRow], schema: Schema) -> Result<RecordBatch> {
-    let mut batch = RecordBatch::with_capacity(schema, rows.len());
-    for row in rows {
-        for (column, value) in row.values.iter().enumerate() {
-            batch.column_mut(column).unwrap().push(value)?;
+enum SortKeyColumn {
+    Typed(ColumnArray),
+    Scalar(Vec<ScalarValue>),
+}
+
+fn evaluate_batch_sort_key_columns(
+    sort_exprs: &[(LogicalExpr, bool)],
+    batch: &RecordBatch,
+) -> Result<Vec<SortKeyColumn>> {
+    sort_exprs
+        .iter()
+        .map(|(expr, _)| match expr {
+            LogicalExpr::Column(index) if batch.column(*index).is_some() => {
+                Ok(SortKeyColumn::Typed(batch.column(*index).unwrap().clone()))
+            }
+            _ => Ok(SortKeyColumn::Scalar(eval_expr_column(expr, batch)?)),
+        })
+        .collect()
+}
+
+fn compare_key_rows(
+    keys: &[SortKeyColumn],
+    left: usize,
+    right: usize,
+    sort_exprs: &[(LogicalExpr, bool)],
+) -> Ordering {
+    for (index, (_, desc)) in sort_exprs.iter().enumerate() {
+        let ordering = match &keys[index] {
+            SortKeyColumn::Typed(column) => column.compare_at(left, right),
+            SortKeyColumn::Scalar(values) => compare_scalars(&values[left], &values[right]),
+        };
+        let ordering = if *desc { ordering.reverse() } else { ordering };
+        if !ordering.is_eq() {
+            return ordering;
         }
     }
-    Ok(batch)
+    Ordering::Equal
 }
 
 fn evaluate_batch_sort_keys(
@@ -216,26 +250,6 @@ fn evaluate_batch_sort_keys(
         .iter()
         .map(|(expr, _)| eval_expr_column(expr, batch))
         .collect()
-}
-
-fn topn_sort(rows: &mut [SortRow], sort_exprs: &[(LogicalExpr, bool)], limit: usize) {
-    if limit == 0 {
-        return;
-    }
-    if rows.len() <= limit {
-        rows.sort_by(|left, right| compare_rows(left, right, sort_exprs));
-        return;
-    }
-    rows.select_nth_unstable_by(limit, |left, right| compare_rows(left, right, sort_exprs));
-    rows[..limit].sort_by(|left, right| compare_rows(left, right, sort_exprs));
-}
-
-fn compare_rows(
-    left: &SortRow,
-    right: &SortRow,
-    sort_exprs: &[(LogicalExpr, bool)],
-) -> std::cmp::Ordering {
-    compare_key_values(&left.keys, &right.keys, sort_exprs)
 }
 
 fn compare_key_values(

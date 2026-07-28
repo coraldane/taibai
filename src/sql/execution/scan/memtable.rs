@@ -181,28 +181,39 @@ pub fn scan_hot_store_by_key(
         .and_then(|pi| pi.partition_key_col_idx);
     let partition_value = partition_col_idx.and_then(|idx| spec.eq_value_for_column(idx));
 
-    let indexed_lookup = spec
-        .eq_predicates
-        .iter()
-        .all(|(idx, _)| *idx == key_idx || Some(*idx) == partition_col_idx)
-        && spec.range_predicates.is_empty()
-        && spec.in_predicates.is_empty()
-        && spec.remaining_predicate.is_none();
+    // Equality/range predicates can be evaluated directly against resident
+    // typed columns before gather. IN and arbitrary expressions retain the
+    // generic batch path.
+    let direct_filter_lookup = spec.in_predicates.is_empty() && spec.remaining_predicate.is_none();
 
-    let lookup_projection = if indexed_lookup {
+    let lookup_projection = if direct_filter_lookup {
         spec.projection.as_deref()
     } else {
         None
     };
 
-    let reverse_lookup =
-        ordered_cluster_order_for_schema(store.schema(), spec).is_some_and(|order| order.desc);
-    let batch = match store.lookup(
+    let ordered_lookup = ordered_cluster_order_for_schema(store.schema(), spec);
+    let reverse_lookup = ordered_lookup.as_ref().is_some_and(|order| order.desc);
+    let lookup_limit = spec
+        .limit
+        .filter(|_| direct_filter_lookup && (!spec.has_order_by || ordered_lookup.is_some()));
+    let batch = match store.lookup_filtered(
         key_value,
         partition_value,
         lookup_projection,
         watermark,
         reverse_lookup,
+        lookup_limit,
+        if direct_filter_lookup {
+            &spec.eq_predicates
+        } else {
+            &[]
+        },
+        if direct_filter_lookup {
+            &spec.range_predicates
+        } else {
+            &[]
+        },
     ) {
         Some(b) => b,
         None => {
@@ -216,7 +227,7 @@ pub fn scan_hot_store_by_key(
         }
     };
 
-    let filtered = if !indexed_lookup && spec.has_predicates() {
+    let filtered = if !direct_filter_lookup && spec.has_predicates() {
         super::row_filter::apply_predicates(
             &batch,
             &spec.eq_predicates,
@@ -228,7 +239,7 @@ pub fn scan_hot_store_by_key(
         batch
     };
 
-    if indexed_lookup {
+    if direct_filter_lookup {
         return Some(filtered);
     }
 
@@ -248,18 +259,32 @@ pub fn count_hot_memtable_rows(
     spec: &ScanSpec,
 ) -> Option<u64> {
     let store = hot_mgr.get(db, table_name)?;
-    let (key_value, partition_value) = hot_count_key_partition_values(&store, spec)?;
+    hot_count_key_partition_values(&store, spec)?;
     let (has_live_memtable_data, watermark) =
         live_memtables_and_watermark(memtable_mgr, db, table_name, spec.reader_txn_id, &store);
     if !has_live_memtable_data {
         return None;
     }
-    store.count_by_key_partition_from(key_value, partition_value, watermark)
+    count_hot_store_by_key(&store, spec, watermark)
 }
 
 pub fn count_hot_store_by_key(store: &HotStore, spec: &ScanSpec, watermark: u64) -> Option<u64> {
     let (key_value, partition_value) = hot_count_key_partition_values(store, spec)?;
-    store.count_by_key_partition_from(key_value, partition_value, watermark)
+    let posting_list_only = spec.range_predicates.is_empty()
+        && spec.eq_predicates.iter().all(|(idx, _)| {
+            *idx == store.key_column_index() || Some(*idx) == store.partition_column_index()
+        });
+    if posting_list_only {
+        store.count_by_key_partition_from(key_value, partition_value, watermark)
+    } else {
+        store.count_filtered(
+            key_value,
+            partition_value,
+            watermark,
+            &spec.eq_predicates,
+            &spec.range_predicates,
+        )
+    }
 }
 
 fn hot_count_key_partition_values<'a>(
@@ -267,7 +292,6 @@ fn hot_count_key_partition_values<'a>(
     spec: &'a ScanSpec,
 ) -> Option<(&'a ScalarValue, Option<&'a ScalarValue>)> {
     if spec.reader_txn_id != 0
-        || !spec.range_predicates.is_empty()
         || !spec.in_predicates.is_empty()
         || spec.remaining_predicate.is_some()
     {
@@ -275,13 +299,6 @@ fn hot_count_key_partition_values<'a>(
     }
     let key_idx = store.key_column_index();
     let partition_col_idx = store.partition_column_index();
-    if !spec
-        .eq_predicates
-        .iter()
-        .all(|(idx, _)| *idx == key_idx || Some(*idx) == partition_col_idx)
-    {
-        return None;
-    }
     let key_value = spec.eq_value_for_column(key_idx)?;
     let partition_value = partition_col_idx.and_then(|idx| spec.eq_value_for_column(idx));
     Some((key_value, partition_value))
@@ -414,14 +431,11 @@ fn is_batch_ordered_by(batch: &RecordBatch, column_index: usize, desc: bool) -> 
     if batch.num_rows() <= 1 {
         return true;
     }
+    let Some(column) = batch.column(column_index) else {
+        return false;
+    };
     for row in 1..batch.num_rows() {
-        let Some(prev) = batch.scalar(row - 1, column_index) else {
-            return false;
-        };
-        let Some(curr) = batch.scalar(row, column_index) else {
-            return false;
-        };
-        let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(&prev, &curr);
+        let cmp = column.compare_at(row - 1, row);
         let violation = if desc {
             cmp == std::cmp::Ordering::Less
         } else {
@@ -435,14 +449,11 @@ fn is_batch_ordered_by(batch: &RecordBatch, column_index: usize, desc: bool) -> 
 }
 
 fn reverse_batch(batch: &RecordBatch) -> Option<RecordBatch> {
-    let mut out = RecordBatch::with_capacity(batch.schema.clone(), batch.num_rows());
-    for row in (0..batch.num_rows()).rev() {
-        for col_idx in 0..batch.num_columns() {
-            let value = batch.scalar(row, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(out.schema.columns[col_idx].data_type)
-            });
-            out.column_mut(col_idx)?.push(&value).ok()?;
-        }
-    }
-    Some(out)
+    let rows = (0..batch.num_rows() as u32).rev().collect::<Vec<_>>();
+    let columns = batch
+        .columns
+        .iter()
+        .map(|column| column.take(&rows))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns).ok()
 }

@@ -201,7 +201,7 @@ impl ColumnArray {
                 }
             }
             ColumnArray::VarChar { data, .. } => {
-                let mut best: Option<&String> = None;
+                let mut best: Option<&str> = None;
                 for (i, v) in data.iter().enumerate().take(n) {
                     if !bitmap.is_null(i) {
                         best = Some(match best {
@@ -210,7 +210,7 @@ impl ColumnArray {
                         });
                     }
                 }
-                best.map(|v| ScalarValue::VarChar(Some(v.clone())))
+                best.map(|v| ScalarValue::VarChar(Some(v.to_owned())))
             }
             ColumnArray::Blob { .. } | ColumnArray::Vector { .. } => None,
         }
@@ -293,7 +293,7 @@ impl ColumnArray {
                 }
             }
             ColumnArray::VarChar { data, .. } => {
-                let mut best: Option<&String> = None;
+                let mut best: Option<&str> = None;
                 for (i, v) in data.iter().enumerate().take(n) {
                     if !bitmap.is_null(i) {
                         best = Some(match best {
@@ -302,7 +302,7 @@ impl ColumnArray {
                         });
                     }
                 }
-                best.map(|v| ScalarValue::VarChar(Some(v.clone())))
+                best.map(|v| ScalarValue::VarChar(Some(v.to_owned())))
             }
             ColumnArray::Blob { .. } | ColumnArray::Vector { .. } => None,
         }
@@ -430,7 +430,7 @@ impl ColumnArray {
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && (self.scalar(i).numeric_cmp(value) == Some(std::cmp::Ordering::Equal))
+                        && self.compare_scalar_at(i, value) == Some(std::cmp::Ordering::Equal)
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -448,12 +448,12 @@ impl ColumnArray {
                 .map(|i| !bitmap.is_null(i) && data[i] < *v)
                 .collect(),
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && &data[i] < v)
+                .map(|i| !bitmap.is_null(i) && data.value(i) < v.as_str())
                 .collect(),
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && (self.scalar(i).numeric_cmp(value) == Some(std::cmp::Ordering::Less))
+                        && self.compare_scalar_at(i, value) == Some(std::cmp::Ordering::Less)
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -471,14 +471,13 @@ impl ColumnArray {
                 .map(|i| !bitmap.is_null(i) && data[i] <= *v)
                 .collect(),
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && &data[i] <= v)
+                .map(|i| !bitmap.is_null(i) && data.value(i) <= v.as_str())
                 .collect(),
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
                         && self
-                            .scalar(i)
-                            .numeric_cmp(value)
+                            .compare_scalar_at(i, value)
                             .is_some_and(|ord| ord != std::cmp::Ordering::Greater)
                 })
                 .collect(),
@@ -497,12 +496,12 @@ impl ColumnArray {
                 .map(|i| !bitmap.is_null(i) && data[i] > *v)
                 .collect(),
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && &data[i] > v)
+                .map(|i| !bitmap.is_null(i) && data.value(i) > v.as_str())
                 .collect(),
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
-                        && (self.scalar(i).numeric_cmp(value) == Some(std::cmp::Ordering::Greater))
+                        && self.compare_scalar_at(i, value) == Some(std::cmp::Ordering::Greater)
                 })
                 .collect(),
             _ => vec![false; num_rows],
@@ -520,14 +519,13 @@ impl ColumnArray {
                 .map(|i| !bitmap.is_null(i) && data[i] >= *v)
                 .collect(),
             (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && &data[i] >= v)
+                .map(|i| !bitmap.is_null(i) && data.value(i) >= v.as_str())
                 .collect(),
             _ if value.numeric_f64().is_some() => (0..num_rows)
                 .map(|i| {
                     !bitmap.is_null(i)
                         && self
-                            .scalar(i)
-                            .numeric_cmp(value)
+                            .compare_scalar_at(i, value)
                             .is_some_and(|ord| ord != std::cmp::Ordering::Less)
                 })
                 .collect(),
@@ -597,11 +595,11 @@ impl ColumnArray {
             ColumnArray::Timestamp { data, bitmap } => filter_copy_column!(Timestamp, data, bitmap),
             ColumnArray::Interval { data, bitmap } => filter_copy_column!(Interval, data, bitmap),
             ColumnArray::VarChar { data, bitmap } => {
-                let mut new_data = Vec::with_capacity(match_count);
+                let mut new_data = Utf8Buffer::with_capacity(match_count);
                 let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for (i, &keep) in mask.iter().enumerate() {
                     if keep {
-                        new_data.push(data[i].clone());
+                        new_data.push_str(data.value(i));
                         if bitmap.is_null(i) {
                             new_bitmap.push_null();
                         } else {
@@ -654,7 +652,13 @@ impl ColumnArray {
             ColumnArray::Time { data, bitmap } => slice_copy_column!(Time, data, bitmap),
             ColumnArray::Timestamp { data, bitmap } => slice_copy_column!(Timestamp, data, bitmap),
             ColumnArray::Interval { data, bitmap } => slice_copy_column!(Interval, data, bitmap),
-            ColumnArray::VarChar { data, bitmap } => slice_copy_column!(VarChar, data, bitmap),
+            ColumnArray::VarChar { data, bitmap } => {
+                let mut out = ColumnArray::with_capacity(crate::protocol::types::DataType::VarChar, end - start);
+                for i in start..end {
+                    if bitmap.is_null(i) { out.push_null_value(); } else { out.push(&ScalarValue::VarChar(Some(data.value(i).to_owned()))).unwrap(); }
+                }
+                out
+            },
             _ => {
                 let mut new_col = ColumnArray::empty(self.data_type());
                 for i in start..end {
@@ -708,11 +712,11 @@ impl ColumnArray {
             ColumnArray::Timestamp { data, bitmap } => take_copy_column!(Timestamp, data, bitmap),
             ColumnArray::Interval { data, bitmap } => take_copy_column!(Interval, data, bitmap),
             ColumnArray::VarChar { data, bitmap } => {
-                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_data = Utf8Buffer::with_capacity(indices.len());
                 let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for &idx in indices {
                     let i = idx as usize;
-                    new_data.push(data[i].clone());
+                    new_data.push_str(data.value(i));
                     if bitmap.is_null(i) {
                         new_bitmap.push_null();
                     } else {
@@ -725,11 +729,11 @@ impl ColumnArray {
                 }
             }
             ColumnArray::Blob { data, bitmap } => {
-                let mut new_data = Vec::with_capacity(indices.len());
+                let mut new_data = BinaryBuffer::with_capacity(indices.len());
                 let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
                 for &idx in indices {
                     let i = idx as usize;
-                    new_data.push(data[i].clone());
+                    new_data.push_slice(data.value(i));
                     if bitmap.is_null(i) {
                         new_bitmap.push_null();
                     } else {
