@@ -33,6 +33,23 @@ fn test_varchar_column() {
 }
 
 #[test]
+fn varchar_uses_contiguous_arrow_layout() {
+    let mut col = ColumnArray::empty(DataType::VarChar);
+    col.push(&ScalarValue::VarChar(Some("alpha".into())))
+        .unwrap();
+    col.push(&ScalarValue::VarChar(None)).unwrap();
+    col.push(&ScalarValue::VarChar(Some("beta".into())))
+        .unwrap();
+
+    let ColumnArray::VarChar { data, .. } = col else {
+        unreachable!()
+    };
+    assert_eq!(data.offsets(), &[0, 5, 5, 9]);
+    assert_eq!(data.values(), b"alphabeta");
+    assert_eq!(data.value(2), "beta");
+}
+
+#[test]
 fn test_type_mismatch() {
     let mut col = ColumnArray::empty(DataType::Int64);
     let result = col.push(&ScalarValue::VarChar(Some("oops".into())));

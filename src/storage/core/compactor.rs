@@ -125,39 +125,61 @@ impl Compactor {
                 ..CompactStats::default()
             };
 
-            for (partition_key, files) in group_segments_by_partition(segment_files) {
-                // A clean single segment can only be skipped when this
-                // operation has no physical ordering requirement. During a
-                // user OPTIMIZE, CLUSTER BY may have been added after the
-                // segment was written, or multiple sorted insert batches may
-                // have been appended out of global order.
-                if sort_key_indices.is_empty() && files.len() == 1 {
-                    let reader = self.segment_mgr.open_reader_cached(&files[0])?;
-                    if reader.deleted_row_count() == 0 {
-                        tracing::info!(
-                            db,
-                            table,
-                            partition_key = partition_key.as_deref().unwrap_or("<none>"),
-                            segment = %files[0].display(),
-                            "skipping clean single-segment optimization"
-                        );
-                        continue;
+            let partition_groups = group_segments_by_partition(segment_files)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let partition_count = partition_groups.len();
+            let partition_stats = partition_groups
+                .into_par_iter()
+                .map(|(partition_key, files)| -> Result<CompactStats> {
+                    // Keep the acquisition order aligned with query scans to
+                    // avoid CPU/IO permit inversion. Holding both permits for
+                    // the partition bounds process-wide compaction pressure.
+                    let _cpu_permit = crate::common::work_limiter::acquire_cpu();
+                    let _io_permit = crate::common::work_limiter::acquire_io();
+
+                    // A clean single segment can only be skipped when this
+                    // operation has no physical ordering requirement. During
+                    // a user OPTIMIZE, CLUSTER BY may have been added after the
+                    // segment was written, or multiple sorted insert batches
+                    // may have been appended out of global order.
+                    if sort_key_indices.is_empty() && files.len() == 1 {
+                        let reader = self.segment_mgr.open_reader_cached(&files[0])?;
+                        if reader.deleted_row_count() == 0 {
+                            tracing::info!(
+                                db,
+                                table,
+                                partition_key = partition_key.as_deref().unwrap_or("<none>"),
+                                segment = %files[0].display(),
+                                "skipping clean single-segment optimization"
+                            );
+                            return Ok(CompactStats::default());
+                        }
                     }
-                }
-                let part_stats = self.compact_segment_group(
-                    db,
-                    table,
-                    &table_dir,
-                    partition_key.as_deref(),
-                    &files,
-                    &schema,
-                    sort_key_indices,
-                    &cluster_key_indices,
-                )?;
+                    self.compact_segment_group(
+                        db,
+                        table,
+                        &table_dir,
+                        partition_key.as_deref(),
+                        &files,
+                        &schema,
+                        sort_key_indices,
+                        &cluster_key_indices,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for part_stats in partition_stats {
                 stats.segments_written += part_stats.segments_written;
                 stats.rows_written += part_stats.rows_written;
                 stats.rows_dropped += part_stats.rows_dropped;
             }
+
+            tracing::info!(
+                db,
+                table,
+                partitions = partition_count,
+                "table optimization partition workers completed"
+            );
 
             Ok(stats)
         })?;
@@ -255,6 +277,8 @@ impl Compactor {
                 "starting requested partition optimization"
             );
 
+            let _cpu_permit = crate::common::work_limiter::acquire_cpu();
+            let _io_permit = crate::common::work_limiter::acquire_io();
             self.compact_segment_group(
                 db,
                 table,
@@ -838,7 +862,7 @@ fn sort_clustered_row_indices(
         if bitmap.is_null(row_idx as usize) {
             null_group.push(row_idx);
         } else if let Some(value) = data.get(row_idx as usize) {
-            groups.entry(value.as_str()).or_default().push(row_idx);
+            groups.entry(value).or_default().push(row_idx);
         } else {
             continue;
         }
@@ -1051,11 +1075,11 @@ fn empty_column_for_gather(data_type: DataType, len: usize) -> ColumnArray {
             bitmap,
         },
         DataType::VarChar => ColumnArray::VarChar {
-            data: vec![String::new(); len],
+            data: vec![String::new(); len].into(),
             bitmap,
         },
         DataType::Blob => ColumnArray::Blob {
-            data: vec![Vec::new(); len],
+            data: vec![Vec::new(); len].into(),
             bitmap,
         },
         DataType::Vector => ColumnArray::Vector {
@@ -1262,7 +1286,14 @@ fn gather_column_positions(
                 data: src_data,
                 bitmap: src_bitmap,
             },
-        ) => copy_clone!(dst_data, dst_bitmap, src_data, src_bitmap),
+        ) => {
+            for &(output_pos, source_row_idx) in positions {
+                dst_data.set(output_pos, src_data.value(source_row_idx));
+                if src_bitmap.is_null(source_row_idx) {
+                    dst_bitmap.set_null(output_pos);
+                }
+            }
+        }
         (
             ColumnArray::Blob {
                 data: dst_data,
@@ -1272,7 +1303,14 @@ fn gather_column_positions(
                 data: src_data,
                 bitmap: src_bitmap,
             },
-        ) => copy_clone!(dst_data, dst_bitmap, src_data, src_bitmap),
+        ) => {
+            for &(output_pos, source_row_idx) in positions {
+                dst_data.set(output_pos, src_data.value(source_row_idx));
+                if src_bitmap.is_null(source_row_idx) {
+                    dst_bitmap.set_null(output_pos);
+                }
+            }
+        }
         (
             ColumnArray::Vector {
                 data: dst_data,

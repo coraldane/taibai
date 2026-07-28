@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::schema::TableMeta;
+use crate::storage::partition::pruning::{RangeClause, RangeOp};
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -445,6 +446,33 @@ impl HotStore {
         min_offset: u64,
         reverse: bool,
     ) -> Option<RecordBatch> {
+        self.lookup_filtered(
+            key_value,
+            partition_value,
+            projection,
+            min_offset,
+            reverse,
+            None,
+            &[],
+            &[],
+        )
+    }
+
+    /// Index lookup with predicate/limit pushdown. Candidate row offsets are
+    /// filtered against resident typed columns before projected values are
+    /// gathered, so a selective time range does not copy every table column.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lookup_filtered(
+        &self,
+        key_value: &ScalarValue,
+        partition_value: Option<&ScalarValue>,
+        projection: Option<&[usize]>,
+        min_offset: u64,
+        reverse: bool,
+        row_limit: Option<usize>,
+        eq_predicates: &[(usize, ScalarValue)],
+        range_predicates: &[RangeClause],
+    ) -> Option<RecordBatch> {
         let (key, partition_key) = {
             let pool = self.string_pool.read().unwrap();
             let key = match scalar_to_key(key_value, &pool).ok()? {
@@ -457,23 +485,61 @@ impl HotStore {
             };
             (key, partition_key)
         };
-        let rows = {
-            let partition_index;
-            let value_index;
-            let raw = if let Some(partition_key) = partition_key {
-                partition_index = self.value_partition_index.read().unwrap();
-                partition_index.get(&(key, partition_key))?
-            } else {
-                value_index = self.value_index.read().unwrap();
-                value_index.get(&key)?
-            };
-            copy_offsets(raw, min_offset, reverse)
+        let partition_index;
+        let value_index;
+        let raw = if let Some(partition_key) = partition_key {
+            partition_index = self.value_partition_index.read().unwrap();
+            partition_index.get(&(key, partition_key))?
+        } else {
+            value_index = self.value_index.read().unwrap();
+            value_index.get(&key)?
         };
 
         let proj: Vec<usize> = match projection {
             Some(p) => p.to_vec(),
             None => (0..self.schema.num_columns()).collect(),
         };
+        let cols = self.columns.read().unwrap();
+        let start = raw.partition_point(|offset| (*offset as u64) < min_offset);
+        let available = &raw[start..];
+        let covered_partition_column = partition_key.and(self.partition_column_index);
+        let target = row_limit.unwrap_or(usize::MAX);
+        let mut rows = Vec::with_capacity(available.len().min(target));
+        if target == 0 {
+            // Keep `rows` empty.
+        } else if reverse {
+            for &row in available.iter().rev() {
+                if hot_row_matches(
+                    &cols,
+                    row as usize,
+                    eq_predicates,
+                    range_predicates,
+                    self.key_column_index,
+                    covered_partition_column,
+                ) {
+                    rows.push(row);
+                    if rows.len() >= target {
+                        break;
+                    }
+                }
+            }
+        } else {
+            for &row in available {
+                if hot_row_matches(
+                    &cols,
+                    row as usize,
+                    eq_predicates,
+                    range_predicates,
+                    self.key_column_index,
+                    covered_partition_column,
+                ) {
+                    rows.push(row);
+                    if rows.len() >= target {
+                        break;
+                    }
+                }
+            }
+        }
 
         if rows.is_empty() {
             let col_defs: Vec<ColumnDef> = proj
@@ -483,7 +549,6 @@ impl HotStore {
             return Some(RecordBatch::new(Schema::new(col_defs)));
         }
 
-        let cols = self.columns.read().unwrap();
         let mut out_cols = Vec::with_capacity(proj.len());
         let mut out_defs = Vec::with_capacity(proj.len());
         for &ci in &proj {
@@ -530,11 +595,55 @@ impl HotStore {
         Some(if min_offset == 0 {
             offsets.len() as u64
         } else {
-            offsets
-                .iter()
-                .filter(|&&o| (o as u64) >= min_offset)
-                .count() as u64
+            (offsets.len() - offsets.partition_point(|offset| (*offset as u64) < min_offset)) as u64
         })
+    }
+
+    /// Count matching index candidates without gathering a RecordBatch.
+    pub fn count_filtered(
+        &self,
+        key_value: &ScalarValue,
+        partition_value: Option<&ScalarValue>,
+        min_offset: u64,
+        eq_predicates: &[(usize, ScalarValue)],
+        range_predicates: &[RangeClause],
+    ) -> Option<u64> {
+        let (key, partition_key) = {
+            let pool = self.string_pool.read().unwrap();
+            let key = scalar_to_key(key_value, &pool).ok()??;
+            let partition_key = match partition_value {
+                Some(value) => scalar_to_key(value, &pool).ok()?,
+                None => None,
+            };
+            (key, partition_key)
+        };
+        let partition_index;
+        let value_index;
+        let offsets = if let Some(partition_key) = partition_key {
+            partition_index = self.value_partition_index.read().unwrap();
+            partition_index.get(&(key, partition_key))?
+        } else {
+            value_index = self.value_index.read().unwrap();
+            value_index.get(&key)?
+        };
+        let start = offsets.partition_point(|offset| (*offset as u64) < min_offset);
+        let covered_partition_column = partition_key.and(self.partition_column_index);
+        let columns = self.columns.read().unwrap();
+        Some(
+            offsets[start..]
+                .iter()
+                .filter(|&&row| {
+                    hot_row_matches(
+                        &columns,
+                        row as usize,
+                        eq_predicates,
+                        range_predicates,
+                        self.key_column_index,
+                        covered_partition_column,
+                    )
+                })
+                .count() as u64,
+        )
     }
 
     /// Rough resident-memory estimate in bytes.
@@ -637,6 +746,46 @@ fn estimate_batch_memory(batch: &RecordBatch) -> u64 {
     total
 }
 
+#[inline]
+fn hot_row_matches(
+    columns: &[ColumnArray],
+    row: usize,
+    eq_predicates: &[(usize, ScalarValue)],
+    range_predicates: &[RangeClause],
+    covered_key_column: usize,
+    covered_partition_column: Option<usize>,
+) -> bool {
+    if !eq_predicates
+        .iter()
+        .filter(|(column, _)| {
+            *column != covered_key_column && Some(*column) != covered_partition_column
+        })
+        .all(|(column, value)| {
+            columns
+                .get(*column)
+                .and_then(|array| array.compare_scalar_at(row, value))
+                .is_some_and(|ordering| ordering.is_eq())
+        })
+    {
+        return false;
+    }
+    range_predicates.iter().all(|clause| {
+        let Some(ordering) = columns
+            .get(clause.column_index)
+            .and_then(|array| array.compare_scalar_at(row, &clause.value))
+        else {
+            return false;
+        };
+        match clause.op {
+            RangeOp::Eq => ordering.is_eq(),
+            RangeOp::Lt => ordering.is_lt(),
+            RangeOp::Le => !ordering.is_gt(),
+            RangeOp::Gt => ordering.is_gt(),
+            RangeOp::Ge => !ordering.is_lt(),
+        }
+    })
+}
+
 fn approx_type_width(dt: &DataType) -> u64 {
     match dt {
         DataType::Bool | DataType::Int8 | DataType::UInt8 => 1,
@@ -661,27 +810,6 @@ fn build_initial_columns(schema: &Schema) -> Vec<ColumnArray> {
         .iter()
         .map(|c| ColumnArray::empty(c.data_type))
         .collect()
-}
-
-fn copy_offsets(raw: &[u32], min_offset: u64, reverse: bool) -> Vec<u32> {
-    if min_offset == 0 {
-        if reverse {
-            raw.iter().rev().copied().collect()
-        } else {
-            raw.to_vec()
-        }
-    } else if reverse {
-        raw.iter()
-            .rev()
-            .filter(|&&o| (o as u64) >= min_offset)
-            .copied()
-            .collect()
-    } else {
-        raw.iter()
-            .filter(|&&o| (o as u64) >= min_offset)
-            .copied()
-            .collect()
-    }
 }
 
 /// Registry of resident hot stores, keyed by `(db, table)`.

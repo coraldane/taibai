@@ -45,6 +45,9 @@ pub struct QueryLimits {
     pub parallel_scan_min_row_groups: usize,
     pub spill_batch_rows: usize,
     pub join_spill_partitions: usize,
+    pub max_parallel_segments: usize,
+    pub global_io_permits: usize,
+    pub global_cpu_permits: usize,
 }
 
 impl Default for QueryLimits {
@@ -56,6 +59,9 @@ impl Default for QueryLimits {
             parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
             spill_batch_rows: default_spill_batch_rows(),
             join_spill_partitions: default_join_spill_partitions(),
+            max_parallel_segments: default_max_parallel_segments(),
+            global_io_permits: default_global_io_permits(),
+            global_cpu_permits: default_global_cpu_permits(),
         }
     }
 }
@@ -78,6 +84,9 @@ pub fn query_limits() -> QueryLimits {
         parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
         spill_batch_rows: default_spill_batch_rows(),
         join_spill_partitions: default_join_spill_partitions(),
+        max_parallel_segments: default_max_parallel_segments(),
+        global_io_permits: default_global_io_permits(),
+        global_cpu_permits: default_global_cpu_permits(),
     })
 }
 
@@ -256,6 +265,16 @@ fn default_join_spill_partitions() -> usize {
     16
 }
 
+fn default_max_parallel_segments() -> usize {
+    default_execution_threads().min(4).max(1)
+}
+fn default_global_io_permits() -> usize {
+    default_execution_threads().min(4).max(1)
+}
+fn default_global_cpu_permits() -> usize {
+    default_execution_threads().max(1)
+}
+
 fn default_row_group_target_rows() -> usize {
     131_072
 }
@@ -401,6 +420,16 @@ pub struct BufferSettings {
     pub spill_batch_rows: usize,
     #[serde(default = "default_join_spill_partitions")]
     pub join_spill_partitions: usize,
+    #[serde(default = "default_max_parallel_segments")]
+    pub max_parallel_segments: usize,
+    /// Process-wide storage work permits shared by query scans and OPTIMIZE
+    /// partition workers. These bound concurrent decode/read/write pressure.
+    #[serde(default = "default_global_io_permits")]
+    pub global_io_permits: usize,
+    /// Process-wide CPU work permits shared by query kernels and OPTIMIZE
+    /// partition workers.
+    #[serde(default = "default_global_cpu_permits")]
+    pub global_cpu_permits: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,6 +564,9 @@ impl Default for ServerConfig {
                 parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
                 spill_batch_rows: default_spill_batch_rows(),
                 join_spill_partitions: default_join_spill_partitions(),
+                max_parallel_segments: default_max_parallel_segments(),
+                global_io_permits: default_global_io_permits(),
+                global_cpu_permits: default_global_cpu_permits(),
             },
             compression: CompressionSettings { enabled: true },
             tls: TlsConfigYaml::default(),

@@ -4,6 +4,7 @@
 use crate::common::error::Result;
 use crate::sql::execution::functions::registry::FunctionRegistry;
 use crate::sql::execution::join_hashtable::{AsofJoinIndex, JoinHashTable, RowPointer};
+use crate::sql::execution::spill::{MemoryManager, MemoryReservation};
 use crate::sql::parser::ast::BinOp;
 use crate::sql::parser::ast::JoinType;
 use crate::sql::planner::LogicalExpr;
@@ -33,6 +34,7 @@ pub struct HashJoinExec {
     memory_limit_bytes: usize,
     spill_state: Option<PartitionedInnerJoin>,
     hash_table: Option<JoinHashTable>,
+    memory_reservation: Option<MemoryReservation>,
     asof_index: Option<AsofJoinIndex>,
     // Probe phase state
     probe_state: ProbeState,
@@ -86,6 +88,7 @@ impl HashJoinExec {
                 .min(usize::MAX as u64) as usize,
             spill_state: None,
             hash_table: None,
+            memory_reservation: None,
             asof_index: None,
             probe_state: ProbeState::default(),
         }
@@ -159,6 +162,7 @@ impl HashJoinExec {
         };
         let mut table = JoinHashTable::new(build_keys.clone());
         let mut estimated_bytes = 0usize;
+        let mut memory = MemoryManager::reservation();
 
         loop {
             let batch = if self.build_left {
@@ -173,7 +177,7 @@ impl HashJoinExec {
                 estimated_bytes.saturating_add(batch.estimated_size_bytes().saturating_mul(2));
             super::profile::record_current_peak_memory(estimated_bytes);
             table.insert_batch(batch);
-            if estimated_bytes >= self.memory_limit_bytes {
+            if estimated_bytes >= self.memory_limit_bytes || !memory.try_resize(estimated_bytes) {
                 let initial_build_batches = std::mem::take(&mut table.build_data);
                 let limits = crate::common::config::query_limits();
                 self.spill_state = Some(if self.build_left {
@@ -225,6 +229,7 @@ impl HashJoinExec {
             self.inject_left_runtime_filter(&table);
         }
         self.hash_table = Some(table);
+        self.memory_reservation = Some(memory);
         self.probe_state.build_done = true;
         Ok(())
     }

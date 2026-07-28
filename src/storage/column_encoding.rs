@@ -31,7 +31,8 @@ pub fn encode_column_direct_range(col: &ColumnArray, start: usize, len: usize) -
             data.extend_from_slice(bytes);
         }
         ColumnArray::VarChar { data: vals, .. } => {
-            for v in &vals[start..end] {
+            for i in start..end {
+                let v = vals.value(i);
                 data.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 data.extend_from_slice(v.as_bytes());
             }
@@ -103,7 +104,8 @@ pub fn encode_column_direct_range(col: &ColumnArray, start: usize, len: usize) -
             data.extend_from_slice(bytes);
         }
         ColumnArray::Blob { data: vals, .. } => {
-            for v in &vals[start..end] {
+            for i in start..end {
+                let v = vals.value(i);
                 data.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 data.extend_from_slice(v);
             }

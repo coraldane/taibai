@@ -202,6 +202,26 @@ fn optimize_table_sorts_by_composite_cluster_key() -> Result<()> {
     assert_eq!(segments.len(), 1);
     // ORDER BY name, id => (a,2), (a,4), (b,1), (b,3).
     assert_eq!(read_ids(&segments[0])?, vec![2, 4, 1, 3]);
+    let reader = SegmentReader::open(&segments[0])?;
+    let zone_maps = reader.zone_maps(0);
+    assert_eq!(zone_maps[0].min_value, ScalarValue::Int64(Some(1)));
+    assert_eq!(zone_maps[0].max_value, ScalarValue::Int64(Some(4)));
+    assert_eq!(
+        zone_maps[1].min_value,
+        ScalarValue::VarChar(Some("a".to_string()))
+    );
+    assert_eq!(
+        zone_maps[1].max_value,
+        ScalarValue::VarChar(Some("b".to_string()))
+    );
+    assert!(reader.value_sets(0)[0]
+        .as_ref()
+        .unwrap()
+        .contains(&ScalarValue::Int64(Some(3))));
+    assert!(reader.bloom_filters(0)[1]
+        .as_ref()
+        .unwrap()
+        .might_contain(&ScalarValue::VarChar(Some("b".to_string()))));
     Ok(())
 }
 

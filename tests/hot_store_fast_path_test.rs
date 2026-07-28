@@ -271,6 +271,34 @@ fn restart_warmup_serves_resident_partition_point_lookup_without_segment_scan() 
     );
     assert_eq!(rows, vec![30, 20, 10]);
 
+    let top_rows = collect_i32_values_in_order(
+        engine
+            .execute(
+                &mut session,
+                "SELECT price FROM stock_tick
+                 WHERE deal_date = 20260709
+                   AND security_id = '688256.SH'
+                   AND deal_time >= 103905
+                 ORDER BY deal_time DESC
+                 LIMIT 1",
+            )
+            .expect("resident hot range lookup with top-N"),
+    );
+    assert_eq!(top_rows, vec![30]);
+
+    let range_count = collect_count(
+        engine
+            .execute(
+                &mut session,
+                "SELECT count(*) FROM stock_tick
+                 WHERE deal_date = 20260709
+                   AND security_id = '688256.SH'
+                   AND deal_time >= 103905",
+            )
+            .expect("resident hot range count"),
+    );
+    assert_eq!(range_count, 2);
+
     let plan = explain_text(
         engine
             .execute(

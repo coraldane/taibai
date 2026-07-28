@@ -54,11 +54,51 @@ impl BloomFilter {
         let hash1 = self.hash_value(value, 0);
         let hash2 = self.hash_value(value, hash1);
 
+        self.add_hashes(hash1, hash2);
+    }
+
+    /// Add a native typed value without first boxing it into `ScalarValue`.
+    /// `type_tag` must match `hash_scalar`; the segment metadata kernels use
+    /// this on the write path while lookups remain wire-compatible with
+    /// `might_contain(ScalarValue)`.
+    pub(crate) fn add_typed<T: Hash + ?Sized>(&mut self, type_tag: u8, value: &T) {
+        let hash1 = self.hash_typed(type_tag, value, 0);
+        let hash2 = self.hash_typed(type_tag, value, hash1);
+        self.add_hashes(hash1, hash2);
+    }
+
+    pub(crate) fn add_vector(&mut self, value: &[f32]) {
+        let hash_value = |seed: u64| {
+            let mut hasher = DefaultHasher::new();
+            seed.hash(&mut hasher);
+            18u8.hash(&mut hasher);
+            value.len().hash(&mut hasher);
+            for item in value {
+                item.to_bits().hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+        let hash1 = hash_value(0);
+        let hash2 = hash_value(hash1);
+        self.add_hashes(hash1, hash2);
+    }
+
+    #[inline]
+    fn add_hashes(&mut self, hash1: u64, hash2: u64) {
         for i in 0..self.num_hashes {
             let combined_hash = hash1.wrapping_add((i as u64).wrapping_mul(hash2));
             let bit_index = combined_hash % (self.num_bits as u64);
             self.set_bit(bit_index as usize);
         }
+    }
+
+    #[inline]
+    fn hash_typed<T: Hash + ?Sized>(&self, type_tag: u8, value: &T, seed: u64) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        seed.hash(&mut hasher);
+        type_tag.hash(&mut hasher);
+        value.hash(&mut hasher);
+        hasher.finish()
     }
 
     pub fn might_contain(&self, value: &ScalarValue) -> bool {
