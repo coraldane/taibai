@@ -9,7 +9,7 @@ members = [
 
 [package]
 name = "taibai"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 autotests = false
 description = "An experimental Rust columnar database server for analytical workloads"
