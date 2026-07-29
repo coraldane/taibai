@@ -5,6 +5,7 @@ use crate::storage::segment_manager::SegmentManager;
 fn query_log_classifier_only_tracks_result_set_queries() {
     for sql in [
         "SELECT * FROM metrics",
+        "select * from metrics",
         "SHOW TABLES",
         "DESCRIBE TABLE metrics",
         "EXPLAIN SELECT * FROM metrics",
@@ -16,6 +17,7 @@ fn query_log_classifier_only_tracks_result_set_queries() {
     for sql in [
         "CREATE TABLE metrics (id INT64)",
         "INSERT INTO metrics VALUES (1)",
+        "insert into metrics values (1)",
         "DELETE FROM metrics WHERE id = 1",
         "UPDATE metrics SET id = 2",
         "BEGIN",

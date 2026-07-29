@@ -69,3 +69,23 @@ fn test_extend() {
     assert!(!bm1.is_null(3));
     assert!(bm1.is_null(4));
 }
+
+#[test]
+fn test_extend_unaligned_uses_correct_word_boundaries() {
+    for prefix_len in [1, 7, 31, 63, 65, 95] {
+        let prefix: Vec<bool> = (0..prefix_len).map(|i| i % 5 == 0).collect();
+        let suffix: Vec<bool> = (0..137).map(|i| i % 3 == 1 || i % 17 == 0).collect();
+        let mut actual = NullBitmap::from_bools(&prefix);
+        actual.extend(&NullBitmap::from_bools(&suffix));
+
+        let expected: Vec<bool> = prefix.into_iter().chain(suffix).collect();
+        assert_eq!(actual.len(), expected.len());
+        for (idx, is_null) in expected.into_iter().enumerate() {
+            assert_eq!(
+                actual.is_null(idx),
+                is_null,
+                "prefix={prefix_len}, row={idx}"
+            );
+        }
+    }
+}

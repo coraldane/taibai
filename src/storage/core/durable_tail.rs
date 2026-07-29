@@ -1,15 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher;
 use uuid::Uuid;
 
 use crate::common::error::{Result, TaibaiError};
-use crate::sql::execution::wal_helper::{deserialize_batch_from_wal, serialize_batch_for_wal};
+use crate::sql::execution::wal_helper::{
+    compress_prepared_batch_for_wal_with, deserialize_batch_from_wal, prepare_batch_for_wal,
+    serialize_batch_for_wal,
+};
 use crate::storage::segment::SegmentReader;
 use crate::types::batch::{RecordBatch, Schema};
 
@@ -18,6 +22,429 @@ const TAIL_LOG_MAGIC: u32 = 0x544C_4F47;
 const FLUSH_MAGIC: u32 = 0x464C_5553;
 const TAIL_DIR: &str = "memtable_tail";
 static TAIL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+const GROUP_COMMIT_MAX_DELAY: Duration = Duration::from_micros(500);
+const GROUP_COMMIT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const GROUP_COMMIT_MAX_REQUESTS: usize = 128;
+
+/// A WAL frame prepared by the request thread. Serialization and zstd level 3
+/// compression therefore happen in parallel and outside the table mutation
+/// lock; the tail writer only performs sequential file I/O and durability.
+pub(crate) struct PreparedTailAppend {
+    wal_payload: Vec<u8>,
+    frame: Option<Vec<u8>>,
+    schema: Schema,
+}
+
+impl PreparedTailAppend {
+    pub(crate) fn new(batch: &RecordBatch) -> Self {
+        Self {
+            wal_payload: prepare_batch_for_wal(batch),
+            frame: None,
+            schema: batch.schema.clone(),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.frame
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(self.wal_payload.len())
+    }
+
+    fn finish(&mut self, compressor: &mut zstd::bulk::Compressor<'_>) {
+        if self.frame.is_none() {
+            let raw = std::mem::take(&mut self.wal_payload);
+            let payload = compress_prepared_batch_for_wal_with(compressor, raw);
+            self.frame = Some(encode_tail_frame_payload(&payload));
+        }
+    }
+
+    fn frame(&self) -> &[u8] {
+        self.frame
+            .as_deref()
+            .expect("tail append must be compressed by commit thread")
+    }
+}
+
+type CommitOutcome = std::result::Result<(), String>;
+
+struct CommitCompletion {
+    outcome: Mutex<Option<CommitOutcome>>,
+    ready: Condvar,
+}
+
+impl CommitCompletion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(None),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn finish(&self, outcome: CommitOutcome) {
+        let mut guard = self.outcome.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(outcome);
+            self.ready.notify_all();
+        }
+    }
+
+    fn wait(&self) -> Result<()> {
+        let mut guard = self.outcome.lock().unwrap();
+        while guard.is_none() {
+            guard = self.ready.wait(guard).unwrap();
+        }
+        match guard.as_ref().unwrap() {
+            Ok(()) => Ok(()),
+            Err(message) => Err(TaibaiError::Storage(message.clone())),
+        }
+    }
+}
+
+pub(crate) struct TailCommitTicket {
+    completion: Arc<CommitCompletion>,
+}
+
+impl TailCommitTicket {
+    pub(crate) fn wait(self) -> Result<()> {
+        self.completion.wait()
+    }
+}
+
+struct AppendCommand {
+    table_dir: PathBuf,
+    id: Uuid,
+    partition_key: String,
+    prepared: PreparedTailAppend,
+    completion: Arc<CommitCompletion>,
+}
+
+enum CommitCommand {
+    Append(AppendCommand),
+    Barrier {
+        table_dir: PathBuf,
+        completion: Arc<CommitCompletion>,
+    },
+    Shutdown {
+        completion: Arc<CommitCompletion>,
+    },
+}
+
+/// Single-owner tail WAL writer. Requests keep their normal SQL semantics: a
+/// ticket is released only after the file containing that request has been
+/// synced. The small collection window amortizes one storage barrier over all
+/// concurrently arriving INSERT statements.
+pub(crate) struct TailCommitter {
+    sender: crossbeam_channel::Sender<CommitCommand>,
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl TailCommitter {
+    pub(crate) fn start() -> Arc<Self> {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let handle = std::thread::Builder::new()
+            .name("taibai-tail-commit".into())
+            .spawn(move || tail_commit_loop(receiver))
+            .expect("failed to spawn durable tail commit thread");
+        Arc::new(Self {
+            sender,
+            handle: Mutex::new(Some(handle)),
+        })
+    }
+
+    pub(crate) fn submit(
+        &self,
+        table_dir: PathBuf,
+        id: Uuid,
+        partition_key: String,
+        prepared: PreparedTailAppend,
+    ) -> TailCommitTicket {
+        let completion = CommitCompletion::new();
+        if self
+            .sender
+            .send(CommitCommand::Append(AppendCommand {
+                table_dir,
+                id,
+                partition_key,
+                prepared,
+                completion: Arc::clone(&completion),
+            }))
+            .is_err()
+        {
+            completion.finish(Err("durable tail commit thread stopped".into()));
+        }
+        TailCommitTicket { completion }
+    }
+
+    /// Wait for every previously submitted append for this table, then close
+    /// its cached handles so flush/rename/delete operations are safe on Windows.
+    pub(crate) fn barrier(&self, table_dir: &Path) -> Result<()> {
+        let completion = CommitCompletion::new();
+        if self
+            .sender
+            .send(CommitCommand::Barrier {
+                table_dir: table_dir.to_path_buf(),
+                completion: Arc::clone(&completion),
+            })
+            .is_err()
+        {
+            return Err(TaibaiError::Storage(
+                "durable tail commit thread stopped".into(),
+            ));
+        }
+        completion.wait()
+    }
+
+    pub(crate) fn stop(&self) {
+        let completion = CommitCompletion::new();
+        if self
+            .sender
+            .send(CommitCommand::Shutdown {
+                completion: Arc::clone(&completion),
+            })
+            .is_ok()
+        {
+            let _ = completion.wait();
+        }
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TailKey {
+    table_dir: PathBuf,
+    id: Uuid,
+}
+
+struct OpenTail {
+    file: fs::File,
+    path: PathBuf,
+    partition_key: String,
+    pending_rename: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct TailFileSet {
+    open: HashMap<TailKey, OpenTail>,
+    poisoned: HashSet<TailKey>,
+}
+
+impl TailFileSet {
+    fn append(&mut self, command: &AppendCommand) -> Result<TailKey> {
+        let key = TailKey {
+            table_dir: command.table_dir.clone(),
+            id: command.id,
+        };
+        if self.poisoned.contains(&key) {
+            return Err(TaibaiError::Storage(
+                "durable tail is unavailable after an earlier write failure".into(),
+            ));
+        }
+
+        if !self.open.contains_key(&key) {
+            match open_tail_for_group_append(command)? {
+                OpenTailResult::Ready(tail) => {
+                    self.open.insert(key.clone(), tail);
+                }
+                OpenTailResult::FrameAlreadyDurable(tail) => {
+                    self.open.insert(key.clone(), tail);
+                    return Ok(key);
+                }
+            }
+        }
+
+        let tail = self.open.get_mut(&key).unwrap();
+        if tail.partition_key != command.partition_key {
+            return Err(TaibaiError::Storage(
+                "durable tail partition key changed while appending".into(),
+            ));
+        }
+        if let Err(error) = tail.file.write_all(command.prepared.frame()) {
+            self.poisoned.insert(key.clone());
+            return Err(error.into());
+        }
+        Ok(key)
+    }
+
+    fn sync(&mut self, key: &TailKey) -> Result<()> {
+        let Some(tail) = self.open.get_mut(key) else {
+            return Err(TaibaiError::Storage(
+                "durable tail handle disappeared before sync".into(),
+            ));
+        };
+        if let Err(error) = tail.file.sync_all() {
+            self.poisoned.insert(key.clone());
+            return Err(error.into());
+        }
+        if let Some(final_path) = tail.pending_rename.take() {
+            if let Err(error) = fs::rename(&tail.path, &final_path) {
+                self.poisoned.insert(key.clone());
+                return Err(error.into());
+            }
+            tail.path = final_path;
+        }
+        Ok(())
+    }
+
+    fn evict_table(&mut self, table_dir: &Path) {
+        self.open.retain(|key, _| key.table_dir != table_dir);
+        self.poisoned.retain(|key| key.table_dir != table_dir);
+    }
+}
+
+enum OpenTailResult {
+    Ready(OpenTail),
+    FrameAlreadyDurable(OpenTail),
+}
+
+fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult> {
+    let tail_dir = command.table_dir.join(TAIL_DIR);
+    fs::create_dir_all(&tail_dir)?;
+    if let Some(path) = newest_live_tail_path(&tail_dir, command.id)? {
+        if read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key) {
+            let file = fs::OpenOptions::new().append(true).open(&path)?;
+            return Ok(OpenTailResult::Ready(OpenTail {
+                file,
+                path,
+                partition_key: command.partition_key.clone(),
+                pending_rename: None,
+            }));
+        }
+
+        // Legacy snapshot tails are uncommon and migrated synchronously once.
+        // Keeping this compatibility path avoids changing the on-disk format.
+        let bytes = fs::read(&path)?;
+        let (old_partition_key, old_batch) = decode_tail(&bytes, &command.prepared.schema)?;
+        if old_partition_key != command.partition_key {
+            return Err(TaibaiError::Storage(
+                "durable tail partition key changed while appending".into(),
+            ));
+        }
+        let sequence = next_sequence();
+        let stem = format!("{}.{}", command.id.simple(), sequence);
+        let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
+        let final_path = tail_dir.join(format!("{stem}.tail"));
+        let mut payload = encode_tail_log(&command.partition_key, &old_batch);
+        payload.extend_from_slice(command.prepared.frame());
+        write_new_synced(&tmp_path, &payload)?;
+        fs::rename(&tmp_path, &final_path)?;
+        remove_other_generations(&tail_dir, command.id, &final_path)?;
+        let file = fs::OpenOptions::new().append(true).open(&final_path)?;
+        return Ok(OpenTailResult::FrameAlreadyDurable(OpenTail {
+            file,
+            path: final_path,
+            partition_key: command.partition_key.clone(),
+            pending_rename: None,
+        }));
+    }
+
+    let sequence = next_sequence();
+    let stem = format!("{}.{}", command.id.simple(), sequence);
+    let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
+    let final_path = tail_dir.join(format!("{stem}.tail"));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .append(true)
+        .open(&tmp_path)?;
+    file.write_all(&encode_tail_log_header(&command.partition_key))?;
+    Ok(OpenTailResult::Ready(OpenTail {
+        file,
+        path: tmp_path,
+        partition_key: command.partition_key.clone(),
+        pending_rename: Some(final_path),
+    }))
+}
+
+fn tail_commit_loop(receiver: crossbeam_channel::Receiver<CommitCommand>) {
+    let mut files = TailFileSet::default();
+    let mut compressor = zstd::bulk::Compressor::new(3)
+        .expect("zstd level 3 compressor must initialize for durable tail writer");
+    let mut deferred = None;
+    loop {
+        let command = match deferred.take() {
+            Some(command) => command,
+            None => match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
+        match command {
+            CommitCommand::Append(first) => {
+                let mut bytes = first.prepared.encoded_len();
+                let mut group = vec![first];
+                let deadline = Instant::now() + GROUP_COMMIT_MAX_DELAY;
+                while group.len() < GROUP_COMMIT_MAX_REQUESTS && bytes < GROUP_COMMIT_MAX_BYTES {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
+                        Ok(CommitCommand::Append(next)) => {
+                            bytes = bytes.saturating_add(next.prepared.encoded_len());
+                            group.push(next);
+                        }
+                        Ok(other) => {
+                            deferred = Some(other);
+                            break;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                commit_append_group(&mut files, &mut compressor, group);
+            }
+            CommitCommand::Barrier {
+                table_dir,
+                completion,
+            } => {
+                files.evict_table(&table_dir);
+                completion.finish(Ok(()));
+            }
+            CommitCommand::Shutdown { completion } => {
+                files.open.clear();
+                completion.finish(Ok(()));
+                break;
+            }
+        }
+    }
+}
+
+fn commit_append_group(
+    files: &mut TailFileSet,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    group: Vec<AppendCommand>,
+) {
+    if matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(value) if value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        let bytes = group
+            .iter()
+            .map(|command| command.prepared.encoded_len())
+            .sum::<usize>();
+        eprintln!(
+            "[insert-profile] stage=tail_group requests={} bytes={}",
+            group.len(),
+            bytes
+        );
+    }
+    let mut by_tail = HashMap::<TailKey, Vec<Arc<CommitCompletion>>>::new();
+    for mut command in group {
+        command.prepared.finish(compressor);
+        match files.append(&command) {
+            Ok(key) => by_tail.entry(key).or_default().push(command.completion),
+            Err(error) => command.completion.finish(Err(error.to_string())),
+        }
+    }
+    for (key, completions) in by_tail {
+        let outcome = files.sync(&key).map_err(|error| error.to_string());
+        for completion in completions {
+            completion.finish(outcome.clone());
+        }
+    }
+}
 
 pub struct RecoveredTail {
     pub id: Uuid,
@@ -256,19 +683,28 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn encode_tail_log(partition_key: &str, batch: &RecordBatch) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(12 + partition_key.len());
+    let mut bytes = encode_tail_log_header(partition_key);
+    bytes.extend_from_slice(&encode_tail_frame(batch));
+    bytes
+}
+
+fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + partition_key.len());
     bytes.extend_from_slice(&TAIL_LOG_MAGIC.to_le_bytes());
     bytes.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
     bytes.extend_from_slice(partition_key.as_bytes());
-    bytes.extend_from_slice(&encode_tail_frame(batch));
     bytes
 }
 
 fn encode_tail_frame(batch: &RecordBatch) -> Vec<u8> {
     let payload = serialize_batch_for_wal(batch);
+    encode_tail_frame_payload(&payload)
+}
+
+fn encode_tail_frame_payload(payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(12 + payload.len());
     frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(payload);
     let mut hasher = Hasher::new();
     hasher.update(&frame);
     frame.extend_from_slice(&hasher.finalize().to_le_bytes());
@@ -605,6 +1041,41 @@ mod tests {
             recovered[0].batch.scalar(2, 0),
             Some(ScalarValue::Int64(Some(3)))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn group_committer_acknowledges_only_recoverable_appends() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        let first = test_batch(&schema, &[1, 2])?;
+        let second = test_batch(&schema, &[3, 4])?;
+        let committer = TailCommitter::start();
+        let first_ticket = committer.submit(
+            temp.path().to_path_buf(),
+            id,
+            "2026".into(),
+            PreparedTailAppend::new(&first),
+        );
+        let second_ticket = committer.submit(
+            temp.path().to_path_buf(),
+            id,
+            "2026".into(),
+            PreparedTailAppend::new(&second),
+        );
+        first_ticket.wait()?;
+        second_ticket.wait()?;
+        committer.barrier(temp.path())?;
+
+        let recovered = recover(temp.path(), &schema)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].batch.num_rows(), 4);
+        assert_eq!(
+            recovered[0].batch.scalar(3, 0),
+            Some(ScalarValue::Int64(Some(4)))
+        );
+        committer.stop();
         Ok(())
     }
 

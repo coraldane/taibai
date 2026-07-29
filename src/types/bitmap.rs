@@ -152,33 +152,45 @@ impl NullBitmap {
     }
 
     pub fn extend(&mut self, other: &NullBitmap) {
+        if other.len == 0 {
+            return;
+        }
         if other.is_all_valid() {
             let needed = Self::u64_count(self.len + other.len);
             self.len += other.len;
-            while self.data.len() < needed {
-                self.data.push(0);
-            }
+            self.data.resize(needed, 0);
             return;
         }
         let old_len = self.len;
         self.len += other.len;
         let needed = Self::u64_count(self.len);
-        while self.data.len() < needed {
-            self.data.push(0);
+        self.data.resize(needed, 0);
+
+        // Merge whole machine words. The previous implementation fell back to
+        // one is_null/set_null pair per row whenever the destination was not
+        // 64-bit aligned, which made many small nullable INSERTs needlessly
+        // branch-heavy.
+        let dst_start = old_len / 64;
+        let shift = old_len % 64;
+        if shift != 0 {
+            // Bits above the old logical length are padding and must not turn
+            // into real NULLs after the append (notably for from_bytes input).
+            self.data[dst_start] &= (1u64 << shift) - 1;
         }
-        let other_offset = old_len % 64;
-        if other_offset == 0 {
-            let dst_start = old_len / 64;
-            for (i, &word) in other.data.iter().enumerate() {
-                if dst_start + i < self.data.len() {
-                    self.data[dst_start + i] |= word;
-                }
+        for (i, &word) in other.data.iter().enumerate() {
+            let dst = dst_start + i;
+            self.data[dst] |= word << shift;
+            if shift != 0 && dst + 1 < self.data.len() {
+                self.data[dst + 1] |= word >> (64 - shift);
             }
-        } else {
-            for i in 0..other.len {
-                if other.is_null(i) {
-                    self.set_null(old_len + i);
-                }
+        }
+
+        // Preserve the canonical invariant that unused tail bits are zero.
+        let tail_bits = self.len % 64;
+        if tail_bits != 0 {
+            let mask = (1u64 << tail_bits) - 1;
+            if let Some(last) = self.data.last_mut() {
+                *last &= mask;
             }
         }
     }

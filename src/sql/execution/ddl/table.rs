@@ -422,13 +422,15 @@ pub fn exec_drop_table(
         .with_table_mutation_lock(db, name, || {
             tracing::info!(db, table = name, elapsed_ms = stage_start.elapsed().as_millis(), "drop table: acquired table mutation lock");
 
+            engine.batch_writer().drain_table_tail(db, name)?;
+
             let step_start = Instant::now();
             engine.segment_mgr().remove_wal(&table_dir);
             tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed wal handle");
 
             let step_start = Instant::now();
-            engine.segment_mgr().remove_table_state(db, name);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table state");
+            engine.segment_mgr().close_table_state_handles(db, name);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: closed table state handles");
 
             let step_start = Instant::now();
             engine.segment_mgr().invalidate_readers_under(&table_dir);
@@ -471,6 +473,8 @@ pub fn exec_drop_table(
             let step_start = Instant::now();
             let cleared_rows = engine.batch_writer().clear_memtables(db, name);
             tracing::info!(db, table = name, cleared_rows, elapsed_ms = step_start.elapsed().as_millis(), "drop table: cleared memtables");
+
+            engine.segment_mgr().remove_table_state(db, name);
 
             Ok(tombstone)
         })?;
@@ -579,9 +583,10 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
                     new_table_dir.display()
                 )));
             }
+            engine.batch_writer().drain_table_tail(db, name)?;
             engine.segment_mgr().flush_table_active(db, name)?;
             engine.segment_mgr().remove_wal(&old_table_dir);
-            engine.segment_mgr().remove_table_state(db, name);
+            engine.segment_mgr().close_table_state_handles(db, name);
             engine.segment_mgr().invalidate_readers_under(&old_table_dir);
 
             std::fs::create_dir_all(&operation_dir)?;
@@ -613,6 +618,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
                 return Err(error);
             }
             let renamed_rows = engine.batch_writer().rename_memtables(db, name, new_name);
+            engine.segment_mgr().remove_table_state(db, name);
             tracing::info!(
                 db,
                 old_table = name,
@@ -1270,8 +1276,9 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     let operation_dir = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
+            engine.batch_writer().drain_table_tail(db, table)?;
             engine.segment_mgr().remove_wal(&table_dir);
-            engine.segment_mgr().remove_table_state(db, table);
+            engine.segment_mgr().close_table_state_handles(db, table);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
 
             write_before_meta(&operation_dir, &before_meta)?;
@@ -1311,6 +1318,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             }
 
             engine.batch_writer().clear_memtables(db, table);
+            engine.segment_mgr().remove_table_state(db, table);
             engine.hot_store_manager().remove(db, table);
             engine.index_manager().clear_index(db, table);
             let unique_index_names = before_meta

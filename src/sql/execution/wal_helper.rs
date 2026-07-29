@@ -96,8 +96,15 @@ pub fn determine_write_dir(
 }
 
 pub fn serialize_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Vec<u8> {
+    compress_prepared_batch_for_wal(prepare_batch_for_wal(batch))
+}
+
+/// Build the uncompressed WAL representation without taking a storage lock.
+/// The durable-tail commit thread performs level-3 compression serially so
+/// concurrent INSERT workers do not saturate memory bandwidth and naturally
+/// accumulate into a larger fsync group.
+pub(crate) fn prepare_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Vec<u8> {
     const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
-    const FLAG_COMPRESSED: u8 = 0x01;
 
     let num_cols = batch.num_columns();
     let num_rows = batch.num_rows();
@@ -123,12 +130,32 @@ pub fn serialize_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Vec<
             raw.extend_from_slice(&0u32.to_le_bytes());
         }
 
-        let col_data = encode_column_raw(col);
-        raw.extend_from_slice(&(col_data.len() as u32).to_le_bytes());
-        raw.extend_from_slice(&col_data);
+        let len_offset = raw.len();
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        let data_offset = raw.len();
+        encode_column_raw_into(col, &mut raw);
+        let data_len = (raw.len() - data_offset) as u32;
+        raw[len_offset..len_offset + 4].copy_from_slice(&data_len.to_le_bytes());
     }
 
-    match zstd::bulk::compress(&raw, 3) {
+    raw
+}
+
+pub(crate) fn compress_prepared_batch_for_wal(raw: Vec<u8>) -> Vec<u8> {
+    match zstd::bulk::Compressor::new(3) {
+        Ok(mut compressor) => compress_prepared_batch_for_wal_with(&mut compressor, raw),
+        Err(_) => raw,
+    }
+}
+
+pub(crate) fn compress_prepared_batch_for_wal_with(
+    compressor: &mut zstd::bulk::Compressor<'_>,
+    raw: Vec<u8>,
+) -> Vec<u8> {
+    const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
+    const FLAG_COMPRESSED: u8 = 0x01;
+
+    match compressor.compress(&raw) {
         Ok(compressed) if compressed.len() < raw.len() => {
             let mut out = Vec::with_capacity(13 + compressed.len());
             out.extend_from_slice(&WAL_BATCH_MAGIC.to_le_bytes());
@@ -142,106 +169,100 @@ pub fn serialize_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Vec<
     }
 }
 
-fn encode_column_raw(col: &crate::types::array::ColumnArray) -> Vec<u8> {
+fn encode_column_raw_into(col: &crate::types::array::ColumnArray, out: &mut Vec<u8>) {
     use crate::types::array::ColumnArray;
     match col {
-        ColumnArray::Bool { data, .. } => data.clone(),
+        ColumnArray::Bool { data, .. } => out.extend_from_slice(data),
         ColumnArray::Int8 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Int16 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Int32 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Int64 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
-        ColumnArray::UInt8 { data, .. } => data.clone(),
+        ColumnArray::UInt8 { data, .. } => out.extend_from_slice(data),
         ColumnArray::UInt16 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::UInt32 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::UInt64 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Float32 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Float64 { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Decimal { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Date { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Time { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Timestamp { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::Interval { data, .. } => {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
-            bytes.to_vec()
+            out.extend_from_slice(bytes);
         }
         ColumnArray::VarChar { data, .. } => {
-            let mut buf = Vec::with_capacity(data.iter().map(|s| s.len() + 4).sum::<usize>());
             for s in data {
-                buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                buf.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
             }
-            buf
         }
         ColumnArray::Blob { data, .. } => {
-            let mut buf = Vec::with_capacity(data.iter().map(|b| b.len() + 4).sum::<usize>());
             for b in data {
-                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                buf.extend_from_slice(b);
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
             }
-            buf
         }
         ColumnArray::Vector { data, .. } => {
-            let mut buf = Vec::new();
             for v in data {
-                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 for f in v {
-                    buf.extend_from_slice(&f.to_le_bytes());
+                    out.extend_from_slice(&f.to_le_bytes());
                 }
             }
-            buf
         }
     }
 }

@@ -101,6 +101,10 @@ impl Engine {
                     .low_rate_max_rows
                     .max(row_group_target_rows.saturating_sub(1)),
                 low_rate_max_age_secs: auto_compact_config.low_rate_max_age.as_secs(),
+                // Acknowledged INSERTs are already recoverable from durable
+                // tails. Use the configured memory budget for asynchronous
+                // checkpoint pressure instead of a fixed 512 MiB estimate.
+                max_total_memory: hot_store_memory_limit_bytes,
                 ..BatchWriterConfig::default()
             },
             Arc::clone(&segment_mgr),

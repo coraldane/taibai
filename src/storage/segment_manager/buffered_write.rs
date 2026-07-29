@@ -6,7 +6,7 @@ impl SegmentManager {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, "", &batch, true)
+        self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true)
     }
 
     pub fn bulk_insert_batch_ref(
@@ -26,7 +26,7 @@ impl SegmentManager {
         batch: RecordBatch,
         _disable_wal: bool,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, "", &batch, false)
+        self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, false)
     }
 
     pub fn bulk_insert_batch_with_partition(
@@ -36,7 +36,13 @@ impl SegmentManager {
         partition_key: &str,
         batch: RecordBatch,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, &batch, true)
+        self.bulk_insert_batch_with_partition_owned_inner(
+            db,
+            table,
+            partition_key,
+            batch,
+            true,
+        )
     }
 
     pub fn bulk_insert_batch_with_partition_ref(
@@ -56,7 +62,42 @@ impl SegmentManager {
         partition_key: &str,
         batch: RecordBatch,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, &batch, false)
+        self.bulk_insert_batch_with_partition_owned_inner(
+            db,
+            table,
+            partition_key,
+            batch,
+            false,
+        )
+    }
+
+    fn bulk_insert_batch_with_partition_owned_inner(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        batch: RecordBatch,
+        flush_immediately: bool,
+    ) -> Result<u64> {
+        let row_count = batch.num_rows() as u64;
+        if row_count == 0 {
+            return Ok(0);
+        }
+        let table_dir = self.data_dir.join(db).join(table);
+        std::fs::create_dir_all(&table_dir)?;
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        ensure_state_not_retired(&state, db, table)?;
+
+        self.append_batch_with_partition_owned_locked(
+            &table_dir,
+            &state,
+            partition_key,
+            batch,
+            flush_immediately,
+        )?;
+        Ok(row_count)
     }
 
     fn bulk_insert_batch_with_partition_inner(
@@ -339,6 +380,45 @@ impl SegmentManager {
         };
         writer.append_batch(batch, &|segment_path| self.invalidate_reader(segment_path))?;
         writer.seal(&|segment_path| self.invalidate_reader(segment_path))?;
+        Ok(())
+    }
+
+    fn append_batch_with_partition_owned_locked(
+        &self,
+        table_dir: &Path,
+        state: &TableSegmentState,
+        partition_key: &str,
+        batch: RecordBatch,
+        flush_immediately: bool,
+    ) -> Result<()> {
+        let schema = batch.schema.clone();
+        let mut active_guard = state.active_segments.lock().unwrap();
+        self.get_or_create_active_segment_for_partition_locked(
+            table_dir,
+            &schema,
+            partition_key,
+            &mut active_guard,
+        )?;
+
+        let seg = active_guard.get_mut(partition_key).unwrap();
+        seg.append_batch_owned(batch, &|path| self.invalidate_reader(path))?;
+
+        if seg.current_size >= self.max_segment_size() {
+            seg.seal(&|path| self.invalidate_reader(path))?;
+            active_guard.remove(partition_key);
+        } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
+            seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+            seg.flush_meta(&|path| self.invalidate_reader(path))?;
+        } else if !flush_immediately {
+            if seg.buffered_rows > 0 {
+                seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+            }
+        } else if seg.buffered_rows > 0 {
+            seg.flush_buffer(&|path| self.invalidate_reader(path))?;
+            seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
+        } else {
+            seg.flush_visible_footer(&|path| self.invalidate_reader(path))?;
+        }
         Ok(())
     }
 

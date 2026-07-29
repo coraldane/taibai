@@ -117,11 +117,10 @@ impl SortKeyInserter {
 
         for i in 1..batch.num_rows() {
             for (ki, &col_idx) in self.key_indices.iter().enumerate() {
-                let prev = batch
-                    .scalar(i - 1, col_idx)
-                    .unwrap_or(ScalarValue::Int64(None));
-                let curr = batch.scalar(i, col_idx).unwrap_or(ScalarValue::Int64(None));
-                let cmp = compare_scalars_for_sort(&prev, &curr);
+                let Some(column) = batch.column(col_idx) else {
+                    return false;
+                };
+                let cmp = column.compare_at(i - 1, i);
                 let cmp = if self.desc.get(ki).copied().unwrap_or(false) {
                     cmp.reverse()
                 } else {

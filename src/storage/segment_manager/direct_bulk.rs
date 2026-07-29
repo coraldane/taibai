@@ -1,7 +1,5 @@
 impl SegmentManager {
     pub fn bulk_insert_payload(&self, db: &str, payload: &[u8], _disable_wal: bool) -> Result<u64> {
-        use rayon::prelude::*;
-
         let req = parse_direct_bulk_payload(payload)?;
         if req.row_count == 0 {
             return Ok(0);
@@ -26,20 +24,7 @@ impl SegmentManager {
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
 
-        let compression_level = bulk_compression_level();
-        let compressed_columns: Vec<(Vec<u8>, u64)> = req
-            .columns
-            .par_iter()
-            .map(|col| {
-                let mut encoded = Vec::with_capacity(4 + col.data.len());
-                encoded.extend_from_slice(&0u32.to_le_bytes());
-                encoded.extend_from_slice(col.data);
-                let orig_len = encoded.len() as u64;
-                let compressed = zstd::bulk::compress(&encoded, compression_level)
-                    .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
-                Ok((compressed, orig_len))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let compressed_columns = self.compress_direct_bulk_columns(&req.columns)?;
 
         {
             let _mutation_guard = state.mutation_lock.lock().unwrap();
@@ -128,10 +113,13 @@ impl SegmentManager {
                     idx, col_def.name, payload_col.name
                 )));
             }
-            if !payload_col.nulls.is_empty() {
-                return Err(TaibaiError::Protocol(
-                    "direct bulk path currently supports all-valid columns only".into(),
-                ));
+            if (col_def.primary_key || !col_def.nullable)
+                && payload_col.has_nulls(req.row_count)
+            {
+                return Err(TaibaiError::Protocol(format!(
+                    "bulk column '{}' does not allow NULL values",
+                    col_def.name
+                )));
             }
         }
         Ok(())
@@ -366,6 +354,21 @@ impl SegmentManager {
             .variable_ranges
             .as_ref()
             .map(|_| Vec::with_capacity(rows.len()));
+        let mut nulls = if col.nulls.is_empty() {
+            Vec::new()
+        } else {
+            vec![0u8; rows.len().div_ceil(64) * 8]
+        };
+        let mut selected_has_nulls = false;
+        for (selected_idx, &row_idx) in rows.iter().enumerate() {
+            if col.is_null(row_idx) {
+                nulls[selected_idx / 8] |= 1u8 << (selected_idx % 8);
+                selected_has_nulls = true;
+            }
+        }
+        if !selected_has_nulls {
+            nulls.clear();
+        }
         if let Some(width) = col.data_type.fixed_size() {
             data.reserve(rows.len() * width);
             for &row_idx in rows {
@@ -413,7 +416,7 @@ impl SegmentManager {
             scale: col.scale,
             precision: col.precision,
             data,
-            nulls: Vec::new(),
+            nulls,
             variable_ranges,
         })
     }
@@ -427,9 +430,7 @@ impl SegmentManager {
         columns
             .par_iter()
             .map(|col| {
-                let mut encoded = Vec::with_capacity(4 + col.data.len());
-                encoded.extend_from_slice(&0u32.to_le_bytes());
-                encoded.extend_from_slice(col.data);
+                let encoded = encode_direct_bulk_column(col)?;
                 let orig_len = encoded.len() as u64;
                 let compressed = zstd::bulk::compress(&encoded, compression_level)
                     .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
@@ -437,4 +438,58 @@ impl SegmentManager {
             })
             .collect::<Result<Vec<_>>>()
     }
+}
+
+/// Convert the wire representation (one physical value slot per row) into the
+/// segment codec representation (bitmap followed by non-null values only).
+fn encode_direct_bulk_column(col: &DirectBulkColumn<'_>) -> Result<Vec<u8>> {
+    let bitmap_len = u32::try_from(col.nulls.len()).map_err(|_| {
+        TaibaiError::Protocol(format!("bulk column '{}' null bitmap is too large", col.name))
+    })?;
+    let mut encoded = Vec::with_capacity(4 + col.nulls.len() + col.data.len());
+    encoded.extend_from_slice(&bitmap_len.to_le_bytes());
+    encoded.extend_from_slice(col.nulls);
+
+    if col.nulls.is_empty() {
+        encoded.extend_from_slice(col.data);
+        return Ok(encoded);
+    }
+
+    if let Some(width) = col.data_type.fixed_size() {
+        let row_count = col.data.len() / width;
+        for row_idx in 0..row_count {
+            if !col.is_null(row_idx) {
+                let offset = row_idx * width;
+                encoded.extend_from_slice(&col.data[offset..offset + width]);
+            }
+        }
+        return Ok(encoded);
+    }
+
+    let ranges = col.variable_ranges.as_ref().ok_or_else(|| {
+        TaibaiError::Protocol(format!(
+            "bulk column '{}' is missing variable value ranges",
+            col.name
+        ))
+    })?;
+    for (row_idx, &(offset, len)) in ranges.iter().enumerate() {
+        if col.is_null(row_idx) {
+            continue;
+        }
+        let end = offset.checked_add(len).ok_or_else(|| {
+            TaibaiError::Protocol(format!("bulk column '{}' range overflow", col.name))
+        })?;
+        if end > col.data.len() {
+            return Err(TaibaiError::Protocol(format!(
+                "bulk column '{}' variable data truncated",
+                col.name
+            )));
+        }
+        let len = u32::try_from(len).map_err(|_| {
+            TaibaiError::Protocol(format!("bulk column '{}' value is too large", col.name))
+        })?;
+        encoded.extend_from_slice(&len.to_le_bytes());
+        encoded.extend_from_slice(&col.data[offset..end]);
+    }
+    Ok(encoded)
 }

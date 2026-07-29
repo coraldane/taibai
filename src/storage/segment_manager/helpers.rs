@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
-use crate::storage::bulk_payload::{DirectBulkColumn, DirectBulkRequest};
+use crate::storage::bulk_payload::{null_bit_is_set, DirectBulkColumn, DirectBulkRequest};
 use crate::storage::partition::pruning::ZoneMap;
 use crate::storage::segment::store;
 use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
@@ -93,24 +93,151 @@ pub(super) fn compute_zone_maps_from_batch(
     start_row: usize,
     row_count: usize,
 ) -> Vec<ZoneMap> {
-    let num_cols = batch.num_columns();
-    let mut zone_maps = Vec::with_capacity(num_cols);
-    for col_idx in 0..num_cols {
-        let mut zm = ZoneMap::default();
-        if let Some(col) = batch.column(col_idx) {
-            for row in start_row..start_row + row_count {
-                if col.bitmap().is_null(row) {
-                    zm.null_count += 1;
-                } else {
-                    let val = col.scalar(row);
-                    zm.update(&val);
+    batch
+        .columns
+        .iter()
+        .map(|column| compute_zone_map_from_column(column, start_row, row_count))
+        .collect()
+}
+
+fn compute_zone_map_from_column(
+    column: &ColumnArray,
+    start_row: usize,
+    row_count: usize,
+) -> ZoneMap {
+    let end_row = start_row + row_count;
+    let bitmap = column.bitmap();
+    let null_count = if bitmap.is_all_valid() {
+        0
+    } else {
+        (start_row..end_row)
+            .filter(|&row| bitmap.is_null(row))
+            .count() as u64
+    };
+
+    macro_rules! ordered_zone_map {
+        ($values:expr, $variant:ident) => {{
+            let mut min = None;
+            let mut max = None;
+            for row in start_row..end_row {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                let value = $values[row];
+                if min.is_none_or(|current| value < current) {
+                    min = Some(value);
+                }
+                if max.is_none_or(|current| value > current) {
+                    max = Some(value);
                 }
             }
-        }
-        zm.row_count = row_count as u64;
-        zone_maps.push(zm);
+            ZoneMap {
+                min_value: ScalarValue::$variant(min),
+                max_value: ScalarValue::$variant(max),
+                null_count,
+                row_count: row_count as u64,
+            }
+        }};
     }
-    zone_maps
+
+    macro_rules! float_zone_map {
+        ($values:expr, $variant:ident) => {{
+            let mut min = None;
+            let mut max = None;
+            for row in start_row..end_row {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                let value = $values[row];
+                if min.is_none_or(|current| value.partial_cmp(&current).is_some_and(|o| o.is_lt()))
+                {
+                    min = Some(value);
+                }
+                if max.is_none_or(|current| value.partial_cmp(&current).is_some_and(|o| o.is_gt()))
+                {
+                    max = Some(value);
+                }
+            }
+            ZoneMap {
+                min_value: ScalarValue::$variant(min),
+                max_value: ScalarValue::$variant(max),
+                null_count,
+                row_count: row_count as u64,
+            }
+        }};
+    }
+
+    match column {
+        ColumnArray::Bool { data, .. } => {
+            let mut min = None;
+            let mut max = None;
+            for row in start_row..end_row {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                let value = data[row] != 0;
+                if min.is_none_or(|current| value < current) {
+                    min = Some(value);
+                }
+                if max.is_none_or(|current| value > current) {
+                    max = Some(value);
+                }
+            }
+            ZoneMap {
+                min_value: ScalarValue::Bool(min),
+                max_value: ScalarValue::Bool(max),
+                null_count,
+                row_count: row_count as u64,
+            }
+        }
+        ColumnArray::Int8 { data, .. } => ordered_zone_map!(data, Int8),
+        ColumnArray::Int16 { data, .. } => ordered_zone_map!(data, Int16),
+        ColumnArray::Int32 { data, .. } => ordered_zone_map!(data, Int32),
+        ColumnArray::Int64 { data, .. } => ordered_zone_map!(data, Int64),
+        ColumnArray::UInt8 { data, .. } => ordered_zone_map!(data, UInt8),
+        ColumnArray::UInt16 { data, .. } => ordered_zone_map!(data, UInt16),
+        ColumnArray::UInt32 { data, .. } => ordered_zone_map!(data, UInt32),
+        ColumnArray::UInt64 { data, .. } => ordered_zone_map!(data, UInt64),
+        ColumnArray::Float32 { data, .. } => float_zone_map!(data, Float32),
+        ColumnArray::Float64 { data, .. } => float_zone_map!(data, Float64),
+        ColumnArray::Decimal { data, .. } => ordered_zone_map!(data, Decimal),
+        ColumnArray::Date { data, .. } => ordered_zone_map!(data, Date),
+        ColumnArray::Time { data, .. } => ordered_zone_map!(data, Time),
+        ColumnArray::Timestamp { data, .. } => ordered_zone_map!(data, Timestamp),
+        ColumnArray::Interval { data, .. } => ordered_zone_map!(data, Interval),
+        ColumnArray::VarChar { data, .. } => {
+            let mut min_row = None;
+            let mut max_row = None;
+            for row in start_row..end_row {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                if min_row.is_none_or(|current| data.value(row) < data.value(current)) {
+                    min_row = Some(row);
+                }
+                if max_row.is_none_or(|current| data.value(row) > data.value(current)) {
+                    max_row = Some(row);
+                }
+            }
+            ZoneMap {
+                min_value: ScalarValue::VarChar(min_row.map(|row| data.value(row).to_string())),
+                max_value: ScalarValue::VarChar(max_row.map(|row| data.value(row).to_string())),
+                null_count,
+                row_count: row_count as u64,
+            }
+        }
+        _ => {
+            let mut zone_map = ZoneMap::default();
+            for row in start_row..end_row {
+                if !bitmap.is_null(row) {
+                    zone_map.update(&column.scalar(row));
+                }
+            }
+            zone_map.null_count = null_count;
+            zone_map.row_count = row_count as u64;
+            zone_map
+        }
+    }
 }
 
 pub(crate) fn direct_bulk_request_to_batch(
@@ -386,15 +513,7 @@ pub(super) fn compute_value_sets_from_bulk_columns(
 }
 
 fn is_null_at(nulls: &[u8], idx: usize) -> bool {
-    if nulls.is_empty() {
-        return false;
-    }
-    let byte_idx = idx / 8;
-    let bit_idx = idx % 8;
-    if byte_idx >= nulls.len() {
-        return false;
-    }
-    (nulls[byte_idx] & (1 << bit_idx)) != 0
+    null_bit_is_set(nulls, idx)
 }
 
 fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<ScalarValue> {
@@ -522,5 +641,47 @@ fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<Scal
             ))))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod zone_map_tests {
+    use super::*;
+    use crate::types::batch::ColumnDef;
+
+    #[test]
+    fn typed_zone_maps_preserve_ranges_and_null_counts() {
+        let schema = Schema::new(vec![
+            ColumnDef::new("number", DataType::Int32),
+            ColumnDef::new("text", DataType::VarChar),
+        ]);
+        let mut batch = RecordBatch::new(schema);
+        for (number, text) in [
+            (
+                ScalarValue::Int32(Some(9)),
+                ScalarValue::VarChar(Some("z".into())),
+            ),
+            (
+                ScalarValue::Int32(None),
+                ScalarValue::VarChar(Some("b".into())),
+            ),
+            (ScalarValue::Int32(Some(-4)), ScalarValue::VarChar(None)),
+            (
+                ScalarValue::Int32(Some(3)),
+                ScalarValue::VarChar(Some("m".into())),
+            ),
+        ] {
+            batch.column_mut(0).unwrap().push(&number).unwrap();
+            batch.column_mut(1).unwrap().push(&text).unwrap();
+        }
+
+        let maps = compute_zone_maps_from_batch(&batch, 0, 4);
+        assert_eq!(maps[0].min_value, ScalarValue::Int32(Some(-4)));
+        assert_eq!(maps[0].max_value, ScalarValue::Int32(Some(9)));
+        assert_eq!(maps[0].null_count, 1);
+        assert_eq!(maps[1].min_value, ScalarValue::VarChar(Some("b".into())));
+        assert_eq!(maps[1].max_value, ScalarValue::VarChar(Some("z".into())));
+        assert_eq!(maps[1].null_count, 1);
+        assert!(maps.iter().all(|map| map.row_count == 4));
     }
 }

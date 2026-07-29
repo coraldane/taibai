@@ -714,6 +714,19 @@ impl SegmentManager {
         }
     }
 
+    /// Close mutable file handles without changing the lock identity. DDL uses
+    /// this while holding `mutation_lock`, then retires the state only after
+    /// the directory operation is complete. Removing the map entry too early
+    /// would let a waiting writer create a second lock for the same table.
+    pub fn close_table_state_handles(&self, db: &str, table: &str) {
+        let key = table_key(db, table);
+        let tables = self.tables.read().unwrap();
+        if let Some(state) = tables.get(&key) {
+            *state.wal_writer.lock().unwrap() = None;
+            state.active_segments.lock().unwrap().clear();
+        }
+    }
+
     pub fn rename_table_state(&self, db: &str, old_name: &str, new_name: &str) {
         let old_key = table_key(db, old_name);
         let new_key = table_key(db, new_name);

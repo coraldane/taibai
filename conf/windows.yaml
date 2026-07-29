@@ -1,11 +1,12 @@
 server:
   host: "0.0.0.0"
-  port: 5151
+  port: 5152
   max_connections: 1024
-  max_concurrent_requests: 8
+  max_concurrent_requests: 16
 
 storage:
-  data_dir: "../data"
+  data_dir: "E:/data/taibai_data"
+  # data_dir: "../data"
   default_database: "main"
   min_segment_seal_size_mb: 500
   max_segment_size_mb: 2048
@@ -13,10 +14,10 @@ storage:
 
 buffer:
   query_memory_limit_mb: 4096
-  execution_threads: 8
+  execution_threads: 16
   max_parallel_row_groups: 8
   global_io_permits: 4
-  global_cpu_permits: 8
+  global_cpu_permits: 16
 
 compression:
   enabled: true

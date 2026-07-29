@@ -69,6 +69,53 @@ impl ActiveSegmentWriter {
         Ok(wal_keys_to_clear)
     }
 
+    /// Append a batch whose buffers are no longer needed by the caller.
+    ///
+    /// The common SQL/bulk path hands ownership to the segment manager.  Keep
+    /// that ownership all the way into the row-group buffer instead of cloning
+    /// every fixed- and variable-width column first.
+    pub(super) fn append_batch_owned(
+        &mut self,
+        batch: RecordBatch,
+        invalidate_reader: &dyn Fn(&Path),
+    ) -> Result<Vec<String>> {
+        let added = batch.num_rows();
+        if batch.num_columns() != self.schema.num_columns() {
+            return Err(TaibaiError::Internal(format!(
+                "active segment append column count mismatch: {} != {}",
+                batch.num_columns(),
+                self.schema.num_columns()
+            )));
+        }
+        if batch
+            .columns
+            .iter()
+            .zip(&self.schema.columns)
+            .any(|(column, definition)| column.data_type() != definition.data_type)
+        {
+            return Err(TaibaiError::Internal(
+                "active segment append column type mismatch".into(),
+            ));
+        }
+        let mut wal_keys_to_clear = Vec::new();
+        if let Some(ref mut buffered) = self.buffered_batch {
+            for (dst, src) in buffered.columns.iter_mut().zip(batch.columns) {
+                dst.append_owned(src)?;
+            }
+            self.buffered_rows += added;
+        } else {
+            self.buffered_batch = Some(batch);
+            self.buffered_rows = added;
+        }
+
+        while self.buffered_rows >= self.row_group_target_rows {
+            if let Some(wk) = self.flush_buffer(invalidate_reader)? {
+                wal_keys_to_clear.push(wk);
+            }
+        }
+        Ok(wal_keys_to_clear)
+    }
+
     pub(super) fn append_direct_row_group(
         &mut self,
         columns: &[DirectBulkColumn<'_>],
@@ -84,7 +131,6 @@ impl ActiveSegmentWriter {
         let mut compressed_sizes = Vec::with_capacity(compressed_columns.len());
         let mut uncompressed_sizes = Vec::with_capacity(compressed_columns.len());
         let mut total_length = 0u64;
-        let mut write_buf = Vec::new();
 
         for (compressed, uncompressed_size) in compressed_columns {
             let n = compressed.len() as u64;
@@ -92,9 +138,11 @@ impl ActiveSegmentWriter {
             compressed_sizes.push(n);
             uncompressed_sizes.push(*uncompressed_size);
             total_length += n;
-            write_buf.extend_from_slice(compressed);
+            // `file` is already buffered. Writing each compressed column
+            // directly avoids constructing and copying one row-group-sized
+            // concatenation buffer.
+            self.file.write_all(compressed)?;
         }
-        self.file.write_all(&write_buf)?;
 
         let value_sets = if build_value_sets {
             compute_value_sets_from_bulk_columns(columns, row_count)?
@@ -209,16 +257,14 @@ impl ActiveSegmentWriter {
         let mut compressed_sizes = Vec::with_capacity(num_cols);
         let mut uncompressed_sizes = Vec::with_capacity(num_cols);
         let mut total_length = 0u64;
-        let mut write_buf = Vec::new();
         for (compressed, uncompressed_size) in &compressed_columns {
             let n = compressed.len() as u64;
             column_compressed_sizes.push(n);
             compressed_sizes.push(n);
             uncompressed_sizes.push(*uncompressed_size);
             total_length += n;
-            write_buf.extend_from_slice(compressed);
+            self.file.write_all(compressed)?;
         }
-        self.file.write_all(&write_buf)?;
         self.row_groups.push(RowGroupMeta {
             offset,
             length: total_length,
@@ -444,4 +490,57 @@ fn compute_value_sets_from_batch(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod owned_append_tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::storage::segment::constants::SEGMENT_HEADER_SIZE;
+    use crate::types::array::ColumnArray;
+    use crate::types::batch::ColumnDef;
+    use crate::types::scalar::ScalarValue;
+
+    #[test]
+    fn first_owned_batch_keeps_variable_buffer_allocation() {
+        let schema = Schema::new(vec![ColumnDef::new("value", DataType::VarChar)]);
+        let mut batch = RecordBatch::with_capacity(schema.clone(), 4);
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("owned-buffer".repeat(64))))
+            .unwrap();
+        let source_ptr = match batch.column(0).unwrap() {
+            ColumnArray::VarChar { data, .. } => data.values().as_ptr(),
+            _ => unreachable!(),
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("owned.dat");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ActiveSegmentWriter {
+            file: std::io::BufWriter::new(file),
+            path,
+            schema,
+            row_groups: Vec::new(),
+            current_size: SEGMENT_HEADER_SIZE as u64,
+            total_rows: 0,
+            delete_bitmap: Vec::new(),
+            deleted_row_count: 0,
+            buffered_batch: None,
+            buffered_rows: 0,
+            dirty_meta: false,
+            data_end: SEGMENT_HEADER_SIZE as u64,
+            sidecar_row_groups_flushed: 0,
+            last_write_at: Instant::now(),
+            row_group_target_rows: 1024,
+        };
+
+        writer.append_batch_owned(batch, &|_| {}).unwrap();
+        let buffered_ptr = match writer.buffered_batch.as_ref().unwrap().column(0).unwrap() {
+            ColumnArray::VarChar { data, .. } => data.values().as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(buffered_ptr, source_ptr, "owned append must not clone data");
+    }
 }

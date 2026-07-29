@@ -170,7 +170,10 @@ impl Handler {
             Err(_) => std::str::from_utf8(payload).unwrap_or("").trim(),
         };
 
-        let is_insert = sql.to_uppercase().starts_with("INSERT");
+        let is_insert = sql
+            .as_bytes()
+            .get(..b"INSERT".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"INSERT"));
         let should_log_query = should_log_query_sql(sql);
         if !is_insert {
             tracing::info!(sql, "query received");
@@ -222,7 +225,11 @@ impl Handler {
         let execute_start = Instant::now();
         let result = self.engine.execute(session, sql);
         let execute_elapsed = execute_start.elapsed();
-        if has_query_database && !sql.to_ascii_uppercase().starts_with("USE ") {
+        let is_use = sql
+            .as_bytes()
+            .get(..b"USE ".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"USE "));
+        if has_query_database && !is_use {
             session.database = original_database;
         }
 
@@ -904,6 +911,11 @@ fn log_query_if_needed(
 }
 
 fn should_log_query_sql(sql: &str) -> bool {
+    // INSERT statements can be megabytes long. Do not parse every statement a
+    // second time merely to decide whether it produces a result set.
+    if !starts_like_query(sql) {
+        return false;
+    }
     match Parser::parse(sql) {
         Ok(stmts) => stmts.first().is_some_and(statement_returns_rows),
         Err(_) => starts_like_query(sql),
@@ -937,10 +949,9 @@ fn starts_like_query(sql: &str) -> bool {
         .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
         .next()
         .unwrap_or_default();
-    matches!(
-        first.to_ascii_uppercase().as_str(),
-        "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC"
-    )
+    ["SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC"]
+        .iter()
+        .any(|keyword| first.eq_ignore_ascii_case(keyword))
 }
 
 fn build_auth_ok(session_id: &str) -> Message {

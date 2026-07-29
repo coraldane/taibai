@@ -92,8 +92,13 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
         name,
         &table_names,
         || {
+            for table_name in &table_names {
+                engine.batch_writer().drain_table_tail(name, table_name)?;
+                engine
+                    .segment_mgr()
+                    .close_table_state_handles(name, table_name);
+            }
             engine.segment_mgr().invalidate_readers_under(&database_dir);
-            engine.segment_mgr().remove_database_state(name);
             let tombstone =
                 stage_database_directory(engine.data_dir(), name).map_err(|error| {
                     TaibaiError::Storage(format!(
@@ -120,6 +125,7 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
             }
 
             catalogs.remove(name);
+            engine.segment_mgr().remove_database_state(name);
             for (table_name, _) in &table_indexes {
                 engine.batch_writer().clear_memtables(name, table_name);
             }

@@ -28,24 +28,16 @@ impl SegmentManager {
         flush_immediately: bool,
     ) -> Result<u64> {
         if !table_meta.is_partitioned() {
-            return self.bulk_insert_batch_with_partition_inner(
-                db,
-                table,
-                "",
-                &batch,
-                flush_immediately,
+            return self.bulk_insert_batch_with_partition_owned_inner(
+                db, table, "", batch, flush_immediately,
             );
         }
 
         let pk_idx = match table_meta.get_partition_column_index_cached() {
             Some(idx) => idx,
             None => {
-                return self.bulk_insert_batch_with_partition_inner(
-                    db,
-                    table,
-                    "",
-                    &batch,
-                    flush_immediately,
+                return self.bulk_insert_batch_with_partition_owned_inner(
+                    db, table, "", batch, flush_immediately,
                 )
             }
         };
@@ -64,11 +56,11 @@ impl SegmentManager {
             }
         }
         if single_partition {
-            return self.bulk_insert_batch_with_partition_inner(
+            return self.bulk_insert_batch_with_partition_owned_inner(
                 db,
                 table,
                 &first_key,
-                &batch,
+                batch,
                 flush_immediately,
             );
         }
@@ -100,11 +92,11 @@ impl SegmentManager {
             let mut written = 0;
             for (partition_key, start, len) in ranges {
                 let part_batch = slice_batch_fast(&batch, start, len)?;
-                written += self.bulk_insert_batch_with_partition_inner(
+                written += self.bulk_insert_batch_with_partition_owned_inner(
                     db,
                     table,
                     &partition_key,
-                    &part_batch,
+                    part_batch,
                     flush_immediately,
                 )?;
             }
@@ -134,11 +126,11 @@ impl SegmentManager {
             };
             let match_count = mask.iter().filter(|keep| **keep).count();
             let part_batch = filter_batch_by_mask(&batch, &mask, match_count)?;
-            written += self.bulk_insert_batch_with_partition_inner(
+            written += self.bulk_insert_batch_with_partition_owned_inner(
                 db,
                 table,
                 &partition_key,
-                &part_batch,
+                part_batch,
                 flush_immediately,
             )?;
         }
