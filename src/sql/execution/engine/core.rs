@@ -87,12 +87,19 @@ impl Engine {
         super::ddl::recover_table_data_tombstones(data_dir, &catalogs)?;
         super::ddl::recover_rename_tombstones(data_dir, &catalogs)?;
 
+        let row_group_target_rows = segment_config.row_group_target_rows.max(1) as u64;
         let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
         let batch_writer = BatchWriter::new(
             BatchWriterConfig {
-                low_rate_max_rows: auto_compact_config.low_rate_max_rows,
+                // A partial row group remains a durable memtable tail. Once a
+                // full row group has accumulated it can be flushed without
+                // manufacturing a tiny row group from scattered INSERTs.
+                max_rows_per_memtable: row_group_target_rows,
+                low_rate_max_rows: auto_compact_config
+                    .low_rate_max_rows
+                    .max(row_group_target_rows.saturating_sub(1)),
                 low_rate_max_age_secs: auto_compact_config.low_rate_max_age.as_secs(),
                 ..BatchWriterConfig::default()
             },
@@ -145,6 +152,7 @@ impl Engine {
             segment_mgr,
             batch_writer,
             bulk_mode_sessions: AtomicUsize::new(0),
+            bulk_dirty_tables: Mutex::new(HashSet::new()),
             in_flight_operations: AtomicUsize::new(0),
             auth_manager,
             auto_increment_mgr,

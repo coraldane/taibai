@@ -36,35 +36,26 @@ impl Handler {
 
     pub fn flush_on_disconnect(&mut self) {
         if let Some(ref mut session) = self.session {
+            let mut remaining_bulk_sessions = self.engine.bulk_mode_session_count();
             if session.bulk_import_mode {
-                let remaining = self.engine.end_bulk_import();
+                remaining_bulk_sessions = self.engine.end_bulk_import();
                 session.bulk_import_mode = false;
                 session.disable_wal = false;
                 tracing::info!(
-                    remaining_bulk_sessions = remaining,
+                    remaining_bulk_sessions,
                     session_id = %session.session_id_string(),
                     "bulk import session ended on disconnect"
                 );
             }
-            if session.had_writes {
-                // Make cleanup idempotent. Multiple error/close paths may try
-                // to clean the same connection, but its buffers only need one
-                // disconnect flush attempt.
-                session.had_writes = false;
-                if self.engine.is_bulk_mode() {
-                    tracing::info!(
-                        session_id = %session.session_id_string(),
-                        active_bulk_sessions = self.engine.bulk_mode_session_count(),
-                        "deferred disconnect flush while bulk import sessions remain active"
-                    );
-                } else {
-                    match self.engine.flush_all_buffers() {
-                        Ok(n) => {
-                            tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed buffers on disconnect")
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to flush buffers on disconnect")
-                        }
+            session.had_writes = false;
+            if remaining_bulk_sessions == 0 {
+                match self.engine.flush_bulk_dirty_tables() {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed bulk-import dirty tables on disconnect")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to flush bulk-import dirty tables on disconnect")
                     }
                 }
             }
@@ -334,14 +325,17 @@ impl Handler {
             self.engine.bulk_mode_session_count()
         };
 
+        // The reference count has already been released. Keep the connection
+        // state consistent even if flushing a dirty table reports an error;
+        // the dirty-table entry remains queued for a later retry.
+        session.bulk_import_mode = false;
+        session.disable_wal = false;
+
         let flushed = if remaining_sessions == 0 {
-            self.engine.flush_all_buffers()?
+            self.engine.flush_bulk_dirty_tables()?
         } else {
             0
         };
-
-        session.bulk_import_mode = false;
-        session.disable_wal = false;
 
         tracing::info!(
             rows_flushed = flushed,

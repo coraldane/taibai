@@ -17,7 +17,7 @@ use crate::types::scalar::ScalarValue;
 
 use super::constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use super::footer::{parse_segment_footer, reserved_section_offset, ParsedSegmentFooter};
-use super::meta::{append_sidecar_footer, read_latest_sidecar_footer};
+use super::meta::{read_embedded_footer, read_latest_sidecar_footer};
 use super::RowGroupMeta;
 
 struct SegmentFooter {
@@ -227,7 +227,10 @@ impl SegmentReader {
         delete_bitmap: &[u8],
         deleted_row_count: u64,
     ) -> Result<()> {
-        let source = Self::read_footer_source(path, None)?;
+        // Delete rewrites use the embedded footer as the authoritative sealed
+        // snapshot. SegmentManager refreshes the sidecar separately when this
+        // is still an active segment.
+        let source = Self::read_dat_footer_source(path, None)?;
         let res_offset = reserved_section_offset(&source.footer)?;
 
         let mut new_footer = Vec::with_capacity(res_offset + 12 + delete_bitmap.len());
@@ -245,7 +248,7 @@ impl SegmentReader {
         file.write_all(&source.data_end.to_le_bytes())?;
         file.flush()?;
         file.sync_all()?;
-        append_sidecar_footer(path, source.data_end, &new_footer)
+        Ok(())
     }
 
     fn read_footer_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -253,57 +256,37 @@ impl SegmentReader {
     }
 
     fn read_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {
-        if let Some(sidecar) = read_latest_sidecar_footer(path)? {
-            if let Some(file_len) = file_len_hint {
-                if sidecar.data_end > file_len {
-                    return Err(TaibaiError::Storage(format!(
-                        "invalid sidecar data_end {} (file size {}, file: {})",
-                        sidecar.data_end,
-                        file_len,
-                        path.display()
-                    )));
-                }
-            }
-            return Ok(FooterSource {
-                data_end: sidecar.data_end,
-                footer: sidecar.footer,
-            });
-        }
-
-        Self::read_dat_footer_source(path, file_len_hint)
-    }
-
-    fn read_dat_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {
-        let mut file = fs::File::open(path)?;
         let file_len = match file_len_hint {
             Some(len) => len,
-            None => file.metadata()?.len(),
+            None => fs::metadata(path)?.len(),
         };
-        if file_len < SEGMENT_HEADER_SIZE as u64 + 8 {
-            return Err(TaibaiError::Storage(format!(
-                "missing segment footer for {}",
-                path.display()
-            )));
-        }
-
-        file.seek(SeekFrom::Start(file_len - 8))?;
-        let mut offset_buf = [0u8; 8];
-        file.read_exact(&mut offset_buf)?;
-        let data_end = u64::from_le_bytes(offset_buf);
-        if data_end < SEGMENT_HEADER_SIZE as u64 || data_end > file_len - 8 {
-            return Err(TaibaiError::Storage(format!(
-                "invalid segment footer offset {} (file size {}, file: {})",
-                data_end,
+        if let Some(sidecar) = read_latest_sidecar_footer(path)? {
+            if sidecar.data_end >= SEGMENT_HEADER_SIZE as u64
+                && sidecar.data_end <= file_len
+                && parse_segment_footer(&sidecar.footer).is_ok()
+            {
+                return Ok(FooterSource {
+                    data_end: sidecar.data_end,
+                    footer: sidecar.footer,
+                });
+            }
+            tracing::warn!(
+                file = %path.display(),
+                sidecar_data_end = sidecar.data_end,
                 file_len,
-                path.display()
-            )));
+                "ignoring invalid segment sidecar and falling back to embedded footer"
+            );
         }
 
-        let footer_len = (file_len - 8 - data_end) as usize;
-        let mut footer = vec![0u8; footer_len];
-        file.seek(SeekFrom::Start(data_end))?;
-        file.read_exact(&mut footer)?;
-        Ok(FooterSource { data_end, footer })
+        Self::read_dat_footer_source(path, Some(file_len))
+    }
+
+    fn read_dat_footer_source(path: &Path, _file_len_hint: Option<u64>) -> Result<FooterSource> {
+        let source = read_embedded_footer(path)?;
+        Ok(FooterSource {
+            data_end: source.data_end,
+            footer: source.footer,
+        })
     }
 
     pub fn read_column(&self, row_group: usize, column_idx: usize) -> Result<ColumnArray> {

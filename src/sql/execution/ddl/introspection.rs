@@ -595,7 +595,13 @@ pub fn exec_optimize_table(
         .clone();
     drop(catalogs);
 
-    engine.flush_all_buffers()?;
+    if let Some(partition) = partition {
+        for candidate in crate::storage::core::compactor::partition_key_candidates(partition) {
+            engine.flush_partition_buffers(db, table, &candidate)?;
+        }
+    } else {
+        engine.flush_table_buffers(db, table)?;
+    }
 
     let compactor = crate::storage::core::compactor::Compactor::new(
         engine.segment_mgr().clone(),

@@ -4,7 +4,7 @@ use taibai::net::session::Session;
 use taibai::protocol::types::DataType;
 use taibai::sql::execution::engine::{Engine, ExecResult};
 use taibai::storage::core::durable_tail;
-use taibai::storage::segment_manager::SegmentManager;
+use taibai::storage::segment_manager::{SegmentConfig, SegmentManager};
 use taibai::types::array::ColumnArray;
 use taibai::types::batch::{ColumnDef, RecordBatch, Schema};
 use taibai::types::scalar::ScalarValue;
@@ -383,6 +383,100 @@ fn update_invalidates_hot_store_for_following_inserts() {
 }
 
 #[test]
+fn partition_update_seals_and_rewrites_only_the_target_partition() {
+    let (temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE partitioned (id INT32, value INT32) PARTITION BY id",
+        )
+        .expect("create partitioned table");
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine
+        .execute(&mut session, "INSERT INTO partitioned VALUES (1, 10)")
+        .expect("insert target partition row");
+    engine
+        .execute(&mut session, "INSERT INTO partitioned VALUES (2, 20)")
+        .expect("insert sibling partition row");
+    let mut active_before = engine
+        .segment_mgr()
+        .active_partition_keys("main", "partitioned");
+    active_before.sort();
+    assert_eq!(active_before, vec!["1".to_string(), "2".to_string()]);
+
+    let updated = engine
+        .execute(
+            &mut session,
+            "UPDATE partitioned SET value = 99 WHERE id = 1",
+        )
+        .expect("update one partition");
+    match updated {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    assert_eq!(
+        engine
+            .segment_mgr()
+            .active_partition_keys("main", "partitioned"),
+        vec!["2".to_string()]
+    );
+    let table_dir = temp_dir.path().join("main").join("partitioned");
+    let names = SegmentManager::discover_segments(&table_dir)
+        .expect("discover partitioned segments")
+        .into_iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(names.iter().any(|name| name.starts_with("p1_")));
+    assert!(names.iter().any(|name| name.starts_with("p2_")));
+    assert!(names.iter().all(|name| !name.starts_with("seg_")));
+
+    let mut values = collect_i32(
+        engine
+            .execute(&mut session, "SELECT value FROM partitioned")
+            .expect("select partition rows"),
+        0,
+    );
+    values.sort_unstable();
+    assert_eq!(values, vec![20, 99]);
+
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn update_rejects_partition_key_changes_instead_of_misplacing_rows() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE partitioned (id INT32, value INT32) PARTITION BY id",
+        )
+        .expect("create partitioned table");
+    engine
+        .execute(&mut session, "INSERT INTO partitioned VALUES (1, 10)")
+        .expect("insert partition row");
+
+    let error = engine
+        .execute(&mut session, "UPDATE partitioned SET id = 2 WHERE id = 1")
+        .expect_err("partition-key update must be rejected");
+    assert!(error.to_string().contains("updating partition key 'id'"));
+    assert_eq!(
+        collect_i32(
+            engine
+                .execute(&mut session, "SELECT id FROM partitioned")
+                .expect("select unchanged partition row"),
+            0,
+        ),
+        vec![1]
+    );
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
 fn delete_and_replace_do_not_flush_unrelated_low_rate_table() {
     let (temp_dir, engine, mut session) = create_engine();
     engine
@@ -431,8 +525,18 @@ fn delete_and_replace_do_not_flush_unrelated_low_rate_table() {
 }
 
 #[test]
-fn crossing_low_rate_tail_limit_atomically_materializes_one_segment() {
-    let (temp_dir, engine, mut session) = create_engine();
+fn scattered_inserts_materialize_only_at_row_group_target() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new_with_storage_config(
+        temp_dir.path(),
+        "main",
+        SegmentConfig {
+            row_group_target_rows: 1024,
+            ..SegmentConfig::default()
+        },
+    )
+    .expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
     engine
         .execute(&mut session, "CREATE TABLE low_rate (id INT32)")
         .expect("create low-rate table");
@@ -449,31 +553,31 @@ fn crossing_low_rate_tail_limit_atomically_materializes_one_segment() {
 
     let table_dir = temp_dir.path().join("main").join("low_rate");
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int32)]);
-    assert_eq!(
-        durable_tail::recover(&table_dir, &schema)
-            .expect("recover full low-rate tail")
-            .len(),
-        1
-    );
-    assert!(SegmentManager::discover_segments(&table_dir)
-        .expect("discover pre-threshold segments")
-        .is_empty());
-
-    engine
-        .execute(&mut session, "INSERT INTO low_rate VALUES (1024)")
-        .expect("cross low-rate tail threshold");
-    let segments =
-        SegmentManager::discover_segments(&table_dir).expect("discover materialized segment");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let segments = loop {
+        let segments = SegmentManager::discover_segments(&table_dir).expect("discover segments");
+        if !segments.is_empty() || std::time::Instant::now() >= deadline {
+            break segments;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(segments.len(), 1);
     let reader = engine
         .segment_mgr()
         .open_reader(&segments[0])
-        .expect("open materialized segment");
-    assert_eq!(reader.row_count(), 1025);
+        .expect("open full row-group segment");
+    assert_eq!(reader.row_count(), 1024);
     assert_eq!(reader.num_row_groups(), 1);
-    assert!(durable_tail::recover(&table_dir, &schema)
-        .expect("verify materialized tail cleared")
-        .is_empty());
+
+    engine
+        .execute(&mut session, "INSERT INTO low_rate VALUES (1024)")
+        .expect("insert scattered tail row");
+    let segments =
+        SegmentManager::discover_segments(&table_dir).expect("discover materialized segments");
+    assert_eq!(segments.len(), 1);
+    let tails = durable_tail::recover(&table_dir, &schema).expect("recover partial durable tail");
+    assert_eq!(tails.len(), 1);
+    assert_eq!(tails[0].batch.num_rows(), 1);
     assert_eq!(
         collect_i32(
             engine

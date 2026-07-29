@@ -2,6 +2,7 @@ use super::*;
 use crate::protocol::types::DataType;
 use crate::storage::catalog::schema::PartitionType;
 use crate::storage::segment::SegmentReader;
+use crate::storage::segment_manager::SegmentConfig;
 use crate::types::batch::ColumnDef;
 use crate::types::scalar::ScalarValue;
 
@@ -432,6 +433,44 @@ fn optimize_partition_only_rewrites_requested_partition() -> Result<()> {
         read_ids(&table_dir.join("p2024_0003.dat"))?,
         vec![1, 2, 3, 4]
     );
+    Ok(())
+}
+
+#[test]
+fn optimize_uses_configured_row_group_target() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+    let schema = test_schema();
+    write_segment_with_row_group_size(
+        &table_dir.join("seg_00001.dat"),
+        &schema,
+        &[(7, "g"), (5, "e"), (3, "c"), (1, "a")],
+        1,
+    )?;
+    write_segment_with_row_group_size(
+        &table_dir.join("seg_00002.dat"),
+        &schema,
+        &[(8, "h"), (6, "f"), (4, "d"), (2, "b")],
+        1,
+    )?;
+
+    let segment_mgr = Arc::new(SegmentManager::with_config(
+        tmp.path(),
+        SegmentConfig {
+            row_group_target_rows: 3,
+            ..SegmentConfig::default()
+        },
+    )?);
+    let compactor = Compactor::new(Arc::clone(&segment_mgr), tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &test_meta(&schema))?;
+    assert_eq!(stats.rows_written, 8);
+
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments.len(), 1);
+    let reader = SegmentReader::open(&segments[0])?;
+    assert_eq!(reader.num_row_groups(), 3);
+    assert_eq!(read_ids(&segments[0])?, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     Ok(())
 }
 

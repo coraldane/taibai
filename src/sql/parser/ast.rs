@@ -46,6 +46,7 @@ pub enum AlterOperation {
     RenameTable { new_name: String },
     DropPartition { partition_key: String },
     TruncatePartition { partition_key: String },
+    SetHot { hot: HotDef },
     SetTtl { ttl: TtlDef },
     DropTtl,
 }

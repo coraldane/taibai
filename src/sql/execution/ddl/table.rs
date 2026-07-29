@@ -333,7 +333,7 @@ pub fn exec_rebuild_unique_index(
     drop(catalogs);
 
     let table_schema = Schema::new(table_meta.columns.clone());
-    engine.flush_all_buffers()?;
+    engine.flush_table_buffers(db, table)?;
     let mut rebuilt = 0u64;
     engine
         .segment_mgr()
@@ -706,13 +706,13 @@ fn exec_partition_change(
                 ))
             })?;
 
-            // Active writers cover all partitions, so persist their buffers and metadata before
-            // retiring the table state. Inserts append under this same table mutation lock and
-            // cannot race this flush or the partition file staging below.
-            engine.segment_mgr().flush_table_active(db, name)?;
-            engine.segment_mgr().remove_wal(&table_dir);
-            engine.segment_mgr().remove_table_state(db, name);
-            engine.segment_mgr().invalidate_readers_under(&table_dir);
+            // Only the partition being changed must become immutable before
+            // its files are staged. Sibling active writers stay resident and
+            // continue accumulating rows instead of being fragmented by an
+            // unrelated partition operation.
+            engine
+                .segment_mgr()
+                .seal_partition_active_under_table_lock(db, name, &partition_key)?;
             write_before_meta(&operation_dir, &before_meta)?;
             stage_partition_files(&operation_dir, &table_dir, &partition_key)?;
 
@@ -797,6 +797,48 @@ fn exec_partition_change(
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
+fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<ExecResult> {
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let catalog = get_existing_catalog(&mut catalogs, db)?;
+    let before_meta = catalog
+        .get_table(name)
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name)))?
+        .clone();
+    validate_hot_def(&before_meta.columns, name, hot)?;
+
+    engine
+        .segment_mgr()
+        .with_table_mutation_lock(db, name, || {
+            // A normal table may already have resident rows that predate the
+            // hot-store index. Persist that prefix before enabling HOT so a
+            // later indexed memtable read cannot omit those rows.
+            engine
+                .batch_writer()
+                .flush_table_under_table_lock(db, name)?;
+            engine.segment_mgr().flush_table_active(db, name)?;
+
+            let meta = catalog.get_table_mut(name).ok_or_else(|| {
+                TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
+            })?;
+            meta.hot_time_column = Some(hot.time_column.clone());
+            meta.hot_index_column = hot.index_column.clone();
+            meta.hot_close_time = hot.close_time.clone();
+
+            let meta_dir = engine.data_dir().join("meta");
+            if let Err(error) = catalog.save(&meta_dir) {
+                catalog.tables.insert(name.to_string(), before_meta.clone());
+                return Err(error);
+            }
+
+            // Existing durable segments remain authoritative. The resident
+            // store starts empty and is populated only by subsequent inserts.
+            engine.hot_store_manager().remove(db, name);
+            Ok(())
+        })?;
+
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
 pub fn exec_alter_table(
     engine: &Engine,
     db: &str,
@@ -810,11 +852,12 @@ pub fn exec_alter_table(
                 AlterOperation::RenameTable { .. }
                     | AlterOperation::DropPartition { .. }
                     | AlterOperation::TruncatePartition { .. }
+                    | AlterOperation::SetHot { .. }
             )
         })
     {
         return Err(TaibaiError::Sql(
-            "RENAME TABLE, DROP PARTITION, and TRUNCATE PARTITION must be executed as a single ALTER operation"
+            "RENAME TABLE, DROP PARTITION, TRUNCATE PARTITION, and SET HOT must be executed as a single ALTER operation"
                 .into(),
         ));
     }
@@ -829,6 +872,7 @@ pub fn exec_alter_table(
             AlterOperation::TruncatePartition { partition_key } => {
                 return exec_partition_change(engine, db, name, partition_key, false)
             }
+            AlterOperation::SetHot { hot } => return exec_set_hot(engine, db, name, hot),
             _ => {}
         }
     }
@@ -1021,6 +1065,9 @@ pub fn exec_alter_table(
             AlterOperation::TruncatePartition { partition_key } => {
                 let _ = partition_key;
                 unreachable!("filesystem ALTER operations are handled before generic ALTER")
+            }
+            AlterOperation::SetHot { hot: _ } => {
+                unreachable!("SET HOT is handled before generic ALTER")
             }
             AlterOperation::SetTtl { ttl } => {
                 let meta = catalog.get_table_mut(name).ok_or_else(|| {

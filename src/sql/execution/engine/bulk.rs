@@ -1,4 +1,11 @@
 impl Engine {
+    fn mark_bulk_dirty_table(&self, db: &str, table: &str) {
+        self.bulk_dirty_tables
+            .lock()
+            .unwrap()
+            .insert((db.to_string(), table.to_string()));
+    }
+
     pub(crate) fn catalogs(&self) -> &Arc<RwLock<HashMap<String, DatabaseCatalog>>> {
         &self.catalogs
     }
@@ -122,7 +129,8 @@ impl Engine {
         } else {
             None
         };
-        let result = match if self.is_bulk_mode() {
+        let deferred = self.is_bulk_mode();
+        let result = match if deferred {
             self.segment_mgr
                 .bulk_insert_batch_deferred(db, table, batch, disable_wal)
         } else {
@@ -139,6 +147,9 @@ impl Engine {
             }
         };
         if result > 0 {
+            if deferred {
+                self.mark_bulk_dirty_table(db, table);
+            }
             if let (Some(table_meta), Some(batch)) =
                 (table_meta_for_hot.as_ref(), hot_batch.as_ref())
             {
@@ -174,7 +185,8 @@ impl Engine {
         } else {
             None
         };
-        let result = match if self.is_bulk_mode() {
+        let deferred = self.is_bulk_mode();
+        let result = match if deferred {
             self.segment_mgr
                 .bulk_insert_batch_partitioned_deferred(db, table, table_meta, batch)
         } else if table_meta.is_partitioned() {
@@ -194,6 +206,9 @@ impl Engine {
             }
         };
         if result > 0 {
+            if deferred {
+                self.mark_bulk_dirty_table(db, table);
+            }
             if let Some(batch) = hot_batch.as_ref() {
                 self.feed_hot_store_after_batch(
                     db,
@@ -307,6 +322,9 @@ impl Engine {
             }
         };
         drop(catalogs);
+        if result > 0 && (bulk_import_mode || self.is_bulk_mode()) {
+            self.mark_bulk_dirty_table(db, &table_name);
+        }
         if result > 0 && hot_payload_should_feed {
             if let Some(table_meta) = table_meta_for_hot.as_ref() {
                 self.feed_hot_store_after_direct_bulk(

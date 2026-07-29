@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +14,7 @@ use crate::storage::segment::SegmentReader;
 use crate::types::batch::{RecordBatch, Schema};
 
 const TAIL_MAGIC: u32 = 0x5441_494C;
+const TAIL_LOG_MAGIC: u32 = 0x544C_4F47;
 const FLUSH_MAGIC: u32 = 0x464C_5553;
 const TAIL_DIR: &str = "memtable_tail";
 static TAIL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -47,7 +48,7 @@ pub fn persist(table_dir: &Path, id: Uuid, partition_key: &str, batch: &RecordBa
     let tail_dir = table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
     let sequence = next_sequence();
-    let payload = encode_tail(partition_key, batch);
+    let payload = encode_tail_log(partition_key, batch);
     let stem = format!("{}.{}", id.simple(), sequence);
     let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
     let final_path = tail_dir.join(format!("{stem}.tail"));
@@ -55,6 +56,59 @@ pub fn persist(table_dir: &Path, id: Uuid, partition_key: &str, batch: &RecordBa
     write_new_synced(&tmp_path, &payload)?;
     fs::rename(&tmp_path, &final_path)?;
     remove_other_generations(&tail_dir, id, &final_path)?;
+    Ok(())
+}
+
+/// Durably append only the newly inserted rows to an existing memtable tail.
+///
+/// The previous implementation rewrote the complete accumulated memtable for
+/// every INSERT. Repeated single-row INSERTs therefore produced quadratic I/O
+/// and one fsync/rename/delete cycle per ever-growing snapshot. A tail log keeps
+/// the same acknowledgement durability while writing only the statement delta.
+pub fn append(table_dir: &Path, id: Uuid, partition_key: &str, delta: &RecordBatch) -> Result<()> {
+    if delta.num_rows() == 0 {
+        return Ok(());
+    }
+    let tail_dir = table_dir.join(TAIL_DIR);
+    fs::create_dir_all(&tail_dir)?;
+    let existing = newest_live_tail_path(&tail_dir, id)?;
+    let frame = encode_tail_frame(delta);
+
+    if let Some(path) = existing {
+        if read_tail_log_partition_key(&path)?.as_deref() == Some(partition_key) {
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            file.write_all(&frame)?;
+            file.sync_all()?;
+            return Ok(());
+        }
+
+        // One-time migration for tails written by versions that stored a full
+        // snapshot. Keep the old generation until the new log is durable.
+        let bytes = fs::read(&path)?;
+        let (old_partition_key, old_batch) = decode_tail(&bytes, &delta.schema)?;
+        if old_partition_key != partition_key {
+            return Err(TaibaiError::Storage(
+                "durable tail partition key changed while appending".into(),
+            ));
+        }
+        let sequence = next_sequence();
+        let stem = format!("{}.{}", id.simple(), sequence);
+        let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
+        let final_path = tail_dir.join(format!("{stem}.tail"));
+        let mut payload = encode_tail_log(partition_key, &old_batch);
+        payload.extend_from_slice(&frame);
+        write_new_synced(&tmp_path, &payload)?;
+        fs::rename(&tmp_path, &final_path)?;
+        remove_other_generations(&tail_dir, id, &final_path)?;
+        return Ok(());
+    }
+
+    let sequence = next_sequence();
+    let stem = format!("{}.{}", id.simple(), sequence);
+    let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
+    let final_path = tail_dir.join(format!("{stem}.tail"));
+    write_new_synced(&tmp_path, &encode_tail_log(partition_key, delta))?;
+    fs::rename(&tmp_path, &final_path)?;
     Ok(())
 }
 
@@ -201,15 +255,24 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn encode_tail(partition_key: &str, batch: &RecordBatch) -> Vec<u8> {
-    let batch_payload = serialize_batch_for_wal(batch);
-    let mut bytes = Vec::with_capacity(20 + partition_key.len() + batch_payload.len());
-    bytes.extend_from_slice(&TAIL_MAGIC.to_le_bytes());
+fn encode_tail_log(partition_key: &str, batch: &RecordBatch) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(12 + partition_key.len());
+    bytes.extend_from_slice(&TAIL_LOG_MAGIC.to_le_bytes());
     bytes.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
     bytes.extend_from_slice(partition_key.as_bytes());
-    bytes.extend_from_slice(&(batch_payload.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&batch_payload);
-    append_crc(bytes)
+    bytes.extend_from_slice(&encode_tail_frame(batch));
+    bytes
+}
+
+fn encode_tail_frame(batch: &RecordBatch) -> Vec<u8> {
+    let payload = serialize_batch_for_wal(batch);
+    let mut frame = Vec::with_capacity(12 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    let mut hasher = Hasher::new();
+    hasher.update(&frame);
+    frame.extend_from_slice(&hasher.finalize().to_le_bytes());
+    frame
 }
 
 fn encode_flush_target(segment_file_name: &str) -> Vec<u8> {
@@ -246,6 +309,9 @@ fn verify_crc(bytes: &[u8]) -> Result<&[u8]> {
 }
 
 fn decode_tail(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
+    if bytes.len() >= 4 && u32::from_le_bytes(bytes[0..4].try_into().unwrap()) == TAIL_LOG_MAGIC {
+        return decode_tail_log(bytes, schema);
+    }
     let body = verify_crc(bytes)?;
     if body.len() < 16 {
         return Err(TaibaiError::Storage("durable tail is truncated".into()));
@@ -273,6 +339,90 @@ fn decode_tail(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
     }
     let batch = deserialize_batch_from_wal(&body[batch_start..batch_end], schema)?;
     Ok((partition_key, batch))
+}
+
+fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
+    if bytes.len() < 8 {
+        return Err(TaibaiError::Storage("durable tail log is truncated".into()));
+    }
+    let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let mut offset = 8usize.saturating_add(partition_len);
+    if offset > bytes.len() {
+        return Err(TaibaiError::Storage(
+            "invalid durable tail log header".into(),
+        ));
+    }
+    let partition_key = std::str::from_utf8(&bytes[8..offset])
+        .map_err(|_| TaibaiError::Storage("invalid durable tail partition key".into()))?
+        .to_string();
+    let mut recovered = RecordBatch::new(schema.clone());
+    let mut complete_frames = 0usize;
+    while offset < bytes.len() {
+        // A crash may leave the final append incomplete. All preceding frames
+        // were individually synced and remain a valid recovery prefix.
+        if bytes.len().saturating_sub(offset) < 12 {
+            break;
+        }
+        let payload_len =
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
+        let payload_start = offset + 8;
+        let payload_end = payload_start.saturating_add(payload_len);
+        let frame_end = payload_end.saturating_add(4);
+        if frame_end > bytes.len() {
+            break;
+        }
+        let mut hasher = Hasher::new();
+        hasher.update(&bytes[offset..payload_end]);
+        let stored_crc = u32::from_le_bytes(bytes[payload_end..frame_end].try_into().unwrap());
+        if stored_crc != hasher.finalize() {
+            return Err(TaibaiError::Storage(
+                "durable tail log frame checksum mismatch".into(),
+            ));
+        }
+        let batch = deserialize_batch_from_wal(&bytes[payload_start..payload_end], schema)?;
+        append_batch(&mut recovered, &batch)?;
+        complete_frames += 1;
+        offset = frame_end;
+    }
+    if complete_frames == 0 {
+        return Err(TaibaiError::Storage(
+            "durable tail log contains no complete frame".into(),
+        ));
+    }
+    Ok((partition_key, recovered))
+}
+
+fn append_batch(target: &mut RecordBatch, batch: &RecordBatch) -> Result<()> {
+    for col_idx in 0..batch.num_columns() {
+        let source = batch
+            .column(col_idx)
+            .ok_or_else(|| TaibaiError::Storage("durable tail delta is missing a column".into()))?;
+        let destination = target
+            .column_mut(col_idx)
+            .ok_or_else(|| TaibaiError::Storage("durable tail schema column mismatch".into()))?;
+        destination.extend(source)?;
+    }
+    Ok(())
+}
+
+fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 8];
+    if let Err(error) = file.read_exact(&mut header) {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC {
+        return Ok(None);
+    }
+    let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let mut partition = vec![0u8; partition_len];
+    file.read_exact(&mut partition)?;
+    String::from_utf8(partition)
+        .map(Some)
+        .map_err(|_| TaibaiError::Storage("invalid durable tail partition key".into()))
 }
 
 fn decode_flush_target(bytes: &[u8]) -> Result<String> {
@@ -350,6 +500,30 @@ fn generations_for_id(tail_dir: &Path, id: Uuid) -> Result<Vec<Generation>> {
     Ok(generations)
 }
 
+fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
+    let mut generations = generations_for_id(tail_dir, id)?;
+    generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+    for generation in generations {
+        match generation.kind {
+            GenerationKind::Tail => return Ok(Some(generation.path)),
+            GenerationKind::Clear => return Ok(None),
+            GenerationKind::Flush => {
+                let Ok(bytes) = fs::read(&generation.path) else {
+                    continue;
+                };
+                let Ok(segment_name) = decode_flush_target(&bytes) else {
+                    continue;
+                };
+                let segment_path = tail_dir.parent().unwrap_or(tail_dir).join(segment_name);
+                if segment_path.is_file() && SegmentReader::open(&segment_path).is_ok() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn remove_other_generations(tail_dir: &Path, id: Uuid, keep_path: &Path) -> Result<()> {
     for generation in generations_for_id(tail_dir, id)? {
         if generation.path != keep_path {
@@ -412,6 +586,73 @@ mod tests {
         clear(temp.path(), id)?;
         assert!(recover(temp.path(), &schema)?.is_empty());
         assert!(!has_tail(temp.path(), id));
+        Ok(())
+    }
+
+    #[test]
+    fn appended_tail_deltas_recover_as_one_batch() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        append(temp.path(), id, "2026", &test_batch(&schema, &[1])?)?;
+        append(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
+
+        let recovered = recover(temp.path(), &schema)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].partition_key, "2026");
+        assert_eq!(recovered[0].batch.num_rows(), 3);
+        assert_eq!(
+            recovered[0].batch.scalar(2, 0),
+            Some(ScalarValue::Int64(Some(3)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn appending_migrates_legacy_snapshot_tail() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        let partition_key = "legacy";
+        let legacy_batch = test_batch(&schema, &[1])?;
+        let batch_payload = serialize_batch_for_wal(&legacy_batch);
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&TAIL_MAGIC.to_le_bytes());
+        legacy.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
+        legacy.extend_from_slice(partition_key.as_bytes());
+        legacy.extend_from_slice(&(batch_payload.len() as u64).to_le_bytes());
+        legacy.extend_from_slice(&batch_payload);
+        let legacy = append_crc(legacy);
+        let tail_dir = temp.path().join(TAIL_DIR);
+        fs::create_dir_all(&tail_dir)?;
+        fs::write(tail_dir.join(format!("{}.1.tail", id.simple())), legacy)?;
+
+        append(temp.path(), id, partition_key, &test_batch(&schema, &[2])?)?;
+        let recovered = recover(temp.path(), &schema)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].batch.num_rows(), 2);
+        assert_eq!(
+            recovered[0].batch.scalar(1, 0),
+            Some(ScalarValue::Int64(Some(2)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_ignores_incomplete_final_tail_frame() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        append(temp.path(), id, "", &test_batch(&schema, &[1])?)?;
+        let tail_path =
+            newest_live_tail_path(&temp.path().join(TAIL_DIR), id)?.expect("tail should exist");
+        let mut file = fs::OpenOptions::new().append(true).open(tail_path)?;
+        file.write_all(&[0x08, 0x00, 0x00, 0x00])?;
+        drop(file);
+
+        let recovered = recover(temp.path(), &schema)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].batch.num_rows(), 1);
         Ok(())
     }
 

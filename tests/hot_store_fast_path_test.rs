@@ -725,6 +725,200 @@ fn hot_clause_indexes_named_column_and_echoes() {
 }
 
 #[test]
+fn alter_table_set_hot_preserves_existing_rows_and_accelerates_future_inserts() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE t_stock_minute (
+                    id INT64,
+                    gmt_create TIMESTAMP,
+                    security_id VARCHAR NOT NULL,
+                    deal_date INT32 NOT NULL,
+                    deal_time INT32 NOT NULL,
+                    close_px INT32
+                ) CLUSTER BY (deal_date, security_id, deal_time)
+                  PARTITION BY YEAR(deal_date)",
+            )
+            .expect("create ordinary minute table");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO t_stock_minute VALUES
+                 (1, 1785310200000000, '000001.SZ', 20260729, 93000, 10)",
+            )
+            .expect("insert row before enabling HOT");
+
+        let before = engine
+            .get_table_meta("main", "t_stock_minute")
+            .expect("ordinary table metadata");
+        assert_eq!(before.row_count, 1);
+        assert!(before.hot_time_column.is_none());
+        assert!(engine
+            .hot_store_manager()
+            .get("main", "t_stock_minute")
+            .is_none());
+
+        engine
+            .execute(
+                &mut session,
+                "ALTER TABLE t_stock_minute
+                 SET HOT BY (gmt_create)
+                 INDEX (security_id)
+                 CLOSE AT '15:30'",
+            )
+            .expect("enable HOT on existing table");
+
+        let altered = engine
+            .get_table_meta("main", "t_stock_minute")
+            .expect("altered table metadata");
+        assert_eq!(altered.row_count, before.row_count);
+        assert_eq!(altered.segment_count, before.segment_count);
+        assert_eq!(altered.hot_time_column.as_deref(), Some("gmt_create"));
+        assert_eq!(altered.hot_index_column.as_deref(), Some("security_id"));
+        assert_eq!(altered.hot_close_time.as_deref(), Some("15:30"));
+        assert!(
+            engine
+                .hot_store_manager()
+                .get("main", "t_stock_minute")
+                .is_none(),
+            "ALTER must not backfill historical rows into the resident hot store"
+        );
+        assert_eq!(
+            collect_count(
+                engine
+                    .execute(&mut session, "SELECT COUNT(*) FROM t_stock_minute")
+                    .expect("count after ALTER")
+            ),
+            1
+        );
+
+        let show = engine
+            .execute(&mut session, "SHOW CREATE TABLE t_stock_minute")
+            .expect("show altered definition");
+        let ExecResult::Query { batches, .. } = show else {
+            panic!("expected SHOW CREATE query result");
+        };
+        let create_sql = batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).filter_map(|row| batch.scalar(row, 1)))
+            .find_map(|value| match value {
+                ScalarValue::VarChar(Some(sql)) => Some(sql),
+                _ => None,
+            })
+            .expect("SHOW CREATE SQL");
+        assert!(create_sql.contains("HOT BY (gmt_create) INDEX (security_id) CLOSE AT '15:30'"));
+
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO t_stock_minute VALUES
+                 (2, 1785310260000000, '000001.SZ', 20260729, 93100, 11)",
+            )
+            .expect("insert row after enabling HOT");
+        assert_eq!(
+            engine
+                .hot_store_manager()
+                .get("main", "t_stock_minute")
+                .expect("future insert should create hot store")
+                .row_count(),
+            1,
+            "the historical row must stay on disk while only the new row becomes resident"
+        );
+        assert_eq!(
+            collect_count(
+                engine
+                    .execute(
+                        &mut session,
+                        "SELECT COUNT(*) FROM t_stock_minute
+                         WHERE security_id = '000001.SZ' AND deal_date = 20260729",
+                    )
+                    .expect("query persisted and resident rows together")
+            ),
+            2
+        );
+        engine.segment_mgr().shutdown();
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    let restored = engine
+        .get_table_meta("main", "t_stock_minute")
+        .expect("restored HOT metadata");
+    assert_eq!(restored.hot_time_column.as_deref(), Some("gmt_create"));
+    assert_eq!(restored.hot_index_column.as_deref(), Some("security_id"));
+    assert_eq!(restored.hot_close_time.as_deref(), Some("15:30"));
+    assert_eq!(
+        collect_count(
+            engine
+                .execute(&mut session, "SELECT COUNT(*) FROM t_stock_minute")
+                .expect("count after restart")
+        ),
+        2
+    );
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn alter_table_set_hot_rejects_invalid_definition_without_changing_table() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ordinary_ticks (
+                id INT64,
+                gmt_create VARCHAR,
+                security_id VARCHAR
+            )",
+        )
+        .expect("create ordinary table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO ordinary_ticks VALUES (1, '2026-07-29 09:30:00', '000001.SZ')",
+        )
+        .expect("insert ordinary row");
+
+    let error = engine
+        .execute(
+            &mut session,
+            "ALTER TABLE ordinary_ticks
+             SET HOT BY (gmt_create)
+             INDEX (security_id)
+             CLOSE AT '15:30'",
+        )
+        .expect_err("non-timestamp HOT column must fail");
+    assert!(error.to_string().contains("must be TIMESTAMP"));
+
+    let unchanged = engine
+        .get_table_meta("main", "ordinary_ticks")
+        .expect("unchanged metadata");
+    assert!(unchanged.hot_time_column.is_none());
+    assert!(unchanged.hot_index_column.is_none());
+    assert!(unchanged.hot_close_time.is_none());
+    assert_eq!(unchanged.row_count, 1);
+    assert_eq!(
+        collect_count(
+            engine
+                .execute(&mut session, "SELECT COUNT(*) FROM ordinary_ticks")
+                .expect("count unchanged table")
+        ),
+        1
+    );
+    assert!(engine
+        .hot_store_manager()
+        .get("main", "ordinary_ticks")
+        .is_none());
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
 fn hot_count_by_index_column_uses_resident_index() {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");

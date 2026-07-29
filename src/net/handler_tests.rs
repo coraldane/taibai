@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::segment_manager::SegmentManager;
 
 #[test]
 fn query_log_classifier_only_tracks_result_set_queries() {
@@ -168,6 +169,84 @@ fn bulk_import_disconnect_releases_only_that_connection() {
     ok_rows(&second.handle_stop_bulk_import().unwrap());
     assert!(!engine.is_bulk_mode());
     assert_eq!(engine.bulk_mode_session_count(), 0);
+}
+
+#[test]
+fn ordinary_disconnect_does_not_materialize_low_rate_inserts() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE low_rate (id INT64)",
+        )
+        .unwrap();
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "INSERT INTO low_rate VALUES (1)",
+        )
+        .unwrap();
+    handler.session.as_mut().unwrap().had_writes = true;
+
+    handler.flush_on_disconnect();
+
+    let table_dir = dir.path().join("main").join("low_rate");
+    assert!(SegmentManager::discover_segments(&table_dir)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn stopping_bulk_import_flushes_only_tables_written_in_bulk_mode() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE bulk_target (id INT64)",
+        )
+        .unwrap();
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE low_rate (id INT64)",
+        )
+        .unwrap();
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "INSERT INTO low_rate VALUES (1)",
+        )
+        .unwrap();
+
+    ok_rows(
+        &handler
+            .handle_start_bulk_import("START BULK IMPORT")
+            .unwrap(),
+    );
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "INSERT INTO bulk_target VALUES (2)",
+        )
+        .unwrap();
+    ok_rows(&handler.handle_stop_bulk_import().unwrap());
+
+    let target_dir = dir.path().join("main").join("bulk_target");
+    let low_rate_dir = dir.path().join("main").join("low_rate");
+    assert!(!SegmentManager::discover_segments(&target_dir)
+        .unwrap()
+        .is_empty());
+    assert!(SegmentManager::discover_segments(&low_rate_dir)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

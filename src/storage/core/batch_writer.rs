@@ -225,9 +225,12 @@ impl BatchWriter {
                 .get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
         log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
         let append_start = Instant::now();
-        mt.append_owned(batch)?;
         if txn_id == 0 {
-            if let Err(error) = self.persist_memtable_tail(&mt) {
+            // Keep the input batch alive so only this INSERT's delta is added
+            // to the durable tail. Rewriting mt.read_snapshot() here made a
+            // stream of small INSERTs quadratic in both serialization and I/O.
+            mt.append(&batch)?;
+            if let Err(error) = self.append_memtable_tail(&mt, &batch) {
                 tracing::warn!(
                     db,
                     table,
@@ -235,17 +238,9 @@ impl BatchWriter {
                     "durable tail write failed; flushing target memtable"
                 );
                 Self::flush_memtable_inner(&self.segment_mgr, &mt, true)?;
-            } else if mt.row_count() > self.config.low_rate_max_rows
-                && crate::storage::core::durable_tail::has_tail(
-                    &self.segment_mgr.table_dir(db, table),
-                    mt.id(),
-                )
-            {
-                // Crossing the durable low-rate bound materializes one
-                // reasonably sized segment instead of growing the tail
-                // without limit.
-                Self::flush_memtable_inner(&self.segment_mgr, &mt, true)?;
             }
+        } else {
+            mt.append_owned(batch)?;
         }
         log_insert_profile(
             "memtable_append",
@@ -281,13 +276,6 @@ impl BatchWriter {
                         error = %error,
                         "committed durable tail write failed; flushing target memtable"
                     );
-                    Self::flush_memtable_inner(&self.segment_mgr, memtable, true)?;
-                } else if memtable.row_count() > self.config.low_rate_max_rows
-                    && crate::storage::core::durable_tail::has_tail(
-                        &self.segment_mgr.table_dir(memtable.db(), memtable.table()),
-                        memtable.id(),
-                    )
-                {
                     Self::flush_memtable_inner(&self.segment_mgr, memtable, true)?;
                 }
                 Ok(())
@@ -335,6 +323,20 @@ impl BatchWriter {
         for mt in mts {
             Self::flush_memtable(&self.segment_mgr, &mt)?;
         }
+        Ok(())
+    }
+
+    pub fn flush_partition(&self, db: &str, table: &str, partition_key: &str) -> Result<()> {
+        let mts = self
+            .memtable_mgr
+            .get_by_table(db, table)
+            .into_iter()
+            .filter(|memtable| memtable.partition_key() == partition_key)
+            .collect::<Vec<_>>();
+        for mt in mts {
+            Self::flush_memtable(&self.segment_mgr, &mt)?;
+        }
+        self.memtable_mgr.remove_flushed();
         Ok(())
     }
 
@@ -414,11 +416,6 @@ impl BatchWriter {
             return Ok(());
         }
         let table_dir = self.segment_mgr.table_dir(memtable.db(), memtable.table());
-        if memtable.row_count() > self.config.low_rate_max_rows
-            && !crate::storage::core::durable_tail::has_tail(&table_dir, memtable.id())
-        {
-            return Ok(());
-        }
         let Some(batch) = memtable.read_snapshot() else {
             return Ok(());
         };
@@ -427,6 +424,25 @@ impl BatchWriter {
             memtable.id(),
             memtable.partition_key(),
             &batch,
+        )
+    }
+
+    fn append_memtable_tail(
+        &self,
+        memtable: &crate::storage::core::memtable::MemTable,
+        delta: &RecordBatch,
+    ) -> Result<()> {
+        if memtable.state() != MemTableState::Pending
+            || memtable.is_transactional()
+            || memtable.visibility() != crate::storage::core::memtable::TxnVisibility::Committed
+        {
+            return Ok(());
+        }
+        crate::storage::core::durable_tail::append(
+            &self.segment_mgr.table_dir(memtable.db(), memtable.table()),
+            memtable.id(),
+            memtable.partition_key(),
+            delta,
         )
     }
 

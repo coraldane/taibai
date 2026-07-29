@@ -182,7 +182,16 @@ pub fn exec_delete(
 
     let resolved_where_clause = resolve_in_subqueries(engine, db, where_clause)?;
 
-    engine.flush_table_buffers(db, table)?;
+    let target_partition_key =
+        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
+    if let Some(partition_key) = target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        engine.flush_partition_buffers(db, table, partition_key)?;
+    } else {
+        engine.flush_table_buffers(db, table)?;
+    }
 
     let table_dir = engine.data_dir().join(db).join(table);
     if !table_dir.exists() {
@@ -299,7 +308,11 @@ pub fn exec_delete(
     })?;
 
     if total_deleted > 0 {
-        let unique_index_tombstones = collect_unique_index_tombstones(&mgr, &table_dir)?;
+        let unique_index_tombstones = if table_meta.unique_indexes.is_empty() {
+            Vec::new()
+        } else {
+            collect_unique_index_tombstones(&mgr, &table_dir)?
+        };
         for index in &table_meta.unique_indexes {
             engine.index_manager().append_unique_index_tombstones(
                 db,
@@ -628,7 +641,7 @@ fn segment_may_match(
     (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
 }
 
-fn prune_segments_by_partition(
+pub(crate) fn prune_segments_by_partition(
     segment_files: Vec<PathBuf>,
     where_clause: &Option<Expr>,
     schema: &Schema,
@@ -905,7 +918,7 @@ fn set_tighter_upper(
     }
 }
 
-fn delete_partition_eq_key(
+pub(crate) fn delete_partition_eq_key(
     where_clause: &Option<Expr>,
     schema: &Schema,
     table_meta: &TableMeta,

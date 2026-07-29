@@ -356,8 +356,14 @@ fn stage_partition_files(
             for candidate in [
                 path.clone(),
                 crate::storage::segment::meta::sidecar_meta_path(&path),
-                path.with_extension("meta"),
             ] {
+                if candidate.exists() && seen.insert(candidate.clone()) {
+                    paths.push(candidate);
+                }
+            }
+            if let Some(candidate) =
+                crate::storage::segment::meta::legacy_partition_sidecar_meta_path(&path)
+            {
                 if candidate.exists() && seen.insert(candidate.clone()) {
                     paths.push(candidate);
                 }

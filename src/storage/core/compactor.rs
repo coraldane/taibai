@@ -17,16 +17,6 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
 
-// Preserve the table's fine-grained query pruning behavior. The speedup in
-// clustered OPTIMIZE comes from contiguous column preload and index-only
-// sorting, not from making output row groups coarser.
-const COMPACT_ROW_GROUP_SIZE: usize = 8192;
-// Gather more rows than one output row group at a time. SegmentWriter still
-// splits the batch into COMPACT_ROW_GROUP_SIZE row groups, but this reduces
-// per-chunk source grouping and per-column dispatch overhead during optimize.
-const WRITE_GATHER_CHUNK_ROWS: usize = COMPACT_ROW_GROUP_SIZE * 8;
-const WRITE_PROGRESS_ROWS: usize = WRITE_GATHER_CHUNK_ROWS * 16;
-
 #[derive(Debug, Clone, Copy)]
 struct RowRef {
     batch_idx: usize,
@@ -66,7 +56,7 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        self.compact_table(db, table, table_meta, true, false)
+        self.compact_table(db, table, table_meta, true, true)
     }
 
     /// Rewrite segments to purge delete bitmaps without paying the cost of a
@@ -116,6 +106,7 @@ impl Compactor {
         } else {
             &[]
         };
+        let output_row_group_rows = self.segment_mgr.row_group_target_rows();
         let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
             if seal_active {
                 self.segment_mgr
@@ -164,7 +155,7 @@ impl Compactor {
                     if sort_key_indices.is_empty() && files.len() == 1 {
                         let reader = self.segment_mgr.open_reader_cached(&files[0])?;
                         let compact_row_groups =
-                            reader.row_count().div_ceil(COMPACT_ROW_GROUP_SIZE as u64) as usize;
+                            reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
                         let needs_row_group_compaction =
                             reader.num_row_groups() > compact_row_groups.max(1);
                         if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
@@ -187,6 +178,7 @@ impl Compactor {
                         &schema,
                         sort_key_indices,
                         &cluster_key_indices,
+                        output_row_group_rows,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -252,7 +244,12 @@ impl Compactor {
 
         let schema = Schema::new(table_meta.columns.clone());
         let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
+        let output_row_group_rows = self.segment_mgr.row_group_target_rows();
         let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+            for candidate in &candidates {
+                self.segment_mgr
+                    .seal_partition_active_under_table_lock(db, table, candidate)?;
+            }
             let segment_files = self
                 .segment_mgr
                 .discover_inactive_segments(db, table, &table_dir)?;
@@ -310,6 +307,7 @@ impl Compactor {
                 &schema,
                 &cluster_key_indices,
                 &cluster_key_indices,
+                output_row_group_rows,
             )
         })?;
 
@@ -339,6 +337,7 @@ impl Compactor {
         schema: &Schema,
         sort_key_indices: &[usize],
         bloom_column_indices: &[usize],
+        output_row_group_rows: usize,
     ) -> Result<CompactStats> {
         // The clustered path follows the original Go implementation's
         // index-only sort design: concatenate each decoded column into one
@@ -538,6 +537,7 @@ impl Compactor {
             &source_row_groups,
             &row_refs,
             &sorted_indices,
+            output_row_group_rows,
         );
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
@@ -590,13 +590,16 @@ impl Compactor {
         source_row_groups: &[SourceRowGroup],
         row_refs: &[RowRef],
         sorted_indices: &[u32],
+        output_row_group_rows: usize,
     ) -> Result<()> {
         let mut writer = SegmentWriter::create_with_bloom_columns(
             path,
             schema.clone(),
-            COMPACT_ROW_GROUP_SIZE,
+            output_row_group_rows,
             bloom_column_indices,
         )?;
+        let write_gather_chunk_rows = output_row_group_rows.saturating_mul(8).max(1);
+        let write_progress_rows = write_gather_chunk_rows.saturating_mul(16).max(1);
         let mut rows_written = 0usize;
         let projection = (0..schema.num_columns()).collect::<Vec<_>>();
         // Non-sorting cleanup preserves source order, so a small cache remains
@@ -612,13 +615,13 @@ impl Compactor {
             source_row_groups = source_row_groups.len(),
             preloaded_contiguous_columns = preloaded_batch.is_some(),
             fallback_cache_capacity = row_group_cache.capacity(),
-            chunk_rows = WRITE_GATHER_CHUNK_ROWS,
-            output_row_group_rows = COMPACT_ROW_GROUP_SIZE,
+            chunk_rows = write_gather_chunk_rows,
+            output_row_group_rows,
             "compact write using index-only gather"
         );
 
         let total_rows = if sort_key_indices.is_empty() {
-            for chunk in row_refs.chunks(WRITE_GATHER_CHUNK_ROWS) {
+            for chunk in row_refs.chunks(write_gather_chunk_rows) {
                 let batch = self.gather_cached_chunk(
                     schema,
                     source_row_groups,
@@ -635,11 +638,11 @@ impl Compactor {
                     "missing contiguous source columns for clustered optimization".to_string(),
                 )
             })?;
-            for chunk in sorted_indices.chunks(WRITE_GATHER_CHUNK_ROWS) {
+            for chunk in sorted_indices.chunks(write_gather_chunk_rows) {
                 let batch = gather_global_chunk(schema, source, chunk)?;
                 rows_written += batch.num_rows();
                 writer.write_batch_parallel(&batch)?;
-                if rows_written.is_multiple_of(WRITE_PROGRESS_ROWS) {
+                if rows_written.is_multiple_of(write_progress_rows) {
                     let progress_pct = rows_written as f64 * 100.0 / sorted_indices.len() as f64;
                     tracing::info!(
                         db,
@@ -1373,7 +1376,7 @@ fn group_segments_by_partition(
     groups
 }
 
-fn partition_key_candidates(raw: &str) -> Vec<String> {
+pub(crate) fn partition_key_candidates(raw: &str) -> Vec<String> {
     let key = raw.trim();
     let mut candidates = vec![key.to_string()];
     if key.len() > 1

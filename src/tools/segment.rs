@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
-use crate::storage::segment::meta::read_latest_sidecar_footer;
+use crate::storage::segment::meta::{read_embedded_footer, read_latest_sidecar_footer};
 use crate::storage::segment::writer::VALUE_SET_EXTENSION_MAGIC;
 use crate::storage::segment::{
     decode_scalar_with_tag, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION,
@@ -91,21 +91,11 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         )));
     }
 
-    let Some(sidecar) = read_latest_sidecar_footer(path)? else {
-        return Err(TaibaiError::Storage(format!(
-            "missing segment meta sidecar for {}",
-            path.display()
-        )));
+    let footer_source = match read_latest_sidecar_footer(path)? {
+        Some(sidecar) if sidecar.data_end <= file_size => sidecar,
+        _ => read_embedded_footer(path)?,
     };
-    if sidecar.data_end > file_size {
-        return Err(TaibaiError::Storage(format!(
-            "invalid sidecar data_end {} (file size {}, file: {})",
-            sidecar.data_end,
-            file_size,
-            path.display()
-        )));
-    }
-    let footer_data = sidecar.footer;
+    let footer_data = footer_source.footer;
 
     let mut cursor = Cursor::new(footer_data.as_slice());
 

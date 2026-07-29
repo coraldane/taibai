@@ -16,7 +16,7 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::constants::{FOOTER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
-use super::meta::{append_sidecar_footer, remove_sidecar_meta};
+use super::meta::remove_sidecar_meta;
 
 pub(crate) const VALUE_SET_EXTENSION_MAGIC: u32 = 0x5354_4958; // STIX
 pub(crate) const VALUE_SET_MAX_DISTINCT: usize = 1024;
@@ -286,7 +286,7 @@ impl SegmentWriter {
         self.file.write_all(&data_end.to_le_bytes())?;
         self.file.flush()?;
         self.file.sync_all()?;
-        append_sidecar_footer(&self.path, data_end, &footer)?;
+        remove_sidecar_meta(&self.path)?;
 
         tracing::debug!(
             path = %self.path.display(),

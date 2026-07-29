@@ -4,6 +4,7 @@ mod cluster_meta_cache;
 mod config;
 mod helpers;
 mod reader_cache;
+mod segment_meta_cache;
 mod state;
 
 use std::collections::{HashMap, HashSet};
@@ -20,8 +21,8 @@ use crate::storage::bulk_payload::{
 use crate::storage::core::wal::WalWriter;
 use crate::storage::partition::partition_function::compute_partition_key_from_scalar;
 use crate::storage::segment::meta::{
-    append_sidecar_footer, read_latest_segment_meta, read_latest_sidecar_footer,
-    remove_sidecar_meta, sidecar_meta_path, SegmentMetaSnapshot,
+    append_sidecar_footer, read_embedded_footer, read_embedded_segment_meta, remove_sidecar_meta,
+    sidecar_meta_path, SegmentMetaSnapshot,
 };
 use crate::storage::segment::{
     encode_segment_header, store, SegmentReader, SegmentWriter, SEGMENT_HEADER_SIZE,
@@ -44,6 +45,7 @@ use helpers::{
     is_transient_footer_error, slice_batch_fast,
 };
 use reader_cache::ReaderCache;
+use segment_meta_cache::SegmentMetaCache;
 use state::TableSegmentState;
 
 fn same_segment_path(a: &Path, b: &Path) -> bool {
@@ -76,6 +78,7 @@ pub struct SegmentManager {
     data_dir: PathBuf,
     tables: RwLock<HashMap<String, Arc<TableSegmentState>>>,
     reader_cache: Mutex<ReaderCache>,
+    segment_meta_cache: Mutex<SegmentMetaCache>,
     cluster_meta_cache: Mutex<ClusterMetaCache>,
     flush_stop: Arc<AtomicBool>,
     flush_paused: Arc<AtomicBool>,

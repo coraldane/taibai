@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher;
@@ -9,7 +9,7 @@ use crate::storage::partition::partition::parse_partition_key;
 use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::writer::encode_segment_footer;
-use crate::storage::segment::RowGroupMeta;
+use crate::storage::segment::{RowGroupMeta, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use crate::types::batch::Schema;
 
 const SIDECAR_MAGIC: u32 = 0x4D58_4D54;
@@ -41,62 +41,108 @@ pub struct SegmentMetaSnapshot {
 }
 
 pub fn sidecar_meta_path(segment_path: &Path) -> PathBuf {
+    segment_path.with_extension("meta")
+}
+
+/// Return the partition-wide sidecar path used by Taibai 0.1.5-0.1.8.
+///
+/// New writes and reads use one sidecar per segment. The shared path is
+/// retained only so partition DDL can clean up files left by older releases.
+pub fn legacy_partition_sidecar_meta_path(segment_path: &Path) -> Option<PathBuf> {
     if let Some(file_name) = segment_path.file_name().and_then(|name| name.to_str()) {
         if let Some(partition_key) = parse_partition_key(file_name) {
             if let Some(parent) = segment_path.parent() {
-                return parent.join(format!("p{}.meta", partition_key));
+                return Some(parent.join(format!("p{}.meta", partition_key)));
             }
         }
     }
-    segment_path.with_extension("meta")
-}
-
-fn legacy_sidecar_meta_path(segment_path: &Path) -> PathBuf {
-    segment_path.with_extension("meta")
+    None
 }
 
 pub fn read_latest_sidecar_footer(segment_path: &Path) -> Result<Option<SidecarFooter>> {
-    if let Some(sidecar) =
-        read_latest_sidecar_footer_from(&sidecar_meta_path(segment_path), segment_path)?
-    {
-        return Ok(Some(sidecar));
-    }
-
-    let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
-    if legacy_meta_path != sidecar_meta_path(segment_path) {
-        return read_latest_sidecar_footer_from(&legacy_meta_path, segment_path);
-    }
-
-    Ok(None)
+    read_latest_sidecar_footer_from(&sidecar_meta_path(segment_path))
 }
 
 pub fn read_latest_segment_meta(segment_path: &Path) -> Result<Option<SegmentMetaSnapshot>> {
     let Some(sidecar) = read_latest_sidecar_footer(segment_path)? else {
         return Ok(None);
     };
-    let parsed = parse_segment_footer(&sidecar.footer)?;
-    Ok(Some(SegmentMetaSnapshot {
-        data_end: sidecar.data_end,
+    Ok(Some(segment_meta_snapshot(sidecar)?))
+}
+
+/// Read only the embedded footer at the end of a segment file.
+///
+/// This path deliberately avoids mmap and never reads column payload bytes. It
+/// is used for sealed segments, whose embedded footer is the authoritative
+/// metadata snapshot after their temporary sidecar has been removed.
+pub fn read_embedded_footer(segment_path: &Path) -> Result<SidecarFooter> {
+    let mut file = fs::File::open(segment_path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < SEGMENT_HEADER_SIZE as u64 + 8 {
+        return Err(TaibaiError::Storage(format!(
+            "missing embedded segment footer for {}",
+            segment_path.display()
+        )));
+    }
+
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header)?;
+    let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if magic != SEGMENT_MAGIC || version != SEGMENT_VERSION {
+        return Err(TaibaiError::Storage(format!(
+            "invalid segment header for {}",
+            segment_path.display()
+        )));
+    }
+
+    file.seek(SeekFrom::End(-8))?;
+    let mut offset = [0u8; 8];
+    file.read_exact(&mut offset)?;
+    let data_end = u64::from_le_bytes(offset);
+    if data_end < SEGMENT_HEADER_SIZE as u64 || data_end > file_len - 8 {
+        return Err(TaibaiError::Storage(format!(
+            "invalid embedded footer offset {} (file size {}, file: {})",
+            data_end,
+            file_len,
+            segment_path.display()
+        )));
+    }
+
+    let footer_len = usize::try_from(file_len - 8 - data_end).map_err(|_| {
+        TaibaiError::Storage(format!(
+            "embedded footer is too large for {}",
+            segment_path.display()
+        ))
+    })?;
+    let mut footer = vec![0u8; footer_len];
+    file.seek(SeekFrom::Start(data_end))?;
+    file.read_exact(&mut footer)?;
+
+    Ok(SidecarFooter { data_end, footer })
+}
+
+pub fn read_embedded_segment_meta(segment_path: &Path) -> Result<SegmentMetaSnapshot> {
+    segment_meta_snapshot(read_embedded_footer(segment_path)?)
+}
+
+fn segment_meta_snapshot(source: SidecarFooter) -> Result<SegmentMetaSnapshot> {
+    let parsed = parse_segment_footer(&source.footer)?;
+    Ok(SegmentMetaSnapshot {
+        data_end: source.data_end,
         schema: parsed.schema,
         row_count: parsed.row_count,
         row_groups: parsed.row_groups,
         delete_bitmap: parsed.delete_bitmap,
         deleted_row_count: parsed.deleted_row_count,
         segment_zone_maps: parsed.segment_zone_maps,
-    }))
+    })
 }
 
-fn read_latest_sidecar_footer_from(
-    meta_path: &Path,
-    segment_path: &Path,
-) -> Result<Option<SidecarFooter>> {
+fn read_latest_sidecar_footer_from(meta_path: &Path) -> Result<Option<SidecarFooter>> {
     if !meta_path.exists() {
         return Ok(None);
     }
-
-    let target_name = segment_name(segment_path);
-    let shared_partition_meta = sidecar_meta_path(segment_path) == meta_path
-        && legacy_sidecar_meta_path(segment_path) != meta_path;
 
     let mut file = fs::File::open(&meta_path)?;
     let mut buf = Vec::new();
@@ -133,20 +179,6 @@ fn read_latest_sidecar_footer_from(
         let computed_crc = compute_crc(&buf[offset..footer_end]);
         if stored_crc != computed_crc {
             break;
-        }
-
-        let record_name = if header.name_len > 0 {
-            std::str::from_utf8(&buf[name_start..name_end]).ok()
-        } else {
-            None
-        };
-        if shared_partition_meta && record_name.is_some_and(|name| name != target_name) {
-            offset = record_end;
-            continue;
-        }
-        if shared_partition_meta && record_name.is_none() && latest.is_some() {
-            offset = record_end;
-            continue;
         }
 
         let footer = &buf[footer_start..footer_end];
@@ -220,10 +252,6 @@ pub fn append_record(segment_path: &Path, kind: u32, data_end: u64, footer: &[u8
         .open(&meta_path)?;
     file.write_all(&record)?;
     file.sync_all()?;
-    let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
-    if legacy_meta_path != meta_path && legacy_meta_path.exists() {
-        remove_file_if_exists(&legacy_meta_path)?;
-    }
     Ok(())
 }
 
@@ -283,16 +311,7 @@ pub fn compact_sidecar_footer_if_needed(
 }
 
 pub fn remove_sidecar_meta(segment_path: &Path) -> Result<()> {
-    let meta_path = sidecar_meta_path(segment_path);
-    remove_file_if_exists(&meta_path)?;
-    let legacy_meta_path = legacy_sidecar_meta_path(segment_path);
-    if legacy_meta_path != meta_path {
-        // 分区段的当前 sidecar 为共享的 `p{key}.meta`，而旧版路径为
-        // `p{key}_{seq}.meta`。两者都必须清理，否则分区元数据文件
-        // 会在 truncate / drop partition 之后残留。
-        remove_file_if_exists(&legacy_meta_path)?;
-    }
-    Ok(())
+    remove_file_if_exists(&sidecar_meta_path(segment_path))
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<()> {

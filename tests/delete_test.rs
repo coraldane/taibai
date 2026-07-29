@@ -2,6 +2,7 @@ use tempfile::TempDir;
 
 use taibai::net::session::Session;
 use taibai::sql::execution::engine::{Engine, ExecResult};
+use taibai::storage::segment_manager::SegmentManager;
 
 fn create_engine() -> (TempDir, Engine, Session) {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
@@ -62,6 +63,72 @@ fn delete_where_marks_matching_rows_only() {
         .execute(&mut session, "SELECT id FROM t")
         .expect("select remaining rows");
     assert_eq!(row_count(remaining), 1);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn partition_delete_flushes_only_the_target_partition() {
+    let (temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE partitioned (id INT32, value INT32) PARTITION BY id",
+        )
+        .expect("create partitioned table");
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine
+        .execute(&mut session, "INSERT INTO partitioned VALUES (1, 10)")
+        .expect("insert target partition row");
+    engine
+        .execute(&mut session, "INSERT INTO partitioned VALUES (2, 20)")
+        .expect("insert sibling partition row");
+
+    let table_dir = temp_dir.path().join("main").join("partitioned");
+    let active_segments =
+        SegmentManager::discover_segments(&table_dir).expect("discover active segments");
+    let active_names = active_segments
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let sibling_path = active_segments
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("p2_"))
+        })
+        .unwrap_or_else(|| panic!("sibling partition segment, found {active_names:?}"));
+    let sibling_len_before = std::fs::metadata(&sibling_path).unwrap().len();
+
+    let deleted = engine
+        .execute(&mut session, "DELETE FROM partitioned WHERE id = 1")
+        .expect("delete one partition");
+    match deleted {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    let mut active_after = engine
+        .segment_mgr()
+        .active_partition_keys("main", "partitioned");
+    active_after.sort();
+    assert_eq!(active_after, vec!["1".to_string(), "2".to_string()]);
+    assert_eq!(
+        std::fs::metadata(&sibling_path).unwrap().len(),
+        sibling_len_before
+    );
+    assert_eq!(
+        count_star(
+            engine
+                .execute(&mut session, "SELECT COUNT(*) FROM partitioned")
+                .expect("count remaining partition rows")
+        ),
+        1
+    );
+
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
     engine.segment_mgr().shutdown();
 }
 

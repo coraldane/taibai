@@ -624,6 +624,79 @@ fn flush_table_only_flushes_named_table() -> Result<()> {
 }
 
 #[test]
+fn optimize_partition_leaves_sibling_partition_and_other_tables_resident() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE partitioned (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.execute(&mut session, "CREATE TABLE low_rate (id INT64)")?;
+    engine.execute(&mut session, "INSERT INTO low_rate VALUES (9)")?;
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(&mut session, "INSERT INTO partitioned VALUES (1, 10)")?;
+    engine.execute(&mut session, "INSERT INTO partitioned VALUES (2, 20)")?;
+
+    let table_dir = dir.path().join("main").join("partitioned");
+    let sibling_path = SegmentManager::discover_segments(&table_dir)?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("p2_"))
+        })
+        .expect("sibling partition segment");
+    let sibling_len_before = std::fs::metadata(&sibling_path)?.len();
+
+    engine.execute(&mut session, "OPTIMIZE TABLE partitioned ON PARTITION p1")?;
+
+    assert_eq!(
+        engine
+            .segment_mgr()
+            .active_partition_keys("main", "partitioned"),
+        vec!["2".to_string()]
+    );
+    assert_eq!(std::fs::metadata(&sibling_path)?.len(), sibling_len_before);
+    assert!(
+        SegmentManager::discover_segments(&dir.path().join("main").join("low_rate"))?.is_empty()
+    );
+
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    Ok(())
+}
+
+#[test]
+fn bulk_multi_value_insert_routes_every_value_partition() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE partitioned (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(
+        &mut session,
+        "INSERT INTO partitioned VALUES (1, 10), (2, 20)",
+    )?;
+
+    let mut active = engine
+        .segment_mgr()
+        .active_partition_keys("main", "partitioned");
+    active.sort();
+    assert_eq!(active, vec!["1".to_string(), "2".to_string()]);
+
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    Ok(())
+}
+
+#[test]
 fn replace_into_deletes_conflicting_unique_row_before_insert() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;

@@ -279,10 +279,21 @@ pub(super) fn slice_batch_fast(
     offset: usize,
     len: usize,
 ) -> Result<RecordBatch> {
+    let end = offset.checked_add(len).ok_or_else(|| {
+        crate::common::error::TaibaiError::Internal("batch slice range overflow".into())
+    })?;
+    if end > batch.num_rows() {
+        return Err(crate::common::error::TaibaiError::Internal(format!(
+            "batch slice {}..{} exceeds {} rows",
+            offset,
+            end,
+            batch.num_rows()
+        )));
+    }
     let columns = batch
         .columns
         .iter()
-        .map(|col| col.slice_fast(offset, len))
+        .map(|col| col.slice_fast(offset, end))
         .collect();
     RecordBatch::try_new(batch.schema.clone(), columns)
 }

@@ -58,6 +58,7 @@ impl SegmentManager {
             data_dir: data_dir.to_path_buf(),
             tables: RwLock::new(tables),
             reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
+            segment_meta_cache: Mutex::new(SegmentMetaCache::new(reader_cache_capacity())),
             cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
             flush_stop,
             flush_paused,
@@ -76,6 +77,10 @@ impl SegmentManager {
 
     fn max_segment_size(&self) -> u64 {
         self.config.max_segment_size
+    }
+
+    pub fn row_group_target_rows(&self) -> usize {
+        self.config.row_group_target_rows.max(1)
     }
 
     pub fn start_flush_thread(mgr: &Arc<Self>) {
@@ -339,11 +344,16 @@ impl SegmentManager {
 
     pub fn invalidate_reader(&self, path: &Path) {
         self.reader_cache.lock().unwrap().invalidate(path);
+        self.segment_meta_cache.lock().unwrap().invalidate(path);
         self.cluster_meta_cache.lock().unwrap().invalidate(path);
     }
 
     pub fn invalidate_readers_under(&self, dir: &Path) {
         self.reader_cache.lock().unwrap().invalidate_under(dir);
+        self.segment_meta_cache
+            .lock()
+            .unwrap()
+            .invalidate_under(dir);
         self.cluster_meta_cache
             .lock()
             .unwrap()
@@ -398,23 +408,20 @@ impl SegmentManager {
         Some(zm.clone())
     }
 
-    pub fn segment_meta(&self, path: &Path) -> Result<Option<SegmentMetaSnapshot>> {
+    pub fn segment_meta(&self, path: &Path) -> Result<Option<Arc<SegmentMetaSnapshot>>> {
         if self.is_mutable_segment_path(path) {
             return Ok(None);
         }
-        if let Some(meta) = read_latest_segment_meta(path)? {
+        if let Some(meta) = self.segment_meta_cache.lock().unwrap().get(path) {
             return Ok(Some(meta));
         }
-        match SegmentReader::open(path) {
-            Ok(reader) => Ok(Some(SegmentMetaSnapshot {
-                data_end: reader.data_end(),
-                schema: reader.schema().clone(),
-                row_count: reader.row_count(),
-                row_groups: reader.footer_row_groups_info(),
-                delete_bitmap: reader.delete_bitmap().to_vec(),
-                deleted_row_count: reader.deleted_row_count(),
-                segment_zone_maps: reader.segment_zone_maps().to_vec(),
-            })),
+        match read_embedded_segment_meta(path) {
+            Ok(meta) => Ok(Some(
+                self.segment_meta_cache
+                    .lock()
+                    .unwrap()
+                    .put(path.to_path_buf(), meta),
+            )),
             Err(_) => Ok(None),
         }
     }
@@ -439,22 +446,16 @@ impl SegmentManager {
             )));
         }
 
-        let tmp_meta = sidecar_meta_path(tmp_path);
         let final_meta = sidecar_meta_path(final_path);
-        let final_legacy_meta = final_path.with_extension("meta");
-        let shared_final_meta = final_meta != final_legacy_meta;
-        if final_meta.exists() && !shared_final_meta {
+        if final_meta.exists() {
             return Err(TaibaiError::Storage(format!(
                 "segment meta target already exists: {}",
                 final_meta.display()
             )));
         }
-        let replacement_meta = read_latest_sidecar_footer(tmp_path)?.ok_or_else(|| {
-            TaibaiError::Storage(format!(
-                "missing segment meta sidecar for replacement: {}",
-                tmp_meta.display()
-            ))
-        })?;
+        // Compaction output is sealed and self-contained. Validate its embedded
+        // footer before replacing any source segment; no sidecar is required.
+        read_embedded_segment_meta(tmp_path)?;
 
         std::fs::rename(tmp_path, final_path)?;
         for old_seg in old_segments {
@@ -463,14 +464,6 @@ impl SegmentManager {
             }
         }
 
-        if final_meta.exists() {
-            std::fs::remove_file(&final_meta)?;
-        }
-        append_sidecar_footer(
-            final_path,
-            replacement_meta.data_end,
-            &replacement_meta.footer,
-        )?;
         remove_sidecar_meta(tmp_path)?;
         let _ = self.open_reader_cached(final_path);
         Ok(())
@@ -482,8 +475,15 @@ impl SegmentManager {
         bitmap: &[u8],
         deleted_count: u64,
     ) -> Result<()> {
+        let mutable = self.is_mutable_segment_path(path);
         self.invalidate_reader(path);
         SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+        if mutable {
+            let footer = read_embedded_footer(path)?;
+            append_sidecar_footer(path, footer.data_end, &footer.footer)?;
+        } else {
+            remove_sidecar_meta(path)?;
+        }
         if let Some(state) = self.state_for_segment_path(path) {
             let mut active_guard = state.active_segments.lock().unwrap();
             for segment in active_guard.values_mut() {
@@ -591,6 +591,42 @@ impl SegmentManager {
     ) -> Result<()> {
         let mut writer = SegmentWriter::create(path, schema, row_group_size)?;
         writer.write_batch(batch)?;
+        writer.seal()?;
+        Ok(())
+    }
+
+    pub fn write_new_segment_batches(
+        &self,
+        path: &Path,
+        schema: Schema,
+        row_group_size: usize,
+        batches: &[RecordBatch],
+    ) -> Result<()> {
+        let total_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        let mut combined = RecordBatch::with_capacity(schema.clone(), total_rows);
+        for batch in batches {
+            if batch.num_columns() != combined.num_columns() {
+                return Err(TaibaiError::Storage(format!(
+                    "replacement batch has {} columns, expected {}",
+                    batch.num_columns(),
+                    combined.num_columns()
+                )));
+            }
+            for column_idx in 0..combined.num_columns() {
+                combined
+                    .column_mut(column_idx)
+                    .expect("validated replacement column")
+                    .extend(
+                        batch
+                            .column(column_idx)
+                            .expect("validated replacement source column"),
+                    )?;
+            }
+        }
+        let mut writer = SegmentWriter::create(path, schema, row_group_size)?;
+        if combined.num_rows() > 0 {
+            writer.write_batch(&combined)?;
+        }
         writer.seal()?;
         Ok(())
     }

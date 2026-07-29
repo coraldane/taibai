@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use taibai::net::bulk_importer::encode_columnar_bulk_insert;
 use taibai::protocol::types::DataType;
-use taibai::storage::segment::meta::{compact_sidecar_footer_if_needed, sidecar_meta_path};
-use taibai::storage::segment::{encode_segment_footer, SegmentReader};
+use taibai::storage::segment::meta::{
+    append_sidecar_footer, compact_sidecar_footer_if_needed, legacy_partition_sidecar_meta_path,
+    remove_sidecar_meta, sidecar_meta_path,
+};
+use taibai::storage::segment::{encode_segment_footer, SegmentReader, SegmentWriter};
 use taibai::storage::segment_manager::{SegmentConfig, SegmentManager};
 use taibai::types::batch::{ColumnDef, RecordBatch, Schema};
 use taibai::types::scalar::ScalarValue;
@@ -23,6 +26,20 @@ fn batch(start: i64, rows: i64) -> RecordBatch {
             .unwrap();
     }
     batch
+}
+
+fn write_legacy_v2_sidecar(path: &std::path::Path, data_end: u64, footer: &[u8]) {
+    let mut record = Vec::new();
+    record.extend_from_slice(&0x4D58_4D54u32.to_le_bytes());
+    record.extend_from_slice(&2u32.to_le_bytes());
+    record.extend_from_slice(&1u32.to_le_bytes());
+    record.extend_from_slice(&0u32.to_le_bytes());
+    record.extend_from_slice(&data_end.to_le_bytes());
+    record.extend_from_slice(&(footer.len() as u64).to_le_bytes());
+    record.extend_from_slice(footer);
+    let crc = crc32fast::hash(&record);
+    record.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(path, record).unwrap();
 }
 
 #[test]
@@ -47,7 +64,7 @@ fn active_flush_writes_sidecar_and_dat_footer() {
 }
 
 #[test]
-fn partition_active_flush_writes_partition_sidecar_meta() {
+fn partition_active_flush_writes_segment_sidecar_meta() {
     let dir = TempDir::new().unwrap();
     let mgr = SegmentManager::new(dir.path()).unwrap();
 
@@ -64,17 +81,17 @@ fn partition_active_flush_writes_partition_sidecar_meta() {
             .file_name()
             .unwrap()
             .to_string_lossy(),
-        "p2024.meta"
+        "p2024_0001.meta"
     );
-    assert!(table_dir.join("p2024.meta").exists());
-    assert!(!seg_path.with_extension("meta").exists());
+    assert!(seg_path.with_extension("meta").exists());
+    assert!(!table_dir.join("p2024.meta").exists());
 
     let reader = SegmentReader::open(seg_path).unwrap();
     assert_eq!(reader.row_count(), 3);
 }
 
 #[test]
-fn partition_reader_accepts_legacy_segment_sidecar_meta() {
+fn partition_reader_uses_embedded_footer_when_only_legacy_shared_sidecar_exists() {
     let dir = TempDir::new().unwrap();
     let mgr = SegmentManager::new(dir.path()).unwrap();
 
@@ -84,12 +101,100 @@ fn partition_reader_accepts_legacy_segment_sidecar_meta() {
     let table_dir = dir.path().join("main").join("t");
     let segments = SegmentManager::discover_segments(&table_dir).unwrap();
     let seg_path = &segments[0];
-    let partition_meta = sidecar_meta_path(seg_path);
-    let legacy_meta = seg_path.with_extension("meta");
-    std::fs::rename(&partition_meta, &legacy_meta).unwrap();
+    let segment_meta = sidecar_meta_path(seg_path);
+    let legacy_meta = legacy_partition_sidecar_meta_path(seg_path).unwrap();
+    std::fs::rename(&segment_meta, &legacy_meta).unwrap();
 
     let reader = SegmentReader::open(seg_path).unwrap();
     assert_eq!(reader.row_count(), 3);
+}
+
+#[test]
+fn partition_reader_ignores_ambiguous_legacy_shared_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::with_config(
+        dir.path(),
+        SegmentConfig {
+            min_segment_size: 1,
+            max_segment_size: 1,
+            row_group_target_rows: 131_072,
+        },
+    )
+    .unwrap();
+    mgr.bulk_insert_batch_with_partition("main", "t", "2024", batch(1, 3))
+        .unwrap();
+    mgr.bulk_insert_batch_with_partition("main", "t", "2024", batch(10, 5))
+        .unwrap();
+
+    let table_dir = dir.path().join("main").join("t");
+    let segments = SegmentManager::discover_segments(&table_dir).unwrap();
+    assert_eq!(segments.len(), 2);
+    let first = SegmentReader::open(&segments[0]).unwrap();
+    let first_footer = encode_segment_footer(
+        first.schema(),
+        first.row_count(),
+        &first.footer_row_groups_info(),
+        first.delete_bitmap(),
+        first.deleted_row_count(),
+        "t",
+        first.segment_zone_maps(),
+    );
+    remove_sidecar_meta(&segments[1]).unwrap();
+    let shared_meta = legacy_partition_sidecar_meta_path(&segments[1]).unwrap();
+    write_legacy_v2_sidecar(&shared_meta, first.data_end(), &first_footer);
+
+    let second = SegmentReader::open(&segments[1]).unwrap();
+    assert_eq!(second.row_count(), 5);
+}
+
+#[test]
+fn removing_one_active_partition_segment_sidecar_preserves_its_sibling() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::new(dir.path()).unwrap();
+
+    mgr.bulk_insert_batch_with_partition("main", "t", "2024", batch(1, 3))
+        .unwrap();
+    mgr.bulk_insert_batch_with_partition("main", "t", "2025", batch(4, 3))
+        .unwrap();
+
+    let table_dir = dir.path().join("main").join("t");
+    let segments = SegmentManager::discover_segments(&table_dir).unwrap();
+    assert_eq!(segments.len(), 2);
+    let sibling_meta = sidecar_meta_path(&segments[1]);
+    assert!(sibling_meta.exists());
+
+    remove_sidecar_meta(&segments[0]).unwrap();
+    assert!(sibling_meta.exists());
+    assert_eq!(SegmentReader::open(&segments[1]).unwrap().row_count(), 3);
+}
+
+#[test]
+fn invalid_sidecar_data_end_falls_back_to_embedded_footer() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::new(dir.path()).unwrap();
+    mgr.bulk_insert_batch_with_partition("main", "t", "2024", batch(1, 3))
+        .unwrap();
+
+    let table_dir = dir.path().join("main").join("t");
+    let segment = SegmentManager::discover_segments(&table_dir)
+        .unwrap()
+        .remove(0);
+    let original = SegmentReader::open(&segment).unwrap();
+    let footer = encode_segment_footer(
+        original.schema(),
+        original.row_count(),
+        &original.footer_row_groups_info(),
+        original.delete_bitmap(),
+        original.deleted_row_count(),
+        "t",
+        original.segment_zone_maps(),
+    );
+    let invalid_data_end = std::fs::metadata(&segment).unwrap().len() + 1024;
+    append_sidecar_footer(&segment, invalid_data_end, &footer).unwrap();
+
+    let recovered = SegmentReader::open(&segment).unwrap();
+    assert_eq!(recovered.row_count(), 3);
+    assert_eq!(recovered.data_end(), original.data_end());
 }
 
 #[test]
@@ -154,7 +259,7 @@ fn sidecar_compaction_replaces_journal_with_full_snapshot() {
 }
 
 #[test]
-fn seal_writes_sidecar_and_dat_footer() {
+fn seal_removes_sidecar_and_keeps_dat_footer() {
     let dir = TempDir::new().unwrap();
     let mgr = SegmentManager::with_config(
         dir.path(),
@@ -177,11 +282,80 @@ fn seal_writes_sidecar_and_dat_footer() {
 
     mgr.flush_all_active().unwrap();
 
-    assert!(sidecar_meta_path(seg_path).exists());
+    assert!(!sidecar_meta_path(seg_path).exists());
     let reader = SegmentReader::open(seg_path).unwrap();
     assert_eq!(reader.row_count(), 3);
     assert_eq!(std::fs::metadata(seg_path).unwrap().len(), len_before_seal);
     assert!(len_before_seal > reader.data_end());
+}
+
+#[test]
+fn standalone_sealed_segment_has_no_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("seg_0001.dat");
+    let mut writer = SegmentWriter::create(&path, schema(), 1024).unwrap();
+    writer.write_batch(&batch(1, 3)).unwrap();
+    writer.seal().unwrap();
+
+    assert!(!sidecar_meta_path(&path).exists());
+    assert_eq!(SegmentReader::open(&path).unwrap().row_count(), 3);
+}
+
+#[test]
+fn sealed_segment_metadata_is_cached_without_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::with_config(
+        dir.path(),
+        SegmentConfig {
+            min_segment_size: 1,
+            max_segment_size: 1024 * 1024,
+            row_group_target_rows: 131_072,
+        },
+    )
+    .unwrap();
+
+    mgr.bulk_insert_batch("main", "t", batch(1, 3), false)
+        .unwrap();
+    mgr.flush_all_active().unwrap();
+    let segment = SegmentManager::discover_segments(&dir.path().join("main").join("t"))
+        .unwrap()
+        .remove(0);
+
+    assert!(!sidecar_meta_path(&segment).exists());
+    let first = mgr.segment_meta(&segment).unwrap().unwrap();
+    let second = mgr.segment_meta(&segment).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(second.row_count, 3);
+}
+
+#[test]
+fn sealed_metadata_cache_is_invalidated_by_delete_rewrite() {
+    let dir = TempDir::new().unwrap();
+    let mgr = SegmentManager::with_config(
+        dir.path(),
+        SegmentConfig {
+            min_segment_size: 1,
+            max_segment_size: 1024 * 1024,
+            row_group_target_rows: 131_072,
+        },
+    )
+    .unwrap();
+
+    mgr.bulk_insert_batch("main", "t", batch(1, 3), false)
+        .unwrap();
+    mgr.flush_all_active().unwrap();
+    let segment = SegmentManager::discover_segments(&dir.path().join("main").join("t"))
+        .unwrap()
+        .remove(0);
+    let before = mgr.segment_meta(&segment).unwrap().unwrap();
+
+    mgr.rewrite_delete_footer(&segment, &[0b0000_0001], 1)
+        .unwrap();
+
+    let after = mgr.segment_meta(&segment).unwrap().unwrap();
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert_eq!(after.deleted_row_count, 1);
+    assert!(!sidecar_meta_path(&segment).exists());
 }
 
 #[test]

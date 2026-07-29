@@ -217,6 +217,37 @@ impl SegmentManager {
         Ok(total)
     }
 
+    pub fn flush_partition_active(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Result<u64> {
+        let key = table_key(db, table);
+        let mut total = 0u64;
+        let tables = self.tables.read().unwrap();
+        if let Some(state) = tables.get(&key) {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            let should_seal = active_guard.get(partition_key).is_some_and(|segment| {
+                segment.total_rows > 0 && segment.current_size >= self.min_segment_seal_size()
+            });
+            if should_seal {
+                if let Some(segment) = active_guard.get_mut(partition_key) {
+                    segment.seal(&|path| self.invalidate_reader(path))?;
+                    total = total.saturating_add(segment.total_rows);
+                }
+                active_guard.remove(partition_key);
+            } else if let Some(segment) = active_guard.get_mut(partition_key) {
+                if segment.total_rows > 0 || segment.buffered_rows > 0 {
+                    segment.flush_buffer(&|path| self.invalidate_reader(path))?;
+                    segment.flush_meta(&|path| self.invalidate_reader(path))?;
+                    total = total.saturating_add(segment.total_rows);
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Seal the target table's active writers while its mutation lock is held.
     /// Unlike a checkpoint flush this deliberately leaves the table WAL alone:
     /// pending memtables may still depend on it.
@@ -245,6 +276,30 @@ impl SegmentManager {
             }
         }
         Ok(total)
+    }
+
+    pub(crate) fn seal_partition_active_under_table_lock(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Result<u64> {
+        let key = table_key(db, table);
+        let tables = self.tables.read().unwrap();
+        let Some(state) = tables.get(&key) else {
+            return Ok(0);
+        };
+        let mut active_guard = state.active_segments.lock().unwrap();
+        let Some(segment) = active_guard.get_mut(partition_key) else {
+            return Ok(0);
+        };
+        if segment.total_rows == 0 && segment.buffered_rows == 0 {
+            return Ok(0);
+        }
+        segment.seal(&|path| self.invalidate_reader(path))?;
+        let rows = segment.total_rows;
+        active_guard.remove(partition_key);
+        Ok(rows)
     }
 
     pub fn flush_all_active(&self) -> Result<u64> {

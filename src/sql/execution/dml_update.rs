@@ -34,11 +34,25 @@ pub fn exec_update(
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
+    if table_meta.is_partitioned()
+        && assignments.iter().any(|assignment| {
+            assignment
+                .column
+                .eq_ignore_ascii_case(&table_meta.partition_key)
+        })
+    {
+        return Err(TaibaiError::Sql(format!(
+            "updating partition key '{}' is not supported; use DELETE followed by INSERT",
+            table_meta.partition_key
+        )));
+    }
     let predicate = build_row_group_predicate(where_clause, &table_schema);
     let predicate_projection = where_clause
         .as_ref()
         .map(|expr| collect_expr_column_indices(expr, &table_schema))
         .unwrap_or_default();
+    let target_partition_key =
+        super::dml_delete::delete_partition_eq_key(where_clause, &table_schema, &table_meta);
 
     let updated_count = mgr.with_table_mutation_lock(db, table, || {
         let mut updated_count = 0u64;
@@ -61,10 +75,19 @@ pub fn exec_update(
         // A background memtable flush may have produced an active segment.
         // Seal only this table's active writers before replacing segment files;
         // pending memtables remain resident and are not flushed here.
-        mgr.seal_table_active_under_table_lock(db, table)?;
+        if let Some(partition_key) = target_partition_key.as_deref() {
+            mgr.seal_partition_active_under_table_lock(db, table, partition_key)?;
+        } else {
+            mgr.seal_table_active_under_table_lock(db, table)?;
+        }
 
         let segment_files = if table_dir.exists() {
-            SegmentManager::discover_segments(&table_dir)?
+            super::dml_delete::prune_segments_by_partition(
+                SegmentManager::discover_segments(&table_dir)?,
+                where_clause,
+                &table_schema,
+                &table_meta,
+            )
         } else {
             Vec::new()
         };
@@ -211,14 +234,29 @@ pub fn exec_update(
         }
 
         for (old_seg, batches) in rewritten_segments {
-            mgr.remove_segment_file(&old_seg)?;
-            for batch in batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let seg_path = mgr.next_segment_path(&table_dir, "")?;
-                mgr.write_new_segment(&seg_path, batch.schema.clone(), 8192, &batch)?;
+            let Some(schema) = batches.first().map(|batch| batch.schema.clone()) else {
+                mgr.remove_segment_file(&old_seg)?;
+                continue;
+            };
+            let partition_key = old_seg.file_name().and_then(|name| {
+                crate::storage::partition::parse_partition_key(&name.to_string_lossy())
+            });
+            let final_path =
+                mgr.next_replacement_segment_path(&table_dir, partition_key.as_deref())?;
+            let tmp_path =
+                crate::storage::segment::store::replacement_tmp_path(&final_path, "update_tmp");
+            let write_result = mgr.write_new_segment_batches(
+                &tmp_path,
+                schema,
+                mgr.row_group_target_rows(),
+                &batches,
+            );
+            if let Err(error) = write_result {
+                let _ = std::fs::remove_file(&tmp_path);
+                let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
+                return Err(error);
             }
+            mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg])?;
         }
 
         let mut tail_persist_failed = false;

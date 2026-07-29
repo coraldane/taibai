@@ -255,6 +255,25 @@ impl Engine {
         self.bulk_mode_sessions.load(Ordering::Acquire)
     }
 
+    pub fn flush_bulk_dirty_tables(&self) -> Result<u64> {
+        let tables = self
+            .bulk_dirty_tables
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut total = 0u64;
+        for (db, table) in tables {
+            total = total.saturating_add(self.flush_table_buffers(&db, &table)?);
+            self.bulk_dirty_tables
+                .lock()
+                .unwrap()
+                .remove(&(db, table));
+        }
+        Ok(total)
+    }
+
     fn begin_operation(&self) -> EngineOperationGuard<'_> {
         self.in_flight_operations.fetch_add(1, Ordering::AcqRel);
         EngineOperationGuard { engine: self }
@@ -265,9 +284,7 @@ impl Engine {
     }
 
     pub fn flush_table_buffers(&self, db: &str, table: &str) -> Result<u64> {
-        if let Err(e) = self.batch_writer.flush_table(db, table) {
-            tracing::warn!(db, table, error = %e, "batch writer table flush failed");
-        }
+        self.batch_writer.flush_table(db, table)?;
 
         let rows = self.segment_mgr.flush_table_active(db, table)?;
 
@@ -287,10 +304,26 @@ impl Engine {
         Ok(rows)
     }
 
-    pub fn flush_all_buffers(&self) -> Result<u64> {
-        if let Err(e) = self.batch_writer.flush_all() {
-            tracing::warn!(error = %e, "batch writer flush failed");
+    pub fn flush_partition_buffers(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Result<u64> {
+        self.batch_writer
+            .flush_partition(db, table, partition_key)?;
+        let rows = self
+            .segment_mgr
+            .flush_partition_active(db, table, partition_key)?;
+        let mut catalogs = self.catalogs.write().unwrap();
+        if let Some(catalog) = catalogs.get_mut(db) {
+            catalog.save(&self.data_dir.join("meta"))?;
         }
+        Ok(rows)
+    }
+
+    pub fn flush_all_buffers(&self) -> Result<u64> {
+        self.batch_writer.flush_all()?;
 
         self.segment_mgr.flush_all_active()?;
 

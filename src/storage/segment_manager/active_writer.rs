@@ -9,6 +9,7 @@ use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::meta::{
     append_sidecar_footer, append_sidecar_row_groups, compact_sidecar_footer_if_needed,
+    remove_sidecar_meta,
 };
 use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
 use crate::storage::segment::{encode_segment_footer, RowGroupMeta};
@@ -324,6 +325,7 @@ impl ActiveSegmentWriter {
         self.flush_buffer(invalidate_reader)?;
         self.flush_meta(invalidate_reader)?;
         self.finalize()?;
+        remove_sidecar_meta(&self.path)?;
         invalidate_reader(&self.path);
 
         tracing::info!(
@@ -356,7 +358,7 @@ impl ActiveSegmentWriter {
         self.file.write_all(&self.data_end.to_le_bytes())?;
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
-        append_sidecar_footer(&self.path, self.data_end, &footer)?;
+        remove_sidecar_meta(&self.path)?;
 
         self.current_size = self.data_end + footer.len() as u64 + 8;
         self.sidecar_row_groups_flushed = self.row_groups.len();
