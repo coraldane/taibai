@@ -14,7 +14,7 @@ pub fn exec_replace(
         ));
     }
 
-    let _unique_guard = PRIMARY_KEY_INSERT_LOCK.lock().unwrap();
+    let _unique_guard = constraint_insert_lock(db, table).lock().unwrap();
     let materialized =
         materialize_insert_values(engine, db, table, columns, values, timezone_offset_hours)?;
     let constraints = replace_constraint_indices(&materialized.table_meta, &materialized.schema)?;
@@ -334,7 +334,7 @@ fn exec_materialized_insert_batch(
         if !lock_unique_constraints || (primary_key_indices.is_empty() && !has_unique_checks) {
             None
         } else {
-            Some(PRIMARY_KEY_INSERT_LOCK.lock().unwrap())
+            Some(constraint_insert_lock(db, table).lock().unwrap())
         };
 
     if validate_existing_constraints {
@@ -371,6 +371,11 @@ fn exec_materialized_insert_batch(
         &missing_auto_inc,
     )?;
 
+    let primary_keys = if primary_key_indices.is_empty() {
+        Vec::new()
+    } else {
+        primary_keys_for_batch(&batch, &schema, &primary_key_indices)?
+    };
     let auto_increment_touched = !auto_inc_cols.is_empty();
     let unique_index_entries =
         build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?;
@@ -419,6 +424,11 @@ fn exec_materialized_insert_batch(
 
     let catalog_start = Instant::now();
     append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
+    if !primary_keys.is_empty() {
+        let _ = engine
+            .index_manager()
+            .append_primary_keys(db, table, &primary_keys)?;
+    }
 
     engine.record_inserted_rows(
         db,
@@ -479,10 +489,18 @@ fn append_unique_index_entries_after_insert(
     entries_by_index: Vec<(String, Vec<UniqueIndexEntry>)>,
 ) -> Result<()> {
     for (index_name, entries) in entries_by_index {
-        let _ =
-            engine
-                .index_manager()
-                .append_unique_index_entries(db, table, &index_name, entries)?;
+        match engine
+            .index_manager()
+            .append_unique_index_entries(db, table, &index_name, entries)
+        {
+            Ok(_) => {}
+            Err(error) => {
+                engine
+                    .index_manager()
+                    .invalidate_unique_index_snapshot(db, table, &index_name);
+                return Err(error);
+            }
+        }
     }
     Ok(())
 }
@@ -695,7 +713,7 @@ fn write_batch_by_partition(
         return Ok(());
     }
 
-    let groups = partition_masks(table_meta, &batch);
+    let groups = partition_row_indices(table_meta, &batch);
     if groups.len() <= 1 {
         let partition_key = groups
             .first()
@@ -715,9 +733,8 @@ fn write_batch_by_partition(
         return Ok(());
     }
 
-    for (partition_key, mask) in groups {
-        let match_count = mask.iter().filter(|keep| **keep).count();
-        let part_batch = filter_batch_by_mask(&batch, &mask, match_count)?;
+    for (partition_key, indices) in groups {
+        let part_batch = take_batch_rows(&batch, &indices)?;
         write_partition_batch(
             engine,
             db,
@@ -863,19 +880,19 @@ fn slice_batch_fast(batch: &RecordBatch, start: usize, end: usize) -> Result<Rec
     RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
-fn partition_masks(
+fn partition_row_indices(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     batch: &RecordBatch,
-) -> Vec<(String, Vec<bool>)> {
+) -> Vec<(String, Vec<u32>)> {
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
-        return vec![(String::new(), vec![true; batch.num_rows()])];
+        return vec![(String::new(), (0..batch.num_rows() as u32).collect())];
     }
     let col_idx = match table_meta.get_partition_column_index_cached() {
         Some(idx) => idx,
-        None => return vec![(String::new(), vec![true; batch.num_rows()])],
+        None => return vec![(String::new(), (0..batch.num_rows() as u32).collect())],
     };
     let mut key_order = Vec::new();
-    let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
     for row_idx in 0..batch.num_rows() {
         let val = batch
             .scalar(row_idx, col_idx)
@@ -883,16 +900,22 @@ fn partition_masks(
         let key = compute_partition_key_for_value(table_meta, &val);
         if !groups.contains_key(&key) {
             key_order.push(key.clone());
-            groups.insert(key.clone(), vec![false; batch.num_rows()]);
         }
-        if let Some(mask) = groups.get_mut(&key) {
-            mask[row_idx] = true;
-        }
+        groups.entry(key).or_default().push(row_idx as u32);
     }
     key_order
         .into_iter()
-        .filter_map(|key| groups.remove(&key).map(|mask| (key, mask)))
+        .filter_map(|key| groups.remove(&key).map(|indices| (key, indices)))
         .collect()
+}
+
+fn take_batch_rows(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
+    let columns = batch
+        .columns
+        .iter()
+        .map(|column| column.take(indices))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
 fn filter_batch_by_mask(

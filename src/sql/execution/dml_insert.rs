@@ -1,6 +1,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,9 +20,20 @@ use super::engine::{Engine, ExecResult};
 use super::helpers::{eval_expr_to_scalar_with_scale_timezone, sort_batch_by_key};
 use crate::sql::parser::ast::Expr;
 
+const CONSTRAINT_INSERT_LOCK_STRIPES: usize = 256;
+
 lazy_static::lazy_static! {
-    static ref PRIMARY_KEY_INSERT_LOCK: Mutex<()> = Mutex::new(());
+    static ref CONSTRAINT_INSERT_LOCKS: Vec<Mutex<()>> = (0..CONSTRAINT_INSERT_LOCK_STRIPES)
+        .map(|_| Mutex::new(()))
+        .collect();
     static ref FAST_INSERT_PLAN_CACHE: Mutex<HashMap<String, Arc<FastInsertPlan>>> = Mutex::new(HashMap::new());
+}
+
+fn constraint_insert_lock(db: &str, table: &str) -> &'static Mutex<()> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    db.hash(&mut hasher);
+    table.hash(&mut hasher);
+    &CONSTRAINT_INSERT_LOCKS[hasher.finish() as usize % CONSTRAINT_INSERT_LOCK_STRIPES]
 }
 
 #[cfg(test)]

@@ -474,10 +474,10 @@ fn delete_then_insert_same_unique_key_after_rebuild() -> Result<()> {
         .join("indexes")
         .join("unique");
     let base_file = index_dir.join("uk_id.keys.tbi");
-    let delta_file = index_dir.join("uk_id.delta.tbi");
+    let invalid_file = index_dir.join("uk_id.invalid");
     engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
     assert!(base_file.exists());
-    assert!(delta_file.exists());
+    assert!(invalid_file.exists());
     assert_eq!(
         engine.index_manager().unique_key_exists(
             "main",
@@ -485,7 +485,7 @@ fn delete_then_insert_same_unique_key_after_rebuild() -> Result<()> {
             "uk_id",
             &[ScalarValue::Int64(Some(1))]
         )?,
-        Some(false)
+        None
     );
     engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (1, 'b')")?;
 
@@ -517,10 +517,10 @@ fn replace_into_works_after_rebuild_unique_index() -> Result<()> {
         .join("indexes")
         .join("unique");
     let base_file = index_dir.join("uk_id.keys.tbi");
-    let delta_file = index_dir.join("uk_id.delta.tbi");
+    let invalid_file = index_dir.join("uk_id.invalid");
     engine.execute(&mut session, "REPLACE INTO t (id, name) VALUES (1, 'new')")?;
     assert!(base_file.exists());
-    assert!(delta_file.exists());
+    assert!(invalid_file.exists());
 
     let name = first_text(
         engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,

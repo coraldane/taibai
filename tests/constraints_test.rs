@@ -14,6 +14,68 @@ fn create_engine() -> (TempDir, Engine, Session) {
 }
 
 #[test]
+fn primary_key_cache_rejects_duplicates_and_allows_deleted_key_reuse() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE cached_pk (id INT64 PRIMARY KEY, value VARCHAR)",
+        )
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO cached_pk VALUES (1, 'a')")
+        .expect("first insert");
+    engine
+        .execute(&mut session, "INSERT INTO cached_pk VALUES (2, 'b')")
+        .expect("second insert");
+    assert!(engine
+        .execute(&mut session, "INSERT INTO cached_pk VALUES (1, 'dup')")
+        .is_err());
+
+    engine
+        .execute(&mut session, "DELETE FROM cached_pk WHERE id = 1")
+        .expect("delete");
+    engine
+        .execute(&mut session, "INSERT INTO cached_pk VALUES (1, 'new')")
+        .expect("reuse deleted key");
+}
+
+#[test]
+fn unique_index_allows_reusing_incremental_key_after_delete() {
+    let (temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE users (id INT64 PRIMARY KEY, code INT64, UNIQUE KEY uk_code (code))",
+        )
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO users VALUES (1, 10)")
+        .expect("insert base row");
+    engine
+        .execute(&mut session, "REBUILD UNIQUE INDEX uk_code ON users")
+        .expect("rebuild unique index");
+    engine
+        .execute(&mut session, "INSERT INTO users VALUES (2, 20)")
+        .expect("insert delta row");
+    engine
+        .execute(&mut session, "DELETE FROM users WHERE id = 2")
+        .expect("delete delta row");
+    engine.flush_all_buffers().expect("flush before restart");
+    engine.segment_mgr().shutdown();
+    drop(engine);
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    engine
+        .execute(&mut session, "INSERT INTO users VALUES (3, 20)")
+        .expect("reuse deleted delta key");
+    assert!(engine
+        .execute(&mut session, "INSERT INTO users VALUES (4, 20)")
+        .is_err());
+}
+
+#[test]
 fn insert_fills_defaults_and_enforces_inline_primary_key() {
     let (_temp_dir, engine, mut session) = create_engine();
 

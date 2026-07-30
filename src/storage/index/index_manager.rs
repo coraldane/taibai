@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,8 @@ use crate::types::scalar::ScalarValue;
 
 pub struct IndexManager {
     indexes: RwLock<HashMap<String, HashMap<String, Arc<SparseIndexImpl>>>>,
-    unique_indexes: RwLock<HashMap<String, Arc<UniqueIndexData>>>,
+    unique_indexes: RwLock<HashMap<String, Arc<UniqueIndexState>>>,
+    primary_key_indexes: RwLock<HashMap<String, HashSet<Vec<u8>>>>,
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
 }
@@ -37,6 +38,35 @@ pub struct UniqueRowLocation {
 pub struct UniqueIndexEntry {
     pub key: Vec<ScalarValue>,
     pub location: UniqueRowLocation,
+}
+
+#[derive(Clone)]
+pub struct PreparedUniqueIndexEntry {
+    pub encoded_key: Vec<u8>,
+    pub entry: UniqueIndexEntry,
+}
+
+struct UniqueIndexState {
+    base: Arc<UniqueIndexData>,
+    delta: RwLock<UniqueIndexDeltaState>,
+    mutation_lock: Mutex<()>,
+}
+
+#[derive(Default)]
+struct UniqueIndexDeltaState {
+    entries: Vec<PreparedUniqueIndexEntry>,
+    key_locations: HashMap<Vec<u8>, Vec<UniqueRowLocation>>,
+    tombstones: HashSet<UniqueRowLocation>,
+}
+
+impl UniqueIndexState {
+    fn new(base: UniqueIndexData, delta: UniqueIndexDeltaState) -> Self {
+        Self {
+            base: Arc::new(base),
+            delta: RwLock::new(delta),
+            mutation_lock: Mutex::new(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +100,7 @@ impl IndexManager {
         Self {
             indexes: RwLock::new(HashMap::new()),
             unique_indexes: RwLock::new(HashMap::new()),
+            primary_key_indexes: RwLock::new(HashMap::new()),
             segment_mgr,
             data_dir,
         }
@@ -253,15 +284,20 @@ impl IndexManager {
         let base = sanitize_file_component(index_name);
         let data_path = dir.join(format!("{}.keys.tbi", base));
         let data_tmp = data_path.with_extension("keys.tbi.tmp");
+        let invalid_path = dir.join(format!("{}.invalid", base));
         let data_bytes = encode_unique_index_data(&data)?;
         std::fs::write(&data_tmp, data_bytes)?;
         std::fs::rename(data_tmp, data_path)?;
         let delta_path = dir.join(format!("{}.delta.tbi", base));
         let _ = std::fs::remove_file(delta_path);
-        self.unique_indexes
-            .write()
-            .unwrap()
-            .insert(unique_index_key(db, table, index_name), Arc::new(data));
+        let _ = std::fs::remove_file(invalid_path);
+        self.unique_indexes.write().unwrap().insert(
+            unique_index_key(db, table, index_name),
+            Arc::new(UniqueIndexState::new(
+                data,
+                UniqueIndexDeltaState::default(),
+            )),
+        );
         Ok(())
     }
 
@@ -271,16 +307,62 @@ impl IndexManager {
         table: &str,
         index_name: &str,
     ) -> Result<Option<UniqueIndexSnapshot>> {
-        let Some(data) = self.load_unique_index_data(db, table, index_name)? else {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
+        let delta = state.delta.read().unwrap();
         Ok(Some(UniqueIndexSnapshot {
-            db: data.db.clone(),
-            table: data.table.clone(),
-            index_name: data.index_name.clone(),
-            columns: data.columns.clone(),
-            key_count: data.entries.len(),
+            db: state.base.db.clone(),
+            table: state.base.table.clone(),
+            index_name: state.base.index_name.clone(),
+            columns: state.base.columns.clone(),
+            key_count: state.base.entries.len() + delta.entries.len(),
         }))
+    }
+
+    fn load_unique_index_state(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<Option<Arc<UniqueIndexState>>> {
+        let cache_key = unique_index_key(db, table, index_name);
+        if let Some(state) = self.unique_indexes.read().unwrap().get(&cache_key).cloned() {
+            return Ok(Some(state));
+        }
+        let base = sanitize_file_component(index_name);
+        let dir = self.unique_index_dir(db, table);
+        if dir.join(format!("{}.invalid", base)).exists() {
+            return Ok(None);
+        }
+        let path = dir.join(format!("{}.keys.tbi", base));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path)?;
+        let Some(mut data) = decode_unique_index_data(&bytes)? else {
+            return Ok(None);
+        };
+        if data.encoded_keys.len() != data.entries.len() {
+            prepare_unique_index_data(&mut data)?;
+        }
+        let delta_path = self
+            .unique_index_dir(db, table)
+            .join(format!("{}.delta.tbi", base));
+        let delta = if delta_path.exists() {
+            decode_unique_index_delta(&std::fs::read(delta_path)?)?.into_state()?
+        } else {
+            UniqueIndexDeltaState::default()
+        };
+        let state = Arc::new(UniqueIndexState::new(data, delta));
+        let current = self
+            .unique_indexes
+            .write()
+            .unwrap()
+            .entry(cache_key)
+            .or_insert_with(|| Arc::clone(&state))
+            .clone();
+        Ok(Some(current))
     }
 
     pub fn load_unique_index_data(
@@ -289,37 +371,81 @@ impl IndexManager {
         table: &str,
         index_name: &str,
     ) -> Result<Option<Arc<UniqueIndexData>>> {
-        let cache_key = unique_index_key(db, table, index_name);
-        if let Some(data) = self.unique_indexes.read().unwrap().get(&cache_key).cloned() {
-            return Ok(Some(data));
-        }
-        let base = sanitize_file_component(index_name);
-        let path = self
-            .unique_index_dir(db, table)
-            .join(format!("{}.keys.tbi", base));
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(path)?;
-        let Some(mut data) = decode_unique_index_data(&bytes)? else {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        let delta_path = self
-            .unique_index_dir(db, table)
-            .join(format!("{}.delta.tbi", base));
-        if delta_path.exists() {
-            let delta_bytes = std::fs::read(delta_path)?;
-            let delta = decode_unique_index_delta(&delta_bytes)?;
-            data.entries.extend(delta.entries);
-            data.tombstones.extend(delta.tombstones);
+        Ok(Some(Arc::new(materialize_unique_index_state(&state)?)))
+    }
+
+    pub fn unique_index_columns(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<Option<Vec<String>>> {
+        Ok(self
+            .load_unique_index_state(db, table, index_name)?
+            .map(|state| state.base.columns.clone()))
+    }
+
+    pub fn primary_keys_exist(
+        &self,
+        db: &str,
+        table: &str,
+        keys: &[Vec<ScalarValue>],
+    ) -> Result<Option<bool>> {
+        let cache_key = format!("{}\0{}", db, table);
+        let indexes = self.primary_key_indexes.read().unwrap();
+        let Some(index) = indexes.get(&cache_key) else {
+            return Ok(None);
+        };
+        for key in keys {
+            if index.contains(&encode_unique_key(key)?) {
+                return Ok(Some(true));
+            }
         }
-        prepare_unique_index_data(&mut data)?;
-        let data = Arc::new(data);
-        self.unique_indexes
+        Ok(Some(false))
+    }
+
+    pub fn install_primary_key_index(
+        &self,
+        db: &str,
+        table: &str,
+        keys: impl IntoIterator<Item = Vec<ScalarValue>>,
+    ) -> Result<()> {
+        let encoded = keys
+            .into_iter()
+            .map(|key| encode_unique_key(&key))
+            .collect::<Result<HashSet<_>>>()?;
+        self.primary_key_indexes
             .write()
             .unwrap()
-            .insert(cache_key, Arc::clone(&data));
-        Ok(Some(data))
+            .insert(format!("{}\0{}", db, table), encoded);
+        Ok(())
+    }
+
+    pub fn append_primary_keys(
+        &self,
+        db: &str,
+        table: &str,
+        keys: &[Vec<ScalarValue>],
+    ) -> Result<bool> {
+        let cache_key = format!("{}\0{}", db, table);
+        let mut indexes = self.primary_key_indexes.write().unwrap();
+        let Some(current) = indexes.get_mut(&cache_key) else {
+            return Ok(false);
+        };
+        for key in keys {
+            current.insert(encode_unique_key(key)?);
+        }
+        Ok(true)
+    }
+
+    pub fn invalidate_primary_key_index(&self, db: &str, table: &str) {
+        self.primary_key_indexes
+            .write()
+            .unwrap()
+            .remove(&format!("{}\0{}", db, table));
     }
 
     pub fn unique_key_exists(
@@ -329,13 +455,14 @@ impl IndexManager {
         index_name: &str,
         key: &[ScalarValue],
     ) -> Result<Option<bool>> {
-        let Some(data) = self.load_unique_index_data(db, table, index_name)? else {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        Ok(Some(unique_index_data_contains_key(
+        let encoded = encode_unique_key(key)?;
+        Ok(Some(unique_index_state_contains_key(
             &self.segment_mgr,
-            &data,
-            key,
+            &state,
+            &encoded,
         )?))
     }
 
@@ -346,15 +473,81 @@ impl IndexManager {
         index_name: &str,
         keys: &[Vec<ScalarValue>],
     ) -> Result<Option<bool>> {
-        let Some(data) = self.load_unique_index_data(db, table, index_name)? else {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
         for key in keys {
-            if unique_index_data_contains_key(&self.segment_mgr, &data, key)? {
+            let encoded = encode_unique_key(key)?;
+            if unique_index_state_contains_key(&self.segment_mgr, &state, &encoded)? {
                 return Ok(Some(true));
             }
         }
         Ok(Some(false))
+    }
+
+    pub fn prepare_unique_index_entries(
+        &self,
+        entries: Vec<UniqueIndexEntry>,
+    ) -> Result<Vec<PreparedUniqueIndexEntry>> {
+        entries
+            .into_iter()
+            .map(|entry| {
+                Ok(PreparedUniqueIndexEntry {
+                    encoded_key: encode_unique_key(&entry.key)?,
+                    entry,
+                })
+            })
+            .collect()
+    }
+
+    pub fn append_prepared_unique_index_entries(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        entries: Vec<PreparedUniqueIndexEntry>,
+    ) -> Result<bool> {
+        if entries.is_empty() {
+            return Ok(true);
+        }
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            return Ok(false);
+        };
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let cache_key = unique_index_key(db, table, index_name);
+        let is_current = self
+            .unique_indexes
+            .read()
+            .unwrap()
+            .get(&cache_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &state));
+        if !is_current {
+            drop(_mutation_guard);
+            return self.append_prepared_unique_index_entries(db, table, index_name, entries);
+        }
+        let dir = self.unique_index_dir(db, table);
+        std::fs::create_dir_all(&dir)?;
+        let base = sanitize_file_component(index_name);
+        let delta_path = dir.join(format!("{}.delta.tbi", base));
+        append_prepared_unique_index_delta(&delta_path, &entries)?;
+        {
+            let mut delta = state.delta.write().unwrap();
+            for addition in entries {
+                delta
+                    .key_locations
+                    .entry(addition.encoded_key.clone())
+                    .or_default()
+                    .push(addition.entry.location.clone());
+                delta.entries.push(addition);
+            }
+        }
+        if std::fs::metadata(&delta_path)?.len() >= UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES {
+            let data = materialize_unique_index_state(&state)?;
+            let columns = data.columns.clone();
+            let live_entries = live_unique_index_entries(&data);
+            self.persist_unique_index_entries(db, table, index_name, &columns, live_entries)?;
+        }
+        Ok(true)
     }
 
     pub fn append_unique_index_entries(
@@ -364,31 +557,8 @@ impl IndexManager {
         index_name: &str,
         entries: Vec<UniqueIndexEntry>,
     ) -> Result<bool> {
-        if entries.is_empty() {
-            return Ok(true);
-        }
-        let Some(data) = self.load_unique_index_data(db, table, index_name)? else {
-            return Ok(false);
-        };
-        let dir = self.unique_index_dir(db, table);
-        std::fs::create_dir_all(&dir)?;
-        let base = sanitize_file_component(index_name);
-        let delta_path = dir.join(format!("{}.delta.tbi", base));
-        append_unique_index_delta(&delta_path, &entries)?;
-        let mut merged = (*data).clone();
-        merged.entries.extend(entries);
-        prepare_unique_index_data(&mut merged)?;
-        if std::fs::metadata(&delta_path)?.len() >= UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES {
-            let columns = merged.columns.clone();
-            let live_entries = live_unique_index_entries(&merged);
-            self.persist_unique_index_entries(db, table, index_name, &columns, live_entries)?;
-        } else {
-            self.unique_indexes
-                .write()
-                .unwrap()
-                .insert(unique_index_key(db, table, index_name), Arc::new(merged));
-        }
-        Ok(true)
+        let prepared = self.prepare_unique_index_entries(entries)?;
+        self.append_prepared_unique_index_entries(db, table, index_name, prepared)
     }
 
     pub fn append_unique_index_tombstones(
@@ -401,6 +571,21 @@ impl IndexManager {
         if tombstones.is_empty() {
             return Ok(true);
         }
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            return Ok(false);
+        };
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let cache_key = unique_index_key(db, table, index_name);
+        let is_current = self
+            .unique_indexes
+            .read()
+            .unwrap()
+            .get(&cache_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &state));
+        if !is_current {
+            drop(_mutation_guard);
+            return self.append_unique_index_tombstones(db, table, index_name, tombstones);
+        }
         let dir = self.unique_index_dir(db, table);
         let base = sanitize_file_component(index_name);
         let data_path = dir.join(format!("{}.keys.tbi", base));
@@ -410,30 +595,37 @@ impl IndexManager {
         std::fs::create_dir_all(&dir)?;
         let delta_path = dir.join(format!("{}.delta.tbi", base));
         append_unique_index_tombstone_delta(&delta_path, &tombstones)?;
+        state.delta.write().unwrap().tombstones.extend(tombstones);
+        if std::fs::metadata(&delta_path)?.len() >= UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES {
+            let data = materialize_unique_index_state(&state)?;
+            let columns = data.columns.clone();
+            let live_entries = live_unique_index_entries(&data);
+            self.persist_unique_index_entries(db, table, index_name, &columns, live_entries)?;
+        }
+        Ok(true)
+    }
+
+    pub fn invalidate_unique_index_snapshot(&self, db: &str, table: &str, index_name: &str) {
+        let dir = self.unique_index_dir(db, table);
+        let base = sanitize_file_component(index_name);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("{}.invalid", base)), []);
         self.unique_indexes
             .write()
             .unwrap()
             .remove(&unique_index_key(db, table, index_name));
-        let Some(data) = self.load_unique_index_data(db, table, index_name)? else {
-            return Ok(false);
-        };
-        let mut merged = (*data).clone();
-        merged.tombstones.extend(tombstones);
-        merged
-            .entries
-            .retain(|entry| !unique_index_tombstones_contains(&merged.tombstones, &entry.location));
-        prepare_unique_index_data(&mut merged)?;
-        if std::fs::metadata(&delta_path)?.len() >= UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES {
-            let columns = merged.columns.clone();
-            let live_entries = live_unique_index_entries(&merged);
-            self.persist_unique_index_entries(db, table, index_name, &columns, live_entries)?;
-        } else {
-            self.unique_indexes
-                .write()
-                .unwrap()
-                .insert(unique_index_key(db, table, index_name), Arc::new(merged));
+    }
+
+    pub fn invalidate_table_unique_index_snapshots(
+        &self,
+        db: &str,
+        table: &str,
+        index_names: &[String],
+    ) {
+        self.invalidate_primary_key_index(db, table);
+        for index_name in index_names {
+            self.invalidate_unique_index_snapshot(db, table, index_name);
         }
-        Ok(true)
     }
 
     pub fn remove_unique_index_snapshot(&self, db: &str, table: &str, index_name: &str) {
@@ -441,6 +633,7 @@ impl IndexManager {
         let base = sanitize_file_component(index_name);
         let _ = std::fs::remove_file(dir.join(format!("{}.keys.tbi", base)));
         let _ = std::fs::remove_file(dir.join(format!("{}.delta.tbi", base)));
+        let _ = std::fs::remove_file(dir.join(format!("{}.invalid", base)));
         self.unique_indexes
             .write()
             .unwrap()
@@ -453,6 +646,7 @@ impl IndexManager {
         table: &str,
         index_names: &[String],
     ) {
+        self.invalidate_primary_key_index(db, table);
         for index_name in index_names {
             self.remove_unique_index_snapshot(db, table, index_name);
         }
@@ -472,10 +666,99 @@ const UNIQUE_INDEX_MAGIC_V2: &[u8; 8] = b"TBIUKV2\0";
 const UNIQUE_INDEX_DELTA_MAGIC_V1: &[u8; 8] = b"TBIUKD1\0";
 const UNIQUE_INDEX_DELTA_MAGIC_V2: &[u8; 8] = b"TBIUKD2\0";
 const UNIQUE_INDEX_BLOCK_SIZE: usize = 256;
+#[cfg(test)]
 const UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 4096;
+#[cfg(not(test))]
+const UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
 fn unique_index_key(db: &str, table: &str, index_name: &str) -> String {
     format!("{}\0{}\0{}", db, table, index_name.to_ascii_lowercase())
+}
+
+fn materialize_unique_index_state(state: &UniqueIndexState) -> Result<UniqueIndexData> {
+    let delta = state.delta.read().unwrap();
+    let mut data = (*state.base).clone();
+    let additions = delta.entries.clone();
+    data.tombstones.extend(delta.tombstones.iter().cloned());
+    drop(delta);
+    merge_prepared_unique_index_entries(&mut data, additions)?;
+    Ok(data)
+}
+
+fn unique_index_state_contains_key(
+    segment_mgr: &SegmentManager,
+    state: &UniqueIndexState,
+    encoded_key: &[u8],
+) -> Result<bool> {
+    let delta = state.delta.read().unwrap();
+    if let Some(locations) = delta.key_locations.get(encoded_key) {
+        for location in locations {
+            if !unique_index_tombstones_contains(&delta.tombstones, location)
+                && unique_index_entry_location_is_live(segment_mgr, location)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    let tombstones = &delta.tombstones;
+    let base = &state.base;
+    let Ok(mut idx) = base
+        .encoded_keys
+        .binary_search_by(|key| key.as_slice().cmp(encoded_key))
+    else {
+        return Ok(false);
+    };
+    while idx > 0 && base.encoded_keys[idx - 1].as_slice() == encoded_key {
+        idx -= 1;
+    }
+    while idx < base.encoded_keys.len() && base.encoded_keys[idx].as_slice() == encoded_key {
+        let location = &base.entries[idx].location;
+        if !unique_index_tombstones_contains(tombstones, location)
+            && unique_index_entry_location_is_live(segment_mgr, location)?
+        {
+            return Ok(true);
+        }
+        idx += 1;
+    }
+    Ok(false)
+}
+
+fn merge_prepared_unique_index_entries(
+    data: &mut UniqueIndexData,
+    mut additions: Vec<PreparedUniqueIndexEntry>,
+) -> Result<()> {
+    additions.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
+    let existing_entries = std::mem::take(&mut data.entries);
+    let existing_keys = std::mem::take(&mut data.encoded_keys);
+    let mut existing = existing_keys.into_iter().zip(existing_entries).peekable();
+    let mut additions = additions.into_iter().peekable();
+    let capacity = existing.size_hint().0 + additions.size_hint().0;
+    let mut merged_entries = Vec::with_capacity(capacity);
+    let mut merged_keys = Vec::with_capacity(capacity);
+    while existing.peek().is_some() && additions.peek().is_some() {
+        let take_existing = existing.peek().unwrap().0 <= additions.peek().unwrap().encoded_key;
+        if take_existing {
+            let (key, entry) = existing.next().unwrap();
+            merged_keys.push(key);
+            merged_entries.push(entry);
+        } else {
+            let addition = additions.next().unwrap();
+            merged_keys.push(addition.encoded_key);
+            merged_entries.push(addition.entry);
+        }
+    }
+    for (key, entry) in existing {
+        merged_keys.push(key);
+        merged_entries.push(entry);
+    }
+    for addition in additions {
+        merged_keys.push(addition.encoded_key);
+        merged_entries.push(addition.entry);
+    }
+    data.entries = merged_entries;
+    data.encoded_keys = merged_keys;
+    data.blocks = build_unique_index_blocks(&data.encoded_keys);
+    Ok(())
 }
 
 fn prepare_unique_index_data(data: &mut UniqueIndexData) -> Result<()> {
@@ -495,6 +778,22 @@ fn prepare_unique_index_data(data: &mut UniqueIndexData) -> Result<()> {
     }
     data.blocks = build_unique_index_blocks(&data.encoded_keys);
     Ok(())
+}
+
+fn merge_unique_index_entries(
+    data: &mut UniqueIndexData,
+    entries: Vec<UniqueIndexEntry>,
+) -> Result<()> {
+    let additions = entries
+        .into_iter()
+        .map(|entry| {
+            Ok(PreparedUniqueIndexEntry {
+                encoded_key: encode_unique_key(&entry.key)?,
+                entry,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    merge_prepared_unique_index_entries(data, additions)
 }
 
 fn build_unique_index_blocks(encoded_keys: &[Vec<u8>]) -> Vec<UniqueIndexBlock> {
@@ -630,6 +929,36 @@ fn encode_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn append_prepared_unique_index_delta(
+    path: &Path,
+    entries: &[PreparedUniqueIndexEntry],
+) -> Result<()> {
+    let is_new = !path.exists() || std::fs::metadata(path)?.len() == 0;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if is_new {
+        file.write_all(UNIQUE_INDEX_DELTA_MAGIC_V2)?;
+    }
+    for addition in entries {
+        let entry = &addition.entry;
+        let mut record = Vec::new();
+        record.push(1);
+        put_bytes(&mut record, &addition.encoded_key);
+        put_u32(&mut record, entry.key.len() as u32);
+        for value in &entry.key {
+            encode_scalar_value(&mut record, value)?;
+        }
+        put_string(&mut record, &entry.location.segment_path);
+        put_u64(&mut record, entry.location.row_id);
+        write_u32(&mut file, record.len() as u32)?;
+        file.write_all(&record)?;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
 fn append_unique_index_delta(path: &Path, entries: &[UniqueIndexEntry]) -> Result<()> {
     append_unique_index_delta_records(path, entries, &[])
 }
@@ -681,8 +1010,26 @@ fn append_unique_index_delta_records(
 
 #[derive(Default)]
 struct UniqueIndexDelta {
-    entries: Vec<UniqueIndexEntry>,
+    entries: Vec<PreparedUniqueIndexEntry>,
     tombstones: Vec<UniqueRowLocation>,
+}
+
+impl UniqueIndexDelta {
+    fn into_state(self) -> Result<UniqueIndexDeltaState> {
+        let mut state = UniqueIndexDeltaState {
+            entries: self.entries,
+            tombstones: self.tombstones.into_iter().collect(),
+            key_locations: HashMap::new(),
+        };
+        for addition in &state.entries {
+            state
+                .key_locations
+                .entry(addition.encoded_key.clone())
+                .or_default()
+                .push(addition.entry.location.clone());
+        }
+        Ok(state)
+    }
 }
 
 fn decode_unique_index_delta(bytes: &[u8]) -> Result<UniqueIndexDelta> {
@@ -715,10 +1062,11 @@ fn decode_unique_index_delta(bytes: &[u8]) -> Result<UniqueIndexDelta> {
         let record_type = read_u8(&mut record_cursor)?;
         match record_type {
             1 => {
-                let _encoded_key = read_bytes(&mut record_cursor)?;
+                let encoded_key = read_bytes(&mut record_cursor)?;
+                let entry = read_unique_index_entry(&mut record_cursor)?;
                 delta
                     .entries
-                    .push(read_unique_index_entry(&mut record_cursor)?);
+                    .push(PreparedUniqueIndexEntry { encoded_key, entry });
             }
             2 => {
                 let segment_path = read_string(&mut record_cursor)?;
@@ -756,10 +1104,11 @@ fn decode_unique_index_delta_v1(
         }
         let record = &bytes[start..end];
         let mut record_cursor = Cursor::new(record);
-        let _encoded_key = read_bytes(&mut record_cursor)?;
+        let encoded_key = read_bytes(&mut record_cursor)?;
+        let entry = read_unique_index_entry(&mut record_cursor)?;
         delta
             .entries
-            .push(read_unique_index_entry(&mut record_cursor)?);
+            .push(PreparedUniqueIndexEntry { encoded_key, entry });
         cursor.set_position(end as u64);
     }
     Ok(delta)
@@ -886,6 +1235,87 @@ fn put_string(out: &mut Vec<u8>, value: &str) {
 fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
     put_u32(out, value.len() as u32);
     out.extend_from_slice(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(value: i64, row_id: u64) -> UniqueIndexEntry {
+        UniqueIndexEntry {
+            key: vec![ScalarValue::Int64(Some(value))],
+            location: UniqueRowLocation {
+                segment_path: String::new(),
+                row_id,
+            },
+        }
+    }
+
+    #[test]
+    fn incremental_unique_index_merge_keeps_entries_sorted_and_aligned() -> Result<()> {
+        let mut data = UniqueIndexData {
+            db: "db".to_string(),
+            table: "ticks".to_string(),
+            index_name: "uk_value".to_string(),
+            columns: vec!["value".to_string()],
+            entries: vec![entry(2, 2), entry(4, 4)],
+            tombstones: HashSet::new(),
+            encoded_keys: Vec::new(),
+            blocks: Vec::new(),
+        };
+        prepare_unique_index_data(&mut data)?;
+
+        merge_unique_index_entries(
+            &mut data,
+            vec![entry(5, 5), entry(1, 1), entry(4, 40), entry(3, 3)],
+        )?;
+
+        assert_eq!(data.entries.len(), 6);
+        assert!(data.encoded_keys.windows(2).all(|keys| keys[0] <= keys[1]));
+        for (encoded, entry) in data.encoded_keys.iter().zip(&data.entries) {
+            assert_eq!(*encoded, encode_unique_key(&entry.key)?);
+        }
+        assert_eq!(
+            data.entries
+                .iter()
+                .filter(|entry| entry.key == vec![ScalarValue::Int64(Some(4))])
+                .count(),
+            2
+        );
+        assert_eq!(data.blocks.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_unique_index_merge_handles_many_batches() -> Result<()> {
+        let mut data = UniqueIndexData {
+            db: "db".to_string(),
+            table: "ticks".to_string(),
+            index_name: "uk_value".to_string(),
+            columns: vec!["value".to_string()],
+            entries: Vec::new(),
+            tombstones: HashSet::new(),
+            encoded_keys: Vec::new(),
+            blocks: Vec::new(),
+        };
+
+        for batch in 0..100 {
+            let start = batch * 100;
+            let entries = (0..100)
+                .rev()
+                .map(|offset| entry((start + offset) as i64, (start + offset) as u64))
+                .collect();
+            merge_unique_index_entries(&mut data, entries)?;
+        }
+
+        assert_eq!(data.entries.len(), 10_000);
+        assert!(data.encoded_keys.windows(2).all(|keys| keys[0] <= keys[1]));
+        assert_eq!(
+            data.blocks.len(),
+            data.entries.len().div_ceil(UNIQUE_INDEX_BLOCK_SIZE)
+        );
+        Ok(())
+    }
 }
 
 fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8> {
