@@ -259,105 +259,127 @@ impl<'a> ScanExecutor<'a> {
                 filtered_segments.reverse();
             }
 
-            for seg_path in &filtered_segments {
-                let meta = mgr.segment_meta(seg_path).ok().flatten();
-                let meta_candidate_indices = meta.as_ref().and_then(|meta| {
-                    let pred = self.spec.to_row_group_predicate();
-                    if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps)
-                    {
-                        return Some(Vec::new());
+            let use_segment_parallel = scan_limit.is_none()
+                && ordered_limit.is_none()
+                && self.stats.is_none()
+                && filtered_segments.len() > 1
+                && crate::common::config::query_limits().max_parallel_segments > 1;
+            if use_segment_parallel {
+                for batch in self.scan_segments_parallel(&filtered_segments, &mgr, &plan)? {
+                    if !output.push(batch) {
+                        return Ok(());
                     }
-                    Some(
-                        super::row_group::prune_row_group_meta(
-                            &meta.row_groups,
+                }
+            } else {
+                for seg_path in &filtered_segments {
+                    let meta = mgr.segment_meta(seg_path).ok().flatten();
+                    let meta_candidate_indices = meta.as_ref().and_then(|meta| {
+                        let pred = self.spec.to_row_group_predicate();
+                        if !super::row_group::prune_segment_by_zone_map(
                             &pred,
-                            &super::row_group::build_bloom_check_list(self.spec),
-                            &super::row_group::build_in_check_list(self.spec),
-                            &super::row_group::build_set_check_list(self.spec),
-                            &super::row_group::build_set_in_check_list(self.spec),
-                        )
-                        .candidate_indices,
-                    )
-                });
-                if meta_candidate_indices
-                    .as_ref()
-                    .is_some_and(|candidates| candidates.is_empty())
-                {
-                    continue;
-                }
-
-                let reader = match mgr.open_reader_cached(seg_path) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-
-                if let Some(s) = self.stats.as_deref_mut() {
-                    s.entry(self.spec.table_name.clone())
-                        .or_default()
-                        .segments_opened += 1;
-                }
-
-                let candidate_indices = if let Some(candidates) = meta_candidate_indices {
-                    candidates
-                } else {
-                    let Some(prune_result) = super::strategy::prune_segment(self.spec, &reader)
-                    else {
-                        continue;
-                    };
-                    prune_result.candidate_indices
-                };
-
-                if let Some(s) = self.stats.as_deref_mut() {
-                    let stats_entry = s.entry(self.spec.table_name.clone()).or_default();
-                    stats_entry.row_groups_total += reader.num_row_groups() as u64;
-                    stats_entry.row_groups_pruned +=
-                        (reader.num_row_groups() - candidate_indices.len()) as u64;
-                    if scan_limit.is_none() && ordered_limit.is_none() {
-                        stats_entry.row_groups_read += candidate_indices.len() as u64;
-                    }
-                }
-
-                let mut candidate_indices = candidate_indices;
-                if ordered_limit.is_some_and(|order| order.desc) {
-                    candidate_indices.reverse();
-                }
-
-                if scan_limit.is_some() || ordered_limit.is_some() {
-                    for rg_idx in &candidate_indices {
-                        self.record_row_group_read(&reader, *rg_idx, &plan);
-                        let mut batch = match super::strategy::read_row_group_with_strategy(
-                            self.spec,
-                            &plan,
-                            &self.table_schema,
-                            &reader,
-                            *rg_idx,
+                            &meta.segment_zone_maps,
                         ) {
-                            Ok(b) => b,
-                            Err(_) => continue,
-                        };
-                        if ordered_limit.is_some_and(|order| order.desc) {
-                            batch = reverse_batch(&batch)?;
+                            return Some(Vec::new());
                         }
-                        self.record_rows_scanned(batch.num_rows() as u64);
-                        let batch = super::strategy::apply_ttl_filter_and_projection(
-                            batch,
-                            &self.table_meta,
-                            &plan.projection_cols,
-                            plan.strip_ttl_column,
-                        )?;
-                        if !output.push(batch) {
-                            return Ok(());
+                        Some(
+                            super::row_group::prune_row_group_meta(
+                                &meta.row_groups,
+                                &pred,
+                                &super::row_group::build_bloom_check_list(self.spec),
+                                &super::row_group::build_in_check_list(self.spec),
+                                &super::row_group::build_set_check_list(self.spec),
+                                &super::row_group::build_set_in_check_list(self.spec),
+                            )
+                            .candidate_indices,
+                        )
+                    });
+                    if meta_candidate_indices
+                        .as_ref()
+                        .is_some_and(|candidates| candidates.is_empty())
+                    {
+                        continue;
+                    }
+
+                    let reader = match mgr.open_reader_cached(seg_path) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        s.entry(self.spec.table_name.clone())
+                            .or_default()
+                            .segments_opened += 1;
+                    }
+
+                    let candidate_indices = if let Some(candidates) = meta_candidate_indices {
+                        candidates
+                    } else {
+                        let Some(prune_result) = super::strategy::prune_segment(self.spec, &reader)
+                        else {
+                            continue;
+                        };
+                        prune_result.candidate_indices
+                    };
+
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        let stats_entry = s.entry(self.spec.table_name.clone()).or_default();
+                        stats_entry.row_groups_total += reader.num_row_groups() as u64;
+                        stats_entry.row_groups_pruned +=
+                            (reader.num_row_groups() - candidate_indices.len()) as u64;
+                        if scan_limit.is_none() && ordered_limit.is_none() {
+                            stats_entry.row_groups_read += candidate_indices.len() as u64;
                         }
                     }
-                    continue;
-                }
 
-                use rayon::prelude::*;
+                    let mut candidate_indices = candidate_indices;
+                    if ordered_limit.is_some_and(|order| order.desc) {
+                        candidate_indices.reverse();
+                    } else if scan_limit.is_some() && self.spec.has_predicates() {
+                        super::strategy::rank_row_groups_for_limit(
+                            self.spec,
+                            &reader,
+                            &mut candidate_indices,
+                        );
+                    }
 
-                let mut rg_batches: Vec<(usize, RecordBatch)> = candidate_indices
-                    .par_iter()
-                    .enumerate()
-                    .filter_map(|(pos, rg_idx)| {
+                    if scan_limit.is_some() || ordered_limit.is_some() {
+                        for rg_idx in &candidate_indices {
+                            self.record_row_group_read(&reader, *rg_idx, &plan);
+                            let mut batch = match super::strategy::read_row_group_with_strategy(
+                                self.spec,
+                                &plan,
+                                &self.table_schema,
+                                &reader,
+                                *rg_idx,
+                            ) {
+                                Ok(b) => b,
+                                Err(_) => continue,
+                            };
+                            if ordered_limit.is_some_and(|order| order.desc) {
+                                batch = reverse_batch(&batch)?;
+                            }
+                            self.record_rows_scanned(batch.num_rows() as u64);
+                            let batch = super::strategy::apply_ttl_filter_and_projection(
+                                batch,
+                                &self.table_meta,
+                                &plan.projection_cols,
+                                plan.strip_ttl_column,
+                            )?;
+                            if !output.push(batch) {
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+
+                    use rayon::prelude::*;
+
+                    let limits = crate::common::config::query_limits();
+                    let max_parallel = limits.max_parallel_row_groups.max(1);
+                    let min_parallel = limits.parallel_scan_min_row_groups.max(2);
+                    let read_one = |pos: usize, rg_idx: &usize| {
+                        let _cpu = crate::common::work_limiter::acquire_cpu();
+                        let _io = crate::common::work_limiter::acquire_io();
                         super::strategy::read_row_group_with_strategy(
                             self.spec,
                             &plan,
@@ -368,28 +390,50 @@ impl<'a> ScanExecutor<'a> {
                         .ok()
                         .filter(|batch| batch.num_rows() > 0)
                         .map(|batch| (pos, batch))
-                    })
-                    .collect();
-                rg_batches.sort_by_key(|(pos, _)| *pos);
+                    };
+                    let mut rg_batches: Vec<(usize, RecordBatch)> = if max_parallel == 1
+                        || candidate_indices.len() < min_parallel
+                    {
+                        candidate_indices
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(pos, rg_idx)| read_one(pos, rg_idx))
+                            .collect()
+                    } else {
+                        let mut batches = Vec::new();
+                        for (chunk_idx, chunk) in candidate_indices.chunks(max_parallel).enumerate()
+                        {
+                            let base = chunk_idx * max_parallel;
+                            let mut chunk_batches: Vec<(usize, RecordBatch)> = chunk
+                                .par_iter()
+                                .enumerate()
+                                .filter_map(|(pos, rg_idx)| read_one(base + pos, rg_idx))
+                                .collect();
+                            batches.append(&mut chunk_batches);
+                        }
+                        batches
+                    };
+                    rg_batches.sort_by_key(|(pos, _)| *pos);
 
-                let rows_scanned = rg_batches
-                    .iter()
-                    .map(|(_, batch)| batch.num_rows() as u64)
-                    .sum::<u64>();
-                if let Some(s) = self.stats.as_deref_mut() {
-                    s.entry(self.spec.table_name.clone())
-                        .or_default()
-                        .rows_scanned += rows_scanned;
-                }
-                for (_, batch) in rg_batches {
-                    let batch = super::strategy::apply_ttl_filter_and_projection(
-                        batch,
-                        &self.table_meta,
-                        &plan.projection_cols,
-                        plan.strip_ttl_column,
-                    )?;
-                    if !output.push(batch) {
-                        return Ok(());
+                    let rows_scanned = rg_batches
+                        .iter()
+                        .map(|(_, batch)| batch.num_rows() as u64)
+                        .sum::<u64>();
+                    if let Some(s) = self.stats.as_deref_mut() {
+                        s.entry(self.spec.table_name.clone())
+                            .or_default()
+                            .rows_scanned += rows_scanned;
+                    }
+                    for (_, batch) in rg_batches {
+                        let batch = super::strategy::apply_ttl_filter_and_projection(
+                            batch,
+                            &self.table_meta,
+                            &plan.projection_cols,
+                            plan.strip_ttl_column,
+                        )?;
+                        if !output.push(batch) {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -442,6 +486,85 @@ impl<'a> ScanExecutor<'a> {
             plan.strip_ttl_column,
         )?;
         Ok(Some(batch))
+    }
+
+    fn scan_segments_parallel(
+        &self,
+        paths: &[PathBuf],
+        manager: &std::sync::Arc<SegmentManager>,
+        plan: &super::strategy::ScanPlan,
+    ) -> Result<Vec<RecordBatch>> {
+        use rayon::prelude::*;
+        let max_parallel = crate::common::config::query_limits()
+            .max_parallel_segments
+            .max(1);
+        let mut output = Vec::new();
+        for (chunk_index, chunk) in paths.chunks(max_parallel).enumerate() {
+            let base = chunk_index * max_parallel;
+            let mut scanned = chunk
+                .par_iter()
+                .enumerate()
+                .filter_map(|(position, path)| {
+                    let reader = {
+                        let _io = crate::common::work_limiter::acquire_io();
+                        manager.open_reader_cached(path).ok()?
+                    };
+                    let candidates = if let Ok(Some(meta)) = manager.segment_meta(path) {
+                        let predicate = self.spec.to_row_group_predicate();
+                        if !super::row_group::prune_segment_by_zone_map(
+                            &predicate,
+                            &meta.segment_zone_maps,
+                        ) {
+                            return Some((base + position, Vec::new()));
+                        }
+                        super::row_group::prune_row_group_meta(
+                            &meta.row_groups,
+                            &predicate,
+                            &super::row_group::build_bloom_check_list(self.spec),
+                            &super::row_group::build_in_check_list(self.spec),
+                            &super::row_group::build_set_check_list(self.spec),
+                            &super::row_group::build_set_in_check_list(self.spec),
+                        )
+                        .candidate_indices
+                    } else {
+                        super::strategy::prune_segment(self.spec, &reader)?.candidate_indices
+                    };
+                    let mut batches = Vec::with_capacity(candidates.len());
+                    for row_group in candidates {
+                        let batch_result = {
+                            let _cpu = crate::common::work_limiter::acquire_cpu();
+                            let _io = crate::common::work_limiter::acquire_io();
+                            super::strategy::read_row_group_with_strategy(
+                                self.spec,
+                                plan,
+                                &self.table_schema,
+                                &reader,
+                                row_group,
+                            )
+                        };
+                        let Ok(batch) = batch_result else {
+                            continue;
+                        };
+                        let batch = super::strategy::apply_ttl_filter_and_projection(
+                            batch,
+                            &self.table_meta,
+                            &plan.projection_cols,
+                            plan.strip_ttl_column,
+                        )
+                        .ok()?;
+                        if batch.num_rows() > 0 {
+                            batches.push(batch);
+                        }
+                    }
+                    Some((base + position, batches))
+                })
+                .collect::<Vec<_>>();
+            scanned.sort_by_key(|(position, _)| *position);
+            for (_, mut batches) in scanned {
+                output.append(&mut batches);
+            }
+        }
+        Ok(output)
     }
 
     fn try_resident_hot_count(&self) -> Result<Option<u64>> {

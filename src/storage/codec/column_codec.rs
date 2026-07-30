@@ -6,7 +6,7 @@ use crate::storage::codec::encoding::EncodingType;
 use crate::storage::codec::io_util::{
     read_u32_le, read_varint, write_varint, zigzag_decode, zigzag_encode,
 };
-use crate::types::array::ColumnArray;
+use crate::types::array::{ColumnArray, Utf8Buffer};
 use crate::types::batch::ColumnDef;
 use crate::types::bitmap::NullBitmap;
 
@@ -204,7 +204,7 @@ fn encode_i64_delta_payload(values: &[i64]) -> Vec<u8> {
 }
 
 fn encode_varchar_dictionary_adaptive(
-    data: &[String],
+    data: &Utf8Buffer,
     bitmap: &NullBitmap,
     offset: usize,
     count: usize,
@@ -218,7 +218,7 @@ fn encode_varchar_dictionary_adaptive(
         if bitmap.is_null(i) {
             continue;
         }
-        let value = item.as_str();
+        let value = item;
         plain_size += 4 + value.len();
         let idx = if let Some(&idx) = index_map.get(value) {
             idx
@@ -319,7 +319,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 }
             }
             ColumnArray::$variant {
-                data: vals,
+                data: vals.into(),
                 bitmap: bitmap.clone(),
             }
         }};
@@ -339,7 +339,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 });
             }
             ColumnArray::Bool {
-                data: vals,
+                data: vals.into(),
                 bitmap: bitmap.clone(),
             }
         }
@@ -403,7 +403,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 }
             }
             ColumnArray::VarChar {
-                data: vals,
+                data: vals.into(),
                 bitmap: bitmap.clone(),
             }
         }
@@ -420,7 +420,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 }
             }
             ColumnArray::Blob {
-                data: vals,
+                data: vals.into(),
                 bitmap: bitmap.clone(),
             }
         }
@@ -636,7 +636,10 @@ fn build_varchar_column(
             value_pos += 1;
         }
     }
-    Ok(ColumnArray::VarChar { data, bitmap })
+    Ok(ColumnArray::VarChar {
+        data: data.into(),
+        bitmap,
+    })
 }
 
 fn project_column(col: &ColumnArray, selected_rows: &[usize]) -> Result<ColumnArray> {
@@ -852,7 +855,7 @@ fn decode_selected_varchar(
     }
 
     Ok(ColumnArray::VarChar {
-        data: out,
+        data: out.into(),
         bitmap: out_bitmap,
     })
 }
@@ -902,7 +905,7 @@ fn decode_selected_blob(
     }
 
     Ok(ColumnArray::Blob {
-        data: out,
+        data: out.into(),
         bitmap: out_bitmap,
     })
 }

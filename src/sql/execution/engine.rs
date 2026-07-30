@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -22,6 +22,36 @@ use crate::sql::parser::parser::Parser;
 
 use crate::types::batch::{RecordBatch, Schema};
 
+fn recover_durable_memtable_tails(
+    data_dir: &Path,
+    catalogs: &HashMap<String, DatabaseCatalog>,
+    batch_writer: &BatchWriter,
+) -> Result<std::collections::HashSet<(String, String)>> {
+    let mut recovered_tables = std::collections::HashSet::new();
+    for (db, catalog) in catalogs {
+        for (table, table_meta) in &catalog.tables {
+            let table_dir = data_dir.join(db).join(table);
+            let schema = Schema::new(table_meta.columns.clone());
+            for tail in crate::storage::core::durable_tail::recover(&table_dir, &schema)? {
+                if tail.batch.num_rows() == 0 {
+                    continue;
+                }
+                let rows = tail.batch.num_rows();
+                batch_writer.memtable_manager().restore_committed_tail(
+                    tail.id,
+                    db,
+                    table,
+                    &tail.partition_key,
+                    tail.batch,
+                );
+                recovered_tables.insert((db.clone(), table.clone()));
+                tracing::info!(db, table, rows, "recovered durable low-rate memtable tail");
+            }
+        }
+    }
+    Ok(recovered_tables)
+}
+
 #[derive(Debug)]
 pub enum ExecResult {
     Ok {
@@ -40,11 +70,13 @@ pub struct Engine {
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
     bulk_mode_sessions: AtomicUsize,
+    bulk_dirty_tables: Mutex<HashSet<(String, String)>>,
     in_flight_operations: AtomicUsize,
     auth_manager: Arc<AuthManager>,
     auto_increment_mgr: Arc<AutoIncrementManager>,
     index_manager: Arc<IndexManager>,
     hot_store_mgr: Arc<crate::storage::core::hot_store::HotStoreManager>,
+    performance_baselines: Arc<crate::common::performance_baseline::PerformanceBaselineStore>,
 }
 
 enum HotResidentMark {
@@ -66,6 +98,14 @@ pub struct AutoCompactConfig {
     pub enabled: bool,
     pub min_deleted_ratio: f64,
     pub min_deleted_rows: u64,
+    pub fragmentation_enabled: bool,
+    pub min_fragmented_row_groups: usize,
+    pub max_row_group_overhead_ratio: f64,
+    pub min_small_row_group_ratio: f64,
+    pub fragmentation_cooldown: Duration,
+    pub fragmentation_scan_interval: Duration,
+    pub low_rate_max_rows: u64,
+    pub low_rate_max_age: Duration,
     pub interval: Duration,
     pub max_tables_per_run: usize,
 }
@@ -76,122 +116,225 @@ impl Default for AutoCompactConfig {
             enabled: true,
             min_deleted_ratio: 0.30,
             min_deleted_rows: 8192,
+            fragmentation_enabled: true,
+            min_fragmented_row_groups: 32,
+            max_row_group_overhead_ratio: 2.0,
+            min_small_row_group_ratio: 0.50,
+            fragmentation_cooldown: Duration::from_secs(3600),
+            fragmentation_scan_interval: Duration::from_secs(300),
+            low_rate_max_rows: 1024,
+            low_rate_max_age: Duration::from_secs(7 * 24 * 60 * 60),
             interval: Duration::from_secs(60),
             max_tables_per_run: 8,
         }
     }
 }
 
-fn start_delete_bitmap_cleanup_thread(
+#[derive(Debug, Default, Clone, Copy)]
+struct TablePhysicalHealth {
+    live_rows: u64,
+    deleted_rows: u64,
+    row_groups: usize,
+    small_row_groups: usize,
+}
+
+impl TablePhysicalHealth {
+    fn needs_delete_cleanup(&self, config: &AutoCompactConfig) -> bool {
+        config.enabled
+            && self.deleted_rows >= config.min_deleted_rows
+            && self.live_rows.saturating_add(self.deleted_rows) > 0
+            && (self.deleted_rows as f64 / self.live_rows.saturating_add(self.deleted_rows) as f64)
+                >= config.min_deleted_ratio
+    }
+
+    fn needs_fragmentation_cleanup(
+        &self,
+        target_row_group_rows: u64,
+        config: &AutoCompactConfig,
+    ) -> bool {
+        if !config.fragmentation_enabled
+            || self.row_groups < config.min_fragmented_row_groups.max(2)
+        {
+            return false;
+        }
+        let target = target_row_group_rows.max(1);
+        let expected = self.live_rows.max(1).div_ceil(target).max(1) as f64;
+        let overhead = self.row_groups as f64 / expected;
+        let small_ratio = self.small_row_groups as f64 / self.row_groups as f64;
+        overhead >= config.max_row_group_overhead_ratio.max(1.0)
+            && small_ratio >= config.min_small_row_group_ratio.clamp(0.0, 1.0)
+    }
+}
+
+fn table_physical_health(
+    segment_mgr: &SegmentManager,
+    db: &str,
+    table: &str,
+    table_dir: &Path,
+    target_row_group_rows: u64,
+    collect_fragmentation: bool,
+) -> Result<TablePhysicalHealth> {
+    segment_mgr.with_table_mutation_lock(db, table, || {
+        let mut health = TablePhysicalHealth::default();
+        let small_limit = target_row_group_rows.max(1).div_ceil(4);
+        for path in SegmentManager::discover_segments(table_dir)? {
+            let reader = segment_mgr.open_reader_cached(&path)?;
+            health.deleted_rows = health
+                .deleted_rows
+                .saturating_add(reader.deleted_row_count());
+            health.live_rows = health.live_rows.saturating_add(
+                reader
+                    .row_count()
+                    .saturating_sub(reader.deleted_row_count()),
+            );
+            if collect_fragmentation {
+                health.row_groups = health.row_groups.saturating_add(reader.num_row_groups());
+                for row_group_idx in 0..reader.num_row_groups() {
+                    if reader.row_group_rows(row_group_idx) <= small_limit {
+                        health.small_row_groups = health.small_row_groups.saturating_add(1);
+                    }
+                }
+            }
+        }
+        Ok(health)
+    })
+}
+
+fn start_auto_compaction_thread(
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
     catalogs: Arc<RwLock<HashMap<String, DatabaseCatalog>>>,
     config: AutoCompactConfig,
 ) {
-    if !config.enabled {
+    if !config.enabled && !config.fragmentation_enabled {
         return;
     }
-    std::thread::spawn(move || loop {
-        std::thread::sleep(config.interval);
-        let compactor = Compactor::new(Arc::clone(&segment_mgr), data_dir.clone());
-        let table_metas = {
-            let catalogs = catalogs.read().unwrap();
-            catalogs
-                .iter()
-                .flat_map(|(db, catalog)| {
-                    catalog
-                        .tables
-                        .iter()
-                        .map(|(table, meta)| (db.clone(), table.clone(), meta.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut compacted = 0usize;
-        for (db, table, table_meta) in table_metas {
-            if compacted >= config.max_tables_per_run {
-                break;
-            }
-            let table_dir = data_dir.join(&db).join(&table);
-            if !table_dir.exists() {
-                continue;
-            }
-            match table_needs_delete_cleanup(
-                &segment_mgr,
-                &db,
-                &table,
-                &table_dir,
-                config.min_deleted_ratio,
-                config.min_deleted_rows,
-            ) {
-                Ok(true) => {
-                    match compactor.compact_table_for_delete_cleanup(&db, &table, &table_meta) {
-                        Ok(stats) => {
-                            if stats.rows_dropped > 0 || stats.segments_written > 0 {
+    std::thread::spawn(move || {
+        let mut fragmentation_last_run = HashMap::<(String, String), Instant>::new();
+        let mut last_fragmentation_scan = None::<Instant>;
+        loop {
+            std::thread::sleep(config.interval);
+            let collect_fragmentation = config.fragmentation_enabled
+                && last_fragmentation_scan
+                    .is_none_or(|last| last.elapsed() >= config.fragmentation_scan_interval);
+            let compactor = Compactor::new(Arc::clone(&segment_mgr), data_dir.clone());
+            let table_metas = {
+                let catalogs = catalogs.read().unwrap();
+                catalogs
+                    .iter()
+                    .flat_map(|(db, catalog)| {
+                        catalog
+                            .tables
+                            .iter()
+                            .map(|(table, meta)| (db.clone(), table.clone(), meta.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut compacted = 0usize;
+            for (db, table, table_meta) in table_metas {
+                if compacted >= config.max_tables_per_run {
+                    break;
+                }
+                let table_dir = data_dir.join(&db).join(&table);
+                if !table_dir.exists() {
+                    continue;
+                }
+                let target_row_group_rows = table_meta.row_group_size.max(1) as u64;
+                match table_physical_health(
+                    &segment_mgr,
+                    &db,
+                    &table,
+                    &table_dir,
+                    target_row_group_rows,
+                    collect_fragmentation,
+                ) {
+                    Ok(health) if health.needs_delete_cleanup(&config) => {
+                        let compact_result =
+                            if segment_mgr.active_partition_keys(&db, &table).is_empty() {
+                                compactor.compact_table_for_delete_cleanup(&db, &table, &table_meta)
+                            } else {
+                                compactor.compact_table_for_fragmentation(&db, &table, &table_meta)
+                            };
+                        match compact_result {
+                            Ok(stats) => {
+                                if stats.rows_dropped > 0 || stats.segments_written > 0 {
+                                    compacted += 1;
+                                    tracing::info!(
+                                        db,
+                                        table,
+                                        rows_dropped = stats.rows_dropped,
+                                        rows_written = stats.rows_written,
+                                        segments_read = stats.segments_read,
+                                        segments_written = stats.segments_written,
+                                        "auto compact cleaned delete bitmap rows"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(db, table, error = %err, "auto compact failed");
+                            }
+                        }
+                    }
+                    Ok(health)
+                        if health.needs_fragmentation_cleanup(target_row_group_rows, &config)
+                            && fragmentation_last_run
+                                .get(&(db.clone(), table.clone()))
+                                .is_none_or(|last| {
+                                    last.elapsed() >= config.fragmentation_cooldown
+                                }) =>
+                    {
+                        match compactor.compact_table_for_fragmentation(&db, &table, &table_meta) {
+                            Ok(stats) => {
+                                if stats.segments_written > 0 {
+                                    compacted += 1;
+                                    fragmentation_last_run
+                                        .insert((db.clone(), table.clone()), Instant::now());
+                                    tracing::info!(
+                                        db,
+                                        table,
+                                        live_rows = health.live_rows,
+                                        row_groups_before = health.row_groups,
+                                        small_row_groups = health.small_row_groups,
+                                        segments_read = stats.segments_read,
+                                        segments_written = stats.segments_written,
+                                        rows_written = stats.rows_written,
+                                        "auto compact repaired row-group fragmentation"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(db, table, error = %err, "fragmentation auto compact failed");
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        match segment_mgr.cleanup_fully_deleted_segments(&db, &table, &table_dir) {
+                            Ok(removed) if removed > 0 => {
                                 compacted += 1;
                                 tracing::info!(
                                     db,
                                     table,
-                                    rows_dropped = stats.rows_dropped,
-                                    rows_written = stats.rows_written,
-                                    segments_read = stats.segments_read,
-                                    segments_written = stats.segments_written,
-                                    "auto compact cleaned delete bitmap rows"
+                                    segments_removed = removed,
+                                    "delete bitmap cleanup removed fully deleted segments"
                                 );
                             }
-                        }
-                        Err(err) => {
-                            tracing::warn!(db, table, error = %err, "auto compact failed");
-                        }
-                    }
-                }
-                Ok(false) => {
-                    match segment_mgr.cleanup_fully_deleted_segments(&db, &table, &table_dir) {
-                        Ok(removed) if removed > 0 => {
-                            compacted += 1;
-                            tracing::info!(
-                                db,
-                                table,
-                                segments_removed = removed,
-                                "delete bitmap cleanup removed fully deleted segments"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::warn!(db, table, error = %err, "delete bitmap cleanup failed");
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(db, table, error = %err, "delete bitmap cleanup failed");
+                            }
                         }
                     }
+                    Err(err) => {
+                        tracing::warn!(db, table, error = %err, "auto compact scan failed");
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(db, table, error = %err, "auto compact scan failed");
-                }
+            }
+            if collect_fragmentation {
+                last_fragmentation_scan = Some(Instant::now());
             }
         }
     });
-}
-
-fn table_needs_delete_cleanup(
-    segment_mgr: &SegmentManager,
-    db: &str,
-    table: &str,
-    table_dir: &Path,
-    min_deleted_ratio: f64,
-    min_deleted_rows: u64,
-) -> Result<bool> {
-    let mut rows = 0u64;
-    let mut deleted = 0u64;
-    for path in segment_mgr.discover_inactive_segments(db, table, table_dir)? {
-        let reader = segment_mgr.open_reader_cached(&path)?;
-        rows = rows.saturating_add(reader.row_count());
-        deleted = deleted.saturating_add(reader.deleted_row_count());
-    }
-    if deleted == 0 || deleted < min_deleted_rows {
-        return Ok(false);
-    }
-    if rows == 0 {
-        return Ok(false);
-    }
-    Ok((deleted as f64 / rows as f64) >= min_deleted_ratio)
 }
 
 include!("engine/core.rs");

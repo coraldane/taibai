@@ -651,6 +651,13 @@ fn truncate_partition_flushes_bulk_import_state_for_surviving_partitions() {
 
     assert!(!partition_segment_exists(&table_dir, "1"));
     assert!(partition_segment_exists(&table_dir, "10"));
+    assert_eq!(
+        engine
+            .segment_mgr()
+            .active_partition_keys("main", "truncate_partition_bulk"),
+        vec!["10".to_string()],
+        "truncating p1 must not seal the surviving partition writer"
+    );
     let surviving_segments =
         crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)
             .expect("discover surviving segments");

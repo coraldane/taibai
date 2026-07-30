@@ -246,3 +246,36 @@ fn test_partition_column_index() {
     meta.partition_key = "nonexistent".to_string();
     assert!(meta.get_partition_column_index().is_none());
 }
+
+#[test]
+fn table_statistics_are_used_only_for_matching_row_and_schema_versions() {
+    let mut meta = TableMeta::new(
+        "testdb",
+        "events",
+        vec![ColumnDef::new("id", DataType::Int64)],
+    );
+    meta.row_count = 10;
+    meta.statistics = Some(TableStatisticsMeta {
+        row_count: 10,
+        schema_version: meta.schema_version,
+        collected_at: 1,
+        columns: HashMap::from([(
+            "id".to_string(),
+            ColumnStatisticsMeta {
+                distinct_count: 10,
+                null_count: 0,
+                min_value: Some(crate::types::scalar::ScalarValue::Int64(Some(1))),
+                max_value: Some(crate::types::scalar::ScalarValue::Int64(Some(10))),
+                histogram: Vec::new(),
+            },
+        )]),
+        composite_columns: Vec::new(),
+    });
+    assert!(meta.valid_statistics().is_some());
+
+    meta.row_count += 1;
+    assert!(meta.valid_statistics().is_none());
+    meta.row_count = 10;
+    meta.schema_version += 1;
+    assert!(meta.valid_statistics().is_none());
+}

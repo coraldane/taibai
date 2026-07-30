@@ -9,10 +9,14 @@ members = [
 
 [package]
 name = "taibai"
-version = "0.1.6"
+version = "0.1.8"
 edition = "2021"
 autotests = false
-description = "A columnar database server wire-compatible with taibai-go"
+description = "An experimental Rust columnar database server for analytical workloads"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["database", "columnar", "analytics", "sql"]
+categories = ["database-implementations"]
 
 [lib]
 name = "taibai"
@@ -25,10 +29,6 @@ path = "src/main.rs"
 [[bin]]
 name = "segment"
 path = "src/bin/segment_checker.rs"
-
-[[bin]]
-name = "tonglian-compare"
-path = "src/bin/tonglian_compare.rs"
 
 
 
@@ -132,3 +132,15 @@ path = "tests/hot_store_fast_path_test.rs"
 [[test]]
 name = "aggregate_streaming_test"
 path = "tests/aggregate_streaming_test.rs"
+
+[[test]]
+name = "analyze_statistics_test"
+path = "tests/analyze_statistics_test.rs"
+
+[[test]]
+name = "join_reorder_statistics_test"
+path = "tests/join_reorder_statistics_test.rs"
+
+[[test]]
+name = "performance_baseline_test"
+path = "tests/performance_baseline_test.rs"

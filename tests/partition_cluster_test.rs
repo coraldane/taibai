@@ -3,6 +3,7 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
+use taibai::net::bulk_importer::encode_columnar_bulk_insert;
 use taibai::net::session::Session;
 use taibai::protocol::types::DataType;
 use taibai::sql::execution::engine::{Engine, ExecResult};
@@ -198,6 +199,170 @@ fn bulk_import_honors_year_partition_on_int32_yyyymmdd() {
     );
 
     engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn direct_bulk_preserves_nulls_when_partition_groups_reorder_rows() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE nullable_bulk (
+                deal_date INT32 NOT NULL,
+                id INT32 NOT NULL,
+                score INT32,
+                note VARCHAR
+            ) PARTITION BY YEAR(deal_date)",
+        )
+        .expect("create nullable bulk table");
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("deal_date", DataType::Int32).with_nullable(false),
+        ColumnDef::new("id", DataType::Int32).with_nullable(false),
+        ColumnDef::new("score", DataType::Int32),
+        ColumnDef::new("note", DataType::VarChar),
+    ]);
+    let mut batch = RecordBatch::new(schema);
+    let rows = [
+        (20250101, 1, None, Some("a")),
+        (20240101, 2, Some(20), None),
+        (20250102, 3, Some(30), None),
+        (20240102, 4, None, Some("d")),
+    ];
+    for (deal_date, id, score, note) in rows {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int32(Some(deal_date)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int32(Some(id)))
+            .unwrap();
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::Int32(score))
+            .unwrap();
+        batch
+            .column_mut(3)
+            .unwrap()
+            .push(&ScalarValue::VarChar(note.map(str::to_string)))
+            .unwrap();
+    }
+
+    let payload = encode_columnar_bulk_insert("nullable_bulk", &batch).unwrap();
+    assert_eq!(
+        engine
+            .exec_bulk_insert_payload_with_wal_control("main", &payload, false)
+            .expect("direct bulk insert with nulls"),
+        4
+    );
+    engine
+        .flush_all_buffers()
+        .expect("flush nullable bulk rows");
+    let mut metadata_rows = 0u64;
+    let mut score_nulls = 0u64;
+    let mut note_nulls = 0u64;
+    for path in
+        SegmentManager::discover_segments(&temp_dir.path().join("main").join("nullable_bulk"))
+            .expect("discover nullable bulk segments")
+    {
+        let reader = taibai::storage::segment::SegmentReader::open(&path).unwrap();
+        for rg_idx in 0..reader.footer_row_groups_info().len() {
+            let zone_maps = reader.zone_maps(rg_idx);
+            metadata_rows += zone_maps[2].row_count;
+            score_nulls += zone_maps[2].null_count;
+            note_nulls += zone_maps[3].null_count;
+        }
+    }
+    assert_eq!(metadata_rows, 4);
+    assert_eq!(score_nulls, 2);
+    assert_eq!(note_nulls, 2);
+
+    let result = engine
+        .execute(
+            &mut session,
+            "SELECT id, score, note FROM nullable_bulk ORDER BY id",
+        )
+        .expect("query nullable bulk rows");
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    let actual: Vec<Vec<ScalarValue>> = batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(|row_idx| {
+                (0..batch.num_columns())
+                    .map(|col_idx| batch.scalar(row_idx, col_idx).unwrap())
+                    .collect()
+            })
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            vec![
+                ScalarValue::Int32(Some(1)),
+                ScalarValue::Int32(None),
+                ScalarValue::VarChar(Some("a".into())),
+            ],
+            vec![
+                ScalarValue::Int32(Some(2)),
+                ScalarValue::Int32(Some(20)),
+                ScalarValue::VarChar(None),
+            ],
+            vec![
+                ScalarValue::Int32(Some(3)),
+                ScalarValue::Int32(Some(30)),
+                ScalarValue::VarChar(None),
+            ],
+            vec![
+                ScalarValue::Int32(Some(4)),
+                ScalarValue::Int32(None),
+                ScalarValue::VarChar(Some("d".into())),
+            ],
+        ]
+    );
+
+    assert_eq!(
+        count_star(
+            engine
+                .execute(&mut session, "SELECT COUNT(*) FROM nullable_bulk")
+                .expect("count nullable bulk rows")
+        ),
+        4
+    );
+}
+
+#[test]
+fn direct_bulk_rejects_null_for_not_null_column() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    engine
+        .execute(&mut session, "CREATE TABLE strict_bulk (id INT32 NOT NULL)")
+        .expect("create strict bulk table");
+
+    let schema = Schema::new(vec![
+        ColumnDef::new("id", DataType::Int32).with_nullable(false)
+    ]);
+    let mut batch = RecordBatch::new(schema);
+    batch
+        .column_mut(0)
+        .unwrap()
+        .push(&ScalarValue::Int32(None))
+        .unwrap();
+    let payload = encode_columnar_bulk_insert("strict_bulk", &batch).unwrap();
+
+    let err = engine
+        .exec_bulk_insert_payload_with_wal_control("main", &payload, false)
+        .unwrap_err();
+    assert!(err.to_string().contains("does not allow NULL"));
 }
 
 #[test]

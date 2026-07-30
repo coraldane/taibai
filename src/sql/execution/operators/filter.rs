@@ -191,6 +191,9 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                 }
             }
             _ => {
+                if let Some(vector_mask) = eval_column_literal_comparison(left, op, right, batch) {
+                    return Ok(vector_mask);
+                }
                 let left_vals = eval_expr_column(left, batch)?;
                 let right_vals = eval_expr_column(right, batch)?;
                 for i in 0..num_rows {
@@ -205,12 +208,22 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
             }
         }
         LogicalExpr::IsNull(inner) => {
+            if let LogicalExpr::Column(idx) = &**inner {
+                if let Some(column) = batch.column(*idx) {
+                    return Ok(column.is_null_vec());
+                }
+            }
             let vals = eval_expr_column(inner, batch)?;
             for i in 0..num_rows {
                 mask[i] = vals[i].is_null();
             }
         }
         LogicalExpr::IsNotNull(inner) => {
+            if let LogicalExpr::Column(idx) = &**inner {
+                if let Some(column) = batch.column(*idx) {
+                    return Ok(column.is_not_null_vec());
+                }
+            }
             let vals = eval_expr_column(inner, batch)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 *m = !vals[i].is_null();
@@ -246,6 +259,43 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
     }
 
     Ok(mask)
+}
+
+fn eval_column_literal_comparison(
+    left: &LogicalExpr,
+    op: &BinOp,
+    right: &LogicalExpr,
+    batch: &RecordBatch,
+) -> Option<Vec<bool>> {
+    let (column_idx, literal, op) = match (left, right) {
+        (LogicalExpr::Column(idx), LogicalExpr::Literal(value)) => (*idx, value, *op),
+        (LogicalExpr::Literal(value), LogicalExpr::Column(idx)) => {
+            let reversed = match op {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Lte => BinOp::Gte,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Gte => BinOp::Lte,
+                other => *other,
+            };
+            (*idx, value, reversed)
+        }
+        _ => return None,
+    };
+    let column = batch.column(column_idx)?;
+    Some(match op {
+        BinOp::Eq => column.eq_vec(literal),
+        BinOp::Neq => column
+            .eq_vec(literal)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, matched)| column.bitmap().is_valid(idx) && !matched)
+            .collect(),
+        BinOp::Lt => column.lt_vec(literal),
+        BinOp::Lte => column.le_vec(literal),
+        BinOp::Gt => column.gt_vec(literal),
+        BinOp::Gte => column.ge_vec(literal),
+        _ => return None,
+    })
 }
 
 fn eval_comparison(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> bool {

@@ -245,6 +245,13 @@ impl RecordBatch {
     pub fn scalar(&self, row: usize, col: usize) -> Option<crate::types::scalar::ScalarValue> {
         self.columns.get(col).map(|c| c.scalar(row))
     }
+
+    pub fn estimated_size_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(ColumnArray::estimated_size_bytes)
+            .sum()
+    }
 }
 
 #[cfg(test)]

@@ -8,6 +8,34 @@ fn session() -> Session {
     Session::new("root".to_string(), "main".to_string())
 }
 
+#[test]
+fn auto_compaction_detects_low_rate_row_group_fragmentation() {
+    let config = AutoCompactConfig::default();
+    let fragmented = TablePhysicalHealth {
+        live_rows: 40,
+        deleted_rows: 0,
+        row_groups: 40,
+        small_row_groups: 40,
+    };
+    assert!(fragmented.needs_fragmentation_cleanup(8192, &config));
+
+    let compact = TablePhysicalHealth {
+        live_rows: 40,
+        deleted_rows: 0,
+        row_groups: 1,
+        small_row_groups: 1,
+    };
+    assert!(!compact.needs_fragmentation_cleanup(8192, &config));
+
+    let legitimately_large = TablePhysicalHealth {
+        live_rows: 8192 * 40,
+        deleted_rows: 0,
+        row_groups: 40,
+        small_row_groups: 0,
+    };
+    assert!(!legitimately_large.needs_fragmentation_cleanup(8192, &config));
+}
+
 fn bulk_payload(table: &str, row_count: u32, columns: Vec<(&str, DataType, Vec<u8>)>) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(table.len() as u16).to_le_bytes());
@@ -446,10 +474,10 @@ fn delete_then_insert_same_unique_key_after_rebuild() -> Result<()> {
         .join("indexes")
         .join("unique");
     let base_file = index_dir.join("uk_id.keys.tbi");
-    let delta_file = index_dir.join("uk_id.delta.tbi");
+    let invalid_file = index_dir.join("uk_id.invalid");
     engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
     assert!(base_file.exists());
-    assert!(delta_file.exists());
+    assert!(invalid_file.exists());
     assert_eq!(
         engine.index_manager().unique_key_exists(
             "main",
@@ -457,7 +485,7 @@ fn delete_then_insert_same_unique_key_after_rebuild() -> Result<()> {
             "uk_id",
             &[ScalarValue::Int64(Some(1))]
         )?,
-        Some(false)
+        None
     );
     engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (1, 'b')")?;
 
@@ -489,10 +517,10 @@ fn replace_into_works_after_rebuild_unique_index() -> Result<()> {
         .join("indexes")
         .join("unique");
     let base_file = index_dir.join("uk_id.keys.tbi");
-    let delta_file = index_dir.join("uk_id.delta.tbi");
+    let invalid_file = index_dir.join("uk_id.invalid");
     engine.execute(&mut session, "REPLACE INTO t (id, name) VALUES (1, 'new')")?;
     assert!(base_file.exists());
-    assert!(delta_file.exists());
+    assert!(invalid_file.exists());
 
     let name = first_text(
         engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
@@ -589,6 +617,79 @@ fn flush_table_only_flushes_named_table() -> Result<()> {
         .collect::<std::io::Result<Vec<_>>>()?;
     assert!(!t1_segments.is_empty());
     assert_eq!(t2_after, t2_before);
+
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    Ok(())
+}
+
+#[test]
+fn optimize_partition_leaves_sibling_partition_and_other_tables_resident() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE partitioned (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.execute(&mut session, "CREATE TABLE low_rate (id INT64)")?;
+    engine.execute(&mut session, "INSERT INTO low_rate VALUES (9)")?;
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(&mut session, "INSERT INTO partitioned VALUES (1, 10)")?;
+    engine.execute(&mut session, "INSERT INTO partitioned VALUES (2, 20)")?;
+
+    let table_dir = dir.path().join("main").join("partitioned");
+    let sibling_path = SegmentManager::discover_segments(&table_dir)?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("p2_"))
+        })
+        .expect("sibling partition segment");
+    let sibling_len_before = std::fs::metadata(&sibling_path)?.len();
+
+    engine.execute(&mut session, "OPTIMIZE TABLE partitioned ON PARTITION p1")?;
+
+    assert_eq!(
+        engine
+            .segment_mgr()
+            .active_partition_keys("main", "partitioned"),
+        vec!["2".to_string()]
+    );
+    assert_eq!(std::fs::metadata(&sibling_path)?.len(), sibling_len_before);
+    assert!(
+        SegmentManager::discover_segments(&dir.path().join("main").join("low_rate"))?.is_empty()
+    );
+
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    Ok(())
+}
+
+#[test]
+fn bulk_multi_value_insert_routes_every_value_partition() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE partitioned (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(
+        &mut session,
+        "INSERT INTO partitioned VALUES (1, 10), (2, 20)",
+    )?;
+
+    let mut active = engine
+        .segment_mgr()
+        .active_partition_keys("main", "partitioned");
+    active.sort();
+    assert_eq!(active, vec!["1".to_string(), "2".to_string()]);
 
     session.bulk_import_mode = false;
     engine.end_bulk_import();
@@ -704,5 +805,49 @@ fn committed_transaction_remains_visible_without_immediate_segment_flush() -> Re
     let table_dir = dir.path().join("main").join("t");
     let segments = SegmentManager::discover_segments(&table_dir)?;
     assert!(segments.is_empty());
+    Ok(())
+}
+
+#[test]
+fn close_of_day_only_optimizes_partitions_written_since_last_close() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE daily_partitioned (trade_date INT64, seq INT64) PARTITION BY trade_date",
+    )?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO daily_partitioned (trade_date, seq) VALUES (1, 2), (1, 1)",
+    )?;
+    engine.close_of_day_flush_table("main", "daily_partitioned")?;
+
+    let table_dir = dir.path().join("main").join("daily_partitioned");
+    let first_partition_path = SegmentManager::discover_segments(&table_dir)?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("p1_"))
+        })
+        .expect("first partition segment after initial close");
+    let first_partition_bytes = std::fs::read(&first_partition_path)?;
+
+    engine.execute(
+        &mut session,
+        "INSERT INTO daily_partitioned (trade_date, seq) VALUES (2, 2), (2, 1)",
+    )?;
+    engine.close_of_day_flush_table("main", "daily_partitioned")?;
+
+    assert!(first_partition_path.exists());
+    assert_eq!(std::fs::read(&first_partition_path)?, first_partition_bytes);
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert!(segments.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("p2_"))
+    }));
     Ok(())
 }

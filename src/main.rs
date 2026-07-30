@@ -13,12 +13,76 @@ use net::server::Server;
 use sql::execution::{AutoCompactConfig, Engine};
 use storage::segment_manager::SegmentConfig;
 
-fn init_tracing(level: &str) {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter(level))
-        .try_init();
+#[derive(Clone)]
+struct AsyncTracingWriter {
+    sender: crossbeam_channel::Sender<Vec<u8>>,
 }
 
+impl std::io::Write for AsyncTracingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Tracing must not stall networking or query workers when the log disk
+        // is slow. Dropping diagnostics is preferable to freezing the server.
+        let _ = self.sender.try_send(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn spawn_async_tracing_writer<W>(
+    output: W,
+    thread_name: &str,
+) -> std::io::Result<AsyncTracingWriter>
+where
+    W: std::io::Write + Send + 'static,
+{
+    use std::io::Write;
+
+    let (sender, receiver) = crossbeam_channel::bounded::<Vec<u8>>(8192);
+    std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            let mut writer = std::io::BufWriter::new(output);
+            loop {
+                match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(bytes) => {
+                        if let Err(error) = writer.write_all(&bytes) {
+                            eprintln!("taibai log write failed: {error}");
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        let _ = writer.flush();
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        let _ = writer.flush();
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(AsyncTracingWriter { sender })
+}
+
+fn init_tracing(level: &str) {
+    match spawn_async_tracing_writer(std::io::stdout(), "taibai-console-log") {
+        Ok(async_writer) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(env_filter(level))
+                .with_writer(move || async_writer.clone())
+                .try_init();
+        }
+        Err(error) => {
+            eprintln!("failed to start asynchronous console logger: {error}");
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(env_filter(level))
+                .try_init();
+        }
+    }
+}
+
+#[cfg(windows)]
 fn init_file_tracing(level: &str, log_file: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = log_file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -27,10 +91,11 @@ fn init_file_tracing(level: &str, log_file: &std::path::Path) -> std::io::Result
         .create(true)
         .append(true)
         .open(log_file)?;
+    let async_writer = spawn_async_tracing_writer(file, "taibai-server-log")?;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter(level))
         .with_ansi(false)
-        .with_writer(file)
+        .with_writer(move || async_writer.clone())
         .try_init();
     Ok(())
 }
@@ -113,6 +178,10 @@ where
         std::process::exit(1);
     }
 
+    let _ = crate::common::config::set_performance_baseline_config(
+        crate::common::config::PerformanceBaselineConfig::from(&config.performance),
+    );
+
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
@@ -136,9 +205,19 @@ where
     let _ = crate::common::config::set_query_limits(crate::common::config::QueryLimits {
         query_memory_limit_mb: config.buffer.query_memory_limit_mb,
         max_aggregate_groups: config.buffer.max_aggregate_groups,
+        max_parallel_row_groups: config.buffer.max_parallel_row_groups.max(1),
+        parallel_scan_min_row_groups: config.buffer.parallel_scan_min_row_groups.max(1),
+        spill_batch_rows: config.buffer.spill_batch_rows.max(1),
+        join_spill_partitions: config.buffer.join_spill_partitions.max(2),
+        max_parallel_segments: config.buffer.max_parallel_segments.max(1),
+        global_io_permits: config.buffer.global_io_permits.max(1),
+        global_cpu_permits: config.buffer.global_cpu_permits.max(1),
     });
     let engine = Arc::new(engine);
-    let _ = rayon::ThreadPoolBuilder::new().build_global();
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.buffer.execution_threads.max(1))
+        .thread_name(|idx| format!("taibai-exec-{idx}"))
+        .build_global();
     crate::sql::execution::engine::start_close_of_day_scheduler(engine.clone());
     tracing::info!("close-of-day scheduler started");
 
@@ -148,8 +227,8 @@ where
         tracing::error!(error = %e, "server error");
     }
 
-    match engine.flush_all_buffers() {
-        Ok(n) => tracing::info!(rows_flushed = n, "all active segments sealed"),
+    match engine.flush_shutdown_buffers() {
+        Ok(n) => tracing::info!(rows_flushed = n, "shutdown buffers checkpointed"),
         Err(e) => tracing::error!(error = %e, "failed to flush segments on shutdown"),
     }
 }
@@ -161,6 +240,7 @@ fn segment_config_from_server_config(config: &ServerConfig) -> SegmentConfig {
     SegmentConfig {
         min_segment_size,
         max_segment_size,
+        row_group_target_rows: config.storage.row_group_target_rows.max(1),
     }
 }
 fn auto_compact_config_from_server_config(config: &ServerConfig) -> AutoCompactConfig {
@@ -175,6 +255,23 @@ fn auto_compact_config_from_server_config(config: &ServerConfig) -> AutoCompactC
         enabled: config.storage.delete_cleanup_enabled,
         min_deleted_ratio: config.storage.delete_cleanup_min_deleted_ratio,
         min_deleted_rows: config.storage.delete_cleanup_min_deleted_rows,
+        fragmentation_enabled: config.storage.fragmentation_cleanup_enabled,
+        min_fragmented_row_groups: config.storage.fragmentation_min_row_groups.max(2),
+        max_row_group_overhead_ratio: config.storage.fragmentation_max_overhead_ratio.max(1.0),
+        min_small_row_group_ratio: config
+            .storage
+            .fragmentation_min_small_row_group_ratio
+            .clamp(0.0, 1.0),
+        fragmentation_cooldown: std::time::Duration::from_secs(
+            config.storage.fragmentation_cooldown_secs,
+        ),
+        fragmentation_scan_interval: std::time::Duration::from_secs(
+            config.storage.fragmentation_scan_interval_secs.max(1),
+        ),
+        low_rate_max_rows: config.storage.low_rate_memtable_max_rows.max(1),
+        low_rate_max_age: std::time::Duration::from_secs(
+            config.storage.low_rate_memtable_max_age_secs.max(30),
+        ),
         interval: interval.max(std::time::Duration::from_millis(1)),
         max_tables_per_run: config.storage.delete_cleanup_max_segments_per_run.max(1),
     }
@@ -490,7 +587,7 @@ fn append_column_cell(line: &mut String, col: &types::array::ColumnArray, row: u
         }
         types::array::ColumnArray::VarChar { data, .. } => line.push_str(&data[row]),
         types::array::ColumnArray::Blob { data, .. } => {
-            let _ = write!(line, "{:?}", data[row]);
+            let _ = write!(line, "{:?}", &data[row]);
         }
         types::array::ColumnArray::Vector { data, .. } => {
             let _ = write!(line, "{:?}", data[row]);

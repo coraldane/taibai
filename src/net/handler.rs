@@ -36,31 +36,26 @@ impl Handler {
 
     pub fn flush_on_disconnect(&mut self) {
         if let Some(ref mut session) = self.session {
+            let mut remaining_bulk_sessions = self.engine.bulk_mode_session_count();
             if session.bulk_import_mode {
-                let remaining = self.engine.end_bulk_import();
+                remaining_bulk_sessions = self.engine.end_bulk_import();
                 session.bulk_import_mode = false;
                 session.disable_wal = false;
                 tracing::info!(
-                    remaining_bulk_sessions = remaining,
+                    remaining_bulk_sessions,
                     session_id = %session.session_id_string(),
                     "bulk import session ended on disconnect"
                 );
             }
-            if session.had_writes {
-                if self.engine.is_bulk_mode() {
-                    tracing::info!(
-                        session_id = %session.session_id_string(),
-                        active_bulk_sessions = self.engine.bulk_mode_session_count(),
-                        "deferred disconnect flush while bulk import sessions remain active"
-                    );
-                } else {
-                    match self.engine.flush_all_buffers() {
-                        Ok(n) => {
-                            tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed buffers on disconnect")
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to flush buffers on disconnect")
-                        }
+            session.had_writes = false;
+            if remaining_bulk_sessions == 0 {
+                match self.engine.flush_bulk_dirty_tables() {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(rows_flushed = n, session_id = %session.session_id_string(), "flushed bulk-import dirty tables on disconnect")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to flush bulk-import dirty tables on disconnect")
                     }
                 }
             }
@@ -175,7 +170,10 @@ impl Handler {
             Err(_) => std::str::from_utf8(payload).unwrap_or("").trim(),
         };
 
-        let is_insert = sql.to_uppercase().starts_with("INSERT");
+        let is_insert = sql
+            .as_bytes()
+            .get(..b"INSERT".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"INSERT"));
         let should_log_query = should_log_query_sql(sql);
         if !is_insert {
             tracing::info!(sql, "query received");
@@ -227,7 +225,11 @@ impl Handler {
         let execute_start = Instant::now();
         let result = self.engine.execute(session, sql);
         let execute_elapsed = execute_start.elapsed();
-        if has_query_database && !sql.to_ascii_uppercase().starts_with("USE ") {
+        let is_use = sql
+            .as_bytes()
+            .get(..b"USE ".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"USE "));
+        if has_query_database && !is_use {
             session.database = original_database;
         }
 
@@ -330,14 +332,17 @@ impl Handler {
             self.engine.bulk_mode_session_count()
         };
 
+        // The reference count has already been released. Keep the connection
+        // state consistent even if flushing a dirty table reports an error;
+        // the dirty-table entry remains queued for a later retry.
+        session.bulk_import_mode = false;
+        session.disable_wal = false;
+
         let flushed = if remaining_sessions == 0 {
-            self.engine.flush_all_buffers()?
+            self.engine.flush_bulk_dirty_tables()?
         } else {
             0
         };
-
-        session.bulk_import_mode = false;
-        session.disable_wal = false;
 
         tracing::info!(
             rows_flushed = flushed,
@@ -718,8 +723,7 @@ impl Handler {
         };
 
         let param_count = stmt.param_count;
-        let mut total_rows_affected = 0u64;
-        let mut had_writes = false;
+        let mut parameter_batch = Vec::with_capacity(batch_size);
 
         for row_idx in 0..batch_size {
             let mut params: Vec<ScalarValue> = Vec::with_capacity(param_count);
@@ -765,33 +769,59 @@ impl Handler {
                 offset += consumed;
             }
 
-            stmt.params = params;
-
-            let result = self.engine.execute_prepared(session, &mut stmt);
-            match result {
-                Ok(ExecResult::Ok { rows_affected }) => {
-                    total_rows_affected += rows_affected;
-                    if rows_affected > 0 {
-                        had_writes = true;
-                    }
-                }
-                Ok(ExecResult::Query { .. }) => {
-                    session.prepared_statements.insert(stmt);
-                    return Ok(vec![build_error(
-                        "batch execute returned query result, expected Ok",
-                    )]);
-                }
-                Err(e) => {
-                    session.prepared_statements.insert(stmt);
-                    return Ok(vec![build_error(&format!(
-                        "row {} execute error: {}",
-                        row_idx, e
-                    ))]);
-                }
-            }
+            parameter_batch.push(params);
         }
 
-        if had_writes {
+        let result = if matches!(stmt.stmt, Statement::Insert { .. }) {
+            self.engine
+                .execute_prepared_insert_batch(session, &stmt, &parameter_batch)
+        } else {
+            let mut total_rows_affected = 0u64;
+            let mut error = None;
+            for (row_idx, params) in parameter_batch.into_iter().enumerate() {
+                stmt.params = params;
+                match self.engine.execute_prepared(session, &mut stmt) {
+                    Ok(ExecResult::Ok { rows_affected }) => {
+                        total_rows_affected += rows_affected;
+                    }
+                    Ok(ExecResult::Query { .. }) => {
+                        error = Some(TaibaiError::Sql(
+                            "batch execute returned query result, expected Ok".into(),
+                        ));
+                        break;
+                    }
+                    Err(err) => {
+                        error = Some(TaibaiError::Sql(format!(
+                            "row {} execute error: {}",
+                            row_idx, err
+                        )));
+                        break;
+                    }
+                }
+            }
+            match error {
+                Some(error) => Err(error),
+                None => Ok(ExecResult::Ok {
+                    rows_affected: total_rows_affected,
+                }),
+            }
+        };
+
+        let total_rows_affected = match result {
+            Ok(ExecResult::Ok { rows_affected }) => rows_affected,
+            Ok(ExecResult::Query { .. }) => {
+                session.prepared_statements.insert(stmt);
+                return Ok(vec![build_error(
+                    "batch execute returned query result, expected Ok",
+                )]);
+            }
+            Err(error) => {
+                session.prepared_statements.insert(stmt);
+                return Ok(vec![build_error(&error.to_string())]);
+            }
+        };
+
+        if total_rows_affected > 0 {
             session.had_writes = true;
             session.mark_txn_write();
         }
@@ -906,6 +936,11 @@ fn log_query_if_needed(
 }
 
 fn should_log_query_sql(sql: &str) -> bool {
+    // INSERT statements can be megabytes long. Do not parse every statement a
+    // second time merely to decide whether it produces a result set.
+    if !starts_like_query(sql) {
+        return false;
+    }
     match Parser::parse(sql) {
         Ok(stmts) => stmts.first().is_some_and(statement_returns_rows),
         Err(_) => starts_like_query(sql),
@@ -939,10 +974,9 @@ fn starts_like_query(sql: &str) -> bool {
         .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
         .next()
         .unwrap_or_default();
-    matches!(
-        first.to_ascii_uppercase().as_str(),
-        "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC"
-    )
+    ["SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC"]
+        .iter()
+        .any(|keyword| first.eq_ignore_ascii_case(keyword))
 }
 
 fn build_auth_ok(session_id: &str) -> Message {

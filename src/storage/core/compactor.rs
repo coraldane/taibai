@@ -1,8 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+use rayon::prelude::*;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
@@ -14,13 +16,6 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
-use crate::types::scalar::ScalarValue;
-
-const COMPACT_ROW_GROUP_SIZE: usize = 8192;
-// Gather more rows than one output row group at a time. SegmentWriter still
-// splits the batch into COMPACT_ROW_GROUP_SIZE row groups, but this reduces
-// per-chunk source grouping and per-column dispatch overhead during optimize.
-const WRITE_GATHER_CHUNK_ROWS: usize = COMPACT_ROW_GROUP_SIZE * 8;
 
 #[derive(Debug, Clone, Copy)]
 struct RowRef {
@@ -61,7 +56,7 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        self.compact_table(db, table, table_meta, true)
+        self.compact_table(db, table, table_meta, true, true)
     }
 
     /// Rewrite segments to purge delete bitmaps without paying the cost of a
@@ -73,7 +68,19 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
     ) -> Result<CompactStats> {
-        self.compact_table(db, table, table_meta, false)
+        self.compact_table(db, table, table_meta, false, false)
+    }
+
+    /// Repair row-group/segment fragmentation, including a fragmented active
+    /// segment. Pending memtables stay resident; only this table's active
+    /// writer is sealed before the immutable rewrite.
+    pub fn compact_table_for_fragmentation(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &TableMeta,
+    ) -> Result<CompactStats> {
+        self.compact_table(db, table, table_meta, false, true)
     }
 
     fn compact_table(
@@ -82,6 +89,7 @@ impl Compactor {
         table: &str,
         table_meta: &TableMeta,
         sort_by_cluster_key: bool,
+        seal_active: bool,
     ) -> Result<CompactStats> {
         let start_time = Instant::now();
         let table_dir = self.data_dir.join(db).join(table);
@@ -98,7 +106,12 @@ impl Compactor {
         } else {
             &[]
         };
+        let output_row_group_rows = self.segment_mgr.row_group_target_rows();
         let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+            if seal_active {
+                self.segment_mgr
+                    .seal_table_active_under_table_lock(db, table)?;
+            }
             let segment_files = self
                 .segment_mgr
                 .discover_inactive_segments(db, table, &table_dir)?;
@@ -120,39 +133,67 @@ impl Compactor {
                 ..CompactStats::default()
             };
 
-            for (partition_key, files) in group_segments_by_partition(segment_files) {
-                // A clean single segment can only be skipped when this
-                // operation has no physical ordering requirement. During a
-                // user OPTIMIZE, CLUSTER BY may have been added after the
-                // segment was written, or multiple sorted insert batches may
-                // have been appended out of global order.
-                if sort_key_indices.is_empty() && files.len() == 1 {
-                    let reader = self.segment_mgr.open_reader_cached(&files[0])?;
-                    if reader.deleted_row_count() == 0 {
-                        tracing::info!(
-                            db,
-                            table,
-                            partition_key = partition_key.as_deref().unwrap_or("<none>"),
-                            segment = %files[0].display(),
-                            "skipping clean single-segment optimization"
-                        );
-                        continue;
+            let partition_groups = group_segments_by_partition(segment_files)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let partition_count = partition_groups.len();
+            let partition_stats = partition_groups
+                .into_par_iter()
+                .map(|(partition_key, files)| -> Result<CompactStats> {
+                    // Keep the acquisition order aligned with query scans to
+                    // avoid CPU/IO permit inversion. Holding both permits for
+                    // the partition bounds process-wide compaction pressure.
+                    let _cpu_permit = crate::common::work_limiter::acquire_cpu();
+                    let _io_permit = crate::common::work_limiter::acquire_io();
+
+                    // A clean single segment can only be skipped when this
+                    // operation has no physical ordering requirement and its
+                    // row groups are already compact. A segment can contain
+                    // thousands of tiny row groups after many small flushes;
+                    // skipping it makes OPTIMIZE unable to repair the main
+                    // source of read amplification.
+                    if sort_key_indices.is_empty() && files.len() == 1 {
+                        let reader = self.segment_mgr.open_reader_cached(&files[0])?;
+                        let compact_row_groups =
+                            reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
+                        let needs_row_group_compaction =
+                            reader.num_row_groups() > compact_row_groups.max(1);
+                        if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
+                            tracing::info!(
+                                db,
+                                table,
+                                partition_key = partition_key.as_deref().unwrap_or("<none>"),
+                                segment = %files[0].display(),
+                                "skipping clean single-segment optimization"
+                            );
+                            return Ok(CompactStats::default());
+                        }
                     }
-                }
-                let part_stats = self.compact_segment_group(
-                    db,
-                    table,
-                    &table_dir,
-                    partition_key.as_deref(),
-                    &files,
-                    &schema,
-                    sort_key_indices,
-                    &cluster_key_indices,
-                )?;
+                    self.compact_segment_group(
+                        db,
+                        table,
+                        &table_dir,
+                        partition_key.as_deref(),
+                        &files,
+                        &schema,
+                        sort_key_indices,
+                        &cluster_key_indices,
+                        output_row_group_rows,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for part_stats in partition_stats {
                 stats.segments_written += part_stats.segments_written;
                 stats.rows_written += part_stats.rows_written;
                 stats.rows_dropped += part_stats.rows_dropped;
             }
+
+            tracing::info!(
+                db,
+                table,
+                partitions = partition_count,
+                "table optimization partition workers completed"
+            );
 
             Ok(stats)
         })?;
@@ -203,7 +244,12 @@ impl Compactor {
 
         let schema = Schema::new(table_meta.columns.clone());
         let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
+        let output_row_group_rows = self.segment_mgr.row_group_target_rows();
         let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+            for candidate in &candidates {
+                self.segment_mgr
+                    .seal_partition_active_under_table_lock(db, table, candidate)?;
+            }
             let segment_files = self
                 .segment_mgr
                 .discover_inactive_segments(db, table, &table_dir)?;
@@ -250,6 +296,8 @@ impl Compactor {
                 "starting requested partition optimization"
             );
 
+            let _cpu_permit = crate::common::work_limiter::acquire_cpu();
+            let _io_permit = crate::common::work_limiter::acquire_io();
             self.compact_segment_group(
                 db,
                 table,
@@ -259,6 +307,7 @@ impl Compactor {
                 &schema,
                 &cluster_key_indices,
                 &cluster_key_indices,
+                output_row_group_rows,
             )
         })?;
 
@@ -288,11 +337,19 @@ impl Compactor {
         schema: &Schema,
         sort_key_indices: &[usize],
         bloom_column_indices: &[usize],
+        output_row_group_rows: usize,
     ) -> Result<CompactStats> {
-        let mut key_batches = Vec::new();
+        // The clustered path follows the original Go implementation's
+        // index-only sort design: concatenate each decoded column into one
+        // global column, sort compact u32 row indices, then gather directly
+        // from those global arrays. This avoids carrying a 16-byte
+        // (row-group,row) reference and rebuilding a source map for every
+        // output chunk.
+        let mut preloaded_batch = None;
         let mut source_row_groups = Vec::new();
-        let mut row_orders = Vec::new();
         let mut row_refs = Vec::new();
+        let mut sorted_indices = Vec::new();
+        let source_row_group_count;
         let mut deleted_rows = 0u64;
         let partition_label = partition_key.unwrap_or("<unpartitioned>");
 
@@ -305,53 +362,133 @@ impl Compactor {
             "compact partition started"
         );
 
-        for seg_path in segment_files {
-            let reader = self.segment_mgr.open_reader(seg_path)?;
-            let mut segment_row_base = 0u64;
-            for rg_idx in 0..reader.num_row_groups() {
-                let batch_idx = source_row_groups.len();
-                let row_count = if sort_key_indices.is_empty() {
-                    reader.row_group_rows(rg_idx) as usize
-                } else {
-                    let key_batch = reader.read_columns_fast(rg_idx, sort_key_indices)?;
-                    let row_count = key_batch.num_rows();
-                    key_batches.push(key_batch);
-                    row_count
-                };
-                let mut row_order = Vec::new();
-                for row_idx in 0..row_count {
-                    let row_id = segment_row_base + row_idx as u64;
-                    if reader.is_row_deleted(row_id) {
-                        deleted_rows += 1;
-                        continue;
-                    }
-                    if sort_key_indices.is_empty() {
+        if sort_key_indices.is_empty() {
+            for seg_path in segment_files {
+                let reader = self.segment_mgr.open_reader(seg_path)?;
+                let mut segment_row_base = 0u64;
+                for rg_idx in 0..reader.num_row_groups() {
+                    let batch_idx = source_row_groups.len();
+                    let row_count = reader.row_group_rows(rg_idx) as usize;
+                    for row_idx in 0..row_count {
+                        let row_id = segment_row_base + row_idx as u64;
+                        if reader.is_row_deleted(row_id) {
+                            deleted_rows += 1;
+                            continue;
+                        }
                         row_refs.push(RowRef { batch_idx, row_idx });
+                    }
+                    segment_row_base += row_count as u64;
+                    source_row_groups.push(SourceRowGroup {
+                        segment_path: seg_path.clone(),
+                        row_group_idx: rg_idx,
+                    });
+                }
+            }
+            source_row_group_count = source_row_groups.len();
+        } else {
+            let decode_started = Instant::now();
+            struct ColumnReadSource {
+                reader: Arc<crate::storage::segment::SegmentReader>,
+                row_group_idx: usize,
+                segment_row_base: u64,
+                global_row_base: usize,
+                row_count: usize,
+            }
+
+            let mut sources = Vec::new();
+            let mut global_row_base = 0usize;
+            for seg_path in segment_files {
+                let reader = Arc::new(self.segment_mgr.open_reader(seg_path)?);
+                let mut segment_row_base = 0u64;
+                for rg_idx in 0..reader.num_row_groups() {
+                    let row_count = reader.row_group_rows(rg_idx) as usize;
+                    sources.push(ColumnReadSource {
+                        reader: Arc::clone(&reader),
+                        row_group_idx: rg_idx,
+                        segment_row_base,
+                        global_row_base,
+                        row_count,
+                    });
+                    segment_row_base += row_count as u64;
+                    global_row_base = global_row_base.checked_add(row_count).ok_or_else(|| {
+                        TaibaiError::Storage("row count overflow during optimization".to_string())
+                    })?;
+                }
+            }
+            source_row_group_count = sources.len();
+            if global_row_base > u32::MAX as usize {
+                return Err(TaibaiError::Storage(format!(
+                    "clustered optimization supports at most {} rows per partition",
+                    u32::MAX
+                )));
+            }
+
+            sorted_indices.reserve(global_row_base);
+            for source in &sources {
+                for local_row_idx in 0..source.row_count {
+                    let segment_row_id = source.segment_row_base + local_row_idx as u64;
+                    if source.reader.is_row_deleted(segment_row_id) {
+                        deleted_rows += 1;
                     } else {
-                        row_order.push(row_idx);
+                        sorted_indices.push((source.global_row_base + local_row_idx) as u32);
                     }
                 }
-                if !sort_key_indices.is_empty() {
-                    sort_row_group_order(batch_idx, &mut row_order, &key_batches);
-                }
-                segment_row_base += row_count as u64;
-                source_row_groups.push(SourceRowGroup {
-                    segment_path: seg_path.clone(),
-                    row_group_idx: rg_idx,
-                });
-                row_orders.push(row_order);
             }
+
+            // Parallelize by column, like the Go ReadColumnsDirect path. Each
+            // worker builds one contiguous destination column and moves decoded
+            // variable-width buffers into it without cloning strings.
+            let columns = schema
+                .columns
+                .par_iter()
+                .enumerate()
+                .map(|(column_idx, column_def)| -> Result<ColumnArray> {
+                    let mut destination =
+                        ColumnArray::with_capacity(column_def.data_type, global_row_base);
+                    for source in &sources {
+                        let decoded = source
+                            .reader
+                            .read_column(source.row_group_idx, column_idx)?;
+                        destination.append_owned(decoded)?;
+                    }
+                    Ok(destination)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            preloaded_batch = Some(RecordBatch::try_new(schema.clone(), columns)?);
+
+            tracing::info!(
+                db,
+                table,
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key = partition_label,
+                source_row_groups = source_row_group_count,
+                rows_to_sort = sorted_indices.len(),
+                elapsed_ms = decode_started.elapsed().as_millis(),
+                "compact partition decoded contiguous columns"
+            );
+            let sort_started = Instant::now();
+            sort_clustered_row_indices(
+                &mut sorted_indices,
+                preloaded_batch.as_ref().unwrap(),
+                sort_key_indices,
+            );
+            tracing::info!(
+                db,
+                table,
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key = partition_label,
+                rows_sorted = sorted_indices.len(),
+                elapsed_ms = sort_started.elapsed().as_millis(),
+                "compact partition sorted cluster keys"
+            );
         }
 
-        if !sort_key_indices.is_empty() {
-            row_refs = merge_sorted_row_groups(&key_batches, &row_orders);
-        }
-        // The per-row-group order vectors are no longer needed once the
-        // partition-wide merge order has been built. Release them before
-        // decoding any wide non-key columns for the output segment.
-        drop(row_orders);
-
-        if row_refs.is_empty() {
+        let rows_to_write = if sort_key_indices.is_empty() {
+            row_refs.len()
+        } else {
+            sorted_indices.len()
+        };
+        if rows_to_write == 0 {
             for old_seg in segment_files {
                 self.segment_mgr.remove_segment_file(old_seg)?;
             }
@@ -381,8 +518,8 @@ impl Compactor {
             table,
             table_full_name = %format!("{}.{}", db, table),
             partition_key = partition_label,
-            source_row_groups = source_row_groups.len(),
-            rows_to_write = row_refs.len(),
+            source_row_groups = source_row_group_count,
+            rows_to_write,
             tmp_path = %tmp_path.display(),
             final_path = %final_path.display(),
             "compact partition writing replacement segment"
@@ -396,9 +533,11 @@ impl Compactor {
             schema,
             sort_key_indices,
             bloom_column_indices,
-            &key_batches,
+            preloaded_batch.as_ref(),
             &source_row_groups,
             &row_refs,
+            &sorted_indices,
+            output_row_group_rows,
         );
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
@@ -425,7 +564,7 @@ impl Compactor {
             partition_key = partition_label,
             final_path = %final_path.display(),
             segments_read = segment_files.len(),
-            rows_written = row_refs.len(),
+            rows_written = rows_to_write,
             rows_dropped = deleted_rows,
             "compact partition completed"
         );
@@ -433,7 +572,7 @@ impl Compactor {
         Ok(CompactStats {
             segments_read: segment_files.len(),
             segments_written: 1,
-            rows_written: row_refs.len() as u64,
+            rows_written: rows_to_write as u64,
             rows_dropped: deleted_rows,
         })
     }
@@ -447,25 +586,26 @@ impl Compactor {
         schema: &Schema,
         sort_key_indices: &[usize],
         bloom_column_indices: &[usize],
-        key_batches: &[RecordBatch],
+        preloaded_batch: Option<&RecordBatch>,
         source_row_groups: &[SourceRowGroup],
         row_refs: &[RowRef],
+        sorted_indices: &[u32],
+        output_row_group_rows: usize,
     ) -> Result<()> {
         let mut writer = SegmentWriter::create_with_bloom_columns(
             path,
             schema.clone(),
-            COMPACT_ROW_GROUP_SIZE,
+            output_row_group_rows,
             bloom_column_indices,
         )?;
+        let write_gather_chunk_rows = output_row_group_rows.saturating_mul(8).max(1);
+        let write_progress_rows = write_gather_chunk_rows.saturating_mul(16).max(1);
         let mut rows_written = 0usize;
-        let projection = non_key_projection(schema.num_columns(), sort_key_indices);
-        let projected_positions = projected_column_positions(schema.num_columns(), &projection);
-        let key_positions = key_column_positions(schema.num_columns(), sort_key_indices);
-        // Sorting is performed one partition at a time. Keep decoded non-key
-        // row groups in a bounded cache so a wide partition is not fully
-        // materialized in memory while its rows are gathered in sorted order.
-        let cache_capacity = source_row_groups.len().min(32).max(1);
-        let mut row_group_cache = RowGroupCache::new(cache_capacity, projection);
+        let projection = (0..schema.num_columns()).collect::<Vec<_>>();
+        // Non-sorting cleanup preserves source order, so a small cache remains
+        // effective there. Clustered OPTIMIZE uses the source batches decoded
+        // during its sort pass and performs no I/O in the write/gather phase.
+        let mut row_group_cache = RowGroupCache::new(32, projection);
 
         tracing::info!(
             db,
@@ -473,25 +613,54 @@ impl Compactor {
             table_full_name = %format!("{}.{}", db, table),
             partition_key,
             source_row_groups = source_row_groups.len(),
-            cache_capacity = row_group_cache.capacity(),
-            chunk_rows = WRITE_GATHER_CHUNK_ROWS,
-            "compact write using decoded row group cache"
+            preloaded_contiguous_columns = preloaded_batch.is_some(),
+            fallback_cache_capacity = row_group_cache.capacity(),
+            chunk_rows = write_gather_chunk_rows,
+            output_row_group_rows,
+            "compact write using index-only gather"
         );
 
-        for chunk in row_refs.chunks(WRITE_GATHER_CHUNK_ROWS) {
-            let batch = self.gather_compacted_chunk(
-                schema,
-                key_batches,
-                &key_positions,
-                &projected_positions,
-                source_row_groups,
-                chunk,
-                &mut row_group_cache,
-            )?;
-            rows_written += batch.num_rows();
-            writer.write_batch(&batch)?;
-            if rows_written.is_multiple_of(WRITE_GATHER_CHUNK_ROWS * 16) {
-                let total_rows = row_refs.len();
+        let total_rows = if sort_key_indices.is_empty() {
+            for chunk in row_refs.chunks(write_gather_chunk_rows) {
+                let batch = self.gather_cached_chunk(
+                    schema,
+                    source_row_groups,
+                    chunk,
+                    &mut row_group_cache,
+                )?;
+                rows_written += batch.num_rows();
+                writer.write_batch_parallel(&batch)?;
+            }
+            row_refs.len()
+        } else {
+            let source = preloaded_batch.ok_or_else(|| {
+                TaibaiError::Storage(
+                    "missing contiguous source columns for clustered optimization".to_string(),
+                )
+            })?;
+            for chunk in sorted_indices.chunks(write_gather_chunk_rows) {
+                let batch = gather_global_chunk(schema, source, chunk)?;
+                rows_written += batch.num_rows();
+                writer.write_batch_parallel(&batch)?;
+                if rows_written.is_multiple_of(write_progress_rows) {
+                    let progress_pct = rows_written as f64 * 100.0 / sorted_indices.len() as f64;
+                    tracing::info!(
+                        db,
+                        table,
+                        table_full_name = %format!("{}.{}", db, table),
+                        partition_key,
+                        rows_written,
+                        total_rows = sorted_indices.len(),
+                        progress_pct = format_args!("{:.2}", progress_pct),
+                        "compact write progress"
+                    );
+                }
+            }
+            sorted_indices.len()
+        };
+
+        if sort_key_indices.is_empty() && total_rows > 0 {
+            if rows_written != total_rows {
                 let progress_pct = rows_written as f64 * 100.0 / total_rows as f64;
                 tracing::info!(
                     db,
@@ -512,31 +681,35 @@ impl Compactor {
             table_full_name = %format!("{}.{}", db, table),
             partition_key,
             rows_written,
-            cache_hits = row_group_cache.hits(),
-            cache_misses = row_group_cache.misses(),
-            cached_row_groups = row_group_cache.len(),
+            fallback_cache_hits = row_group_cache.hits(),
+            fallback_cache_misses = row_group_cache.misses(),
+            fallback_cached_row_groups = row_group_cache.len(),
             "compact write gathered rows"
         );
 
         writer.seal()
     }
 
-    fn gather_compacted_chunk(
+    fn gather_cached_chunk(
         &self,
         schema: &Schema,
-        key_batches: &[RecordBatch],
-        key_positions: &[Option<usize>],
-        projected_positions: &[Option<usize>],
         source_row_groups: &[SourceRowGroup],
         row_refs: &[RowRef],
         row_group_cache: &mut RowGroupCache,
     ) -> Result<RecordBatch> {
-        let mut positions_by_source: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        let mut positions_by_source = (0..source_row_groups.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<(usize, usize)>>>();
         for (output_pos, row_ref) in row_refs.iter().enumerate() {
-            positions_by_source
-                .entry(row_ref.batch_idx)
-                .or_default()
-                .push((output_pos, row_ref.row_idx));
+            let positions = positions_by_source
+                .get_mut(row_ref.batch_idx)
+                .ok_or_else(|| {
+                    TaibaiError::Storage(format!(
+                        "missing source row group {} during gather",
+                        row_ref.batch_idx
+                    ))
+                })?;
+            positions.push((output_pos, row_ref.row_idx));
         }
 
         let mut columns = schema
@@ -545,37 +718,22 @@ impl Compactor {
             .map(|col| empty_column_for_gather(col.data_type, row_refs.len()))
             .collect::<Vec<_>>();
 
-        for (source_idx, positions) in positions_by_source {
+        for (source_idx, positions) in positions_by_source.into_iter().enumerate() {
+            if positions.is_empty() {
+                continue;
+            }
             let source = source_row_groups.get(source_idx).ok_or_else(|| {
                 TaibaiError::Storage(format!("missing source row group {}", source_idx))
             })?;
             let src_batch = row_group_cache.get(source, &self.segment_mgr)?;
 
             for col_idx in 0..schema.columns.len() {
-                let src_col = if let Some(key_pos) = key_positions[col_idx] {
-                    key_batches
-                        .get(source_idx)
-                        .and_then(|batch| batch.column(key_pos))
-                        .ok_or_else(|| {
-                            TaibaiError::Storage(format!(
-                                "missing key column {} in row group {}",
-                                col_idx, source_idx
-                            ))
-                        })?
-                } else {
-                    let projected_pos = projected_positions[col_idx].ok_or_else(|| {
-                        TaibaiError::Storage(format!(
-                            "missing projection for source column {}",
-                            col_idx
-                        ))
-                    })?;
-                    src_batch.column(projected_pos).ok_or_else(|| {
-                        TaibaiError::Storage(format!(
-                            "missing source column {} in row group {}",
-                            col_idx, source_idx
-                        ))
-                    })?
-                };
+                let src_col = src_batch.column(col_idx).ok_or_else(|| {
+                    TaibaiError::Storage(format!(
+                        "missing source column {} in row group {}",
+                        col_idx, source_idx
+                    ))
+                })?;
                 gather_column_positions(&mut columns[col_idx], src_col, &positions)?;
             }
         }
@@ -649,7 +807,10 @@ impl RowGroupCache {
         }
 
         self.misses += 1;
-        let reader = segment_mgr.open_reader(&source.segment_path)?;
+        // Reuse the parsed footer and mmap for every row group in the same
+        // segment. Reopening here is especially expensive for fragmented
+        // segments because their footer can be almost as large as the data.
+        let reader = segment_mgr.open_reader_cached(&source.segment_path)?;
         let batch =
             reader.read_row_group_with_projection(source.row_group_idx, &self.projection)?;
         self.batches.insert(key.clone(), batch);
@@ -676,100 +837,17 @@ impl RowGroupCache {
     }
 }
 
-#[derive(Debug, Clone)]
-struct MergeEntry {
-    key: Vec<ScalarValue>,
-    ordinal: u64,
-    batch_idx: usize,
-    row_idx: usize,
-}
-
-impl PartialEq for MergeEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.ordinal == other.ordinal
-    }
-}
-
-impl Eq for MergeEntry {}
-
-impl PartialOrd for MergeEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MergeEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap, so reverse the key comparison to emit
-        // ascending CLUSTER BY order. Ordinal provides deterministic ordering
-        // for equal keys.
-        compare_merge_keys(&other.key, &self.key).then_with(|| other.ordinal.cmp(&self.ordinal))
-    }
-}
-
-fn sort_row_group_order(batch_idx: usize, row_order: &mut [usize], key_batches: &[RecordBatch]) {
-    row_order.sort_unstable_by(|left, right| {
-        compare_rows_in_batch(key_batches, batch_idx, *left, *right).then_with(|| left.cmp(right))
-    });
-}
-
-fn merge_sorted_row_groups(key_batches: &[RecordBatch], row_orders: &[Vec<usize>]) -> Vec<RowRef> {
-    let total_rows = row_orders.iter().map(Vec::len).sum();
-    let mut row_refs = Vec::with_capacity(total_rows);
-    let mut heap = BinaryHeap::new();
-    let mut cursors = vec![0usize; row_orders.len()];
-    let mut next_ordinal = 0u64;
-
-    for batch_idx in 0..key_batches.len() {
-        if let Some(&row_idx) = row_orders.get(batch_idx).and_then(|rows| rows.first()) {
-            heap.push(MergeEntry {
-                key: row_key(&key_batches[batch_idx], row_idx),
-                ordinal: next_ordinal,
-                batch_idx,
-                row_idx,
-            });
-            next_ordinal += 1;
-        }
-    }
-
-    while let Some(entry) = heap.pop() {
-        row_refs.push(RowRef {
-            batch_idx: entry.batch_idx,
-            row_idx: entry.row_idx,
-        });
-
-        cursors[entry.batch_idx] += 1;
-        if let Some(&row_idx) = row_orders
-            .get(entry.batch_idx)
-            .and_then(|rows| rows.get(cursors[entry.batch_idx]))
-        {
-            heap.push(MergeEntry {
-                key: row_key(&key_batches[entry.batch_idx], row_idx),
-                ordinal: next_ordinal,
-                batch_idx: entry.batch_idx,
-                row_idx,
-            });
-            next_ordinal += 1;
-        }
-    }
-
-    row_refs
-}
-
-fn compare_rows_in_batch(
-    key_batches: &[RecordBatch],
-    batch_idx: usize,
-    left_row: usize,
-    right_row: usize,
+fn compare_row_indices(
+    left: u32,
+    right: u32,
+    source_batch: &RecordBatch,
+    sort_key_indices: &[usize],
 ) -> Ordering {
-    let key_count = key_batches
-        .get(batch_idx)
-        .map(|batch| batch.num_columns())
-        .unwrap_or(0);
-    for key_pos in 0..key_count {
-        let left_val = scalar_at_row(key_batches, batch_idx, left_row, key_pos);
-        let right_val = scalar_at_row(key_batches, batch_idx, right_row, key_pos);
-        let cmp = compare_scalars_for_sort(&left_val, &right_val);
+    for &col_idx in sort_key_indices {
+        let Some(column) = source_batch.column(col_idx) else {
+            continue;
+        };
+        let cmp = compare_column_rows(column, left as usize, column, right as usize);
         if cmp != Ordering::Equal {
             return cmp;
         }
@@ -777,63 +855,184 @@ fn compare_rows_in_batch(
     Ordering::Equal
 }
 
-fn scalar_at_row(
-    batches: &[RecordBatch],
-    batch_idx: usize,
-    row_idx: usize,
-    col_idx: usize,
-) -> ScalarValue {
-    batches[batch_idx]
-        .scalar(row_idx, col_idx)
-        .unwrap_or_else(|| {
-            ScalarValue::null_for_type(batches[batch_idx].schema.columns[col_idx].data_type)
-        })
-}
+fn sort_clustered_row_indices(
+    row_indices: &mut Vec<u32>,
+    source_batch: &RecordBatch,
+    sort_key_indices: &[usize],
+) {
+    let Some(&leading_key_idx) = sort_key_indices.first() else {
+        return;
+    };
+    let varchar_leading_key = matches!(
+        source_batch.column(leading_key_idx),
+        Some(ColumnArray::VarChar { .. })
+    );
+    if !varchar_leading_key {
+        row_indices.par_sort_unstable_by(|left, right| {
+            compare_row_indices(*left, *right, source_batch, sort_key_indices)
+                .then_with(|| left.cmp(right))
+        });
+        return;
+    }
 
-fn row_key(batch: &RecordBatch, row_idx: usize) -> Vec<ScalarValue> {
-    (0..batch.num_columns())
-        .map(|col_idx| {
-            batch.scalar(row_idx, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
-            })
-        })
-        .collect()
-}
-
-fn compare_merge_keys(left: &[ScalarValue], right: &[ScalarValue]) -> Ordering {
-    for (left_val, right_val) in left.iter().zip(right.iter()) {
-        let cmp = compare_scalars_for_sort(left_val, right_val);
-        if cmp != Ordering::Equal {
-            return cmp;
+    // Tick data arrives in time order, while its leading cluster key is the
+    // security identifier. Group that string key in one linear pass, sort the
+    // few thousand group names once, then sort each group by the remaining
+    // numeric/time keys in parallel. Null leading keys stay last.
+    let total_rows = row_indices.len();
+    let unsorted = std::mem::take(row_indices);
+    let mut groups: HashMap<&str, Vec<u32>> = HashMap::new();
+    let mut null_group = Vec::new();
+    let Some(ColumnArray::VarChar { data, bitmap }) = source_batch.column(leading_key_idx) else {
+        return;
+    };
+    for row_idx in unsorted {
+        if bitmap.is_null(row_idx as usize) {
+            null_group.push(row_idx);
+        } else if let Some(value) = data.get(row_idx as usize) {
+            groups.entry(value).or_default().push(row_idx);
+        } else {
+            continue;
         }
     }
-    left.len().cmp(&right.len())
-}
 
-fn non_key_projection(num_columns: usize, cluster_key_indices: &[usize]) -> Vec<usize> {
-    (0..num_columns)
-        .filter(|idx| !cluster_key_indices.contains(idx))
-        .collect()
-}
+    let remaining_keys = &sort_key_indices[1..];
+    let mut ordered_groups = groups.into_iter().collect::<Vec<_>>();
+    ordered_groups.par_iter_mut().for_each(|(_, rows)| {
+        rows.sort_unstable_by(|left, right| {
+            compare_row_indices(*left, *right, source_batch, remaining_keys)
+                .then_with(|| left.cmp(right))
+        });
+    });
+    ordered_groups.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    null_group.sort_unstable_by(|left, right| {
+        compare_row_indices(*left, *right, source_batch, remaining_keys)
+            .then_with(|| left.cmp(right))
+    });
 
-fn projected_column_positions(num_columns: usize, projection: &[usize]) -> Vec<Option<usize>> {
-    let mut positions = vec![None; num_columns];
-    for (projected_pos, &col_idx) in projection.iter().enumerate() {
-        if col_idx < num_columns {
-            positions[col_idx] = Some(projected_pos);
-        }
+    row_indices.reserve(total_rows);
+    for (_, mut rows) in ordered_groups {
+        row_indices.append(&mut rows);
     }
-    positions
+    row_indices.append(&mut null_group);
 }
 
-fn key_column_positions(num_columns: usize, cluster_key_indices: &[usize]) -> Vec<Option<usize>> {
-    let mut positions = vec![None; num_columns];
-    for (key_pos, &col_idx) in cluster_key_indices.iter().enumerate() {
-        if col_idx < num_columns {
-            positions[col_idx] = Some(key_pos);
-        }
+fn gather_global_chunk(
+    schema: &Schema,
+    source_batch: &RecordBatch,
+    row_indices: &[u32],
+) -> Result<RecordBatch> {
+    let positions = row_indices
+        .iter()
+        .enumerate()
+        .map(|(output_pos, source_row_idx)| (output_pos, *source_row_idx as usize))
+        .collect::<Vec<_>>();
+
+    let mut columns = schema
+        .columns
+        .iter()
+        .map(|col| empty_column_for_gather(col.data_type, row_indices.len()))
+        .collect::<Vec<_>>();
+
+    columns
+        .par_iter_mut()
+        .enumerate()
+        .try_for_each(|(col_idx, dst_col)| -> Result<()> {
+            let src_col = source_batch.column(col_idx).ok_or_else(|| {
+                TaibaiError::Storage(format!("missing source column {}", col_idx))
+            })?;
+            gather_column_positions(dst_col, src_col, &positions)?;
+            Ok(())
+        })?;
+
+    RecordBatch::try_new(schema.clone(), columns)
+}
+
+fn compare_column_rows(
+    left: &ColumnArray,
+    left_row: usize,
+    right: &ColumnArray,
+    right_row: usize,
+) -> Ordering {
+    let left_null = left.bitmap().is_null(left_row);
+    let right_null = right.bitmap().is_null(right_row);
+    match (left_null, right_null) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
     }
-    positions
+
+    macro_rules! compare_ord {
+        ($left_data:expr, $right_data:expr) => {
+            $left_data[left_row].cmp(&$right_data[right_row])
+        };
+    }
+    macro_rules! compare_float {
+        ($left_data:expr, $right_data:expr) => {
+            $left_data[left_row]
+                .partial_cmp(&$right_data[right_row])
+                .unwrap_or(Ordering::Equal)
+        };
+    }
+
+    match (left, right) {
+        (ColumnArray::Bool { data: l, .. }, ColumnArray::Bool { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Int8 { data: l, .. }, ColumnArray::Int8 { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Int16 { data: l, .. }, ColumnArray::Int16 { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Int32 { data: l, .. }, ColumnArray::Int32 { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Int64 { data: l, .. }, ColumnArray::Int64 { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::UInt8 { data: l, .. }, ColumnArray::UInt8 { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::UInt16 { data: l, .. }, ColumnArray::UInt16 { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::UInt32 { data: l, .. }, ColumnArray::UInt32 { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::UInt64 { data: l, .. }, ColumnArray::UInt64 { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Float32 { data: l, .. }, ColumnArray::Float32 { data: r, .. }) => {
+            compare_float!(l, r)
+        }
+        (ColumnArray::Float64 { data: l, .. }, ColumnArray::Float64 { data: r, .. }) => {
+            compare_float!(l, r)
+        }
+        (ColumnArray::Decimal { data: l, .. }, ColumnArray::Decimal { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Date { data: l, .. }, ColumnArray::Date { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Time { data: l, .. }, ColumnArray::Time { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Timestamp { data: l, .. }, ColumnArray::Timestamp { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Interval { data: l, .. }, ColumnArray::Interval { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::VarChar { data: l, .. }, ColumnArray::VarChar { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        (ColumnArray::Blob { data: l, .. }, ColumnArray::Blob { data: r, .. }) => {
+            compare_ord!(l, r)
+        }
+        _ => compare_scalars_for_sort(&left.scalar(left_row), &right.scalar(right_row)),
+    }
 }
 
 fn empty_column_for_gather(data_type: DataType, len: usize) -> ColumnArray {
@@ -904,11 +1103,11 @@ fn empty_column_for_gather(data_type: DataType, len: usize) -> ColumnArray {
             bitmap,
         },
         DataType::VarChar => ColumnArray::VarChar {
-            data: vec![String::new(); len],
+            data: vec![String::new(); len].into(),
             bitmap,
         },
         DataType::Blob => ColumnArray::Blob {
-            data: vec![Vec::new(); len],
+            data: vec![Vec::new(); len].into(),
             bitmap,
         },
         DataType::Vector => ColumnArray::Vector {
@@ -1115,7 +1314,14 @@ fn gather_column_positions(
                 data: src_data,
                 bitmap: src_bitmap,
             },
-        ) => copy_clone!(dst_data, dst_bitmap, src_data, src_bitmap),
+        ) => {
+            for &(output_pos, source_row_idx) in positions {
+                dst_data.set(output_pos, src_data.value(source_row_idx));
+                if src_bitmap.is_null(source_row_idx) {
+                    dst_bitmap.set_null(output_pos);
+                }
+            }
+        }
         (
             ColumnArray::Blob {
                 data: dst_data,
@@ -1125,7 +1331,14 @@ fn gather_column_positions(
                 data: src_data,
                 bitmap: src_bitmap,
             },
-        ) => copy_clone!(dst_data, dst_bitmap, src_data, src_bitmap),
+        ) => {
+            for &(output_pos, source_row_idx) in positions {
+                dst_data.set(output_pos, src_data.value(source_row_idx));
+                if src_bitmap.is_null(source_row_idx) {
+                    dst_bitmap.set_null(output_pos);
+                }
+            }
+        }
         (
             ColumnArray::Vector {
                 data: dst_data,
@@ -1163,7 +1376,7 @@ fn group_segments_by_partition(
     groups
 }
 
-fn partition_key_candidates(raw: &str) -> Vec<String> {
+pub(crate) fn partition_key_candidates(raw: &str) -> Vec<String> {
     let key = raw.trim();
     let mut candidates = vec![key.to_string()];
     if key.len() > 1

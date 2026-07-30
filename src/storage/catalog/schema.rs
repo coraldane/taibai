@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::error::{Result, TaibaiError};
 use crate::types::batch::ColumnDef;
+use crate::types::scalar::ScalarValue;
 
 /// Partition type for a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -85,6 +86,42 @@ pub struct SecondaryIndexMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistogramBucketMeta {
+    pub lower_bound: ScalarValue,
+    pub upper_bound: ScalarValue,
+    pub sample_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnStatisticsMeta {
+    pub distinct_count: i64,
+    pub null_count: i64,
+    pub min_value: Option<ScalarValue>,
+    pub max_value: Option<ScalarValue>,
+    #[serde(default)]
+    pub histogram: Vec<HistogramBucketMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompositeStatisticsMeta {
+    pub columns: Vec<String>,
+    pub distinct_count: i64,
+    pub null_count: i64,
+    #[serde(default)]
+    pub unique: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableStatisticsMeta {
+    pub row_count: i64,
+    pub schema_version: u64,
+    pub collected_at: i64,
+    pub columns: HashMap<String, ColumnStatisticsMeta>,
+    #[serde(default)]
+    pub composite_columns: Vec<CompositeStatisticsMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMeta {
     pub name: String,
     pub database: String,
@@ -128,6 +165,8 @@ pub struct TableMeta {
     pub schema_version: u64,
     #[serde(default)]
     pub dropped_columns: Vec<ColumnDef>,
+    #[serde(default)]
+    pub statistics: Option<TableStatisticsMeta>,
 }
 
 impl TableMeta {
@@ -161,9 +200,17 @@ impl TableMeta {
             next_column_id: 1,
             schema_version: 1,
             dropped_columns: Vec::new(),
+            statistics: None,
         };
         meta.ensure_column_ids();
         meta
+    }
+
+    pub fn valid_statistics(&self) -> Option<&TableStatisticsMeta> {
+        self.statistics.as_ref().filter(|statistics| {
+            statistics.row_count == self.row_count
+                && statistics.schema_version == self.schema_version
+        })
     }
 
     pub fn ensure_column_ids(&mut self) {

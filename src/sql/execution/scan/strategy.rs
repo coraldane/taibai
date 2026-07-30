@@ -241,6 +241,80 @@ pub fn prune_segment(spec: &ScanSpec, reader: &SegmentReader) -> Option<RowGroup
     ))
 }
 
+/// For unordered LIMIT queries, visit row groups with the highest estimated
+/// match density first. This is a small cost-based decision backed entirely by
+/// persisted row-group statistics, so it adds no write-path work.
+pub fn rank_row_groups_for_limit(
+    spec: &ScanSpec,
+    reader: &SegmentReader,
+    candidates: &mut [usize],
+) {
+    candidates.sort_by(|left, right| {
+        let left_score = estimated_match_density(spec, reader, *left);
+        let right_score = estimated_match_density(spec, reader, *right);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.cmp(right))
+    });
+}
+
+fn estimated_match_density(spec: &ScanSpec, reader: &SegmentReader, row_group: usize) -> f64 {
+    let mut selectivity = 1.0f64;
+    let value_sets = reader.value_sets(row_group);
+    let zone_maps = reader.zone_maps(row_group);
+    for (column, value) in &spec.eq_predicates {
+        if let Some(values) = value_sets.get(*column).and_then(|values| values.as_ref()) {
+            selectivity *= 1.0 / values.len().max(1) as f64;
+            continue;
+        }
+        if let Some(zone) = zone_maps.get(*column) {
+            if zone.min_value == *value && zone.max_value == *value {
+                continue;
+            }
+        }
+        selectivity *= 0.1;
+    }
+    for predicate in &spec.in_predicates {
+        if let Some(values) = value_sets
+            .get(predicate.column_index)
+            .and_then(|values| values.as_ref())
+        {
+            selectivity *=
+                (predicate.values.len() as f64 / values.len().max(1) as f64).clamp(0.0, 1.0);
+        } else {
+            selectivity *= (predicate.values.len() as f64 * 0.1).min(1.0);
+        }
+    }
+    for predicate in &spec.range_predicates {
+        let Some(zone) = zone_maps.get(predicate.column_index) else {
+            selectivity *= 0.33;
+            continue;
+        };
+        let (Some(min), Some(max), Some(value)) = (
+            zone.min_value.numeric_f64(),
+            zone.max_value.numeric_f64(),
+            predicate.value.numeric_f64(),
+        ) else {
+            selectivity *= 0.33;
+            continue;
+        };
+        let fraction = if max <= min {
+            1.0
+        } else {
+            ((value - min) / (max - min)).clamp(0.0, 1.0)
+        };
+        selectivity *= match predicate.op {
+            crate::storage::partition::pruning::RangeOp::Eq => 0.1,
+            crate::storage::partition::pruning::RangeOp::Lt
+            | crate::storage::partition::pruning::RangeOp::Le => fraction,
+            crate::storage::partition::pruning::RangeOp::Gt
+            | crate::storage::partition::pruning::RangeOp::Ge => 1.0 - fraction,
+        };
+    }
+    selectivity.clamp(0.0, 1.0)
+}
+
 pub fn read_row_group_with_strategy(
     spec: &ScanSpec,
     plan: &ScanPlan,

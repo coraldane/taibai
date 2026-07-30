@@ -1,44 +1,25 @@
-# Taibai Database Server Configuration
-# Copy this file to config.yaml and modify as needed
-
-# Server settings
 server:
   host: "0.0.0.0"
   port: 5151
-  max_message_size: 67108864  # 64MB
+  max_connections: 1024
+  max_concurrent_requests: 8
 
-# Storage settings
 storage:
-  data_dir: "/Users/coral/Downloads/data/taibai"
+  data_dir: "./data"
   default_database: "main"
-  flush_threshold_rows: 65536
-  min_segment_seal_size_mb: 500  # Minimum segment size in MB before sealing
-  max_segment_size_mb: 2048  # Target maximum segment size in MB before rotating
-  delete_cleanup_enabled: true  # Enable async cleanup for DELETE bitmaps without resorting
-  delete_cleanup_min_deleted_ratio: 0.30  # Cleanup segment groups when deleted rows reach 30%
-  delete_cleanup_min_deleted_rows: 8192  # Minimum deleted rows before cleanup
-  delete_bitmap_cleanup_interval_secs: 60  # Background cleanup interval; overrides delete_cleanup_interval_ms when set
-  delete_cleanup_max_segments_per_run: 8  # Limit cleanup work per round
-  hot_store_memory_limit_mb: 8192  # Unified resident hot store memory limit in MB
+  min_segment_seal_size_mb: 500
+  max_segment_size_mb: 2048
+  hot_store_memory_limit_mb: 8192
 
-# Buffer settings
 buffer:
-  batch_size: 4096  # Batch size for query processing
+  query_memory_limit_mb: 4096
+  execution_threads: 8
+  max_parallel_row_groups: 8
+  global_io_permits: 4
+  global_cpu_permits: 8
 
-# Compression settings
 compression:
-  enabled: true  # Enable protocol compression
+  enabled: true
 
-# TLS configuration (optional)
-# Set enabled: true and provide cert/key paths to enable TLS
-tls:
-  enabled: false
-  cert_path: ""
-  key_path: ""
-
-# Log settings
 log:
-  level: "info"  # trace, debug, info, warn, error
-  # file: "../logs/taibai.log"
-  # query_file: "../logs/taibai-query.log"  # Defaults to taibai-query.log next to log.file when omitted
-  query_max_size_mb: 1024  # 0 disables query log rotation
+  level: "info"

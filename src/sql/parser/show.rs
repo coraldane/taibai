@@ -107,6 +107,16 @@ impl Parser {
                 self.advance();
                 Ok(Statement::ShowStats)
             }
+            Token::Ident(word) if word.eq_ignore_ascii_case("PERFORMANCE") => {
+                self.advance();
+                let baselines = self.expect_ident()?;
+                if !baselines.eq_ignore_ascii_case("BASELINES") {
+                    return Err(TaibaiError::Sql(format!(
+                        "expected BASELINES after SHOW PERFORMANCE, got {baselines}"
+                    )));
+                }
+                Ok(Statement::ShowPerformanceBaselines)
+            }
             Token::Engines => {
                 self.advance();
                 Ok(Statement::ShowEngines)
@@ -192,6 +202,14 @@ impl Parser {
         Ok(Statement::OptimizeTable { table, partition })
     }
 
+    pub fn parse_analyze_table(&mut self) -> Result<Statement> {
+        self.expect(&Token::Analyze)?;
+        self.expect(&Token::Table)?;
+        Ok(Statement::AnalyzeTable {
+            table: self.parse_object_name()?,
+        })
+    }
+
     pub fn parse_rebuild(&mut self) -> Result<Statement> {
         self.expect(&Token::Rebuild)?;
         match self.peek() {
@@ -244,6 +262,23 @@ impl Parser {
     pub fn parse_resume(&mut self) -> Result<Statement> {
         self.expect(&Token::Resume)?;
         Ok(Statement::ResumeFlush)
+    }
+
+    pub fn parse_reset(&mut self) -> Result<Statement> {
+        self.expect(&Token::Reset)?;
+        let performance = self.expect_ident()?;
+        if !performance.eq_ignore_ascii_case("PERFORMANCE") {
+            return Err(TaibaiError::Sql(format!(
+                "expected PERFORMANCE after RESET, got {performance}"
+            )));
+        }
+        let baselines = self.expect_ident()?;
+        if !baselines.eq_ignore_ascii_case("BASELINES") {
+            return Err(TaibaiError::Sql(format!(
+                "expected BASELINES after RESET PERFORMANCE, got {baselines}"
+            )));
+        }
+        Ok(Statement::ResetPerformanceBaselines)
     }
 
     pub fn parse_explain(&mut self) -> Result<Statement> {

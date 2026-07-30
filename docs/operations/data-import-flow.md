@@ -164,9 +164,11 @@ repeat column_count:
 
 - 固定宽度列的 `computed_data_len = elem_count * type_width`。
 - 变长列按每行 `len: u32 + bytes` 顺序编码。
+- `data` 为 dense slot 布局：即使某行是 `NULL`，也保留该行的固定宽度占位值或变长值槽。
 - `elem_count` 必须等于 payload 头部的 `row_count`。
+- `nulls_size == 0` 表示整列无 NULL；否则 bitmap 使用小端 `u64` 字组，长度必须为 `ceil(row_count / 64) * 8`，第 K 位为 1 表示第 K 行是 NULL。
+- 最后一个字组中超出 `row_count` 的 padding bit 必须为 0。
 - 服务端解析变长列时会一次性建立每行的 `(offset, len)` 索引，后续分区/聚簇转换和统计信息计算可以按行 O(1) 访问。
-- 当前通过服务端 catalog 校验的 bulk 路径要求 `nulls_size == 0`，即直接 bulk path 目前只支持 all-valid columns。
 
 ### 服务端侧
 
@@ -183,13 +185,10 @@ MSG_TYPE_BULK_INSERT_COLUMNAR
 
 1. 解析二进制 payload。
 2. 根据 catalog 找到表 schema。
-3. 校验列数量、列名、列类型。
-4. 拒绝带 null bitmap 的 payload。
-5. 若表有 `PARTITION BY` 或 `CLUSTER BY`，先把 DirectBulkRequest 转成 `RecordBatch`：
-   - 有 `CLUSTER BY` 时按聚簇键排序。
-   - 有分区时按分区函数拆成多个 partition batch。
-   - 最后走 `bulk_insert_batch_partitioned` / `bulk_insert_batch_with_partition`。
-6. 若表没有分区和聚簇键，走直接列式写入：
+3. 校验列数量、列名、列类型和 null bitmap；`NOT NULL`/主键列出现 NULL 时拒绝导入。
+4. 分区或 row group 切片时同步重建每个子组的 null bitmap。
+5. 落盘前把 wire 层的 dense slot 数据转换为 segment codec 所需的“bitmap + 仅非 NULL 值”布局。
+6. 走直接列式写入：
    - 每列用 Rayon 并行 zstd 压缩。
    - 生成 row group 元数据。
    - 计算 Zone Map。
@@ -271,15 +270,9 @@ partition by deal_date cluster by security_id
 
 ## 检查发现与注意事项
 
-### 1. bulk payload 目前只支持 all-valid columns
+### 1. bulk payload 已支持 nullable columns
 
-`bulk_insert_payload_with_catalog` 会在发现 `payload_col.nulls` 非空时返回错误：
-
-```text
-direct bulk path currently supports all-valid columns only
-```
-
-如果要支持 nullable bulk 导入，需要补齐 DirectBulkColumn 的 null bitmap 语义、固定宽度列 offset 计算和服务端校验。
+direct bulk 会保留固定宽度和变长列的 NULL，并在分区/row group 拆分后重新映射 bitmap。Zone Map 的 `null_count` 也随写入结果生成。协议要求使用上文定义的 canonical `u64` 字组 bitmap；畸形长度、越界 padding bit，以及向 `NOT NULL`/主键列写 NULL 都会返回协议错误。
 
 ### 2. `net::bulk_importer::encode_columnar_bulk_insert` 协议字段语义已修复
 
@@ -336,7 +329,6 @@ examples/batch_import
 ## 后续优化建议
 
 1. 明确 bulk WAL 设计：要么实现真正的 bulk WAL，要么在文档/API 中明确 bulk import 是可重放导入语义。
-2. 支持 nullable bulk payload，统一 null bitmap 与固定宽度列数据布局。
-3. 在列式 bulk 直接路径中为适合的列生成 Bloom Filter。
-4. 对分区/聚簇 bulk 做流式分桶和局部排序，减少 DirectBulkRequest 全量转 RecordBatch 的成本。
-5. 在 `STOP BULK IMPORT` 或 bulk 写入结束时同步更新 catalog `row_count`，避免 `SHOW STATS` 与实际 segment 行数不一致。
+2. 在列式 bulk 直接路径中为适合的列生成 Bloom Filter。
+3. 对分区/聚簇 bulk 做流式分桶和局部排序，减少重排开销。
+4. 在 `STOP BULK IMPORT` 或 bulk 写入结束时同步更新 catalog `row_count`，避免 `SHOW STATS` 与实际 segment 行数不一致。

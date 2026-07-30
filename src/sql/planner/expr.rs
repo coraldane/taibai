@@ -7,7 +7,7 @@ use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
 use super::types::*;
-use super::{AliasMap, JoinTableInfo, PlannerContext};
+use super::{AliasMap, PlannerContext};
 
 fn aggregate_func(name: &str) -> Option<AggFunc> {
     match name.to_uppercase().as_str() {
@@ -421,7 +421,6 @@ pub fn ast_expr_to_logical_join(
     left_schema: &Schema,
     right_schema: &Schema,
     alias_map: &AliasMap,
-    table_info: &JoinTableInfo,
 ) -> Result<LogicalExpr> {
     match expr {
         Expr::Literal(v) => Ok(LogicalExpr::Literal(v.clone())),
@@ -432,53 +431,7 @@ pub fn ast_expr_to_logical_join(
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
-            let alias_lower = table.to_lowercase();
-
-            let left_idx = left_schema.index_of(column);
-            let right_idx = right_schema.index_of(column);
-
-            let is_left = table_info.left_tables.iter().any(|t| {
-                t.eq_ignore_ascii_case(&alias_lower)
-                    || alias_map
-                        .get(&alias_lower)
-                        .map(|a| a.table_name.eq_ignore_ascii_case(t))
-                        .unwrap_or(false)
-            });
-            let is_right = table_info.right_tables.iter().any(|t| {
-                t.eq_ignore_ascii_case(&alias_lower)
-                    || alias_map
-                        .get(&alias_lower)
-                        .map(|a| a.table_name.eq_ignore_ascii_case(t))
-                        .unwrap_or(false)
-            });
-
-            let idx = match (left_idx, right_idx, is_left, is_right) {
-                (Some(l), None, _, _) => l,
-                (None, Some(r), _, _) => left_schema.columns.len() + r,
-                (Some(l), Some(_r), true, false) => l,
-                (Some(_l), Some(r), false, true) => left_schema.columns.len() + r,
-                (Some(l), Some(_r), true, true) => {
-                    if alias_lower.ends_with("1") || alias_lower.starts_with("l") {
-                        l
-                    } else if alias_lower.ends_with("2") || alias_lower.starts_with("r") {
-                        left_schema.columns.len() + left_schema.index_of(column).unwrap_or(0)
-                    } else if alias_lower.starts_with("a") || alias_lower.starts_with("c") {
-                        l
-                    } else if alias_lower.starts_with("b") || alias_lower.starts_with("p") {
-                        left_schema.columns.len() + left_schema.index_of(column).unwrap_or(0)
-                    } else {
-                        l
-                    }
-                }
-                (Some(l), Some(_r), _, _) => l,
-                (None, None, _, _) => {
-                    return Err(TaibaiError::Sql(format!(
-                        "column '{}' not found in table '{}'",
-                        column, table
-                    )));
-                }
-            };
-
+            let idx = resolve_qualified_column_index(table, column, output_schema, alias_map)?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::BinaryOp { left, op, right } => {
@@ -488,7 +441,6 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
-                table_info,
             )?;
             let r = ast_expr_to_logical_join(
                 right,
@@ -496,7 +448,6 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
-                table_info,
             )?;
             Ok(LogicalExpr::BinaryOp {
                 left: Box::new(l),
@@ -511,7 +462,6 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
-                table_info,
             )?;
             Ok(LogicalExpr::Not(Box::new(e)))
         }
@@ -522,7 +472,6 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
-                table_info,
             )?;
             Ok(LogicalExpr::BinaryOp {
                 left: Box::new(LogicalExpr::Literal(ScalarValue::Int64(Some(0)))),
@@ -537,7 +486,6 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
-                table_info,
             )?;
             Ok(LogicalExpr::IsNull(Box::new(e)))
         }
@@ -548,7 +496,6 @@ pub fn ast_expr_to_logical_join(
                 left_schema,
                 right_schema,
                 alias_map,
-                table_info,
             )?;
             Ok(LogicalExpr::IsNotNull(Box::new(e)))
         }
@@ -569,7 +516,6 @@ pub fn ast_expr_to_logical_join(
                         left_schema,
                         right_schema,
                         alias_map,
-                        table_info,
                     )?
                 };
                 return Ok(LogicalExpr::Aggregate(AggregateExpr {
@@ -596,7 +542,6 @@ pub fn ast_expr_to_logical_join(
                         left_schema,
                         right_schema,
                         alias_map,
-                        table_info,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;

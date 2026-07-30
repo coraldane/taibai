@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::catalog::schema::{PartitionType, TableMeta};
-use crate::storage::index::index_manager::UniqueRowLocation;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::pruning::ZoneMap;
 use crate::storage::partition::{
@@ -24,7 +23,6 @@ use crate::sql::parser::ast::{BinOp, Expr};
 
 pub(crate) struct ReplaceDeleteUndo {
     segment_footers: Vec<(PathBuf, Vec<u8>, u64)>,
-    tombstones: Vec<UniqueRowLocation>,
     deleted_rows: u64,
 }
 
@@ -43,7 +41,6 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
     let table_dir = engine.data_dir().join(db).join(table);
     let mut undo = ReplaceDeleteUndo {
         segment_footers: Vec::new(),
-        tombstones: Vec::new(),
         deleted_rows: 0,
     };
     if !table_dir.exists() || key_sets.is_empty() {
@@ -85,10 +82,6 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
                     keys.contains(&key)
                 });
                 if conflicts && delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row) {
-                    undo.tombstones.push(UniqueRowLocation {
-                        segment_path: seg_path.to_string_lossy().into_owned(),
-                        row_id: absolute_row,
-                    });
                     newly_deleted += 1;
                 }
             }
@@ -142,14 +135,17 @@ pub(crate) fn finalize_replace_delete_under_table_lock(
     if undo.deleted_rows == 0 {
         return Ok(());
     }
-    for index in &table_meta.unique_indexes {
-        engine.index_manager().append_unique_index_tombstones(
-            db,
-            table,
-            &index.name,
-            undo.tombstones.clone(),
-        )?;
-    }
+    engine
+        .index_manager()
+        .invalidate_primary_key_index(db, table);
+    let unique_index_names = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    engine
+        .index_manager()
+        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
 
     let mut catalogs = engine.catalogs().write().unwrap();
     if let Some(catalog) = catalogs.get_mut(db) {
@@ -182,7 +178,16 @@ pub fn exec_delete(
 
     let resolved_where_clause = resolve_in_subqueries(engine, db, where_clause)?;
 
-    engine.flush_all_buffers()?;
+    let target_partition_key =
+        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
+    if let Some(partition_key) = target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        engine.flush_partition_buffers(db, table, partition_key)?;
+    } else {
+        engine.flush_table_buffers(db, table)?;
+    }
 
     let table_dir = engine.data_dir().join(db).join(table);
     if !table_dir.exists() {
@@ -191,7 +196,6 @@ pub fn exec_delete(
 
     let mgr = engine.segment_mgr();
     let mut total_deleted: u64 = 0;
-    let mut unique_index_tombstones: Vec<UniqueRowLocation> = Vec::new();
     let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
     let predicate_projection = resolved_where_clause
         .as_ref()
@@ -262,10 +266,6 @@ pub fn exec_delete(
                             if matches
                                 && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
                             {
-                                unique_index_tombstones.push(UniqueRowLocation {
-                                    segment_path: seg_path.to_string_lossy().into_owned(),
-                                    row_id: row_id + i as u64,
-                                });
                                 newly_deleted += 1;
                             }
                         }
@@ -273,10 +273,6 @@ pub fn exec_delete(
                     } else {
                         for i in 0..rg_rows {
                             if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
-                                unique_index_tombstones.push(UniqueRowLocation {
-                                    segment_path: seg_path.to_string_lossy().into_owned(),
-                                    row_id: row_id + i,
-                                });
                                 newly_deleted += 1;
                             }
                         }
@@ -299,15 +295,17 @@ pub fn exec_delete(
     })?;
 
     if total_deleted > 0 {
-        let unique_index_tombstones = collect_unique_index_tombstones(&mgr, &table_dir)?;
-        for index in &table_meta.unique_indexes {
-            engine.index_manager().append_unique_index_tombstones(
-                db,
-                table,
-                &index.name,
-                unique_index_tombstones.clone(),
-            )?;
-        }
+        engine
+            .index_manager()
+            .invalidate_primary_key_index(db, table);
+        let unique_index_names = table_meta
+            .unique_indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        engine
+            .index_manager()
+            .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
 
         let mut catalogs = engine.catalogs().write().unwrap();
         if let Some(catalog) = catalogs.get_mut(db) {
@@ -322,29 +320,6 @@ pub fn exec_delete(
     Ok(ExecResult::Ok {
         rows_affected: total_deleted,
     })
-}
-
-fn collect_unique_index_tombstones(
-    mgr: &SegmentManager,
-    table_dir: &std::path::Path,
-) -> Result<Vec<UniqueRowLocation>> {
-    let mut tombstones = Vec::new();
-    for seg_path in SegmentManager::discover_segments(table_dir)? {
-        let reader = mgr.open_reader(&seg_path)?;
-        let bitmap = reader.delete_bitmap();
-        if bitmap.is_empty() {
-            continue;
-        }
-        for row_id in 0..reader.row_count() {
-            if delete_bitmap::is_deleted(bitmap, row_id) {
-                tombstones.push(UniqueRowLocation {
-                    segment_path: seg_path.to_string_lossy().into_owned(),
-                    row_id,
-                });
-            }
-        }
-    }
-    Ok(tombstones)
 }
 
 fn resolve_in_subqueries(
@@ -628,7 +603,7 @@ fn segment_may_match(
     (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
 }
 
-fn prune_segments_by_partition(
+pub(crate) fn prune_segments_by_partition(
     segment_files: Vec<PathBuf>,
     where_clause: &Option<Expr>,
     schema: &Schema,
@@ -905,7 +880,7 @@ fn set_tighter_upper(
     }
 }
 
-fn delete_partition_eq_key(
+pub(crate) fn delete_partition_eq_key(
     where_clause: &Option<Expr>,
     schema: &Schema,
     table_meta: &TableMeta,

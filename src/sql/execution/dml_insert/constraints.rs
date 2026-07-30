@@ -70,15 +70,15 @@ pub fn validate_unique_key_uniqueness(
         }
     }
     if new_batch.is_some() {
-        if let Some(data) = engine
+        if let Some(columns) = engine
             .index_manager()
-            .load_unique_index_data(db, table, index_name)?
+            .unique_index_columns(db, table, index_name)?
         {
             let index_columns = indices
                 .iter()
                 .map(|idx| schema.columns[*idx].name.clone())
                 .collect::<Vec<_>>();
-            if data.columns == index_columns {
+            if columns == index_columns {
                 for key in &keys {
                     if engine
                         .index_manager()
@@ -325,6 +325,16 @@ fn validate_primary_key_values_present(
     Ok(())
 }
 
+fn primary_keys_for_batch(
+    batch: &RecordBatch,
+    schema: &Schema,
+    primary_key_indices: &[usize],
+) -> Result<Vec<Vec<ScalarValue>>> {
+    (0..batch.num_rows())
+        .map(|row_idx| primary_key_for_row(batch, row_idx, primary_key_indices, schema))
+        .collect()
+}
+
 fn validate_primary_key_uniqueness(
     engine: &Engine,
     db: &str,
@@ -333,15 +343,47 @@ fn validate_primary_key_uniqueness(
     schema: &Schema,
     primary_key_indices: &[usize],
 ) -> Result<()> {
-    let mut keys = HashSet::new();
-    for row_idx in 0..batch.num_rows() {
-        let key = primary_key_for_row(batch, row_idx, primary_key_indices, schema)?;
-        if !keys.insert(key.clone()) {
-            return Err(duplicate_primary_key_error(table, &key));
+    let keys = primary_keys_for_batch(batch, schema, primary_key_indices)?;
+    let mut unique = HashSet::with_capacity(keys.len());
+    for key in &keys {
+        if !unique.insert(key.clone()) {
+            return Err(duplicate_primary_key_error(table, key));
         }
     }
 
-    load_existing_primary_keys(engine, db, table, primary_key_indices, &mut keys)?;
+    if let Some(exists) = engine
+        .index_manager()
+        .primary_keys_exist(db, table, &keys)?
+    {
+        if exists {
+            return Err(TaibaiError::Sql(format!(
+                "duplicate primary key for table '{}'",
+                table
+            )));
+        }
+        return Ok(());
+    }
+
+    let entries = collect_unique_index_entries(
+        engine,
+        db,
+        table,
+        primary_key_indices,
+        "PRIMARY",
+    )?;
+    let historical_keys = entries
+        .into_iter()
+        .map(|entry| entry.key)
+        .collect::<Vec<_>>();
+    if historical_keys.iter().any(|key| unique.contains(key)) {
+        return Err(TaibaiError::Sql(format!(
+            "duplicate primary key for table '{}'",
+            table
+        )));
+    }
+    engine
+        .index_manager()
+        .install_primary_key_index(db, table, historical_keys)?;
     Ok(())
 }
 
@@ -392,65 +434,6 @@ fn advance_explicit_auto_increment_counters(
             engine
                 .auto_increment_manager()
                 .advance_past(db, table, value)?;
-        }
-    }
-    Ok(())
-}
-
-fn load_existing_primary_keys(
-    engine: &Engine,
-    db: &str,
-    table: &str,
-    primary_key_indices: &[usize],
-    inserted_keys: &mut HashSet<Vec<ScalarValue>>,
-) -> Result<()> {
-    let table_dir = engine.data_dir().join(db).join(table);
-    if table_dir.exists() {
-        for seg_path in SegmentManager::discover_segments(&table_dir)? {
-            let reader = engine.segment_mgr().open_reader_cached(&seg_path)?;
-            for rg_idx in 0..reader.num_row_groups() {
-                let mut batch =
-                    reader.read_row_group_with_projection(rg_idx, primary_key_indices)?;
-                if !reader.delete_bitmap().is_empty() {
-                    batch = crate::storage::segment::delete_bitmap::filter_batch(
-                        &batch,
-                        reader.row_group_start_row(rg_idx),
-                        reader.delete_bitmap(),
-                    )?;
-                }
-                check_existing_batch(table, &batch, inserted_keys)?;
-            }
-        }
-    }
-
-    for memtable in engine.memtable_manager().get_by_table(db, table) {
-        if let Some(batch) = memtable.read() {
-            check_existing_batch_with_indices(table, &batch, primary_key_indices, inserted_keys)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn check_existing_batch(
-    table: &str,
-    batch: &RecordBatch,
-    inserted_keys: &HashSet<Vec<ScalarValue>>,
-) -> Result<()> {
-    let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
-    check_existing_batch_with_indices(table, batch, &projected_indices, inserted_keys)
-}
-
-fn check_existing_batch_with_indices(
-    table: &str,
-    batch: &RecordBatch,
-    primary_key_indices: &[usize],
-    inserted_keys: &HashSet<Vec<ScalarValue>>,
-) -> Result<()> {
-    for row_idx in 0..batch.num_rows() {
-        let key = primary_key_for_row(batch, row_idx, primary_key_indices, &batch.schema)?;
-        if inserted_keys.contains(&key) {
-            return Err(duplicate_primary_key_error(table, &key));
         }
     }
     Ok(())

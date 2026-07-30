@@ -102,6 +102,22 @@ pub fn exec_create_table(
     let table_dir = engine.data_dir().join(db).join(name);
     std::fs::create_dir_all(&table_dir)?;
 
+    // A UNIQUE KEY declared with CREATE TABLE starts from an empty, valid
+    // snapshot.  Without this file, INSERT validation falls back to scanning
+    // every segment and resident memtable and later appends cannot bootstrap
+    // the index because they do not contain the pre-existing row locations.
+    if let Some(meta) = catalog.get_table(name) {
+        for index in &meta.unique_indexes {
+            engine.index_manager().persist_unique_index_entries(
+                db,
+                name,
+                &index.name,
+                &index.columns,
+                Vec::new(),
+            )?;
+        }
+    }
+
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
 
@@ -333,7 +349,7 @@ pub fn exec_rebuild_unique_index(
     drop(catalogs);
 
     let table_schema = Schema::new(table_meta.columns.clone());
-    engine.flush_all_buffers()?;
+    engine.flush_table_buffers(db, table)?;
     let mut rebuilt = 0u64;
     engine
         .segment_mgr()
@@ -422,13 +438,15 @@ pub fn exec_drop_table(
         .with_table_mutation_lock(db, name, || {
             tracing::info!(db, table = name, elapsed_ms = stage_start.elapsed().as_millis(), "drop table: acquired table mutation lock");
 
+            engine.batch_writer().drain_table_tail(db, name)?;
+
             let step_start = Instant::now();
             engine.segment_mgr().remove_wal(&table_dir);
             tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed wal handle");
 
             let step_start = Instant::now();
-            engine.segment_mgr().remove_table_state(db, name);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed table state");
+            engine.segment_mgr().close_table_state_handles(db, name);
+            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: closed table state handles");
 
             let step_start = Instant::now();
             engine.segment_mgr().invalidate_readers_under(&table_dir);
@@ -471,6 +489,8 @@ pub fn exec_drop_table(
             let step_start = Instant::now();
             let cleared_rows = engine.batch_writer().clear_memtables(db, name);
             tracing::info!(db, table = name, cleared_rows, elapsed_ms = step_start.elapsed().as_millis(), "drop table: cleared memtables");
+
+            engine.segment_mgr().remove_table_state(db, name);
 
             Ok(tombstone)
         })?;
@@ -579,9 +599,10 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
                     new_table_dir.display()
                 )));
             }
+            engine.batch_writer().drain_table_tail(db, name)?;
             engine.segment_mgr().flush_table_active(db, name)?;
             engine.segment_mgr().remove_wal(&old_table_dir);
-            engine.segment_mgr().remove_table_state(db, name);
+            engine.segment_mgr().close_table_state_handles(db, name);
             engine.segment_mgr().invalidate_readers_under(&old_table_dir);
 
             std::fs::create_dir_all(&operation_dir)?;
@@ -613,6 +634,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
                 return Err(error);
             }
             let renamed_rows = engine.batch_writer().rename_memtables(db, name, new_name);
+            engine.segment_mgr().remove_table_state(db, name);
             tracing::info!(
                 db,
                 old_table = name,
@@ -706,13 +728,13 @@ fn exec_partition_change(
                 ))
             })?;
 
-            // Active writers cover all partitions, so persist their buffers and metadata before
-            // retiring the table state. Inserts append under this same table mutation lock and
-            // cannot race this flush or the partition file staging below.
-            engine.segment_mgr().flush_table_active(db, name)?;
-            engine.segment_mgr().remove_wal(&table_dir);
-            engine.segment_mgr().remove_table_state(db, name);
-            engine.segment_mgr().invalidate_readers_under(&table_dir);
+            // Only the partition being changed must become immutable before
+            // its files are staged. Sibling active writers stay resident and
+            // continue accumulating rows instead of being fragmented by an
+            // unrelated partition operation.
+            engine
+                .segment_mgr()
+                .seal_partition_active_under_table_lock(db, name, &partition_key)?;
             write_before_meta(&operation_dir, &before_meta)?;
             stage_partition_files(&operation_dir, &table_dir, &partition_key)?;
 
@@ -797,6 +819,48 @@ fn exec_partition_change(
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
+fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<ExecResult> {
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let catalog = get_existing_catalog(&mut catalogs, db)?;
+    let before_meta = catalog
+        .get_table(name)
+        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name)))?
+        .clone();
+    validate_hot_def(&before_meta.columns, name, hot)?;
+
+    engine
+        .segment_mgr()
+        .with_table_mutation_lock(db, name, || {
+            // A normal table may already have resident rows that predate the
+            // hot-store index. Persist that prefix before enabling HOT so a
+            // later indexed memtable read cannot omit those rows.
+            engine
+                .batch_writer()
+                .flush_table_under_table_lock(db, name)?;
+            engine.segment_mgr().flush_table_active(db, name)?;
+
+            let meta = catalog.get_table_mut(name).ok_or_else(|| {
+                TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
+            })?;
+            meta.hot_time_column = Some(hot.time_column.clone());
+            meta.hot_index_column = hot.index_column.clone();
+            meta.hot_close_time = hot.close_time.clone();
+
+            let meta_dir = engine.data_dir().join("meta");
+            if let Err(error) = catalog.save(&meta_dir) {
+                catalog.tables.insert(name.to_string(), before_meta.clone());
+                return Err(error);
+            }
+
+            // Existing durable segments remain authoritative. The resident
+            // store starts empty and is populated only by subsequent inserts.
+            engine.hot_store_manager().remove(db, name);
+            Ok(())
+        })?;
+
+    Ok(ExecResult::Ok { rows_affected: 0 })
+}
+
 pub fn exec_alter_table(
     engine: &Engine,
     db: &str,
@@ -810,11 +874,12 @@ pub fn exec_alter_table(
                 AlterOperation::RenameTable { .. }
                     | AlterOperation::DropPartition { .. }
                     | AlterOperation::TruncatePartition { .. }
+                    | AlterOperation::SetHot { .. }
             )
         })
     {
         return Err(TaibaiError::Sql(
-            "RENAME TABLE, DROP PARTITION, and TRUNCATE PARTITION must be executed as a single ALTER operation"
+            "RENAME TABLE, DROP PARTITION, TRUNCATE PARTITION, and SET HOT must be executed as a single ALTER operation"
                 .into(),
         ));
     }
@@ -829,6 +894,7 @@ pub fn exec_alter_table(
             AlterOperation::TruncatePartition { partition_key } => {
                 return exec_partition_change(engine, db, name, partition_key, false)
             }
+            AlterOperation::SetHot { hot } => return exec_set_hot(engine, db, name, hot),
             _ => {}
         }
     }
@@ -1021,6 +1087,9 @@ pub fn exec_alter_table(
             AlterOperation::TruncatePartition { partition_key } => {
                 let _ = partition_key;
                 unreachable!("filesystem ALTER operations are handled before generic ALTER")
+            }
+            AlterOperation::SetHot { hot: _ } => {
+                unreachable!("SET HOT is handled before generic ALTER")
             }
             AlterOperation::SetTtl { ttl } => {
                 let meta = catalog.get_table_mut(name).ok_or_else(|| {
@@ -1223,8 +1292,9 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
     let operation_dir = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
+            engine.batch_writer().drain_table_tail(db, table)?;
             engine.segment_mgr().remove_wal(&table_dir);
-            engine.segment_mgr().remove_table_state(db, table);
+            engine.segment_mgr().close_table_state_handles(db, table);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
 
             write_before_meta(&operation_dir, &before_meta)?;
@@ -1264,6 +1334,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             }
 
             engine.batch_writer().clear_memtables(db, table);
+            engine.segment_mgr().remove_table_state(db, table);
             engine.hot_store_manager().remove(db, table);
             engine.index_manager().clear_index(db, table);
             let unique_index_names = before_meta

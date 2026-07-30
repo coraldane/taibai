@@ -17,6 +17,17 @@ pub struct DirectBulkColumn<'a> {
     pub variable_ranges: Option<Vec<(usize, usize)>>,
 }
 
+impl DirectBulkColumn<'_> {
+    #[inline]
+    pub fn is_null(&self, row_idx: usize) -> bool {
+        null_bit_is_set(self.nulls, row_idx)
+    }
+
+    pub fn has_nulls(&self, row_count: usize) -> bool {
+        (0..row_count).any(|row_idx| self.is_null(row_idx))
+    }
+}
+
 pub fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>> {
     if payload.len() < 10 {
         return Err(TaibaiError::Protocol("bulk payload too short".into()));
@@ -64,6 +75,8 @@ pub fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>
         let nulls = &payload[pos..pos + nulls_size];
         pos += nulls_size;
 
+        validate_null_bitmap(col_idx, row_count, nulls)?;
+
         columns.push(DirectBulkColumn {
             name,
             data_type: dtype,
@@ -88,6 +101,48 @@ pub fn parse_direct_bulk_payload(payload: &[u8]) -> Result<DirectBulkRequest<'_>
         row_count,
         columns,
     })
+}
+
+fn validate_null_bitmap(col_idx: usize, row_count: usize, nulls: &[u8]) -> Result<()> {
+    if nulls.is_empty() {
+        return Ok(());
+    }
+
+    // NullBitmap serializes complete little-endian u64 words.  Requiring the
+    // canonical length prevents truncated bitmaps from silently treating rows
+    // as valid in the direct path.
+    let expected = row_count
+        .div_ceil(64)
+        .checked_mul(8)
+        .ok_or_else(|| TaibaiError::Protocol("bulk null bitmap length overflow".into()))?;
+    if nulls.len() != expected {
+        return Err(TaibaiError::Protocol(format!(
+            "column {} null bitmap size mismatch: got {}, expected {} for {} rows",
+            col_idx,
+            nulls.len(),
+            expected,
+            row_count
+        )));
+    }
+
+    if row_count % 64 != 0 {
+        let used_bits = row_count % 64;
+        let last_word = u64::from_le_bytes(nulls[nulls.len() - 8..].try_into().unwrap());
+        if last_word >> used_bits != 0 {
+            return Err(TaibaiError::Protocol(format!(
+                "column {} null bitmap has bits set beyond {} rows",
+                col_idx, row_count
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+pub(crate) fn null_bit_is_set(nulls: &[u8], row_idx: usize) -> bool {
+    nulls
+        .get(row_idx / 8)
+        .is_some_and(|byte| byte & (1u8 << (row_idx % 8)) != 0)
 }
 
 fn direct_column_layout(

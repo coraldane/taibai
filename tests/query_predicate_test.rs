@@ -65,6 +65,45 @@ fn seed_predicate_tables(engine: &Engine, session: &mut Session) {
 }
 
 #[test]
+fn qualified_column_supports_is_null_predicates() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE nullable_t (id INT, note VARCHAR)",
+        )
+        .expect("create nullable_t");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO nullable_t VALUES (1, 'value'), (2, NULL)",
+        )
+        .expect("insert nullable_t");
+
+    let non_null_rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT id FROM nullable_t t WHERE t.note IS NOT NULL ORDER BY id",
+            )
+            .expect("qualified IS NOT NULL query"),
+    );
+    assert_eq!(non_null_rows, vec![vec![ScalarValue::Int32(Some(1))]]);
+
+    let null_rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT id FROM nullable_t t WHERE t.note IS NULL ORDER BY id",
+            )
+            .expect("qualified IS NULL query"),
+    );
+    assert_eq!(null_rows, vec![vec![ScalarValue::Int32(Some(2))]]);
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
 fn count_star_matches_select_rows_for_constant_true_predicate() {
     let (_temp_dir, engine, mut session) = create_engine();
     seed_predicate_tables(&engine, &mut session);

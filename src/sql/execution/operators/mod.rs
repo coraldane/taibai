@@ -2,7 +2,9 @@
 pub mod aggregate;
 pub mod filter;
 pub mod join;
+mod join_spill;
 pub mod limit;
+pub(crate) mod profile;
 pub mod project;
 pub mod scan;
 pub mod semi_join;
@@ -37,16 +39,11 @@ pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
     if mask.iter().all(|&m| m) {
         return batch.clone();
     }
-    let match_count = mask.iter().filter(|&&m| m).count();
-    if match_count == 0 {
+    let selection = crate::types::selection::SelectionVector::from_mask(mask);
+    if selection.is_empty() {
         return RecordBatch::new(batch.schema.clone());
     }
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for col_idx in 0..batch.num_columns() {
-        let col = batch.column(col_idx).unwrap();
-        columns.push(col.filter_by_mask_fast(mask, match_count));
-    }
-    RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
+    selection.apply(batch)
 }
 
 pub fn build_pipeline(

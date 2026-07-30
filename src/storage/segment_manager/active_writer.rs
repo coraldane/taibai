@@ -9,12 +9,13 @@ use crate::storage::column_encoding::encode_column_direct_range;
 use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::meta::{
     append_sidecar_footer, append_sidecar_row_groups, compact_sidecar_footer_if_needed,
+    remove_sidecar_meta,
 };
 use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
 use crate::storage::segment::{encode_segment_footer, RowGroupMeta};
 use crate::storage::segment_manager::config::{
     bulk_compression_level, FLUSH_META_AFTER_ROW_GROUP, SIDECAR_COMPACT_MIN_BYTES,
-    SIDECAR_COMPACT_MIN_RECORDS, SQL_INSERT_ROW_GROUP_TARGET_ROWS,
+    SIDECAR_COMPACT_MIN_RECORDS,
 };
 use crate::storage::segment_manager::helpers::{
     compute_value_sets_from_bulk_columns, compute_zone_maps_from_batch,
@@ -38,6 +39,7 @@ pub(super) struct ActiveSegmentWriter {
     pub(super) data_end: u64,
     pub(super) sidecar_row_groups_flushed: usize,
     pub(super) last_write_at: Instant,
+    pub(super) row_group_target_rows: usize,
 }
 
 impl ActiveSegmentWriter {
@@ -59,7 +61,54 @@ impl ActiveSegmentWriter {
             self.buffered_rows = batch.num_rows();
         }
 
-        while self.buffered_rows >= SQL_INSERT_ROW_GROUP_TARGET_ROWS {
+        while self.buffered_rows >= self.row_group_target_rows {
+            if let Some(wk) = self.flush_buffer(invalidate_reader)? {
+                wal_keys_to_clear.push(wk);
+            }
+        }
+        Ok(wal_keys_to_clear)
+    }
+
+    /// Append a batch whose buffers are no longer needed by the caller.
+    ///
+    /// The common SQL/bulk path hands ownership to the segment manager.  Keep
+    /// that ownership all the way into the row-group buffer instead of cloning
+    /// every fixed- and variable-width column first.
+    pub(super) fn append_batch_owned(
+        &mut self,
+        batch: RecordBatch,
+        invalidate_reader: &dyn Fn(&Path),
+    ) -> Result<Vec<String>> {
+        let added = batch.num_rows();
+        if batch.num_columns() != self.schema.num_columns() {
+            return Err(TaibaiError::Internal(format!(
+                "active segment append column count mismatch: {} != {}",
+                batch.num_columns(),
+                self.schema.num_columns()
+            )));
+        }
+        if batch
+            .columns
+            .iter()
+            .zip(&self.schema.columns)
+            .any(|(column, definition)| column.data_type() != definition.data_type)
+        {
+            return Err(TaibaiError::Internal(
+                "active segment append column type mismatch".into(),
+            ));
+        }
+        let mut wal_keys_to_clear = Vec::new();
+        if let Some(ref mut buffered) = self.buffered_batch {
+            for (dst, src) in buffered.columns.iter_mut().zip(batch.columns) {
+                dst.append_owned(src)?;
+            }
+            self.buffered_rows += added;
+        } else {
+            self.buffered_batch = Some(batch);
+            self.buffered_rows = added;
+        }
+
+        while self.buffered_rows >= self.row_group_target_rows {
             if let Some(wk) = self.flush_buffer(invalidate_reader)? {
                 wal_keys_to_clear.push(wk);
             }
@@ -82,7 +131,6 @@ impl ActiveSegmentWriter {
         let mut compressed_sizes = Vec::with_capacity(compressed_columns.len());
         let mut uncompressed_sizes = Vec::with_capacity(compressed_columns.len());
         let mut total_length = 0u64;
-        let mut write_buf = Vec::new();
 
         for (compressed, uncompressed_size) in compressed_columns {
             let n = compressed.len() as u64;
@@ -90,9 +138,11 @@ impl ActiveSegmentWriter {
             compressed_sizes.push(n);
             uncompressed_sizes.push(*uncompressed_size);
             total_length += n;
-            write_buf.extend_from_slice(compressed);
+            // `file` is already buffered. Writing each compressed column
+            // directly avoids constructing and copying one row-group-sized
+            // concatenation buffer.
+            self.file.write_all(compressed)?;
         }
-        self.file.write_all(&write_buf)?;
 
         let value_sets = if build_value_sets {
             compute_value_sets_from_bulk_columns(columns, row_count)?
@@ -186,7 +236,7 @@ impl ActiveSegmentWriter {
         let compression_level = bulk_compression_level();
         let num_cols = buffered.num_columns();
 
-        let rows_to_flush = SQL_INSERT_ROW_GROUP_TARGET_ROWS.min(total_buffered);
+        let rows_to_flush = self.row_group_target_rows.min(total_buffered);
 
         let compressed_columns: Vec<(Vec<u8>, u64)> = (0..num_cols)
             .into_par_iter()
@@ -207,16 +257,14 @@ impl ActiveSegmentWriter {
         let mut compressed_sizes = Vec::with_capacity(num_cols);
         let mut uncompressed_sizes = Vec::with_capacity(num_cols);
         let mut total_length = 0u64;
-        let mut write_buf = Vec::new();
         for (compressed, uncompressed_size) in &compressed_columns {
             let n = compressed.len() as u64;
             column_compressed_sizes.push(n);
             compressed_sizes.push(n);
             uncompressed_sizes.push(*uncompressed_size);
             total_length += n;
-            write_buf.extend_from_slice(compressed);
+            self.file.write_all(compressed)?;
         }
-        self.file.write_all(&write_buf)?;
         self.row_groups.push(RowGroupMeta {
             offset,
             length: total_length,
@@ -323,6 +371,7 @@ impl ActiveSegmentWriter {
         self.flush_buffer(invalidate_reader)?;
         self.flush_meta(invalidate_reader)?;
         self.finalize()?;
+        remove_sidecar_meta(&self.path)?;
         invalidate_reader(&self.path);
 
         tracing::info!(
@@ -355,7 +404,7 @@ impl ActiveSegmentWriter {
         self.file.write_all(&self.data_end.to_le_bytes())?;
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
-        append_sidecar_footer(&self.path, self.data_end, &footer)?;
+        remove_sidecar_meta(&self.path)?;
 
         self.current_size = self.data_end + footer.len() as u64 + 8;
         self.sidecar_row_groups_flushed = self.row_groups.len();
@@ -441,4 +490,57 @@ fn compute_value_sets_from_batch(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod owned_append_tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::storage::segment::constants::SEGMENT_HEADER_SIZE;
+    use crate::types::array::ColumnArray;
+    use crate::types::batch::ColumnDef;
+    use crate::types::scalar::ScalarValue;
+
+    #[test]
+    fn first_owned_batch_keeps_variable_buffer_allocation() {
+        let schema = Schema::new(vec![ColumnDef::new("value", DataType::VarChar)]);
+        let mut batch = RecordBatch::with_capacity(schema.clone(), 4);
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("owned-buffer".repeat(64))))
+            .unwrap();
+        let source_ptr = match batch.column(0).unwrap() {
+            ColumnArray::VarChar { data, .. } => data.values().as_ptr(),
+            _ => unreachable!(),
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("owned.dat");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ActiveSegmentWriter {
+            file: std::io::BufWriter::new(file),
+            path,
+            schema,
+            row_groups: Vec::new(),
+            current_size: SEGMENT_HEADER_SIZE as u64,
+            total_rows: 0,
+            delete_bitmap: Vec::new(),
+            deleted_row_count: 0,
+            buffered_batch: None,
+            buffered_rows: 0,
+            dirty_meta: false,
+            data_end: SEGMENT_HEADER_SIZE as u64,
+            sidecar_row_groups_flushed: 0,
+            last_write_at: Instant::now(),
+            row_group_target_rows: 1024,
+        };
+
+        writer.append_batch_owned(batch, &|_| {}).unwrap();
+        let buffered_ptr = match writer.buffered_batch.as_ref().unwrap().column(0).unwrap() {
+            ColumnArray::VarChar { data, .. } => data.values().as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(buffered_ptr, source_ptr, "owned append must not clone data");
+    }
 }

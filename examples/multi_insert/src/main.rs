@@ -8,9 +8,9 @@ use taibai::net::client::{BulkImportConfig, Client};
 use tick::{append_insert_prefix, append_tick_csv_values, TICK_CREATE_TABLE_SQL};
 
 const TICK_TABLE: &str = "stock_tick_multi";
-const DEFAULT_BATCH_SIZE: usize = 5000;
+const DEFAULT_BATCH_SIZE: usize = 10_000;
 const PIPELINE_DEPTH: usize = 8;
-const DEFAULT_CLIENTS: usize = 4;
+const DEFAULT_CLIENTS: usize = 16;
 
 macro_rules! log_msg {
     ($($arg:tt)*) => {
@@ -51,12 +51,12 @@ fn print_usage() {
         DEFAULT_CLIENTS
     );
     eprintln!("  --bulk            Use START/STOP BULK IMPORT mode");
-    eprintln!("  --no-bulk         Use ordinary INSERT visibility/durability path (default)");
+    eprintln!("  --no-bulk         Use ordinary per-batch INSERT durability path (default)");
     eprintln!();
     eprintln!(
         "This tool tests regular SQL INSERT performance (INSERT ... VALUES (...), (...), ...)."
     );
-    eprintln!("Use --bulk to enable bulk import mode for better performance.");
+    eprintln!("The default benchmarks ordinary per-batch durability.");
     eprintln!("For bulk binary import, use batch_import instead.");
 }
 

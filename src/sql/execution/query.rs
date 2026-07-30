@@ -7,8 +7,10 @@ use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
+use super::operators::profile::{QueryProfile, ScanProfileSeed};
 use super::physical::{
-    build_physical_pipeline, can_use_physical_pipeline, drain_pipeline, PhysicalContext,
+    build_physical_pipeline, build_profiled_materialized_pipeline, can_use_physical_pipeline,
+    drain_pipeline, PhysicalContext,
 };
 use crate::sql::parser::ast::{Expr, FromClause, ObjectName, SelectItem, Statement, TableRef};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
@@ -26,7 +28,7 @@ pub fn exec_select_with_txn(
     stmt: &Statement,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, None, None, reader_txn_id)
+    exec_select_inner(engine, db, stmt, None, None, reader_txn_id, None)
 }
 
 #[allow(dead_code)]
@@ -46,16 +48,44 @@ pub fn exec_select_with_plan_and_txn(
     cached_plan: LogicalPlan,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, None, Some(cached_plan), reader_txn_id)
+    exec_select_inner(
+        engine,
+        db,
+        stmt,
+        None,
+        Some(cached_plan),
+        reader_txn_id,
+        None,
+    )
 }
 
+#[allow(dead_code)]
 pub fn exec_select_with_stats(
     engine: &Engine,
     db: &str,
     stmt: &Statement,
     stats: &mut HashMap<String, ScanStats>,
 ) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, Some(stats), None, 0)
+    exec_select_inner(engine, db, stmt, Some(stats), None, 0, None)
+}
+
+pub(crate) fn exec_select_with_profile(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    stats: &mut HashMap<String, ScanStats>,
+    prepared_plan: LogicalPlan,
+    profile: &QueryProfile,
+) -> Result<ExecResult> {
+    exec_select_inner(
+        engine,
+        db,
+        stmt,
+        Some(stats),
+        Some(prepared_plan),
+        0,
+        Some(profile),
+    )
 }
 
 fn exec_select_inner(
@@ -65,6 +95,7 @@ fn exec_select_inner(
     stats: Option<&mut HashMap<String, ScanStats>>,
     cached_plan: Option<LogicalPlan>,
     reader_txn_id: u64,
+    profile: Option<&QueryProfile>,
 ) -> Result<ExecResult> {
     let from = match stmt {
         Statement::Select { from, .. } => from,
@@ -85,6 +116,7 @@ fn exec_select_inner(
             stats,
             cached_plan,
             reader_txn_id,
+            profile,
         ),
     }
 }
@@ -131,6 +163,7 @@ fn exec_table_select(
     stats: Option<&mut HashMap<String, ScanStats>>,
     cached_plan: Option<LogicalPlan>,
     reader_txn_id: u64,
+    profile: Option<&QueryProfile>,
 ) -> Result<ExecResult> {
     let resolved_stmt;
     let (stmt, from_clause) = if cached_plan.is_none() {
@@ -235,6 +268,7 @@ fn exec_table_select(
         simple_metadata_aggregates,
         stats,
         reader_txn_id,
+        profile,
     )
 }
 
@@ -250,9 +284,11 @@ fn exec_table_select_materialized(
     simple_metadata_aggregates: Option<Vec<crate::sql::planner::AggregateExpr>>,
     mut stats: Option<&mut HashMap<String, ScanStats>>,
     reader_txn_id: u64,
+    profile: Option<&QueryProfile>,
 ) -> Result<ExecResult> {
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
+    let mut scan_seeds: HashMap<String, ScanProfileSeed> = HashMap::new();
 
     for table_ref in table_refs {
         let table_name = &table_ref.key;
@@ -263,7 +299,7 @@ fn exec_table_select_materialized(
         spec.table_name = table_ref.table.clone();
         spec.reader_txn_id = reader_txn_id;
 
-        if is_count_star {
+        if is_count_star && profile.is_none() {
             spec.is_count_star = true;
         }
         if simple_metadata_aggregates.is_some() {
@@ -275,7 +311,15 @@ fn exec_table_select_materialized(
             executor = executor.with_stats(s);
         }
 
+        let scan_start = std::time::Instant::now();
         let batches = executor.execute()?;
+        scan_seeds.insert(
+            table_name.clone(),
+            ScanProfileSeed {
+                elapsed: scan_start.elapsed(),
+                peak_memory_bytes: batches.iter().map(RecordBatch::estimated_size_bytes).sum(),
+            },
+        );
         fully_applied_scan_filters.insert(
             table_name.clone(),
             spec.has_predicates() && spec.remaining_predicate.is_none(),
@@ -309,7 +353,8 @@ fn exec_table_select_materialized(
         table_batches.insert(table_name.clone(), batches);
     }
 
-    let plan = if table_names.len() == 1
+    let plan = if profile.is_none()
+        && table_names.len() == 1
         && fully_applied_scan_filters
             .get(&table_names[0])
             .copied()
@@ -320,10 +365,25 @@ fn exec_table_select_materialized(
         plan
     };
 
-    let plan =
-        try_skip_sort_for_cluster_key(plan, &table_batches, &table_cluster_keys, &table_schemas);
+    let plan = if profile.is_some() {
+        plan
+    } else {
+        try_skip_sort_for_cluster_key(plan, &table_batches, &table_cluster_keys, &table_schemas)
+    };
 
-    let mut pipeline = super::operators::build_pipeline(plan, &table_batches)?;
+    let mut pipeline = if let Some(profile) = profile {
+        let mut physical_ctx =
+            PhysicalContext::new(engine, table_refs, &table_schemas, &table_metas, false);
+        build_profiled_materialized_pipeline(
+            plan,
+            &mut physical_ctx,
+            &table_batches,
+            &scan_seeds,
+            profile,
+        )?
+    } else {
+        super::operators::build_pipeline(plan, &table_batches)?
+    };
     tracing::debug!("query: materialized pipeline built, starting next_batch loop");
     let mut result_batches = Vec::new();
     let mut result_schema = None;
@@ -644,7 +704,9 @@ fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) ->
 /// Pull the aggregate expressions out of the plan root (must be an
 /// `Aggregate` with no GROUP BY). Returns None on any shape mismatch so the
 /// caller falls back to the normal path.
-fn extract_simple_metadata_aggregates(plan: &LogicalPlan) -> Option<Vec<crate::sql::planner::AggregateExpr>> {
+fn extract_simple_metadata_aggregates(
+    plan: &LogicalPlan,
+) -> Option<Vec<crate::sql::planner::AggregateExpr>> {
     match plan {
         LogicalPlan::Aggregate(agg) if agg.group_by.is_empty() && !agg.distinct => {
             // Restrict to COUNT/MIN/MAX to match detect_simple_metadata_aggregate.

@@ -45,35 +45,15 @@ if ((Resolve-Path $sourceExe).Path -ne (Resolve-Path $targetExe -ErrorAction Sil
     Copy-Item $sourceExe $targetExe -Force
 }
 
-$config = @"
-server:
-  host: ""0.0.0.0""
-  port: $Port
-  max_message_size: 67108864
-storage:
-  data_dir: ""$($DataDir.Replace('\', '/'))""
-  default_database: ""main""
-  flush_threshold_rows: 65536
-  min_segment_seal_size_mb: 500
-buffer:
-  batch_size: 4096
-compression:
-  enabled: true
-tls:
-  enabled: false
-  cert_path: """"
-  key_path: """"
-auto_compact:
-  enabled: true
-  check_interval_secs: 60
-  idle_threshold_secs: 30
-  min_segments: 4
-  min_deleted_rows: 100000
-  max_tables_per_run: 1
-log:
-  level: ""info""
-  file: ""$((Join-Path $logDir "taibai.log").Replace('\', '/'))""
-"@
+$configTemplate = Join-Path $SourceDir "conf\example.yaml"
+if (-not (Test-Path $configTemplate)) {
+    throw "Configuration template not found: $configTemplate"
+}
+
+$config = Get-Content -Path $configTemplate -Raw
+$config = $config -replace '(?m)^  port:.*$', "  port: $Port"
+$config = $config -replace '(?m)^  data_dir:.*$', "  data_dir: `"$($DataDir.Replace('\', '/'))`""
+$config = $config -replace '(?m)^(  level:.*)$', "`$1`r`n  file: `"$((Join-Path $logDir 'taibai.log').Replace('\', '/'))`""
 Set-Content -Path $configPath -Value $config -Encoding UTF8
 
 & $targetExe --install-service --service-name $ServiceName --service-display-name $DisplayName --config $configPath

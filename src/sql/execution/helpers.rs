@@ -705,25 +705,13 @@ pub fn sort_batch_by_key(
         return Ok(batch.clone());
     }
 
-    let mut rows_with_keys: Vec<(Vec<ScalarValue>, usize)> = Vec::with_capacity(num_rows);
-    for row_idx in 0..num_rows {
-        let key_values: Vec<ScalarValue> = inserter
-            .key_indices
-            .iter()
-            .map(|&col_idx| {
-                batch
-                    .scalar(row_idx, col_idx)
-                    .unwrap_or(ScalarValue::null_for_type(
-                        batch.schema.columns[col_idx].data_type,
-                    ))
-            })
-            .collect();
-        rows_with_keys.push((key_values, row_idx));
-    }
-
-    rows_with_keys.sort_by(|a, b| {
-        for (ki, _) in inserter.key_indices.iter().enumerate() {
-            let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(&a.0[ki], &b.0[ki]);
+    // Sort lightweight row indices against the typed column buffers. The old
+    // implementation materialized every key as ScalarValue and then rebuilt
+    // all cells one by one, which dominated multi-value INSERT workloads.
+    let mut rows = (0..num_rows as u32).collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        for (ki, &col_idx) in inserter.key_indices.iter().enumerate() {
+            let cmp = batch.columns[col_idx].compare_at(*left as usize, *right as usize);
             let cmp = if inserter.desc.get(ki).copied().unwrap_or(false) {
                 cmp.reverse()
             } else {
@@ -736,19 +724,12 @@ pub fn sort_batch_by_key(
         std::cmp::Ordering::Equal
     });
 
-    let mut sorted_batch = RecordBatch::new(batch.schema.clone());
-    for (_, orig_row_idx) in rows_with_keys {
-        for col_idx in 0..batch.num_columns() {
-            let val = batch
-                .scalar(orig_row_idx, col_idx)
-                .unwrap_or(ScalarValue::null_for_type(
-                    batch.schema.columns[col_idx].data_type,
-                ));
-            sorted_batch.column_mut(col_idx).unwrap().push(&val)?;
-        }
-    }
-
-    Ok(sorted_batch)
+    let columns = batch
+        .columns
+        .iter()
+        .map(|column| column.take(&rows))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
 pub fn apply_row_group_predicate(

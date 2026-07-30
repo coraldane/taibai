@@ -216,10 +216,7 @@ fn large_input_does_not_oom() {
     // passing (rather than aborting) inside the test process is the signal.
     let (_temp_dir, engine, mut session) = create_engine();
     engine
-        .execute(
-            &mut session,
-            "CREATE TABLE big (id INT, grp INT, val INT)",
-        )
+        .execute(&mut session, "CREATE TABLE big (id INT, grp INT, val INT)")
         .expect("create big");
 
     // Insert 50k rows in chunks. Each insert is a separate batch so the engine
@@ -272,7 +269,9 @@ fn _link_first_scalar_helper() {
         .execute(&mut session, "INSERT INTO t VALUES (42)")
         .expect("insert");
     let v = first_scalar(
-        engine.execute(&mut session, "SELECT MIN(a) FROM t").expect("min"),
+        engine
+            .execute(&mut session, "SELECT MIN(a) FROM t")
+            .expect("min"),
         0,
         0,
     );

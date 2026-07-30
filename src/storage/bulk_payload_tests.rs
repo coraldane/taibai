@@ -27,6 +27,57 @@ fn rejects_trailing_bytes() {
     assert!(parse_direct_bulk_payload(&payload).is_err());
 }
 
+#[test]
+fn parses_canonical_null_bitmap() {
+    let mut payload = Vec::new();
+    write_header(&mut payload, "test_table", 3, 1);
+    write_column_header(&mut payload, "value", DataType::Int32, 0, 0, 3, 8);
+    payload.extend_from_slice(&10i32.to_le_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.extend_from_slice(&30i32.to_le_bytes());
+    payload.extend_from_slice(&2u64.to_le_bytes());
+
+    let req = parse_direct_bulk_payload(&payload).unwrap();
+
+    assert!(!req.columns[0].is_null(0));
+    assert!(req.columns[0].is_null(1));
+    assert!(!req.columns[0].is_null(2));
+}
+
+#[test]
+fn rejects_truncated_null_bitmap() {
+    let mut payload = Vec::new();
+    write_header(&mut payload, "test_table", 3, 1);
+    write_column_header(&mut payload, "value", DataType::Int32, 0, 0, 3, 1);
+    payload.extend_from_slice(&10i32.to_le_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.extend_from_slice(&30i32.to_le_bytes());
+    payload.push(2);
+
+    let err = match parse_direct_bulk_payload(&payload) {
+        Ok(_) => panic!("expected truncated null bitmap to fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("null bitmap size mismatch"));
+}
+
+#[test]
+fn rejects_null_bitmap_bits_beyond_row_count() {
+    let mut payload = Vec::new();
+    write_header(&mut payload, "test_table", 3, 1);
+    write_column_header(&mut payload, "value", DataType::Int32, 0, 0, 3, 8);
+    payload.extend_from_slice(&10i32.to_le_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.extend_from_slice(&30i32.to_le_bytes());
+    payload.extend_from_slice(&(1u64 << 3).to_le_bytes());
+
+    let err = match parse_direct_bulk_payload(&payload) {
+        Ok(_) => panic!("expected out-of-range null bit to fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("bits set beyond"));
+}
+
 fn write_header(buf: &mut Vec<u8>, table: &str, rows: u32, cols: u32) {
     buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
     buf.extend_from_slice(table.as_bytes());

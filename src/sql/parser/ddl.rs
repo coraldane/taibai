@@ -812,13 +812,17 @@ impl Parser {
                 }
             } else if self.peek() == &Token::Set {
                 self.advance();
-                if is_ttl_token(self.peek()) {
+                if self.peek() == &Token::Hot {
+                    AlterOperation::SetHot {
+                        hot: self.parse_hot_def()?,
+                    }
+                } else if is_ttl_token(self.peek()) {
                     AlterOperation::SetTtl {
                         ttl: self.parse_ttl_def()?,
                     }
                 } else {
                     return Err(TaibaiError::Sql(
-                        "expected TTL after SET in ALTER TABLE".into(),
+                        "expected HOT or TTL after SET in ALTER TABLE".into(),
                     ));
                 }
             } else if self.peek() == &Token::Truncate {

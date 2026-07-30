@@ -46,6 +46,7 @@ pub enum AlterOperation {
     RenameTable { new_name: String },
     DropPartition { partition_key: String },
     TruncatePartition { partition_key: String },
+    SetHot { hot: HotDef },
     SetTtl { ttl: TtlDef },
     DropTtl,
 }
@@ -225,6 +226,7 @@ pub enum Statement {
         table: Option<ObjectName>,
     },
     ShowStats,
+    ShowPerformanceBaselines,
     ShowEngines,
     ShowProcesslist {
         full: bool,
@@ -244,8 +246,12 @@ pub enum Statement {
         table: ObjectName,
         partition: Option<String>,
     },
+    AnalyzeTable {
+        table: ObjectName,
+    },
     PauseFlush,
     ResumeFlush,
+    ResetPerformanceBaselines,
 }
 
 #[derive(Debug, Clone, PartialEq)]

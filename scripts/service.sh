@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PREFIX="/usr/local/taibai"
 BIN_DIR="$PREFIX/bin"
 CONF_DIR="$PREFIX/conf"
-LOG_DIR="$PREFIX/log"
+LOG_DIR="$PREFIX/logs"
 RUN_DIR="$PREFIX/run"
 
 DEV_BIN="$PROJECT_ROOT/target/release/taibai"

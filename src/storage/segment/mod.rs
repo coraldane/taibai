@@ -22,6 +22,11 @@ pub struct RowGroupMeta {
     pub value_sets: Vec<Option<Vec<crate::types::scalar::ScalarValue>>>,
 }
 
+/// In segment v1 each physical row-group entry is also the independently
+/// compressed page boundary. Exposing the alias makes the page-level contract
+/// explicit while keeping old footer files readable.
+pub type PageMeta = RowGroupMeta;
+
 #[allow(unused_imports)]
 pub use constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 pub use reader::SegmentReader;

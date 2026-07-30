@@ -87,10 +87,30 @@ impl Engine {
         super::ddl::recover_table_data_tombstones(data_dir, &catalogs)?;
         super::ddl::recover_rename_tombstones(data_dir, &catalogs)?;
 
+        let row_group_target_rows = segment_config.row_group_target_rows.max(1) as u64;
         let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
-        let batch_writer = BatchWriter::new(BatchWriterConfig::default(), Arc::clone(&segment_mgr));
+        let batch_writer = BatchWriter::new(
+            BatchWriterConfig {
+                // A partial row group remains a durable memtable tail. Once a
+                // full row group has accumulated it can be flushed without
+                // manufacturing a tiny row group from scattered INSERTs.
+                max_rows_per_memtable: row_group_target_rows,
+                low_rate_max_rows: auto_compact_config
+                    .low_rate_max_rows
+                    .max(row_group_target_rows.saturating_sub(1)),
+                low_rate_max_age_secs: auto_compact_config.low_rate_max_age.as_secs(),
+                // Acknowledged INSERTs are already recoverable from durable
+                // tails. Use the configured memory budget for asynchronous
+                // checkpoint pressure instead of a fixed 512 MiB estimate.
+                max_total_memory: hot_store_memory_limit_bytes,
+                ..BatchWriterConfig::default()
+            },
+            Arc::clone(&segment_mgr),
+        );
+        let recovered_tail_tables =
+            recover_durable_memtable_tails(data_dir, &catalogs, &batch_writer)?;
 
         let auth_manager = Arc::new(AuthManager::new(data_dir)?);
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
@@ -116,8 +136,10 @@ impl Engine {
                 hot_store_memory_limit_bytes,
             ),
         );
+        let performance_baselines =
+            Arc::new(crate::common::performance_baseline::PerformanceBaselineStore::load(data_dir));
         let catalogs = Arc::new(RwLock::new(catalogs));
-        start_delete_bitmap_cleanup_thread(
+        start_auto_compaction_thread(
             Arc::clone(&segment_mgr),
             data_dir.to_path_buf(),
             Arc::clone(&catalogs),
@@ -134,13 +156,18 @@ impl Engine {
             segment_mgr,
             batch_writer,
             bulk_mode_sessions: AtomicUsize::new(0),
+            bulk_dirty_tables: Mutex::new(HashSet::new()),
             in_flight_operations: AtomicUsize::new(0),
             auth_manager,
             auto_increment_mgr,
             index_manager,
             hot_store_mgr,
+            performance_baselines,
         };
         engine.warmup_hot_stores();
+        for (db, table) in recovered_tail_tables {
+            engine.hot_store_mgr.invalidate(&db, &table);
+        }
         Ok(engine)
     }
 
@@ -217,6 +244,64 @@ impl Engine {
             }
             _ => self.execute_stmt(session, &stmt),
         }
+    }
+
+    /// Execute a batch of parameter sets for a prepared INSERT as one logical
+    /// multi-row INSERT.  The wire protocol sends all parameter sets together;
+    /// keeping them together here is important because constraint validation,
+    /// partition routing, durable-tail commits, and catalog accounting are all
+    /// batch-oriented below the SQL layer.
+    pub fn execute_prepared_insert_batch(
+        &self,
+        session: &mut Session,
+        prepared: &crate::sql::execution::prepared::PreparedStatement,
+        batch: &[Vec<crate::types::scalar::ScalarValue>],
+    ) -> Result<ExecResult> {
+        let _op_guard = self.begin_operation();
+        if batch.is_empty() {
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
+
+        let (table, columns) = match &prepared.stmt {
+            Statement::Insert { table, columns, .. } => (table.clone(), columns.clone()),
+            _ => {
+                return Err(TaibaiError::Sql(
+                    "prepared batch fast path only supports INSERT".into(),
+                ))
+            }
+        };
+
+        let mut values = Vec::with_capacity(batch.len());
+        for (row_idx, params) in batch.iter().enumerate() {
+            if params.len() != prepared.param_count {
+                return Err(TaibaiError::Sql(format!(
+                    "row {} parameter count mismatch: expected {}, got {}",
+                    row_idx,
+                    prepared.param_count,
+                    params.len()
+                )));
+            }
+            let mut bound = prepared.stmt.clone();
+            crate::sql::execution::prepared::bind_params(&mut bound, params).map_err(|error| {
+                TaibaiError::Sql(format!("row {} parameter bind failed: {}", row_idx, error))
+            })?;
+            let Statement::Insert {
+                values: bound_values,
+                ..
+            } = bound
+            else {
+                unreachable!("prepared statement kind was checked above")
+            };
+            values.extend(bound_values);
+        }
+
+        let stmt = Statement::Insert {
+            table,
+            columns,
+            values,
+        };
+        self.ensure_permissions(session, &stmt)?;
+        self.execute_stmt(session, &stmt)
     }
 
     fn gather_table_schemas(
@@ -445,6 +530,7 @@ impl Engine {
                     &table.name,
                     assignments,
                     where_clause,
+                    session.active_txn_id(),
                 );
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
@@ -553,8 +639,14 @@ impl Engine {
                 })
             }
             Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),
+            Statement::ShowPerformanceBaselines => {
+                super::performance::exec_show_performance_baselines(self, &session.database)
+            }
             Statement::ShowEngines => super::ddl::exec_show_engines(self),
             Statement::ShowProcesslist { full } => super::ddl::exec_show_processlist(self, *full),
+            Statement::ResetPerformanceBaselines => {
+                super::performance::exec_reset_performance_baselines(self, &session.database)
+            }
             Statement::AlterUser { name, operations } => {
                 super::ddl::exec_alter_user(self, name, operations)
             }
@@ -588,6 +680,11 @@ impl Engine {
                 table.effective_database(&session.database),
                 &table.name,
                 partition.as_deref(),
+            ),
+            Statement::AnalyzeTable { table } => super::ddl::exec_analyze_table(
+                self,
+                table.effective_database(&session.database),
+                &table.name,
             ),
             Statement::PauseFlush => {
                 self.segment_mgr().pause_flush();
@@ -740,7 +837,7 @@ impl Engine {
                     )
                 }
             }
-            Statement::ShowStats => {
+            Statement::ShowStats | Statement::ShowPerformanceBaselines => {
                 self.require_database_permission(session, PermissionType::Select, &session.database)
             }
             Statement::FlushTable { table } => {
@@ -760,6 +857,7 @@ impl Engine {
                 }
             }
             Statement::OptimizeTable { table, .. }
+            | Statement::AnalyzeTable { table }
             | Statement::RebuildUniqueIndex { table, .. } => self.require_table_permission(
                 session,
                 PermissionType::Alter,
@@ -785,7 +883,8 @@ impl Engine {
             | Statement::ShowGrants { .. }
             | Statement::ShowProcesslist { .. }
             | Statement::PauseFlush
-            | Statement::ResumeFlush => self.require_global_admin(session),
+            | Statement::ResumeFlush
+            | Statement::ResetPerformanceBaselines => self.require_global_admin(session),
         }
     }
 
