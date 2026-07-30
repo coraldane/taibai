@@ -723,8 +723,7 @@ impl Handler {
         };
 
         let param_count = stmt.param_count;
-        let mut total_rows_affected = 0u64;
-        let mut had_writes = false;
+        let mut parameter_batch = Vec::with_capacity(batch_size);
 
         for row_idx in 0..batch_size {
             let mut params: Vec<ScalarValue> = Vec::with_capacity(param_count);
@@ -770,33 +769,59 @@ impl Handler {
                 offset += consumed;
             }
 
-            stmt.params = params;
-
-            let result = self.engine.execute_prepared(session, &mut stmt);
-            match result {
-                Ok(ExecResult::Ok { rows_affected }) => {
-                    total_rows_affected += rows_affected;
-                    if rows_affected > 0 {
-                        had_writes = true;
-                    }
-                }
-                Ok(ExecResult::Query { .. }) => {
-                    session.prepared_statements.insert(stmt);
-                    return Ok(vec![build_error(
-                        "batch execute returned query result, expected Ok",
-                    )]);
-                }
-                Err(e) => {
-                    session.prepared_statements.insert(stmt);
-                    return Ok(vec![build_error(&format!(
-                        "row {} execute error: {}",
-                        row_idx, e
-                    ))]);
-                }
-            }
+            parameter_batch.push(params);
         }
 
-        if had_writes {
+        let result = if matches!(stmt.stmt, Statement::Insert { .. }) {
+            self.engine
+                .execute_prepared_insert_batch(session, &stmt, &parameter_batch)
+        } else {
+            let mut total_rows_affected = 0u64;
+            let mut error = None;
+            for (row_idx, params) in parameter_batch.into_iter().enumerate() {
+                stmt.params = params;
+                match self.engine.execute_prepared(session, &mut stmt) {
+                    Ok(ExecResult::Ok { rows_affected }) => {
+                        total_rows_affected += rows_affected;
+                    }
+                    Ok(ExecResult::Query { .. }) => {
+                        error = Some(TaibaiError::Sql(
+                            "batch execute returned query result, expected Ok".into(),
+                        ));
+                        break;
+                    }
+                    Err(err) => {
+                        error = Some(TaibaiError::Sql(format!(
+                            "row {} execute error: {}",
+                            row_idx, err
+                        )));
+                        break;
+                    }
+                }
+            }
+            match error {
+                Some(error) => Err(error),
+                None => Ok(ExecResult::Ok {
+                    rows_affected: total_rows_affected,
+                }),
+            }
+        };
+
+        let total_rows_affected = match result {
+            Ok(ExecResult::Ok { rows_affected }) => rows_affected,
+            Ok(ExecResult::Query { .. }) => {
+                session.prepared_statements.insert(stmt);
+                return Ok(vec![build_error(
+                    "batch execute returned query result, expected Ok",
+                )]);
+            }
+            Err(error) => {
+                session.prepared_statements.insert(stmt);
+                return Ok(vec![build_error(&error.to_string())]);
+            }
+        };
+
+        if total_rows_affected > 0 {
             session.had_writes = true;
             session.mark_txn_write();
         }

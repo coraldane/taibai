@@ -102,6 +102,22 @@ pub fn exec_create_table(
     let table_dir = engine.data_dir().join(db).join(name);
     std::fs::create_dir_all(&table_dir)?;
 
+    // A UNIQUE KEY declared with CREATE TABLE starts from an empty, valid
+    // snapshot.  Without this file, INSERT validation falls back to scanning
+    // every segment and resident memtable and later appends cannot bootstrap
+    // the index because they do not contain the pre-existing row locations.
+    if let Some(meta) = catalog.get_table(name) {
+        for index in &meta.unique_indexes {
+            engine.index_manager().persist_unique_index_entries(
+                db,
+                name,
+                &index.name,
+                &index.columns,
+                Vec::new(),
+            )?;
+        }
+    }
+
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
 

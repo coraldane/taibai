@@ -103,6 +103,11 @@ fn ok_rows(resp: &[Message]) -> u64 {
     u64::from_le_bytes(resp[0].payload[..8].try_into().unwrap())
 }
 
+fn append_int64_param(payload: &mut Vec<u8>, value: i64) {
+    payload.push(DataType::Int64 as u8);
+    payload.extend_from_slice(&value.to_le_bytes());
+}
+
 #[test]
 fn bulk_import_mode_is_reference_counted_across_connections() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -390,6 +395,117 @@ fn test_prepare_execute_with_params() {
         .handle_message(Message::new(MSG_TYPE_CLOSE_STMT, close_payload))
         .unwrap();
     assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
+}
+
+#[test]
+fn prepared_insert_batch_writes_all_rows_as_one_batch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+
+    let mut sql_payload = Vec::new();
+    write_len_prefixed_string(&mut sql_payload, "main");
+    write_len_prefixed_string(
+        &mut sql_payload,
+        "CREATE TABLE batch_insert (id INT64, value INT64, UNIQUE KEY uk_id (id))",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+        .unwrap();
+
+    let index_path = dir
+        .path()
+        .join("main")
+        .join("batch_insert")
+        .join("indexes")
+        .join("unique")
+        .join("uk_id.keys.tbi");
+    assert!(index_path.is_file());
+
+    let mut prep_payload = Vec::new();
+    write_len_prefixed_string(&mut prep_payload, "INSERT INTO batch_insert VALUES (?, ?)");
+    let prepared = handler
+        .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+        .unwrap();
+    let stmt_id = u32::from_le_bytes(prepared[0].payload[..4].try_into().unwrap());
+
+    let mut batch_payload = Vec::new();
+    batch_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    const ROWS: u32 = 5_000;
+    batch_payload.extend_from_slice(&ROWS.to_le_bytes());
+    for id in 1..=i64::from(ROWS) {
+        append_int64_param(&mut batch_payload, id);
+        append_int64_param(&mut batch_payload, id * 10);
+    }
+    let response = handler
+        .handle_message(Message::new(
+            MSG_TYPE_BATCH_EXECUTE,
+            Bytes::from(batch_payload),
+        ))
+        .unwrap();
+    assert_eq!(ok_rows(&response), u64::from(ROWS));
+
+    let catalogs = engine.catalogs().read().unwrap();
+    assert_eq!(
+        catalogs
+            .get("main")
+            .unwrap()
+            .get_table("batch_insert")
+            .unwrap()
+            .row_count,
+        i64::from(ROWS)
+    );
+}
+
+#[test]
+fn prepared_insert_batch_rejects_duplicates_before_writing_any_row() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+
+    let mut sql_payload = Vec::new();
+    write_len_prefixed_string(&mut sql_payload, "main");
+    write_len_prefixed_string(
+        &mut sql_payload,
+        "CREATE TABLE batch_duplicate (id INT64, UNIQUE KEY uk_id (id))",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+        .unwrap();
+
+    let mut prep_payload = Vec::new();
+    write_len_prefixed_string(&mut prep_payload, "INSERT INTO batch_duplicate VALUES (?)");
+    let prepared = handler
+        .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+        .unwrap();
+    let stmt_id = u32::from_le_bytes(prepared[0].payload[..4].try_into().unwrap());
+
+    let mut batch_payload = Vec::new();
+    batch_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    batch_payload.extend_from_slice(&2u32.to_le_bytes());
+    append_int64_param(&mut batch_payload, 7);
+    append_int64_param(&mut batch_payload, 7);
+    let response = handler
+        .handle_message(Message::new(
+            MSG_TYPE_BATCH_EXECUTE,
+            Bytes::from(batch_payload),
+        ))
+        .unwrap();
+    assert_eq!(response.len(), 1);
+    assert_eq!(response[0].msg_type, MSG_TYPE_ERROR);
+
+    let catalogs = engine.catalogs().read().unwrap();
+    assert_eq!(
+        catalogs
+            .get("main")
+            .unwrap()
+            .get_table("batch_duplicate")
+            .unwrap()
+            .row_count,
+        0
+    );
 }
 
 #[test]

@@ -246,6 +246,64 @@ impl Engine {
         }
     }
 
+    /// Execute a batch of parameter sets for a prepared INSERT as one logical
+    /// multi-row INSERT.  The wire protocol sends all parameter sets together;
+    /// keeping them together here is important because constraint validation,
+    /// partition routing, durable-tail commits, and catalog accounting are all
+    /// batch-oriented below the SQL layer.
+    pub fn execute_prepared_insert_batch(
+        &self,
+        session: &mut Session,
+        prepared: &crate::sql::execution::prepared::PreparedStatement,
+        batch: &[Vec<crate::types::scalar::ScalarValue>],
+    ) -> Result<ExecResult> {
+        let _op_guard = self.begin_operation();
+        if batch.is_empty() {
+            return Ok(ExecResult::Ok { rows_affected: 0 });
+        }
+
+        let (table, columns) = match &prepared.stmt {
+            Statement::Insert { table, columns, .. } => (table.clone(), columns.clone()),
+            _ => {
+                return Err(TaibaiError::Sql(
+                    "prepared batch fast path only supports INSERT".into(),
+                ))
+            }
+        };
+
+        let mut values = Vec::with_capacity(batch.len());
+        for (row_idx, params) in batch.iter().enumerate() {
+            if params.len() != prepared.param_count {
+                return Err(TaibaiError::Sql(format!(
+                    "row {} parameter count mismatch: expected {}, got {}",
+                    row_idx,
+                    prepared.param_count,
+                    params.len()
+                )));
+            }
+            let mut bound = prepared.stmt.clone();
+            crate::sql::execution::prepared::bind_params(&mut bound, params).map_err(|error| {
+                TaibaiError::Sql(format!("row {} parameter bind failed: {}", row_idx, error))
+            })?;
+            let Statement::Insert {
+                values: bound_values,
+                ..
+            } = bound
+            else {
+                unreachable!("prepared statement kind was checked above")
+            };
+            values.extend(bound_values);
+        }
+
+        let stmt = Statement::Insert {
+            table,
+            columns,
+            values,
+        };
+        self.ensure_permissions(session, &stmt)?;
+        self.execute_stmt(session, &stmt)
+    }
+
     fn gather_table_schemas(
         &self,
         db: &str,
