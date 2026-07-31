@@ -58,7 +58,7 @@ impl Engine {
                 for db_entry in dbs.flatten() {
                     if db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         let db_name = db_entry.file_name().to_string_lossy().to_string();
-                        if db_name == "meta"
+                        if db_name.starts_with('.') || db_name == "meta"
                             || db_name == "wal"
                             || db_name == ".taibai-drop-databases"
                         {

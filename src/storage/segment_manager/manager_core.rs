@@ -13,7 +13,7 @@ impl SegmentManager {
                         continue;
                     }
                     let db_name = db_entry.file_name().to_string_lossy().to_string();
-                    if db_name == "meta" || db_name == "wal" || db_name == ".taibai-drop-databases"
+                    if db_name.starts_with('.') || db_name == "meta" || db_name == "wal"
                     {
                         continue;
                     }

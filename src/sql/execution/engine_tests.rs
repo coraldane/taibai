@@ -85,6 +85,30 @@ fn first_i64(result: ExecResult, row: usize, col: usize) -> i64 {
 }
 
 #[test]
+fn internal_data_directories_are_not_registered_as_databases() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".memtable_flush_tmp").join("orphan"))?;
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    let ExecResult::Query { batches, .. } = engine.execute(&mut session, "SHOW DATABASES")? else {
+        panic!("expected query result");
+    };
+    let databases = (0..batches[0].num_rows())
+        .filter_map(|row| batches[0].scalar(row, 0).and_then(|value| value.to_text()))
+        .collect::<Vec<_>>();
+
+    assert!(databases.iter().any(|database| database == "main"));
+    assert!(!databases.iter().any(|database| database.starts_with('.')));
+    assert!(!engine
+        .catalogs()
+        .read()
+        .unwrap()
+        .contains_key(".memtable_flush_tmp"));
+    Ok(())
+}
+
+#[test]
 fn fast_insert_sql_materializes_generic_multi_values() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;
