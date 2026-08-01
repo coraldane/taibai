@@ -566,11 +566,7 @@ pub fn has_tail(table_dir: &Path, id: Uuid) -> bool {
                 let Ok(bytes) = fs::read(&generation.path) else {
                     continue;
                 };
-                let Ok(segment_name) = decode_flush_target(&bytes) else {
-                    continue;
-                };
-                let segment_path = table_dir.join(segment_name);
-                if segment_path.is_file() && SegmentReader::open(&segment_path).is_ok() {
+                if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
                     return false;
                 }
             }
@@ -579,10 +575,18 @@ pub fn has_tail(table_dir: &Path, id: Uuid) -> bool {
     false
 }
 
-/// Record the destination before a durable tail is copied into a sealed
-/// segment. Recovery can then distinguish "segment rename completed" from
-/// "flush never reached the atomic rename", avoiding duplicate rows.
-pub fn begin_flush(table_dir: &Path, id: Uuid, segment_file_name: &str) -> Result<FlushIntent> {
+/// Record the destination before a durable tail is copied into a segment.
+/// Recovery can then distinguish "rows durable in the segment" from "flush
+/// never completed", avoiding duplicate rows. `expected_rows` is the row
+/// count the segment footer must reach for the intent to be satisfied; this
+/// allows the target to be a shared active segment that also holds rows from
+/// other flushes.
+pub fn begin_flush(
+    table_dir: &Path,
+    id: Uuid,
+    segment_file_name: &str,
+    expected_rows: u64,
+) -> Result<FlushIntent> {
     if Path::new(segment_file_name)
         .file_name()
         .and_then(|name| name.to_str())
@@ -595,7 +599,10 @@ pub fn begin_flush(table_dir: &Path, id: Uuid, segment_file_name: &str) -> Resul
     let tail_dir = table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
     let marker_path = tail_dir.join(format!("{}.{}.flush", id.simple(), next_sequence()));
-    write_new_synced(&marker_path, &encode_flush_target(segment_file_name))?;
+    write_new_synced(
+        &marker_path,
+        &encode_flush_target(segment_file_name, expected_rows),
+    )?;
     Ok(FlushIntent { id, marker_path })
 }
 
@@ -646,15 +653,13 @@ pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> 
                 }
                 GenerationKind::Clear => break,
                 GenerationKind::Flush => {
-                    let segment_name = decode_flush_target(&fs::read(&generation.path)?)?;
-                    let segment_path = table_dir.join(segment_name);
-                    if segment_path.is_file() && SegmentReader::open(&segment_path).is_ok() {
+                    if flush_intent_satisfied(table_dir, &fs::read(&generation.path)?)? {
                         remove_other_generations(&tail_dir, id, &generation.path)?;
                         remove_file_if_exists(&generation.path)?;
                         break;
                     }
-                    // The atomic segment rename did not complete. Ignore this
-                    // intent and continue to the preceding durable tail.
+                    // The rows never became durable in the target segment.
+                    // Ignore this intent and continue to the preceding tail.
                     let _ = remove_file_if_exists(&generation.path);
                 }
             }
@@ -711,11 +716,12 @@ fn encode_tail_frame_payload(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-fn encode_flush_target(segment_file_name: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(12 + segment_file_name.len());
+fn encode_flush_target(segment_file_name: &str, expected_rows: u64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(20 + segment_file_name.len());
     bytes.extend_from_slice(&FLUSH_MAGIC.to_le_bytes());
     bytes.extend_from_slice(&(segment_file_name.len() as u32).to_le_bytes());
     bytes.extend_from_slice(segment_file_name.as_bytes());
+    bytes.extend_from_slice(&expected_rows.to_le_bytes());
     append_crc(bytes)
 }
 
@@ -861,7 +867,7 @@ fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
         .map_err(|_| TaibaiError::Storage("invalid durable tail partition key".into()))
 }
 
-fn decode_flush_target(bytes: &[u8]) -> Result<String> {
+fn decode_flush_target(bytes: &[u8]) -> Result<(String, Option<u64>)> {
     let body = verify_crc(bytes)?;
     if body.len() < 8 {
         return Err(TaibaiError::Storage("flush intent is truncated".into()));
@@ -870,10 +876,17 @@ fn decode_flush_target(bytes: &[u8]) -> Result<String> {
         return Err(TaibaiError::Storage("invalid flush intent magic".into()));
     }
     let name_len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
-    if 8usize.saturating_add(name_len) != body.len() {
+    let name_end = 8usize.saturating_add(name_len);
+    let expected_rows = if name_end == body.len() {
+        None
+    } else if name_end.saturating_add(8) == body.len() {
+        Some(u64::from_le_bytes(
+            body[name_end..name_end + 8].try_into().unwrap(),
+        ))
+    } else {
         return Err(TaibaiError::Storage("invalid flush intent length".into()));
-    }
-    let name = std::str::from_utf8(&body[8..])
+    };
+    let name = std::str::from_utf8(&body[8..name_end])
         .map_err(|_| TaibaiError::Storage("invalid flush intent target".into()))?
         .to_string();
     if Path::new(&name)
@@ -883,7 +896,27 @@ fn decode_flush_target(bytes: &[u8]) -> Result<String> {
     {
         return Err(TaibaiError::Storage("unsafe flush intent target".into()));
     }
-    Ok(name)
+    Ok((name, expected_rows))
+}
+
+/// A recorded flush intent proves its tail is durable once the named segment
+/// is readable and, for intents carrying a row-count watermark, holds at
+/// least that many rows. Legacy intents without a watermark keep the old
+/// existence check; their target was a standalone segment written atomically.
+fn flush_intent_satisfied(table_dir: &Path, bytes: &[u8]) -> Result<bool> {
+    let (segment_name, expected_rows) = decode_flush_target(bytes)?;
+    let segment_path = table_dir.join(segment_name);
+    if !segment_path.is_file() {
+        return Ok(false);
+    }
+    let reader = match SegmentReader::open(&segment_path) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(false),
+    };
+    Ok(match expected_rows {
+        Some(expected) => reader.row_count() >= expected,
+        None => true,
+    })
 }
 
 fn next_sequence() -> u64 {
@@ -947,11 +980,8 @@ fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
                 let Ok(bytes) = fs::read(&generation.path) else {
                     continue;
                 };
-                let Ok(segment_name) = decode_flush_target(&bytes) else {
-                    continue;
-                };
-                let segment_path = tail_dir.parent().unwrap_or(tail_dir).join(segment_name);
-                if segment_path.is_file() && SegmentReader::open(&segment_path).is_ok() {
+                let table_dir = tail_dir.parent().unwrap_or(tail_dir);
+                if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
                     return Ok(None);
                 }
             }
@@ -1135,11 +1165,11 @@ mod tests {
         let id = Uuid::new_v4();
         persist(temp.path(), id, "", &batch)?;
 
-        let incomplete = begin_flush(temp.path(), id, "seg_00001.dat")?;
+        let incomplete = begin_flush(temp.path(), id, "seg_00001.dat", 2)?;
         assert_eq!(recover(temp.path(), &schema)?.len(), 1);
         let _ = cancel_flush(incomplete);
 
-        let _completed = begin_flush(temp.path(), id, "seg_00001.dat")?;
+        let _completed = begin_flush(temp.path(), id, "seg_00001.dat", 2)?;
         let mut writer = SegmentWriter::create(
             &temp.path().join("seg_00001.dat"),
             schema.clone(),
@@ -1147,6 +1177,54 @@ mod tests {
         )?;
         writer.write_batch(&batch)?;
         writer.seal()?;
+        assert!(recover(temp.path(), &schema)?.is_empty());
+        assert!(!has_tail(temp.path(), id));
+        Ok(())
+    }
+
+    #[test]
+    fn flush_intent_watermark_requires_segment_row_count() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let batch = test_batch(&schema, &[1, 2])?;
+        let id = Uuid::new_v4();
+        persist(temp.path(), id, "", &batch)?;
+
+        let _intent = begin_flush(temp.path(), id, "seg_00001.dat", 6)?;
+        let mut writer = SegmentWriter::create(
+            &temp.path().join("seg_00001.dat"),
+            schema.clone(),
+            DEFAULT_ROW_GROUP_SIZE,
+        )?;
+        writer.write_batch(&batch)?;
+        writer.seal()?;
+
+        let recovered = recover(temp.path(), &schema)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].batch.num_rows(), 2);
+        assert!(has_tail(temp.path(), id));
+        Ok(())
+    }
+
+    #[test]
+    fn flush_intent_watermark_satisfied_by_shared_segment_growth() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let first = test_batch(&schema, &[1, 2])?;
+        let second = test_batch(&schema, &[3, 4])?;
+        let id = Uuid::new_v4();
+        persist(temp.path(), id, "", &second)?;
+
+        let _intent = begin_flush(temp.path(), id, "seg_00001.dat", 4)?;
+        let mut writer = SegmentWriter::create(
+            &temp.path().join("seg_00001.dat"),
+            schema.clone(),
+            DEFAULT_ROW_GROUP_SIZE,
+        )?;
+        writer.write_batch(&first)?;
+        writer.write_batch(&second)?;
+        writer.seal()?;
+
         assert!(recover(temp.path(), &schema)?.is_empty());
         assert!(!has_tail(temp.path(), id));
         Ok(())
