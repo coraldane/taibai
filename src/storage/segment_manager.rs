@@ -30,6 +30,7 @@ use crate::storage::segment::{
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
+pub(crate) use config::bulk_compression_level;
 pub use config::SegmentConfig;
 pub(crate) use helpers::direct_bulk_request_to_batch;
 pub use helpers::table_key;
@@ -37,8 +38,8 @@ pub use helpers::table_key;
 use active_writer::ActiveSegmentWriter;
 use cluster_meta_cache::ClusterMetaCache;
 use config::{
-    bulk_compression_level, reader_cache_capacity, FLUSH_CHECK_INTERVAL_SECS,
-    FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
+    reader_cache_capacity, FLUSH_CHECK_INTERVAL_SECS, FLUSH_IDLE_THRESHOLD_SECS,
+    SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
     discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,

@@ -147,8 +147,11 @@ impl SegmentWriter {
                 let encoded = encode_column(col, offset, to_write)?;
                 let uncompressed_len = encoded.len() as u64;
 
-                let compressed = zstd::bulk::compress(&encoded, 3)
-                    .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+                let compressed = zstd::bulk::compress(
+                    &encoded,
+                    crate::storage::segment_manager::bulk_compression_level(),
+                )
+                .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
 
                 group.uncompressed_sizes[col_idx] += uncompressed_len;
                 if group.columns[col_idx].is_empty() {
@@ -218,8 +221,11 @@ impl SegmentWriter {
 
                 let encoded = encode_column(col, row_offset, row_count)?;
                 let uncompressed_size = encoded.len() as u64;
-                let compressed = zstd::bulk::compress(&encoded, 3)
-                    .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+                let compressed = zstd::bulk::compress(
+                    &encoded,
+                    crate::storage::segment_manager::bulk_compression_level(),
+                )
+                .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
                 let value_set = metadata.value_set.map(|mut values| {
                     values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
                     values

@@ -27,7 +27,7 @@ impl Default for SegmentConfig {
     }
 }
 
-pub(super) fn bulk_compression_level() -> i32 {
+pub(crate) fn bulk_compression_level() -> i32 {
     static LEVEL: OnceLock<i32> = OnceLock::new();
     *LEVEL.get_or_init(|| {
         std::env::var("TAIBAI_BULK_ZSTD_LEVEL")

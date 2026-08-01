@@ -5,6 +5,7 @@ members = [
     "examples/multi_insert",
     "examples/prepare_test",
     "examples/hot_insert",
+    "examples/query_bench",
 ]
 
 [package]

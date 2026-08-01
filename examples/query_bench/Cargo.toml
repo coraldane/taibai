@@ -1,0 +1,12 @@
+[package]
+name = "query_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+taibai = { path = "../.." }
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "query_bench"
+path = "src/main.rs"
