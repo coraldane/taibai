@@ -24,7 +24,7 @@ pub fn exec_show_databases(engine: &Engine) -> Result<ExecResult> {
     let schema = Schema::new(vec![ColumnDef::new("database", DataType::VarChar)]);
 
     let mut batch = RecordBatch::new(schema.clone());
-    for name in catalogs.keys() {
+    for name in catalogs.keys().filter(|name| !name.starts_with('.')) {
         batch
             .column_mut(0)
             .unwrap()

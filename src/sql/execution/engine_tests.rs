@@ -85,6 +85,32 @@ fn first_i64(result: ExecResult, row: usize, col: usize) -> i64 {
 }
 
 #[test]
+fn graceful_shutdown_materializes_durable_tail_into_segment() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+        engine.execute(&mut session, "CREATE TABLE low_rate (id INT64)")?;
+        engine.execute(&mut session, "INSERT INTO low_rate VALUES (9)")?;
+        engine.flush_shutdown_buffers()?;
+    }
+
+    let table_dir = dir.path().join("main").join("low_rate");
+    assert!(!SegmentManager::discover_segments(&table_dir)?.is_empty());
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM low_rate")?,
+            0,
+            0
+        ),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn internal_data_directories_are_not_registered_as_databases() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".memtable_flush_tmp").join("orphan"))?;

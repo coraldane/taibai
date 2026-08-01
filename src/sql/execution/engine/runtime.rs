@@ -343,13 +343,11 @@ impl Engine {
         Ok(0)
     }
 
-    /// Graceful process checkpoint that preserves durable low-rate memtables.
-    /// Explicit FLUSH/CLOSE OF DAY still use `flush_all_buffers` and therefore
-    /// materialize every row when the operator asks for it.
+    /// Graceful process checkpoint that materializes every live memtable into
+    /// segments. Durable tails remain the crash-recovery source until each
+    /// segment append is committed, then are removed atomically by the writer.
     pub fn flush_shutdown_buffers(&self) -> Result<u64> {
-        if let Err(e) = self.batch_writer.flush_all_for_shutdown() {
-            tracing::warn!(error = %e, "shutdown buffer flush failed");
-        }
+        self.batch_writer.flush_all()?;
 
         self.segment_mgr.flush_all_active()?;
         {

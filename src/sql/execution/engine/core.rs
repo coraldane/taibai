@@ -43,6 +43,9 @@ impl Engine {
                             continue;
                         }
                         if let Some(db_name) = path.file_stem().and_then(|s| s.to_str()) {
+                            if db_name.starts_with('.') {
+                                continue;
+                            }
                             if let Ok(catalog) = DatabaseCatalog::load_or_create(&meta_dir, db_name)
                             {
                                 catalogs.insert(db_name.to_string(), catalog);

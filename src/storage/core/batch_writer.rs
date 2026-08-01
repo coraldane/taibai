@@ -491,22 +491,6 @@ impl BatchWriter {
         Ok(())
     }
 
-    /// Flush buffers that have no durable low-rate tail. Durable tails remain
-    /// resident-on-disk and are restored as memtables at the next startup, so
-    /// a routine service restart does not manufacture a tiny row group.
-    pub fn flush_all_for_shutdown(&self) -> Result<()> {
-        let mts = self.memtable_mgr.get_all_pending();
-        for mt in mts {
-            let table_dir = self.segment_mgr.table_dir(mt.db(), mt.table());
-            if crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()) {
-                continue;
-            }
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
-        }
-        self.memtable_mgr.remove_flushed();
-        Ok(())
-    }
-
     pub fn clear_memtables(&self, db: &str, table: &str) -> u64 {
         let table_dir = self.segment_mgr.table_dir(db, table);
         if let Err(error) = self.tail_committer.barrier(&table_dir) {

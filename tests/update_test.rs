@@ -274,15 +274,12 @@ fn updated_memtable_is_persisted_by_graceful_restart() {
         ColumnDef::new("id", DataType::Int32),
         ColumnDef::new("value", DataType::Int32),
     ]);
-    assert!(SegmentManager::discover_segments(&table_dir)
+    assert!(!SegmentManager::discover_segments(&table_dir)
         .expect("discover segments after shutdown")
         .is_empty());
-    assert_eq!(
-        durable_tail::recover(&table_dir, &schema)
-            .expect("recover shutdown tail")
-            .len(),
-        1
-    );
+    assert!(durable_tail::recover(&table_dir, &schema)
+        .expect("verify shutdown tail cleared")
+        .is_empty());
 
     let engine = Engine::new(temp_dir.path(), "main").expect("reopen engine");
     let mut session = Session::new("root".to_string(), "main".to_string());
