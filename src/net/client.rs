@@ -124,6 +124,7 @@ impl Client {
         write_len_prefixed_string(&mut payload, database);
         payload.push(1);
         payload.extend_from_slice(&timezone_offset_hours.to_le_bytes());
+        payload.push(1);
 
         self.send(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
             .await?;
@@ -170,10 +171,56 @@ impl Client {
 
         let recv_start = tokio::time::Instant::now();
         let resp = self.recv().await?;
+        let mut streamed_batches = Vec::new();
+        let mut streamed_schema = None;
+        let resp = if resp.msg_type == MSG_TYPE_RESULT_CHUNK {
+            let mut current = resp;
+            loop {
+                match current.msg_type {
+                    MSG_TYPE_RESULT_CHUNK => {
+                        let QueryResult::Rows {
+                            schema, batches, ..
+                        } = parse_binary_result(&current.payload)?
+                        else {
+                            unreachable!()
+                        };
+                        if let Some(expected) = &streamed_schema {
+                            if expected != &schema {
+                                return Err(TaibaiError::Protocol(
+                                    "query stream schema changed between chunks".into(),
+                                ));
+                            }
+                        } else {
+                            streamed_schema = Some(schema);
+                        }
+                        streamed_batches.extend(batches);
+                    }
+                    MSG_TYPE_RESULT_END | MSG_TYPE_ERROR => break current,
+                    other => {
+                        return Err(TaibaiError::Protocol(format!(
+                            "unexpected query stream response type: {other:#04X}"
+                        )))
+                    }
+                }
+                current = self.recv().await?;
+            }
+        } else {
+            resp
+        };
         let recv_elapsed = recv_start.elapsed();
 
         let decode_start = tokio::time::Instant::now();
         let mut result = match resp.msg_type {
+            MSG_TYPE_RESULT_END => {
+                let server_timings = parse_server_timing_trailer(&resp.payload, 0);
+                Ok(QueryResult::Rows {
+                    schema: streamed_schema.unwrap_or_else(Schema::empty),
+                    batches: streamed_batches,
+                    server_elapsed: server_timings.as_ref().map(|timings| timings.total),
+                    server_timings,
+                    client_timings: None,
+                })
+            }
             MSG_TYPE_OK => {
                 if resp.payload.len() < 8 {
                     return Err(TaibaiError::Protocol("OK payload too short".into()));
@@ -207,6 +254,69 @@ impl Client {
             },
         );
         Ok(result)
+    }
+
+    pub async fn query_each_batch<F>(
+        &mut self,
+        sql: &str,
+        mut on_batch: F,
+    ) -> Result<Option<ServerTimings>>
+    where
+        F: FnMut(&Schema, RecordBatch) -> Result<()>,
+    {
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, "");
+        write_len_prefixed_string(&mut payload, sql);
+        self.send(Message::new(MSG_TYPE_QUERY, Bytes::from(payload)))
+            .await?;
+
+        loop {
+            let response = self.recv().await?;
+            match response.msg_type {
+                MSG_TYPE_RESULT_CHUNK | MSG_TYPE_BINARY_QUERY_RESULT => {
+                    let QueryResult::Rows {
+                        schema, batches, ..
+                    } = parse_binary_result(&response.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    for batch in batches {
+                        on_batch(&schema, batch)?;
+                    }
+                    if response.msg_type == MSG_TYPE_BINARY_QUERY_RESULT {
+                        return Ok(None);
+                    }
+                }
+                MSG_TYPE_RESULT => {
+                    let QueryResult::Rows {
+                        schema,
+                        batches,
+                        server_timings,
+                        ..
+                    } = parse_text_result(&response.payload)?
+                    else {
+                        unreachable!()
+                    };
+                    for batch in batches {
+                        on_batch(&schema, batch)?;
+                    }
+                    return Ok(server_timings);
+                }
+                MSG_TYPE_RESULT_END => {
+                    return Ok(parse_server_timing_trailer(&response.payload, 0));
+                }
+                MSG_TYPE_ERROR => {
+                    return Err(TaibaiError::Sql(
+                        String::from_utf8_lossy(&response.payload).to_string(),
+                    ));
+                }
+                other => {
+                    return Err(TaibaiError::Protocol(format!(
+                        "unexpected streaming query response type: {other:#04X}"
+                    )));
+                }
+            }
+        }
     }
 
     pub async fn execute(&mut self, sql: &str) -> Result<u64> {

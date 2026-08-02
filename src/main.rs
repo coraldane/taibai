@@ -204,6 +204,7 @@ where
     // streaming scans) to consult.
     let _ = crate::common::config::set_query_limits(crate::common::config::QueryLimits {
         query_memory_limit_mb: config.buffer.query_memory_limit_mb,
+        max_result_message_bytes: config.server.max_message_size,
         max_aggregate_groups: config.buffer.max_aggregate_groups,
         max_parallel_row_groups: config.buffer.max_parallel_row_groups.max(1),
         parallel_scan_min_row_groups: config.buffer.parallel_scan_min_row_groups.max(1),

@@ -19,6 +19,8 @@ pub const MSG_TYPE_AUTH_FAIL: u8 = 0x0B;
 pub const MSG_TYPE_BULK_INSERT_COLUMNAR: u8 = 0x23;
 pub const MSG_TYPE_BINARY_QUERY_RESULT: u8 = 0x24;
 pub const MSG_TYPE_FLUSH: u8 = 0x25;
+pub const MSG_TYPE_RESULT_CHUNK: u8 = 0x26;
+pub const MSG_TYPE_RESULT_END: u8 = 0x27;
 
 pub const MSG_TYPE_BEGIN_TXN: u8 = 0x30;
 pub const MSG_TYPE_COMMIT_TXN: u8 = 0x31;

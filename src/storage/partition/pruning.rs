@@ -148,6 +148,13 @@ pub struct RowGroupPredicate {
     pub clauses: Vec<RangeClause>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateMatch {
+    None,
+    Partial,
+    All,
+}
+
 impl RowGroupPredicate {
     pub fn new(clauses: Vec<RangeClause>) -> Self {
         Self { clauses }
@@ -157,22 +164,61 @@ impl RowGroupPredicate {
         self.clauses.is_empty()
     }
 
-    pub fn matches_row_group(&self, zone_maps: &[ZoneMap]) -> bool {
-        for c in &self.clauses {
-            let Some(zm) = zone_maps.get(c.column_index) else {
-                continue;
+    pub fn classify_row_group(&self, zone_maps: &[ZoneMap]) -> PredicateMatch {
+        let mut result = PredicateMatch::All;
+        for clause in &self.clauses {
+            let Some(zone_map) = zone_maps.get(clause.column_index) else {
+                return PredicateMatch::Partial;
             };
-            if zm.row_count > 0 && zm.null_count == zm.row_count {
-                return false;
+            let clause_match = classify_clause(clause, zone_map);
+            if clause_match == PredicateMatch::None {
+                return PredicateMatch::None;
             }
-            if zm.min_value.is_null() || zm.max_value.is_null() {
-                continue;
-            }
-            if !clause_overlaps_range(c, &zm.min_value, &zm.max_value) {
-                return false;
+            if clause_match == PredicateMatch::Partial {
+                result = PredicateMatch::Partial;
             }
         }
-        true
+        result
+    }
+
+    pub fn matches_row_group(&self, zone_maps: &[ZoneMap]) -> bool {
+        self.classify_row_group(zone_maps) != PredicateMatch::None
+    }
+}
+
+fn classify_clause(clause: &RangeClause, zone_map: &ZoneMap) -> PredicateMatch {
+    if zone_map.row_count > 0 && zone_map.null_count == zone_map.row_count {
+        return PredicateMatch::None;
+    }
+    if zone_map.min_value.is_null() || zone_map.max_value.is_null() {
+        return PredicateMatch::Partial;
+    }
+    if !clause_overlaps_range(clause, &zone_map.min_value, &zone_map.max_value) {
+        return PredicateMatch::None;
+    }
+    if zone_map.null_count > 0 {
+        return PredicateMatch::Partial;
+    }
+
+    let min_cmp = crate::storage::index::sort_key::compare_scalars_for_sort(
+        &zone_map.min_value,
+        &clause.value,
+    );
+    let max_cmp = crate::storage::index::sort_key::compare_scalars_for_sort(
+        &zone_map.max_value,
+        &clause.value,
+    );
+    let all = match clause.op {
+        RangeOp::Eq => min_cmp.is_eq() && max_cmp.is_eq(),
+        RangeOp::Lt => max_cmp.is_lt(),
+        RangeOp::Le => !max_cmp.is_gt(),
+        RangeOp::Gt => min_cmp.is_gt(),
+        RangeOp::Ge => !min_cmp.is_lt(),
+    };
+    if all {
+        PredicateMatch::All
+    } else {
+        PredicateMatch::Partial
     }
 }
 
@@ -242,3 +288,7 @@ pub fn compute_segment_zone_maps_from_row_groups(
 
     segment_maps
 }
+
+#[cfg(test)]
+#[path = "pruning_tests.rs"]
+mod tests;

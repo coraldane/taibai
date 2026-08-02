@@ -72,6 +72,110 @@ fn test_build_error() {
 }
 
 #[test]
+fn streaming_query_stops_when_chunk_receiver_is_dropped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+    handler.session.as_mut().unwrap().streaming_results = true;
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE dropped_stream (id INT64)",
+        )
+        .unwrap();
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "INSERT INTO dropped_stream VALUES (1), (2)",
+        )
+        .unwrap();
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    drop(receiver);
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id FROM dropped_stream");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(AtomicBool::new(false)),
+            Some(sender),
+        )
+        .unwrap();
+
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_ERROR);
+    assert!(String::from_utf8_lossy(&responses[0].payload).contains("disconnected"));
+}
+
+#[test]
+fn streaming_query_emits_chunks_and_end_marker() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+    handler.session.as_mut().unwrap().binary_results = true;
+    handler.session.as_mut().unwrap().streaming_results = true;
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE stream_rows (id INT64)",
+        )
+        .unwrap();
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "INSERT INTO stream_rows VALUES (1), (2), (3)",
+        )
+        .unwrap();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let consumer = std::thread::spawn(move || {
+        let mut chunks = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            chunks.push(message);
+        }
+        chunks
+    });
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id FROM stream_rows");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(AtomicBool::new(false)),
+            Some(sender),
+        )
+        .unwrap();
+    drop(handler);
+    let chunks = consumer.join().unwrap();
+
+    assert!(!chunks.is_empty());
+    assert!(chunks
+        .iter()
+        .all(|message| message.msg_type == MSG_TYPE_RESULT_CHUNK));
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_RESULT_END);
+}
+
+#[test]
+fn query_response_size_reserves_timing_trailer() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let mut config = ServerConfig::default();
+    config.server.max_message_size = 64;
+    let handler = Handler::new(Arc::new(config), engine);
+
+    assert!(handler
+        .validate_query_response(Message::new(MSG_TYPE_RESULT, Bytes::from(vec![0; 36])))
+        .is_ok());
+    assert!(handler
+        .validate_query_response(Message::new(MSG_TYPE_RESULT, Bytes::from(vec![0; 37])))
+        .is_err());
+}
+
+#[test]
 fn test_login_dispatch() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());

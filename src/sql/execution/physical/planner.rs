@@ -62,12 +62,23 @@ pub fn drain_pipeline(
     mut pipeline: Box<dyn ExecutionOp + '_>,
 ) -> Result<(Schema, Vec<RecordBatch>)> {
     let mut result_batches = Vec::new();
+    let mut retained_bytes = 0;
+    let result_limit = crate::common::query_memory::result_memory_limit_bytes();
     let mut result_schema = None;
-    while let Some(batch) = pipeline.next_batch()? {
+    loop {
+        crate::common::query_cancel::check()?;
+        let Some(batch) = pipeline.next_batch()? else {
+            break;
+        };
         if result_schema.is_none() {
             result_schema = Some(batch.schema.clone());
         }
-        result_batches.push(batch);
+        crate::common::query_memory::push_result_batch(
+            &mut result_batches,
+            &mut retained_bytes,
+            batch,
+            result_limit,
+        )?;
     }
     Ok((result_schema.unwrap_or_else(Schema::empty), result_batches))
 }

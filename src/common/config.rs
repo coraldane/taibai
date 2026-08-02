@@ -34,12 +34,12 @@ fn default_tls_handshake_timeout_secs() -> u64 {
 /// the [`QueryLimits::default`] values apply.
 #[derive(Debug, Clone, Copy)]
 pub struct QueryLimits {
-    /// Soft per-query memory ceiling in MB. Surfaced to operators so future
-    /// streaming-scan enforcement can consult it; currently the
-    /// `max_aggregate_groups` cap is the primary OOM safeguard for grouped
-    /// aggregation, while no-GROUP-BY aggregation is already O(1) memory.
+    /// Soft per-query memory ceiling in MB. Query operators and final result
+    /// materialization enforce this limit to abort oversized queries before
+    /// they can exhaust process memory.
     #[allow(dead_code)]
     pub query_memory_limit_mb: u64,
+    pub max_result_message_bytes: usize,
     pub max_aggregate_groups: usize,
     pub max_parallel_row_groups: usize,
     pub parallel_scan_min_row_groups: usize,
@@ -54,6 +54,7 @@ impl Default for QueryLimits {
     fn default() -> Self {
         Self {
             query_memory_limit_mb: default_query_memory_limit_mb(),
+            max_result_message_bytes: default_max_message_size(),
             max_aggregate_groups: default_max_aggregate_groups(),
             max_parallel_row_groups: default_max_parallel_row_groups(),
             parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),
@@ -79,6 +80,7 @@ pub fn set_query_limits(limits: QueryLimits) -> Result<(), QueryLimits> {
 pub fn query_limits() -> QueryLimits {
     *QUERY_LIMITS.get().unwrap_or(&QueryLimits {
         query_memory_limit_mb: default_query_memory_limit_mb(),
+        max_result_message_bytes: default_max_message_size(),
         max_aggregate_groups: default_max_aggregate_groups(),
         max_parallel_row_groups: default_max_parallel_row_groups(),
         parallel_scan_min_row_groups: default_parallel_scan_min_row_groups(),

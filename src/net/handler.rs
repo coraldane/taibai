@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ pub struct Handler {
     pub session: Option<Session>,
     config: Arc<ServerConfig>,
     engine: Arc<Engine>,
+    stream_sender: Option<tokio::sync::mpsc::Sender<Message>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +33,7 @@ impl Handler {
             session: None,
             config,
             engine,
+            stream_sender: None,
         }
     }
 
@@ -62,8 +65,20 @@ impl Handler {
         }
     }
 
+    #[cfg(test)]
     pub fn handle_message(&mut self, msg: Message) -> Result<Vec<Message>> {
-        match msg.msg_type {
+        self.handle_message_cancellable(msg, Arc::new(AtomicBool::new(false)), None)
+    }
+
+    pub fn handle_message_cancellable(
+        &mut self,
+        msg: Message,
+        cancelled: Arc<AtomicBool>,
+        stream_sender: Option<tokio::sync::mpsc::Sender<Message>>,
+    ) -> Result<Vec<Message>> {
+        self.stream_sender = stream_sender;
+        let _cancellation = crate::common::query_cancel::QueryCancellationGuard::enter(cancelled);
+        let result = match msg.msg_type {
             MSG_TYPE_LOGIN => self.handle_login(&msg.payload),
             MSG_TYPE_PING => Ok(vec![build_pong()]),
             MSG_TYPE_LOGOUT => {
@@ -99,7 +114,9 @@ impl Handler {
                     "unsupported message type: {other:#04X}"
                 ))])
             }
-        }
+        };
+        self.stream_sender = None;
+        result
     }
 
     fn handle_login(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -120,6 +137,7 @@ impl Handler {
         } else {
             0
         };
+        let streaming_results = rest.get(5).is_some_and(|&b| b != 0);
 
         let auth_result = self
             .engine
@@ -146,6 +164,7 @@ impl Handler {
 
         let mut session = Session::new(username.to_string(), database);
         session.binary_results = binary_results;
+        session.streaming_results = streaming_results;
         session.timezone_offset_hours = timezone_offset_hours;
         let session_id = session.session_id_string();
         tracing::info!(username, session_id = %session_id, timezone_offset_hours, "login success");
@@ -223,6 +242,47 @@ impl Handler {
         }
 
         let execute_start = Instant::now();
+        if session.streaming_results {
+            if let Some(sender) = self.stream_sender.clone() {
+                let max_message_size = self.config.server.max_message_size;
+                match self.engine.execute_streaming_query(session, sql, |batch| {
+                    let payload = crate::protocol::result::encode_binary_result(&batch);
+                    if payload.len() > max_message_size {
+                        return Err(TaibaiError::ResourceBusy(format!(
+                            "query result chunk exceeded maximum message size of {} MB",
+                            max_message_size / (1024 * 1024)
+                        )));
+                    }
+                    sender
+                        .blocking_send(Message::new(MSG_TYPE_RESULT_CHUNK, Bytes::from(payload)))
+                        .map_err(|_| {
+                            TaibaiError::Network("client disconnected during query stream".into())
+                        })
+                }) {
+                    Ok(Some(_)) => {
+                        if has_query_database {
+                            session.database = original_database;
+                        }
+                        let timings = ServerTimings {
+                            total: server_start.elapsed(),
+                            execute: execute_start.elapsed(),
+                            encode: Duration::ZERO,
+                        };
+                        return Ok(vec![append_server_timings(
+                            Message::empty(MSG_TYPE_RESULT_END),
+                            timings,
+                        )]);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if has_query_database {
+                            session.database = original_database;
+                        }
+                        return Ok(vec![build_error(&error.to_string())]);
+                    }
+                }
+            }
+        }
         let result = self.engine.execute(session, sql);
         let execute_elapsed = execute_start.elapsed();
         let is_use = sql
@@ -263,6 +323,10 @@ impl Handler {
                 } else {
                     build_query_result(&schema, &batches)
                 };
+                let msg = match self.validate_query_response(msg) {
+                    Ok(msg) => msg,
+                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
+                };
                 log_query_if_needed(
                     should_log_query,
                     &query_user,
@@ -294,6 +358,18 @@ impl Handler {
                 Ok(vec![build_error(&e.to_string())])
             }
         }
+    }
+
+    fn validate_query_response(&self, msg: Message) -> Result<Message> {
+        let max_bytes = self.config.server.max_message_size.min(u32::MAX as usize);
+        let payload_limit = max_bytes.saturating_sub(28);
+        if msg.payload.len() > payload_limit {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "query response exceeded maximum message size of {} MB; add filters or LIMIT",
+                max_bytes / (1024 * 1024)
+            )));
+        }
+        Ok(msg)
     }
 
     fn handle_start_bulk_import(&mut self, sql: &str) -> Result<Vec<Message>> {
@@ -504,6 +580,10 @@ impl Handler {
                     build_binary_query_result(&schema, &batches)
                 } else {
                     build_query_result(&schema, &batches)
+                };
+                let msg = match self.validate_query_response(msg) {
+                    Ok(msg) => msg,
+                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
                 };
                 let timings = ServerTimings {
                     total: server_start.elapsed(),

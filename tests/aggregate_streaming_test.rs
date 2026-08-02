@@ -185,6 +185,101 @@ fn sum_and_avg_via_streaming_accumulator() {
 }
 
 #[test]
+fn range_predicate_full_row_group_matches_metadata_result() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE covered_metrics (bucket INT, amount INT)",
+        )
+        .expect("create covered_metrics");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO covered_metrics VALUES (10, 100), (20, 200), (30, 300)",
+        )
+        .expect("insert covered_metrics");
+    engine
+        .execute(&mut session, "FLUSH TABLE covered_metrics")
+        .expect("flush covered_metrics");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), MIN(amount), MAX(amount) FROM covered_metrics WHERE bucket >= 0",
+            )
+            .expect("covered aggregate"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int64(Some(3)));
+    assert_eq!(rows[0][1], ScalarValue::Int32(Some(100)));
+    assert_eq!(rows[0][2], ScalarValue::Int32(Some(300)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn filtered_max_does_not_use_non_matching_row_group_extreme() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE filtered_metrics (bucket INT, amount INT)",
+        )
+        .expect("create filtered_metrics");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO filtered_metrics VALUES (1, 10), (2, 999), (1, 20)",
+        )
+        .expect("insert filtered_metrics");
+    engine
+        .execute(&mut session, "FLUSH TABLE filtered_metrics")
+        .expect("flush filtered_metrics");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT MAX(amount) FROM filtered_metrics WHERE bucket = 1",
+            )
+            .expect("filtered max"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int32(Some(20)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn filtered_max_reads_predicate_and_aggregate_columns() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE projected_metrics (id INT, bucket INT, amount INT)",
+        )
+        .expect("create projected_metrics");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO projected_metrics VALUES (1, 1, 10), (2, 2, 999), (3, 1, 20)",
+        )
+        .expect("insert projected_metrics");
+    engine
+        .execute(&mut session, "FLUSH TABLE projected_metrics")
+        .expect("flush projected_metrics");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT MAX(amount) FROM projected_metrics WHERE bucket = 1",
+            )
+            .expect("projected filtered max"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int32(Some(20)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
 fn aggregate_respects_delete_bitmap_for_min_max() {
     let (_temp_dir, engine, mut session) = create_engine();
     seed_metrics(&engine, &mut session);

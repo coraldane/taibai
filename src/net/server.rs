@@ -1,5 +1,7 @@
 use futures::SinkExt;
 use futures::StreamExt;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -159,9 +161,12 @@ where
         MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),
     );
     let mut handler = Handler::new(config, engine.clone());
+    let mut pending_messages = VecDeque::new();
 
     let outcome = 'connection: loop {
-        let next = if idle_timeout_secs == 0 {
+        let next = if let Some(msg) = pending_messages.pop_front() {
+            Some(Ok(msg))
+        } else if idle_timeout_secs == 0 {
             framed.next().await
         } else {
             match timeout(Duration::from_secs(idle_timeout_secs), framed.next()).await {
@@ -185,9 +190,67 @@ where
 
         tracing::debug!(msg_type = msg.msg_type, "message received");
 
-        let (returned_handler, responses) =
-            run_handler_blocking(handler, msg, Arc::clone(&request_limiter)).await?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
+        let mut worker = run_handler_blocking(
+            handler,
+            msg,
+            Arc::clone(&request_limiter),
+            Arc::clone(&cancelled),
+            stream_sender,
+        )
+        .await?;
+        let mut disconnected = false;
+        let (returned_handler, responses) = loop {
+            tokio::select! {
+                result = &mut worker => {
+                    break result.map_err(|error| {
+                        TaibaiError::Internal(format!("request worker failed: {error}"))
+                    })?;
+                }
+                chunk = stream_receiver.recv() => {
+                    if let Some(chunk) = chunk {
+                        if let Err(error) = framed.send(chunk).await {
+                            tracing::error!(%error, "query stream send error");
+                            cancelled.store(true, Ordering::Release);
+                            disconnected = true;
+                            break worker.await.map_err(|join_error| {
+                                TaibaiError::Internal(format!("request worker failed: {join_error}"))
+                            })?;
+                        }
+                    }
+                }
+                next = framed.next() => {
+                    match next {
+                        Some(Ok(msg)) => pending_messages.push_back(msg),
+                        Some(Err(error)) => {
+                            tracing::error!(%error, "decode error while query was running");
+                            cancelled.store(true, Ordering::Release);
+                            disconnected = true;
+                        }
+                        None => {
+                            cancelled.store(true, Ordering::Release);
+                            disconnected = true;
+                        }
+                    }
+                    if disconnected {
+                        break worker.await.map_err(|error| {
+                            TaibaiError::Internal(format!("request worker failed: {error}"))
+                        })?;
+                    }
+                }
+            }
+        };
         handler = returned_handler;
+        if disconnected {
+            break Ok(());
+        }
+        while let Ok(chunk) = stream_receiver.try_recv() {
+            if let Err(error) = framed.send(chunk).await {
+                tracing::error!(%error, "query stream send error");
+                break 'connection Err(error);
+            }
+        }
         let responses = match responses {
             Ok(responses) => responses,
             Err(error) => break Err(error),
@@ -213,7 +276,9 @@ async fn run_handler_blocking(
     mut handler: Handler,
     msg: Message,
     request_limiter: Arc<Semaphore>,
-) -> Result<(Handler, Result<Vec<Message>>)> {
+    cancelled: Arc<AtomicBool>,
+    stream_sender: tokio::sync::mpsc::Sender<Message>,
+) -> Result<tokio::task::JoinHandle<(Handler, Result<Vec<Message>>)>> {
     let permit = if is_heavy_request(msg.msg_type) {
         Some(
             request_limiter
@@ -225,13 +290,11 @@ async fn run_handler_blocking(
         None
     };
 
-    tokio::task::spawn_blocking(move || {
+    Ok(tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let responses = handler.handle_message(msg);
+        let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
         (handler, responses)
-    })
-    .await
-    .map_err(|error| TaibaiError::Internal(format!("request worker failed: {error}")))
+    }))
 }
 
 async fn cleanup_handler_blocking(mut handler: Handler, request_limiter: Arc<Semaphore>) {

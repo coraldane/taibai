@@ -61,7 +61,8 @@ impl Engine {
                 for db_entry in dbs.flatten() {
                     if db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         let db_name = db_entry.file_name().to_string_lossy().to_string();
-                        if db_name.starts_with('.') || db_name == "meta"
+                        if db_name.starts_with('.')
+                            || db_name == "meta"
                             || db_name == "wal"
                             || db_name == ".taibai-drop-databases"
                         {
@@ -198,6 +199,27 @@ impl Engine {
             return Err(TaibaiError::Sql("empty query".into()));
         }
         self.execute_stmt(session, &stmts[0])
+    }
+
+    pub fn execute_streaming_query<F>(
+        &self,
+        session: &Session,
+        sql: &str,
+        emit: F,
+    ) -> Result<Option<Schema>>
+    where
+        F: FnMut(RecordBatch) -> Result<()>,
+    {
+        let _op_guard = self.begin_operation();
+        if session.active_txn_id() != 0 {
+            return Ok(None);
+        }
+        let stmts = Parser::parse(sql)?;
+        let Some(stmt @ Statement::Select { .. }) = stmts.first() else {
+            return Ok(None);
+        };
+        self.ensure_permissions(session, stmt)?;
+        super::query::exec_select_streaming(self, &session.database, stmt, emit)
     }
 
     pub fn execute_prepared(

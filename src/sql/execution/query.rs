@@ -18,6 +18,79 @@ use crate::sql::planner::{LogicalExpr, LogicalPlan};
 use super::scan::spec::compile_scan_spec;
 use super::scan::ScanExecutor;
 
+pub fn exec_select_streaming<F>(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    mut emit: F,
+) -> Result<Option<Schema>>
+where
+    F: FnMut(RecordBatch) -> Result<()>,
+{
+    let Statement::Select {
+        from: Some(from_clause),
+        ..
+    } = stmt
+    else {
+        return Ok(None);
+    };
+    let resolved_stmt = resolve_in_subqueries(engine, db, stmt)?;
+    let resolved_from = match &resolved_stmt {
+        Statement::Select {
+            from: Some(from), ..
+        } => from,
+        _ => from_clause,
+    };
+    let table_refs = extract_table_refs(resolved_from, db);
+    let table_names: Vec<String> = table_refs.iter().map(|table| table.key.clone()).collect();
+    let mut table_schemas = HashMap::new();
+    let mut table_metas = HashMap::new();
+    {
+        let catalogs = engine.catalogs().read().unwrap();
+        for table_ref in &table_refs {
+            let catalog = catalogs.get(&table_ref.database).ok_or_else(|| {
+                TaibaiError::Sql(format!("database '{}' does not exist", table_ref.database))
+            })?;
+            let meta = catalog
+                .get_table(&table_ref.table)
+                .ok_or_else(|| {
+                    TaibaiError::Sql(format!(
+                        "table '{}.{}' does not exist",
+                        table_ref.database, table_ref.table
+                    ))
+                })?
+                .clone();
+            table_schemas.insert(table_ref.key.clone(), Schema::new(meta.columns.clone()));
+            table_metas.insert(table_ref.key.clone(), meta);
+        }
+    }
+    let plan = crate::sql::optimizer::optimize(crate::sql::planner::plan_select(
+        &resolved_stmt,
+        &table_schemas,
+    )?);
+    if detect_count_star(&resolved_stmt, &table_names)
+        || detect_simple_metadata_aggregate(&resolved_stmt, &table_names)
+        || !can_use_physical_pipeline(&plan)
+    {
+        return Ok(None);
+    }
+    let mut physical_ctx =
+        PhysicalContext::new(engine, &table_refs, &table_schemas, &table_metas, false);
+    let mut pipeline = build_physical_pipeline(plan, &mut physical_ctx)?;
+    let mut schema = None;
+    loop {
+        crate::common::query_cancel::check()?;
+        let Some(batch) = pipeline.next_batch()? else {
+            break;
+        };
+        if schema.is_none() {
+            schema = Some(batch.schema.clone());
+        }
+        emit(batch)?;
+    }
+    Ok(Some(schema.unwrap_or_else(Schema::empty)))
+}
+
 pub fn exec_select(engine: &Engine, db: &str, stmt: &Statement) -> Result<ExecResult> {
     exec_select_with_txn(engine, db, stmt, 0)
 }
@@ -386,8 +459,14 @@ fn exec_table_select_materialized(
     };
     tracing::debug!("query: materialized pipeline built, starting next_batch loop");
     let mut result_batches = Vec::new();
+    let mut retained_bytes = 0;
+    let result_limit = crate::common::query_memory::result_memory_limit_bytes();
     let mut result_schema = None;
-    while let Some(batch) = pipeline.next_batch()? {
+    loop {
+        crate::common::query_cancel::check()?;
+        let Some(batch) = pipeline.next_batch()? else {
+            break;
+        };
         tracing::debug!(
             "query: got batch with {} rows, schema columns={:?}",
             batch.num_rows(),
@@ -401,7 +480,12 @@ fn exec_table_select_materialized(
         if result_schema.is_none() {
             result_schema = Some(batch.schema.clone());
         }
-        result_batches.push(batch);
+        crate::common::query_memory::push_result_batch(
+            &mut result_batches,
+            &mut retained_bytes,
+            batch,
+            result_limit,
+        )?;
     }
     tracing::debug!(
         "query: finished next_batch loop, {} batches",

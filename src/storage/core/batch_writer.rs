@@ -1182,12 +1182,8 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        let _intent = crate::storage::core::durable_tail::begin_flush(
-            &table_dir,
-            id,
-            &segment_name,
-            6,
-        )?;
+        let _intent =
+            crate::storage::core::durable_tail::begin_flush(&table_dir, id, &segment_name, 6)?;
 
         let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
         assert!(
@@ -1228,12 +1224,8 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        let _intent = crate::storage::core::durable_tail::begin_flush(
-            &table_dir,
-            id,
-            &segment_name,
-            6,
-        )?;
+        let _intent =
+            crate::storage::core::durable_tail::begin_flush(&table_dir, id, &segment_name, 6)?;
 
         let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
         assert_eq!(recovered.len(), 1, "unsatisfied watermark must replay");
