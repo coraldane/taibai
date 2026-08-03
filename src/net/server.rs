@@ -13,7 +13,7 @@ use tokio_util::codec::Framed;
 
 use crate::common::config::ServerConfig;
 use crate::common::error::{Result, TaibaiError};
-use crate::net::handler::Handler;
+use crate::net::handler::{build_error, Handler};
 use crate::net::tls::TlsMode;
 use crate::protocol::codec::MessageCodec;
 use crate::protocol::message::{
@@ -253,7 +253,14 @@ where
         }
         let responses = match responses {
             Ok(responses) => responses,
-            Err(error) => break Err(error),
+            Err(error) => {
+                tracing::error!(%error, "request handler error");
+                if let Err(send_error) = framed.send(build_error(&error.to_string())).await {
+                    tracing::error!(error = %send_error, "send error response failed");
+                    break Err(send_error);
+                }
+                break Err(error);
+            }
         };
         if responses.is_empty() {
             break Ok(());
@@ -469,6 +476,13 @@ mod tests {
             .send(Message::new(MSG_TYPE_LOGIN, Bytes::from_static(&[0])))
             .await
             .unwrap();
+        let response = timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("malformed protocol request should receive an error response")
+            .expect("server should respond before closing the connection")
+            .expect("error response should be decodable");
+        assert_eq!(response.msg_type, crate::protocol::message::MSG_TYPE_ERROR);
+        assert!(String::from_utf8_lossy(&response.payload).contains("protocol error"));
         let connection_result = timeout(Duration::from_secs(2), server)
             .await
             .expect("connection should terminate after malformed protocol request")
