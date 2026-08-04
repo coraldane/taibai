@@ -13,8 +13,7 @@ impl SegmentManager {
                         continue;
                     }
                     let db_name = db_entry.file_name().to_string_lossy().to_string();
-                    if db_name.starts_with('.') || db_name == "meta" || db_name == "wal"
-                    {
+                    if db_name.starts_with('.') || db_name == "meta" || db_name == "wal" {
                         continue;
                     }
                     let db_dir = data_dir.join(&db_name);
@@ -648,9 +647,13 @@ impl SegmentManager {
         Ok(())
     }
 
+    fn table_states_snapshot(&self) -> Vec<Arc<TableSegmentState>> {
+        self.tables.read().unwrap().values().cloned().collect()
+    }
+
     pub fn sync_all_wals(&self) {
-        let tables = self.tables.read().unwrap();
-        for state in tables.values() {
+        let states = self.table_states_snapshot();
+        for state in states {
             let mut wal_guard = state.wal_writer.lock().unwrap();
             if let Some(ref mut w) = *wal_guard {
                 let _ = w.sync();
@@ -669,8 +672,8 @@ impl SegmentManager {
 
     pub fn clear_active_segments(&self, db: &str, table: &str) {
         let key = table_key(db, table);
-        let tables = self.tables.read().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             state.active_segments.lock().unwrap().clear();
         }
     }
@@ -680,8 +683,8 @@ impl SegmentManager {
     /// partitions must capture this before sealing removes those writers.
     pub fn active_partition_keys(&self, db: &str, table: &str) -> Vec<String> {
         let key = table_key(db, table);
-        let tables = self.tables.read().unwrap();
-        let Some(state) = tables.get(&key) else {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        let Some(state) = state else {
             return Vec::new();
         };
         let active_segments = state.active_segments.lock().unwrap();
@@ -696,8 +699,8 @@ impl SegmentManager {
         let Ok(key) = self.table_state_key_from_dir(table_dir) else {
             return;
         };
-        let tables = self.tables.write().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             let mut wal_guard = state.wal_writer.lock().unwrap();
             *wal_guard = None;
         }
@@ -705,8 +708,8 @@ impl SegmentManager {
 
     pub fn remove_table_state(&self, db: &str, table: &str) {
         let key = table_key(db, table);
-        let mut tables = self.tables.write().unwrap();
-        if let Some(state) = tables.remove(&key) {
+        let state = self.tables.write().unwrap().remove(&key);
+        if let Some(state) = state {
             state.retired.store(true, Ordering::Release);
             let mut wal_guard = state.wal_writer.lock().unwrap();
             *wal_guard = None;
@@ -720,8 +723,8 @@ impl SegmentManager {
     /// would let a waiting writer create a second lock for the same table.
     pub fn close_table_state_handles(&self, db: &str, table: &str) {
         let key = table_key(db, table);
-        let tables = self.tables.read().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             *state.wal_writer.lock().unwrap() = None;
             state.active_segments.lock().unwrap().clear();
         }
@@ -738,25 +741,28 @@ impl SegmentManager {
 
     pub fn remove_database_state(&self, db: &str) {
         let prefix = format!("{}:", db);
-        let mut tables = self.tables.write().unwrap();
-        let keys: Vec<String> = tables
-            .keys()
-            .filter(|key| key.starts_with(&prefix))
-            .cloned()
-            .collect();
-        for key in keys {
-            if let Some(state) = tables.remove(&key) {
-                state.retired.store(true, Ordering::Release);
-                let mut wal_guard = state.wal_writer.lock().unwrap();
-                *wal_guard = None;
-                state.active_segments.lock().unwrap().clear();
-            }
+        let states = {
+            let mut tables = self.tables.write().unwrap();
+            let keys = tables
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| tables.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for state in states {
+            state.retired.store(true, Ordering::Release);
+            let mut wal_guard = state.wal_writer.lock().unwrap();
+            *wal_guard = None;
+            state.active_segments.lock().unwrap().clear();
         }
     }
 
     pub fn clear_all_wals(&self) {
-        let tables = self.tables.read().unwrap();
-        for state in tables.values() {
+        let states = self.table_states_snapshot();
+        for state in states {
             let mut wal_guard = state.wal_writer.lock().unwrap();
             if let Some(ref mut w) = *wal_guard {
                 let _ = w.clear();

@@ -4,7 +4,9 @@ use taibai::net::client::{Client, QueryResult};
 
 fn print_rows(result: &QueryResult) -> usize {
     match result {
-        QueryResult::Rows { schema, batches, .. } => {
+        QueryResult::Rows {
+            schema, batches, ..
+        } => {
             let names: Vec<String> = schema.column_names().map(|s| s.to_string()).collect();
             println!("columns: {}", names.join(" | "));
             let mut total = 0usize;
@@ -32,10 +34,23 @@ fn print_rows(result: &QueryResult) -> usize {
     }
 }
 
-fn timings(result: &QueryResult) -> (Option<std::time::Duration>, Option<taibai::net::client::ServerTimings>) {
+fn timings(
+    result: &QueryResult,
+) -> (
+    Option<std::time::Duration>,
+    Option<taibai::net::client::ServerTimings>,
+) {
     match result {
-        QueryResult::Rows { server_elapsed, server_timings, .. } => (*server_elapsed, server_timings.clone()),
-        QueryResult::Ok { server_elapsed, server_timings, .. } => (*server_elapsed, server_timings.clone()),
+        QueryResult::Rows {
+            server_elapsed,
+            server_timings,
+            ..
+        } => (*server_elapsed, server_timings.clone()),
+        QueryResult::Ok {
+            server_elapsed,
+            server_timings,
+            ..
+        } => (*server_elapsed, server_timings.clone()),
         QueryResult::Error(_) => (None, None),
     }
 }
@@ -43,8 +58,14 @@ fn timings(result: &QueryResult) -> (Option<std::time::Duration>, Option<taibai:
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let host = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:5152".to_string());
-    let database = args.get(2).cloned().unwrap_or_else(|| "quant_base".to_string());
+    let host = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:5152".to_string());
+    let database = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "quant_base".to_string());
     let sql = match args.get(3) {
         Some(s) if s.starts_with('@') => {
             std::fs::read_to_string(&s[1..]).expect("read sql file failed").trim().to_string()
@@ -52,14 +73,14 @@ async fn main() {
         Some(s) => s.clone(),
         None => "SELECT security_id, deal_date, deal_time, open_px, high_px, low_px, close_px, trade_volume, trade_value FROM t_stock_minute WHERE security_id = '000529.SZ' AND deal_date >= 20260701 AND deal_date <= 20260731 ORDER BY deal_date, deal_time".to_string(),
     };
-    let repeat: usize = args
-        .get(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+    let repeat: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2);
 
     let mut client = Client::connect(&host).await.expect("connect failed");
     client.set_timeout(std::time::Duration::from_secs(1800));
-    client.login("root", "taibai", &database).await.expect("login failed");
+    client
+        .login("root", "taibai", &database)
+        .await
+        .expect("login failed");
 
     let explain_sql = format!("EXPLAIN {}", sql);
     match client.query(&explain_sql).await {
@@ -80,7 +101,9 @@ async fn main() {
                 }
                 let (server_elapsed, server_timings) = timings(&res);
                 let rows = match &res {
-                    QueryResult::Rows { batches, .. } => batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                    QueryResult::Rows { batches, .. } => {
+                        batches.iter().map(|b| b.num_rows()).sum::<usize>()
+                    }
                     QueryResult::Ok { rows_affected, .. } => *rows_affected as usize,
                     QueryResult::Error(e) => {
                         println!("server error: {}", e);

@@ -2,7 +2,9 @@ use taibai::net::client::{Client, QueryResult};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:5152".into());
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:5152".into());
     let sql = std::env::args()
         .nth(2)
         .map(|raw| raw.replace('+', " "))

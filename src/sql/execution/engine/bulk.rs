@@ -78,11 +78,14 @@ impl Engine {
         table: &str,
         batch: &RecordBatch,
     ) -> Result<()> {
-        let catalogs = self.catalogs.read().unwrap();
-        let Some(catalog) = catalogs.get(db) else {
-            return Ok(());
+        let table_meta = {
+            let catalogs = self.catalogs.read().unwrap();
+            catalogs
+                .get(db)
+                .and_then(|catalog| catalog.get_table(table))
+                .cloned()
         };
-        let Some(table_meta) = catalog.get_table(table) else {
+        let Some(table_meta) = table_meta else {
             return Ok(());
         };
         let schema = Schema::new(table_meta.columns.clone());
@@ -245,10 +248,13 @@ impl Engine {
     ) -> Result<u64> {
         let _op_guard = self.begin_operation();
         let table_name = bulk_payload_table_name(payload)?.to_string();
-        let catalogs = self.catalogs.read().unwrap();
-        let catalog = catalogs
-            .get(db)
-            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+        let catalog = {
+            let catalogs = self.catalogs.read().unwrap();
+            catalogs
+                .get(db)
+                .cloned()
+                .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?
+        };
 
         let mut explicit_auto_increment_max = None;
         let mut unique_index_names = Vec::new();
@@ -309,7 +315,7 @@ impl Engine {
             db,
             payload,
             disable_wal,
-            catalog,
+            &catalog,
             !bulk_import_mode,
         ) {
             Ok(result) => result,
@@ -321,7 +327,6 @@ impl Engine {
                 return Err(e);
             }
         };
-        drop(catalogs);
         if result > 0 && (bulk_import_mode || self.is_bulk_mode()) {
             self.mark_bulk_dirty_table(db, &table_name);
         }
@@ -353,30 +358,8 @@ impl Engine {
         }
 
         if !disable_wal && !bulk_import_mode {
-            let req = {
-                let catalogs = self.catalogs.read().unwrap();
-                let catalog = catalogs
-                    .get(db)
-                    .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-                if catalog.get_table(&table_name).is_some() {
-                    let row_count = result as i64;
-                    drop(catalogs);
-                    let mut catalogs_mut = self.catalogs.write().unwrap();
-                    if let Some(catalog) = catalogs_mut.get_mut(db) {
-                        if let Some(meta) = catalog.get_table_mut(&table_name) {
-                            meta.row_count += row_count;
-                            if let Some(counter) = self.auto_increment_mgr.get(db, &table_name) {
-                                meta.auto_increment_next_value = counter.current_value();
-                            }
-                        }
-                        let meta_dir = self.data_dir.join("meta");
-                        catalog.save(&meta_dir)?;
-                    }
-                }
-                if result > 0 {}
-                result
-            };
-            return Ok(req);
+            self.record_inserted_rows(db, &table_name, result as i64, true, false)?;
+            return Ok(result);
         }
 
         if explicit_auto_increment_max.is_some() {

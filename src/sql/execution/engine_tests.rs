@@ -639,6 +639,101 @@ fn bulk_payload_invalidates_rebuilt_unique_index() -> Result<()> {
 }
 
 #[test]
+fn concurrent_bulk_payload_workers_complete_without_catalog_lock_upgrade() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main")?);
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (id INT64)")?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut workers = Vec::new();
+    for worker_id in 0..8 {
+        let engine = Arc::clone(&engine);
+        let barrier = Arc::clone(&barrier);
+        let tx = tx.clone();
+        workers.push(std::thread::spawn(move || {
+            let payload = bulk_payload(
+                "t",
+                1,
+                vec![("id", DataType::Int64, int64_col(&[worker_id]))],
+            );
+            barrier.wait();
+            let result = engine.exec_bulk_insert_payload_with_wal_control("main", &payload, false);
+            tx.send(result).unwrap();
+        }));
+    }
+    drop(tx);
+
+    for _ in 0..8 {
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("bulk worker timed out")?,
+            1
+        );
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    assert_eq!(engine.get_table_meta("main", "t").unwrap().row_count, 8);
+    Ok(())
+}
+
+#[test]
+fn mixed_read_write_flush_workers_keep_making_progress() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main")?);
+    let mut setup = session();
+    engine.execute(&mut setup, "CREATE TABLE t (id INT64)")?;
+
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let (tx, rx) = std::sync::mpsc::channel();
+    for worker_id in 0..8i64 {
+        let engine = Arc::clone(&engine);
+        let barrier = Arc::clone(&barrier);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let result = (|| -> Result<()> {
+                if worker_id < 4 {
+                    for iteration in 0..20i64 {
+                        let value = worker_id * 1000 + iteration;
+                        let payload = bulk_payload(
+                            "t",
+                            1,
+                            vec![("id", DataType::Int64, int64_col(&[value]))],
+                        );
+                        engine
+                            .exec_bulk_insert_payload_with_wal_control("main", &payload, false)?;
+                    }
+                } else if worker_id < 7 {
+                    let mut worker_session = session();
+                    for _ in 0..20 {
+                        engine.execute(&mut worker_session, "SELECT COUNT(*) FROM t")?;
+                        engine.get_table_meta("main", "t").unwrap();
+                    }
+                } else {
+                    for _ in 0..10 {
+                        engine.flush_table_buffers("main", "t")?;
+                    }
+                }
+                Ok(())
+            })();
+            tx.send(result).unwrap();
+        });
+    }
+    drop(tx);
+
+    for _ in 0..8 {
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("mixed workload worker timed out")?;
+    }
+    assert_eq!(engine.get_table_meta("main", "t").unwrap().row_count, 80);
+    Ok(())
+}
+
+#[test]
 fn flush_table_only_flushes_named_table() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;

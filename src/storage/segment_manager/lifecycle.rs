@@ -29,7 +29,11 @@ impl SegmentManager {
     ) -> Result<u64> {
         if !table_meta.is_partitioned() {
             return self.bulk_insert_batch_with_partition_owned_inner(
-                db, table, "", batch, flush_immediately,
+                db,
+                table,
+                "",
+                batch,
+                flush_immediately,
             );
         }
 
@@ -37,7 +41,11 @@ impl SegmentManager {
             Some(idx) => idx,
             None => {
                 return self.bulk_insert_batch_with_partition_owned_inner(
-                    db, table, "", batch, flush_immediately,
+                    db,
+                    table,
+                    "",
+                    batch,
+                    flush_immediately,
                 )
             }
         };
@@ -142,8 +150,8 @@ impl SegmentManager {
 
         let key = table_key(db, table);
         let mut total = 0u64;
-        let tables = self.tables.read().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             let mut active_guard = state.active_segments.lock().unwrap();
             let keys_to_seal: Vec<String> = active_guard
                 .iter()
@@ -169,7 +177,6 @@ impl SegmentManager {
                 }
             }
         }
-        drop(tables);
         self.clear_wal(&table_dir)?;
         Ok(total)
     }
@@ -181,8 +188,8 @@ impl SegmentManager {
         let table_dir = self.table_dir(db, table);
         let key = table_key(db, table);
         let mut total = 0u64;
-        let tables = self.tables.read().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             let mut active_guard = state.active_segments.lock().unwrap();
             let keys_to_seal = active_guard
                 .iter()
@@ -204,7 +211,6 @@ impl SegmentManager {
                 active_guard.remove(&partition_key);
             }
         }
-        drop(tables);
         self.clear_wal(&table_dir)?;
         Ok(total)
     }
@@ -217,8 +223,8 @@ impl SegmentManager {
     ) -> Result<u64> {
         let key = table_key(db, table);
         let mut total = 0u64;
-        let tables = self.tables.read().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             let mut active_guard = state.active_segments.lock().unwrap();
             let should_seal = active_guard.get(partition_key).is_some_and(|segment| {
                 segment.total_rows > 0 && segment.current_size >= self.min_segment_seal_size()
@@ -243,15 +249,11 @@ impl SegmentManager {
     /// Seal the target table's active writers while its mutation lock is held.
     /// Unlike a checkpoint flush this deliberately leaves the table WAL alone:
     /// pending memtables may still depend on it.
-    pub(crate) fn seal_table_active_under_table_lock(
-        &self,
-        db: &str,
-        table: &str,
-    ) -> Result<u64> {
+    pub(crate) fn seal_table_active_under_table_lock(&self, db: &str, table: &str) -> Result<u64> {
         let key = table_key(db, table);
         let mut total = 0u64;
-        let tables = self.tables.read().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             let mut active_guard = state.active_segments.lock().unwrap();
             let keys_to_seal = active_guard
                 .iter()
@@ -277,8 +279,8 @@ impl SegmentManager {
         partition_key: &str,
     ) -> Result<u64> {
         let key = table_key(db, table);
-        let tables = self.tables.read().unwrap();
-        let Some(state) = tables.get(&key) else {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        let Some(state) = state else {
             return Ok(0);
         };
         let mut active_guard = state.active_segments.lock().unwrap();
@@ -298,8 +300,8 @@ impl SegmentManager {
         self.sync_all_wals();
 
         let mut total = 0u64;
-        let tables = self.tables.read().unwrap();
-        for state in tables.values() {
+        let states = self.table_states_snapshot();
+        for state in states {
             let mut active_guard = state.active_segments.lock().unwrap();
             let keys_to_seal: Vec<String> = active_guard
                 .iter()
@@ -339,7 +341,6 @@ impl SegmentManager {
                 }
             }
         }
-        drop(tables);
 
         self.clear_all_wals();
 
@@ -349,8 +350,8 @@ impl SegmentManager {
     fn periodic_flush_check(&self) -> Result<u64> {
         let now = Instant::now();
         let mut total = 0u64;
-        let tables = self.tables.read().unwrap();
-        for state in tables.values() {
+        let states = self.table_states_snapshot();
+        for state in states {
             let mut active_guard = state.active_segments.lock().unwrap();
             for (_, seg) in active_guard.iter_mut() {
                 if !seg.dirty_meta && seg.buffered_rows == 0 {
