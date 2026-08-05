@@ -403,39 +403,39 @@ pub fn exec_drop_table(
     tracing::info!(db, table = name, "drop table: start");
     let table_dir = engine.data_dir().join(db).join(name);
     let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
-    let table_meta = match catalog.get_table(name) {
-        Some(table_meta) => table_meta.clone(),
-        None if cleanup_pending_table_drop(engine.data_dir(), db, name)? => {
-            tracing::info!(
-                db,
-                table = name,
-                "drop table: completed pending physical cleanup"
-            );
-            return Ok(ExecResult::Ok { rows_affected: 0 });
-        }
-        None if if_exists => {
-            tracing::info!(
-                db,
-                table = name,
-                total_elapsed_ms = total_start.elapsed().as_millis(),
-                "drop table: table missing, if exists ignored"
-            );
-            return Ok(ExecResult::Ok { rows_affected: 0 });
-        }
-        None => {
-            return Err(TaibaiError::Sql(format!(
-                "table '{}.{}' does not exist",
-                db, name
-            )))
-        }
-    };
-
     tracing::info!(db, table = name, path = %table_dir.display(), "drop table: waiting for table mutation lock");
-    let stage_start = Instant::now();
-    let tombstone = engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, name, || {
+    let mut lock_attempts = 0u32;
+    let (tombstone, table_meta) = loop {
+        let catalog = get_existing_catalog(&mut catalogs, db)?;
+        let table_meta = match catalog.get_table(name) {
+            Some(table_meta) => table_meta.clone(),
+            None if cleanup_pending_table_drop(engine.data_dir(), db, name)? => {
+                tracing::info!(
+                    db,
+                    table = name,
+                    "drop table: completed pending physical cleanup"
+                );
+                return Ok(ExecResult::Ok { rows_affected: 0 });
+            }
+            None if if_exists => {
+                tracing::info!(
+                    db,
+                    table = name,
+                    total_elapsed_ms = total_start.elapsed().as_millis(),
+                    "drop table: table missing, if exists ignored"
+                );
+                return Ok(ExecResult::Ok { rows_affected: 0 });
+            }
+            None => {
+                return Err(TaibaiError::Sql(format!(
+                    "table '{}.{}' does not exist",
+                    db, name
+                )))
+            }
+        };
+
+        let stage_start = Instant::now();
+        let mut op = || {
             tracing::info!(db, table = name, elapsed_ms = stage_start.elapsed().as_millis(), "drop table: acquired table mutation lock");
 
             engine.batch_writer().drain_table_tail(db, name)?;
@@ -493,7 +493,36 @@ pub fn exec_drop_table(
             engine.segment_mgr().remove_table_state(db, name);
 
             Ok(tombstone)
-        })?;
+        };
+        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
+            Some(
+                engine
+                    .segment_mgr()
+                    .with_table_mutation_lock(db, name, &mut op)?,
+            )
+        } else {
+            engine
+                .segment_mgr()
+                .try_with_table_mutation_lock(db, name, &mut op)?
+        };
+        match attempt {
+            Some(tombstone) => break (tombstone, table_meta),
+            None => {
+                lock_attempts += 1;
+                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                    tracing::warn!(
+                        db,
+                        table = name,
+                        lock_attempts,
+                        "drop table: table mutation lock busy; retrying without the catalog lock"
+                    );
+                }
+                drop(catalogs);
+                thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
+                catalogs = engine.catalogs().write().unwrap();
+            }
+        }
+    };
     drop(catalogs);
 
     engine.auto_increment_manager().unregister(db, name);
@@ -557,24 +586,6 @@ pub fn exec_drop_table(
 }
 
 fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
-    if catalog.get_table(name).is_none() {
-        return Err(TaibaiError::Sql(format!(
-            "table '{}.{}' does not exist",
-            db, name
-        )));
-    }
-    if catalog.get_table(new_name).is_some() {
-        return Err(TaibaiError::Sql(format!(
-            "table '{}.{}' already exists",
-            db, new_name
-        )));
-    }
-
-    let catalog_before = catalog.clone();
-    let old_table_dir = engine.data_dir().join(db).join(name);
-    let new_table_dir = engine.data_dir().join(db).join(new_name);
     let operation_dir = engine
         .data_dir()
         .join(db)
@@ -588,9 +599,28 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             operation_dir.display()
         )));
     }
-    engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, name, || {
+
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let mut lock_attempts = 0u32;
+    let catalog_before = loop {
+        let catalog = get_existing_catalog(&mut catalogs, db)?;
+        if catalog.get_table(name).is_none() {
+            return Err(TaibaiError::Sql(format!(
+                "table '{}.{}' does not exist",
+                db, name
+            )));
+        }
+        if catalog.get_table(new_name).is_some() {
+            return Err(TaibaiError::Sql(format!(
+                "table '{}.{}' already exists",
+                db, new_name
+            )));
+        }
+
+        let catalog_before = catalog.clone();
+        let old_table_dir = engine.data_dir().join(db).join(name);
+        let new_table_dir = engine.data_dir().join(db).join(new_name);
+        let mut op = || {
             if new_table_dir.exists() {
                 return Err(TaibaiError::Storage(format!(
                     "cannot rename table '{}.{}': destination directory '{}' already exists",
@@ -643,7 +673,37 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
                 "renamed resident memtables"
             );
             Ok(())
-        })?;
+        };
+        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
+            Some(
+                engine
+                    .segment_mgr()
+                    .with_table_mutation_lock(db, name, &mut op)?,
+            )
+        } else {
+            engine
+                .segment_mgr()
+                .try_with_table_mutation_lock(db, name, &mut op)?
+        };
+        match attempt {
+            Some(()) => break catalog_before,
+            None => {
+                lock_attempts += 1;
+                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                    tracing::warn!(
+                        db,
+                        table = name,
+                        lock_attempts,
+                        "rename table: table mutation lock busy; retrying without the catalog lock"
+                    );
+                }
+                drop(catalogs);
+                thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
+                catalogs = engine.catalogs().write().unwrap();
+            }
+        }
+    };
+    drop(catalogs);
 
     engine
         .auto_increment_manager()
@@ -687,12 +747,6 @@ fn exec_partition_change(
     partition_key: &str,
     drop_partition: bool,
 ) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
-    let before_meta = catalog
-        .get_table(name)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name)))?
-        .clone();
     let table_dir = engine.data_dir().join(db).join(name);
     let operation_dir = engine
         .data_dir()
@@ -708,9 +762,15 @@ fn exec_partition_change(
         )));
     }
 
-    let operation_dir = engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, name, || {
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let mut lock_attempts = 0u32;
+    let operation_dir = loop {
+        let catalog = get_existing_catalog(&mut catalogs, db)?;
+        let before_meta = catalog
+            .get_table(name)
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name)))?
+            .clone();
+        let mut op = || {
             let resident_partition_keys = engine
                 .batch_writer()
                 .memtable_manager()
@@ -795,7 +855,36 @@ fn exec_partition_change(
                 &unique_index_names,
             );
             Ok(operation_dir.clone())
-        })?;
+        };
+        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
+            Some(
+                engine
+                    .segment_mgr()
+                    .with_table_mutation_lock(db, name, &mut op)?,
+            )
+        } else {
+            engine
+                .segment_mgr()
+                .try_with_table_mutation_lock(db, name, &mut op)?
+        };
+        match attempt {
+            Some(operation_dir) => break operation_dir,
+            None => {
+                lock_attempts += 1;
+                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                    tracing::warn!(
+                        db,
+                        table = name,
+                        lock_attempts,
+                        "partition change: table mutation lock busy; retrying without the catalog lock"
+                    );
+                }
+                drop(catalogs);
+                thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
+                catalogs = engine.catalogs().write().unwrap();
+            }
+        }
+    };
     drop(catalogs);
 
     if let Err(error) = remove_committed_operation_directory(&operation_dir) {
@@ -821,16 +910,16 @@ fn exec_partition_change(
 
 fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = get_existing_catalog(&mut catalogs, db)?;
-    let before_meta = catalog
-        .get_table(name)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name)))?
-        .clone();
-    validate_hot_def(&before_meta.columns, name, hot)?;
+    let mut lock_attempts = 0u32;
+    loop {
+        let catalog = get_existing_catalog(&mut catalogs, db)?;
+        let before_meta = catalog
+            .get_table(name)
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name)))?
+            .clone();
+        validate_hot_def(&before_meta.columns, name, hot)?;
 
-    engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, name, || {
+        let mut op = || {
             // A normal table may already have resident rows that predate the
             // hot-store index. Persist that prefix before enabling HOT so a
             // later indexed memtable read cannot omit those rows.
@@ -856,7 +945,37 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
             // store starts empty and is populated only by subsequent inserts.
             engine.hot_store_manager().remove(db, name);
             Ok(())
-        })?;
+        };
+        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
+            Some(
+                engine
+                    .segment_mgr()
+                    .with_table_mutation_lock(db, name, &mut op)?,
+            )
+        } else {
+            engine
+                .segment_mgr()
+                .try_with_table_mutation_lock(db, name, &mut op)?
+        };
+        match attempt {
+            Some(()) => break,
+            None => {
+                lock_attempts += 1;
+                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                    tracing::warn!(
+                        db,
+                        table = name,
+                        lock_attempts,
+                        "set hot: table mutation lock busy; retrying without the catalog lock"
+                    );
+                }
+                drop(catalogs);
+                thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
+                catalogs = engine.catalogs().write().unwrap();
+            }
+        }
+    }
+    drop(catalogs);
 
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
@@ -1264,16 +1383,6 @@ fn normalize_default_value(
 }
 
 pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<ExecResult> {
-    let mut catalogs = engine.catalogs().write().unwrap();
-    let catalog = catalogs
-        .get_mut(db)
-        .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-
-    let before_meta = catalog
-        .get_table(table)
-        .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-        .clone();
-
     let table_dir = engine.data_dir().join(db).join(table);
     let operation_dir = engine
         .data_dir()
@@ -1289,9 +1398,19 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
         )));
     }
 
-    let operation_dir = engine
-        .segment_mgr()
-        .with_table_mutation_lock(db, table, || {
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let mut lock_attempts = 0u32;
+    let operation_dir = loop {
+        let catalog = catalogs
+            .get_mut(db)
+            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
+
+        let before_meta = catalog
+            .get_table(table)
+            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
+            .clone();
+
+        let mut op = || {
             engine.batch_writer().drain_table_tail(db, table)?;
             engine.segment_mgr().remove_wal(&table_dir);
             engine.segment_mgr().close_table_state_handles(db, table);
@@ -1346,7 +1465,36 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
                 .index_manager()
                 .remove_table_unique_index_snapshots(db, table, &unique_index_names);
             Ok(operation_dir.clone())
-        })?;
+        };
+        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
+            Some(
+                engine
+                    .segment_mgr()
+                    .with_table_mutation_lock(db, table, &mut op)?,
+            )
+        } else {
+            engine
+                .segment_mgr()
+                .try_with_table_mutation_lock(db, table, &mut op)?
+        };
+        match attempt {
+            Some(operation_dir) => break operation_dir,
+            None => {
+                lock_attempts += 1;
+                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                    tracing::warn!(
+                        db,
+                        table,
+                        lock_attempts,
+                        "truncate table: table mutation lock busy; retrying without the catalog lock"
+                    );
+                }
+                drop(catalogs);
+                thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
+                catalogs = engine.catalogs().write().unwrap();
+            }
+        }
+    };
 
     if engine.auto_increment_manager().get(db, table).is_some() {
         engine.auto_increment_manager().reset(db, table, 1)?;

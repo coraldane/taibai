@@ -61,37 +61,43 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
         return Err(TaibaiError::Sql("cannot drop default database".into()));
     }
 
-    let table_indexes = catalogs
-        .get(name)
-        .map(|catalog| {
-            catalog
-                .tables
-                .iter()
-                .map(|(table_name, table_meta)| {
-                    (
-                        table_name.clone(),
-                        table_meta
-                            .unique_indexes
-                            .iter()
-                            .map(|index| index.name.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut lock_attempts = 0u32;
+    let (tombstone, table_indexes) = loop {
+        if !catalogs.contains_key(name) {
+            return Err(TaibaiError::Sql(format!(
+                "database '{}' does not exist",
+                name
+            )));
+        }
 
-    let table_names = table_indexes
-        .iter()
-        .map(|(table_name, _)| table_name.clone())
-        .collect::<Vec<_>>();
-    let database_dir = engine.data_dir().join(name);
-    let meta_dir = engine.data_dir().join("meta");
-    let catalog_file = DatabaseCatalog::catalog_path(&meta_dir, name);
-    let tombstone = engine.segment_mgr().with_database_mutation_locks(
-        name,
-        &table_names,
-        || {
+        let table_indexes = catalogs
+            .get(name)
+            .map(|catalog| {
+                catalog
+                    .tables
+                    .iter()
+                    .map(|(table_name, table_meta)| {
+                        (
+                            table_name.clone(),
+                            table_meta
+                                .unique_indexes
+                                .iter()
+                                .map(|index| index.name.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let table_names = table_indexes
+            .iter()
+            .map(|(table_name, _)| table_name.clone())
+            .collect::<Vec<_>>();
+        let database_dir = engine.data_dir().join(name);
+        let meta_dir = engine.data_dir().join("meta");
+        let catalog_file = DatabaseCatalog::catalog_path(&meta_dir, name);
+        let mut op = || {
             for table_name in &table_names {
                 engine.batch_writer().drain_table_tail(name, table_name)?;
                 engine
@@ -130,8 +136,35 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
                 engine.batch_writer().clear_memtables(name, table_name);
             }
             Ok(tombstone)
-        },
-    )?;
+        };
+        let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {
+            Some(
+                engine
+                    .segment_mgr()
+                    .with_database_mutation_locks(name, &table_names, &mut op)?,
+            )
+        } else {
+            engine
+                .segment_mgr()
+                .try_with_database_mutation_locks(name, &table_names, &mut op)?
+        };
+        match attempt {
+            Some(tombstone) => break (tombstone, table_indexes),
+            None => {
+                lock_attempts += 1;
+                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                    tracing::warn!(
+                        db = name,
+                        lock_attempts,
+                        "drop database: mutation locks busy; retrying without the catalog lock"
+                    );
+                }
+                drop(catalogs);
+                thread::sleep(DDL_TABLE_LOCK_RETRY_INTERVAL);
+                catalogs = engine.catalogs().write().unwrap();
+            }
+        }
+    };
 
     for (table_name, unique_index_names) in &table_indexes {
         engine.index_manager().remove_table_unique_index_snapshots(

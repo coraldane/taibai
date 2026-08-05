@@ -125,7 +125,7 @@ pub(crate) fn restore_replace_delete_under_table_lock(
     }
 }
 
-pub(crate) fn finalize_replace_delete_under_table_lock(
+pub(crate) fn finalize_replace_delete(
     engine: &Engine,
     db: &str,
     table: &str,

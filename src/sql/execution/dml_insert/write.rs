@@ -22,13 +22,12 @@ pub fn exec_replace(
     let (survivors, replaced_inside_batch) =
         collapse_replace_batch(&materialized.batch, &constraints)?;
     let inserted_rows = materialized.batch.num_rows() as u64;
-    let original_row_count = materialized.table_meta.row_count;
     let internal_txn_id = engine.alloc_txn_id();
 
     // Flush before taking the statement-wide table lock. The delete and the
     // staged insert then run under one lock, so DELETE/UPDATE cannot interleave.
     engine.flush_table_buffers(db, table)?;
-    engine
+    let (deleted, undo) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
             let undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
@@ -43,7 +42,6 @@ pub fn exec_replace(
                     db,
                     table,
                     &materialized.table_meta,
-                    original_row_count,
                     internal_txn_id,
                     &undo,
                 )?;
@@ -65,6 +63,7 @@ pub fn exec_replace(
                 false,
                 true,
                 materialized.missing_auto_inc,
+                false,
             );
             if let Err(error) = insert_result {
                 rollback_replace_under_table_lock(
@@ -72,32 +71,21 @@ pub fn exec_replace(
                     db,
                     table,
                     &materialized.table_meta,
-                    original_row_count,
                     internal_txn_id,
                     &undo,
                 )?;
                 return Err(error);
             }
 
-            let finalize_result = super::dml_delete::finalize_replace_delete_under_table_lock(
-                engine,
-                db,
-                table,
-                &materialized.table_meta,
-                &undo,
-            )
-            .and_then(|_| {
-                engine
-                    .batch_writer()
-                    .commit_txn_under_table_lock(internal_txn_id)
-            });
+            let finalize_result = engine
+                .batch_writer()
+                .commit_txn_under_table_lock(internal_txn_id);
             if let Err(error) = finalize_result {
                 rollback_replace_under_table_lock(
                     engine,
                     db,
                     table,
                     &materialized.table_meta,
-                    original_row_count,
                     internal_txn_id,
                     &undo,
                 )?;
@@ -115,10 +103,29 @@ pub fn exec_replace(
                 .batch_writer()
                 .flush_table_under_table_lock(db, table)?;
 
-            Ok(ExecResult::Ok {
-                rows_affected: deleted + inserted_rows + replaced_inside_batch,
-            })
-        })
+            Ok((deleted, undo))
+        })?;
+
+    super::dml_delete::finalize_replace_delete(
+        engine,
+        db,
+        table,
+        &materialized.table_meta,
+        &undo,
+    )?;
+    engine.record_inserted_rows(db, table, inserted_rows as i64, false, true)?;
+    if materialized
+        .table_meta
+        .columns
+        .iter()
+        .any(|column| column.auto_increment)
+    {
+        engine.persist_auto_increment_next_value(db, table, false)?;
+    }
+
+    Ok(ExecResult::Ok {
+        rows_affected: deleted + inserted_rows + replaced_inside_batch,
+    })
 }
 
 pub fn exec_insert(
@@ -171,6 +178,7 @@ fn exec_insert_inner(
         true,
         false,
         materialized.missing_auto_inc,
+        true,
     )
 }
 
@@ -297,6 +305,7 @@ fn exec_materialized_insert_batch(
     validate_existing_constraints: bool,
     table_lock_held: bool,
     missing_auto_inc: Vec<usize>,
+    publish_catalog: bool,
 ) -> Result<ExecResult> {
     let auto_inc_cols: Vec<usize> = schema
         .columns
@@ -430,15 +439,17 @@ fn exec_materialized_insert_batch(
             .append_primary_keys(db, table, &primary_keys)?;
     }
 
-    engine.record_inserted_rows(
-        db,
-        table,
-        row_count as i64,
-        !bulk_import_mode && txn_id > 0,
-        !bulk_import_mode && txn_id == 0,
-    )?;
-    if auto_increment_touched {
-        engine.persist_auto_increment_next_value(db, table, !bulk_import_mode && txn_id > 0)?;
+    if publish_catalog {
+        engine.record_inserted_rows(
+            db,
+            table,
+            row_count as i64,
+            !bulk_import_mode && txn_id > 0,
+            !bulk_import_mode && txn_id == 0,
+        )?;
+        if auto_increment_touched {
+            engine.persist_auto_increment_next_value(db, table, !bulk_import_mode && txn_id > 0)?;
+        }
     }
     log_insert_profile("catalog", row_count as usize, catalog_start.elapsed());
     log_insert_profile("total_exec", row_count as usize, total_start.elapsed());
@@ -543,7 +554,6 @@ fn rollback_replace_under_table_lock(
     db: &str,
     table: &str,
     table_meta: &crate::storage::catalog::schema::TableMeta,
-    original_row_count: i64,
     txn_id: u64,
     undo: &super::dml_delete::ReplaceDeleteUndo,
 ) -> Result<()> {
@@ -561,20 +571,6 @@ fn rollback_replace_under_table_lock(
             .remove_unique_index_snapshot(db, table, &index.name);
     }
 
-    let catalog_restore: Result<()> = (|| {
-        let mut catalogs = engine.catalogs().write().unwrap();
-        if let Some(catalog) = catalogs.get_mut(db) {
-            if let Some(meta) = catalog.get_table_mut(table) {
-                meta.row_count = original_row_count;
-            }
-            catalog.save(&engine.data_dir().join("meta"))?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = catalog_restore {
-        errors.push(format!("restore catalog: {}", error));
-    }
-
     if errors.is_empty() {
         Ok(())
     } else {
@@ -582,6 +578,31 @@ fn rollback_replace_under_table_lock(
             "REPLACE rollback failed: {}",
             errors.join("; ")
         )))
+    }
+}
+
+#[cfg(test)]
+mod lock_order_tests {
+    #[test]
+    fn replace_does_not_publish_catalog_while_holding_table_lock() {
+        let source = include_str!("write.rs");
+        let replace = source
+            .split_once("pub fn exec_replace(")
+            .unwrap()
+            .1
+            .split_once("pub fn exec_insert(")
+            .unwrap()
+            .0;
+        let locked = replace
+            .split_once("with_table_mutation_lock")
+            .unwrap()
+            .1
+            .split_once("})?;")
+            .unwrap()
+            .0;
+        assert!(!locked.contains("record_inserted_rows"));
+        assert!(!locked.contains("persist_auto_increment_next_value"));
+        assert!(!locked.contains("finalize_replace_delete("));
     }
 }
 

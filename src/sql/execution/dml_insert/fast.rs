@@ -243,6 +243,7 @@ fn try_exec_fast_insert_sql_inner(
         true,
         false,
         missing_auto_inc,
+        true,
     ))
 }
 

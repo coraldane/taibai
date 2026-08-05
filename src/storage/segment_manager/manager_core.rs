@@ -533,6 +533,54 @@ impl SegmentManager {
         f()
     }
 
+    pub fn try_with_table_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _guard = match state.mutation_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("table mutation lock poisoned: {}", poisoned)
+            }
+        };
+        ensure_state_not_retired(&state, db, table)?;
+        f().map(Some)
+    }
+
+    pub fn try_with_database_mutation_locks<T>(
+        &self,
+        db: &str,
+        tables: &[String],
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let mut keys = tables
+            .iter()
+            .map(|table| table_key(db, table))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        let states = keys
+            .iter()
+            .map(|key| self.get_or_create_state(key))
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(states.len());
+        for state in &states {
+            match state.mutation_lock.try_lock() {
+                Ok(guard) => guards.push(guard),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("table mutation lock poisoned: {}", poisoned)
+                }
+            }
+        }
+        f().map(Some)
+    }
+
     fn open_mutable_reader_owned(&self, path: &Path) -> Result<SegmentReader> {
         let Some(state) = self.state_for_segment_path(path) else {
             return SegmentReader::open_owned(path);

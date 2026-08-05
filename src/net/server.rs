@@ -192,14 +192,33 @@ where
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
-        let mut worker = run_handler_blocking(
+        let worker = run_handler_blocking(
             handler,
             msg,
             Arc::clone(&request_limiter),
             Arc::clone(&cancelled),
             stream_sender,
-        )
-        .await?;
+        );
+        tokio::pin!(worker);
+        let mut worker = loop {
+            tokio::select! {
+                result = &mut worker => break result?,
+                next = framed.next() => {
+                    match next {
+                        Some(Ok(msg)) => pending_messages.push_back(msg),
+                        Some(Err(error)) => {
+                            tracing::error!(%error, "decode error while waiting for request capacity");
+                            cancelled.store(true, Ordering::Release);
+                            return Err(error);
+                        }
+                        None => {
+                            cancelled.store(true, Ordering::Release);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        };
         let mut disconnected = false;
         let (returned_handler, responses) = loop {
             tokio::select! {
@@ -213,10 +232,8 @@ where
                         if let Err(error) = framed.send(chunk).await {
                             tracing::error!(%error, "query stream send error");
                             cancelled.store(true, Ordering::Release);
-                            disconnected = true;
-                            break worker.await.map_err(|join_error| {
-                                TaibaiError::Internal(format!("request worker failed: {join_error}"))
-                            })?;
+                            worker.abort();
+                            return Ok(());
                         }
                     }
                 }
@@ -234,9 +251,20 @@ where
                         }
                     }
                     if disconnected {
-                        break worker.await.map_err(|error| {
-                            TaibaiError::Internal(format!("request worker failed: {error}"))
-                        })?;
+                        match timeout(DISCONNECT_WORKER_WAIT, &mut worker).await {
+                            Ok(result) => {
+                                break result.map_err(|error| {
+                                    TaibaiError::Internal(format!("request worker failed: {error}"))
+                                })?;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "client disconnected but the request worker did not stop; aborting the worker and closing the connection"
+                                );
+                                worker.abort();
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -279,6 +307,8 @@ where
     outcome
 }
 
+const DISCONNECT_WORKER_WAIT: Duration = Duration::from_secs(5);
+
 async fn run_handler_blocking(
     mut handler: Handler,
     msg: Message,
@@ -310,10 +340,14 @@ async fn cleanup_handler_blocking(mut handler: Handler, request_limiter: Arc<Sem
         .as_ref()
         .is_some_and(|session| session.had_writes);
     let permit = if needs_heavy_permit {
-        let Ok(permit) = request_limiter.acquire_owned().await else {
-            return;
-        };
-        Some(permit)
+        match timeout(DISCONNECT_WORKER_WAIT, request_limiter.acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            Ok(Err(_)) => return,
+            Err(_) => {
+                tracing::warn!("request limiter busy; skipping disconnect flush");
+                return;
+            }
+        }
     } else {
         None
     };
@@ -457,6 +491,23 @@ mod tests {
             .unwrap();
         drop(blocked_client);
         let _ = blocked_server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_while_waiting_for_request_capacity_closes_connection() {
+        let (_dir, engine) = test_engine();
+        let limiter = Arc::new(Semaphore::new(1));
+        let _held_permit = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let (mut client, server) = spawn_test_connection_with_limiter(engine, limiter);
+        login(&mut client, "root").await;
+        client.send(query("SELECT 1")).await.unwrap();
+        drop(client);
+
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("disconnected connection must not wait for request capacity")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
