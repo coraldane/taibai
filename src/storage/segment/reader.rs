@@ -123,17 +123,16 @@ impl SegmentReader {
         }
 
         let data = if owned {
-            let mut buf = Vec::with_capacity(file_len as usize);
+            let mut buf = vec![0u8; file_len as usize];
             tmp_file.seek(SeekFrom::Start(0))?;
-            tmp_file.read_to_end(&mut buf)?;
-            if buf.len() != file_len as usize {
-                return Err(TaibaiError::Storage(format!(
-                    "segment file changed while opening: expected {} bytes, read {} bytes ({})",
+            tmp_file.read_exact(&mut buf).map_err(|err| {
+                TaibaiError::Storage(format!(
+                    "segment file changed while opening: expected {} bytes ({}, {})",
                     file_len,
-                    buf.len(),
-                    path.display()
-                )));
-            }
+                    path.display(),
+                    err
+                ))
+            })?;
             SegmentData::Owned(buf)
         } else {
             SegmentData::Mmap(unsafe { Mmap::map(&tmp_file)? })
