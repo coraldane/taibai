@@ -373,3 +373,75 @@ fn _link_first_scalar_helper() {
     assert_eq!(v, ScalarValue::Int32(Some(42)));
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn case_expressions_execute_in_projection_and_aggregates() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE case_metrics (id INT, volume BIGINT, high_px DECIMAL(18, 4), low_px DECIMAL(18, 4))",
+        )
+        .expect("create case metrics");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO case_metrics VALUES (1, 10, 10.5000, 10.2000), (2, 0, 99.0000, 1.0000), (3, 20, 10.8000, 10.3000)",
+        )
+        .expect("insert case metrics");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT MAX(CASE volume WHEN 0 THEN 0 ELSE high_px END), MIN(CASE WHEN volume = 0 THEN 5000 ELSE low_px END) FROM case_metrics",
+            )
+            .expect("aggregate case query"),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0],
+        ScalarValue::Decimal(Some(108000)),
+        "unexpected CASE aggregate rows: {:?}",
+        rows
+    );
+    assert_eq!(rows[0][1], ScalarValue::Decimal(Some(102000)));
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT volume, MAX(CASE volume WHEN 0 THEN 0 ELSE high_px END) FROM case_metrics GROUP BY volume ORDER BY volume",
+            )
+            .expect("grouped aggregate case query"),
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1], ScalarValue::Decimal(Some(0)));
+    assert_eq!(rows[1][1], ScalarValue::Decimal(Some(105000)));
+    assert_eq!(rows[2][1], ScalarValue::Decimal(Some(108000)));
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT CASE WHEN volume = 0 THEN 'zero' WHEN volume > 10 THEN 'large' ELSE 'small' END FROM case_metrics ORDER BY id",
+            )
+            .expect("searched case query"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::VarChar(Some("small".into())));
+    assert_eq!(rows[1][0], ScalarValue::VarChar(Some("zero".into())));
+    assert_eq!(rows[2][0], ScalarValue::VarChar(Some("large".into())));
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT id, CASE WHEN volume = 0 THEN CASE WHEN id = 2 THEN 'nested' ELSE 'other' END END FROM case_metrics WHERE CASE WHEN volume > 0 THEN true ELSE false END ORDER BY id",
+            )
+            .expect("nested and filter case query"),
+    );
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0][1].is_null());
+    assert!(rows[1][1].is_null());
+    engine.segment_mgr().shutdown();
+}

@@ -549,6 +549,59 @@ pub fn ast_expr_to_logical_join(
             )?;
             Ok(LogicalExpr::IsNotNull(Box::new(e)))
         }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => Ok(LogicalExpr::Case {
+            operand: operand
+                .as_deref()
+                .map(|expr| {
+                    ast_expr_to_logical_join(
+                        expr,
+                        output_schema,
+                        left_schema,
+                        right_schema,
+                        alias_map,
+                    )
+                })
+                .transpose()?
+                .map(Box::new),
+            when_clauses: when_clauses
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    Ok((
+                        ast_expr_to_logical_join(
+                            when_expr,
+                            output_schema,
+                            left_schema,
+                            right_schema,
+                            alias_map,
+                        )?,
+                        ast_expr_to_logical_join(
+                            then_expr,
+                            output_schema,
+                            left_schema,
+                            right_schema,
+                            alias_map,
+                        )?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_clause: else_clause
+                .as_deref()
+                .map(|expr| {
+                    ast_expr_to_logical_join(
+                        expr,
+                        output_schema,
+                        left_schema,
+                        right_schema,
+                        alias_map,
+                    )
+                })
+                .transpose()?
+                .map(Box::new),
+        }),
         Expr::Function {
             name,
             args,
@@ -784,6 +837,19 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
                 .map(|arg| infer_type(arg, schema))
                 .collect::<Vec<_>>();
             infer_scalar_function_type(name, &arg_types)
+        }
+        LogicalExpr::Case {
+            when_clauses,
+            else_clause,
+            ..
+        } => {
+            let branch_types = when_clauses
+                .iter()
+                .map(|(_, then_expr)| infer_type(then_expr, schema))
+                .chain(else_clause.as_deref().map(|expr| infer_type(expr, schema)));
+            branch_types
+                .reduce(|left, right| crate::sql::binder::type_resolver::common_type(&left, &right))
+                .unwrap_or(DataType::Int64)
         }
         _ => DataType::Int64,
     }
