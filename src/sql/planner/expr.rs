@@ -140,6 +140,31 @@ pub fn ast_expr_to_logical_with_context(
                 negated: *negated,
             })
         }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => Ok(LogicalExpr::Case {
+            operand: operand
+                .as_deref()
+                .map(|expr| ast_expr_to_logical_with_context(expr, schema, alias_map, ctx))
+                .transpose()?
+                .map(Box::new),
+            when_clauses: when_clauses
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    Ok((
+                        ast_expr_to_logical_with_context(when_expr, schema, alias_map, ctx)?,
+                        ast_expr_to_logical_with_context(then_expr, schema, alias_map, ctx)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_clause: else_clause
+                .as_deref()
+                .map(|expr| ast_expr_to_logical_with_context(expr, schema, alias_map, ctx))
+                .transpose()?
+                .map(Box::new),
+        }),
         Expr::Like {
             expr,
             pattern,
@@ -316,6 +341,31 @@ pub fn ast_expr_to_logical(
                 negated: *negated,
             })
         }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => Ok(LogicalExpr::Case {
+            operand: operand
+                .as_deref()
+                .map(|expr| ast_expr_to_logical(expr, schema, alias_map))
+                .transpose()?
+                .map(Box::new),
+            when_clauses: when_clauses
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    Ok((
+                        ast_expr_to_logical(when_expr, schema, alias_map)?,
+                        ast_expr_to_logical(then_expr, schema, alias_map)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_clause: else_clause
+                .as_deref()
+                .map(|expr| ast_expr_to_logical(expr, schema, alias_map))
+                .transpose()?
+                .map(Box::new),
+        }),
         Expr::Like {
             expr,
             pattern,
