@@ -404,6 +404,7 @@ impl Accumulator {
             Accumulator::Max(v) => v.clone().unwrap_or_else(|| null_scalar_of_type(col_type)),
             Accumulator::SumI(v) => match col_type {
                 DataType::Float32 | DataType::Float64 => ScalarValue::Float64(v.map(|x| x as f64)),
+                DataType::Decimal => ScalarValue::Decimal(*v),
                 _ => ScalarValue::Int64(*v),
             },
             Accumulator::SumF(v) => ScalarValue::Float64(*v),
@@ -1303,6 +1304,9 @@ impl DistinctSummary {
             AggFunc::Sum if matches!(col_type, DataType::Float32 | DataType::Float64) => {
                 ScalarValue::Float64(Some(self.float_sum))
             }
+            AggFunc::Sum if col_type == DataType::Decimal => {
+                ScalarValue::Decimal(Some(self.integer_sum as i64))
+            }
             AggFunc::Sum => ScalarValue::Int64(Some(self.integer_sum as i64)),
             AggFunc::Avg if self.count == 0 => ScalarValue::Float64(None),
             AggFunc::Avg => ScalarValue::Float64(Some(self.float_sum / self.count as f64)),
@@ -1630,6 +1634,7 @@ pub fn compute_aggregate(
             if !has_non_null {
                 match input_type {
                     DataType::Float32 | DataType::Float64 => ScalarValue::Float64(None),
+                    DataType::Decimal => ScalarValue::Decimal(None),
                     _ => ScalarValue::Int64(None),
                 }
             } else {
@@ -1637,6 +1642,16 @@ pub fn compute_aggregate(
                     DataType::Float32 | DataType::Float64 => {
                         let sum: f64 = values.iter().filter_map(|v| scalar_to_f64(v)).sum();
                         ScalarValue::Float64(Some(sum))
+                    }
+                    DataType::Decimal => {
+                        let sum: i64 = values
+                            .iter()
+                            .filter_map(|v| match v {
+                                ScalarValue::Decimal(Some(n)) => Some(*n),
+                                _ => None,
+                            })
+                            .sum();
+                        ScalarValue::Decimal(Some(sum))
                     }
                     _ => {
                         let sum: i64 = values

@@ -407,6 +407,21 @@ fn case_expressions_execute_in_projection_and_aggregates() {
     );
     assert_eq!(rows[0][1], ScalarValue::Decimal(Some(102000)));
 
+    // Production-shaped statMinute query: SUM(trade_value) must preserve
+    // DECIMAL rather than emitting an INT64 into a DECIMAL result column.
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT volume, MAX(CASE volume WHEN 0 THEN 0 ELSE high_px END), MIN(CASE volume WHEN 0 THEN 5000 ELSE low_px END), SUM(volume), SUM(high_px), COUNT(*) FROM case_metrics GROUP BY volume ORDER BY volume",
+            )
+            .expect("production-shaped decimal aggregate query"),
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][4], ScalarValue::Decimal(Some(990000)));
+    assert_eq!(rows[1][4], ScalarValue::Decimal(Some(105000)));
+    assert_eq!(rows[2][4], ScalarValue::Decimal(Some(108000)));
+
     let rows = collect_rows(
         engine
             .execute(
