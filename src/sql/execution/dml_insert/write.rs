@@ -24,15 +24,24 @@ pub fn exec_replace(
     let affected_insert_rows = materialized.batch.num_rows() as u64;
     let physical_insert_rows = survivors.num_rows() as u64;
     let location_schema = materialized.schema.clone();
+    // Pseudo unique-index entries (empty segment_path) marking the replacement
+    // rows as existing. Published only after the staged insert commits, so a
+    // later plain INSERT still sees the keys without a segment location.
+    let replace_unique_constraints = unique_constraints(&materialized.table_meta, &location_schema)?;
+    let replace_unique_entries = build_unique_index_entries_for_batch(
+        &materialized.table_meta,
+        &location_schema,
+        &survivors,
+        &replace_unique_constraints,
+    )?;
     let internal_txn_id = engine.alloc_txn_id();
 
-    // Flush before taking the statement-wide table lock. The delete and the
-    // staged insert then run under one lock, so DELETE/UPDATE cannot interleave.
-    engine.flush_table_buffers(db, table)?;
+    // No pre-flush: rows still resident in memtables are conflict-deleted in
+    // place below. The delete and the staged insert run under one lock, so
+    // DELETE/UPDATE cannot interleave.
     let (deleted, undo) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
-            let segment_watermarks = segment_row_count_watermarks(engine, db, table)?;
             ensure_replace_location_indexes(
                 engine,
                 db,
@@ -41,13 +50,34 @@ pub fn exec_replace(
                 &location_schema,
                 &key_sets,
             )?;
-            let undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
+            let memtable_plans = super::dml_delete::plan_replace_memtable_conflicts(
+                engine, db, table, &key_sets,
+            )?;
+            let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
                 engine,
                 db,
                 table,
                 &materialized.table_meta,
                 &key_sets,
             )?;
+            // The resident hot store is append-only and cannot remove the rows
+            // replaced below. Drop it before filtering so subsequent reads
+            // rebuild from the authoritative segments plus memtables.
+            engine.hot_store_manager().remove(db, table);
+            match super::dml_delete::apply_replace_memtable_conflicts(
+                engine,
+                db,
+                table,
+                memtable_plans,
+            ) {
+                Ok(memtable_undo) => undo.merge(memtable_undo),
+                Err(error) => {
+                    let _ = super::dml_delete::restore_replace_delete_under_table_lock(
+                        engine, &undo,
+                    );
+                    return Err(error);
+                }
+            }
             let deleted = undo.deleted_rows();
 
             #[cfg(test)]
@@ -107,30 +137,21 @@ pub fn exec_replace(
                 )?;
                 return Err(error);
             }
-            // The resident hot store is append-only and cannot remove the rows
-            // replaced above. Drop it so subsequent reads use the authoritative
-            // segments plus the newly committed memtable.
-            engine.hot_store_manager().remove(db, table);
 
-            // Publish the committed replacement to an on-disk segment before
-            // releasing the table lock. A following DELETE/UPDATE must not miss
-            // rows that were still resident in the committed memtable.
-            engine
-                .batch_writer()
-                .flush_table_under_table_lock(db, table)?;
-            if let Err(error) = append_new_unique_index_locations(
+            // Publish existence markers for the committed replacement rows.
+            // Failure only downgrades later validation to a full scan; the
+            // statement is already committed and must not fail here.
+            if let Err(error) = append_unique_index_entries_after_insert(
                 engine,
                 db,
                 table,
-                &materialized.table_meta,
-                &location_schema,
-                &segment_watermarks,
+                replace_unique_entries,
             ) {
                 tracing::warn!(
                     db,
                     table,
                     error = %error,
-                    "failed to derive REPLACE unique-index locations; invalidating indexes"
+                    "failed to publish REPLACE unique-index entries; invalidating indexes"
                 );
                 let index_names = materialized
                     .table_meta
@@ -618,127 +639,14 @@ fn ensure_replace_location_indexes(
             continue;
         }
         let entries = collect_unique_index_entries(engine, db, table, &indices, index_name)?;
-        engine
-            .index_manager()
-            .persist_unique_index_entries(db, table, index_name, &columns, entries)?;
-    }
-    Ok(())
-}
-
-fn segment_row_count_watermarks(
-    engine: &Engine,
-    db: &str,
-    table: &str,
-) -> Result<HashMap<String, u64>> {
-    let table_dir = engine.data_dir().join(db).join(table);
-    let mut watermarks = HashMap::new();
-    for path in SegmentManager::discover_segments(&table_dir)? {
-        let row_count = engine.segment_mgr().open_reader_cached(&path)?.row_count();
-        watermarks.insert(path.to_string_lossy().to_string(), row_count);
-    }
-    Ok(watermarks)
-}
-
-fn append_new_unique_index_locations(
-    engine: &Engine,
-    db: &str,
-    table: &str,
-    table_meta: &crate::storage::catalog::schema::TableMeta,
-    schema: &Schema,
-    watermarks: &HashMap<String, u64>,
-) -> Result<()> {
-    let mut indexes = table_meta
-        .unique_indexes
-        .iter()
-        .map(|index| {
-            let indices = index
-                .columns
-                .iter()
-                .map(|column| {
-                    schema.index_of(column).ok_or_else(|| {
-                        TaibaiError::Internal(format!(
-                            "unique index column '{}' is missing",
-                            column
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok((index.name.as_str(), indices))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let primary_indices = primary_key_indices(schema);
-    if !primary_indices.is_empty() {
-        indexes.push((
-            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
-            primary_indices,
-        ));
-    }
-    let table_dir = engine.data_dir().join(db).join(table);
-    for (index_name, indices) in indexes {
-        let mut entries = Vec::new();
-        for path in SegmentManager::discover_segments(&table_dir)? {
-            let segment_path = path.to_string_lossy().to_string();
-            let first_new_row = watermarks.get(&segment_path).copied().unwrap_or(0);
-            let reader = engine.segment_mgr().open_reader_cached(&path)?;
-            if first_new_row >= reader.row_count() {
-                continue;
-            }
-            for row_group in 0..reader.num_row_groups() {
-                let row_group_start = reader.row_group_start_row(row_group);
-                let row_group_end = row_group_start + reader.row_group_rows(row_group) as u64;
-                if row_group_end <= first_new_row {
-                    continue;
-                }
-                let batch = reader.read_row_group_with_projection(row_group, &indices)?;
-                let projected_indices = (0..indices.len()).collect::<Vec<_>>();
-                let start = first_new_row.saturating_sub(row_group_start) as usize;
-                for row_idx in start..batch.num_rows() {
-                    let row_id = row_group_start + row_idx as u64;
-                    if crate::storage::segment::delete_bitmap::is_deleted(
-                        reader.delete_bitmap(),
-                        row_id,
-                    ) {
-                        continue;
-                    }
-                    let Some(key) =
-                        unique_key_for_row(&batch, row_idx, &projected_indices, &batch.schema)
-                    else {
-                        continue;
-                    };
-                    entries.push(UniqueIndexEntry {
-                        key,
-                        location: UniqueRowLocation {
-                            segment_path: segment_path.clone(),
-                            row_id,
-                        },
-                    });
-                }
-            }
-        }
-        if entries.is_empty() {
-            continue;
-        }
-        match engine
-            .index_manager()
-            .append_unique_index_entries(db, table, index_name, entries)
-        {
-            Ok(true) => {}
-            Ok(false) => engine
-                .index_manager()
-                .invalidate_unique_index_snapshot(db, table, index_name),
-            Err(error) => {
-                tracing::warn!(
-                    db,
-                    table,
-                    index = index_name,
-                    error = %error,
-                    "failed to publish REPLACE unique-index locations; invalidating index"
-                );
-                engine
-                    .index_manager()
-                    .invalidate_unique_index_snapshot(db, table, index_name);
-            }
-        }
+        engine.index_manager().persist_unique_index_entries(
+            db,
+            table,
+            index_name,
+            &columns,
+            entries,
+            Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
+        )?;
     }
     Ok(())
 }

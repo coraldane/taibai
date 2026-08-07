@@ -491,6 +491,23 @@ impl BatchWriter {
         Ok(())
     }
 
+    /// Flush only pending memtables that have no durable tail. Tailed
+    /// memtables are restart-safe (recovered from their tails), so a routine
+    /// shutdown leaves them resident instead of cutting tiny row groups.
+    pub fn flush_untailed_pending(&self) -> Result<()> {
+        let mts = self.memtable_mgr.get_all_pending();
+        for mt in mts {
+            let table_dir = self.segment_mgr.table_dir(mt.db(), mt.table());
+            let _ = self.tail_committer.barrier(&table_dir);
+            if crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()) {
+                continue;
+            }
+            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+        }
+        self.memtable_mgr.remove_flushed();
+        Ok(())
+    }
+
     pub fn clear_memtables(&self, db: &str, table: &str) -> u64 {
         let table_dir = self.segment_mgr.table_dir(db, table);
         if let Err(error) = self.tail_committer.barrier(&table_dir) {
@@ -759,12 +776,36 @@ impl BatchWriter {
     ) -> Result<()> {
         let db = mt.db().to_string();
         let table = mt.table().to_string();
-        if table_lock_held {
-            return Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer);
-        }
-        segment_mgr.with_table_mutation_lock(&db, &table, || {
+        let had_rows = mt.state() == MemTableState::Pending && mt.row_count() > 0;
+        let result = if table_lock_held {
             Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)
-        })
+        } else {
+            segment_mgr.with_table_mutation_lock(&db, &table, || {
+                Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)
+            })
+        };
+        if result.is_ok() && had_rows {
+            // Rows may have landed in segments (or been carried by a concurrent
+            // winner flush); advance the epoch so unique-index snapshots stamped
+            // earlier are rebuilt before probing segment-side locations.
+            segment_mgr.note_memtable_flush(&db, &table);
+        }
+        result
+    }
+
+    /// Rollback fallback: when restoring a memtable's durable tail fails, flush
+    /// the memtable to segments under the already-held table lock and drop the
+    /// stale tail, so crash recovery cannot replay partially-restored rows.
+    pub(crate) fn flush_memtable_restore_fallback_under_table_lock(
+        &self,
+        memtable: &Arc<crate::storage::core::memtable::MemTable>,
+    ) -> Result<()> {
+        Self::flush_memtable_inner(&self.segment_mgr, memtable, true, &self.tail_committer)?;
+        let _ = crate::storage::core::durable_tail::clear(
+            &self.segment_mgr.table_dir(memtable.db(), memtable.table()),
+            memtable.id(),
+        );
+        Ok(())
     }
 
     fn flush_memtable_under_table_lock(

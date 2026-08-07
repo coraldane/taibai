@@ -59,6 +59,7 @@ impl SegmentManager {
             reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
             segment_meta_cache: Mutex::new(SegmentMetaCache::new(reader_cache_capacity())),
             cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
+            flush_epochs: RwLock::new(HashMap::new()),
             flush_stop,
             flush_paused,
             next_txn_id: AtomicU64::new(1),
@@ -137,6 +138,53 @@ impl SegmentManager {
 
     pub fn table_dir(&self, db: &str, table: &str) -> PathBuf {
         self.data_dir.join(db).join(table)
+    }
+
+    fn flush_epoch_file_path(&self, db: &str, table: &str) -> PathBuf {
+        self.data_dir.join("meta").join("flush_epochs").join(format!(
+            "{}--{}.epoch",
+            sanitize_component(db),
+            sanitize_component(table)
+        ))
+    }
+
+    /// Current memtable-flush epoch for a table. Lazily restored from the
+    /// on-disk marker so epochs survive restarts.
+    pub fn memtable_flush_epoch(&self, db: &str, table: &str) -> u64 {
+        let key = table_key(db, table);
+        if let Some(epoch) = self.flush_epochs.read().unwrap().get(&key) {
+            return *epoch;
+        }
+        let epoch = read_flush_epoch_file(&self.flush_epoch_file_path(db, table));
+        self.flush_epochs.write().unwrap().insert(key, epoch);
+        epoch
+    }
+
+    /// Record that a memtable flush persisted rows for this table. Any unique
+    /// index snapshot stamped with the previous epoch is now potentially
+    /// incomplete for segment-side lookups and must be rebuilt before probing.
+    pub fn note_memtable_flush(&self, db: &str, table: &str) {
+        let key = table_key(db, table);
+        let path = self.flush_epoch_file_path(db, table);
+        let mut epochs = self.flush_epochs.write().unwrap();
+        let current = epochs
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| read_flush_epoch_file(&path));
+        let next = current.saturating_add(1);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent)
+                .and_then(|_| std::fs::write(&path, next.to_string()))
+            {
+                tracing::error!(
+                    db,
+                    table,
+                    error = %error,
+                    "failed to persist memtable flush epoch; in-memory epoch still advanced"
+                );
+            }
+        }
+        epochs.insert(key, next);
     }
 
     fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {

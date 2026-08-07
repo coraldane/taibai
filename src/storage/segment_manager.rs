@@ -53,6 +53,25 @@ fn same_segment_path(a: &Path, b: &Path) -> bool {
     a == b || a.to_string_lossy().replace('\\', "/") == b.to_string_lossy().replace('\\', "/")
 }
 
+fn sanitize_component(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn read_flush_epoch_file(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 enum PreparedDirectColumns<'a> {
     Borrowed(Vec<DirectBulkColumn<'a>>),
     Owned(Vec<OwnedDirectBulkColumn<'a>>),
@@ -81,6 +100,10 @@ pub struct SegmentManager {
     reader_cache: Mutex<ReaderCache>,
     segment_meta_cache: Mutex<SegmentMetaCache>,
     cluster_meta_cache: Mutex<ClusterMetaCache>,
+    /// Per-table count of successful memtable flushes. Unique-index snapshots stamp
+    /// this epoch at build time; a later mismatch means segment rows landed after
+    /// the snapshot was built, so the snapshot must be rebuilt before probing.
+    flush_epochs: RwLock<HashMap<String, u64>>,
     flush_stop: Arc<AtomicBool>,
     flush_paused: Arc<AtomicBool>,
     next_txn_id: AtomicU64,

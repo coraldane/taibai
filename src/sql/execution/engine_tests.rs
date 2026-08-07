@@ -85,7 +85,7 @@ fn first_i64(result: ExecResult, row: usize, col: usize) -> i64 {
 }
 
 #[test]
-fn graceful_shutdown_materializes_durable_tail_into_segment() -> Result<()> {
+fn graceful_shutdown_keeps_tailed_memtable_resident() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = Engine::new(dir.path(), "main")?;
@@ -95,8 +95,12 @@ fn graceful_shutdown_materializes_durable_tail_into_segment() -> Result<()> {
         engine.flush_shutdown_buffers()?;
     }
 
+    // The tailed memtable is restart-safe, so shutdown leaves it resident
+    // instead of cutting a tiny row group; restart recovers it from the tail.
     let table_dir = dir.path().join("main").join("low_rate");
-    assert!(!SegmentManager::discover_segments(&table_dir)?.is_empty());
+    if table_dir.exists() {
+        assert!(SegmentManager::discover_segments(&table_dir)?.is_empty());
+    }
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
     assert_eq!(
@@ -358,7 +362,7 @@ fn rebuild_unique_index_supports_multi_column_point_checks() -> Result<()> {
 }
 
 #[test]
-fn rebuild_unique_index_writes_v2_blocks_for_large_keyset() -> Result<()> {
+fn rebuild_unique_index_writes_v3_blocks_for_large_keyset() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
@@ -385,7 +389,7 @@ fn rebuild_unique_index_writes_v2_blocks_for_large_keyset() -> Result<()> {
         .join("unique")
         .join("uk_id.keys.tbi");
     let bytes = std::fs::read(index_file)?;
-    assert_eq!(&bytes[..8], b"TBIUKV2\0");
+    assert_eq!(&bytes[..8], b"TBIUKV4\0");
 
     let duplicate = engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (299, 'dup')");
     assert!(duplicate.is_err());
@@ -571,12 +575,14 @@ fn replace_into_works_after_rebuild_unique_index() -> Result<()> {
     engine.execute(&mut session, "REPLACE INTO t (id, name) VALUES (1, 'new')")?;
     assert!(base_file.exists());
     assert!(!invalid_file.exists());
+    // Replacement rows stay memtable-resident; their pseudo index entries mark
+    // existence but carry no segment location, so the probe comes back empty
+    // until a flush plus rebuild materializes physical locations.
     let locations = engine
         .index_manager()
         .unique_key_locations("main", "t", "uk_id", &[vec![ScalarValue::Int64(Some(1))]])?
         .unwrap();
-    assert_eq!(locations.len(), 1);
-    assert!(!locations[0].segment_path.is_empty());
+    assert!(locations.is_empty());
 
     engine.execute(
         &mut session,
@@ -586,8 +592,7 @@ fn replace_into_works_after_rebuild_unique_index() -> Result<()> {
         .index_manager()
         .unique_key_locations("main", "t", "uk_id", &[vec![ScalarValue::Int64(Some(1))]])?
         .unwrap();
-    assert_eq!(locations.len(), 1);
-    assert!(!locations[0].segment_path.is_empty());
+    assert!(locations.is_empty());
 
     let name = first_text(
         engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
@@ -605,7 +610,7 @@ fn replace_into_works_after_rebuild_unique_index() -> Result<()> {
 }
 
 #[test]
-fn replace_upgrades_transient_unique_location_from_regular_insert() -> Result<()> {
+fn replace_deletes_conflicting_memtable_rows_in_place() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
@@ -614,6 +619,7 @@ fn replace_upgrades_transient_unique_location_from_regular_insert() -> Result<()
         &mut session,
         "CREATE TABLE t (id INT64, name VARCHAR, UNIQUE KEY uk_id (id))",
     )?;
+    // The conflicting row never leaves the memtable before the REPLACE.
     engine.execute(&mut session, "INSERT INTO t VALUES (1, 'old')")?;
     assert_eq!(
         engine.index_manager().unique_key_locations(
@@ -622,22 +628,54 @@ fn replace_upgrades_transient_unique_location_from_regular_insert() -> Result<()
             "uk_id",
             &[vec![ScalarValue::Int64(Some(1))]],
         )?,
-        None
+        Some(Vec::new())
     );
 
+    // REPLACE must delete the memtable-resident row in place: no flush
+    // happens, so the probe still has no segment location for the key.
     engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'new')")?;
-    let locations = engine
-        .index_manager()
-        .unique_key_locations("main", "t", "uk_id", &[vec![ScalarValue::Int64(Some(1))]])?
-        .unwrap();
-    assert_eq!(locations.len(), 1);
-    assert!(!locations[0].segment_path.is_empty());
+    assert_eq!(
+        engine.index_manager().unique_key_locations(
+            "main",
+            "t",
+            "uk_id",
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?,
+        Some(Vec::new())
+    );
     let name = first_text(
         engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
         0,
         0,
     );
     assert_eq!(name, "new");
+    let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
+    assert_eq!(count, 1);
+
+    // A second REPLACE conflicts with the row the first REPLACE left resident
+    // in the memtable.
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'newer')")?;
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
+    assert_eq!(name, "newer");
+    assert_eq!(count, 1);
+
+    // After a flush the row lives in a segment; the next REPLACE rebuilds the
+    // index (flush-epoch mismatch) and deletes the segment row directly.
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'final')")?;
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
+    assert_eq!(name, "final");
+    assert_eq!(count, 1);
     Ok(())
 }
 
@@ -663,6 +701,8 @@ fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()>
         .is_none());
 
     engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'new')")?;
+    // Replacement rows stay memtable-resident, so location probes skip their
+    // pseudo entries until a flush plus rebuild derives physical locations.
     let locations = engine
         .index_manager()
         .unique_key_locations(
@@ -672,8 +712,7 @@ fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()>
             &[vec![ScalarValue::Int64(Some(1))]],
         )?
         .unwrap();
-    assert_eq!(locations.len(), 1);
-    assert!(!locations[0].segment_path.is_empty());
+    assert!(locations.is_empty());
 
     engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'newer')")?;
     let locations = engine
@@ -685,8 +724,7 @@ fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()>
             &[vec![ScalarValue::Int64(Some(1))]],
         )?
         .unwrap();
-    assert_eq!(locations.len(), 1);
-    assert!(!locations[0].segment_path.is_empty());
+    assert!(locations.is_empty());
 
     engine.execute(&mut session, "OPTIMIZE TABLE t")?;
     assert!(engine
@@ -708,11 +746,29 @@ fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()>
             &[vec![ScalarValue::Int64(Some(1))]],
         )?
         .unwrap();
-    assert_eq!(locations.len(), 1);
-    assert!(!locations[0].segment_path.is_empty());
+    assert!(locations.is_empty());
     drop(engine);
 
+    // Restart: shutdown no longer flushes tailed memtables, so the rows are
+    // recovered from durable tails, the flush epoch is unchanged, and the
+    // probe still reports no physical locations.
     let engine = Engine::new(dir.path(), "main")?;
+    let locations = engine
+        .index_manager()
+        .unique_key_locations(
+            "main",
+            "t",
+            index_name,
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?
+        .unwrap();
+    assert!(locations.is_empty());
+
+    // An explicit flush moves the rows into a segment and advances the flush
+    // epoch; the next REPLACE observes the mismatch, rebuilds the index, and
+    // keys that were not replaced away then have physical locations again.
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+    engine.execute(&mut session, "REPLACE INTO t VALUES (2, 'other')")?;
     let locations = engine
         .index_manager()
         .unique_key_locations(
@@ -724,6 +780,7 @@ fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()>
         .unwrap();
     assert_eq!(locations.len(), 1);
     assert!(!locations[0].segment_path.is_empty());
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 2")?;
     let name = first_text(
         engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
         0,
@@ -754,6 +811,109 @@ fn update_unique_key_after_rebuild_allows_old_key_reuse() -> Result<()> {
         0,
     );
     assert_eq!(count, 2);
+    Ok(())
+}
+
+#[test]
+fn replace_memtable_conflict_removes_old_row_without_flushing() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, name VARCHAR, PRIMARY KEY (id))",
+    )?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+    )?;
+    let epoch_before = engine.segment_mgr().memtable_flush_epoch("main", "t");
+
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'uno')")?;
+
+    // The old memtable-resident version is gone and the replacement is visible.
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "uno");
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 3);
+
+    // REPLACE handled the conflict in place: no memtable flush happened...
+    assert_eq!(
+        engine.segment_mgr().memtable_flush_epoch("main", "t"),
+        epoch_before
+    );
+    // ...so the unique index only tracks the resident row via a pseudo
+    // location that the probe filters out.
+    let locations = engine
+        .index_manager()
+        .unique_key_locations(
+            "main",
+            "t",
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?
+        .unwrap();
+    assert!(locations.is_empty());
+    Ok(())
+}
+
+#[test]
+fn delete_removes_memtable_rows_without_flushing() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+
+        engine.execute(
+            &mut session,
+            "CREATE TABLE t (id INT64, name VARCHAR, PRIMARY KEY (id))",
+        )?;
+        engine.execute(
+            &mut session,
+            "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+        )?;
+        let epoch_before = engine.segment_mgr().memtable_flush_epoch("main", "t");
+
+        engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
+        let count = first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0,
+        );
+        assert_eq!(count, 2);
+        // No forced flush: the rows were removed from the memtable in place.
+        assert_eq!(
+            engine.segment_mgr().memtable_flush_epoch("main", "t"),
+            epoch_before
+        );
+    }
+
+    // The filtered durable tail survives a restart; the deleted row must not
+    // resurrect, and its key must be insertable again.
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 2);
+    engine.execute(&mut session, "INSERT INTO t VALUES (1, 'uno')")?;
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "uno");
     Ok(())
 }
 

@@ -114,6 +114,7 @@ pub fn exec_create_table(
                 &index.name,
                 &index.columns,
                 Vec::new(),
+                Some(engine.segment_mgr().memtable_flush_epoch(db, name)),
             )?;
         }
         let primary_columns = meta
@@ -129,6 +130,7 @@ pub fn exec_create_table(
                 crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
                 &primary_columns,
                 Vec::new(),
+                Some(engine.segment_mgr().memtable_flush_epoch(db, name)),
             )?;
         }
     }
@@ -390,6 +392,7 @@ pub fn exec_rebuild_unique_index(
                     &index.name,
                     &index.columns,
                     entries,
+                    Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
                 )?;
                 rebuilt += 1;
             }

@@ -343,11 +343,11 @@ impl Engine {
         Ok(0)
     }
 
-    /// Graceful process checkpoint that materializes every live memtable into
-    /// segments. Durable tails remain the crash-recovery source until each
-    /// segment append is committed, then are removed atomically by the writer.
+    /// Graceful process checkpoint. Memtables backed by a durable tail stay
+    /// resident (recovered from their tails on restart), so routine restarts
+    /// do not cut tiny row groups; only untailed memtables are materialized.
     pub fn flush_shutdown_buffers(&self) -> Result<u64> {
-        self.batch_writer.flush_all()?;
+        self.batch_writer.flush_untailed_pending()?;
 
         self.segment_mgr.flush_all_active()?;
         {
