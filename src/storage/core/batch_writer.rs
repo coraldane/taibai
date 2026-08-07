@@ -453,8 +453,8 @@ impl BatchWriter {
 
     pub fn flush_table(&self, db: &str, table: &str) -> Result<()> {
         let mts = self.memtable_mgr.get_by_table(db, table);
-        for mt in mts {
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer)?;
         }
         Ok(())
     }
@@ -466,8 +466,8 @@ impl BatchWriter {
             .into_iter()
             .filter(|memtable| memtable.partition_key() == partition_key)
             .collect::<Vec<_>>();
-        for mt in mts {
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer)?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -475,8 +475,8 @@ impl BatchWriter {
 
     pub(crate) fn flush_table_under_table_lock(&self, db: &str, table: &str) -> Result<()> {
         let mts = self.memtable_mgr.get_by_table(db, table);
-        for mt in mts {
-            Self::flush_memtable_inner(&self.segment_mgr, &mt, true, &self.tail_committer)?;
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, true, &self.tail_committer)?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -484,8 +484,8 @@ impl BatchWriter {
 
     pub fn flush_all(&self) -> Result<()> {
         let mts = self.memtable_mgr.get_all_pending();
-        for mt in mts {
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer)?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -495,14 +495,18 @@ impl BatchWriter {
     /// memtables are restart-safe (recovered from their tails), so a routine
     /// shutdown leaves them resident instead of cutting tiny row groups.
     pub fn flush_untailed_pending(&self) -> Result<()> {
-        let mts = self.memtable_mgr.get_all_pending();
-        for mt in mts {
-            let table_dir = self.segment_mgr.table_dir(mt.db(), mt.table());
-            let _ = self.tail_committer.barrier(&table_dir);
-            if crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()) {
-                continue;
-            }
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+        let mts = self
+            .memtable_mgr
+            .get_all_pending()
+            .into_iter()
+            .filter(|mt| {
+                let table_dir = self.segment_mgr.table_dir(mt.db(), mt.table());
+                let _ = self.tail_committer.barrier(&table_dir);
+                !crate::storage::core::durable_tail::has_tail(&table_dir, mt.id())
+            })
+            .collect();
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer)?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -735,8 +739,8 @@ impl BatchWriter {
         tail_committer: &Arc<TailCommitter>,
     ) -> Result<()> {
         let flushable = memtable_mgr.get_flushable();
-        for mt in flushable {
-            Self::flush_memtable(segment_mgr, &mt, tail_committer)?;
+        for group in Self::group_memtables_for_flush(flushable) {
+            Self::flush_memtable_group(segment_mgr, &group, false, tail_committer)?;
         }
         memtable_mgr.remove_flushed();
         Ok(())
@@ -751,10 +755,13 @@ impl BatchWriter {
         memtable_mgr: &MemTableManager,
         tail_committer: &Arc<TailCommitter>,
     ) -> Result<()> {
-        for mt in memtable_mgr.get_all_pending() {
-            if !mt.is_transactional() {
-                Self::flush_memtable(segment_mgr, &mt, tail_committer)?;
-            }
+        let mts = memtable_mgr
+            .get_all_pending()
+            .into_iter()
+            .filter(|mt| !mt.is_transactional())
+            .collect();
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(segment_mgr, &group, false, tail_committer)?;
         }
         memtable_mgr.remove_flushed();
         Ok(())
@@ -884,6 +891,414 @@ impl BatchWriter {
         Ok(())
     }
 
+    /// Group memtables that would be flushed to the same active segment
+    /// (same db/table/partition and the same txn WAL scope), preserving the
+    /// original chronological order inside each group. Flushing such a group
+    /// as one merged append cuts a single row group instead of one small row
+    /// group per memtable (close-of-day / aging / FLUSH TABLE paths).
+    fn group_memtables_for_flush(
+        mts: Vec<Arc<crate::storage::core::memtable::MemTable>>,
+    ) -> Vec<Vec<Arc<crate::storage::core::memtable::MemTable>>> {
+        let mut groups: Vec<Vec<Arc<crate::storage::core::memtable::MemTable>>> = Vec::new();
+        'outer: for mt in mts {
+            for group in groups.iter_mut() {
+                let first = &group[0];
+                if first.db() == mt.db()
+                    && first.table() == mt.table()
+                    && first.partition_key() == mt.partition_key()
+                    && first.txn_id() == mt.txn_id()
+                {
+                    group.push(mt);
+                    continue 'outer;
+                }
+            }
+            groups.push(vec![mt]);
+        }
+        groups
+    }
+
+    fn flush_memtable_group(
+        segment_mgr: &Arc<SegmentManager>,
+        group: &[Arc<crate::storage::core::memtable::MemTable>],
+        table_lock_held: bool,
+        tail_committer: &Arc<TailCommitter>,
+    ) -> Result<()> {
+        if group.len() == 1 {
+            return Self::flush_memtable_inner(segment_mgr, &group[0], table_lock_held, tail_committer);
+        }
+        let db = group[0].db().to_string();
+        let table = group[0].table().to_string();
+        let had_rows = group
+            .iter()
+            .any(|mt| mt.state() == MemTableState::Pending && mt.row_count() > 0);
+        let result = if table_lock_held {
+            Self::flush_memtable_group_under_table_lock(segment_mgr, group, tail_committer)
+        } else {
+            segment_mgr.with_table_mutation_lock(&db, &table, || {
+                Self::flush_memtable_group_under_table_lock(segment_mgr, group, tail_committer)
+            })
+        };
+        if result.is_ok() && had_rows {
+            segment_mgr.note_memtable_flush(&db, &table);
+        }
+        result
+    }
+
+    /// Flush a same-segment memtable group as ONE merged append. Mixed
+    /// tailed/untailed groups keep the legacy sequential semantics.
+    fn flush_memtable_group_under_table_lock(
+        segment_mgr: &Arc<SegmentManager>,
+        group: &[Arc<crate::storage::core::memtable::MemTable>],
+        tail_committer: &Arc<TailCommitter>,
+    ) -> Result<()> {
+        let db = group[0].db().to_string();
+        let table = group[0].table().to_string();
+        let partition_key = group[0].partition_key().to_string();
+        let txn_id = group[0].txn_id();
+        let table_dir = segment_mgr.table_dir(&db, &table);
+        tail_committer.barrier(&table_dir)?;
+
+        let pending: Vec<&Arc<crate::storage::core::memtable::MemTable>> = group
+            .iter()
+            .filter(|mt| mt.state() == MemTableState::Pending)
+            .collect();
+        let tailed: Vec<bool> = pending
+            .iter()
+            .map(|mt| crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()))
+            .collect();
+        let all_tailed = !tailed.is_empty() && tailed.iter().all(|t| *t);
+        let none_tailed = tailed.iter().all(|t| !*t);
+        if pending.len() <= 1 || (!all_tailed && !none_tailed) {
+            for mt in pending {
+                Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)?;
+            }
+            return Ok(());
+        }
+
+        // Lock the group in Flushing state and snapshot every batch.
+        let mut locked: Vec<(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)> =
+            Vec::with_capacity(pending.len());
+        for mt in pending {
+            mt.set_state(MemTableState::Flushing);
+            match mt.read_snapshot() {
+                Some(b) if b.num_rows() > 0 => locked.push((mt.clone(), b)),
+                _ => mt.set_state(MemTableState::Flushed),
+            }
+        }
+        if locked.is_empty() {
+            return Ok(());
+        }
+        if !table_dir.is_dir() {
+            // Table was dropped while the group waited on the table lock.
+            for (mt, _) in &locked {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            }
+            return Ok(());
+        }
+
+        let merged = Self::concat_flush_group_batches(&locked)?;
+        if all_tailed {
+            return Self::flush_durable_memtable_group_under_table_lock(
+                segment_mgr,
+                &locked,
+                &merged,
+                &db,
+                &table,
+                &partition_key,
+                txn_id,
+                &table_dir,
+            );
+        }
+
+        let flush_result = segment_mgr.flush_memtable_batch_if_under_table_lock(
+            &db,
+            &table,
+            &partition_key,
+            &merged,
+            txn_id,
+            || locked.iter().all(|(mt, _)| mt.state() == MemTableState::Flushing),
+            || {
+                for (mt, _) in &locked {
+                    let _ = mt.take_batch();
+                    mt.set_state(MemTableState::Flushed);
+                }
+            },
+        );
+        let wrote = match flush_result {
+            Ok(wrote) => wrote,
+            Err(e) => {
+                for (mt, _) in &locked {
+                    if mt.state() == MemTableState::Flushing {
+                        mt.set_state(MemTableState::Pending);
+                    }
+                }
+                return Err(e);
+            }
+        };
+        if !wrote {
+            // A concurrent winner already carried these rows; drop the copies.
+            for (mt, _) in &locked {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            }
+            return Ok(());
+        }
+        for (mt, _) in &locked {
+            crate::storage::core::durable_tail::clear(&table_dir, mt.id())?;
+        }
+        tracing::debug!(
+            table = %table,
+            rows = merged.num_rows(),
+            memtables = locked.len(),
+            txn_id,
+            "memtable group flushed to active segment as one row group"
+        );
+        Ok(())
+    }
+
+    fn concat_flush_group_batches(
+        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
+    ) -> Result<RecordBatch> {
+        let mut iter = locked.iter();
+        let (_, first) = iter
+            .next()
+            .ok_or_else(|| TaibaiError::Storage("flush group is empty".into()))?;
+        let mut merged = first.clone();
+        for (_, batch) in iter {
+            for col_idx in 0..batch.num_columns() {
+                let source = batch
+                    .column(col_idx)
+                    .ok_or_else(|| TaibaiError::Storage("flush group batch is missing a column".into()))?;
+                let destination = merged.column_mut(col_idx).ok_or_else(|| {
+                    TaibaiError::Storage("flush group merged batch is missing a column".into())
+                })?;
+                destination.extend(source)?;
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Durable (tailed) group flush: one flush intent per tail with cumulative
+    /// row-count watermarks over the shared target segment. The single merged
+    /// append makes every watermark true at once; a crash before the footer
+    /// reaches a watermark leaves that tail's intent for recovery, exactly as
+    /// in the single-memtable protocol.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_durable_memtable_group_under_table_lock(
+        segment_mgr: &Arc<SegmentManager>,
+        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
+        merged: &RecordBatch,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        txn_id: u64,
+        table_dir: &std::path::Path,
+    ) -> Result<()> {
+        let watermark = segment_mgr.durable_active_segment_watermark_under_table_lock(
+            db,
+            table,
+            partition_key,
+            &merged.schema,
+            merged.num_rows() as u64,
+        )?;
+        let Some((segment_file_name, expected_total_rows)) = watermark else {
+            return Self::flush_durable_memtable_group_as_new_segment(
+                segment_mgr,
+                locked,
+                merged,
+                db,
+                table,
+                partition_key,
+                txn_id,
+                table_dir,
+            );
+        };
+        let base_rows = expected_total_rows - merged.num_rows() as u64;
+        let mut intents = Vec::with_capacity(locked.len());
+        let mut cumulative = 0u64;
+        for (mt, batch) in locked {
+            cumulative += batch.num_rows() as u64;
+            match crate::storage::core::durable_tail::begin_flush(
+                table_dir,
+                mt.id(),
+                &segment_file_name,
+                base_rows + cumulative,
+            ) {
+                Ok(intent) => intents.push(intent),
+                Err(error) => {
+                    for intent in intents {
+                        let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+                    }
+                    for (mt, _) in locked {
+                        if mt.state() == MemTableState::Flushing {
+                            mt.set_state(MemTableState::Pending);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let flush_result = segment_mgr.flush_memtable_batch_if_under_table_lock(
+            db,
+            table,
+            partition_key,
+            merged,
+            0,
+            || locked.iter().all(|(mt, _)| mt.state() == MemTableState::Flushing),
+            || {
+                for (mt, _) in locked {
+                    let _ = mt.take_batch();
+                    mt.set_state(MemTableState::Flushed);
+                }
+            },
+        );
+        let wrote = match flush_result {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                for intent in intents {
+                    let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+                }
+                for (mt, _) in locked {
+                    if mt.state() == MemTableState::Flushing {
+                        mt.set_state(MemTableState::Pending);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if !wrote {
+            for (mt, _) in locked {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            }
+            for intent in intents {
+                let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+            }
+            return Ok(());
+        }
+        for intent in intents {
+            if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent) {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "durable tail group flush cleanup deferred to recovery"
+                );
+            }
+        }
+        tracing::debug!(
+            table,
+            rows = merged.num_rows(),
+            memtables = locked.len(),
+            txn_id,
+            segment = %segment_file_name,
+            expected_total_rows,
+            "durable memtable group appended to active segment as one row group"
+        );
+        Ok(())
+    }
+
+    /// Durable group flush with no appendable active segment yet: write the
+    /// merged rows as one standalone segment via tmp+rename (mirrors
+    /// `flush_durable_memtable_as_new_segment` for a group).
+    #[allow(clippy::too_many_arguments)]
+    fn flush_durable_memtable_group_as_new_segment(
+        segment_mgr: &Arc<SegmentManager>,
+        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
+        merged: &RecordBatch,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        txn_id: u64,
+        table_dir: &std::path::Path,
+    ) -> Result<()> {
+        let final_path = if partition_key.is_empty() {
+            segment_mgr.next_segment_path(table_dir, "")?
+        } else {
+            segment_mgr.next_partition_segment_path(table_dir, partition_key)?
+        };
+        let segment_file_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                TaibaiError::Storage("durable tail segment path has no file name".into())
+            })?
+            .to_string();
+        let mut intents = Vec::with_capacity(locked.len());
+        let mut cumulative = 0u64;
+        for (mt, batch) in locked {
+            cumulative += batch.num_rows() as u64;
+            match crate::storage::core::durable_tail::begin_flush(
+                table_dir,
+                mt.id(),
+                &segment_file_name,
+                cumulative,
+            ) {
+                Ok(intent) => intents.push(intent),
+                Err(error) => {
+                    for intent in intents {
+                        let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+                    }
+                    for (mt, _) in locked {
+                        if mt.state() == MemTableState::Flushing {
+                            mt.set_state(MemTableState::Pending);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let tmp_path = table_dir.join(format!(".tail_flush_{}.tmp", locked[0].0.id().simple()));
+
+        let write_result = (|| {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_sidecar_meta(&tmp_path);
+            segment_mgr.write_standalone_active_encoded_segment(&tmp_path, merged)?;
+            std::fs::rename(&tmp_path, &final_path)?;
+            let _ = remove_sidecar_meta(&tmp_path);
+            segment_mgr.open_reader(&final_path)?;
+            Ok(())
+        })();
+
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_sidecar_meta(&tmp_path);
+            for intent in intents {
+                let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+            }
+            for (mt, _) in locked {
+                if mt.state() == MemTableState::Flushing {
+                    mt.set_state(MemTableState::Pending);
+                }
+            }
+            return Err(error);
+        }
+
+        for (mt, _) in locked {
+            let _ = mt.take_batch();
+            mt.set_state(MemTableState::Flushed);
+        }
+        for intent in intents {
+            if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent) {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "durable tail group flush cleanup deferred to recovery"
+                );
+            }
+        }
+        tracing::debug!(
+            table,
+            rows = merged.num_rows(),
+            memtables = locked.len(),
+            txn_id,
+            segment = %segment_file_name,
+            "durable memtable group materialized as new segment"
+        );
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     fn flush_durable_memtable_under_table_lock(
         segment_mgr: &Arc<SegmentManager>,

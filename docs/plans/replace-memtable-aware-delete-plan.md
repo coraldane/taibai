@@ -298,3 +298,20 @@ memtable，不会与已 flush 内容重复，因为 flush 的是删除后的 kep
    这也消除了"重启 → epoch 过期 → 首个 REPLACE 全量重建索引"的连锁代价。
    `graceful_shutdown_keeps_tailed_memtable_resident` 与
    `updated_memtable_is_persisted_by_graceful_restart` 两个测试按新语义更新。
+9. **批量 flush 分组合并为单次追加（第三轮迭代）**：原 `flush_all`/`flush_table`/
+   `flush_partition`/`flush_table_under_table_lock`/`flush_untailed_pending`/aging
+   （`flush_pending_memtables`）/内存压力（`flush_all_pending`）路径逐 memtable
+   flush，同表 N 个驻留 memtable 一次批量 flush 会切 N 个小 row group。现统一先按
+   (db, table, partition, txn_id) 分组（`group_memtables_for_flush`，保持原有
+   时间序），组内用 `concat_flush_group_batches`（`ColumnArray::extend`）合并成
+   **一次 segment 追加**，每组只切一个 row group。durable 路径为组内每条 tail
+   建一个 flush intent，watermark 用 cumulative 行数（`base + 累计行数`；合并
+   追加原子地满足所有 watermark，崩溃时未达 watermark 的 intent 照常留给恢复）；
+   无活跃 segment 时走 tmp+rename 的 standalone 新 segment
+   （`flush_durable_memtable_group_as_new_segment`，内部按正常 row group 策略
+   切分，大批量自动切出多个满 row group）。tailed/untailed 混合组回退逐
+   memtable flush 以保持原语义。epoch 打点每组一次（per-table，语义等价）。
+   回归测试 `bulk_flush_merges_same_table_memtables_into_one_row_group`：
+   INSERT + REPLACE 产生两个 committed memtable，`flush_all_buffers` 后
+   segment 只有一个 row group，且重启后 durable intent 清理正确（无重放/丢失）。
+   全部 343 lib + 342 bin + 集成测试通过。

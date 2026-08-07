@@ -1302,3 +1302,46 @@ fn close_of_day_only_optimizes_partitions_written_since_last_close() -> Result<(
     }));
     Ok(())
 }
+#[test]
+fn bulk_flush_merges_same_table_memtables_into_one_row_group() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, v INT64, UNIQUE KEY uk_id (id))",
+    )?;
+    // Committed shared memtable #1.
+    engine.execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    // REPLACE stages its insert in an internal-txn memtable that commits as a
+    // second committed memtable (same table, same partition, txn 0).
+    engine.execute(&mut session, "REPLACE INTO t VALUES (3, 30)")?;
+
+    engine.flush_all_buffers()?;
+
+    let table_dir = dir.path().join("main").join("t");
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments.len(), 1);
+    let reader = crate::storage::segment::reader::SegmentReader::open(&segments[0])?;
+    // Before group merging, each memtable flush cut its own tiny row group.
+    assert_eq!(reader.num_row_groups(), 1);
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 3);
+
+    // Restart: the merged segment plus cleared durable-tail intents must
+    // recover cleanly (no double-replay, no loss).
+    drop(engine);
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 3);
+    Ok(())
+}
