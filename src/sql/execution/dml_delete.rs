@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::catalog::schema::{PartitionType, TableMeta};
+use crate::storage::index::index_manager::UniqueRowLocation;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::pruning::ZoneMap;
 use crate::storage::partition::{
@@ -24,6 +25,7 @@ use crate::sql::parser::ast::{BinOp, Expr};
 pub(crate) struct ReplaceDeleteUndo {
     segment_footers: Vec<(PathBuf, Vec<u8>, u64)>,
     deleted_rows: u64,
+    deleted_locations: Vec<UniqueRowLocation>,
 }
 
 impl ReplaceDeleteUndo {
@@ -36,19 +38,116 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
     engine: &Engine,
     db: &str,
     table: &str,
+    table_meta: &TableMeta,
     key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
 ) -> Result<ReplaceDeleteUndo> {
     let table_dir = engine.data_dir().join(db).join(table);
     let mut undo = ReplaceDeleteUndo {
         segment_footers: Vec::new(),
         deleted_rows: 0,
+        deleted_locations: Vec::new(),
     };
     if !table_dir.exists() || key_sets.is_empty() {
         return Ok(undo);
     }
 
+    let primary_key_indices = table_meta
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| column.primary_key.then_some(index))
+        .collect::<Vec<_>>();
+    let mut fallback = vec![false; key_sets.len()];
+    let schema = Schema::new(table_meta.columns.clone());
+    let mut direct_locations = Vec::new();
+    if !primary_key_indices.is_empty() {
+        if let Some((key_set_offset, (_, keys))) = key_sets
+            .iter()
+            .enumerate()
+            .find(|(_, (indices, _))| *indices == primary_key_indices)
+        {
+            let keys = keys.iter().cloned().collect::<Vec<_>>();
+            match engine.index_manager().unique_key_locations(
+                db,
+                table,
+                crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                &keys,
+            )? {
+                Some(locations) => direct_locations.extend(locations),
+                None => fallback[key_set_offset] = true,
+            }
+        }
+    }
+    for index in &table_meta.unique_indexes {
+        let indices = index
+            .columns
+            .iter()
+            .map(|column| {
+                schema.index_of(column).ok_or_else(|| {
+                    TaibaiError::Internal(format!("unique index column '{}' is missing", column))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let Some((key_set_offset, (_, keys))) = key_sets
+            .iter()
+            .enumerate()
+            .find(|(_, (key_indices, _))| *key_indices == indices)
+        else {
+            continue;
+        };
+        let keys = keys.iter().cloned().collect::<Vec<_>>();
+        match engine
+            .index_manager()
+            .unique_key_locations(db, table, &index.name, &keys)?
+        {
+            Some(locations) => direct_locations.extend(locations),
+            None => fallback[key_set_offset] = true,
+        }
+    }
+    let fallback_key_sets = key_sets
+        .iter()
+        .zip(&fallback)
+        .filter_map(|(key_set, fallback)| fallback.then_some(key_set))
+        .collect::<Vec<_>>();
+    let projected_indices = fallback_key_sets
+        .iter()
+        .flat_map(|(indices, _)| indices.iter().copied())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let key_envelopes = build_replace_key_envelopes_from_refs(&fallback_key_sets);
+    let projected_positions = fallback_key_sets
+        .iter()
+        .map(|(indices, keys)| {
+            let positions = indices
+                .iter()
+                .map(|index| {
+                    projected_indices
+                        .iter()
+                        .position(|projected| projected == index)
+                        .ok_or_else(|| {
+                            TaibaiError::Internal("replace projection is inconsistent".to_string())
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((positions, keys))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut direct_rows = HashMap::<PathBuf, HashSet<u64>>::new();
+    for location in direct_locations {
+        direct_rows
+            .entry(PathBuf::from(location.segment_path))
+            .or_default()
+            .insert(location.row_id);
+    }
     let mgr = engine.segment_mgr();
-    for seg_path in SegmentManager::discover_segments(&table_dir)? {
+    let segment_paths = if fallback_key_sets.is_empty() {
+        direct_rows.keys().map(PathBuf::from).collect::<Vec<_>>()
+    } else {
+        SegmentManager::discover_segments(&table_dir)?
+    };
+    for seg_path in segment_paths {
         let reader = mgr.open_reader_cached(&seg_path)?;
         let total_rows = reader.row_count();
         if total_rows == 0 || reader.deleted_row_count() >= total_rows {
@@ -58,17 +157,44 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         let old_deleted = reader.deleted_row_count();
         let mut new_bitmap = old_bitmap.clone();
         new_bitmap.resize(total_rows.div_ceil(8) as usize, 0);
-        let mut row_id = 0u64;
         let mut newly_deleted = 0u64;
+        let segment_name = seg_path.to_string_lossy().to_string();
+        if let Some(rows) = direct_rows.get(&seg_path) {
+            for &row_id in rows {
+                if delete_bitmap::mark_deleted(&mut new_bitmap, row_id) {
+                    newly_deleted += 1;
+                    undo.deleted_locations.push(UniqueRowLocation {
+                        segment_path: segment_name.clone(),
+                        row_id,
+                    });
+                }
+            }
+        }
 
         for rg_idx in 0..reader.num_row_groups() {
-            let batch = reader.read_row_group(rg_idx)?;
+            if fallback_key_sets.is_empty()
+                || !replace_keys_may_match_row_group_from_refs(
+                    reader.zone_maps(rg_idx),
+                    &fallback_key_sets,
+                    &key_envelopes,
+                )
+            {
+                continue;
+            }
+            let batch = reader.read_row_group_with_projection(rg_idx, &projected_indices)?;
+            let row_id = reader.row_group_start_row(rg_idx);
             for row_idx in 0..batch.num_rows() {
                 let absolute_row = row_id + row_idx as u64;
                 if delete_bitmap::is_deleted(&new_bitmap, absolute_row) {
                     continue;
                 }
-                let conflicts = key_sets.iter().any(|(indices, keys)| {
+                let conflicts = projected_positions.iter().any(|(indices, keys)| {
+                    if indices.len() == 1 {
+                        let Some(value) = batch.scalar(row_idx, indices[0]) else {
+                            return false;
+                        };
+                        return !value.is_null() && keys.contains(std::slice::from_ref(&value));
+                    }
                     let mut key = Vec::with_capacity(indices.len());
                     for &col_idx in indices {
                         let Some(value) = batch.scalar(row_idx, col_idx) else {
@@ -83,9 +209,12 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
                 });
                 if conflicts && delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row) {
                     newly_deleted += 1;
+                    undo.deleted_locations.push(UniqueRowLocation {
+                        segment_path: segment_name.clone(),
+                        row_id: absolute_row,
+                    });
                 }
             }
-            row_id += batch.num_rows() as u64;
         }
 
         if newly_deleted == 0 {
@@ -102,6 +231,85 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         undo.deleted_rows += newly_deleted;
     }
     Ok(undo)
+}
+
+#[cfg(test)]
+fn build_replace_key_envelopes(
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Vec<ReplaceKeyEnvelope> {
+    build_replace_key_envelopes_from_refs(&key_sets.iter().collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+fn replace_keys_may_match_row_group(
+    zone_maps: &[ZoneMap],
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+    envelopes: &[ReplaceKeyEnvelope],
+) -> bool {
+    replace_keys_may_match_row_group_from_refs(
+        zone_maps,
+        &key_sets.iter().collect::<Vec<_>>(),
+        envelopes,
+    )
+}
+
+type ReplaceKeyEnvelope = (Vec<usize>, Vec<(ScalarValue, ScalarValue)>);
+
+fn build_replace_key_envelopes_from_refs(
+    key_sets: &[&(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Vec<ReplaceKeyEnvelope> {
+    key_sets
+        .iter()
+        .filter_map(|(indices, keys)| {
+            let first = keys.iter().next()?;
+            let mut ranges = first
+                .iter()
+                .map(|value| (value.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            for key in keys.iter().skip(1) {
+                for (value, (min, max)) in key.iter().zip(&mut ranges) {
+                    if compare_scalars_for_sort(value, min).is_lt() {
+                        *min = value.clone();
+                    }
+                    if compare_scalars_for_sort(value, max).is_gt() {
+                        *max = value.clone();
+                    }
+                }
+            }
+            Some((indices.clone(), ranges))
+        })
+        .collect()
+}
+
+fn replace_keys_may_match_row_group_from_refs(
+    zone_maps: &[ZoneMap],
+    key_sets: &[&(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+    envelopes: &[ReplaceKeyEnvelope],
+) -> bool {
+    key_sets
+        .iter()
+        .zip(envelopes)
+        .any(|((indices, keys), (_, ranges))| {
+            if keys.len() <= 64 {
+                return keys.iter().any(|key| {
+                    indices.iter().zip(key).all(|(column_index, value)| {
+                        zone_maps
+                            .get(*column_index)
+                            .map(|zone_map| zone_map.contains(value))
+                            .unwrap_or(true)
+                    })
+                });
+            }
+            indices
+                .iter()
+                .zip(ranges)
+                .all(|(column_index, (min, max))| {
+                    zone_maps
+                        .get(*column_index)
+                        .map(|zone_map| zone_map.overlaps(min, max))
+                        .unwrap_or(true)
+                })
+        })
 }
 
 pub(crate) fn restore_replace_delete_under_table_lock(
@@ -137,15 +345,33 @@ pub(crate) fn finalize_replace_delete(
     }
     engine
         .index_manager()
-        .invalidate_primary_key_index(db, table);
-    let unique_index_names = table_meta
-        .unique_indexes
-        .iter()
-        .map(|index| index.name.clone())
-        .collect::<Vec<_>>();
-    engine
-        .index_manager()
-        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+        .invalidate_primary_key_cache(db, table);
+    if table_meta.columns.iter().any(|column| column.primary_key)
+        && !engine.index_manager().append_unique_index_tombstones(
+            db,
+            table,
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+            undo.deleted_locations.clone(),
+        )?
+    {
+        engine.index_manager().invalidate_unique_index_snapshot(
+            db,
+            table,
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+        );
+    }
+    for index in &table_meta.unique_indexes {
+        if !engine.index_manager().append_unique_index_tombstones(
+            db,
+            table,
+            &index.name,
+            undo.deleted_locations.clone(),
+        )? {
+            engine
+                .index_manager()
+                .invalidate_unique_index_snapshot(db, table, &index.name);
+        }
+    }
 
     let mut catalogs = engine.catalogs().write().unwrap();
     if let Some(catalog) = catalogs.get_mut(db) {
@@ -935,3 +1161,84 @@ fn expr_matches_column(expr: &Expr, column: &str) -> bool {
 #[cfg(test)]
 #[path = "dml_delete_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod replace_pruning_tests {
+    use super::*;
+
+    fn zone(min: i64, max: i64) -> ZoneMap {
+        ZoneMap {
+            min_value: ScalarValue::Int64(Some(min)),
+            max_value: ScalarValue::Int64(Some(max)),
+            null_count: 0,
+            row_count: 10,
+        }
+    }
+
+    #[test]
+    fn replace_prunes_row_group_when_no_key_can_match() {
+        let key_sets = vec![(
+            vec![0, 1],
+            [
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(100))],
+                vec![ScalarValue::Int64(Some(20)), ScalarValue::Int64(Some(5))],
+            ]
+            .into_iter()
+            .collect(),
+        )];
+        assert!(!replace_keys_may_match_row_group(
+            &[zone(1, 10), zone(1, 10)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+    }
+
+    #[test]
+    fn replace_keeps_row_group_when_composite_key_may_match() {
+        let key_sets = vec![(
+            vec![0, 1],
+            [vec![
+                ScalarValue::Int64(Some(5)),
+                ScalarValue::Int64(Some(8)),
+            ]]
+            .into_iter()
+            .collect(),
+        )];
+        assert!(replace_keys_may_match_row_group(
+            &[zone(1, 10), zone(1, 10)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+    }
+
+    #[test]
+    fn replace_large_batch_uses_envelope_pruning() {
+        let keys = (1_000..6_000)
+            .map(|value| vec![ScalarValue::Int64(Some(value))])
+            .collect();
+        let key_sets = vec![(vec![0], keys)];
+        assert!(!replace_keys_may_match_row_group(
+            &[zone(1, 10)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+        assert!(replace_keys_may_match_row_group(
+            &[zone(2_000, 2_100)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+    }
+
+    #[test]
+    fn replace_keeps_row_group_when_zone_map_is_missing() {
+        let key_sets = vec![(
+            vec![1],
+            [vec![ScalarValue::Int64(Some(100))]].into_iter().collect(),
+        )];
+        assert!(replace_keys_may_match_row_group(
+            &[zone(1, 10)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+    }
+}

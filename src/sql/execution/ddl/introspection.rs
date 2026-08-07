@@ -615,6 +615,14 @@ pub fn exec_optimize_table(
     };
 
     engine.index_manager().mark_index_stale(db, table);
+    let unique_index_names = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    engine
+        .index_manager()
+        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
 
     tracing::info!(
         db,

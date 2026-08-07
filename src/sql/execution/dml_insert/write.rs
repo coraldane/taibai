@@ -21,7 +21,9 @@ pub fn exec_replace(
     let key_sets = replace_key_sets(&materialized.batch, &constraints);
     let (survivors, replaced_inside_batch) =
         collapse_replace_batch(&materialized.batch, &constraints)?;
-    let inserted_rows = materialized.batch.num_rows() as u64;
+    let affected_insert_rows = materialized.batch.num_rows() as u64;
+    let physical_insert_rows = survivors.num_rows() as u64;
+    let location_schema = materialized.schema.clone();
     let internal_txn_id = engine.alloc_txn_id();
 
     // Flush before taking the statement-wide table lock. The delete and the
@@ -30,8 +32,21 @@ pub fn exec_replace(
     let (deleted, undo) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
+            let segment_watermarks = segment_row_count_watermarks(engine, db, table)?;
+            ensure_replace_location_indexes(
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                &location_schema,
+                &key_sets,
+            )?;
             let undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
-                engine, db, table, &key_sets,
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                &key_sets,
             )?;
             let deleted = undo.deleted_rows();
 
@@ -63,6 +78,7 @@ pub fn exec_replace(
                 false,
                 true,
                 materialized.missing_auto_inc,
+                false,
                 false,
             );
             if let Err(error) = insert_result {
@@ -102,18 +118,36 @@ pub fn exec_replace(
             engine
                 .batch_writer()
                 .flush_table_under_table_lock(db, table)?;
+            if let Err(error) = append_new_unique_index_locations(
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                &location_schema,
+                &segment_watermarks,
+            ) {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "failed to derive REPLACE unique-index locations; invalidating indexes"
+                );
+                let index_names = materialized
+                    .table_meta
+                    .unique_indexes
+                    .iter()
+                    .map(|index| index.name.clone())
+                    .collect::<Vec<_>>();
+                engine
+                    .index_manager()
+                    .invalidate_table_unique_index_snapshots(db, table, &index_names);
+            }
 
             Ok((deleted, undo))
         })?;
 
-    super::dml_delete::finalize_replace_delete(
-        engine,
-        db,
-        table,
-        &materialized.table_meta,
-        &undo,
-    )?;
-    engine.record_inserted_rows(db, table, inserted_rows as i64, false, true)?;
+    super::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
+    engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
     if materialized
         .table_meta
         .columns
@@ -124,7 +158,7 @@ pub fn exec_replace(
     }
 
     Ok(ExecResult::Ok {
-        rows_affected: deleted + inserted_rows + replaced_inside_batch,
+        rows_affected: deleted + affected_insert_rows + replaced_inside_batch,
     })
 }
 
@@ -178,6 +212,7 @@ fn exec_insert_inner(
         true,
         false,
         materialized.missing_auto_inc,
+        true,
         true,
     )
 }
@@ -305,6 +340,7 @@ fn exec_materialized_insert_batch(
     validate_existing_constraints: bool,
     table_lock_held: bool,
     missing_auto_inc: Vec<usize>,
+    publish_unique_index_entries: bool,
     publish_catalog: bool,
 ) -> Result<ExecResult> {
     let auto_inc_cols: Vec<usize> = schema
@@ -386,8 +422,11 @@ fn exec_materialized_insert_batch(
         primary_keys_for_batch(&batch, &schema, &primary_key_indices)?
     };
     let auto_increment_touched = !auto_inc_cols.is_empty();
-    let unique_index_entries =
-        build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?;
+    let unique_index_entries = if publish_unique_index_entries {
+        build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?
+    } else {
+        Vec::new()
+    };
     log_insert_profile(
         "constraints",
         row_count as usize,
@@ -432,11 +471,22 @@ fn exec_materialized_insert_batch(
     log_insert_profile("write", row_count as usize, write_start.elapsed());
 
     let catalog_start = Instant::now();
-    append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
+    if publish_unique_index_entries {
+        append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
+    }
     if !primary_keys.is_empty() {
         let _ = engine
             .index_manager()
             .append_primary_keys(db, table, &primary_keys)?;
+        if publish_unique_index_entries {
+            engine
+                .index_manager()
+                .invalidate_unique_index_snapshot_if_present(
+                    db,
+                    table,
+                    crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                );
+        }
     }
 
     if publish_catalog {
@@ -516,6 +566,183 @@ fn append_unique_index_entries_after_insert(
     Ok(())
 }
 
+fn ensure_replace_location_indexes(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Result<()> {
+    let mut indexes = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| {
+            let indices = index
+                .columns
+                .iter()
+                .map(|column| {
+                    schema.index_of(column).ok_or_else(|| {
+                        TaibaiError::Internal(format!(
+                            "unique index column '{}' is missing",
+                            column
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((index.name.as_str(), index.columns.clone(), indices))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let primary_indices = primary_key_indices(schema);
+    if !primary_indices.is_empty() {
+        indexes.push((
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+            primary_indices
+                .iter()
+                .map(|index| table_meta.columns[*index].name.clone())
+                .collect(),
+            primary_indices,
+        ));
+    }
+    for (index_name, columns, indices) in indexes {
+        let keys = key_sets
+            .iter()
+            .find(|(key_indices, _)| *key_indices == indices)
+            .map(|(_, keys)| keys.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if engine
+            .index_manager()
+            .unique_key_locations(db, table, index_name, &keys)?
+            .is_some()
+        {
+            continue;
+        }
+        let entries = collect_unique_index_entries(engine, db, table, &indices, index_name)?;
+        engine
+            .index_manager()
+            .persist_unique_index_entries(db, table, index_name, &columns, entries)?;
+    }
+    Ok(())
+}
+
+fn segment_row_count_watermarks(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+) -> Result<HashMap<String, u64>> {
+    let table_dir = engine.data_dir().join(db).join(table);
+    let mut watermarks = HashMap::new();
+    for path in SegmentManager::discover_segments(&table_dir)? {
+        let row_count = engine.segment_mgr().open_reader_cached(&path)?.row_count();
+        watermarks.insert(path.to_string_lossy().to_string(), row_count);
+    }
+    Ok(watermarks)
+}
+
+fn append_new_unique_index_locations(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+    watermarks: &HashMap<String, u64>,
+) -> Result<()> {
+    let mut indexes = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| {
+            let indices = index
+                .columns
+                .iter()
+                .map(|column| {
+                    schema.index_of(column).ok_or_else(|| {
+                        TaibaiError::Internal(format!(
+                            "unique index column '{}' is missing",
+                            column
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((index.name.as_str(), indices))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let primary_indices = primary_key_indices(schema);
+    if !primary_indices.is_empty() {
+        indexes.push((
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+            primary_indices,
+        ));
+    }
+    let table_dir = engine.data_dir().join(db).join(table);
+    for (index_name, indices) in indexes {
+        let mut entries = Vec::new();
+        for path in SegmentManager::discover_segments(&table_dir)? {
+            let segment_path = path.to_string_lossy().to_string();
+            let first_new_row = watermarks.get(&segment_path).copied().unwrap_or(0);
+            let reader = engine.segment_mgr().open_reader_cached(&path)?;
+            if first_new_row >= reader.row_count() {
+                continue;
+            }
+            for row_group in 0..reader.num_row_groups() {
+                let row_group_start = reader.row_group_start_row(row_group);
+                let row_group_end = row_group_start + reader.row_group_rows(row_group) as u64;
+                if row_group_end <= first_new_row {
+                    continue;
+                }
+                let batch = reader.read_row_group_with_projection(row_group, &indices)?;
+                let projected_indices = (0..indices.len()).collect::<Vec<_>>();
+                let start = first_new_row.saturating_sub(row_group_start) as usize;
+                for row_idx in start..batch.num_rows() {
+                    let row_id = row_group_start + row_idx as u64;
+                    if crate::storage::segment::delete_bitmap::is_deleted(
+                        reader.delete_bitmap(),
+                        row_id,
+                    ) {
+                        continue;
+                    }
+                    let Some(key) =
+                        unique_key_for_row(&batch, row_idx, &projected_indices, &batch.schema)
+                    else {
+                        continue;
+                    };
+                    entries.push(UniqueIndexEntry {
+                        key,
+                        location: UniqueRowLocation {
+                            segment_path: segment_path.clone(),
+                            row_id,
+                        },
+                    });
+                }
+            }
+        }
+        if entries.is_empty() {
+            continue;
+        }
+        match engine
+            .index_manager()
+            .append_unique_index_entries(db, table, index_name, entries)
+        {
+            Ok(true) => {}
+            Ok(false) => engine
+                .index_manager()
+                .invalidate_unique_index_snapshot(db, table, index_name),
+            Err(error) => {
+                tracing::warn!(
+                    db,
+                    table,
+                    index = index_name,
+                    error = %error,
+                    "failed to publish REPLACE unique-index locations; invalidating index"
+                );
+                engine
+                    .index_manager()
+                    .invalidate_unique_index_snapshot(db, table, index_name);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn replace_constraint_indices(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
@@ -570,6 +797,11 @@ fn rollback_replace_under_table_lock(
             .index_manager()
             .remove_unique_index_snapshot(db, table, &index.name);
     }
+    engine.index_manager().remove_unique_index_snapshot(
+        db,
+        table,
+        crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+    );
 
     if errors.is_empty() {
         Ok(())

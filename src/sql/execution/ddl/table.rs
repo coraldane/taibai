@@ -116,6 +116,21 @@ pub fn exec_create_table(
                 Vec::new(),
             )?;
         }
+        let primary_columns = meta
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        if !primary_columns.is_empty() {
+            engine.index_manager().persist_unique_index_entries(
+                db,
+                name,
+                crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                &primary_columns,
+                Vec::new(),
+            )?;
+        }
     }
 
     let meta_dir = engine.data_dir().join("meta");
@@ -436,21 +451,41 @@ pub fn exec_drop_table(
 
         let stage_start = Instant::now();
         let mut op = || {
-            tracing::info!(db, table = name, elapsed_ms = stage_start.elapsed().as_millis(), "drop table: acquired table mutation lock");
+            tracing::info!(
+                db,
+                table = name,
+                elapsed_ms = stage_start.elapsed().as_millis(),
+                "drop table: acquired table mutation lock"
+            );
 
             engine.batch_writer().drain_table_tail(db, name)?;
 
             let step_start = Instant::now();
             engine.segment_mgr().remove_wal(&table_dir);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed wal handle");
+            tracing::info!(
+                db,
+                table = name,
+                elapsed_ms = step_start.elapsed().as_millis(),
+                "drop table: removed wal handle"
+            );
 
             let step_start = Instant::now();
             engine.segment_mgr().close_table_state_handles(db, name);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: closed table state handles");
+            tracing::info!(
+                db,
+                table = name,
+                elapsed_ms = step_start.elapsed().as_millis(),
+                "drop table: closed table state handles"
+            );
 
             let step_start = Instant::now();
             engine.segment_mgr().invalidate_readers_under(&table_dir);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: invalidated readers");
+            tracing::info!(
+                db,
+                table = name,
+                elapsed_ms = step_start.elapsed().as_millis(),
+                "drop table: invalidated readers"
+            );
 
             let step_start = Instant::now();
             tracing::info!(db, table = name, path = %table_dir.display(), "drop table: staging table directory");
@@ -484,11 +519,22 @@ pub fn exec_drop_table(
 
             let step_start = Instant::now();
             engine.hot_store_manager().remove(db, name);
-            tracing::info!(db, table = name, elapsed_ms = step_start.elapsed().as_millis(), "drop table: removed resident hot store");
+            tracing::info!(
+                db,
+                table = name,
+                elapsed_ms = step_start.elapsed().as_millis(),
+                "drop table: removed resident hot store"
+            );
 
             let step_start = Instant::now();
             let cleared_rows = engine.batch_writer().clear_memtables(db, name);
-            tracing::info!(db, table = name, cleared_rows, elapsed_ms = step_start.elapsed().as_millis(), "drop table: cleared memtables");
+            tracing::info!(
+                db,
+                table = name,
+                cleared_rows,
+                elapsed_ms = step_start.elapsed().as_millis(),
+                "drop table: cleared memtables"
+            );
 
             engine.segment_mgr().remove_table_state(db, name);
 
@@ -633,7 +679,9 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             engine.segment_mgr().flush_table_active(db, name)?;
             engine.segment_mgr().remove_wal(&old_table_dir);
             engine.segment_mgr().close_table_state_handles(db, name);
-            engine.segment_mgr().invalidate_readers_under(&old_table_dir);
+            engine
+                .segment_mgr()
+                .invalidate_readers_under(&old_table_dir);
 
             std::fs::create_dir_all(&operation_dir)?;
             std::fs::write(operation_dir.join(RENAME_TARGET_FILE), new_name.as_bytes())?;
@@ -1461,9 +1509,11 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
                 .iter()
                 .map(|index| index.name.clone())
                 .collect::<Vec<_>>();
-            engine
-                .index_manager()
-                .remove_table_unique_index_snapshots(db, table, &unique_index_names);
+            engine.index_manager().remove_table_unique_index_snapshots(
+                db,
+                table,
+                &unique_index_names,
+            );
             Ok(operation_dir.clone())
         };
         let attempt = if lock_attempts >= DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS {

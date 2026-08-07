@@ -11,6 +11,8 @@ use crate::storage::index::sparse_index::SparseIndexImpl;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::scalar::ScalarValue;
 
+pub const PRIMARY_LOCATION_INDEX_NAME: &str = "__taibai_primary_location";
+
 pub struct IndexManager {
     indexes: RwLock<HashMap<String, HashMap<String, Arc<SparseIndexImpl>>>>,
     unique_indexes: RwLock<HashMap<String, Arc<UniqueIndexState>>>,
@@ -441,11 +443,16 @@ impl IndexManager {
         Ok(true)
     }
 
-    pub fn invalidate_primary_key_index(&self, db: &str, table: &str) {
+    pub fn invalidate_primary_key_cache(&self, db: &str, table: &str) {
         self.primary_key_indexes
             .write()
             .unwrap()
             .remove(&format!("{}\0{}", db, table));
+    }
+
+    pub fn invalidate_primary_key_index(&self, db: &str, table: &str) {
+        self.invalidate_primary_key_cache(db, table);
+        self.invalidate_unique_index_snapshot_if_present(db, table, PRIMARY_LOCATION_INDEX_NAME);
     }
 
     pub fn unique_key_exists(
@@ -464,6 +471,89 @@ impl IndexManager {
             &state,
             &encoded,
         )?))
+    }
+
+    pub fn unique_key_locations(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        keys: &[Vec<ScalarValue>],
+    ) -> Result<Option<Vec<UniqueRowLocation>>> {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            return Ok(None);
+        };
+        let encoded_keys = keys
+            .iter()
+            .map(|key| encode_unique_key(key))
+            .collect::<Result<Vec<_>>>()?;
+        let mut locations = {
+            let delta = state.delta.read().unwrap();
+            let mut locations = Vec::new();
+            for encoded in &encoded_keys {
+                if let Some(matches) = delta.key_locations.get(encoded) {
+                    locations.extend(
+                        matches
+                            .iter()
+                            .filter(|location| {
+                                !unique_index_tombstones_contains(&delta.tombstones, location)
+                            })
+                            .cloned(),
+                    );
+                }
+                let Ok(mut idx) = state
+                    .base
+                    .encoded_keys
+                    .binary_search_by(|value| value.as_slice().cmp(encoded))
+                else {
+                    continue;
+                };
+                while idx > 0 && state.base.encoded_keys[idx - 1] == *encoded {
+                    idx -= 1;
+                }
+                while idx < state.base.encoded_keys.len()
+                    && state.base.encoded_keys[idx] == *encoded
+                {
+                    let location = &state.base.entries[idx].location;
+                    if !unique_index_tombstones_contains(&delta.tombstones, location) {
+                        locations.push(location.clone());
+                    }
+                    idx += 1;
+                }
+            }
+            locations
+        };
+        locations.sort_by(|left, right| {
+            left.segment_path
+                .cmp(&right.segment_path)
+                .then(left.row_id.cmp(&right.row_id))
+        });
+        locations.dedup();
+        let mut start = 0;
+        while start < locations.len() {
+            if locations[start].segment_path.is_empty() {
+                return Ok(None);
+            }
+            let path = Path::new(&locations[start].segment_path);
+            if !path.exists() {
+                return Ok(None);
+            }
+            let reader = self.segment_mgr.open_reader_cached(path)?;
+            let mut end = start + 1;
+            while end < locations.len()
+                && locations[end].segment_path == locations[start].segment_path
+            {
+                end += 1;
+            }
+            if locations[start..end]
+                .iter()
+                .any(|location| location.row_id >= reader.row_count())
+            {
+                return Ok(None);
+            }
+            start = end;
+        }
+        Ok(Some(locations))
     }
 
     pub fn unique_keys_exist(
@@ -605,6 +695,25 @@ impl IndexManager {
         Ok(true)
     }
 
+    pub fn invalidate_unique_index_snapshot_if_present(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) {
+        let base = sanitize_file_component(index_name);
+        let dir = self.unique_index_dir(db, table);
+        if dir.join(format!("{}.keys.tbi", base)).exists()
+            || self
+                .unique_indexes
+                .read()
+                .unwrap()
+                .contains_key(&unique_index_key(db, table, index_name))
+        {
+            self.invalidate_unique_index_snapshot(db, table, index_name);
+        }
+    }
+
     pub fn invalidate_unique_index_snapshot(&self, db: &str, table: &str, index_name: &str) {
         let dir = self.unique_index_dir(db, table);
         let base = sanitize_file_component(index_name);
@@ -646,7 +755,8 @@ impl IndexManager {
         table: &str,
         index_names: &[String],
     ) {
-        self.invalidate_primary_key_index(db, table);
+        self.invalidate_primary_key_cache(db, table);
+        self.remove_unique_index_snapshot(db, table, PRIMARY_LOCATION_INDEX_NAME);
         for index_name in index_names {
             self.remove_unique_index_snapshot(db, table, index_name);
         }
@@ -1283,6 +1393,32 @@ mod tests {
             2
         );
         assert_eq!(data.blocks.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_location_lookup_rejects_transient_locations() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = IndexManager::new_with_data_dir(
+            Arc::new(SegmentManager::new(dir.path())?),
+            dir.path().to_path_buf(),
+        );
+        manager.persist_unique_index_entries(
+            "db",
+            "ticks",
+            "uk_value",
+            &["value".to_string()],
+            vec![entry(1, 0)],
+        )?;
+        assert_eq!(
+            manager.unique_key_locations(
+                "db",
+                "ticks",
+                "uk_value",
+                &[vec![ScalarValue::Int64(Some(1))]],
+            )?,
+            None
+        );
         Ok(())
     }
 

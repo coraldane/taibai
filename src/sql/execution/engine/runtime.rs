@@ -442,6 +442,16 @@ impl Engine {
         }
         if stats.segments_written > 0 {
             self.index_manager.mark_index_stale(db, table);
+            let unique_index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            self.index_manager.invalidate_table_unique_index_snapshots(
+                db,
+                table,
+                &unique_index_names,
+            );
         }
         let today = chrono::Local::now().date_naive().to_string();
         {

@@ -200,10 +200,25 @@ fn table_physical_health(
     })
 }
 
+fn invalidate_compacted_location_indexes(
+    index_manager: &crate::storage::index::index_manager::IndexManager,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+) {
+    let index_names = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    index_manager.invalidate_table_unique_index_snapshots(db, table, &index_names);
+}
+
 fn start_auto_compaction_thread(
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
     catalogs: Arc<RwLock<HashMap<String, DatabaseCatalog>>>,
+    index_manager: Arc<crate::storage::index::index_manager::IndexManager>,
     config: AutoCompactConfig,
 ) {
     if !config.enabled && !config.fragmentation_enabled {
@@ -259,6 +274,12 @@ fn start_auto_compaction_thread(
                         match compact_result {
                             Ok(stats) => {
                                 if stats.rows_dropped > 0 || stats.segments_written > 0 {
+                                    invalidate_compacted_location_indexes(
+                                        &index_manager,
+                                        &db,
+                                        &table,
+                                        &table_meta,
+                                    );
                                     compacted += 1;
                                     tracing::info!(
                                         db,
@@ -287,6 +308,12 @@ fn start_auto_compaction_thread(
                         match compactor.compact_table_for_fragmentation(&db, &table, &table_meta) {
                             Ok(stats) => {
                                 if stats.segments_written > 0 {
+                                    invalidate_compacted_location_indexes(
+                                        &index_manager,
+                                        &db,
+                                        &table,
+                                        &table_meta,
+                                    );
                                     compacted += 1;
                                     fragmentation_last_run
                                         .insert((db.clone(), table.clone()), Instant::now());
@@ -311,6 +338,12 @@ fn start_auto_compaction_thread(
                     Ok(_) => {
                         match segment_mgr.cleanup_fully_deleted_segments(&db, &table, &table_dir) {
                             Ok(removed) if removed > 0 => {
+                                invalidate_compacted_location_indexes(
+                                    &index_manager,
+                                    &db,
+                                    &table,
+                                    &table_meta,
+                                );
                                 compacted += 1;
                                 tracing::info!(
                                     db,

@@ -852,9 +852,12 @@ impl Handler {
             parameter_batch.push(params);
         }
 
-        let result = if matches!(stmt.stmt, Statement::Insert { .. }) {
+        let result = if matches!(
+            stmt.stmt,
+            Statement::Insert { .. } | Statement::Replace { .. }
+        ) {
             self.engine
-                .execute_prepared_insert_batch(session, &stmt, &parameter_batch)
+                .execute_prepared_write_batch(session, &stmt, &parameter_batch)
         } else {
             let mut total_rows_affected = 0u64;
             let mut error = None;

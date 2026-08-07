@@ -563,6 +563,98 @@ fn prepared_insert_batch_writes_all_rows_as_one_batch() {
 }
 
 #[test]
+fn prepared_replace_batch_executes_as_one_logical_replace() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+
+    let mut sql_payload = Vec::new();
+    write_len_prefixed_string(&mut sql_payload, "main");
+    write_len_prefixed_string(
+        &mut sql_payload,
+        "CREATE TABLE batch_replace (id INT64 PRIMARY KEY, value INT64)",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+        .unwrap();
+
+    let mut insert_payload = Vec::new();
+    write_len_prefixed_string(&mut insert_payload, "main");
+    write_len_prefixed_string(
+        &mut insert_payload,
+        "INSERT INTO batch_replace VALUES (1, 10), (2, 20)",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(insert_payload)))
+        .unwrap();
+
+    let mut prep_payload = Vec::new();
+    write_len_prefixed_string(
+        &mut prep_payload,
+        "REPLACE INTO batch_replace VALUES (?, ?)",
+    );
+    let prepared = handler
+        .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+        .unwrap();
+    let stmt_id = u32::from_le_bytes(prepared[0].payload[..4].try_into().unwrap());
+
+    let mut batch_payload = Vec::new();
+    batch_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    batch_payload.extend_from_slice(&4u32.to_le_bytes());
+    for (id, value) in [(1, 11), (3, 30), (3, 31), (4, 40)] {
+        append_int64_param(&mut batch_payload, id);
+        append_int64_param(&mut batch_payload, value);
+    }
+    let response = handler
+        .handle_message(Message::new(
+            MSG_TYPE_BATCH_EXECUTE,
+            Bytes::from(batch_payload),
+        ))
+        .unwrap();
+    assert_eq!(ok_rows(&response), 6);
+
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    let result = engine
+        .execute(
+            &mut session,
+            "SELECT id, value FROM batch_replace ORDER BY id",
+        )
+        .unwrap();
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result")
+    };
+    let rows = batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .map(|row| (batch.scalar(row, 0).unwrap(), batch.scalar(row, 1).unwrap()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            (ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(11))),
+            (ScalarValue::Int64(Some(2)), ScalarValue::Int64(Some(20))),
+            (ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(31))),
+            (ScalarValue::Int64(Some(4)), ScalarValue::Int64(Some(40))),
+        ]
+    );
+    assert_eq!(
+        engine
+            .catalogs()
+            .read()
+            .unwrap()
+            .get("main")
+            .unwrap()
+            .get_table("batch_replace")
+            .unwrap()
+            .row_count,
+        4
+    );
+}
+
+#[test]
 fn prepared_insert_batch_rejects_duplicates_before_writing_any_row() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());

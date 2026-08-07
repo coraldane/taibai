@@ -147,6 +147,7 @@ impl Engine {
             Arc::clone(&segment_mgr),
             data_dir.to_path_buf(),
             Arc::clone(&catalogs),
+            Arc::clone(&index_manager),
             auto_compact_config,
         );
 
@@ -276,7 +277,7 @@ impl Engine {
     /// keeping them together here is important because constraint validation,
     /// partition routing, durable-tail commits, and catalog accounting are all
     /// batch-oriented below the SQL layer.
-    pub fn execute_prepared_insert_batch(
+    pub fn execute_prepared_write_batch(
         &self,
         session: &mut Session,
         prepared: &crate::sql::execution::prepared::PreparedStatement,
@@ -287,11 +288,12 @@ impl Engine {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
 
-        let (table, columns) = match &prepared.stmt {
-            Statement::Insert { table, columns, .. } => (table.clone(), columns.clone()),
+        let (table, columns, is_replace) = match &prepared.stmt {
+            Statement::Insert { table, columns, .. } => (table.clone(), columns.clone(), false),
+            Statement::Replace { table, columns, .. } => (table.clone(), columns.clone(), true),
             _ => {
                 return Err(TaibaiError::Sql(
-                    "prepared batch fast path only supports INSERT".into(),
+                    "prepared batch fast path only supports INSERT and REPLACE".into(),
                 ))
             }
         };
@@ -310,20 +312,31 @@ impl Engine {
             crate::sql::execution::prepared::bind_params(&mut bound, params).map_err(|error| {
                 TaibaiError::Sql(format!("row {} parameter bind failed: {}", row_idx, error))
             })?;
-            let Statement::Insert {
-                values: bound_values,
-                ..
-            } = bound
-            else {
-                unreachable!("prepared statement kind was checked above")
-            };
-            values.extend(bound_values);
+            match bound {
+                Statement::Insert {
+                    values: bound_values,
+                    ..
+                }
+                | Statement::Replace {
+                    values: bound_values,
+                    ..
+                } => values.extend(bound_values),
+                _ => unreachable!("prepared statement kind was checked above"),
+            }
         }
 
-        let stmt = Statement::Insert {
-            table,
-            columns,
-            values,
+        let stmt = if is_replace {
+            Statement::Replace {
+                table,
+                columns,
+                values,
+            }
+        } else {
+            Statement::Insert {
+                table,
+                columns,
+                values,
+            }
         };
         self.ensure_permissions(session, &stmt)?;
         self.execute_stmt(session, &stmt)

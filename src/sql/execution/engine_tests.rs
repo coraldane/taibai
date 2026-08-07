@@ -570,7 +570,24 @@ fn replace_into_works_after_rebuild_unique_index() -> Result<()> {
     let invalid_file = index_dir.join("uk_id.invalid");
     engine.execute(&mut session, "REPLACE INTO t (id, name) VALUES (1, 'new')")?;
     assert!(base_file.exists());
-    assert!(invalid_file.exists());
+    assert!(!invalid_file.exists());
+    let locations = engine
+        .index_manager()
+        .unique_key_locations("main", "t", "uk_id", &[vec![ScalarValue::Int64(Some(1))]])?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
+
+    engine.execute(
+        &mut session,
+        "REPLACE INTO t (id, name) VALUES (1, 'newer')",
+    )?;
+    let locations = engine
+        .index_manager()
+        .unique_key_locations("main", "t", "uk_id", &[vec![ScalarValue::Int64(Some(1))]])?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
 
     let name = first_text(
         engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
@@ -582,8 +599,137 @@ fn replace_into_works_after_rebuild_unique_index() -> Result<()> {
         0,
         0,
     );
-    assert_eq!(name, "new");
+    assert_eq!(name, "newer");
     assert_eq!(count, 1);
+    Ok(())
+}
+
+#[test]
+fn replace_upgrades_transient_unique_location_from_regular_insert() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, name VARCHAR, UNIQUE KEY uk_id (id))",
+    )?;
+    engine.execute(&mut session, "INSERT INTO t VALUES (1, 'old')")?;
+    assert_eq!(
+        engine.index_manager().unique_key_locations(
+            "main",
+            "t",
+            "uk_id",
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?,
+        None
+    );
+
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'new')")?;
+    let locations = engine
+        .index_manager()
+        .unique_key_locations("main", "t", "uk_id", &[vec![ScalarValue::Int64(Some(1))]])?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "new");
+    Ok(())
+}
+
+#[test]
+fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    let index_name = crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME;
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, name VARCHAR)",
+    )?;
+    assert!(engine
+        .index_manager()
+        .load_unique_index_snapshot("main", "t", index_name)?
+        .is_some());
+    engine.execute(&mut session, "INSERT INTO t VALUES (1, 'old')")?;
+    assert!(engine
+        .index_manager()
+        .load_unique_index_snapshot("main", "t", index_name)?
+        .is_none());
+
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'new')")?;
+    let locations = engine
+        .index_manager()
+        .unique_key_locations(
+            "main",
+            "t",
+            index_name,
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
+
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'newer')")?;
+    let locations = engine
+        .index_manager()
+        .unique_key_locations(
+            "main",
+            "t",
+            index_name,
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
+
+    engine.execute(&mut session, "OPTIMIZE TABLE t")?;
+    assert!(engine
+        .index_manager()
+        .unique_key_locations(
+            "main",
+            "t",
+            index_name,
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?
+        .is_none());
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'optimized')")?;
+    let locations = engine
+        .index_manager()
+        .unique_key_locations(
+            "main",
+            "t",
+            index_name,
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
+    drop(engine);
+
+    let engine = Engine::new(dir.path(), "main")?;
+    let locations = engine
+        .index_manager()
+        .unique_key_locations(
+            "main",
+            "t",
+            index_name,
+            &[vec![ScalarValue::Int64(Some(1))]],
+        )?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "optimized");
     Ok(())
 }
 
