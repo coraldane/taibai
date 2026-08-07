@@ -389,8 +389,7 @@ fn parse_hh_mm(s: &str) -> Option<(u32, u32)> {
 }
 
 /// Start the background scheduler that flushes HOT tables once per day when
-/// each table's `HOT ... CLOSE AT` time is reached. Tables without an explicit
-/// close time default to 15:30 local time.
+/// each table's explicit `HOT ... CLOSE AT` time is reached.
 pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHandle<()> {
     use chrono::{Local, Timelike};
     use std::collections::HashSet;
@@ -409,11 +408,13 @@ pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHan
                     let mut tables = Vec::new();
                     for (db, catalog) in catalogs.iter() {
                         for (table, meta) in catalog.tables.iter() {
-                            if meta.hot_time_column.is_some() {
+                            if let (Some(_), Some(close_time)) =
+                                (&meta.hot_time_column, &meta.hot_close_time)
+                            {
                                 tables.push((
                                     db.clone(),
                                     table.clone(),
-                                    meta.hot_close_time.as_deref().unwrap_or("15:30").to_string(),
+                                    close_time.clone(),
                                     meta.hot_last_close_date.clone(),
                                 ));
                             }

@@ -310,7 +310,7 @@ fn default_global_cpu_permits() -> usize {
 }
 
 fn default_row_group_target_rows() -> usize {
-    131_072
+    8_192
 }
 
 fn default_log_level() -> String {

@@ -59,7 +59,7 @@ buffer:
   join_spill_partitions: 16
 
 storage:
-  row_group_target_rows: 131072
+  row_group_target_rows: 8192
 
 performance:
   max_entries: 1024

@@ -22,7 +22,7 @@ impl Default for SegmentConfig {
         Self {
             min_segment_size: DEFAULT_MIN_SEGMENT_SIZE,
             max_segment_size: DEFAULT_MAX_SEGMENT_SIZE,
-            row_group_target_rows: 131_072,
+            row_group_target_rows: 8_192,
         }
     }
 }

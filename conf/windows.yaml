@@ -11,6 +11,7 @@ storage:
   min_segment_seal_size_mb: 500
   max_segment_size_mb: 2048
   hot_store_memory_limit_mb: 8192
+  row_group_target_rows: 8192
 
 buffer:
   query_memory_limit_mb: 4096
