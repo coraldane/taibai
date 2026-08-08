@@ -1090,7 +1090,10 @@ fn encode_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
         put_varint(&mut out, prefix_len as u64);
         put_varint(&mut out, (encoded_key.len() - prefix_len) as u64);
         out.extend_from_slice(&encoded_key[prefix_len..]);
-        put_varint(&mut out, path_ids[entry.location.segment_path.as_str()] as u64);
+        put_varint(
+            &mut out,
+            path_ids[entry.location.segment_path.as_str()] as u64,
+        );
         put_varint(&mut out, entry.location.row_id);
     }
     out.push(if data.flush_epoch.is_some() { 1 } else { 0 });
@@ -1619,10 +1622,8 @@ mod tests {
     fn flush_epoch_mismatch_forces_location_probe_rebuild() -> Result<()> {
         let dir = tempfile::tempdir().unwrap();
         let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
-        let manager = IndexManager::new_with_data_dir(
-            Arc::clone(&segment_mgr),
-            dir.path().to_path_buf(),
-        );
+        let manager =
+            IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
         manager.persist_unique_index_entries(
             "db",
             "ticks",
@@ -1645,10 +1646,8 @@ mod tests {
         );
         // The epoch survives a restart through the on-disk marker.
         let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
-        let manager = IndexManager::new_with_data_dir(
-            Arc::clone(&segment_mgr),
-            dir.path().to_path_buf(),
-        );
+        let manager =
+            IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
         assert_eq!(segment_mgr.memtable_flush_epoch("db", "ticks"), 1);
         assert_eq!(
             manager.unique_key_locations(

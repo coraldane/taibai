@@ -854,3 +854,39 @@ fn test_txn_error_rollback_without_active() {
     let msg = String::from_utf8_lossy(&resp[0].payload);
     assert!(msg.contains("no active transaction"), "got: {msg}");
 }
+
+#[test]
+fn prepare_insert_returns_decimal_target_scale() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, engine, "root");
+
+    let mut query = Vec::new();
+    write_len_prefixed_string(&mut query, "main");
+    write_len_prefixed_string(
+        &mut query,
+        "CREATE TABLE prices (id INT64, amount DECIMAL(12,4))",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(query)))
+        .unwrap();
+
+    for sql in [
+        "INSERT INTO prices (id, amount) VALUES (?, ?)",
+        "INSERT INTO prices VALUES (?, ?)",
+    ] {
+        let mut prepare = Vec::new();
+        write_len_prefixed_string(&mut prepare, sql);
+        let response = handler
+            .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prepare)))
+            .unwrap();
+        assert_eq!(response[0].msg_type, MSG_TYPE_PREPARE);
+        assert_eq!(
+            u32::from_le_bytes(response[0].payload[4..8].try_into().unwrap()),
+            2
+        );
+        assert_eq!(response[0].payload[10], DataType::Decimal as u8);
+        assert_eq!(response[0].payload[11], 4);
+    }
+}

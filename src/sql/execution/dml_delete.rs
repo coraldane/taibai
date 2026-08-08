@@ -81,11 +81,7 @@ fn replace_row_matches_key_set(
     keys.contains(&key)
 }
 
-fn filter_batch_keep(
-    batch: &RecordBatch,
-    keep: &[bool],
-    keep_count: usize,
-) -> Result<RecordBatch> {
+fn filter_batch_keep(batch: &RecordBatch, keep: &[bool], keep_count: usize) -> Result<RecordBatch> {
     let columns = batch
         .columns
         .iter()
@@ -131,8 +127,7 @@ pub(crate) fn plan_replace_memtable_conflicts(
                 if removed == 0 {
                     return None;
                 }
-                let filtered =
-                    filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
+                let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
                 Some((batch.clone(), filtered))
             })
             .flatten();
@@ -183,8 +178,7 @@ fn plan_delete_memtable_rows(
                     return None;
                 }
                 let keep = mask.iter().map(|matches| !matches).collect::<Vec<_>>();
-                let filtered =
-                    filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
+                let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
                 Some((batch.clone(), filtered))
             })
             .flatten();
@@ -690,12 +684,13 @@ pub fn exec_delete(
             table,
             &resolved_where_clause,
             &table_schema,
-            target_partition_key.as_deref().filter(|key| !key.is_empty()),
+            target_partition_key
+                .as_deref()
+                .filter(|key| !key.is_empty()),
         )?;
         if !memtable_plans.is_empty() {
             engine.hot_store_manager().remove(db, table);
-            let undo =
-                apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
+            let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
             total_deleted += undo.deleted_rows();
         }
 

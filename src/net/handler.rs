@@ -472,13 +472,21 @@ impl Handler {
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&stmt.id.to_le_bytes());
                 buf.extend_from_slice(&(stmt.param_count as u32).to_le_bytes());
-                if let Statement::Insert { table, columns, .. } | Statement::Replace { table, columns, .. } = &stmt.stmt {
+                if let Statement::Insert { table, columns, .. }
+                | Statement::Replace { table, columns, .. } = &stmt.stmt
+                {
                     let database = table.effective_database(&session.database);
                     if let Some(meta) = self.engine.get_table_meta(database, &table.name) {
                         for param_index in 0..stmt.param_count {
-                            let column = columns.get(param_index).and_then(|name| {
-                                meta.columns.iter().find(|column| column.name.eq_ignore_ascii_case(name))
-                            });
+                            let column = if columns.is_empty() {
+                                meta.columns.get(param_index)
+                            } else {
+                                columns.get(param_index).and_then(|name| {
+                                    meta.columns
+                                        .iter()
+                                        .find(|column| column.name.eq_ignore_ascii_case(name))
+                                })
+                            };
                             buf.push(column.map(|column| column.data_type as u8).unwrap_or(0));
                             buf.push(column.map(|column| column.scale as u8).unwrap_or(0));
                         }
@@ -505,7 +513,6 @@ impl Handler {
             )]);
         }
         let stmt_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-
         let mut offset = 4usize;
         let mut params: Vec<ScalarValue> = Vec::new();
 

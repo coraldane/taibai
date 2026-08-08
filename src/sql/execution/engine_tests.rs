@@ -649,7 +649,11 @@ fn replace_deletes_conflicting_memtable_rows_in_place() -> Result<()> {
         0,
     );
     assert_eq!(name, "new");
-    let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
     assert_eq!(count, 1);
 
     // A second REPLACE conflicts with the row the first REPLACE left resident
@@ -660,7 +664,11 @@ fn replace_deletes_conflicting_memtable_rows_in_place() -> Result<()> {
         0,
         0,
     );
-    let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
     assert_eq!(name, "newer");
     assert_eq!(count, 1);
 
@@ -673,7 +681,11 @@ fn replace_deletes_conflicting_memtable_rows_in_place() -> Result<()> {
         0,
         0,
     );
-    let count = first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0);
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
     assert_eq!(name, "final");
     assert_eq!(count, 1);
     Ok(())

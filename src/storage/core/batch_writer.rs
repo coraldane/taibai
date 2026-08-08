@@ -924,7 +924,12 @@ impl BatchWriter {
         tail_committer: &Arc<TailCommitter>,
     ) -> Result<()> {
         if group.len() == 1 {
-            return Self::flush_memtable_inner(segment_mgr, &group[0], table_lock_held, tail_committer);
+            return Self::flush_memtable_inner(
+                segment_mgr,
+                &group[0],
+                table_lock_held,
+                tail_committer,
+            );
         }
         let db = group[0].db().to_string();
         let table = group[0].table().to_string();
@@ -1017,7 +1022,11 @@ impl BatchWriter {
             &partition_key,
             &merged,
             txn_id,
-            || locked.iter().all(|(mt, _)| mt.state() == MemTableState::Flushing),
+            || {
+                locked
+                    .iter()
+                    .all(|(mt, _)| mt.state() == MemTableState::Flushing)
+            },
             || {
                 for (mt, _) in &locked {
                     let _ = mt.take_batch();
@@ -1067,9 +1076,9 @@ impl BatchWriter {
         let mut merged = first.clone();
         for (_, batch) in iter {
             for col_idx in 0..batch.num_columns() {
-                let source = batch
-                    .column(col_idx)
-                    .ok_or_else(|| TaibaiError::Storage("flush group batch is missing a column".into()))?;
+                let source = batch.column(col_idx).ok_or_else(|| {
+                    TaibaiError::Storage("flush group batch is missing a column".into())
+                })?;
                 let destination = merged.column_mut(col_idx).ok_or_else(|| {
                     TaibaiError::Storage("flush group merged batch is missing a column".into())
                 })?;
@@ -1145,7 +1154,11 @@ impl BatchWriter {
             partition_key,
             merged,
             0,
-            || locked.iter().all(|(mt, _)| mt.state() == MemTableState::Flushing),
+            || {
+                locked
+                    .iter()
+                    .all(|(mt, _)| mt.state() == MemTableState::Flushing)
+            },
             || {
                 for (mt, _) in locked {
                     let _ = mt.take_batch();
@@ -1178,7 +1191,8 @@ impl BatchWriter {
             return Ok(());
         }
         for intent in intents {
-            if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent) {
+            if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent)
+            {
                 tracing::warn!(
                     db,
                     table,
@@ -1280,7 +1294,8 @@ impl BatchWriter {
             mt.set_state(MemTableState::Flushed);
         }
         for intent in intents {
-            if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent) {
+            if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent)
+            {
                 tracing::warn!(
                     db,
                     table,
