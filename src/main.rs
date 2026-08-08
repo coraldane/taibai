@@ -139,7 +139,10 @@ async fn main() {
 
 async fn run_server(config: ServerConfig) {
     run_server_until(config, async {
-        let _ = tokio::signal::ctrl_c().await;
+        if tokio::signal::ctrl_c().await.is_err() {
+            tracing::warn!("Ctrl+C handler unavailable (headless session); server runs until killed");
+            std::future::pending::<()>().await;
+        }
         tracing::info!("received Ctrl+C, flushing active segments...");
     })
     .await;
@@ -226,6 +229,7 @@ where
 
     if let Err(e) = server.run_with_shutdown(shutdown).await {
         tracing::error!(error = %e, "server error");
+        eprintln!("taibai server error: {e}");
     }
 
     match engine.flush_shutdown_buffers() {
