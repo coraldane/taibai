@@ -32,20 +32,26 @@ fn recover_durable_memtable_tails(
         for (table, table_meta) in &catalog.tables {
             let table_dir = data_dir.join(db).join(table);
             let schema = Schema::new(table_meta.columns.clone());
-            for tail in crate::storage::core::durable_tail::recover(&table_dir, &schema)? {
-                if tail.batch.num_rows() == 0 {
+            // Lazy recovery: tails are only indexed here (no decode), and each
+            // memtable materializes from its tail file on first access. This
+            // keeps restart time and post-restart memory independent of the
+            // amount of unflushed data.
+            for tail in crate::storage::core::durable_tail::recover_index(&table_dir, &schema)? {
+                if tail.rows == 0 {
                     continue;
                 }
-                let rows = tail.batch.num_rows();
-                batch_writer.memtable_manager().restore_committed_tail(
+                let rows = tail.rows;
+                batch_writer.memtable_manager().restore_spilled_tail(
                     tail.id,
                     db,
                     table,
                     &tail.partition_key,
-                    tail.batch,
+                    schema.clone(),
+                    rows,
+                    tail.path,
                 );
                 recovered_tables.insert((db.clone(), table.clone()));
-                tracing::info!(db, table, rows, "recovered durable low-rate memtable tail");
+                tracing::info!(db, table, rows, "recovered durable low-rate memtable tail (spilled)");
             }
         }
     }

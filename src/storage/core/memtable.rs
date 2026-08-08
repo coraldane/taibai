@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -28,12 +29,23 @@ pub enum TxnVisibility {
     Aborted,
 }
 
+/// Where a pending memtable's rows live. Committed rows are always durable in
+/// the memtable's tail file, so the resident batch is only a query
+/// acceleration copy: spilling drops it and re-points the memtable at its
+/// tail, from which the rows are lazily re-materialized on first access.
+enum MemTableBacking {
+    Resident,
+    Spilled { tail_path: PathBuf, rows: u64 },
+}
+
 pub struct MemTable {
     id: Uuid,
     db: String,
     table: String,
     partition_key: String,
+    schema: Schema,
     batch: RwLock<Option<Arc<RecordBatch>>>,
+    backing: RwLock<MemTableBacking>,
     state: AtomicU8,
     row_count: AtomicU64,
     created_at: Instant,
@@ -48,7 +60,9 @@ impl MemTable {
             db,
             table,
             partition_key,
-            batch: RwLock::new(Some(Arc::new(RecordBatch::new(schema)))),
+            batch: RwLock::new(Some(Arc::new(RecordBatch::new(schema.clone())))),
+            schema,
+            backing: RwLock::new(MemTableBacking::Resident),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(0),
             created_at: Instant::now(),
@@ -69,7 +83,9 @@ impl MemTable {
             db,
             table,
             partition_key,
-            batch: RwLock::new(Some(Arc::new(RecordBatch::new(schema)))),
+            batch: RwLock::new(Some(Arc::new(RecordBatch::new(schema.clone())))),
+            schema,
+            backing: RwLock::new(MemTableBacking::Resident),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(0),
             created_at: Instant::now(),
@@ -145,6 +161,7 @@ impl MemTable {
         if added == 0 {
             return Ok(0);
         }
+        self.ensure_resident()?;
         let mut guard = self.batch.write().unwrap();
         match guard.as_mut() {
             Some(existing) => {
@@ -170,6 +187,7 @@ impl MemTable {
         if added == 0 {
             return Ok(0);
         }
+        self.ensure_resident()?;
         let mut guard = self.batch.write().unwrap();
         match guard.as_mut() {
             Some(existing) if existing.num_rows() > 0 => {
@@ -207,16 +225,25 @@ impl MemTable {
     }
 
     pub fn read(&self) -> Option<RecordBatch> {
+        if self.ensure_resident().is_err() {
+            return None;
+        }
         let guard = self.batch.read().unwrap();
         guard.as_ref().map(|batch| batch.as_ref().clone())
     }
 
     pub fn read_with<R>(&self, f: impl FnOnce(&RecordBatch) -> R) -> Option<R> {
+        if self.ensure_resident().is_err() {
+            return None;
+        }
         let guard = self.batch.read().unwrap();
         guard.as_ref().map(|batch| f(batch.as_ref()))
     }
 
     pub fn take_batch(&self) -> Option<RecordBatch> {
+        if self.ensure_resident().is_err() {
+            return None;
+        }
         let mut guard = self.batch.write().unwrap();
         guard
             .take()
@@ -227,6 +254,9 @@ impl MemTable {
     /// flush path so the data stays resident (then the memtable is marked
     /// `Archived`), in contrast to `take_batch()` which empties the memtable.
     pub fn read_snapshot(&self) -> Option<RecordBatch> {
+        if self.ensure_resident().is_err() {
+            return None;
+        }
         let guard = self.batch.read().unwrap();
         guard.as_ref().map(|batch| batch.as_ref().clone())
     }
@@ -235,13 +265,113 @@ impl MemTable {
     /// memtable enters `Flushing`, INSERTs switch to a new memtable, so this
     /// shared batch remains immutable without copying all column buffers.
     pub fn read_snapshot_shared(&self) -> Option<Arc<RecordBatch>> {
+        if self.ensure_resident().is_err() {
+            return None;
+        }
         self.batch.read().unwrap().clone()
+    }
+
+    pub fn is_spilled(&self) -> bool {
+        matches!(
+            *self.backing.read().unwrap(),
+            MemTableBacking::Spilled { .. }
+        )
+    }
+
+    /// Resident bytes owned by this memtable; a spilled memtable keeps only
+    /// metadata in memory.
+    pub fn estimated_memory_bytes(&self) -> u64 {
+        if self.is_spilled() {
+            return 0;
+        }
+        self.batch
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|batch| batch.estimated_size_bytes() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Drop the resident batch and re-point this memtable at its durable
+    /// tail. The caller must have verified (under the table mutation lock,
+    /// after a tail barrier) that `tail_path` holds exactly `row_count()`
+    /// committed rows. Returns `false` without changing anything when the
+    /// memtable is no longer pending or has no resident rows.
+    pub fn spill_to_tail(&self, tail_path: PathBuf) -> bool {
+        if self.state() != MemTableState::Pending {
+            return false;
+        }
+        let mut batch_guard = self.batch.write().unwrap();
+        let mut backing_guard = self.backing.write().unwrap();
+        if self.state() != MemTableState::Pending {
+            return false;
+        }
+        if matches!(*backing_guard, MemTableBacking::Spilled { .. }) {
+            return false;
+        }
+        let Some(batch) = batch_guard.as_ref() else {
+            return false;
+        };
+        let rows = batch.num_rows() as u64;
+        if rows == 0 {
+            return false;
+        }
+        *batch_guard = None;
+        *backing_guard = MemTableBacking::Spilled { tail_path, rows };
+        self.row_count.store(rows, Ordering::Release);
+        true
+    }
+
+    /// Materialize a spilled memtable from its durable tail. Lock order is
+    /// always `batch` then `backing`; the decode happens outside both locks.
+    fn ensure_resident(&self) -> Result<()> {
+        let tail_path = {
+            let guard = self.backing.read().unwrap();
+            match &*guard {
+                MemTableBacking::Resident => return Ok(()),
+                MemTableBacking::Spilled { tail_path, .. } => tail_path.clone(),
+            }
+        };
+        let decoded = crate::storage::core::durable_tail::decode_tail_file(&tail_path, &self.schema);
+        let mut batch_guard = self.batch.write().unwrap();
+        let mut backing_guard = self.backing.write().unwrap();
+        let expected_rows = match &*backing_guard {
+            MemTableBacking::Resident => return Ok(()),
+            MemTableBacking::Spilled { rows, .. } => *rows,
+        };
+        let (_, batch) = decoded.map_err(|error| {
+            tracing::error!(
+                error = %error,
+                path = %tail_path.display(),
+                db = %self.db,
+                table = %self.table,
+                "failed to materialize spilled memtable tail"
+            );
+            error
+        })?;
+        let decoded_rows = batch.num_rows() as u64;
+        if decoded_rows != expected_rows {
+            tracing::error!(
+                expected_rows,
+                decoded_rows,
+                path = %tail_path.display(),
+                db = %self.db,
+                table = %self.table,
+                "spilled memtable tail row count mismatch; trusting the tail"
+            );
+            self.row_count.store(decoded_rows, Ordering::Release);
+        }
+        *batch_guard = Some(Arc::new(batch));
+        *backing_guard = MemTableBacking::Resident;
+        Ok(())
     }
 
     pub fn restore_batch(&self, batch: RecordBatch) {
         let rows = batch.num_rows() as u64;
         let mut guard = self.batch.write().unwrap();
+        let mut backing_guard = self.backing.write().unwrap();
         *guard = Some(Arc::new(batch));
+        *backing_guard = MemTableBacking::Resident;
         self.row_count.store(rows, Ordering::Release);
     }
 
@@ -262,7 +392,39 @@ impl MemTable {
             db,
             table,
             partition_key,
+            schema: batch.schema.clone(),
             batch: RwLock::new(Some(Arc::new(batch))),
+            backing: RwLock::new(MemTableBacking::Resident),
+            state: AtomicU8::new(MemTableState::Pending as u8),
+            row_count: AtomicU64::new(rows),
+            created_at: Instant::now(),
+            txn_id: AtomicU64::new(0),
+            visibility: RwLock::new(TxnVisibility::Committed),
+        }
+    }
+
+    /// A recovered or spilled memtable whose rows live only in its durable
+    /// tail; the batch is materialized lazily on first access.
+    pub fn spilled(
+        id: Uuid,
+        db: String,
+        table: String,
+        partition_key: String,
+        schema: Schema,
+        rows: u64,
+        tail_path: PathBuf,
+    ) -> Self {
+        Self {
+            id,
+            db,
+            table,
+            partition_key,
+            schema,
+            batch: RwLock::new(None),
+            backing: RwLock::new(MemTableBacking::Spilled {
+                tail_path,
+                rows,
+            }),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(rows),
             created_at: Instant::now(),
@@ -278,6 +440,9 @@ impl MemTable {
         if self.state() != MemTableState::Pending {
             return false;
         }
+        if self.ensure_resident().is_err() {
+            return false;
+        }
         let rows = batch.num_rows() as u64;
         let mut guard = self.batch.write().unwrap();
         if self.state() != MemTableState::Pending {
@@ -289,8 +454,7 @@ impl MemTable {
     }
 
     pub fn schema(&self) -> Option<Schema> {
-        let guard = self.batch.read().unwrap();
-        guard.as_ref().map(|b| b.schema.clone())
+        Some(self.schema.clone())
     }
 
     pub fn age_secs(&self) -> u64 {
@@ -343,6 +507,53 @@ impl MemTableManager {
         ));
         memtables.push(Arc::clone(&memtable));
         memtable
+    }
+
+    /// Register a recovered tail without decoding it: the memtable starts
+    /// spilled and materializes from `tail_path` on first access.
+    pub fn restore_spilled_tail(
+        &self,
+        id: Uuid,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        schema: Schema,
+        rows: u64,
+        tail_path: std::path::PathBuf,
+    ) -> Arc<MemTable> {
+        let mut memtables = self.memtables.write().unwrap();
+        if let Some(existing) = memtables.iter().find(|memtable| memtable.id() == id) {
+            return Arc::clone(existing);
+        }
+        let memtable = Arc::new(MemTable::spilled(
+            id,
+            db.to_string(),
+            table.to_string(),
+            partition_key.to_string(),
+            schema,
+            rows,
+            tail_path,
+        ));
+        memtables.push(Arc::clone(&memtable));
+        memtable
+    }
+
+    /// Pending, committed, resident memtables old enough to spill. The caller
+    /// still verifies the durable tail row count before spilling each one.
+    pub fn spill_candidates(&self, min_age_secs: u64) -> Vec<Arc<MemTable>> {
+        let memtables = self.memtables.read().unwrap();
+        memtables
+            .iter()
+            .filter(|mt| {
+                mt.state() == MemTableState::Pending
+                    && !mt.is_transactional()
+                    && mt.visibility() == TxnVisibility::Committed
+                    && !mt.is_spilled()
+                    && mt.row_count() > 0
+                    && mt.age_secs() >= min_age_secs
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn get_or_create(
@@ -632,22 +843,15 @@ impl MemTableManager {
             .sum()
     }
 
-    /// Approximate resident bytes owned by pending memtables. This uses the
-    /// actual column-vector capacities instead of a nominal bytes-per-row
-    /// multiplier, which matters for wide SQL INSERT batches.
+    /// Approximate resident bytes owned by pending memtables. Spilled
+    /// memtables contribute only metadata (counted as zero), since their rows
+    /// live in the durable tail.
     pub fn total_estimated_memory_bytes(&self) -> u64 {
         let memtables = self.memtables.read().unwrap();
         memtables
             .iter()
             .filter(|mt| mt.state() == MemTableState::Pending)
-            .map(|mt| {
-                mt.batch
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .map(|batch| batch.estimated_size_bytes() as u64)
-                    .unwrap_or(0)
-            })
+            .map(|mt| mt.estimated_memory_bytes())
             .sum()
     }
 
@@ -714,5 +918,51 @@ mod tests {
         assert!(manager.total_estimated_memory_bytes() >= 3 * std::mem::size_of::<i64>() as u64);
         memtable.set_state(MemTableState::Flushed);
         assert_eq!(manager.total_estimated_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn spilled_memtable_materializes_lazily() {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let memtable = MemTable::new("main".into(), "t".into(), "2026".into(), schema.clone());
+        let rows = batch(&schema, &[1, 2, 3]);
+        memtable.append(&rows).unwrap();
+        assert!(memtable.estimated_memory_bytes() > 0);
+
+        crate::storage::core::durable_tail::persist(temp.path(), memtable.id(), "2026", &rows)
+            .unwrap();
+        let tail_path =
+            crate::storage::core::durable_tail::live_tail_path(temp.path(), memtable.id())
+                .unwrap()
+                .expect("tail should exist");
+
+        assert!(memtable.spill_to_tail(tail_path));
+        assert!(memtable.is_spilled());
+        assert_eq!(memtable.estimated_memory_bytes(), 0);
+        assert_eq!(memtable.row_count(), 3);
+        // A second spill is a no-op.
+        assert!(!memtable.spill_to_tail(std::path::PathBuf::from("unused")));
+
+        let snapshot = memtable.read_snapshot().expect("spilled rows materialize");
+        assert_eq!(snapshot.num_rows(), 3);
+        assert_eq!(snapshot.scalar(2, 0), Some(ScalarValue::Int64(Some(3))));
+        assert!(!memtable.is_spilled());
+
+        // Appending after materialization keeps all rows visible.
+        memtable.append(&batch(&schema, &[4])).unwrap();
+        let snapshot = memtable.read_snapshot().unwrap();
+        assert_eq!(snapshot.num_rows(), 4);
+    }
+
+    #[test]
+    fn spill_rejects_empty_or_flushed_memtables() {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let memtable = MemTable::new("main".into(), "t".into(), "".into(), schema.clone());
+        assert!(!memtable.spill_to_tail(temp.path().join("none.tail")));
+
+        memtable.append(&batch(&schema, &[1])).unwrap();
+        memtable.set_state(MemTableState::Flushing);
+        assert!(!memtable.spill_to_tail(temp.path().join("none.tail")));
     }
 }

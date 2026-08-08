@@ -16,6 +16,7 @@ const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 const DEFAULT_MAX_TOTAL_MEMORY: u64 = 512 * 1024 * 1024;
 const DEFAULT_LOW_RATE_MAX_ROWS: u64 = 1024;
 const DEFAULT_LOW_RATE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_SPILL_MIN_AGE_SECS: u64 = 60;
 
 fn insert_profile_enabled() -> bool {
     matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"))
@@ -61,6 +62,10 @@ pub struct BatchWriterConfig {
     pub worker_count: usize,
     pub low_rate_max_rows: u64,
     pub low_rate_max_age_secs: u64,
+    /// Relieve memtable memory pressure by spilling cold committed memtables
+    /// to their durable tails instead of flushing small row groups.
+    pub spill_enabled: bool,
+    pub spill_min_age_secs: u64,
 }
 
 impl Default for BatchWriterConfig {
@@ -72,6 +77,8 @@ impl Default for BatchWriterConfig {
             worker_count: 1,
             low_rate_max_rows: DEFAULT_LOW_RATE_MAX_ROWS,
             low_rate_max_age_secs: DEFAULT_LOW_RATE_MAX_AGE_SECS,
+            spill_enabled: true,
+            spill_min_age_secs: DEFAULT_SPILL_MIN_AGE_SECS,
         }
     }
 }
@@ -138,6 +145,8 @@ impl BatchWriter {
         let flush_stop = Arc::clone(&stop);
         let flush_interval = config.flush_interval_secs;
         let flush_memory_high_water = config.max_total_memory.max(1);
+        let flush_spill_enabled = config.spill_enabled;
+        let flush_spill_min_age_secs = config.spill_min_age_secs;
         let flush_mgr = Arc::clone(&segment_mgr);
         let flush_mt_mgr = Arc::clone(&memtable_mgr);
         let flush_tail_committer = Arc::clone(&tail_committer);
@@ -152,12 +161,34 @@ impl BatchWriter {
                             break;
                         }
                         if flush_mt_mgr.total_estimated_memory_bytes() >= flush_memory_high_water {
-                            if let Err(e) = Self::flush_all_pending(
-                                &flush_mgr,
-                                &flush_mt_mgr,
-                                &flush_tail_committer,
-                            ) {
-                                tracing::warn!(error = %e, "pressure memtable flush failed");
+                            // Spilling cold committed memtables to their
+                            // durable tails is the first relief valve: it
+                            // frees memory without cutting small row groups.
+                            if flush_spill_enabled {
+                                let spilled = Self::spill_pressure_pass(
+                                    &flush_mgr,
+                                    &flush_mt_mgr,
+                                    &flush_tail_committer,
+                                    flush_memory_high_water,
+                                    flush_spill_min_age_secs,
+                                );
+                                if spilled > 0 {
+                                    tracing::info!(
+                                        spilled,
+                                        "memory pressure relieved by spilling memtables to durable tails"
+                                    );
+                                }
+                            }
+                            if flush_mt_mgr.total_estimated_memory_bytes()
+                                >= flush_memory_high_water
+                            {
+                                if let Err(e) = Self::flush_all_pending(
+                                    &flush_mgr,
+                                    &flush_mt_mgr,
+                                    &flush_tail_committer,
+                                ) {
+                                    tracing::warn!(error = %e, "pressure memtable flush failed");
+                                }
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -744,6 +775,89 @@ impl BatchWriter {
         }
         memtable_mgr.remove_flushed();
         Ok(())
+    }
+
+    /// Spill cold committed memtables onto their durable tails until resident
+    /// memory drops to 80% of the high-water mark, or candidates run out.
+    /// Returns the number of memtables spilled. Spilling is metadata-only:
+    /// the rows are already durable in the tail, so this performs no I/O
+    /// beyond a tail barrier and a frame-header scan.
+    fn spill_pressure_pass(
+        segment_mgr: &Arc<SegmentManager>,
+        memtable_mgr: &Arc<MemTableManager>,
+        tail_committer: &Arc<TailCommitter>,
+        high_water: u64,
+        min_age_secs: u64,
+    ) -> usize {
+        let target = high_water.saturating_sub(high_water / 5);
+        let mut candidates = memtable_mgr.spill_candidates(min_age_secs);
+        candidates.sort_by_key(|mt| std::cmp::Reverse(mt.age_secs()));
+        let mut by_table = Vec::<((String, String), Vec<Arc<crate::storage::core::memtable::MemTable>>)>::new();
+        'outer: for mt in candidates {
+            let key = (mt.db().to_string(), mt.table().to_string());
+            for (existing_key, group) in by_table.iter_mut() {
+                if *existing_key == key {
+                    group.push(mt);
+                    continue 'outer;
+                }
+            }
+            by_table.push((key, vec![mt]));
+        }
+        let mut spilled = 0usize;
+        for ((db, table), mts) in by_table {
+            if memtable_mgr.total_estimated_memory_bytes() <= target {
+                break;
+            }
+            let table_dir = segment_mgr.table_dir(&db, &table);
+            let result = segment_mgr.with_table_mutation_lock(&db, &table, || {
+                tail_committer.barrier(&table_dir)?;
+                let mut count = 0usize;
+                for mt in &mts {
+                    if memtable_mgr.total_estimated_memory_bytes() <= target {
+                        break;
+                    }
+                    if Self::try_spill_memtable(&table_dir, mt) {
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            });
+            match result {
+                Ok(count) => spilled += count,
+                Err(error) => {
+                    tracing::warn!(db, table, error = %error, "memtable spill pass failed for table")
+                }
+            }
+        }
+        spilled
+    }
+
+    /// Spill one memtable after proving its durable tail covers exactly the
+    /// memtable's rows. Holding the table mutation lock plus the preceding
+    /// tail barrier makes that proof race-free against concurrent inserts.
+    fn try_spill_memtable(
+        table_dir: &std::path::Path,
+        mt: &Arc<crate::storage::core::memtable::MemTable>,
+    ) -> bool {
+        if mt.state() != MemTableState::Pending
+            || mt.is_transactional()
+            || mt.visibility() != crate::storage::core::memtable::TxnVisibility::Committed
+        {
+            return false;
+        }
+        let Ok(Some(path)) = crate::storage::core::durable_tail::live_tail_path(table_dir, mt.id())
+        else {
+            return false;
+        };
+        // Only v2 tails expose their row count without decoding; legacy tails
+        // stay resident and migrate to v2 on the next append.
+        let Ok(Some(tail_rows)) = crate::storage::core::durable_tail::tail_log_rows(&path) else {
+            return false;
+        };
+        if tail_rows != mt.row_count() {
+            return false;
+        }
+        mt.spill_to_tail(path)
     }
 
     /// Flush *every* pending memtable regardless of age or size. Used under
@@ -1515,6 +1629,8 @@ mod tests {
             worker_count: 1,
             low_rate_max_rows: 1024,
             low_rate_max_age_secs: 3600,
+            spill_enabled: true,
+            spill_min_age_secs: 0,
         }
     }
 
@@ -1701,6 +1817,84 @@ mod tests {
         let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
         assert_eq!(recovered.len(), 1, "unsatisfied watermark must replay");
         assert_eq!(recovered[0].batch.num_rows(), 3);
+        Ok(())
+    }
+
+    /// Under memory pressure a cold committed memtable spills to its durable
+    /// tail instead of being flushed into a small row group; a later flush
+    /// materializes the rows exactly once.
+    #[test]
+    fn memory_pressure_spills_memtable_then_flush_materializes() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+
+        let batch = make_batch(&schema, 0, 5)?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        assert!(writer.memtable_manager().total_estimated_memory_bytes() > 0);
+
+        // A 1-byte high-water mark forces the pass to spill everything.
+        let spilled = BatchWriter::spill_pressure_pass(
+            &segment_mgr,
+            writer.memtable_manager(),
+            &writer.tail_committer,
+            1,
+            0,
+        );
+        assert_eq!(spilled, 1);
+        assert_eq!(writer.memtable_manager().total_estimated_memory_bytes(), 0);
+        assert_eq!(
+            total_segment_rows(&table_dir),
+            0,
+            "spilling must not cut a row group"
+        );
+        assert!(tail_entries(&table_dir) > 0, "spilled rows stay in the tail");
+
+        writer.flush_table(TEST_DB, TEST_TABLE)?;
+        writer.stop();
+
+        assert_eq!(total_segment_rows(&table_dir), 5);
+        assert_eq!(tail_entries(&table_dir), 0, "flushed tails must be cleared");
+        Ok(())
+    }
+
+    /// A spilled memtable keeps serving reads by materializing from its tail,
+    /// and new inserts land on top of the recovered rows.
+    #[test]
+    fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+
+        writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 0, 3)?, schema.clone())?;
+        let spilled = BatchWriter::spill_pressure_pass(
+            &segment_mgr,
+            writer.memtable_manager(),
+            &writer.tail_committer,
+            1,
+            0,
+        );
+        assert_eq!(spilled, 1);
+
+        let memtables = writer.memtable_manager().get_by_table(TEST_DB, TEST_TABLE);
+        assert_eq!(memtables.len(), 1);
+        assert!(memtables[0].is_spilled());
+        let snapshot = memtables[0].read_snapshot().expect("spilled rows materialize");
+        assert_eq!(snapshot.num_rows(), 3);
+
+        writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 3, 2)?, schema)?;
+        let snapshot = writer.memtable_manager().get_by_table(TEST_DB, TEST_TABLE)[0]
+            .read_snapshot()
+            .unwrap();
+        assert_eq!(snapshot.num_rows(), 5);
+        drop(snapshot);
+        writer.stop();
         Ok(())
     }
 }

@@ -19,6 +19,9 @@ use crate::types::batch::{RecordBatch, Schema};
 
 const TAIL_MAGIC: u32 = 0x5441_494C;
 const TAIL_LOG_MAGIC: u32 = 0x544C_4F47;
+/// V2 tail log frames carry the row count in the frame header so recovery can
+/// index a tail without decompressing any payload.
+const TAIL_LOG_MAGIC_V2: u32 = 0x544C_4F48;
 const FLUSH_MAGIC: u32 = 0x464C_5553;
 const TAIL_DIR: &str = "memtable_tail";
 static TAIL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +37,7 @@ pub(crate) struct PreparedTailAppend {
     wal_payload: Vec<u8>,
     frame: Option<Vec<u8>>,
     schema: Schema,
+    rows: u64,
 }
 
 impl PreparedTailAppend {
@@ -42,6 +46,7 @@ impl PreparedTailAppend {
             wal_payload: prepare_batch_for_wal(batch),
             frame: None,
             schema: batch.schema.clone(),
+            rows: batch.num_rows() as u64,
         }
     }
 
@@ -56,7 +61,7 @@ impl PreparedTailAppend {
         if self.frame.is_none() {
             let raw = std::mem::take(&mut self.wal_payload);
             let payload = compress_prepared_batch_for_wal_with(compressor, raw);
-            self.frame = Some(encode_tail_frame_payload(&payload));
+            self.frame = Some(encode_tail_frame_payload(&payload, self.rows));
         }
     }
 
@@ -304,7 +309,9 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
     let tail_dir = command.table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
     if let Some(path) = newest_live_tail_path(&tail_dir, command.id)? {
-        if read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key) {
+        let is_v2 = read_tail_log_version(&path)? == Some(TAIL_LOG_MAGIC_V2);
+        if is_v2 && read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key)
+        {
             let file = fs::OpenOptions::new().append(true).open(&path)?;
             return Ok(OpenTailResult::Ready(OpenTail {
                 file,
@@ -314,8 +321,9 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
             }));
         }
 
-        // Legacy snapshot tails are uncommon and migrated synchronously once.
-        // Keeping this compatibility path avoids changing the on-disk format.
+        // Legacy snapshot and v1 log tails are migrated to the v2 log format
+        // synchronously once. Keeping this compatibility path means every live
+        // tail becomes row-indexable without a decode.
         let bytes = fs::read(&path)?;
         let (old_partition_key, old_batch) = decode_tail(&bytes, &command.prepared.schema)?;
         if old_partition_key != command.partition_key {
@@ -446,10 +454,20 @@ fn commit_append_group(
     }
 }
 
+#[allow(dead_code)] // still used by crash-recovery tests
 pub struct RecoveredTail {
     pub id: Uuid,
     pub partition_key: String,
     pub batch: RecordBatch,
+}
+
+/// Metadata-only view of a recovered tail: the rows stay on disk until a
+/// query, DML, or flush materializes them.
+pub struct RecoveredTailIndex {
+    pub id: Uuid,
+    pub partition_key: String,
+    pub rows: u64,
+    pub path: PathBuf,
 }
 
 pub struct FlushIntent {
@@ -620,7 +638,11 @@ pub fn cancel_flush(intent: FlushIntent) -> Result<()> {
     remove_file_if_exists(&intent.marker_path)
 }
 
-pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> {
+/// Apply generation arbitration (newest tail wins, clear tombstones, flush
+/// intents) and return the live tail file for every recoverable memtable id.
+/// Shared by `recover` (eager decode) and `recover_index` (metadata only);
+/// performs the same on-disk cleanup as before.
+fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf)>> {
     let tail_dir = table_dir.join(TAIL_DIR);
     if !tail_dir.exists() {
         return Ok(Vec::new());
@@ -639,16 +661,14 @@ pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> 
         by_id.entry(id).or_default().push(generation);
     }
 
-    let mut recovered = Vec::new();
+    let mut resolved = Vec::new();
     for (id, mut generations) in by_id {
         generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-        let mut recovered_tail = None;
+        let mut live_path = None;
         for generation in &generations {
             match generation.kind {
                 GenerationKind::Tail => {
-                    let bytes = fs::read(&generation.path)?;
-                    let (partition_key, batch) = decode_tail(&bytes, schema)?;
-                    recovered_tail = Some((generation.path.clone(), partition_key, batch));
+                    live_path = Some(generation.path.clone());
                     break;
                 }
                 GenerationKind::Clear => break,
@@ -664,17 +684,73 @@ pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> 
                 }
             }
         }
-        if let Some((path, partition_key, batch)) = recovered_tail {
+        if let Some(path) = live_path {
             remove_other_generations(&tail_dir, id, &path)?;
-            recovered.push(RecoveredTail {
-                id,
-                partition_key,
-                batch,
-            });
+            resolved.push((id, path));
         }
     }
     remove_empty_dir(&tail_dir);
+    Ok(resolved)
+}
+
+#[allow(dead_code)] // still used by crash-recovery tests
+pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> {
+    let mut recovered = Vec::new();
+    for (id, path) in resolve_live_tail_paths(table_dir)? {
+        let (partition_key, batch) = decode_tail_file(&path, schema)?;
+        recovered.push(RecoveredTail {
+            id,
+            partition_key,
+            batch,
+        });
+    }
     Ok(recovered)
+}
+
+/// Lazy counterpart of `recover`: v2 tails are indexed from frame headers
+/// without decoding; legacy tails are decoded once only to count rows, and
+/// their payloads remain on disk either way.
+pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTailIndex>> {
+    let mut recovered = Vec::new();
+    for (id, path) in resolve_live_tail_paths(table_dir)? {
+        let bytes = fs::read(&path)?;
+        if let Some(rows) = scan_tail_log_rows(&bytes) {
+            let partition_key = read_tail_log_partition_key(&path)?.ok_or_else(|| {
+                TaibaiError::Storage("v2 durable tail is missing its partition key".into())
+            })?;
+            recovered.push(RecoveredTailIndex {
+                id,
+                partition_key,
+                rows,
+                path,
+            });
+            continue;
+        }
+        let (partition_key, batch) = decode_tail(&bytes, schema)?;
+        recovered.push(RecoveredTailIndex {
+            id,
+            partition_key,
+            rows: batch.num_rows() as u64,
+            path,
+        });
+    }
+    Ok(recovered)
+}
+
+/// Newest live tail file for a memtable, applying the same clear/flush-intent
+/// arbitration as crash recovery. Used by the spill path.
+pub fn live_tail_path(table_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
+    newest_live_tail_path(&table_dir.join(TAIL_DIR), id)
+}
+
+/// Row count of a v2 tail log without decompressing any frame. Returns `None`
+/// for legacy formats, which are not eligible for spilling.
+pub fn tail_log_rows(path: &Path) -> Result<Option<u64>> {
+    Ok(scan_tail_log_rows(&fs::read(path)?))
+}
+
+pub(crate) fn decode_tail_file(path: &Path, schema: &Schema) -> Result<(String, RecordBatch)> {
+    decode_tail(&fs::read(path)?, schema)
 }
 
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -695,7 +771,7 @@ fn encode_tail_log(partition_key: &str, batch: &RecordBatch) -> Vec<u8> {
 
 fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(8 + partition_key.len());
-    bytes.extend_from_slice(&TAIL_LOG_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&TAIL_LOG_MAGIC_V2.to_le_bytes());
     bytes.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
     bytes.extend_from_slice(partition_key.as_bytes());
     bytes
@@ -703,12 +779,16 @@ fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
 
 fn encode_tail_frame(batch: &RecordBatch) -> Vec<u8> {
     let payload = serialize_batch_for_wal(batch);
-    encode_tail_frame_payload(&payload)
+    encode_tail_frame_payload(&payload, batch.num_rows() as u64)
 }
 
-fn encode_tail_frame_payload(payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(12 + payload.len());
+/// V2 frame layout: `[u64 payload_len][u64 rows][payload][crc32]`, with the
+/// CRC covering both header fields and the payload. V1 frames lacked the
+/// `rows` field; both versions remain decodable.
+fn encode_tail_frame_payload(payload: &[u8], rows: u64) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(20 + payload.len());
     frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&rows.to_le_bytes());
     frame.extend_from_slice(payload);
     let mut hasher = Hasher::new();
     hasher.update(&frame);
@@ -751,8 +831,11 @@ fn verify_crc(bytes: &[u8]) -> Result<&[u8]> {
 }
 
 fn decode_tail(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
-    if bytes.len() >= 4 && u32::from_le_bytes(bytes[0..4].try_into().unwrap()) == TAIL_LOG_MAGIC {
-        return decode_tail_log(bytes, schema);
+    if bytes.len() >= 4 {
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic == TAIL_LOG_MAGIC || magic == TAIL_LOG_MAGIC_V2 {
+            return decode_tail_log(bytes, schema);
+        }
     }
     let body = verify_crc(bytes)?;
     if body.len() < 16 {
@@ -787,6 +870,16 @@ fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch
     if bytes.len() < 8 {
         return Err(TaibaiError::Storage("durable tail log is truncated".into()));
     }
+    let v2 = match u32::from_le_bytes(bytes[0..4].try_into().unwrap()) {
+        TAIL_LOG_MAGIC => false,
+        TAIL_LOG_MAGIC_V2 => true,
+        _ => {
+            return Err(TaibaiError::Storage(
+                "invalid durable tail log magic".into(),
+            ));
+        }
+    };
+    let frame_header_len = if v2 { 16usize } else { 8usize };
     let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let mut offset = 8usize.saturating_add(partition_len);
     if offset > bytes.len() {
@@ -802,12 +895,12 @@ fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch
     while offset < bytes.len() {
         // A crash may leave the final append incomplete. All preceding frames
         // were individually synced and remain a valid recovery prefix.
-        if bytes.len().saturating_sub(offset) < 12 {
+        if bytes.len().saturating_sub(offset) < frame_header_len + 4 {
             break;
         }
         let payload_len =
             u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
-        let payload_start = offset + 8;
+        let payload_start = offset + frame_header_len;
         let payload_end = payload_start.saturating_add(payload_len);
         let frame_end = payload_end.saturating_add(4);
         if frame_end > bytes.len() {
@@ -847,6 +940,62 @@ fn append_batch(target: &mut RecordBatch, batch: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
+fn read_tail_log_version(path: &Path) -> Result<Option<u32>> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 4];
+    if let Err(error) = file.read_exact(&mut header) {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let magic = u32::from_le_bytes(header);
+    Ok((magic == TAIL_LOG_MAGIC || magic == TAIL_LOG_MAGIC_V2).then_some(magic))
+}
+
+/// Row count of a v2 tail log obtained by walking frame headers only — no
+/// payload is decompressed. Returns `None` for legacy (v1 log / snapshot)
+/// tails or on checksum mismatch, so callers can fall back to decoding.
+fn scan_tail_log_rows(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
+        return None;
+    }
+    let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let mut offset = 8usize.saturating_add(partition_len);
+    if offset > bytes.len() {
+        return None;
+    }
+    let mut rows = 0u64;
+    while offset < bytes.len() {
+        // Mirror decode_tail_log: a crash-truncated final frame ends the
+        // valid prefix without failing the scan.
+        if bytes.len().saturating_sub(offset) < 20 {
+            break;
+        }
+        let payload_len =
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
+        let frame_rows = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
+        let payload_start = offset + 16;
+        let payload_end = payload_start.saturating_add(payload_len);
+        let frame_end = payload_end.saturating_add(4);
+        if frame_end > bytes.len() {
+            break;
+        }
+        let mut hasher = Hasher::new();
+        hasher.update(&bytes[offset..payload_end]);
+        let stored_crc = u32::from_le_bytes(bytes[payload_end..frame_end].try_into().unwrap());
+        if stored_crc != hasher.finalize() {
+            return None;
+        }
+        rows = rows.saturating_add(frame_rows);
+        offset = frame_end;
+    }
+    Some(rows)
+}
+
 fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
     let mut file = fs::File::open(path)?;
     let mut header = [0u8; 8];
@@ -856,7 +1005,8 @@ fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
         }
         return Err(error.into());
     }
-    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC {
+    let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    if magic != TAIL_LOG_MAGIC && magic != TAIL_LOG_MAGIC_V2 {
         return Ok(None);
     }
     let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
@@ -1227,6 +1377,79 @@ mod tests {
 
         assert!(recover(temp.path(), &schema)?.is_empty());
         assert!(!has_tail(temp.path(), id));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_tail_log_reports_rows_without_decode() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        append(temp.path(), id, "2026", &test_batch(&schema, &[1])?)?;
+        append(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
+
+        let path = live_tail_path(temp.path(), id)?.expect("tail should exist");
+        assert_eq!(tail_log_rows(&path)?, Some(3));
+
+        // A crash-truncated final frame still yields the valid prefix count.
+        let mut bytes = fs::read(&path)?;
+        bytes.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+        assert_eq!(scan_tail_log_rows(&bytes), Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn recover_index_counts_rows_and_keeps_tail_on_disk() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        append(temp.path(), id, "2026", &test_batch(&schema, &[1, 2])?)?;
+        append(temp.path(), id, "2026", &test_batch(&schema, &[3])?)?;
+
+        let index = recover_index(temp.path(), &schema)?;
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].id, id);
+        assert_eq!(index[0].partition_key, "2026");
+        assert_eq!(index[0].rows, 3);
+        assert!(index[0].path.is_file(), "indexing must keep the tail file");
+
+        let (partition_key, batch) = decode_tail_file(&index[0].path, &schema)?;
+        assert_eq!(partition_key, "2026");
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.scalar(2, 0), Some(ScalarValue::Int64(Some(3))));
+
+        // Arbitration cleanup is idempotent across repeated index passes.
+        assert_eq!(recover_index(temp.path(), &schema)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recover_index_counts_legacy_snapshot_tail_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        let partition_key = "legacy";
+        let legacy_batch = test_batch(&schema, &[7, 8])?;
+        let batch_payload = serialize_batch_for_wal(&legacy_batch);
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&TAIL_MAGIC.to_le_bytes());
+        legacy.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
+        legacy.extend_from_slice(partition_key.as_bytes());
+        legacy.extend_from_slice(&(batch_payload.len() as u64).to_le_bytes());
+        legacy.extend_from_slice(&batch_payload);
+        let legacy = append_crc(legacy);
+        let tail_dir = temp.path().join(TAIL_DIR);
+        fs::create_dir_all(&tail_dir)?;
+        fs::write(tail_dir.join(format!("{}.1.tail", id.simple())), legacy)?;
+
+        let index = recover_index(temp.path(), &schema)?;
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].partition_key, "legacy");
+        assert_eq!(index[0].rows, 2);
+        assert!(index[0].path.is_file());
+
+        let (_, batch) = decode_tail_file(&index[0].path, &schema)?;
+        assert_eq!(batch.num_rows(), 2);
         Ok(())
     }
 }
