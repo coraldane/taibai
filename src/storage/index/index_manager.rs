@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::index::sparse_index::SparseIndexImpl;
 use crate::storage::segment_manager::SegmentManager;
+use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
 
 pub const PRIMARY_LOCATION_INDEX_NAME: &str = "__taibai_primary_location";
@@ -85,6 +86,11 @@ pub struct UniqueIndexData {
     /// segment coverage is guaranteed before it is trusted for row locations.
     #[serde(default)]
     pub flush_epoch: Option<u64>,
+    /// Per-segment row-count watermark captured when this snapshot's entries
+    /// were collected. Enables bounded incremental refresh after memtable
+    /// flushes instead of a full segment rescan.
+    #[serde(default)]
+    pub segment_watermarks: HashMap<String, u64>,
     #[serde(skip)]
     pub tombstones: HashSet<UniqueRowLocation>,
     #[serde(skip)]
@@ -277,7 +283,12 @@ impl IndexManager {
         columns: &[String],
         entries: Vec<UniqueIndexEntry>,
         flush_epoch: Option<u64>,
+        segment_watermarks: Option<HashMap<String, u64>>,
     ) -> Result<()> {
+        let segment_watermarks = match segment_watermarks {
+            Some(watermarks) => watermarks,
+            None => self.current_segment_watermarks(db, table)?,
+        };
         let dir = self.unique_index_dir(db, table);
         std::fs::create_dir_all(&dir)?;
         let mut data = UniqueIndexData {
@@ -287,11 +298,28 @@ impl IndexManager {
             columns: columns.to_vec(),
             entries,
             flush_epoch,
+            segment_watermarks,
             tombstones: HashSet::new(),
             encoded_keys: Vec::new(),
             blocks: Vec::new(),
         };
         prepare_unique_index_data(&mut data)?;
+        self.persist_prepared_unique_index_data(db, table, index_name, data)
+    }
+
+    /// Persist an already-prepared snapshot (entries and encoded keys aligned,
+    /// blocks built) without re-encoding or re-cloning it. Refresh and delta
+    /// compaction rewrite large snapshots through this path to keep peak
+    /// memory at one materialized copy plus the encoded bytes.
+    fn persist_prepared_unique_index_data(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        data: UniqueIndexData,
+    ) -> Result<()> {
+        let dir = self.unique_index_dir(db, table);
+        std::fs::create_dir_all(&dir)?;
         let base = sanitize_file_component(index_name);
         let data_path = dir.join(format!("{}.keys.tbi", base));
         let data_tmp = data_path.with_extension("keys.tbi.tmp");
@@ -482,6 +510,130 @@ impl IndexManager {
         )?))
     }
 
+    fn current_segment_watermarks(&self, db: &str, table: &str) -> Result<HashMap<String, u64>> {
+        let table_dir = self.data_dir.join(db).join(table);
+        let mut watermarks = HashMap::new();
+        if table_dir.exists() {
+            for seg_path in SegmentManager::discover_segments(&table_dir)? {
+                let reader = self.segment_mgr.open_reader_cached(&seg_path)?;
+                watermarks.insert(seg_path.to_string_lossy().to_string(), reader.row_count());
+            }
+        }
+        Ok(watermarks)
+    }
+
+    /// Incrementally catch a stale unique-index snapshot up to the current
+    /// memtable-flush epoch: only rows appended to segments beyond the
+    /// snapshot's per-segment watermarks are scanned, instead of rebuilding
+    /// the whole snapshot from every segment. Returns the refreshed state, or
+    /// `None` when a safe incremental refresh is not possible and callers
+    /// should fall back to a full rebuild.
+    fn refresh_stale_unique_index_state(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        state: &Arc<UniqueIndexState>,
+    ) -> Result<Option<Arc<UniqueIndexState>>> {
+        if state.base.columns.is_empty() {
+            return Ok(None);
+        }
+        let epoch_before = self.segment_mgr.memtable_flush_epoch(db, table);
+        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let cache_key = unique_index_key(db, table, index_name);
+        let is_current = self
+            .unique_indexes
+            .read()
+            .unwrap()
+            .get(&cache_key)
+            .is_some_and(|current| Arc::ptr_eq(current, state));
+        if !is_current {
+            // Another thread refreshed (or replaced) the state concurrently;
+            // reuse its result instead of falling back to a full rebuild.
+            return Ok(self
+                .unique_indexes
+                .read()
+                .unwrap()
+                .get(&cache_key)
+                .filter(|current| {
+                    current.flush_epoch == Some(self.segment_mgr.memtable_flush_epoch(db, table))
+                })
+                .cloned());
+        }
+        let mut additions = Vec::new();
+        let mut watermarks = HashMap::new();
+        let table_dir = self.data_dir.join(db).join(table);
+        if table_dir.exists() {
+            for seg_path in SegmentManager::discover_segments(&table_dir)? {
+                let reader = self.segment_mgr.open_reader_cached(&seg_path)?;
+                let current_rows = reader.row_count();
+                let segment_path = seg_path.to_string_lossy().to_string();
+                let watermark = state
+                    .base
+                    .segment_watermarks
+                    .get(&segment_path)
+                    .copied()
+                    .unwrap_or(0);
+                watermarks.insert(segment_path, current_rows);
+                if current_rows <= watermark {
+                    continue;
+                }
+                let schema = reader.schema();
+                let indices = state
+                    .base
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        schema.index_of(column).ok_or_else(|| {
+                            TaibaiError::Storage(format!(
+                                "unique index column '{}' missing from segment {}",
+                                column,
+                                seg_path.display()
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for rg_idx in 0..reader.num_row_groups() {
+                    let rg_start = reader.row_group_start_row(rg_idx);
+                    let rg_rows = reader.row_group_rows(rg_idx);
+                    if rg_start + rg_rows <= watermark {
+                        continue;
+                    }
+                    let mut batch = reader.read_row_group_with_projection(rg_idx, &indices)?;
+                    if !reader.delete_bitmap().is_empty() {
+                        batch = crate::storage::segment::delete_bitmap::filter_batch(
+                            &batch,
+                            rg_start,
+                            reader.delete_bitmap(),
+                        )?;
+                    }
+                    for row_idx in 0..batch.num_rows() {
+                        let key = projected_unique_key_for_row(&batch, row_idx);
+                        let Some(key) = key else { continue };
+                        additions.push(UniqueIndexEntry {
+                            key,
+                            location: UniqueRowLocation {
+                                segment_path: seg_path.to_string_lossy().to_string(),
+                                row_id: rg_start + row_idx as u64,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        let mut data = materialize_unique_index_state(state)?;
+        let additions = self.prepare_unique_index_entries(additions)?;
+        merge_prepared_unique_index_entries(&mut data, additions)?;
+        compact_prepared_unique_index_entries(&mut data);
+        data.flush_epoch = Some(epoch_before);
+        data.segment_watermarks = watermarks;
+        self.persist_prepared_unique_index_data(db, table, index_name, data)?;
+        match self.unique_indexes.read().unwrap().get(&cache_key) {
+            Some(state) => Ok(Some(Arc::clone(state))),
+            None => Ok(None),
+        }
+    }
+
     pub fn unique_key_locations(
         &self,
         db: &str,
@@ -489,13 +641,21 @@ impl IndexManager {
         index_name: &str,
         keys: &[Vec<ScalarValue>],
     ) -> Result<Option<Vec<UniqueRowLocation>>> {
-        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+        let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        // A memtable flush after this snapshot was built may have moved rows into
-        // segments without index entries; force a rebuild rather than miss them.
+        // A memtable flush after this snapshot was built may have moved rows
+        // into segments without index entries. Incrementally refresh the
+        // snapshot (scanning only rows appended past its per-segment
+        // watermarks) instead of forcing a full rebuild; fall back to the
+        // rebuild path only when the incremental refresh is not possible.
         if state.flush_epoch != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
-            return Ok(None);
+            let Some(refreshed) =
+                self.refresh_stale_unique_index_state(db, table, index_name, &state)?
+            else {
+                return Ok(None);
+            };
+            state = refreshed;
         }
         let encoded_keys = keys
             .iter()
@@ -580,13 +740,19 @@ impl IndexManager {
         index_name: &str,
         keys: &[Vec<ScalarValue>],
     ) -> Result<Option<bool>> {
-        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+        let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        // Same staleness guard as unique_key_locations: rows flushed to segments
-        // after this snapshot was built may be missing from it entirely.
+        // Same staleness guard as unique_key_locations, resolved by the same
+        // incremental refresh; a full rebuild is only needed when the refresh
+        // cannot run.
         if state.flush_epoch != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
-            return Ok(None);
+            let Some(refreshed) =
+                self.refresh_stale_unique_index_state(db, table, index_name, &state)?
+            else {
+                return Ok(None);
+            };
+            state = refreshed;
         }
         for key in keys {
             let encoded = encode_unique_key(key)?;
@@ -654,19 +820,12 @@ impl IndexManager {
             }
         }
         if std::fs::metadata(&delta_path)?.len() >= UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES {
-            let data = materialize_unique_index_state(&state)?;
-            let columns = data.columns.clone();
-            let live_entries = live_unique_index_entries(&data);
+            let mut data = materialize_unique_index_state(&state)?;
             // Delta compaction preserves the snapshot's epoch: flushing since the
-            // snapshot was built keeps it stale so the next probe rebuilds it.
-            self.persist_unique_index_entries(
-                db,
-                table,
-                index_name,
-                &columns,
-                live_entries,
-                state.flush_epoch,
-            )?;
+            // snapshot was built keeps it stale so the next probe refreshes it.
+            data.segment_watermarks = state.base.segment_watermarks.clone();
+            compact_prepared_unique_index_entries(&mut data);
+            self.persist_prepared_unique_index_data(db, table, index_name, data)?;
         }
         Ok(true)
     }
@@ -718,17 +877,10 @@ impl IndexManager {
         append_unique_index_tombstone_delta(&delta_path, &tombstones)?;
         state.delta.write().unwrap().tombstones.extend(tombstones);
         if std::fs::metadata(&delta_path)?.len() >= UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES {
-            let data = materialize_unique_index_state(&state)?;
-            let columns = data.columns.clone();
-            let live_entries = live_unique_index_entries(&data);
-            self.persist_unique_index_entries(
-                db,
-                table,
-                index_name,
-                &columns,
-                live_entries,
-                state.flush_epoch,
-            )?;
+            let mut data = materialize_unique_index_state(&state)?;
+            data.segment_watermarks = state.base.segment_watermarks.clone();
+            compact_prepared_unique_index_entries(&mut data);
+            self.persist_prepared_unique_index_data(db, table, index_name, data)?;
         }
         Ok(true)
     }
@@ -813,6 +965,7 @@ const UNIQUE_INDEX_MAGIC_V1: &[u8; 8] = b"TBIUKV1\0";
 const UNIQUE_INDEX_MAGIC_V2: &[u8; 8] = b"TBIUKV2\0";
 const UNIQUE_INDEX_MAGIC_V3: &[u8; 8] = b"TBIUKV3\0";
 const UNIQUE_INDEX_MAGIC_V4: &[u8; 8] = b"TBIUKV4\0";
+const UNIQUE_INDEX_MAGIC_V5: &[u8; 8] = b"TBIUKV5\0";
 const UNIQUE_INDEX_DELTA_MAGIC_V1: &[u8; 8] = b"TBIUKD1\0";
 const UNIQUE_INDEX_DELTA_MAGIC_V2: &[u8; 8] = b"TBIUKD2\0";
 const UNIQUE_INDEX_BLOCK_SIZE: usize = 256;
@@ -823,6 +976,20 @@ const UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
 fn unique_index_key(db: &str, table: &str, index_name: &str) -> String {
     format!("{}\0{}\0{}", db, table, index_name.to_ascii_lowercase())
+}
+
+fn projected_unique_key_for_row(batch: &RecordBatch, row_idx: usize) -> Option<Vec<ScalarValue>> {
+    let mut key = Vec::with_capacity(batch.num_columns());
+    for col_idx in 0..batch.num_columns() {
+        let value = batch
+            .scalar(row_idx, col_idx)
+            .unwrap_or_else(|| ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type));
+        if value.is_null() {
+            return None;
+        }
+        key.push(value);
+    }
+    Some(key)
 }
 
 fn materialize_unique_index_state(state: &UniqueIndexState) -> Result<UniqueIndexData> {
@@ -987,12 +1154,41 @@ fn unique_index_data_contains_key(
     Ok(false)
 }
 
-fn live_unique_index_entries(data: &UniqueIndexData) -> Vec<UniqueIndexEntry> {
-    data.entries
-        .iter()
-        .filter(|entry| !data.tombstones.contains(&entry.location))
-        .cloned()
-        .collect()
+/// In-place snapshot compaction for prepared data (entries aligned with
+/// encoded_keys): drops tombstoned locations and collapses duplicate
+/// memtable-resident placeholders (empty segment path) to one entry per key.
+///
+/// Placeholder dedup is semantics-preserving: placeholders are never
+/// tombstoned (tombstones only reference segment locations), so a key probes
+/// as existing before the compaction if and only if it still probes as
+/// existing afterwards. Without it, high-frequency upserts of the same key
+/// accumulate one placeholder per write and the snapshot grows with total
+/// upsert count instead of table cardinality.
+fn compact_prepared_unique_index_entries(data: &mut UniqueIndexData) {
+    let mut keep = Vec::with_capacity(data.entries.len());
+    let mut seen_memtable_keys: HashSet<Vec<u8>> = HashSet::new();
+    for idx in 0..data.entries.len() {
+        let location = &data.entries[idx].location;
+        let entry_keep = if data.tombstones.contains(location) {
+            false
+        } else if location.segment_path.is_empty() {
+            seen_memtable_keys.insert(data.encoded_keys[idx].clone())
+        } else {
+            true
+        };
+        keep.push(entry_keep);
+    }
+    let mut write = 0usize;
+    for (read, entry_keep) in keep.iter().enumerate() {
+        if *entry_keep {
+            data.entries.swap(read, write);
+            data.encoded_keys.swap(read, write);
+            write += 1;
+        }
+    }
+    data.entries.truncate(write);
+    data.encoded_keys.truncate(write);
+    data.blocks = build_unique_index_blocks(&data.encoded_keys);
 }
 
 fn unique_index_tombstones_contains(
@@ -1051,7 +1247,7 @@ fn encode_unique_key(key: &[ScalarValue]) -> Result<Vec<u8>> {
 
 fn encode_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(UNIQUE_INDEX_MAGIC_V4);
+    out.extend_from_slice(UNIQUE_INDEX_MAGIC_V5);
     put_string(&mut out, &data.db);
     put_string(&mut out, &data.table);
     put_string(&mut out, &data.index_name);
@@ -1076,6 +1272,12 @@ fn encode_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
             paths.push(path);
         }
     }
+    for path in data.segment_watermarks.keys() {
+        if !path_ids.contains_key(path.as_str()) {
+            path_ids.insert(path.as_str(), paths.len() as u32);
+            paths.push(path.as_str());
+        }
+    }
     put_u32(&mut out, paths.len() as u32);
     for path in &paths {
         put_string(&mut out, path);
@@ -1098,6 +1300,11 @@ fn encode_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
     }
     out.push(if data.flush_epoch.is_some() { 1 } else { 0 });
     put_u64(&mut out, data.flush_epoch.unwrap_or(0));
+    put_u32(&mut out, data.segment_watermarks.len() as u32);
+    for (path, row_count) in &data.segment_watermarks {
+        put_varint(&mut out, path_ids[path.as_str()] as u64);
+        put_u64(&mut out, *row_count);
+    }
     Ok(out)
 }
 
@@ -1306,6 +1513,9 @@ fn decode_unique_index_data(bytes: &[u8]) -> Result<Option<UniqueIndexData>> {
     if &magic == UNIQUE_INDEX_MAGIC_V4 {
         return decode_unique_index_data_v4(&mut cursor);
     }
+    if &magic == UNIQUE_INDEX_MAGIC_V5 {
+        return decode_unique_index_data_v5(&mut cursor);
+    }
     Err(TaibaiError::Storage(
         "invalid unique index binary file".to_string(),
     ))
@@ -1332,6 +1542,7 @@ fn decode_unique_index_data_v1(cursor: &mut Cursor<&[u8]>) -> Result<Option<Uniq
         columns,
         entries,
         flush_epoch: None,
+        segment_watermarks: HashMap::new(),
         tombstones: HashSet::new(),
         encoded_keys: Vec::new(),
         blocks: Vec::new(),
@@ -1371,6 +1582,7 @@ fn decode_unique_index_data_v2(cursor: &mut Cursor<&[u8]>) -> Result<Option<Uniq
         columns,
         entries,
         flush_epoch: None,
+        segment_watermarks: HashMap::new(),
         tombstones: HashSet::new(),
         encoded_keys,
         blocks,
@@ -1395,11 +1607,34 @@ fn read_unique_index_entry(cursor: &mut Cursor<&[u8]>) -> Result<UniqueIndexEntr
 }
 
 fn decode_unique_index_data_v3(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
-    decode_unique_index_data_blocks(cursor)
+    decode_unique_index_data_blocks(cursor).map(|result| result.map(|(data, _)| data))
+}
+
+fn decode_unique_index_data_v5(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
+    let Some((mut data, paths)) = decode_unique_index_data_blocks_with_paths(cursor)? else {
+        return Ok(None);
+    };
+    let mut flag = [0u8; 1];
+    cursor.read_exact(&mut flag)?;
+    let epoch = read_u64(cursor)?;
+    data.flush_epoch = (flag[0] == 1).then_some(epoch);
+    let watermark_count = read_u32(cursor)? as usize;
+    for _ in 0..watermark_count {
+        let path_idx = read_varint(cursor)? as usize;
+        let row_count = read_u64(cursor)?;
+        let Some(segment_path) = paths.get(path_idx) else {
+            return Err(TaibaiError::Storage(
+                "corrupt unique index watermark path reference".to_string(),
+            ));
+        };
+        data.segment_watermarks
+            .insert(segment_path.clone(), row_count);
+    }
+    Ok(Some(data))
 }
 
 fn decode_unique_index_data_v4(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
-    let Some(mut data) = decode_unique_index_data_blocks(cursor)? else {
+    let Some((mut data, _paths)) = decode_unique_index_data_blocks_with_paths(cursor)? else {
         return Ok(None);
     };
     let mut flag = [0u8; 1];
@@ -1409,7 +1644,15 @@ fn decode_unique_index_data_v4(cursor: &mut Cursor<&[u8]>) -> Result<Option<Uniq
     Ok(Some(data))
 }
 
-fn decode_unique_index_data_blocks(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
+fn decode_unique_index_data_blocks(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<Option<(UniqueIndexData, Vec<String>)>> {
+    decode_unique_index_data_blocks_with_paths(cursor)
+}
+
+fn decode_unique_index_data_blocks_with_paths(
+    cursor: &mut Cursor<&[u8]>,
+) -> Result<Option<(UniqueIndexData, Vec<String>)>> {
     let db = read_string(cursor)?;
     let table = read_string(cursor)?;
     let index_name = read_string(cursor)?;
@@ -1473,17 +1716,21 @@ fn decode_unique_index_data_blocks(cursor: &mut Cursor<&[u8]>) -> Result<Option<
             "corrupt unique index entry count".to_string(),
         ));
     }
-    Ok(Some(UniqueIndexData {
-        db,
-        table,
-        index_name,
-        columns,
-        entries,
-        flush_epoch: None,
-        tombstones: HashSet::new(),
-        encoded_keys,
-        blocks,
-    }))
+    Ok(Some((
+        UniqueIndexData {
+            db,
+            table,
+            index_name,
+            columns,
+            entries,
+            flush_epoch: None,
+            segment_watermarks: HashMap::new(),
+            tombstones: HashSet::new(),
+            encoded_keys,
+            blocks,
+        },
+        paths,
+    )))
 }
 
 fn decode_encoded_unique_key(encoded: &[u8]) -> Result<Vec<ScalarValue>> {
@@ -1541,6 +1788,9 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::types::DataType;
+    use crate::storage::segment::writer::SegmentWriter;
+    use crate::types::batch::{ColumnDef, Schema};
 
     fn entry(value: i64, row_id: u64) -> UniqueIndexEntry {
         UniqueIndexEntry {
@@ -1561,6 +1811,7 @@ mod tests {
             columns: vec!["value".to_string()],
             entries: vec![entry(2, 2), entry(4, 4)],
             flush_epoch: None,
+            segment_watermarks: HashMap::new(),
             tombstones: HashSet::new(),
             encoded_keys: Vec::new(),
             blocks: Vec::new(),
@@ -1602,6 +1853,7 @@ mod tests {
             &["value".to_string()],
             vec![entry(1, 0)],
             Some(0),
+            None,
         )?;
         // Memtable-resident pseudo locations (empty segment_path) are skipped:
         // REPLACE deletes conflicting memtable rows in place, so a location
@@ -1619,7 +1871,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_epoch_mismatch_forces_location_probe_rebuild() -> Result<()> {
+    fn flush_epoch_mismatch_refreshes_snapshot_incrementally() -> Result<()> {
         let dir = tempfile::tempdir().unwrap();
         let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
         let manager =
@@ -1631,9 +1883,11 @@ mod tests {
             &["value".to_string()],
             vec![entry(1, 0)],
             Some(segment_mgr.memtable_flush_epoch("db", "ticks")),
+            None,
         )?;
-        // A memtable flush after the snapshot was built may have moved rows
-        // into segments without index entries; probing must report stale.
+        // A memtable flush after the snapshot was built bumps the epoch. With
+        // no segment rows beyond the watermarks, the refresh is a no-op scan
+        // and the probe succeeds without a full rebuild.
         segment_mgr.note_memtable_flush("db", "ticks");
         assert_eq!(
             manager.unique_key_locations(
@@ -1642,9 +1896,10 @@ mod tests {
                 "uk_value",
                 &[vec![ScalarValue::Int64(Some(1))]],
             )?,
-            None
+            Some(Vec::new())
         );
-        // The epoch survives a restart through the on-disk marker.
+        // The refreshed snapshot (epoch stamped) survives a restart through
+        // the on-disk files; the epoch marker survives as well.
         let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
         let manager =
             IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
@@ -1656,7 +1911,261 @@ mod tests {
                 "uk_value",
                 &[vec![ScalarValue::Int64(Some(1))]],
             )?,
-            None
+            Some(Vec::new())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_prepared_entries_drops_tombstones_and_dedups_placeholders() -> Result<()> {
+        let seg_path = "/tmp/taibai-test/seg_00000.dat".to_string();
+        let mut data = UniqueIndexData {
+            db: "db".to_string(),
+            table: "ticks".to_string(),
+            index_name: "uk_value".to_string(),
+            columns: vec!["value".to_string()],
+            entries: vec![
+                entry(1, 0),
+                entry(1, 5),
+                entry(2, 0),
+                UniqueIndexEntry {
+                    key: vec![ScalarValue::Int64(Some(3))],
+                    location: UniqueRowLocation {
+                        segment_path: seg_path.clone(),
+                        row_id: 0,
+                    },
+                },
+                UniqueIndexEntry {
+                    key: vec![ScalarValue::Int64(Some(4))],
+                    location: UniqueRowLocation {
+                        segment_path: seg_path.clone(),
+                        row_id: 1,
+                    },
+                },
+            ],
+            flush_epoch: Some(1),
+            segment_watermarks: HashMap::from([(seg_path.clone(), 2)]),
+            tombstones: HashSet::new(),
+            encoded_keys: Vec::new(),
+            blocks: Vec::new(),
+        };
+        prepare_unique_index_data(&mut data)?;
+        data.tombstones.insert(UniqueRowLocation {
+            segment_path: seg_path.clone(),
+            row_id: 1,
+        });
+        compact_prepared_unique_index_entries(&mut data);
+
+        let keys = data
+            .entries
+            .iter()
+            .map(|entry| entry.key[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int64(Some(3)),
+            ],
+            "duplicate placeholders collapse to one and tombstoned locations drop"
+        );
+        for (encoded, entry) in data.encoded_keys.iter().zip(&data.entries) {
+            assert_eq!(*encoded, encode_unique_key(&entry.key)?);
+        }
+        assert_eq!(
+            data.blocks.len(),
+            data.entries.len().div_ceil(UNIQUE_INDEX_BLOCK_SIZE)
+        );
+        assert_eq!(data.segment_watermarks.get(&seg_path), Some(&2));
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_collapses_duplicate_memtable_placeholders() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("db").join("ticks");
+        std::fs::create_dir_all(&table_dir)?;
+        write_value_segment(&table_dir.join("seg_00000.dat"), &[1, 2, 3])?;
+
+        let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+        let manager =
+            IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+        let seg0 = table_dir
+            .join("seg_00000.dat")
+            .to_string_lossy()
+            .to_string();
+        // Two placeholders for key 2 simulate two upserts of the same key
+        // while the row was still memtable-resident.
+        manager.persist_unique_index_entries(
+            "db",
+            "ticks",
+            "uk_value",
+            &["value".to_string()],
+            vec![
+                UniqueIndexEntry {
+                    key: vec![ScalarValue::Int64(Some(1))],
+                    location: UniqueRowLocation {
+                        segment_path: seg0.clone(),
+                        row_id: 0,
+                    },
+                },
+                entry(2, 1),
+                entry(2, 2),
+            ],
+            Some(segment_mgr.memtable_flush_epoch("db", "ticks")),
+            Some(HashMap::from([(seg0.clone(), 3)])),
+        )?;
+
+        write_value_segment(&table_dir.join("seg_00001.dat"), &[4, 5])?;
+        segment_mgr.note_memtable_flush("db", "ticks");
+        assert!(manager
+            .unique_key_locations(
+                "db",
+                "ticks",
+                "uk_value",
+                &[vec![ScalarValue::Int64(Some(5))]],
+            )?
+            .is_some());
+
+        let indexes = manager.unique_indexes.read().unwrap();
+        let state = indexes
+            .get(&unique_index_key("db", "ticks", "uk_value"))
+            .expect("refreshed state must be cached");
+        let placeholder_count = state
+            .base
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.location.segment_path.is_empty()
+                    && entry.key == vec![ScalarValue::Int64(Some(2))]
+            })
+            .count();
+        assert_eq!(
+            placeholder_count, 1,
+            "refresh must collapse duplicate memtable placeholders per key"
+        );
+        let total = state.base.entries.len();
+        assert_eq!(total, 4, "keys 1, 2, 4, 5 each keep exactly one entry");
+        Ok(())
+    }
+
+    fn write_value_segment(path: &Path, values: &[i64]) -> Result<()> {
+        let schema = Schema::new(vec![ColumnDef::new("value", DataType::Int64)]);
+        let mut batch = RecordBatch::new(schema.clone());
+        for value in values {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(*value)))?;
+        }
+        let mut writer = SegmentWriter::create(path, schema, 8192)?;
+        writer.write_batch(&batch)?;
+        writer.seal()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stale_epoch_refresh_scans_only_new_segment_rows() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("db").join("ticks");
+        std::fs::create_dir_all(&table_dir)?;
+        write_value_segment(&table_dir.join("seg_00000.dat"), &[1, 2, 3])?;
+
+        let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+        let manager =
+            IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+        // Snapshot covering the first segment: value=1 has a real location,
+        // values 2 and 3 are memtable-resident placeholders.
+        let seg0 = table_dir
+            .join("seg_00000.dat")
+            .to_string_lossy()
+            .to_string();
+        manager.persist_unique_index_entries(
+            "db",
+            "ticks",
+            "uk_value",
+            &["value".to_string()],
+            vec![
+                UniqueIndexEntry {
+                    key: vec![ScalarValue::Int64(Some(1))],
+                    location: UniqueRowLocation {
+                        segment_path: seg0.clone(),
+                        row_id: 0,
+                    },
+                },
+                entry(2, 1),
+                entry(3, 2),
+            ],
+            Some(segment_mgr.memtable_flush_epoch("db", "ticks")),
+            None,
+        )?;
+
+        // A later flush appends a new segment with values 4 and 5 and bumps
+        // the epoch; the next probe must pick up their locations via an
+        // incremental refresh.
+        write_value_segment(&table_dir.join("seg_00001.dat"), &[4, 5])?;
+        segment_mgr.note_memtable_flush("db", "ticks");
+
+        let seg1 = table_dir
+            .join("seg_00001.dat")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            manager.unique_key_locations(
+                "db",
+                "ticks",
+                "uk_value",
+                &[
+                    vec![ScalarValue::Int64(Some(4))],
+                    vec![ScalarValue::Int64(Some(5))]
+                ],
+            )?,
+            Some(vec![
+                UniqueRowLocation {
+                    segment_path: seg1.clone(),
+                    row_id: 0,
+                },
+                UniqueRowLocation {
+                    segment_path: seg1.clone(),
+                    row_id: 1,
+                },
+            ])
+        );
+        // Rows already covered by the snapshot keep their recorded location
+        // (watermark skips the first segment) and memtable placeholders stay
+        // location-free.
+        assert_eq!(
+            manager.unique_key_locations(
+                "db",
+                "ticks",
+                "uk_value",
+                &[
+                    vec![ScalarValue::Int64(Some(1))],
+                    vec![ScalarValue::Int64(Some(2))]
+                ],
+            )?,
+            Some(vec![UniqueRowLocation {
+                segment_path: seg0,
+                row_id: 0,
+            }])
+        );
+        // The refreshed snapshot is stamped with the new epoch and persists
+        // across a restart.
+        let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+        let manager =
+            IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+        assert_eq!(
+            manager.unique_key_locations(
+                "db",
+                "ticks",
+                "uk_value",
+                &[vec![ScalarValue::Int64(Some(5))]],
+            )?,
+            Some(vec![UniqueRowLocation {
+                segment_path: seg1,
+                row_id: 1,
+            }])
         );
         Ok(())
     }
@@ -1670,6 +2179,7 @@ mod tests {
             columns: vec!["value".to_string()],
             entries: Vec::new(),
             flush_epoch: None,
+            segment_watermarks: HashMap::new(),
             tombstones: HashSet::new(),
             encoded_keys: Vec::new(),
             blocks: Vec::new(),
@@ -1730,6 +2240,7 @@ mod tests {
             ],
             entries,
             flush_epoch: None,
+            segment_watermarks: HashMap::new(),
             tombstones: HashSet::new(),
             encoded_keys: Vec::new(),
             blocks: Vec::new(),
@@ -1767,14 +2278,20 @@ mod tests {
     }
 
     #[test]
-    fn unique_index_data_v4_roundtrip_preserves_entries() -> Result<()> {
+    fn unique_index_data_v5_roundtrip_preserves_entries_and_watermarks() -> Result<()> {
         let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
         let mut data = stock_minute_index_data(3000, path);
         data.flush_epoch = Some(7);
+        data.segment_watermarks.insert(path.to_string(), 424_242);
         prepare_unique_index_data(&mut data)?;
         let bytes = encode_unique_index_data(&data)?;
-        assert_eq!(&bytes[..8], UNIQUE_INDEX_MAGIC_V4);
+        assert_eq!(&bytes[..8], UNIQUE_INDEX_MAGIC_V5);
         let decoded = decode_unique_index_data(&bytes)?.unwrap();
+        assert_eq!(
+            decoded.segment_watermarks.get(path),
+            Some(&424_242),
+            "segment watermarks must survive the round trip"
+        );
         assert_eq!(decoded.db, data.db);
         assert_eq!(decoded.table, data.table);
         assert_eq!(decoded.index_name, data.index_name);
@@ -1792,6 +2309,26 @@ mod tests {
             assert_eq!(decoded_block.len, expected_block.len);
             assert_eq!(decoded_block.first_key, expected_block.first_key);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn unique_index_data_v4_without_watermarks_still_decodes() -> Result<()> {
+        let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
+        let mut data = stock_minute_index_data(3000, path);
+        data.flush_epoch = Some(7);
+        prepare_unique_index_data(&mut data)?;
+        let v5_bytes = encode_unique_index_data(&data)?;
+        // With no watermarks the v5 layout is exactly v4 plus a trailing
+        // zero-count u32; stripping it and downgrading the magic
+        // reconstructs a legacy v4 payload.
+        let mut v4_bytes = v5_bytes[..v5_bytes.len() - 4].to_vec();
+        v4_bytes[..8].copy_from_slice(UNIQUE_INDEX_MAGIC_V4);
+        assert_eq!(&v4_bytes[..8], UNIQUE_INDEX_MAGIC_V4);
+        let decoded = decode_unique_index_data(&v4_bytes)?.unwrap();
+        assert_eq!(decoded.flush_epoch, Some(7));
+        assert_eq!(decoded.entries.len(), data.entries.len());
+        assert!(decoded.segment_watermarks.is_empty());
         Ok(())
     }
 

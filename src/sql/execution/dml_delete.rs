@@ -47,38 +47,16 @@ impl ReplaceDeleteUndo {
     }
 }
 
-/// A planned memtable conflict delete: the memtable, its original batch and the
-/// batch with conflicting rows removed. Computed before any mutation so the
-/// delete stays two-phase (plan, then apply).
+/// A planned memtable conflict delete: the memtable, its original batch, the
+/// batch with conflicting rows removed, and the ascending positions removed.
+/// Computed before any mutation so the delete stays two-phase (plan, then
+/// apply). Positions let the apply step compact the REPLACE key index instead
+/// of invalidating it.
 pub(crate) struct ReplaceMemtableConflictPlan {
     memtable: Arc<MemTable>,
     original: RecordBatch,
     filtered: RecordBatch,
-}
-
-fn replace_row_matches_key_set(
-    batch: &RecordBatch,
-    row_idx: usize,
-    indices: &[usize],
-    keys: &HashSet<Vec<ScalarValue>>,
-) -> bool {
-    if indices.len() == 1 {
-        let Some(value) = batch.scalar(row_idx, indices[0]) else {
-            return false;
-        };
-        return !value.is_null() && keys.contains(std::slice::from_ref(&value));
-    }
-    let mut key = Vec::with_capacity(indices.len());
-    for &col_idx in indices {
-        let Some(value) = batch.scalar(row_idx, col_idx) else {
-            return false;
-        };
-        if value.is_null() {
-            return false;
-        }
-        key.push(value);
-    }
-    keys.contains(&key)
+    removed_positions: Vec<u32>,
 }
 
 fn filter_batch_keep(batch: &RecordBatch, keep: &[bool], keep_count: usize) -> Result<RecordBatch> {
@@ -90,10 +68,12 @@ fn filter_batch_keep(batch: &RecordBatch, keep: &[bool], keep_count: usize) -> R
     RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
-/// Scan the table's committed, non-transactional pending memtables for rows
-/// conflicting with `key_sets`. The caller holds the table mutation lock, so no
-/// INSERT or flush can mutate the memtables between this plan and
-/// `apply_replace_memtable_conflicts`.
+/// Find rows in the table's committed, non-transactional pending memtables
+/// conflicting with `key_sets`. The caller holds the table mutation lock, so
+/// no INSERT or flush can mutate the memtables between this plan and
+/// `apply_replace_memtable_conflicts`. Conflict matching probes a lazily
+/// built per-memtable key index (incrementally maintained across appends)
+/// instead of rescanning every memtable row per statement.
 pub(crate) fn plan_replace_memtable_conflicts(
     engine: &Engine,
     db: &str,
@@ -113,29 +93,27 @@ pub(crate) fn plan_replace_memtable_conflicts(
                 if batch.num_rows() == 0 {
                     return None;
                 }
-                let mut keep = vec![true; batch.num_rows()];
-                let mut removed = 0usize;
-                for row_idx in 0..batch.num_rows() {
-                    let conflicts = key_sets.iter().any(|(indices, keys)| {
-                        replace_row_matches_key_set(batch, row_idx, indices, keys)
-                    });
-                    if conflicts {
-                        keep[row_idx] = false;
-                        removed += 1;
-                    }
-                }
-                if removed == 0 {
+                let positions = engine
+                    .memtable_manager()
+                    .replace_key_conflicts(&memtable, key_sets, batch);
+                if positions.is_empty() {
                     return None;
                 }
+                let removed = positions.len();
+                let mut keep = vec![true; batch.num_rows()];
+                for &row_idx in &positions {
+                    keep[row_idx as usize] = false;
+                }
                 let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
-                Some((batch.clone(), filtered))
+                Some((batch.clone(), filtered, positions))
             })
             .flatten();
-        if let Some((original, filtered)) = planned {
+        if let Some((original, filtered, removed_positions)) = planned {
             plans.push(ReplaceMemtableConflictPlan {
                 memtable,
                 original,
                 filtered,
+                removed_positions,
             });
         }
     }
@@ -179,14 +157,20 @@ fn plan_delete_memtable_rows(
                 }
                 let keep = mask.iter().map(|matches| !matches).collect::<Vec<_>>();
                 let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
-                Some((batch.clone(), filtered))
+                let removed_positions = mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
+                    .collect::<Vec<_>>();
+                Some((batch.clone(), filtered, removed_positions))
             })
             .flatten();
-        if let Some((original, filtered)) = planned {
+        if let Some((original, filtered, removed_positions)) = planned {
             plans.push(ReplaceMemtableConflictPlan {
                 memtable,
                 original,
                 filtered,
+                removed_positions,
             });
         }
     }
@@ -219,6 +203,11 @@ pub(crate) fn apply_replace_memtable_conflicts(
                 "REPLACE conflict delete raced with a memtable flush".to_string(),
             ));
         }
+        engine.memtable_manager().compact_replace_key_index(
+            &plan.memtable,
+            &plan.removed_positions,
+            plan.original.num_rows(),
+        );
         if let Err(error) = crate::storage::core::durable_tail::persist(
             &table_dir,
             plan.memtable.id(),
@@ -707,7 +696,7 @@ pub fn exec_delete(
         if let Some(ref pred) = predicate {
             segment_files = prune_segments_by_cluster_key(
                 segment_files,
-                &mgr,
+                mgr,
                 &table_schema,
                 &table_meta,
                 pred,

@@ -646,6 +646,7 @@ fn ensure_replace_location_indexes(
             &columns,
             entries,
             Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
+            None,
         )?;
     }
     Ok(())

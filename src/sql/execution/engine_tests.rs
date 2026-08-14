@@ -389,7 +389,7 @@ fn rebuild_unique_index_writes_v3_blocks_for_large_keyset() -> Result<()> {
         .join("unique")
         .join("uk_id.keys.tbi");
     let bytes = std::fs::read(index_file)?;
-    assert_eq!(&bytes[..8], b"TBIUKV4\0");
+    assert_eq!(&bytes[..8], b"TBIUKV5\0");
 
     let duplicate = engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (299, 'dup')");
     assert!(duplicate.is_err());

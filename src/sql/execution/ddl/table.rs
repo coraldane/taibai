@@ -115,6 +115,7 @@ pub fn exec_create_table(
                 &index.columns,
                 Vec::new(),
                 Some(engine.segment_mgr().memtable_flush_epoch(db, name)),
+                None,
             )?;
         }
         let primary_columns = meta
@@ -131,6 +132,7 @@ pub fn exec_create_table(
                 &primary_columns,
                 Vec::new(),
                 Some(engine.segment_mgr().memtable_flush_epoch(db, name)),
+                None,
             )?;
         }
     }
@@ -393,6 +395,7 @@ pub fn exec_rebuild_unique_index(
                     &index.columns,
                     entries,
                     Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
+                    None,
                 )?;
                 rebuilt += 1;
             }
