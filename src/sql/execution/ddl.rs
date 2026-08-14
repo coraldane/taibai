@@ -15,8 +15,8 @@ use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{
-    AlterOperation, ColumnDefAst, DefaultValue, DurabilityLevel, GrantObject, HotDef,
-    PartitionDef, PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
+    AlterOperation, ColumnDefAst, DefaultValue, DurabilityLevel, GrantObject, HotDef, PartitionDef,
+    PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
 };
 
 const FILE_DELETE_MAX_ATTEMPTS: usize = 5;

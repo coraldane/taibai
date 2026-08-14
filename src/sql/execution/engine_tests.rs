@@ -1375,7 +1375,11 @@ fn relaxed_durability_large_insert_bypasses_durable_tail() -> Result<()> {
     }
     engine.execute(&mut session, &sql)?;
 
-    let tail_dir = dir.path().join("main").join("relaxed_bulk").join("memtable_tail");
+    let tail_dir = dir
+        .path()
+        .join("main")
+        .join("relaxed_bulk")
+        .join("memtable_tail");
     let tail_files = std::fs::read_dir(&tail_dir)
         .map(|entries| entries.filter_map(|entry| entry.ok()).count())
         .unwrap_or(0);
@@ -1407,7 +1411,11 @@ fn relaxed_durability_small_insert_keeps_strict_pipeline() -> Result<()> {
     )?;
     engine.execute(&mut session, "INSERT INTO relaxed_small VALUES (1), (2)")?;
 
-    let tail_dir = dir.path().join("main").join("relaxed_small").join("memtable_tail");
+    let tail_dir = dir
+        .path()
+        .join("main")
+        .join("relaxed_small")
+        .join("memtable_tail");
     let tail_files = std::fs::read_dir(&tail_dir)
         .map(|entries| entries.filter_map(|entry| entry.ok()).count())
         .unwrap_or(0);
