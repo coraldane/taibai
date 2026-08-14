@@ -74,6 +74,7 @@ async fn main() {
         None => "SELECT security_id, deal_date, deal_time, open_px, high_px, low_px, close_px, trade_volume, trade_value FROM t_stock_minute WHERE security_id = '000529.SZ' AND deal_date >= 20260701 AND deal_date <= 20260731 ORDER BY deal_date, deal_time".to_string(),
     };
     let repeat: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2);
+    let print_rows_enabled = args.iter().skip(1).any(|arg| arg == "--print-rows");
 
     let mut client = Client::connect(&host).await.expect("connect failed");
     client.set_timeout(std::time::Duration::from_secs(1800));
@@ -96,7 +97,7 @@ async fn main() {
         match client.query(&sql).await {
             Ok(res) => {
                 let wall = start.elapsed();
-                if std::env::var("QB_PRINT_ROWS").is_ok() {
+                if print_rows_enabled {
                     print_rows(&res);
                 }
                 let (server_elapsed, server_timings) = timings(&res);

@@ -51,7 +51,12 @@ fn recover_durable_memtable_tails(
                     tail.path,
                 );
                 recovered_tables.insert((db.clone(), table.clone()));
-                tracing::info!(db, table, rows, "recovered durable low-rate memtable tail (spilled)");
+                tracing::info!(
+                    db,
+                    table,
+                    rows,
+                    "recovered durable low-rate memtable tail (spilled)"
+                );
             }
         }
     }
@@ -129,7 +134,7 @@ impl Default for AutoCompactConfig {
             fragmentation_cooldown: Duration::from_secs(3600),
             fragmentation_scan_interval: Duration::from_secs(300),
             low_rate_max_rows: 1024,
-            low_rate_max_age: Duration::from_secs(7 * 24 * 60 * 60),
+            low_rate_max_age: Duration::from_secs(3600),
             interval: Duration::from_secs(60),
             max_tables_per_run: 8,
         }

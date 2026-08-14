@@ -58,7 +58,9 @@ fn test_zlib_decompress_complete_rejects_trailing_bytes() {
 
 #[test]
 fn test_zlib_decompress_complete_rejects_garbage() {
-    assert!(zlib_decompress_complete(&[0x78, 0x9C, 0xAA, 0xBB, 0x00, 0x11, 0x22, 0x33, 0x44]).is_none());
+    assert!(
+        zlib_decompress_complete(&[0x78, 0x9C, 0xAA, 0xBB, 0x00, 0x11, 0x22, 0x33, 0x44]).is_none()
+    );
     assert!(zlib_decompress_complete(b"not compressed at all").is_none());
     assert!(zlib_decompress_complete(&[]).is_none());
 }

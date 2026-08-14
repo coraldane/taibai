@@ -310,8 +310,7 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
     fs::create_dir_all(&tail_dir)?;
     if let Some(path) = newest_live_tail_path(&tail_dir, command.id)? {
         let is_v2 = read_tail_log_version(&path)? == Some(TAIL_LOG_MAGIC_V2);
-        if is_v2 && read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key)
-        {
+        if is_v2 && read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key) {
             let file = fs::OpenOptions::new().append(true).open(&path)?;
             return Ok(OpenTailResult::Ready(OpenTail {
                 file,
@@ -426,8 +425,7 @@ fn commit_append_group(
     compressor: &mut zstd::bulk::Compressor<'_>,
     group: Vec<AppendCommand>,
 ) {
-    if matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(value) if value == "1" || value.eq_ignore_ascii_case("true"))
-    {
+    if crate::common::config::insert_profile_enabled() {
         let bytes = group
             .iter()
             .map(|command| command.prepared.encoded_len())
@@ -593,6 +591,96 @@ pub fn has_tail(table_dir: &Path, id: Uuid) -> bool {
     false
 }
 
+pub fn generation_file_count(table_dir: &Path) -> Result<usize> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    if !tail_dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for entry in fs::read_dir(tail_dir)? {
+        if parse_generation(&entry?.path()).is_some() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Batch form of `has_tail`: a single directory scan answers for every
+/// requested id, applying the same generation arbitration (newest tail wins,
+/// clear tombstones, flush intents). With thousands of live tails, per-id
+/// scans made flush grouping quadratic in the size of the tail directory.
+pub fn has_tail_batch(table_dir: &Path, ids: &[Uuid]) -> Result<HashMap<Uuid, bool>> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let mut by_id = generations_by_id(&tail_dir)?;
+    let mut answers = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let Some(mut generations) = by_id.remove(id) else {
+            answers.insert(*id, false);
+            continue;
+        };
+        generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+        let mut has = false;
+        for generation in generations {
+            match generation.kind {
+                GenerationKind::Tail => {
+                    has = true;
+                    break;
+                }
+                GenerationKind::Clear => break,
+                GenerationKind::Flush => {
+                    let Ok(bytes) = fs::read(&generation.path) else {
+                        continue;
+                    };
+                    if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
+                        break;
+                    }
+                }
+            }
+        }
+        answers.insert(*id, has);
+    }
+    Ok(answers)
+}
+
+/// Batch form of `live_tail_path`: one directory scan resolves the newest
+/// live tail file of every requested id with the same arbitration rules.
+pub fn live_tail_paths_batch(
+    table_dir: &Path,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Option<PathBuf>>> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let mut by_id = generations_by_id(&tail_dir)?;
+    let parent_dir = tail_dir.parent().unwrap_or(&tail_dir);
+    let mut answers = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let Some(mut generations) = by_id.remove(id) else {
+            answers.insert(*id, None);
+            continue;
+        };
+        generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+        let mut live = None;
+        for generation in generations {
+            match generation.kind {
+                GenerationKind::Tail => {
+                    live = Some(generation.path);
+                    break;
+                }
+                GenerationKind::Clear => break,
+                GenerationKind::Flush => {
+                    let Ok(bytes) = fs::read(&generation.path) else {
+                        continue;
+                    };
+                    if flush_intent_satisfied(parent_dir, &bytes).unwrap_or(false) {
+                        break;
+                    }
+                }
+            }
+        }
+        answers.insert(*id, live);
+    }
+    Ok(answers)
+}
+
 /// Record the destination before a durable tail is copied into a segment.
 /// Recovery can then distinguish "rows durable in the segment" from "flush
 /// never completed", avoiding duplicate rows. `expected_rows` is the row
@@ -624,12 +712,36 @@ pub fn begin_flush(
     Ok(FlushIntent { id, marker_path })
 }
 
-/// Remove the source tail first and the intent last. If cleanup is interrupted,
-/// the surviving intent still points recovery at the already durable segment.
-pub fn finish_flush(table_dir: &Path, intent: FlushIntent) -> Result<()> {
+/// Finish a flush pass by cleaning up every intent with a single directory
+/// scan. Per-intent scans made group cleanup quadratic in the number of live
+/// tail files. Ordering per intent is preserved exactly: source tails are
+/// removed first and intent markers last, so an interrupted batch still fails
+/// closed during recovery (the surviving marker points at the durable segment).
+pub fn finish_flush_batch(table_dir: &Path, intents: Vec<FlushIntent>) -> Result<()> {
+    if intents.is_empty() {
+        return Ok(());
+    }
     let tail_dir = table_dir.join(TAIL_DIR);
-    remove_other_generations(&tail_dir, intent.id, &intent.marker_path)?;
-    remove_file_if_exists(&intent.marker_path)?;
+    if !tail_dir.exists() {
+        return Ok(());
+    }
+    let keep: HashSet<PathBuf> = intents
+        .iter()
+        .map(|intent| intent.marker_path.clone())
+        .collect();
+    let ids: HashSet<Uuid> = intents.iter().map(|intent| intent.id).collect();
+    for entry in fs::read_dir(&tail_dir)? {
+        let path = entry?.path();
+        let Some((id, _)) = parse_generation(&path) else {
+            continue;
+        };
+        if ids.contains(&id) && !keep.contains(&path) {
+            remove_file_if_exists(&path)?;
+        }
+    }
+    for intent in intents {
+        remove_file_if_exists(&intent.marker_path)?;
+    }
     remove_empty_dir(&tail_dir);
     Ok(())
 }
@@ -739,6 +851,7 @@ pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredT
 
 /// Newest live tail file for a memtable, applying the same clear/flush-intent
 /// arbitration as crash recovery. Used by the spill path.
+#[allow(dead_code)] // still used by spill/recovery tests
 pub fn live_tail_path(table_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     newest_live_tail_path(&table_dir.join(TAIL_DIR), id)
 }
@@ -1119,6 +1232,23 @@ fn generations_for_id(tail_dir: &Path, id: Uuid) -> Result<Vec<Generation>> {
     Ok(generations)
 }
 
+/// Index the whole tail directory in one `read_dir` pass, grouped by memtable
+/// id. Shared by the batched flush/spill helpers so that answering for N
+/// memtables costs one scan instead of N.
+fn generations_by_id(tail_dir: &Path) -> Result<HashMap<Uuid, Vec<Generation>>> {
+    let mut by_id = HashMap::new();
+    if !tail_dir.exists() {
+        return Ok(by_id);
+    }
+    for entry in fs::read_dir(tail_dir)? {
+        let path = entry?.path();
+        if let Some((id, generation)) = parse_generation(&path) {
+            by_id.entry(id).or_default().push(generation);
+        }
+    }
+    Ok(by_id)
+}
+
 fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     let mut generations = generations_for_id(tail_dir, id)?;
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
@@ -1377,6 +1507,63 @@ mod tests {
 
         assert!(recover(temp.path(), &schema)?.is_empty());
         assert!(!has_tail(temp.path(), id));
+        Ok(())
+    }
+
+    #[test]
+    fn batched_tail_queries_match_single_id_semantics() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let live = Uuid::new_v4();
+        let cleared = Uuid::new_v4();
+        let flushed = Uuid::new_v4();
+        let unknown = Uuid::new_v4();
+        persist(temp.path(), live, "2026", &test_batch(&schema, &[1])?)?;
+        persist(temp.path(), cleared, "2026", &test_batch(&schema, &[2])?)?;
+        clear(temp.path(), cleared)?;
+        let flushed_batch = test_batch(&schema, &[3, 4])?;
+        persist(temp.path(), flushed, "", &flushed_batch)?;
+        let _intent = begin_flush(temp.path(), flushed, "seg_00001.dat", 2)?;
+        let mut writer = SegmentWriter::create(
+            &temp.path().join("seg_00001.dat"),
+            schema.clone(),
+            DEFAULT_ROW_GROUP_SIZE,
+        )?;
+        writer.write_batch(&flushed_batch)?;
+        writer.seal()?;
+
+        let answers = has_tail_batch(temp.path(), &[live, cleared, flushed, unknown])?;
+        assert!(answers[&live]);
+        assert!(!answers[&cleared]);
+        assert!(!answers[&flushed]);
+        assert!(!answers[&unknown]);
+
+        let paths = live_tail_paths_batch(temp.path(), &[live, cleared, unknown])?;
+        assert!(paths[&live].is_some());
+        assert!(paths[&cleared].is_none());
+        assert!(paths[&unknown].is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn finish_flush_batch_removes_tails_and_markers_in_one_pass() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for id in ids {
+            persist(temp.path(), id, "", &test_batch(&schema, &[1])?)?;
+        }
+        let intents = ids
+            .iter()
+            .map(|id| begin_flush(temp.path(), *id, "seg_00001.dat", 1))
+            .collect::<Result<Vec<_>>>()?;
+
+        finish_flush_batch(temp.path(), intents)?;
+
+        for id in ids {
+            assert!(!has_tail(temp.path(), id));
+        }
+        assert!(!temp.path().join(TAIL_DIR).exists());
         Ok(())
     }
 

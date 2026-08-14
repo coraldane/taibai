@@ -101,8 +101,7 @@ fn init_file_tracing(level: &str, log_file: &std::path::Path) -> std::io::Result
 }
 
 fn env_filter(level: &str) -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level))
+    tracing_subscriber::EnvFilter::new(level)
 }
 
 #[tokio::main]
@@ -140,7 +139,9 @@ async fn main() {
 async fn run_server(config: ServerConfig) {
     run_server_until(config, async {
         if tokio::signal::ctrl_c().await.is_err() {
-            tracing::warn!("Ctrl+C handler unavailable (headless session); server runs until killed");
+            tracing::warn!(
+                "Ctrl+C handler unavailable (headless session); server runs until killed"
+            );
             std::future::pending::<()>().await;
         }
         tracing::info!("received Ctrl+C, flushing active segments...");
@@ -183,6 +184,11 @@ where
 
     let _ = crate::common::config::set_performance_baseline_config(
         crate::common::config::PerformanceBaselineConfig::from(&config.performance),
+    );
+    crate::common::config::set_insert_profile_enabled(config.log.insert_profile);
+    crate::common::config::set_storage_runtime_settings(
+        config.compression.bulk_zstd_level,
+        config.storage.reader_cache_capacity,
     );
 
     let engine = match Engine::new_with_storage_config_and_auto_compact(

@@ -192,7 +192,7 @@ where
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
-        let worker = run_handler_blocking(
+        let worker = run_handler(
             handler,
             msg,
             Arc::clone(&request_limiter),
@@ -309,29 +309,29 @@ where
 
 const DISCONNECT_WORKER_WAIT: Duration = Duration::from_secs(5);
 
-async fn run_handler_blocking(
+async fn run_handler(
     mut handler: Handler,
     msg: Message,
     request_limiter: Arc<Semaphore>,
     cancelled: Arc<AtomicBool>,
     stream_sender: tokio::sync::mpsc::Sender<Message>,
 ) -> Result<tokio::task::JoinHandle<(Handler, Result<Vec<Message>>)>> {
-    let permit = if is_heavy_request(msg.msg_type) {
-        Some(
-            request_limiter
-                .acquire_owned()
-                .await
-                .map_err(|_| TaibaiError::Internal("request limiter closed".into()))?,
-        )
+    if is_heavy_request(msg.msg_type) {
+        let permit = request_limiter
+            .acquire_owned()
+            .await
+            .map_err(|_| TaibaiError::Internal("request limiter closed".into()))?;
+        Ok(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
+            (handler, responses)
+        }))
     } else {
-        None
-    };
-
-    Ok(tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
-        (handler, responses)
-    }))
+        Ok(tokio::spawn(async move {
+            let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
+            (handler, responses)
+        }))
+    }
 }
 
 async fn cleanup_handler_blocking(mut handler: Handler, request_limiter: Arc<Semaphore>) {
@@ -409,7 +409,10 @@ mod tests {
     ) -> (Framed<DuplexStream, MessageCodec>, JoinHandle<Result<()>>) {
         let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);
         let config = Arc::new(ServerConfig {
-            compression: crate::common::config::CompressionSettings { enabled: false },
+            compression: crate::common::config::CompressionSettings {
+                enabled: false,
+                bulk_zstd_level: 1,
+            },
             ..ServerConfig::default()
         });
         let server = tokio::spawn(handle_framed(
@@ -444,6 +447,47 @@ mod tests {
             .expect("login response")
             .expect("login frame");
         assert_eq!(resp.msg_type, MSG_TYPE_AUTH_OK);
+    }
+
+    #[test]
+    fn lightweight_requests_do_not_use_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+
+            let (_dir, engine) = test_engine();
+            let (mut client, server) = spawn_test_connection(engine);
+            timeout(Duration::from_secs(2), login(&mut client, "root"))
+                .await
+                .expect("login should not use the saturated blocking pool");
+            client.send(Message::empty(MSG_TYPE_PING)).await.unwrap();
+            let pong = timeout(Duration::from_secs(2), client.next())
+                .await
+                .expect("ping should not use the saturated blocking pool")
+                .unwrap()
+                .unwrap();
+            assert_eq!(pong.msg_type, MSG_TYPE_PONG);
+
+            drop(client);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            timeout(Duration::from_secs(2), server)
+                .await
+                .expect("connection cleanup should complete after blocking capacity returns")
+                .unwrap()
+                .unwrap();
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

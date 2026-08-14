@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -332,7 +332,8 @@ impl MemTable {
                 MemTableBacking::Spilled { tail_path, .. } => tail_path.clone(),
             }
         };
-        let decoded = crate::storage::core::durable_tail::decode_tail_file(&tail_path, &self.schema);
+        let decoded =
+            crate::storage::core::durable_tail::decode_tail_file(&tail_path, &self.schema);
         let mut batch_guard = self.batch.write().unwrap();
         let mut backing_guard = self.backing.write().unwrap();
         let expected_rows = match &*backing_guard {
@@ -421,10 +422,7 @@ impl MemTable {
             partition_key,
             schema,
             batch: RwLock::new(None),
-            backing: RwLock::new(MemTableBacking::Spilled {
-                tail_path,
-                rows,
-            }),
+            backing: RwLock::new(MemTableBacking::Spilled { tail_path, rows }),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(rows),
             created_at: Instant::now(),
@@ -464,6 +462,7 @@ impl MemTable {
 
 pub struct MemTableManager {
     memtables: RwLock<Vec<Arc<MemTable>>>,
+    writable: RwLock<HashMap<(String, String, String, u64), Weak<MemTable>>>,
     max_rows_per_memtable: u64,
     max_age_secs: u64,
     low_rate_max_rows: u64,
@@ -479,6 +478,7 @@ impl MemTableManager {
     ) -> Self {
         Self {
             memtables: RwLock::new(Vec::new()),
+            writable: RwLock::new(HashMap::new()),
             max_rows_per_memtable,
             max_age_secs,
             low_rate_max_rows,
@@ -574,34 +574,37 @@ impl MemTableManager {
         schema: &Schema,
         txn_id: u64,
     ) -> Arc<MemTable> {
+        let key = (
+            db.to_string(),
+            table.to_string(),
+            partition_key.to_string(),
+            txn_id,
+        );
+        if let Some(memtable) = self
+            .writable
+            .read()
+            .unwrap()
+            .get(&key)
+            .and_then(Weak::upgrade)
         {
-            let memtables = self.memtables.read().unwrap();
-            for mt in memtables.iter() {
-                if mt.db() == db
-                    && mt.table() == table
-                    && mt.partition_key() == partition_key
-                    && mt.state() == MemTableState::Pending
-                    && mt.txn_id() == txn_id
-                    && mt.row_count() < self.max_rows_per_memtable
-                {
-                    return Arc::clone(mt);
-                }
+            if memtable.state() == MemTableState::Pending
+                && memtable.txn_id() == txn_id
+                && memtable.row_count() < self.max_rows_per_memtable
+            {
+                return memtable;
             }
         }
 
-        let mut memtables = self.memtables.write().unwrap();
-        for mt in memtables.iter() {
-            if mt.db() == db
-                && mt.table() == table
-                && mt.partition_key() == partition_key
-                && mt.state() == MemTableState::Pending
-                && mt.txn_id() == txn_id
-                && mt.row_count() < self.max_rows_per_memtable
+        let mut writable = self.writable.write().unwrap();
+        if let Some(memtable) = writable.get(&key).and_then(Weak::upgrade) {
+            if memtable.state() == MemTableState::Pending
+                && memtable.txn_id() == txn_id
+                && memtable.row_count() < self.max_rows_per_memtable
             {
-                return Arc::clone(mt);
+                return memtable;
             }
         }
-        let mt = if txn_id > 0 {
+        let memtable = if txn_id > 0 {
             Arc::new(MemTable::with_txn(
                 db.to_string(),
                 table.to_string(),
@@ -617,8 +620,9 @@ impl MemTableManager {
                 schema.clone(),
             ))
         };
-        memtables.push(Arc::clone(&mt));
-        mt
+        self.memtables.write().unwrap().push(Arc::clone(&memtable));
+        writable.insert(key, Arc::downgrade(&memtable));
+        memtable
     }
 
     pub fn get_by_table(&self, db: &str, table: &str) -> Vec<Arc<MemTable>> {
@@ -701,7 +705,10 @@ impl MemTableManager {
                     return false;
                 }
                 let rows = mt.row_count();
-                let age_limit = if rows <= self.low_rate_max_rows {
+                // A spilled memtable holds no resident rows, so the extended
+                // low-rate age brings no memory benefit — it only keeps tail
+                // files on disk. Convert spilled memtables at the regular age.
+                let age_limit = if !mt.is_spilled() && rows <= self.low_rate_max_rows {
                     self.low_rate_max_age_secs
                 } else {
                     self.max_age_secs
@@ -909,6 +916,29 @@ mod tests {
     }
 
     #[test]
+    fn spilled_memtable_flushes_at_regular_age() {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let manager = MemTableManager::new(10_000, 0, 2, 3600);
+        let memtable = manager.get_or_create("main", "t", "2026", &schema);
+        let rows = batch(&schema, &[1]);
+        memtable.append(&rows).unwrap();
+        assert!(manager.get_flushable().is_empty());
+
+        crate::storage::core::durable_tail::persist(temp.path(), memtable.id(), "2026", &rows)
+            .unwrap();
+        let tail_path =
+            crate::storage::core::durable_tail::live_tail_path(temp.path(), memtable.id())
+                .unwrap()
+                .expect("tail should exist");
+        assert!(memtable.spill_to_tail(tail_path));
+
+        // The extended low-rate age exists to batch resident rows; a spilled
+        // memtable holds no memory, so it must flush at the regular age.
+        assert_eq!(manager.get_flushable().len(), 1);
+    }
+
+    #[test]
     fn pending_memory_uses_column_capacity_and_excludes_flushed_tables() {
         let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
         let manager = MemTableManager::new(10_000, 60, 2, 3600);
@@ -918,6 +948,26 @@ mod tests {
         assert!(manager.total_estimated_memory_bytes() >= 3 * std::mem::size_of::<i64>() as u64);
         memtable.set_state(MemTableState::Flushed);
         assert_eq!(manager.total_estimated_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn writable_index_replaces_full_memtable_without_reusing_history() {
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let manager = MemTableManager::new(2, 60, 2, 3600);
+
+        let first = manager.get_or_create("main", "t", "2026", &schema);
+        first.append_owned(batch(&schema, &[1, 2])).unwrap();
+        let second = manager.get_or_create("main", "t", "2026", &schema);
+        assert_ne!(first.id(), second.id());
+        assert_eq!(
+            manager.get_or_create("main", "t", "2026", &schema).id(),
+            second.id()
+        );
+
+        second.append_owned(batch(&schema, &[3, 4])).unwrap();
+        let third = manager.get_or_create("main", "t", "2026", &schema);
+        assert_ne!(second.id(), third.id());
+        assert_eq!(manager.get_by_table("main", "t").len(), 3);
     }
 
     #[test]

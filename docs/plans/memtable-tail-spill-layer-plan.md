@@ -4,6 +4,25 @@
 > 实施细节见文末「实施记录」。Phase 3（压缩缓存物化层）未实施。
 >
 > 注：本文档曾因编码事故损坏，已按实施后的最终状态重写。
+>
+> **2026-08 更新（tail 文件堆积与转储延迟修复）**：
+> - 低速率 memtable 的年龄阈值默认从 7 天降为 1 小时
+>   （`low_rate_memtable_max_age_secs`），避免低频分区的 tail 文件长期滞留；
+> - 已 spill 的 memtable 不再适用低速率放宽年龄——spill 后内存已释放，
+>   延迟转储只剩 tail 文件堆积代价，改用常规 `max_age_secs` 判定；
+> - 周期 flush 不再被 write_epoch guard 阻断：持续写入期间每
+>   `flush_interval_secs`（默认 30s）照常执行 tail→segment 转储；
+> - flush/spill 路径改为批量目录扫描（`has_tail_batch` /
+>   `live_tail_paths_batch` / `finish_flush_batch`），消除随 tail 文件数
+>   二次增长的 `read_dir` 开销；
+> - 增加每表 256 个 generation 文件的物理高水位：后台线程每秒检查一次，
+>   达到阈值后立即按分区批量转储该表全部 committed、非事务 memtable，
+>   不再等待年龄或内存阈值，避免高基数分区把目录持续推到几千个小文件；
+> - 修复满 memtable checkpoint 饥饿：`WriteCommand::Flush` 到达时立即批量
+>   drain 当前表的全部满 memtable，不再等 512MB+ backlog 或命令队列空闲
+>   1 秒。`multi_insert` 的 2470 万行单日行情在 8192 行阈值下会滚动约
+>   3016 个 memtable；旧调度在 16 客户端 × 8 pipeline 持续写入时长期等不到
+>   queue timeout，因而这些 memtable 各自对应的 tail 文件全部堆积。
 
 ## 1. 背景与问题
 

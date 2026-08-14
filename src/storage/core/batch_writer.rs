@@ -15,11 +15,12 @@ const DEFAULT_MAX_ROWS_PER_MEMTABLE: u64 = 500_000;
 const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 const DEFAULT_MAX_TOTAL_MEMORY: u64 = 512 * 1024 * 1024;
 const DEFAULT_LOW_RATE_MAX_ROWS: u64 = 1024;
-const DEFAULT_LOW_RATE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_LOW_RATE_MAX_AGE_SECS: u64 = 3600;
 const DEFAULT_SPILL_MIN_AGE_SECS: u64 = 60;
+const MAX_TAIL_FILES_PER_TABLE: usize = 256;
 
 fn insert_profile_enabled() -> bool {
-    matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+    crate::common::config::insert_profile_enabled()
 }
 
 fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
@@ -110,10 +111,6 @@ impl BatchWriter {
         let write_epoch = Arc::new(AtomicU64::new(0));
 
         let worker_count = config.worker_count.max(1);
-        let checkpoint_backlog_bytes = config
-            .max_total_memory
-            .saturating_div(4)
-            .clamp(512 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
         let mut workers = Vec::with_capacity(worker_count);
         for i in 0..worker_count {
             let rx = Arc::clone(&receiver);
@@ -135,7 +132,6 @@ impl BatchWriter {
                             tail_committer_clone,
                             write_epoch_clone,
                             max_rows_per_memtable,
-                            checkpoint_backlog_bytes,
                         );
                     })
                     .expect("failed to spawn batch writer worker"),
@@ -150,11 +146,9 @@ impl BatchWriter {
         let flush_mgr = Arc::clone(&segment_mgr);
         let flush_mt_mgr = Arc::clone(&memtable_mgr);
         let flush_tail_committer = Arc::clone(&tail_committer);
-        let flush_write_epoch = Arc::clone(&write_epoch);
         let flush_handle = std::thread::Builder::new()
             .name("taibai-bw-flush".into())
             .spawn(move || {
-                let mut last_periodic_write_epoch = flush_write_epoch.load(Ordering::Acquire);
                 while !flush_stop.load(Ordering::Acquire) {
                     for _ in 0..flush_interval {
                         if flush_stop.load(Ordering::Acquire) {
@@ -191,16 +185,27 @@ impl BatchWriter {
                                 }
                             }
                         }
+                        if let Err(error) = Self::flush_tail_file_pressure(
+                            &flush_mgr,
+                            &flush_mt_mgr,
+                            &flush_tail_committer,
+                            MAX_TAIL_FILES_PER_TABLE,
+                        ) {
+                            tracing::warn!(
+                                error = %error,
+                                "durable tail file pressure flush failed"
+                            );
+                        }
                         std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                     if flush_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let current_write_epoch = flush_write_epoch.load(Ordering::Acquire);
-                    if current_write_epoch != last_periodic_write_epoch {
-                        last_periodic_write_epoch = current_write_epoch;
-                        continue;
-                    }
+                    // Flush due memtables every interval regardless of write
+                    // activity. Gating this on "no writes since the last
+                    // flush" starved tail->segment conversion during
+                    // sustained imports and let tail files pile up in the
+                    // memtable_tail directory.
                     if let Err(e) = Self::flush_pending_memtables(
                         &flush_mgr,
                         &flush_mt_mgr,
@@ -648,7 +653,6 @@ impl BatchWriter {
         tail_committer: Arc<TailCommitter>,
         write_epoch: Arc<AtomicU64>,
         max_rows_per_memtable: u64,
-        checkpoint_backlog_bytes: u64,
     ) {
         let mut pending_tables = std::collections::HashSet::<(String, String)>::new();
         let mut last_write_epoch = write_epoch.load(Ordering::Acquire);
@@ -673,22 +677,18 @@ impl BatchWriter {
                 Ok(WriteCommand::WriteColumns { .. }) => {}
                 Ok(WriteCommand::Flush { db, table }) => {
                     last_write_epoch = write_epoch.load(Ordering::Acquire);
-                    pending_tables.insert((db.clone(), table.clone()));
-                    if memtable_mgr.total_estimated_memory_bytes() >= checkpoint_backlog_bytes {
-                        pending_tables.remove(&(db.clone(), table.clone()));
-                        if Self::checkpoint_one_full_memtable(
-                            &segment_mgr,
-                            &memtable_mgr,
-                            &tail_committer,
-                            max_rows_per_memtable,
-                            &db,
-                            &table,
-                        ) {
-                            pending_tables.insert((db, table));
-                        }
-                    } else {
-                        checkpoint_idle = false;
+                    pending_tables.remove(&(db.clone(), table.clone()));
+                    if Self::checkpoint_full_memtables(
+                        &segment_mgr,
+                        &memtable_mgr,
+                        &tail_committer,
+                        max_rows_per_memtable,
+                        &db,
+                        &table,
+                    ) {
+                        pending_tables.insert((db, table));
                     }
+                    checkpoint_idle = false;
                 }
                 Ok(WriteCommand::TxnCommit { txn_id }) => {
                     memtable_mgr.commit_txn(txn_id);
@@ -719,7 +719,7 @@ impl BatchWriter {
                         continue;
                     };
                     pending_tables.remove(&(db.clone(), table.clone()));
-                    if Self::checkpoint_one_full_memtable(
+                    if Self::checkpoint_full_memtables(
                         &segment_mgr,
                         &memtable_mgr,
                         &tail_committer,
@@ -740,10 +740,7 @@ impl BatchWriter {
         }
     }
 
-    /// Checkpoint one full memtable and report whether the same table still
-    /// has additional full memtables waiting. Limiting each foreground-active
-    /// turn to one keeps the write-behind queue bounded without a long burst.
-    fn checkpoint_one_full_memtable(
+    fn checkpoint_full_memtables(
         segment_mgr: &Arc<SegmentManager>,
         memtable_mgr: &MemTableManager,
         tail_committer: &Arc<TailCommitter>,
@@ -751,17 +748,24 @@ impl BatchWriter {
         db: &str,
         table: &str,
     ) -> bool {
-        let mut full = memtable_mgr
+        let full = memtable_mgr
             .get_by_table(db, table)
             .into_iter()
             .filter(|mt| mt.row_count() >= max_rows_per_memtable)
             .collect::<Vec<_>>();
-        if let Some(mt) = full.pop() {
-            if let Err(error) = Self::flush_memtable(segment_mgr, &mt, tail_committer) {
-                tracing::warn!(error = %error, "failed to flush memtable for {}.{}", db, table);
+        let mut failed = false;
+        for group in Self::group_memtables_for_flush(full) {
+            if let Err(error) =
+                Self::flush_memtable_group(segment_mgr, &group, false, tail_committer)
+            {
+                failed = true;
+                tracing::warn!(error = %error, "failed to flush memtables for {}.{}", db, table);
             }
         }
-        !full.is_empty()
+        if !failed {
+            memtable_mgr.remove_flushed();
+        }
+        failed
     }
 
     fn flush_pending_memtables(
@@ -775,6 +779,51 @@ impl BatchWriter {
         }
         memtable_mgr.remove_flushed();
         Ok(())
+    }
+
+    fn flush_tail_file_pressure(
+        segment_mgr: &Arc<SegmentManager>,
+        memtable_mgr: &MemTableManager,
+        tail_committer: &Arc<TailCommitter>,
+        max_files_per_table: usize,
+    ) -> Result<usize> {
+        let mut tables = std::collections::HashSet::new();
+        for memtable in memtable_mgr.get_all_pending() {
+            if !memtable.is_transactional() {
+                tables.insert((memtable.db().to_string(), memtable.table().to_string()));
+            }
+        }
+        let mut flushed_tables = 0usize;
+        for (db, table) in tables {
+            let table_dir = segment_mgr.table_dir(&db, &table);
+            let file_count = crate::storage::core::durable_tail::generation_file_count(&table_dir)?;
+            if file_count < max_files_per_table {
+                continue;
+            }
+            let memtables = memtable_mgr
+                .get_by_table(&db, &table)
+                .into_iter()
+                .filter(|memtable| !memtable.is_transactional())
+                .collect::<Vec<_>>();
+            if memtables.is_empty() {
+                continue;
+            }
+            for group in Self::group_memtables_for_flush(memtables) {
+                Self::flush_memtable_group(segment_mgr, &group, false, tail_committer)?;
+            }
+            flushed_tables += 1;
+            tracing::info!(
+                db,
+                table,
+                file_count,
+                max_files_per_table,
+                "forced memtable flush to bound durable tail file count"
+            );
+        }
+        if flushed_tables > 0 {
+            memtable_mgr.remove_flushed();
+        }
+        Ok(flushed_tables)
     }
 
     /// Spill cold committed memtables onto their durable tails until resident
@@ -792,7 +841,10 @@ impl BatchWriter {
         let target = high_water.saturating_sub(high_water / 5);
         let mut candidates = memtable_mgr.spill_candidates(min_age_secs);
         candidates.sort_by_key(|mt| std::cmp::Reverse(mt.age_secs()));
-        let mut by_table = Vec::<((String, String), Vec<Arc<crate::storage::core::memtable::MemTable>>)>::new();
+        let mut by_table = Vec::<(
+            (String, String),
+            Vec<Arc<crate::storage::core::memtable::MemTable>>,
+        )>::new();
         'outer: for mt in candidates {
             let key = (mt.db().to_string(), mt.table().to_string());
             for (existing_key, group) in by_table.iter_mut() {
@@ -811,12 +863,18 @@ impl BatchWriter {
             let table_dir = segment_mgr.table_dir(&db, &table);
             let result = segment_mgr.with_table_mutation_lock(&db, &table, || {
                 tail_committer.barrier(&table_dir)?;
+                let ids = mts.iter().map(|mt| mt.id()).collect::<Vec<_>>();
+                let live_paths =
+                    crate::storage::core::durable_tail::live_tail_paths_batch(&table_dir, &ids)?;
                 let mut count = 0usize;
                 for mt in &mts {
                     if memtable_mgr.total_estimated_memory_bytes() <= target {
                         break;
                     }
-                    if Self::try_spill_memtable(&table_dir, mt) {
+                    if Self::try_spill_memtable(
+                        live_paths.get(&mt.id()).and_then(|path| path.clone()),
+                        mt,
+                    ) {
                         count += 1;
                     }
                 }
@@ -835,8 +893,9 @@ impl BatchWriter {
     /// Spill one memtable after proving its durable tail covers exactly the
     /// memtable's rows. Holding the table mutation lock plus the preceding
     /// tail barrier makes that proof race-free against concurrent inserts.
+    /// The caller resolves the live tail paths in one batched directory scan.
     fn try_spill_memtable(
-        table_dir: &std::path::Path,
+        live_tail: Option<std::path::PathBuf>,
         mt: &Arc<crate::storage::core::memtable::MemTable>,
     ) -> bool {
         if mt.state() != MemTableState::Pending
@@ -845,8 +904,7 @@ impl BatchWriter {
         {
             return false;
         }
-        let Ok(Some(path)) = crate::storage::core::durable_tail::live_tail_path(table_dir, mt.id())
-        else {
+        let Some(path) = live_tail else {
             return false;
         };
         // Only v2 tails expose their row count without decoding; legacy tails
@@ -1081,9 +1139,11 @@ impl BatchWriter {
             .iter()
             .filter(|mt| mt.state() == MemTableState::Pending)
             .collect();
+        let ids = pending.iter().map(|mt| mt.id()).collect::<Vec<_>>();
+        let tailed_map = crate::storage::core::durable_tail::has_tail_batch(&table_dir, &ids)?;
         let tailed: Vec<bool> = pending
             .iter()
-            .map(|mt| crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()))
+            .map(|mt| tailed_map.get(&mt.id()).copied().unwrap_or(false))
             .collect();
         let all_tailed = !tailed.is_empty() && tailed.iter().all(|t| *t);
         let none_tailed = tailed.iter().all(|t| !*t);
@@ -1304,16 +1364,15 @@ impl BatchWriter {
             }
             return Ok(());
         }
-        for intent in intents {
-            if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent)
-            {
-                tracing::warn!(
-                    db,
-                    table,
-                    error = %error,
-                    "durable tail group flush cleanup deferred to recovery"
-                );
-            }
+        if let Err(error) =
+            crate::storage::core::durable_tail::finish_flush_batch(table_dir, intents)
+        {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "durable tail group flush cleanup deferred to recovery"
+            );
         }
         tracing::debug!(
             table,
@@ -1407,16 +1466,15 @@ impl BatchWriter {
             let _ = mt.take_batch();
             mt.set_state(MemTableState::Flushed);
         }
-        for intent in intents {
-            if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent)
-            {
-                tracing::warn!(
-                    db,
-                    table,
-                    error = %error,
-                    "durable tail group flush cleanup deferred to recovery"
-                );
-            }
+        if let Err(error) =
+            crate::storage::core::durable_tail::finish_flush_batch(table_dir, intents)
+        {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "durable tail group flush cleanup deferred to recovery"
+            );
         }
         tracing::debug!(
             table,
@@ -1498,7 +1556,10 @@ impl BatchWriter {
             return Ok(());
         }
 
-        if let Err(error) = crate::storage::core::durable_tail::finish_flush(&table_dir, intent) {
+        if let Err(error) = crate::storage::core::durable_tail::finish_flush_batch(
+            &table_dir,
+            std::iter::once(intent).collect(),
+        ) {
             tracing::warn!(
                 db,
                 table,
@@ -1575,7 +1636,10 @@ impl BatchWriter {
 
         let _ = mt.take_batch();
         mt.set_state(MemTableState::Flushed);
-        if let Err(error) = crate::storage::core::durable_tail::finish_flush(table_dir, intent) {
+        if let Err(error) = crate::storage::core::durable_tail::finish_flush_batch(
+            table_dir,
+            std::iter::once(intent).collect(),
+        ) {
             tracing::warn!(
                 db,
                 table,
@@ -1658,6 +1722,81 @@ mod tests {
             return 0;
         }
         std::fs::read_dir(tail_dir).unwrap().flatten().count()
+    }
+
+    #[test]
+    fn full_memtables_flush_while_write_queue_stays_active() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr));
+
+        for batch_idx in 0..64 {
+            writer.write_columns(
+                TEST_DB,
+                TEST_TABLE,
+                "20251231",
+                make_batch(&schema, batch_idx * 4, 4)?,
+                schema.clone(),
+            )?;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::storage::core::durable_tail::generation_file_count(&table_dir)? > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            crate::storage::core::durable_tail::generation_file_count(&table_dir)?,
+            0
+        );
+        assert_eq!(total_segment_rows(&table_dir), 256);
+        writer.stop();
+        Ok(())
+    }
+
+    #[test]
+    fn tail_file_pressure_forces_table_flush() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+
+        for partition in 0..4 {
+            writer.write_columns(
+                TEST_DB,
+                TEST_TABLE,
+                &partition.to_string(),
+                make_batch(&schema, partition, 1)?,
+                schema.clone(),
+            )?;
+        }
+        assert_eq!(
+            crate::storage::core::durable_tail::generation_file_count(&table_dir)?,
+            4
+        );
+
+        let flushed = BatchWriter::flush_tail_file_pressure(
+            &segment_mgr,
+            writer.memtable_manager(),
+            &writer.tail_committer,
+            4,
+        )?;
+
+        assert_eq!(flushed, 1);
+        assert_eq!(
+            crate::storage::core::durable_tail::generation_file_count(&table_dir)?,
+            0
+        );
+        assert_eq!(total_segment_rows(&table_dir), 4);
+        writer.stop();
+        Ok(())
     }
 
     /// Repeated durable memtable flushes must append into one shared active
@@ -1851,7 +1990,10 @@ mod tests {
             0,
             "spilling must not cut a row group"
         );
-        assert!(tail_entries(&table_dir) > 0, "spilled rows stay in the tail");
+        assert!(
+            tail_entries(&table_dir) > 0,
+            "spilled rows stay in the tail"
+        );
 
         writer.flush_table(TEST_DB, TEST_TABLE)?;
         writer.stop();
@@ -1872,7 +2014,13 @@ mod tests {
         let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
         let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
 
-        writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 0, 3)?, schema.clone())?;
+        writer.write_columns(
+            TEST_DB,
+            TEST_TABLE,
+            "",
+            make_batch(&schema, 0, 3)?,
+            schema.clone(),
+        )?;
         let spilled = BatchWriter::spill_pressure_pass(
             &segment_mgr,
             writer.memtable_manager(),
@@ -1885,7 +2033,9 @@ mod tests {
         let memtables = writer.memtable_manager().get_by_table(TEST_DB, TEST_TABLE);
         assert_eq!(memtables.len(), 1);
         assert!(memtables[0].is_spilled());
-        let snapshot = memtables[0].read_snapshot().expect("spilled rows materialize");
+        let snapshot = memtables[0]
+            .read_snapshot()
+            .expect("spilled rows materialize");
         assert_eq!(snapshot.num_rows(), 3);
 
         writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 3, 2)?, schema)?;

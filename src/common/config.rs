@@ -69,6 +69,35 @@ impl Default for QueryLimits {
 
 static QUERY_LIMITS: OnceLock<QueryLimits> = OnceLock::new();
 static PERFORMANCE_BASELINE_CONFIG: OnceLock<PerformanceBaselineConfig> = OnceLock::new();
+static INSERT_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+static BULK_ZSTD_LEVEL: OnceLock<i32> = OnceLock::new();
+static READER_CACHE_CAPACITY: OnceLock<usize> = OnceLock::new();
+
+/// Enable per-stage INSERT profiling logs. Configured from `log.insert_profile`
+/// in the config file at startup; defaults to off.
+pub fn set_insert_profile_enabled(enabled: bool) {
+    let _ = INSERT_PROFILE_ENABLED.set(enabled);
+}
+
+pub fn insert_profile_enabled() -> bool {
+    *INSERT_PROFILE_ENABLED.get().unwrap_or(&false)
+}
+
+/// Install storage runtime tunables sourced from `compression.bulk_zstd_level`
+/// and `storage.reader_cache_capacity` in the config file. Called once during
+/// server startup, before any storage component reads them.
+pub fn set_storage_runtime_settings(bulk_zstd_level: i32, reader_cache_capacity: usize) {
+    let _ = BULK_ZSTD_LEVEL.set(bulk_zstd_level.clamp(1, 22));
+    let _ = READER_CACHE_CAPACITY.set(reader_cache_capacity.max(1));
+}
+
+pub fn bulk_zstd_level() -> i32 {
+    *BULK_ZSTD_LEVEL.get().unwrap_or(&1)
+}
+
+pub fn reader_cache_capacity() -> usize {
+    *READER_CACHE_CAPACITY.get().unwrap_or(&1024)
+}
 
 /// Install the process-wide query limits. Called once during startup.
 /// Returns an error if called more than once (limits are immutable thereafter).
@@ -257,7 +286,7 @@ fn default_low_rate_memtable_max_rows() -> u64 {
 }
 
 fn default_low_rate_memtable_max_age_secs() -> u64 {
-    7 * 24 * 60 * 60
+    3600
 }
 
 fn default_hot_store_memory_limit_mb() -> u64 {
@@ -311,6 +340,18 @@ fn default_global_cpu_permits() -> usize {
 
 fn default_row_group_target_rows() -> usize {
     8_192
+}
+
+fn default_reader_cache_capacity() -> usize {
+    1024
+}
+
+fn default_bulk_zstd_level() -> i32 {
+    1
+}
+
+fn default_insert_profile() -> bool {
+    false
 }
 
 fn default_log_level() -> String {
@@ -451,6 +492,9 @@ pub struct StorageSettings {
     pub hot_store_memory_limit_mb: u64,
     #[serde(default = "default_row_group_target_rows")]
     pub row_group_target_rows: usize,
+    /// Number of segments kept in the reader and segment-metadata caches.
+    #[serde(default = "default_reader_cache_capacity")]
+    pub reader_cache_capacity: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +535,10 @@ pub struct BufferSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionSettings {
     pub enabled: bool,
+    /// zstd compression level applied to bulk segment writes. Valid range is
+    /// clamped to 1..=22 at startup; higher levels trade CPU for size.
+    #[serde(default = "default_bulk_zstd_level")]
+    pub bulk_zstd_level: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -510,6 +558,9 @@ pub struct LogSettings {
     pub query_file: Option<String>,
     #[serde(default = "default_query_log_max_size_mb")]
     pub query_max_size_mb: u64,
+    /// Emit per-stage INSERT profiling diagnostics (`[insert-profile]` lines).
+    #[serde(default = "default_insert_profile")]
+    pub insert_profile: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,6 +670,7 @@ fn default_storage_settings() -> StorageSettings {
         low_rate_memtable_max_age_secs: default_low_rate_memtable_max_age_secs(),
         hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
         row_group_target_rows: default_row_group_target_rows(),
+        reader_cache_capacity: default_reader_cache_capacity(),
     }
 }
 
@@ -639,7 +691,10 @@ fn default_buffer_settings() -> BufferSettings {
 }
 
 fn default_compression_settings() -> CompressionSettings {
-    CompressionSettings { enabled: true }
+    CompressionSettings {
+        enabled: true,
+        bulk_zstd_level: default_bulk_zstd_level(),
+    }
 }
 
 fn default_log_settings() -> LogSettings {
@@ -648,6 +703,7 @@ fn default_log_settings() -> LogSettings {
         file: None,
         query_file: None,
         query_max_size_mb: default_query_log_max_size_mb(),
+        insert_profile: default_insert_profile(),
     }
 }
 
