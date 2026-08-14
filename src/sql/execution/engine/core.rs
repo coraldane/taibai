@@ -43,6 +43,9 @@ impl Engine {
                             continue;
                         }
                         if let Some(db_name) = path.file_stem().and_then(|s| s.to_str()) {
+                            if db_name.starts_with('.') {
+                                continue;
+                            }
                             if let Ok(catalog) = DatabaseCatalog::load_or_create(&meta_dir, db_name)
                             {
                                 catalogs.insert(db_name.to_string(), catalog);
@@ -58,7 +61,8 @@ impl Engine {
                 for db_entry in dbs.flatten() {
                     if db_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         let db_name = db_entry.file_name().to_string_lossy().to_string();
-                        if db_name == "meta"
+                        if db_name.starts_with('.')
+                            || db_name == "meta"
                             || db_name == "wal"
                             || db_name == ".taibai-drop-databases"
                         {
@@ -143,6 +147,7 @@ impl Engine {
             Arc::clone(&segment_mgr),
             data_dir.to_path_buf(),
             Arc::clone(&catalogs),
+            Arc::clone(&index_manager),
             auto_compact_config,
         );
 
@@ -195,6 +200,27 @@ impl Engine {
             return Err(TaibaiError::Sql("empty query".into()));
         }
         self.execute_stmt(session, &stmts[0])
+    }
+
+    pub fn execute_streaming_query<F>(
+        &self,
+        session: &Session,
+        sql: &str,
+        emit: F,
+    ) -> Result<Option<Schema>>
+    where
+        F: FnMut(RecordBatch) -> Result<()>,
+    {
+        let _op_guard = self.begin_operation();
+        if session.active_txn_id() != 0 {
+            return Ok(None);
+        }
+        let stmts = Parser::parse(sql)?;
+        let Some(stmt @ Statement::Select { .. }) = stmts.first() else {
+            return Ok(None);
+        };
+        self.ensure_permissions(session, stmt)?;
+        super::query::exec_select_streaming(self, &session.database, stmt, emit)
     }
 
     pub fn execute_prepared(
@@ -251,7 +277,7 @@ impl Engine {
     /// keeping them together here is important because constraint validation,
     /// partition routing, durable-tail commits, and catalog accounting are all
     /// batch-oriented below the SQL layer.
-    pub fn execute_prepared_insert_batch(
+    pub fn execute_prepared_write_batch(
         &self,
         session: &mut Session,
         prepared: &crate::sql::execution::prepared::PreparedStatement,
@@ -262,11 +288,12 @@ impl Engine {
             return Ok(ExecResult::Ok { rows_affected: 0 });
         }
 
-        let (table, columns) = match &prepared.stmt {
-            Statement::Insert { table, columns, .. } => (table.clone(), columns.clone()),
+        let (table, columns, is_replace) = match &prepared.stmt {
+            Statement::Insert { table, columns, .. } => (table.clone(), columns.clone(), false),
+            Statement::Replace { table, columns, .. } => (table.clone(), columns.clone(), true),
             _ => {
                 return Err(TaibaiError::Sql(
-                    "prepared batch fast path only supports INSERT".into(),
+                    "prepared batch fast path only supports INSERT and REPLACE".into(),
                 ))
             }
         };
@@ -285,20 +312,31 @@ impl Engine {
             crate::sql::execution::prepared::bind_params(&mut bound, params).map_err(|error| {
                 TaibaiError::Sql(format!("row {} parameter bind failed: {}", row_idx, error))
             })?;
-            let Statement::Insert {
-                values: bound_values,
-                ..
-            } = bound
-            else {
-                unreachable!("prepared statement kind was checked above")
-            };
-            values.extend(bound_values);
+            match bound {
+                Statement::Insert {
+                    values: bound_values,
+                    ..
+                }
+                | Statement::Replace {
+                    values: bound_values,
+                    ..
+                } => values.extend(bound_values),
+                _ => unreachable!("prepared statement kind was checked above"),
+            }
         }
 
-        let stmt = Statement::Insert {
-            table,
-            columns,
-            values,
+        let stmt = if is_replace {
+            Statement::Replace {
+                table,
+                columns,
+                values,
+            }
+        } else {
+            Statement::Insert {
+                table,
+                columns,
+                values,
+            }
         };
         self.ensure_permissions(session, &stmt)?;
         self.execute_stmt(session, &stmt)

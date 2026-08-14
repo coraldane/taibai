@@ -215,13 +215,7 @@ MSG_TYPE_BULK_INSERT_COLUMNAR
 - segment 大小达到阈值时 seal，写入 footer 和 footer offset。
 - 未达到 seal 阈值时会刷新 meta，便于后续恢复未 seal segment。
 
-bulk 压缩级别由环境变量控制：
-
-```text
-TAIBAI_BULK_ZSTD_LEVEL
-```
-
-默认值为 `1`。
+bulk 压缩级别由配置文件 `compression.bulk_zstd_level` 控制，默认值为 `1`。
 
 ## 分区与聚簇处理
 
@@ -323,7 +317,7 @@ examples/batch_import
 - 尽量使用列式二进制 bulk。
 - 对可重放导入使用 `disable_wal=true`。
 - 调大 batch size 和 pipeline depth，但不要超过 `Client::start_pipeline` 当前上限 16。
-- 对无需查询裁剪的导入阶段，可通过 `TAIBAI_BULK_ZSTD_LEVEL=1` 或更低级别压缩减少 CPU。
+- 对无需查询裁剪的导入阶段，可通过配置文件 `compression.bulk_zstd_level: 1` 或更低级别压缩减少 CPU。
 - 若希望直接列式路径收益最大，优先导入无分区/无聚簇表，或后续再执行整理/优化。
 
 ## 后续优化建议

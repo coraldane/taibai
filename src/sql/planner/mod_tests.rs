@@ -97,3 +97,16 @@ fn test_plan_aggregate() {
     }
     assert!(has_aggregate(&plan));
 }
+
+#[test]
+fn test_plan_aggregate_with_simple_case_argument() {
+    let schema = make_schema();
+    let mut schemas = std::collections::HashMap::new();
+    schemas.insert("users".into(), schema);
+
+    let stmts = Parser::parse(
+        "SELECT MAX(CASE age WHEN 0 THEN 0 ELSE id END), MIN(CASE age WHEN 0 THEN 5000 ELSE id END) FROM users",
+    )
+    .unwrap();
+    plan_select(&stmts[0], &schemas).unwrap();
+}

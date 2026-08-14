@@ -26,9 +26,40 @@ storage:
     assert_eq!(config.storage.default_database, "main");
     assert_eq!(config.buffer.batch_size, 4096);
     assert!(config.compression.enabled);
+    assert_eq!(config.compression.bulk_zstd_level, 1);
+    assert_eq!(config.storage.reader_cache_capacity, 1024);
     assert!(!config.tls.enabled);
     assert_eq!(config.log.level, "info");
+    assert!(!config.log.insert_profile);
     assert!(config.performance.max_entries > 0);
+}
+
+#[test]
+fn config_overrides_storage_caches_bulk_level_and_insert_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.yaml");
+    std::fs::write(
+        &config_path,
+        r#"
+storage:
+  data_dir: "./data"
+  reader_cache_capacity: 4096
+compression:
+  enabled: true
+  bulk_zstd_level: 3
+log:
+  level: "debug"
+  insert_profile: true
+"#,
+    )
+    .unwrap();
+
+    let config = ServerConfig::from_yaml_file(&config_path).unwrap();
+
+    assert_eq!(config.storage.reader_cache_capacity, 4096);
+    assert_eq!(config.compression.bulk_zstd_level, 3);
+    assert_eq!(config.log.level, "debug");
+    assert!(config.log.insert_profile);
 }
 
 #[test]

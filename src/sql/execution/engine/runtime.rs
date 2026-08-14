@@ -343,13 +343,11 @@ impl Engine {
         Ok(0)
     }
 
-    /// Graceful process checkpoint that preserves durable low-rate memtables.
-    /// Explicit FLUSH/CLOSE OF DAY still use `flush_all_buffers` and therefore
-    /// materialize every row when the operator asks for it.
+    /// Graceful process checkpoint. Memtables backed by a durable tail stay
+    /// resident (recovered from their tails on restart), so routine restarts
+    /// do not cut tiny row groups; only untailed memtables are materialized.
     pub fn flush_shutdown_buffers(&self) -> Result<u64> {
-        if let Err(e) = self.batch_writer.flush_all_for_shutdown() {
-            tracing::warn!(error = %e, "shutdown buffer flush failed");
-        }
+        self.batch_writer.flush_untailed_pending()?;
 
         self.segment_mgr.flush_all_active()?;
         {
@@ -444,6 +442,16 @@ impl Engine {
         }
         if stats.segments_written > 0 {
             self.index_manager.mark_index_stale(db, table);
+            let unique_index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            self.index_manager.invalidate_table_unique_index_snapshots(
+                db,
+                table,
+                &unique_index_names,
+            );
         }
         let today = chrono::Local::now().date_naive().to_string();
         {

@@ -101,8 +101,7 @@ fn init_file_tracing(level: &str, log_file: &std::path::Path) -> std::io::Result
 }
 
 fn env_filter(level: &str) -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level))
+    tracing_subscriber::EnvFilter::new(level)
 }
 
 #[tokio::main]
@@ -139,7 +138,12 @@ async fn main() {
 
 async fn run_server(config: ServerConfig) {
     run_server_until(config, async {
-        let _ = tokio::signal::ctrl_c().await;
+        if tokio::signal::ctrl_c().await.is_err() {
+            tracing::warn!(
+                "Ctrl+C handler unavailable (headless session); server runs until killed"
+            );
+            std::future::pending::<()>().await;
+        }
         tracing::info!("received Ctrl+C, flushing active segments...");
     })
     .await;
@@ -181,6 +185,11 @@ where
     let _ = crate::common::config::set_performance_baseline_config(
         crate::common::config::PerformanceBaselineConfig::from(&config.performance),
     );
+    crate::common::config::set_insert_profile_enabled(config.log.insert_profile);
+    crate::common::config::set_storage_runtime_settings(
+        config.compression.bulk_zstd_level,
+        config.storage.reader_cache_capacity,
+    );
 
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
@@ -204,6 +213,7 @@ where
     // streaming scans) to consult.
     let _ = crate::common::config::set_query_limits(crate::common::config::QueryLimits {
         query_memory_limit_mb: config.buffer.query_memory_limit_mb,
+        max_result_message_bytes: config.server.max_message_size,
         max_aggregate_groups: config.buffer.max_aggregate_groups,
         max_parallel_row_groups: config.buffer.max_parallel_row_groups.max(1),
         parallel_scan_min_row_groups: config.buffer.parallel_scan_min_row_groups.max(1),
@@ -225,6 +235,7 @@ where
 
     if let Err(e) = server.run_with_shutdown(shutdown).await {
         tracing::error!(error = %e, "server error");
+        eprintln!("taibai server error: {e}");
     }
 
     match engine.flush_shutdown_buffers() {

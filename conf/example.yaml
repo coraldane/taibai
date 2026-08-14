@@ -5,11 +5,15 @@ server:
   max_concurrent_requests: 8
 
 storage:
-  data_dir: "./data"
+  # data_dir: "./data"
+  data_dir: "/Users/coral/Downloads/data/taibai_data"
   default_database: "main"
   min_segment_seal_size_mb: 500
   max_segment_size_mb: 2048
   hot_store_memory_limit_mb: 8192
+  row_group_target_rows: 8192
+  # reader 与 segment 元数据缓存的 segment 数量
+  reader_cache_capacity: 1024
 
 buffer:
   query_memory_limit_mb: 4096
@@ -20,6 +24,10 @@ buffer:
 
 compression:
   enabled: true
+  # bulk segment 写入的 zstd 压缩级别（1..=22，启动时截断）
+  bulk_zstd_level: 1
 
 log:
   level: "info"
+  # 输出 [insert-profile] 逐阶段 INSERT 诊断日志
+  insert_profile: false

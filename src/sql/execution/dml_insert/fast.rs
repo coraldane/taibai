@@ -1,5 +1,5 @@
 fn insert_profile_enabled() -> bool {
-    matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+    crate::common::config::insert_profile_enabled()
 }
 
 fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
@@ -243,6 +243,8 @@ fn try_exec_fast_insert_sql_inner(
         true,
         false,
         missing_auto_inc,
+        true,
+        true,
     ))
 }
 

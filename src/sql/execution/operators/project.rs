@@ -36,19 +36,15 @@ impl ExecutionOp for ProjectExec {
                 for (i, expr) in self.expressions.iter().enumerate() {
                     let expr = remap_expr_for_batch(expr, &self.input_schema, &batch.schema);
                     let vals = eval_expr_column(&expr, &batch)?;
-                    let dt = infer_type(&expr, &batch.schema);
-
-                    let mut col = ColumnArray::empty(dt);
+                    let col_def =
+                        project_column_def(&expr, &batch.schema, self.aliases[i].as_deref());
+                    let mut col = ColumnArray::empty(col_def.data_type);
                     for v in &vals {
-                        let coerced = coerce_scalar_for_dtype(v, dt)?;
+                        let coerced = coerce_project_value(v, &col_def)?;
                         col.push(&coerced)?;
                     }
                     columns.push(col);
-                    col_defs.push(project_column_def(
-                        &expr,
-                        &batch.schema,
-                        self.aliases[i].as_deref(),
-                    ));
+                    col_defs.push(col_def);
                 }
 
                 let schema = Schema::new(col_defs);
@@ -154,8 +150,50 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
                 .collect::<Vec<_>>();
             crate::sql::planner::expr::infer_scalar_function_type(name, &arg_types)
         }
+        LogicalExpr::Case {
+            when_clauses,
+            else_clause,
+            ..
+        } => {
+            let branch_types = when_clauses
+                .iter()
+                .map(|(_, then_expr)| infer_type(then_expr, schema))
+                .chain(else_clause.as_deref().map(|expr| infer_type(expr, schema)));
+            branch_types
+                .reduce(|left, right| crate::sql::binder::type_resolver::common_type(&left, &right))
+                .unwrap_or(DataType::Int64)
+        }
         _ => DataType::Int64,
     }
+}
+
+fn coerce_project_value(
+    value: &crate::types::scalar::ScalarValue,
+    column: &ColumnDef,
+) -> Result<crate::types::scalar::ScalarValue> {
+    if column.data_type == DataType::Decimal
+        && value.data_type() != DataType::Decimal
+        && !value.is_null()
+    {
+        let multiplier = 10_i64.checked_pow(column.scale as u32).ok_or_else(|| {
+            crate::common::error::TaibaiError::Sql(format!(
+                "invalid decimal scale {}",
+                column.scale
+            ))
+        })?;
+        if let Some(integer) = value.integer_i128() {
+            let scaled = integer
+                .checked_mul(multiplier as i128)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or_else(|| {
+                    crate::common::error::TaibaiError::Sql(
+                        "decimal projection value overflow".into(),
+                    )
+                })?;
+            return Ok(crate::types::scalar::ScalarValue::Decimal(Some(scaled)));
+        }
+    }
+    coerce_scalar_for_dtype(value, column.data_type)
 }
 
 pub fn project_column_def(expr: &LogicalExpr, schema: &Schema, alias: Option<&str>) -> ColumnDef {
@@ -166,6 +204,31 @@ pub fn project_column_def(expr: &LogicalExpr, schema: &Schema, alias: Option<&st
                 col_def.name = alias.to_string();
             }
             return col_def;
+        }
+    }
+
+    if let LogicalExpr::Case {
+        when_clauses,
+        else_clause,
+        ..
+    } = expr
+    {
+        let branch = when_clauses
+            .iter()
+            .map(|(_, then_expr)| then_expr)
+            .chain(else_clause.iter().map(|expr| expr.as_ref()))
+            .find_map(|branch| match branch {
+                LogicalExpr::Column(index)
+                    if schema.columns.get(*index)?.data_type == DataType::Decimal =>
+                {
+                    schema.columns.get(*index).cloned()
+                }
+                _ => None,
+            });
+        if let Some(mut column) = branch {
+            column.name = alias.unwrap_or("expr").to_string();
+            column.nullable = true;
+            return column;
         }
     }
 

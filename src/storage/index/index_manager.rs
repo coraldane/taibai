@@ -11,6 +11,8 @@ use crate::storage::index::sparse_index::SparseIndexImpl;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::scalar::ScalarValue;
 
+pub const PRIMARY_LOCATION_INDEX_NAME: &str = "__taibai_primary_location";
+
 pub struct IndexManager {
     indexes: RwLock<HashMap<String, HashMap<String, Arc<SparseIndexImpl>>>>,
     unique_indexes: RwLock<HashMap<String, Arc<UniqueIndexState>>>,
@@ -47,6 +49,7 @@ pub struct PreparedUniqueIndexEntry {
 }
 
 struct UniqueIndexState {
+    flush_epoch: Option<u64>,
     base: Arc<UniqueIndexData>,
     delta: RwLock<UniqueIndexDeltaState>,
     mutation_lock: Mutex<()>,
@@ -62,6 +65,7 @@ struct UniqueIndexDeltaState {
 impl UniqueIndexState {
     fn new(base: UniqueIndexData, delta: UniqueIndexDeltaState) -> Self {
         Self {
+            flush_epoch: base.flush_epoch,
             base: Arc::new(base),
             delta: RwLock::new(delta),
             mutation_lock: Mutex::new(()),
@@ -76,6 +80,11 @@ pub struct UniqueIndexData {
     pub index_name: String,
     pub columns: Vec<String>,
     pub entries: Vec<UniqueIndexEntry>,
+    /// Memtable-flush epoch stamped when this snapshot was built. `None` (legacy
+    /// files) is treated as stale: the first probe rebuilds the snapshot so its
+    /// segment coverage is guaranteed before it is trusted for row locations.
+    #[serde(default)]
+    pub flush_epoch: Option<u64>,
     #[serde(skip)]
     pub tombstones: HashSet<UniqueRowLocation>,
     #[serde(skip)]
@@ -267,6 +276,7 @@ impl IndexManager {
         index_name: &str,
         columns: &[String],
         entries: Vec<UniqueIndexEntry>,
+        flush_epoch: Option<u64>,
     ) -> Result<()> {
         let dir = self.unique_index_dir(db, table);
         std::fs::create_dir_all(&dir)?;
@@ -276,6 +286,7 @@ impl IndexManager {
             index_name: index_name.to_string(),
             columns: columns.to_vec(),
             entries,
+            flush_epoch,
             tombstones: HashSet::new(),
             encoded_keys: Vec::new(),
             blocks: Vec::new(),
@@ -441,11 +452,16 @@ impl IndexManager {
         Ok(true)
     }
 
-    pub fn invalidate_primary_key_index(&self, db: &str, table: &str) {
+    pub fn invalidate_primary_key_cache(&self, db: &str, table: &str) {
         self.primary_key_indexes
             .write()
             .unwrap()
             .remove(&format!("{}\0{}", db, table));
+    }
+
+    pub fn invalidate_primary_key_index(&self, db: &str, table: &str) {
+        self.invalidate_primary_key_cache(db, table);
+        self.invalidate_unique_index_snapshot_if_present(db, table, PRIMARY_LOCATION_INDEX_NAME);
     }
 
     pub fn unique_key_exists(
@@ -466,6 +482,97 @@ impl IndexManager {
         )?))
     }
 
+    pub fn unique_key_locations(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        keys: &[Vec<ScalarValue>],
+    ) -> Result<Option<Vec<UniqueRowLocation>>> {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            return Ok(None);
+        };
+        // A memtable flush after this snapshot was built may have moved rows into
+        // segments without index entries; force a rebuild rather than miss them.
+        if state.flush_epoch != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+            return Ok(None);
+        }
+        let encoded_keys = keys
+            .iter()
+            .map(|key| encode_unique_key(key))
+            .collect::<Result<Vec<_>>>()?;
+        let mut locations = {
+            let delta = state.delta.read().unwrap();
+            let mut locations = Vec::new();
+            for encoded in &encoded_keys {
+                if let Some(matches) = delta.key_locations.get(encoded) {
+                    locations.extend(
+                        matches
+                            .iter()
+                            .filter(|location| {
+                                !location.segment_path.is_empty()
+                                    && !unique_index_tombstones_contains(
+                                        &delta.tombstones,
+                                        location,
+                                    )
+                            })
+                            .cloned(),
+                    );
+                }
+                let Ok(mut idx) = state
+                    .base
+                    .encoded_keys
+                    .binary_search_by(|value| value.as_slice().cmp(encoded))
+                else {
+                    continue;
+                };
+                while idx > 0 && state.base.encoded_keys[idx - 1] == *encoded {
+                    idx -= 1;
+                }
+                while idx < state.base.encoded_keys.len()
+                    && state.base.encoded_keys[idx] == *encoded
+                {
+                    let location = &state.base.entries[idx].location;
+                    if !location.segment_path.is_empty()
+                        && !unique_index_tombstones_contains(&delta.tombstones, location)
+                    {
+                        locations.push(location.clone());
+                    }
+                    idx += 1;
+                }
+            }
+            locations
+        };
+        locations.sort_by(|left, right| {
+            left.segment_path
+                .cmp(&right.segment_path)
+                .then(left.row_id.cmp(&right.row_id))
+        });
+        locations.dedup();
+        let mut start = 0;
+        while start < locations.len() {
+            let path = Path::new(&locations[start].segment_path);
+            if !path.exists() {
+                return Ok(None);
+            }
+            let reader = self.segment_mgr.open_reader_cached(path)?;
+            let mut end = start + 1;
+            while end < locations.len()
+                && locations[end].segment_path == locations[start].segment_path
+            {
+                end += 1;
+            }
+            if locations[start..end]
+                .iter()
+                .any(|location| location.row_id >= reader.row_count())
+            {
+                return Ok(None);
+            }
+            start = end;
+        }
+        Ok(Some(locations))
+    }
+
     pub fn unique_keys_exist(
         &self,
         db: &str,
@@ -476,6 +583,11 @@ impl IndexManager {
         let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
+        // Same staleness guard as unique_key_locations: rows flushed to segments
+        // after this snapshot was built may be missing from it entirely.
+        if state.flush_epoch != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+            return Ok(None);
+        }
         for key in keys {
             let encoded = encode_unique_key(key)?;
             if unique_index_state_contains_key(&self.segment_mgr, &state, &encoded)? {
@@ -545,7 +657,16 @@ impl IndexManager {
             let data = materialize_unique_index_state(&state)?;
             let columns = data.columns.clone();
             let live_entries = live_unique_index_entries(&data);
-            self.persist_unique_index_entries(db, table, index_name, &columns, live_entries)?;
+            // Delta compaction preserves the snapshot's epoch: flushing since the
+            // snapshot was built keeps it stale so the next probe rebuilds it.
+            self.persist_unique_index_entries(
+                db,
+                table,
+                index_name,
+                &columns,
+                live_entries,
+                state.flush_epoch,
+            )?;
         }
         Ok(true)
     }
@@ -600,9 +721,35 @@ impl IndexManager {
             let data = materialize_unique_index_state(&state)?;
             let columns = data.columns.clone();
             let live_entries = live_unique_index_entries(&data);
-            self.persist_unique_index_entries(db, table, index_name, &columns, live_entries)?;
+            self.persist_unique_index_entries(
+                db,
+                table,
+                index_name,
+                &columns,
+                live_entries,
+                state.flush_epoch,
+            )?;
         }
         Ok(true)
+    }
+
+    pub fn invalidate_unique_index_snapshot_if_present(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) {
+        let base = sanitize_file_component(index_name);
+        let dir = self.unique_index_dir(db, table);
+        if dir.join(format!("{}.keys.tbi", base)).exists()
+            || self
+                .unique_indexes
+                .read()
+                .unwrap()
+                .contains_key(&unique_index_key(db, table, index_name))
+        {
+            self.invalidate_unique_index_snapshot(db, table, index_name);
+        }
     }
 
     pub fn invalidate_unique_index_snapshot(&self, db: &str, table: &str, index_name: &str) {
@@ -646,7 +793,8 @@ impl IndexManager {
         table: &str,
         index_names: &[String],
     ) {
-        self.invalidate_primary_key_index(db, table);
+        self.invalidate_primary_key_cache(db, table);
+        self.remove_unique_index_snapshot(db, table, PRIMARY_LOCATION_INDEX_NAME);
         for index_name in index_names {
             self.remove_unique_index_snapshot(db, table, index_name);
         }
@@ -663,6 +811,8 @@ impl IndexManager {
 
 const UNIQUE_INDEX_MAGIC_V1: &[u8; 8] = b"TBIUKV1\0";
 const UNIQUE_INDEX_MAGIC_V2: &[u8; 8] = b"TBIUKV2\0";
+const UNIQUE_INDEX_MAGIC_V3: &[u8; 8] = b"TBIUKV3\0";
+const UNIQUE_INDEX_MAGIC_V4: &[u8; 8] = b"TBIUKV4\0";
 const UNIQUE_INDEX_DELTA_MAGIC_V1: &[u8; 8] = b"TBIUKD1\0";
 const UNIQUE_INDEX_DELTA_MAGIC_V2: &[u8; 8] = b"TBIUKD2\0";
 const UNIQUE_INDEX_BLOCK_SIZE: usize = 256;
@@ -901,7 +1051,7 @@ fn encode_unique_key(key: &[ScalarValue]) -> Result<Vec<u8>> {
 
 fn encode_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(UNIQUE_INDEX_MAGIC_V2);
+    out.extend_from_slice(UNIQUE_INDEX_MAGIC_V4);
     put_string(&mut out, &data.db);
     put_string(&mut out, &data.table);
     put_string(&mut out, &data.index_name);
@@ -917,15 +1067,37 @@ fn encode_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
         put_u32(&mut out, block.len as u32);
         put_bytes(&mut out, &block.first_key);
     }
-    for (idx, entry) in data.entries.iter().enumerate() {
-        put_bytes(&mut out, &data.encoded_keys[idx]);
-        put_u32(&mut out, entry.key.len() as u32);
-        for value in &entry.key {
-            encode_scalar_value(&mut out, value)?;
+    let mut path_ids: HashMap<&str, u32> = HashMap::new();
+    let mut paths: Vec<&str> = Vec::new();
+    for entry in &data.entries {
+        let path = entry.location.segment_path.as_str();
+        if !path_ids.contains_key(path) {
+            path_ids.insert(path, paths.len() as u32);
+            paths.push(path);
         }
-        put_string(&mut out, &entry.location.segment_path);
-        put_u64(&mut out, entry.location.row_id);
     }
+    put_u32(&mut out, paths.len() as u32);
+    for path in &paths {
+        put_string(&mut out, path);
+    }
+    for (idx, entry) in data.entries.iter().enumerate() {
+        let encoded_key = &data.encoded_keys[idx];
+        let prefix_len = data
+            .blocks
+            .get(idx / UNIQUE_INDEX_BLOCK_SIZE)
+            .map(|block| common_prefix_len(&block.first_key, encoded_key))
+            .unwrap_or(0);
+        put_varint(&mut out, prefix_len as u64);
+        put_varint(&mut out, (encoded_key.len() - prefix_len) as u64);
+        out.extend_from_slice(&encoded_key[prefix_len..]);
+        put_varint(
+            &mut out,
+            path_ids[entry.location.segment_path.as_str()] as u64,
+        );
+        put_varint(&mut out, entry.location.row_id);
+    }
+    out.push(if data.flush_epoch.is_some() { 1 } else { 0 });
+    put_u64(&mut out, data.flush_epoch.unwrap_or(0));
     Ok(out)
 }
 
@@ -1128,6 +1300,12 @@ fn decode_unique_index_data(bytes: &[u8]) -> Result<Option<UniqueIndexData>> {
     if &magic == UNIQUE_INDEX_MAGIC_V2 {
         return decode_unique_index_data_v2(&mut cursor);
     }
+    if &magic == UNIQUE_INDEX_MAGIC_V3 {
+        return decode_unique_index_data_v3(&mut cursor);
+    }
+    if &magic == UNIQUE_INDEX_MAGIC_V4 {
+        return decode_unique_index_data_v4(&mut cursor);
+    }
     Err(TaibaiError::Storage(
         "invalid unique index binary file".to_string(),
     ))
@@ -1153,6 +1331,7 @@ fn decode_unique_index_data_v1(cursor: &mut Cursor<&[u8]>) -> Result<Option<Uniq
         index_name,
         columns,
         entries,
+        flush_epoch: None,
         tombstones: HashSet::new(),
         encoded_keys: Vec::new(),
         blocks: Vec::new(),
@@ -1191,6 +1370,7 @@ fn decode_unique_index_data_v2(cursor: &mut Cursor<&[u8]>) -> Result<Option<Uniq
         index_name,
         columns,
         entries,
+        flush_epoch: None,
         tombstones: HashSet::new(),
         encoded_keys,
         blocks,
@@ -1214,12 +1394,133 @@ fn read_unique_index_entry(cursor: &mut Cursor<&[u8]>) -> Result<UniqueIndexEntr
     })
 }
 
+fn decode_unique_index_data_v3(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
+    decode_unique_index_data_blocks(cursor)
+}
+
+fn decode_unique_index_data_v4(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
+    let Some(mut data) = decode_unique_index_data_blocks(cursor)? else {
+        return Ok(None);
+    };
+    let mut flag = [0u8; 1];
+    cursor.read_exact(&mut flag)?;
+    let epoch = read_u64(cursor)?;
+    data.flush_epoch = (flag[0] == 1).then_some(epoch);
+    Ok(Some(data))
+}
+
+fn decode_unique_index_data_blocks(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
+    let db = read_string(cursor)?;
+    let table = read_string(cursor)?;
+    let index_name = read_string(cursor)?;
+    let column_count = read_u32(cursor)? as usize;
+    let mut columns = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        columns.push(read_string(cursor)?);
+    }
+    let entry_count = read_u64(cursor)? as usize;
+    let _block_size = read_u32(cursor)? as usize;
+    let block_count = read_u32(cursor)? as usize;
+    let mut blocks = Vec::with_capacity(block_count);
+    for _ in 0..block_count {
+        blocks.push(UniqueIndexBlock {
+            start: read_u64(cursor)? as usize,
+            len: read_u32(cursor)? as usize,
+            first_key: read_bytes(cursor)?,
+        });
+    }
+    let path_count = read_u32(cursor)? as usize;
+    let mut paths = Vec::with_capacity(path_count);
+    for _ in 0..path_count {
+        paths.push(read_string(cursor)?);
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut encoded_keys = Vec::with_capacity(entry_count);
+    for block in &blocks {
+        for _ in 0..block.len {
+            let prefix_len = read_varint(cursor)? as usize;
+            let suffix_len = read_varint(cursor)? as usize;
+            if prefix_len > block.first_key.len() {
+                return Err(TaibaiError::Storage(
+                    "corrupt unique index key prefix".to_string(),
+                ));
+            }
+            let mut encoded_key = Vec::with_capacity(prefix_len + suffix_len);
+            encoded_key.extend_from_slice(&block.first_key[..prefix_len]);
+            let mut suffix = vec![0u8; suffix_len];
+            cursor.read_exact(&mut suffix)?;
+            encoded_key.extend_from_slice(&suffix);
+            let path_idx = read_varint(cursor)? as usize;
+            let row_id = read_varint(cursor)?;
+            let Some(segment_path) = paths.get(path_idx) else {
+                return Err(TaibaiError::Storage(
+                    "corrupt unique index path reference".to_string(),
+                ));
+            };
+            let key = decode_encoded_unique_key(&encoded_key)?;
+            encoded_keys.push(encoded_key);
+            entries.push(UniqueIndexEntry {
+                key,
+                location: UniqueRowLocation {
+                    segment_path: segment_path.clone(),
+                    row_id,
+                },
+            });
+        }
+    }
+    if entries.len() != entry_count {
+        return Err(TaibaiError::Storage(
+            "corrupt unique index entry count".to_string(),
+        ));
+    }
+    Ok(Some(UniqueIndexData {
+        db,
+        table,
+        index_name,
+        columns,
+        entries,
+        flush_epoch: None,
+        tombstones: HashSet::new(),
+        encoded_keys,
+        blocks,
+    }))
+}
+
+fn decode_encoded_unique_key(encoded: &[u8]) -> Result<Vec<ScalarValue>> {
+    let mut cursor = Cursor::new(encoded);
+    let count = read_u32(&mut cursor)? as usize;
+    let mut key = Vec::with_capacity(count);
+    for _ in 0..count {
+        key.push(decode_scalar_value(&mut cursor)?);
+    }
+    Ok(key)
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
 }
 
 fn put_i64(out: &mut Vec<u8>, value: i64) {
@@ -1259,6 +1560,7 @@ mod tests {
             index_name: "uk_value".to_string(),
             columns: vec!["value".to_string()],
             entries: vec![entry(2, 2), entry(4, 4)],
+            flush_epoch: None,
             tombstones: HashSet::new(),
             encoded_keys: Vec::new(),
             blocks: Vec::new(),
@@ -1287,6 +1589,79 @@ mod tests {
     }
 
     #[test]
+    fn direct_location_lookup_skips_transient_locations() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = IndexManager::new_with_data_dir(
+            Arc::new(SegmentManager::new(dir.path())?),
+            dir.path().to_path_buf(),
+        );
+        manager.persist_unique_index_entries(
+            "db",
+            "ticks",
+            "uk_value",
+            &["value".to_string()],
+            vec![entry(1, 0)],
+            Some(0),
+        )?;
+        // Memtable-resident pseudo locations (empty segment_path) are skipped:
+        // REPLACE deletes conflicting memtable rows in place, so a location
+        // probe only needs segment-side results.
+        assert_eq!(
+            manager.unique_key_locations(
+                "db",
+                "ticks",
+                "uk_value",
+                &[vec![ScalarValue::Int64(Some(1))]],
+            )?,
+            Some(Vec::new())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flush_epoch_mismatch_forces_location_probe_rebuild() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+        let manager =
+            IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+        manager.persist_unique_index_entries(
+            "db",
+            "ticks",
+            "uk_value",
+            &["value".to_string()],
+            vec![entry(1, 0)],
+            Some(segment_mgr.memtable_flush_epoch("db", "ticks")),
+        )?;
+        // A memtable flush after the snapshot was built may have moved rows
+        // into segments without index entries; probing must report stale.
+        segment_mgr.note_memtable_flush("db", "ticks");
+        assert_eq!(
+            manager.unique_key_locations(
+                "db",
+                "ticks",
+                "uk_value",
+                &[vec![ScalarValue::Int64(Some(1))]],
+            )?,
+            None
+        );
+        // The epoch survives a restart through the on-disk marker.
+        let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+        let manager =
+            IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+        assert_eq!(segment_mgr.memtable_flush_epoch("db", "ticks"), 1);
+        assert_eq!(
+            manager.unique_key_locations(
+                "db",
+                "ticks",
+                "uk_value",
+                &[vec![ScalarValue::Int64(Some(1))]],
+            )?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
     fn incremental_unique_index_merge_handles_many_batches() -> Result<()> {
         let mut data = UniqueIndexData {
             db: "db".to_string(),
@@ -1294,6 +1669,7 @@ mod tests {
             index_name: "uk_value".to_string(),
             columns: vec!["value".to_string()],
             entries: Vec::new(),
+            flush_epoch: None,
             tombstones: HashSet::new(),
             encoded_keys: Vec::new(),
             blocks: Vec::new(),
@@ -1316,12 +1692,160 @@ mod tests {
         );
         Ok(())
     }
+
+    fn stock_entry(id: &str, date: i32, time: i32, row_id: u64, path: &str) -> UniqueIndexEntry {
+        UniqueIndexEntry {
+            key: vec![
+                ScalarValue::VarChar(Some(id.to_string())),
+                ScalarValue::Int32(Some(date)),
+                ScalarValue::Int32(Some(time)),
+            ],
+            location: UniqueRowLocation {
+                segment_path: path.to_string(),
+                row_id,
+            },
+        }
+    }
+
+    fn stock_minute_index_data(entry_count: u32, path: &str) -> UniqueIndexData {
+        let entries = (0..entry_count)
+            .map(|idx| {
+                stock_entry(
+                    &format!("{:06}.SZ", idx / 240),
+                    20260701,
+                    93000 + (idx % 240) as i32,
+                    idx as u64,
+                    path,
+                )
+            })
+            .collect();
+        UniqueIndexData {
+            db: "quant_base".to_string(),
+            table: "t_stock_minute".to_string(),
+            index_name: PRIMARY_LOCATION_INDEX_NAME.to_string(),
+            columns: vec![
+                "security_id".to_string(),
+                "deal_date".to_string(),
+                "deal_time".to_string(),
+            ],
+            entries,
+            flush_epoch: None,
+            tombstones: HashSet::new(),
+            encoded_keys: Vec::new(),
+            blocks: Vec::new(),
+        }
+    }
+
+    fn encode_legacy_v2_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(UNIQUE_INDEX_MAGIC_V2);
+        put_string(&mut out, &data.db);
+        put_string(&mut out, &data.table);
+        put_string(&mut out, &data.index_name);
+        put_u32(&mut out, data.columns.len() as u32);
+        for column in &data.columns {
+            put_string(&mut out, column);
+        }
+        put_u64(&mut out, data.entries.len() as u64);
+        put_u32(&mut out, UNIQUE_INDEX_BLOCK_SIZE as u32);
+        put_u32(&mut out, data.blocks.len() as u32);
+        for block in &data.blocks {
+            put_u64(&mut out, block.start as u64);
+            put_u32(&mut out, block.len as u32);
+            put_bytes(&mut out, &block.first_key);
+        }
+        for (idx, entry) in data.entries.iter().enumerate() {
+            put_bytes(&mut out, &data.encoded_keys[idx]);
+            put_u32(&mut out, entry.key.len() as u32);
+            for value in &entry.key {
+                encode_scalar_value(&mut out, value)?;
+            }
+            put_string(&mut out, &entry.location.segment_path);
+            put_u64(&mut out, entry.location.row_id);
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn unique_index_data_v4_roundtrip_preserves_entries() -> Result<()> {
+        let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
+        let mut data = stock_minute_index_data(3000, path);
+        data.flush_epoch = Some(7);
+        prepare_unique_index_data(&mut data)?;
+        let bytes = encode_unique_index_data(&data)?;
+        assert_eq!(&bytes[..8], UNIQUE_INDEX_MAGIC_V4);
+        let decoded = decode_unique_index_data(&bytes)?.unwrap();
+        assert_eq!(decoded.db, data.db);
+        assert_eq!(decoded.table, data.table);
+        assert_eq!(decoded.index_name, data.index_name);
+        assert_eq!(decoded.columns, data.columns);
+        assert_eq!(decoded.flush_epoch, Some(7));
+        assert_eq!(decoded.entries.len(), data.entries.len());
+        assert_eq!(decoded.encoded_keys, data.encoded_keys);
+        for (decoded_entry, expected_entry) in decoded.entries.iter().zip(&data.entries) {
+            assert_eq!(decoded_entry.key, expected_entry.key);
+            assert_eq!(decoded_entry.location, expected_entry.location);
+        }
+        assert_eq!(decoded.blocks.len(), data.blocks.len());
+        for (decoded_block, expected_block) in decoded.blocks.iter().zip(&data.blocks) {
+            assert_eq!(decoded_block.start, expected_block.start);
+            assert_eq!(decoded_block.len, expected_block.len);
+            assert_eq!(decoded_block.first_key, expected_block.first_key);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unique_index_data_v3_shrinks_shared_path_keyset() -> Result<()> {
+        let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
+        let mut data = stock_minute_index_data(2000, path);
+        prepare_unique_index_data(&mut data)?;
+        let v2_bytes = encode_legacy_v2_unique_index_data(&data)?;
+        let v3_bytes = encode_unique_index_data(&data)?;
+        assert!(v3_bytes.len() * 3 < v2_bytes.len());
+        assert!(v3_bytes.len() < data.entries.len() * 40);
+        Ok(())
+    }
+
+    #[test]
+    fn unique_index_data_v2_snapshot_still_decodes() -> Result<()> {
+        let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
+        let mut data = stock_minute_index_data(600, path);
+        prepare_unique_index_data(&mut data)?;
+        let v2_bytes = encode_legacy_v2_unique_index_data(&data)?;
+        let decoded = decode_unique_index_data(&v2_bytes)?.unwrap();
+        assert_eq!(decoded.entries.len(), data.entries.len());
+        assert_eq!(decoded.encoded_keys, data.encoded_keys);
+        for (decoded_entry, expected_entry) in decoded.entries.iter().zip(&data.entries) {
+            assert_eq!(decoded_entry.key, expected_entry.key);
+            assert_eq!(decoded_entry.location, expected_entry.location);
+        }
+        Ok(())
+    }
 }
 
 fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8> {
     let mut buf = [0u8; 1];
     cursor.read_exact(&mut buf)?;
     Ok(buf[0])
+}
+
+fn read_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = read_u8(cursor)?;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(TaibaiError::Storage(
+                "invalid varint in unique index".to_string(),
+            ));
+        }
+    }
 }
 
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32> {

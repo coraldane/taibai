@@ -19,6 +19,9 @@ use crate::types::batch::{RecordBatch, Schema};
 
 const TAIL_MAGIC: u32 = 0x5441_494C;
 const TAIL_LOG_MAGIC: u32 = 0x544C_4F47;
+/// V2 tail log frames carry the row count in the frame header so recovery can
+/// index a tail without decompressing any payload.
+const TAIL_LOG_MAGIC_V2: u32 = 0x544C_4F48;
 const FLUSH_MAGIC: u32 = 0x464C_5553;
 const TAIL_DIR: &str = "memtable_tail";
 static TAIL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +37,7 @@ pub(crate) struct PreparedTailAppend {
     wal_payload: Vec<u8>,
     frame: Option<Vec<u8>>,
     schema: Schema,
+    rows: u64,
 }
 
 impl PreparedTailAppend {
@@ -42,6 +46,7 @@ impl PreparedTailAppend {
             wal_payload: prepare_batch_for_wal(batch),
             frame: None,
             schema: batch.schema.clone(),
+            rows: batch.num_rows() as u64,
         }
     }
 
@@ -56,7 +61,7 @@ impl PreparedTailAppend {
         if self.frame.is_none() {
             let raw = std::mem::take(&mut self.wal_payload);
             let payload = compress_prepared_batch_for_wal_with(compressor, raw);
-            self.frame = Some(encode_tail_frame_payload(&payload));
+            self.frame = Some(encode_tail_frame_payload(&payload, self.rows));
         }
     }
 
@@ -304,7 +309,8 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
     let tail_dir = command.table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
     if let Some(path) = newest_live_tail_path(&tail_dir, command.id)? {
-        if read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key) {
+        let is_v2 = read_tail_log_version(&path)? == Some(TAIL_LOG_MAGIC_V2);
+        if is_v2 && read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key) {
             let file = fs::OpenOptions::new().append(true).open(&path)?;
             return Ok(OpenTailResult::Ready(OpenTail {
                 file,
@@ -314,8 +320,9 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
             }));
         }
 
-        // Legacy snapshot tails are uncommon and migrated synchronously once.
-        // Keeping this compatibility path avoids changing the on-disk format.
+        // Legacy snapshot and v1 log tails are migrated to the v2 log format
+        // synchronously once. Keeping this compatibility path means every live
+        // tail becomes row-indexable without a decode.
         let bytes = fs::read(&path)?;
         let (old_partition_key, old_batch) = decode_tail(&bytes, &command.prepared.schema)?;
         if old_partition_key != command.partition_key {
@@ -418,8 +425,7 @@ fn commit_append_group(
     compressor: &mut zstd::bulk::Compressor<'_>,
     group: Vec<AppendCommand>,
 ) {
-    if matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(value) if value == "1" || value.eq_ignore_ascii_case("true"))
-    {
+    if crate::common::config::insert_profile_enabled() {
         let bytes = group
             .iter()
             .map(|command| command.prepared.encoded_len())
@@ -446,10 +452,20 @@ fn commit_append_group(
     }
 }
 
+#[allow(dead_code)] // still used by crash-recovery tests
 pub struct RecoveredTail {
     pub id: Uuid,
     pub partition_key: String,
     pub batch: RecordBatch,
+}
+
+/// Metadata-only view of a recovered tail: the rows stay on disk until a
+/// query, DML, or flush materializes them.
+pub struct RecoveredTailIndex {
+    pub id: Uuid,
+    pub partition_key: String,
+    pub rows: u64,
+    pub path: PathBuf,
 }
 
 pub struct FlushIntent {
@@ -566,11 +582,7 @@ pub fn has_tail(table_dir: &Path, id: Uuid) -> bool {
                 let Ok(bytes) = fs::read(&generation.path) else {
                     continue;
                 };
-                let Ok(segment_name) = decode_flush_target(&bytes) else {
-                    continue;
-                };
-                let segment_path = table_dir.join(segment_name);
-                if segment_path.is_file() && SegmentReader::open(&segment_path).is_ok() {
+                if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
                     return false;
                 }
             }
@@ -579,10 +591,108 @@ pub fn has_tail(table_dir: &Path, id: Uuid) -> bool {
     false
 }
 
-/// Record the destination before a durable tail is copied into a sealed
-/// segment. Recovery can then distinguish "segment rename completed" from
-/// "flush never reached the atomic rename", avoiding duplicate rows.
-pub fn begin_flush(table_dir: &Path, id: Uuid, segment_file_name: &str) -> Result<FlushIntent> {
+pub fn generation_file_count(table_dir: &Path) -> Result<usize> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    if !tail_dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for entry in fs::read_dir(tail_dir)? {
+        if parse_generation(&entry?.path()).is_some() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Batch form of `has_tail`: a single directory scan answers for every
+/// requested id, applying the same generation arbitration (newest tail wins,
+/// clear tombstones, flush intents). With thousands of live tails, per-id
+/// scans made flush grouping quadratic in the size of the tail directory.
+pub fn has_tail_batch(table_dir: &Path, ids: &[Uuid]) -> Result<HashMap<Uuid, bool>> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let mut by_id = generations_by_id(&tail_dir)?;
+    let mut answers = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let Some(mut generations) = by_id.remove(id) else {
+            answers.insert(*id, false);
+            continue;
+        };
+        generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+        let mut has = false;
+        for generation in generations {
+            match generation.kind {
+                GenerationKind::Tail => {
+                    has = true;
+                    break;
+                }
+                GenerationKind::Clear => break,
+                GenerationKind::Flush => {
+                    let Ok(bytes) = fs::read(&generation.path) else {
+                        continue;
+                    };
+                    if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
+                        break;
+                    }
+                }
+            }
+        }
+        answers.insert(*id, has);
+    }
+    Ok(answers)
+}
+
+/// Batch form of `live_tail_path`: one directory scan resolves the newest
+/// live tail file of every requested id with the same arbitration rules.
+pub fn live_tail_paths_batch(
+    table_dir: &Path,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Option<PathBuf>>> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let mut by_id = generations_by_id(&tail_dir)?;
+    let parent_dir = tail_dir.parent().unwrap_or(&tail_dir);
+    let mut answers = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let Some(mut generations) = by_id.remove(id) else {
+            answers.insert(*id, None);
+            continue;
+        };
+        generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+        let mut live = None;
+        for generation in generations {
+            match generation.kind {
+                GenerationKind::Tail => {
+                    live = Some(generation.path);
+                    break;
+                }
+                GenerationKind::Clear => break,
+                GenerationKind::Flush => {
+                    let Ok(bytes) = fs::read(&generation.path) else {
+                        continue;
+                    };
+                    if flush_intent_satisfied(parent_dir, &bytes).unwrap_or(false) {
+                        break;
+                    }
+                }
+            }
+        }
+        answers.insert(*id, live);
+    }
+    Ok(answers)
+}
+
+/// Record the destination before a durable tail is copied into a segment.
+/// Recovery can then distinguish "rows durable in the segment" from "flush
+/// never completed", avoiding duplicate rows. `expected_rows` is the row
+/// count the segment footer must reach for the intent to be satisfied; this
+/// allows the target to be a shared active segment that also holds rows from
+/// other flushes.
+pub fn begin_flush(
+    table_dir: &Path,
+    id: Uuid,
+    segment_file_name: &str,
+    expected_rows: u64,
+) -> Result<FlushIntent> {
     if Path::new(segment_file_name)
         .file_name()
         .and_then(|name| name.to_str())
@@ -595,16 +705,43 @@ pub fn begin_flush(table_dir: &Path, id: Uuid, segment_file_name: &str) -> Resul
     let tail_dir = table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
     let marker_path = tail_dir.join(format!("{}.{}.flush", id.simple(), next_sequence()));
-    write_new_synced(&marker_path, &encode_flush_target(segment_file_name))?;
+    write_new_synced(
+        &marker_path,
+        &encode_flush_target(segment_file_name, expected_rows),
+    )?;
     Ok(FlushIntent { id, marker_path })
 }
 
-/// Remove the source tail first and the intent last. If cleanup is interrupted,
-/// the surviving intent still points recovery at the already durable segment.
-pub fn finish_flush(table_dir: &Path, intent: FlushIntent) -> Result<()> {
+/// Finish a flush pass by cleaning up every intent with a single directory
+/// scan. Per-intent scans made group cleanup quadratic in the number of live
+/// tail files. Ordering per intent is preserved exactly: source tails are
+/// removed first and intent markers last, so an interrupted batch still fails
+/// closed during recovery (the surviving marker points at the durable segment).
+pub fn finish_flush_batch(table_dir: &Path, intents: Vec<FlushIntent>) -> Result<()> {
+    if intents.is_empty() {
+        return Ok(());
+    }
     let tail_dir = table_dir.join(TAIL_DIR);
-    remove_other_generations(&tail_dir, intent.id, &intent.marker_path)?;
-    remove_file_if_exists(&intent.marker_path)?;
+    if !tail_dir.exists() {
+        return Ok(());
+    }
+    let keep: HashSet<PathBuf> = intents
+        .iter()
+        .map(|intent| intent.marker_path.clone())
+        .collect();
+    let ids: HashSet<Uuid> = intents.iter().map(|intent| intent.id).collect();
+    for entry in fs::read_dir(&tail_dir)? {
+        let path = entry?.path();
+        let Some((id, _)) = parse_generation(&path) else {
+            continue;
+        };
+        if ids.contains(&id) && !keep.contains(&path) {
+            remove_file_if_exists(&path)?;
+        }
+    }
+    for intent in intents {
+        remove_file_if_exists(&intent.marker_path)?;
+    }
     remove_empty_dir(&tail_dir);
     Ok(())
 }
@@ -613,7 +750,11 @@ pub fn cancel_flush(intent: FlushIntent) -> Result<()> {
     remove_file_if_exists(&intent.marker_path)
 }
 
-pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> {
+/// Apply generation arbitration (newest tail wins, clear tombstones, flush
+/// intents) and return the live tail file for every recoverable memtable id.
+/// Shared by `recover` (eager decode) and `recover_index` (metadata only);
+/// performs the same on-disk cleanup as before.
+fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf)>> {
     let tail_dir = table_dir.join(TAIL_DIR);
     if !tail_dir.exists() {
         return Ok(Vec::new());
@@ -632,44 +773,97 @@ pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> 
         by_id.entry(id).or_default().push(generation);
     }
 
-    let mut recovered = Vec::new();
+    let mut resolved = Vec::new();
     for (id, mut generations) in by_id {
         generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-        let mut recovered_tail = None;
+        let mut live_path = None;
         for generation in &generations {
             match generation.kind {
                 GenerationKind::Tail => {
-                    let bytes = fs::read(&generation.path)?;
-                    let (partition_key, batch) = decode_tail(&bytes, schema)?;
-                    recovered_tail = Some((generation.path.clone(), partition_key, batch));
+                    live_path = Some(generation.path.clone());
                     break;
                 }
                 GenerationKind::Clear => break,
                 GenerationKind::Flush => {
-                    let segment_name = decode_flush_target(&fs::read(&generation.path)?)?;
-                    let segment_path = table_dir.join(segment_name);
-                    if segment_path.is_file() && SegmentReader::open(&segment_path).is_ok() {
+                    if flush_intent_satisfied(table_dir, &fs::read(&generation.path)?)? {
                         remove_other_generations(&tail_dir, id, &generation.path)?;
                         remove_file_if_exists(&generation.path)?;
                         break;
                     }
-                    // The atomic segment rename did not complete. Ignore this
-                    // intent and continue to the preceding durable tail.
+                    // The rows never became durable in the target segment.
+                    // Ignore this intent and continue to the preceding tail.
                     let _ = remove_file_if_exists(&generation.path);
                 }
             }
         }
-        if let Some((path, partition_key, batch)) = recovered_tail {
+        if let Some(path) = live_path {
             remove_other_generations(&tail_dir, id, &path)?;
-            recovered.push(RecoveredTail {
-                id,
-                partition_key,
-                batch,
-            });
+            resolved.push((id, path));
         }
     }
     remove_empty_dir(&tail_dir);
+    Ok(resolved)
+}
+
+#[allow(dead_code)] // still used by crash-recovery tests
+pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> {
+    let mut recovered = Vec::new();
+    for (id, path) in resolve_live_tail_paths(table_dir)? {
+        let (partition_key, batch) = decode_tail_file(&path, schema)?;
+        recovered.push(RecoveredTail {
+            id,
+            partition_key,
+            batch,
+        });
+    }
     Ok(recovered)
+}
+
+/// Lazy counterpart of `recover`: v2 tails are indexed from frame headers
+/// without decoding; legacy tails are decoded once only to count rows, and
+/// their payloads remain on disk either way.
+pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTailIndex>> {
+    let mut recovered = Vec::new();
+    for (id, path) in resolve_live_tail_paths(table_dir)? {
+        let bytes = fs::read(&path)?;
+        if let Some(rows) = scan_tail_log_rows(&bytes) {
+            let partition_key = read_tail_log_partition_key(&path)?.ok_or_else(|| {
+                TaibaiError::Storage("v2 durable tail is missing its partition key".into())
+            })?;
+            recovered.push(RecoveredTailIndex {
+                id,
+                partition_key,
+                rows,
+                path,
+            });
+            continue;
+        }
+        let (partition_key, batch) = decode_tail(&bytes, schema)?;
+        recovered.push(RecoveredTailIndex {
+            id,
+            partition_key,
+            rows: batch.num_rows() as u64,
+            path,
+        });
+    }
+    Ok(recovered)
+}
+
+/// Newest live tail file for a memtable, applying the same clear/flush-intent
+/// arbitration as crash recovery. Used by the spill path.
+#[allow(dead_code)] // still used by spill/recovery tests
+pub fn live_tail_path(table_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
+    newest_live_tail_path(&table_dir.join(TAIL_DIR), id)
+}
+
+/// Row count of a v2 tail log without decompressing any frame. Returns `None`
+/// for legacy formats, which are not eligible for spilling.
+pub fn tail_log_rows(path: &Path) -> Result<Option<u64>> {
+    Ok(scan_tail_log_rows(&fs::read(path)?))
+}
+
+pub(crate) fn decode_tail_file(path: &Path, schema: &Schema) -> Result<(String, RecordBatch)> {
+    decode_tail(&fs::read(path)?, schema)
 }
 
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -690,7 +884,7 @@ fn encode_tail_log(partition_key: &str, batch: &RecordBatch) -> Vec<u8> {
 
 fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(8 + partition_key.len());
-    bytes.extend_from_slice(&TAIL_LOG_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&TAIL_LOG_MAGIC_V2.to_le_bytes());
     bytes.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
     bytes.extend_from_slice(partition_key.as_bytes());
     bytes
@@ -698,12 +892,16 @@ fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
 
 fn encode_tail_frame(batch: &RecordBatch) -> Vec<u8> {
     let payload = serialize_batch_for_wal(batch);
-    encode_tail_frame_payload(&payload)
+    encode_tail_frame_payload(&payload, batch.num_rows() as u64)
 }
 
-fn encode_tail_frame_payload(payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(12 + payload.len());
+/// V2 frame layout: `[u64 payload_len][u64 rows][payload][crc32]`, with the
+/// CRC covering both header fields and the payload. V1 frames lacked the
+/// `rows` field; both versions remain decodable.
+fn encode_tail_frame_payload(payload: &[u8], rows: u64) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(20 + payload.len());
     frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&rows.to_le_bytes());
     frame.extend_from_slice(payload);
     let mut hasher = Hasher::new();
     hasher.update(&frame);
@@ -711,11 +909,12 @@ fn encode_tail_frame_payload(payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-fn encode_flush_target(segment_file_name: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(12 + segment_file_name.len());
+fn encode_flush_target(segment_file_name: &str, expected_rows: u64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(20 + segment_file_name.len());
     bytes.extend_from_slice(&FLUSH_MAGIC.to_le_bytes());
     bytes.extend_from_slice(&(segment_file_name.len() as u32).to_le_bytes());
     bytes.extend_from_slice(segment_file_name.as_bytes());
+    bytes.extend_from_slice(&expected_rows.to_le_bytes());
     append_crc(bytes)
 }
 
@@ -745,8 +944,11 @@ fn verify_crc(bytes: &[u8]) -> Result<&[u8]> {
 }
 
 fn decode_tail(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
-    if bytes.len() >= 4 && u32::from_le_bytes(bytes[0..4].try_into().unwrap()) == TAIL_LOG_MAGIC {
-        return decode_tail_log(bytes, schema);
+    if bytes.len() >= 4 {
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic == TAIL_LOG_MAGIC || magic == TAIL_LOG_MAGIC_V2 {
+            return decode_tail_log(bytes, schema);
+        }
     }
     let body = verify_crc(bytes)?;
     if body.len() < 16 {
@@ -781,6 +983,16 @@ fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch
     if bytes.len() < 8 {
         return Err(TaibaiError::Storage("durable tail log is truncated".into()));
     }
+    let v2 = match u32::from_le_bytes(bytes[0..4].try_into().unwrap()) {
+        TAIL_LOG_MAGIC => false,
+        TAIL_LOG_MAGIC_V2 => true,
+        _ => {
+            return Err(TaibaiError::Storage(
+                "invalid durable tail log magic".into(),
+            ));
+        }
+    };
+    let frame_header_len = if v2 { 16usize } else { 8usize };
     let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let mut offset = 8usize.saturating_add(partition_len);
     if offset > bytes.len() {
@@ -796,12 +1008,12 @@ fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch
     while offset < bytes.len() {
         // A crash may leave the final append incomplete. All preceding frames
         // were individually synced and remain a valid recovery prefix.
-        if bytes.len().saturating_sub(offset) < 12 {
+        if bytes.len().saturating_sub(offset) < frame_header_len + 4 {
             break;
         }
         let payload_len =
             u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
-        let payload_start = offset + 8;
+        let payload_start = offset + frame_header_len;
         let payload_end = payload_start.saturating_add(payload_len);
         let frame_end = payload_end.saturating_add(4);
         if frame_end > bytes.len() {
@@ -841,6 +1053,62 @@ fn append_batch(target: &mut RecordBatch, batch: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
+fn read_tail_log_version(path: &Path) -> Result<Option<u32>> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; 4];
+    if let Err(error) = file.read_exact(&mut header) {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let magic = u32::from_le_bytes(header);
+    Ok((magic == TAIL_LOG_MAGIC || magic == TAIL_LOG_MAGIC_V2).then_some(magic))
+}
+
+/// Row count of a v2 tail log obtained by walking frame headers only — no
+/// payload is decompressed. Returns `None` for legacy (v1 log / snapshot)
+/// tails or on checksum mismatch, so callers can fall back to decoding.
+fn scan_tail_log_rows(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
+        return None;
+    }
+    let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let mut offset = 8usize.saturating_add(partition_len);
+    if offset > bytes.len() {
+        return None;
+    }
+    let mut rows = 0u64;
+    while offset < bytes.len() {
+        // Mirror decode_tail_log: a crash-truncated final frame ends the
+        // valid prefix without failing the scan.
+        if bytes.len().saturating_sub(offset) < 20 {
+            break;
+        }
+        let payload_len =
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
+        let frame_rows = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
+        let payload_start = offset + 16;
+        let payload_end = payload_start.saturating_add(payload_len);
+        let frame_end = payload_end.saturating_add(4);
+        if frame_end > bytes.len() {
+            break;
+        }
+        let mut hasher = Hasher::new();
+        hasher.update(&bytes[offset..payload_end]);
+        let stored_crc = u32::from_le_bytes(bytes[payload_end..frame_end].try_into().unwrap());
+        if stored_crc != hasher.finalize() {
+            return None;
+        }
+        rows = rows.saturating_add(frame_rows);
+        offset = frame_end;
+    }
+    Some(rows)
+}
+
 fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
     let mut file = fs::File::open(path)?;
     let mut header = [0u8; 8];
@@ -850,7 +1118,8 @@ fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
         }
         return Err(error.into());
     }
-    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC {
+    let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    if magic != TAIL_LOG_MAGIC && magic != TAIL_LOG_MAGIC_V2 {
         return Ok(None);
     }
     let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
@@ -861,7 +1130,7 @@ fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
         .map_err(|_| TaibaiError::Storage("invalid durable tail partition key".into()))
 }
 
-fn decode_flush_target(bytes: &[u8]) -> Result<String> {
+fn decode_flush_target(bytes: &[u8]) -> Result<(String, Option<u64>)> {
     let body = verify_crc(bytes)?;
     if body.len() < 8 {
         return Err(TaibaiError::Storage("flush intent is truncated".into()));
@@ -870,10 +1139,17 @@ fn decode_flush_target(bytes: &[u8]) -> Result<String> {
         return Err(TaibaiError::Storage("invalid flush intent magic".into()));
     }
     let name_len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
-    if 8usize.saturating_add(name_len) != body.len() {
+    let name_end = 8usize.saturating_add(name_len);
+    let expected_rows = if name_end == body.len() {
+        None
+    } else if name_end.saturating_add(8) == body.len() {
+        Some(u64::from_le_bytes(
+            body[name_end..name_end + 8].try_into().unwrap(),
+        ))
+    } else {
         return Err(TaibaiError::Storage("invalid flush intent length".into()));
-    }
-    let name = std::str::from_utf8(&body[8..])
+    };
+    let name = std::str::from_utf8(&body[8..name_end])
         .map_err(|_| TaibaiError::Storage("invalid flush intent target".into()))?
         .to_string();
     if Path::new(&name)
@@ -883,7 +1159,27 @@ fn decode_flush_target(bytes: &[u8]) -> Result<String> {
     {
         return Err(TaibaiError::Storage("unsafe flush intent target".into()));
     }
-    Ok(name)
+    Ok((name, expected_rows))
+}
+
+/// A recorded flush intent proves its tail is durable once the named segment
+/// is readable and, for intents carrying a row-count watermark, holds at
+/// least that many rows. Legacy intents without a watermark keep the old
+/// existence check; their target was a standalone segment written atomically.
+fn flush_intent_satisfied(table_dir: &Path, bytes: &[u8]) -> Result<bool> {
+    let (segment_name, expected_rows) = decode_flush_target(bytes)?;
+    let segment_path = table_dir.join(segment_name);
+    if !segment_path.is_file() {
+        return Ok(false);
+    }
+    let reader = match SegmentReader::open(&segment_path) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(false),
+    };
+    Ok(match expected_rows {
+        Some(expected) => reader.row_count() >= expected,
+        None => true,
+    })
 }
 
 fn next_sequence() -> u64 {
@@ -936,6 +1232,23 @@ fn generations_for_id(tail_dir: &Path, id: Uuid) -> Result<Vec<Generation>> {
     Ok(generations)
 }
 
+/// Index the whole tail directory in one `read_dir` pass, grouped by memtable
+/// id. Shared by the batched flush/spill helpers so that answering for N
+/// memtables costs one scan instead of N.
+fn generations_by_id(tail_dir: &Path) -> Result<HashMap<Uuid, Vec<Generation>>> {
+    let mut by_id = HashMap::new();
+    if !tail_dir.exists() {
+        return Ok(by_id);
+    }
+    for entry in fs::read_dir(tail_dir)? {
+        let path = entry?.path();
+        if let Some((id, generation)) = parse_generation(&path) {
+            by_id.entry(id).or_default().push(generation);
+        }
+    }
+    Ok(by_id)
+}
+
 fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     let mut generations = generations_for_id(tail_dir, id)?;
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
@@ -947,11 +1260,8 @@ fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
                 let Ok(bytes) = fs::read(&generation.path) else {
                     continue;
                 };
-                let Ok(segment_name) = decode_flush_target(&bytes) else {
-                    continue;
-                };
-                let segment_path = tail_dir.parent().unwrap_or(tail_dir).join(segment_name);
-                if segment_path.is_file() && SegmentReader::open(&segment_path).is_ok() {
+                let table_dir = tail_dir.parent().unwrap_or(tail_dir);
+                if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
                     return Ok(None);
                 }
             }
@@ -1135,11 +1445,11 @@ mod tests {
         let id = Uuid::new_v4();
         persist(temp.path(), id, "", &batch)?;
 
-        let incomplete = begin_flush(temp.path(), id, "seg_00001.dat")?;
+        let incomplete = begin_flush(temp.path(), id, "seg_00001.dat", 2)?;
         assert_eq!(recover(temp.path(), &schema)?.len(), 1);
         let _ = cancel_flush(incomplete);
 
-        let _completed = begin_flush(temp.path(), id, "seg_00001.dat")?;
+        let _completed = begin_flush(temp.path(), id, "seg_00001.dat", 2)?;
         let mut writer = SegmentWriter::create(
             &temp.path().join("seg_00001.dat"),
             schema.clone(),
@@ -1149,6 +1459,184 @@ mod tests {
         writer.seal()?;
         assert!(recover(temp.path(), &schema)?.is_empty());
         assert!(!has_tail(temp.path(), id));
+        Ok(())
+    }
+
+    #[test]
+    fn flush_intent_watermark_requires_segment_row_count() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let batch = test_batch(&schema, &[1, 2])?;
+        let id = Uuid::new_v4();
+        persist(temp.path(), id, "", &batch)?;
+
+        let _intent = begin_flush(temp.path(), id, "seg_00001.dat", 6)?;
+        let mut writer = SegmentWriter::create(
+            &temp.path().join("seg_00001.dat"),
+            schema.clone(),
+            DEFAULT_ROW_GROUP_SIZE,
+        )?;
+        writer.write_batch(&batch)?;
+        writer.seal()?;
+
+        let recovered = recover(temp.path(), &schema)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].batch.num_rows(), 2);
+        assert!(has_tail(temp.path(), id));
+        Ok(())
+    }
+
+    #[test]
+    fn flush_intent_watermark_satisfied_by_shared_segment_growth() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let first = test_batch(&schema, &[1, 2])?;
+        let second = test_batch(&schema, &[3, 4])?;
+        let id = Uuid::new_v4();
+        persist(temp.path(), id, "", &second)?;
+
+        let _intent = begin_flush(temp.path(), id, "seg_00001.dat", 4)?;
+        let mut writer = SegmentWriter::create(
+            &temp.path().join("seg_00001.dat"),
+            schema.clone(),
+            DEFAULT_ROW_GROUP_SIZE,
+        )?;
+        writer.write_batch(&first)?;
+        writer.write_batch(&second)?;
+        writer.seal()?;
+
+        assert!(recover(temp.path(), &schema)?.is_empty());
+        assert!(!has_tail(temp.path(), id));
+        Ok(())
+    }
+
+    #[test]
+    fn batched_tail_queries_match_single_id_semantics() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let live = Uuid::new_v4();
+        let cleared = Uuid::new_v4();
+        let flushed = Uuid::new_v4();
+        let unknown = Uuid::new_v4();
+        persist(temp.path(), live, "2026", &test_batch(&schema, &[1])?)?;
+        persist(temp.path(), cleared, "2026", &test_batch(&schema, &[2])?)?;
+        clear(temp.path(), cleared)?;
+        let flushed_batch = test_batch(&schema, &[3, 4])?;
+        persist(temp.path(), flushed, "", &flushed_batch)?;
+        let _intent = begin_flush(temp.path(), flushed, "seg_00001.dat", 2)?;
+        let mut writer = SegmentWriter::create(
+            &temp.path().join("seg_00001.dat"),
+            schema.clone(),
+            DEFAULT_ROW_GROUP_SIZE,
+        )?;
+        writer.write_batch(&flushed_batch)?;
+        writer.seal()?;
+
+        let answers = has_tail_batch(temp.path(), &[live, cleared, flushed, unknown])?;
+        assert!(answers[&live]);
+        assert!(!answers[&cleared]);
+        assert!(!answers[&flushed]);
+        assert!(!answers[&unknown]);
+
+        let paths = live_tail_paths_batch(temp.path(), &[live, cleared, unknown])?;
+        assert!(paths[&live].is_some());
+        assert!(paths[&cleared].is_none());
+        assert!(paths[&unknown].is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn finish_flush_batch_removes_tails_and_markers_in_one_pass() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for id in ids {
+            persist(temp.path(), id, "", &test_batch(&schema, &[1])?)?;
+        }
+        let intents = ids
+            .iter()
+            .map(|id| begin_flush(temp.path(), *id, "seg_00001.dat", 1))
+            .collect::<Result<Vec<_>>>()?;
+
+        finish_flush_batch(temp.path(), intents)?;
+
+        for id in ids {
+            assert!(!has_tail(temp.path(), id));
+        }
+        assert!(!temp.path().join(TAIL_DIR).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn v2_tail_log_reports_rows_without_decode() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        append(temp.path(), id, "2026", &test_batch(&schema, &[1])?)?;
+        append(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
+
+        let path = live_tail_path(temp.path(), id)?.expect("tail should exist");
+        assert_eq!(tail_log_rows(&path)?, Some(3));
+
+        // A crash-truncated final frame still yields the valid prefix count.
+        let mut bytes = fs::read(&path)?;
+        bytes.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+        assert_eq!(scan_tail_log_rows(&bytes), Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn recover_index_counts_rows_and_keeps_tail_on_disk() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        append(temp.path(), id, "2026", &test_batch(&schema, &[1, 2])?)?;
+        append(temp.path(), id, "2026", &test_batch(&schema, &[3])?)?;
+
+        let index = recover_index(temp.path(), &schema)?;
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].id, id);
+        assert_eq!(index[0].partition_key, "2026");
+        assert_eq!(index[0].rows, 3);
+        assert!(index[0].path.is_file(), "indexing must keep the tail file");
+
+        let (partition_key, batch) = decode_tail_file(&index[0].path, &schema)?;
+        assert_eq!(partition_key, "2026");
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.scalar(2, 0), Some(ScalarValue::Int64(Some(3))));
+
+        // Arbitration cleanup is idempotent across repeated index passes.
+        assert_eq!(recover_index(temp.path(), &schema)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recover_index_counts_legacy_snapshot_tail_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        let partition_key = "legacy";
+        let legacy_batch = test_batch(&schema, &[7, 8])?;
+        let batch_payload = serialize_batch_for_wal(&legacy_batch);
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&TAIL_MAGIC.to_le_bytes());
+        legacy.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
+        legacy.extend_from_slice(partition_key.as_bytes());
+        legacy.extend_from_slice(&(batch_payload.len() as u64).to_le_bytes());
+        legacy.extend_from_slice(&batch_payload);
+        let legacy = append_crc(legacy);
+        let tail_dir = temp.path().join(TAIL_DIR);
+        fs::create_dir_all(&tail_dir)?;
+        fs::write(tail_dir.join(format!("{}.1.tail", id.simple())), legacy)?;
+
+        let index = recover_index(temp.path(), &schema)?;
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].partition_key, "legacy");
+        assert_eq!(index[0].rows, 2);
+        assert!(index[0].path.is_file());
+
+        let (_, batch) = decode_tail_file(&index[0].path, &schema)?;
+        assert_eq!(batch.num_rows(), 2);
         Ok(())
     }
 }

@@ -13,8 +13,7 @@ impl SegmentManager {
                         continue;
                     }
                     let db_name = db_entry.file_name().to_string_lossy().to_string();
-                    if db_name == "meta" || db_name == "wal" || db_name == ".taibai-drop-databases"
-                    {
+                    if db_name.starts_with('.') || db_name == "meta" || db_name == "wal" {
                         continue;
                     }
                     let db_dir = data_dir.join(&db_name);
@@ -60,6 +59,7 @@ impl SegmentManager {
             reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
             segment_meta_cache: Mutex::new(SegmentMetaCache::new(reader_cache_capacity())),
             cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
+            flush_epochs: RwLock::new(HashMap::new()),
             flush_stop,
             flush_paused,
             next_txn_id: AtomicU64::new(1),
@@ -138,6 +138,53 @@ impl SegmentManager {
 
     pub fn table_dir(&self, db: &str, table: &str) -> PathBuf {
         self.data_dir.join(db).join(table)
+    }
+
+    fn flush_epoch_file_path(&self, db: &str, table: &str) -> PathBuf {
+        self.data_dir.join("meta").join("flush_epochs").join(format!(
+            "{}--{}.epoch",
+            sanitize_component(db),
+            sanitize_component(table)
+        ))
+    }
+
+    /// Current memtable-flush epoch for a table. Lazily restored from the
+    /// on-disk marker so epochs survive restarts.
+    pub fn memtable_flush_epoch(&self, db: &str, table: &str) -> u64 {
+        let key = table_key(db, table);
+        if let Some(epoch) = self.flush_epochs.read().unwrap().get(&key) {
+            return *epoch;
+        }
+        let epoch = read_flush_epoch_file(&self.flush_epoch_file_path(db, table));
+        self.flush_epochs.write().unwrap().insert(key, epoch);
+        epoch
+    }
+
+    /// Record that a memtable flush persisted rows for this table. Any unique
+    /// index snapshot stamped with the previous epoch is now potentially
+    /// incomplete for segment-side lookups and must be rebuilt before probing.
+    pub fn note_memtable_flush(&self, db: &str, table: &str) {
+        let key = table_key(db, table);
+        let path = self.flush_epoch_file_path(db, table);
+        let mut epochs = self.flush_epochs.write().unwrap();
+        let current = epochs
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| read_flush_epoch_file(&path));
+        let next = current.saturating_add(1);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent)
+                .and_then(|_| std::fs::write(&path, next.to_string()))
+            {
+                tracing::error!(
+                    db,
+                    table,
+                    error = %error,
+                    "failed to persist memtable flush epoch; in-memory epoch still advanced"
+                );
+            }
+        }
+        epochs.insert(key, next);
     }
 
     fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {
@@ -534,6 +581,54 @@ impl SegmentManager {
         f()
     }
 
+    pub fn try_with_table_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _guard = match state.mutation_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("table mutation lock poisoned: {}", poisoned)
+            }
+        };
+        ensure_state_not_retired(&state, db, table)?;
+        f().map(Some)
+    }
+
+    pub fn try_with_database_mutation_locks<T>(
+        &self,
+        db: &str,
+        tables: &[String],
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let mut keys = tables
+            .iter()
+            .map(|table| table_key(db, table))
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        let states = keys
+            .iter()
+            .map(|key| self.get_or_create_state(key))
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(states.len());
+        for state in &states {
+            match state.mutation_lock.try_lock() {
+                Ok(guard) => guards.push(guard),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("table mutation lock poisoned: {}", poisoned)
+                }
+            }
+        }
+        f().map(Some)
+    }
+
     fn open_mutable_reader_owned(&self, path: &Path) -> Result<SegmentReader> {
         let Some(state) = self.state_for_segment_path(path) else {
             return SegmentReader::open_owned(path);
@@ -648,9 +743,13 @@ impl SegmentManager {
         Ok(())
     }
 
+    fn table_states_snapshot(&self) -> Vec<Arc<TableSegmentState>> {
+        self.tables.read().unwrap().values().cloned().collect()
+    }
+
     pub fn sync_all_wals(&self) {
-        let tables = self.tables.read().unwrap();
-        for state in tables.values() {
+        let states = self.table_states_snapshot();
+        for state in states {
             let mut wal_guard = state.wal_writer.lock().unwrap();
             if let Some(ref mut w) = *wal_guard {
                 let _ = w.sync();
@@ -669,8 +768,8 @@ impl SegmentManager {
 
     pub fn clear_active_segments(&self, db: &str, table: &str) {
         let key = table_key(db, table);
-        let tables = self.tables.read().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             state.active_segments.lock().unwrap().clear();
         }
     }
@@ -680,8 +779,8 @@ impl SegmentManager {
     /// partitions must capture this before sealing removes those writers.
     pub fn active_partition_keys(&self, db: &str, table: &str) -> Vec<String> {
         let key = table_key(db, table);
-        let tables = self.tables.read().unwrap();
-        let Some(state) = tables.get(&key) else {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        let Some(state) = state else {
             return Vec::new();
         };
         let active_segments = state.active_segments.lock().unwrap();
@@ -696,8 +795,8 @@ impl SegmentManager {
         let Ok(key) = self.table_state_key_from_dir(table_dir) else {
             return;
         };
-        let tables = self.tables.write().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             let mut wal_guard = state.wal_writer.lock().unwrap();
             *wal_guard = None;
         }
@@ -705,8 +804,8 @@ impl SegmentManager {
 
     pub fn remove_table_state(&self, db: &str, table: &str) {
         let key = table_key(db, table);
-        let mut tables = self.tables.write().unwrap();
-        if let Some(state) = tables.remove(&key) {
+        let state = self.tables.write().unwrap().remove(&key);
+        if let Some(state) = state {
             state.retired.store(true, Ordering::Release);
             let mut wal_guard = state.wal_writer.lock().unwrap();
             *wal_guard = None;
@@ -720,8 +819,8 @@ impl SegmentManager {
     /// would let a waiting writer create a second lock for the same table.
     pub fn close_table_state_handles(&self, db: &str, table: &str) {
         let key = table_key(db, table);
-        let tables = self.tables.read().unwrap();
-        if let Some(state) = tables.get(&key) {
+        let state = self.tables.read().unwrap().get(&key).cloned();
+        if let Some(state) = state {
             *state.wal_writer.lock().unwrap() = None;
             state.active_segments.lock().unwrap().clear();
         }
@@ -738,25 +837,28 @@ impl SegmentManager {
 
     pub fn remove_database_state(&self, db: &str) {
         let prefix = format!("{}:", db);
-        let mut tables = self.tables.write().unwrap();
-        let keys: Vec<String> = tables
-            .keys()
-            .filter(|key| key.starts_with(&prefix))
-            .cloned()
-            .collect();
-        for key in keys {
-            if let Some(state) = tables.remove(&key) {
-                state.retired.store(true, Ordering::Release);
-                let mut wal_guard = state.wal_writer.lock().unwrap();
-                *wal_guard = None;
-                state.active_segments.lock().unwrap().clear();
-            }
+        let states = {
+            let mut tables = self.tables.write().unwrap();
+            let keys = tables
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| tables.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for state in states {
+            state.retired.store(true, Ordering::Release);
+            let mut wal_guard = state.wal_writer.lock().unwrap();
+            *wal_guard = None;
+            state.active_segments.lock().unwrap().clear();
         }
     }
 
     pub fn clear_all_wals(&self) {
-        let tables = self.tables.read().unwrap();
-        for state in tables.values() {
+        let states = self.table_states_snapshot();
+        for state in states {
             let mut wal_guard = state.wal_writer.lock().unwrap();
             if let Some(ref mut w) = *wal_guard {
                 let _ = w.clear();

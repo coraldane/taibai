@@ -115,6 +115,7 @@ impl ScanExec {
 
 impl ExecutionOp for ScanExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        crate::common::query_cancel::check()?;
         if let ScanSource::Cursor(cursor) = &mut self.source {
             return cursor.next_batch();
         }

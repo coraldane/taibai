@@ -598,7 +598,7 @@ impl Compactor {
             output_row_group_rows,
             bloom_column_indices,
         )?;
-        let write_gather_chunk_rows = output_row_group_rows.saturating_mul(8).max(1);
+        let write_gather_chunk_rows = output_row_group_rows.max(1);
         let write_progress_rows = write_gather_chunk_rows.saturating_mul(16).max(1);
         let mut rows_written = 0usize;
         let projection = (0..schema.num_columns()).collect::<Vec<_>>();
@@ -617,6 +617,7 @@ impl Compactor {
             fallback_cache_capacity = row_group_cache.capacity(),
             chunk_rows = write_gather_chunk_rows,
             output_row_group_rows,
+            compression_level = crate::storage::segment_manager::bulk_compression_level(),
             "compact write using index-only gather"
         );
 
@@ -922,28 +923,15 @@ fn gather_global_chunk(
     source_batch: &RecordBatch,
     row_indices: &[u32],
 ) -> Result<RecordBatch> {
-    let positions = row_indices
-        .iter()
-        .enumerate()
-        .map(|(output_pos, source_row_idx)| (output_pos, *source_row_idx as usize))
-        .collect::<Vec<_>>();
-
-    let mut columns = schema
-        .columns
-        .iter()
-        .map(|col| empty_column_for_gather(col.data_type, row_indices.len()))
-        .collect::<Vec<_>>();
-
-    columns
-        .par_iter_mut()
-        .enumerate()
-        .try_for_each(|(col_idx, dst_col)| -> Result<()> {
-            let src_col = source_batch.column(col_idx).ok_or_else(|| {
-                TaibaiError::Storage(format!("missing source column {}", col_idx))
-            })?;
-            gather_column_positions(dst_col, src_col, &positions)?;
-            Ok(())
-        })?;
+    let columns = (0..schema.num_columns())
+        .into_par_iter()
+        .map(|col_idx| {
+            source_batch
+                .column(col_idx)
+                .map(|column| column.take(row_indices))
+                .ok_or_else(|| TaibaiError::Storage(format!("missing source column {}", col_idx)))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     RecordBatch::try_new(schema.clone(), columns)
 }

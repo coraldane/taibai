@@ -185,6 +185,101 @@ fn sum_and_avg_via_streaming_accumulator() {
 }
 
 #[test]
+fn range_predicate_full_row_group_matches_metadata_result() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE covered_metrics (bucket INT, amount INT)",
+        )
+        .expect("create covered_metrics");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO covered_metrics VALUES (10, 100), (20, 200), (30, 300)",
+        )
+        .expect("insert covered_metrics");
+    engine
+        .execute(&mut session, "FLUSH TABLE covered_metrics")
+        .expect("flush covered_metrics");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), MIN(amount), MAX(amount) FROM covered_metrics WHERE bucket >= 0",
+            )
+            .expect("covered aggregate"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int64(Some(3)));
+    assert_eq!(rows[0][1], ScalarValue::Int32(Some(100)));
+    assert_eq!(rows[0][2], ScalarValue::Int32(Some(300)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn filtered_max_does_not_use_non_matching_row_group_extreme() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE filtered_metrics (bucket INT, amount INT)",
+        )
+        .expect("create filtered_metrics");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO filtered_metrics VALUES (1, 10), (2, 999), (1, 20)",
+        )
+        .expect("insert filtered_metrics");
+    engine
+        .execute(&mut session, "FLUSH TABLE filtered_metrics")
+        .expect("flush filtered_metrics");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT MAX(amount) FROM filtered_metrics WHERE bucket = 1",
+            )
+            .expect("filtered max"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int32(Some(20)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn filtered_max_reads_predicate_and_aggregate_columns() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE projected_metrics (id INT, bucket INT, amount INT)",
+        )
+        .expect("create projected_metrics");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO projected_metrics VALUES (1, 1, 10), (2, 2, 999), (3, 1, 20)",
+        )
+        .expect("insert projected_metrics");
+    engine
+        .execute(&mut session, "FLUSH TABLE projected_metrics")
+        .expect("flush projected_metrics");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT MAX(amount) FROM projected_metrics WHERE bucket = 1",
+            )
+            .expect("projected filtered max"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int32(Some(20)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
 fn aggregate_respects_delete_bitmap_for_min_max() {
     let (_temp_dir, engine, mut session) = create_engine();
     seed_metrics(&engine, &mut session);
@@ -276,5 +371,92 @@ fn _link_first_scalar_helper() {
         0,
     );
     assert_eq!(v, ScalarValue::Int32(Some(42)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn case_expressions_execute_in_projection_and_aggregates() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE case_metrics (id INT, volume BIGINT, high_px DECIMAL(18, 4), low_px DECIMAL(18, 4))",
+        )
+        .expect("create case metrics");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO case_metrics VALUES (1, 10, 10.5000, 10.2000), (2, 0, 99.0000, 1.0000), (3, 20, 10.8000, 10.3000)",
+        )
+        .expect("insert case metrics");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT MAX(CASE volume WHEN 0 THEN 0 ELSE high_px END), MIN(CASE WHEN volume = 0 THEN 5000 ELSE low_px END) FROM case_metrics",
+            )
+            .expect("aggregate case query"),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0],
+        ScalarValue::Decimal(Some(108000)),
+        "unexpected CASE aggregate rows: {:?}",
+        rows
+    );
+    assert_eq!(rows[0][1], ScalarValue::Decimal(Some(102000)));
+
+    // Production-shaped statMinute query: SUM(trade_value) must preserve
+    // DECIMAL rather than emitting an INT64 into a DECIMAL result column.
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT volume, MAX(CASE volume WHEN 0 THEN 0 ELSE high_px END), MIN(CASE volume WHEN 0 THEN 5000 ELSE low_px END), SUM(volume), SUM(high_px), COUNT(*) FROM case_metrics GROUP BY volume ORDER BY volume",
+            )
+            .expect("production-shaped decimal aggregate query"),
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][4], ScalarValue::Decimal(Some(990000)));
+    assert_eq!(rows[1][4], ScalarValue::Decimal(Some(105000)));
+    assert_eq!(rows[2][4], ScalarValue::Decimal(Some(108000)));
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT volume, MAX(CASE volume WHEN 0 THEN 0 ELSE high_px END) FROM case_metrics GROUP BY volume ORDER BY volume",
+            )
+            .expect("grouped aggregate case query"),
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1], ScalarValue::Decimal(Some(0)));
+    assert_eq!(rows[1][1], ScalarValue::Decimal(Some(105000)));
+    assert_eq!(rows[2][1], ScalarValue::Decimal(Some(108000)));
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT CASE WHEN volume = 0 THEN 'zero' WHEN volume > 10 THEN 'large' ELSE 'small' END FROM case_metrics ORDER BY id",
+            )
+            .expect("searched case query"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::VarChar(Some("small".into())));
+    assert_eq!(rows[1][0], ScalarValue::VarChar(Some("zero".into())));
+    assert_eq!(rows[2][0], ScalarValue::VarChar(Some("large".into())));
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT id, CASE WHEN volume = 0 THEN CASE WHEN id = 2 THEN 'nested' ELSE 'other' END END FROM case_metrics WHERE CASE WHEN volume > 0 THEN true ELSE false END ORDER BY id",
+            )
+            .expect("nested and filter case query"),
+    );
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0][1].is_null());
+    assert!(rows[1][1].is_null());
     engine.segment_mgr().shutdown();
 }

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::error::{Result, TaibaiError};
@@ -15,21 +15,12 @@ const DEFAULT_MAX_ROWS_PER_MEMTABLE: u64 = 500_000;
 const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 const DEFAULT_MAX_TOTAL_MEMORY: u64 = 512 * 1024 * 1024;
 const DEFAULT_LOW_RATE_MAX_ROWS: u64 = 1024;
-const DEFAULT_LOW_RATE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-
-fn checkpoint_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .thread_name(|index| format!("taibai-checkpoint-{index}"))
-            .build()
-            .expect("failed to build checkpoint compression pool")
-    })
-}
+const DEFAULT_LOW_RATE_MAX_AGE_SECS: u64 = 3600;
+const DEFAULT_SPILL_MIN_AGE_SECS: u64 = 60;
+const MAX_TAIL_FILES_PER_TABLE: usize = 256;
 
 fn insert_profile_enabled() -> bool {
-    matches!(std::env::var("TAIBAI_INSERT_PROFILE"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+    crate::common::config::insert_profile_enabled()
 }
 
 fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
@@ -72,6 +63,10 @@ pub struct BatchWriterConfig {
     pub worker_count: usize,
     pub low_rate_max_rows: u64,
     pub low_rate_max_age_secs: u64,
+    /// Relieve memtable memory pressure by spilling cold committed memtables
+    /// to their durable tails instead of flushing small row groups.
+    pub spill_enabled: bool,
+    pub spill_min_age_secs: u64,
 }
 
 impl Default for BatchWriterConfig {
@@ -83,6 +78,8 @@ impl Default for BatchWriterConfig {
             worker_count: 1,
             low_rate_max_rows: DEFAULT_LOW_RATE_MAX_ROWS,
             low_rate_max_age_secs: DEFAULT_LOW_RATE_MAX_AGE_SECS,
+            spill_enabled: true,
+            spill_min_age_secs: DEFAULT_SPILL_MIN_AGE_SECS,
         }
     }
 }
@@ -97,14 +94,6 @@ pub struct BatchWriter {
     flush_handle: Option<std::thread::JoinHandle<()>>,
     tail_committer: Arc<TailCommitter>,
     write_epoch: Arc<AtomicU64>,
-}
-
-struct DetachedDurableFlush {
-    memtable: Arc<crate::storage::core::memtable::MemTable>,
-    batch: Arc<RecordBatch>,
-    table_dir: std::path::PathBuf,
-    tmp_path: std::path::PathBuf,
-    final_path: std::path::PathBuf,
 }
 
 impl BatchWriter {
@@ -122,10 +111,6 @@ impl BatchWriter {
         let write_epoch = Arc::new(AtomicU64::new(0));
 
         let worker_count = config.worker_count.max(1);
-        let checkpoint_backlog_bytes = config
-            .max_total_memory
-            .saturating_div(4)
-            .clamp(512 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
         let mut workers = Vec::with_capacity(worker_count);
         for i in 0..worker_count {
             let rx = Arc::clone(&receiver);
@@ -147,7 +132,6 @@ impl BatchWriter {
                             tail_committer_clone,
                             write_epoch_clone,
                             max_rows_per_memtable,
-                            checkpoint_backlog_bytes,
                         );
                     })
                     .expect("failed to spawn batch writer worker"),
@@ -157,38 +141,71 @@ impl BatchWriter {
         let flush_stop = Arc::clone(&stop);
         let flush_interval = config.flush_interval_secs;
         let flush_memory_high_water = config.max_total_memory.max(1);
+        let flush_spill_enabled = config.spill_enabled;
+        let flush_spill_min_age_secs = config.spill_min_age_secs;
         let flush_mgr = Arc::clone(&segment_mgr);
         let flush_mt_mgr = Arc::clone(&memtable_mgr);
         let flush_tail_committer = Arc::clone(&tail_committer);
-        let flush_write_epoch = Arc::clone(&write_epoch);
         let flush_handle = std::thread::Builder::new()
             .name("taibai-bw-flush".into())
             .spawn(move || {
-                let mut last_periodic_write_epoch = flush_write_epoch.load(Ordering::Acquire);
                 while !flush_stop.load(Ordering::Acquire) {
                     for _ in 0..flush_interval {
                         if flush_stop.load(Ordering::Acquire) {
                             break;
                         }
                         if flush_mt_mgr.total_estimated_memory_bytes() >= flush_memory_high_water {
-                            if let Err(e) = Self::flush_all_pending(
-                                &flush_mgr,
-                                &flush_mt_mgr,
-                                &flush_tail_committer,
-                            ) {
-                                tracing::warn!(error = %e, "pressure memtable flush failed");
+                            // Spilling cold committed memtables to their
+                            // durable tails is the first relief valve: it
+                            // frees memory without cutting small row groups.
+                            if flush_spill_enabled {
+                                let spilled = Self::spill_pressure_pass(
+                                    &flush_mgr,
+                                    &flush_mt_mgr,
+                                    &flush_tail_committer,
+                                    flush_memory_high_water,
+                                    flush_spill_min_age_secs,
+                                );
+                                if spilled > 0 {
+                                    tracing::info!(
+                                        spilled,
+                                        "memory pressure relieved by spilling memtables to durable tails"
+                                    );
+                                }
                             }
+                            if flush_mt_mgr.total_estimated_memory_bytes()
+                                >= flush_memory_high_water
+                            {
+                                if let Err(e) = Self::flush_all_pending(
+                                    &flush_mgr,
+                                    &flush_mt_mgr,
+                                    &flush_tail_committer,
+                                ) {
+                                    tracing::warn!(error = %e, "pressure memtable flush failed");
+                                }
+                            }
+                        }
+                        if let Err(error) = Self::flush_tail_file_pressure(
+                            &flush_mgr,
+                            &flush_mt_mgr,
+                            &flush_tail_committer,
+                            MAX_TAIL_FILES_PER_TABLE,
+                        ) {
+                            tracing::warn!(
+                                error = %error,
+                                "durable tail file pressure flush failed"
+                            );
                         }
                         std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                     if flush_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let current_write_epoch = flush_write_epoch.load(Ordering::Acquire);
-                    if current_write_epoch != last_periodic_write_epoch {
-                        last_periodic_write_epoch = current_write_epoch;
-                        continue;
-                    }
+                    // Flush due memtables every interval regardless of write
+                    // activity. Gating this on "no writes since the last
+                    // flush" starved tail->segment conversion during
+                    // sustained imports and let tail files pile up in the
+                    // memtable_tail directory.
                     if let Err(e) = Self::flush_pending_memtables(
                         &flush_mgr,
                         &flush_mt_mgr,
@@ -472,8 +489,8 @@ impl BatchWriter {
 
     pub fn flush_table(&self, db: &str, table: &str) -> Result<()> {
         let mts = self.memtable_mgr.get_by_table(db, table);
-        for mt in mts {
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer)?;
         }
         Ok(())
     }
@@ -485,8 +502,8 @@ impl BatchWriter {
             .into_iter()
             .filter(|memtable| memtable.partition_key() == partition_key)
             .collect::<Vec<_>>();
-        for mt in mts {
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer)?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -494,8 +511,8 @@ impl BatchWriter {
 
     pub(crate) fn flush_table_under_table_lock(&self, db: &str, table: &str) -> Result<()> {
         let mts = self.memtable_mgr.get_by_table(db, table);
-        for mt in mts {
-            Self::flush_memtable_inner(&self.segment_mgr, &mt, true, &self.tail_committer)?;
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, true, &self.tail_committer)?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -503,24 +520,29 @@ impl BatchWriter {
 
     pub fn flush_all(&self) -> Result<()> {
         let mts = self.memtable_mgr.get_all_pending();
-        for mt in mts {
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer)?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
     }
 
-    /// Flush buffers that have no durable low-rate tail. Durable tails remain
-    /// resident-on-disk and are restored as memtables at the next startup, so
-    /// a routine service restart does not manufacture a tiny row group.
-    pub fn flush_all_for_shutdown(&self) -> Result<()> {
-        let mts = self.memtable_mgr.get_all_pending();
-        for mt in mts {
-            let table_dir = self.segment_mgr.table_dir(mt.db(), mt.table());
-            if crate::storage::core::durable_tail::has_tail(&table_dir, mt.id()) {
-                continue;
-            }
-            Self::flush_memtable(&self.segment_mgr, &mt, &self.tail_committer)?;
+    /// Flush only pending memtables that have no durable tail. Tailed
+    /// memtables are restart-safe (recovered from their tails), so a routine
+    /// shutdown leaves them resident instead of cutting tiny row groups.
+    pub fn flush_untailed_pending(&self) -> Result<()> {
+        let mts = self
+            .memtable_mgr
+            .get_all_pending()
+            .into_iter()
+            .filter(|mt| {
+                let table_dir = self.segment_mgr.table_dir(mt.db(), mt.table());
+                let _ = self.tail_committer.barrier(&table_dir);
+                !crate::storage::core::durable_tail::has_tail(&table_dir, mt.id())
+            })
+            .collect();
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer)?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -631,7 +653,6 @@ impl BatchWriter {
         tail_committer: Arc<TailCommitter>,
         write_epoch: Arc<AtomicU64>,
         max_rows_per_memtable: u64,
-        checkpoint_backlog_bytes: u64,
     ) {
         let mut pending_tables = std::collections::HashSet::<(String, String)>::new();
         let mut last_write_epoch = write_epoch.load(Ordering::Acquire);
@@ -656,22 +677,18 @@ impl BatchWriter {
                 Ok(WriteCommand::WriteColumns { .. }) => {}
                 Ok(WriteCommand::Flush { db, table }) => {
                     last_write_epoch = write_epoch.load(Ordering::Acquire);
-                    pending_tables.insert((db.clone(), table.clone()));
-                    if memtable_mgr.total_estimated_memory_bytes() >= checkpoint_backlog_bytes {
-                        pending_tables.remove(&(db.clone(), table.clone()));
-                        if Self::checkpoint_one_full_memtable(
-                            &segment_mgr,
-                            &memtable_mgr,
-                            &tail_committer,
-                            max_rows_per_memtable,
-                            &db,
-                            &table,
-                        ) {
-                            pending_tables.insert((db, table));
-                        }
-                    } else {
-                        checkpoint_idle = false;
+                    pending_tables.remove(&(db.clone(), table.clone()));
+                    if Self::checkpoint_full_memtables(
+                        &segment_mgr,
+                        &memtable_mgr,
+                        &tail_committer,
+                        max_rows_per_memtable,
+                        &db,
+                        &table,
+                    ) {
+                        pending_tables.insert((db, table));
                     }
+                    checkpoint_idle = false;
                 }
                 Ok(WriteCommand::TxnCommit { txn_id }) => {
                     memtable_mgr.commit_txn(txn_id);
@@ -702,7 +719,7 @@ impl BatchWriter {
                         continue;
                     };
                     pending_tables.remove(&(db.clone(), table.clone()));
-                    if Self::checkpoint_one_full_memtable(
+                    if Self::checkpoint_full_memtables(
                         &segment_mgr,
                         &memtable_mgr,
                         &tail_committer,
@@ -723,10 +740,7 @@ impl BatchWriter {
         }
     }
 
-    /// Checkpoint one full memtable and report whether the same table still
-    /// has additional full memtables waiting. Limiting each foreground-active
-    /// turn to one keeps the write-behind queue bounded without a long burst.
-    fn checkpoint_one_full_memtable(
+    fn checkpoint_full_memtables(
         segment_mgr: &Arc<SegmentManager>,
         memtable_mgr: &MemTableManager,
         tail_committer: &Arc<TailCommitter>,
@@ -734,17 +748,24 @@ impl BatchWriter {
         db: &str,
         table: &str,
     ) -> bool {
-        let mut full = memtable_mgr
+        let full = memtable_mgr
             .get_by_table(db, table)
             .into_iter()
             .filter(|mt| mt.row_count() >= max_rows_per_memtable)
             .collect::<Vec<_>>();
-        if let Some(mt) = full.pop() {
-            if let Err(error) = Self::flush_memtable(segment_mgr, &mt, tail_committer) {
-                tracing::warn!(error = %error, "failed to flush memtable for {}.{}", db, table);
+        let mut failed = false;
+        for group in Self::group_memtables_for_flush(full) {
+            if let Err(error) =
+                Self::flush_memtable_group(segment_mgr, &group, false, tail_committer)
+            {
+                failed = true;
+                tracing::warn!(error = %error, "failed to flush memtables for {}.{}", db, table);
             }
         }
-        !full.is_empty()
+        if !failed {
+            memtable_mgr.remove_flushed();
+        }
+        failed
     }
 
     fn flush_pending_memtables(
@@ -753,11 +774,148 @@ impl BatchWriter {
         tail_committer: &Arc<TailCommitter>,
     ) -> Result<()> {
         let flushable = memtable_mgr.get_flushable();
-        for mt in flushable {
-            Self::flush_memtable(segment_mgr, &mt, tail_committer)?;
+        for group in Self::group_memtables_for_flush(flushable) {
+            Self::flush_memtable_group(segment_mgr, &group, false, tail_committer)?;
         }
         memtable_mgr.remove_flushed();
         Ok(())
+    }
+
+    fn flush_tail_file_pressure(
+        segment_mgr: &Arc<SegmentManager>,
+        memtable_mgr: &MemTableManager,
+        tail_committer: &Arc<TailCommitter>,
+        max_files_per_table: usize,
+    ) -> Result<usize> {
+        let mut tables = std::collections::HashSet::new();
+        for memtable in memtable_mgr.get_all_pending() {
+            if !memtable.is_transactional() {
+                tables.insert((memtable.db().to_string(), memtable.table().to_string()));
+            }
+        }
+        let mut flushed_tables = 0usize;
+        for (db, table) in tables {
+            let table_dir = segment_mgr.table_dir(&db, &table);
+            let file_count = crate::storage::core::durable_tail::generation_file_count(&table_dir)?;
+            if file_count < max_files_per_table {
+                continue;
+            }
+            let memtables = memtable_mgr
+                .get_by_table(&db, &table)
+                .into_iter()
+                .filter(|memtable| !memtable.is_transactional())
+                .collect::<Vec<_>>();
+            if memtables.is_empty() {
+                continue;
+            }
+            for group in Self::group_memtables_for_flush(memtables) {
+                Self::flush_memtable_group(segment_mgr, &group, false, tail_committer)?;
+            }
+            flushed_tables += 1;
+            tracing::info!(
+                db,
+                table,
+                file_count,
+                max_files_per_table,
+                "forced memtable flush to bound durable tail file count"
+            );
+        }
+        if flushed_tables > 0 {
+            memtable_mgr.remove_flushed();
+        }
+        Ok(flushed_tables)
+    }
+
+    /// Spill cold committed memtables onto their durable tails until resident
+    /// memory drops to 80% of the high-water mark, or candidates run out.
+    /// Returns the number of memtables spilled. Spilling is metadata-only:
+    /// the rows are already durable in the tail, so this performs no I/O
+    /// beyond a tail barrier and a frame-header scan.
+    fn spill_pressure_pass(
+        segment_mgr: &Arc<SegmentManager>,
+        memtable_mgr: &Arc<MemTableManager>,
+        tail_committer: &Arc<TailCommitter>,
+        high_water: u64,
+        min_age_secs: u64,
+    ) -> usize {
+        let target = high_water.saturating_sub(high_water / 5);
+        let mut candidates = memtable_mgr.spill_candidates(min_age_secs);
+        candidates.sort_by_key(|mt| std::cmp::Reverse(mt.age_secs()));
+        let mut by_table = Vec::<(
+            (String, String),
+            Vec<Arc<crate::storage::core::memtable::MemTable>>,
+        )>::new();
+        'outer: for mt in candidates {
+            let key = (mt.db().to_string(), mt.table().to_string());
+            for (existing_key, group) in by_table.iter_mut() {
+                if *existing_key == key {
+                    group.push(mt);
+                    continue 'outer;
+                }
+            }
+            by_table.push((key, vec![mt]));
+        }
+        let mut spilled = 0usize;
+        for ((db, table), mts) in by_table {
+            if memtable_mgr.total_estimated_memory_bytes() <= target {
+                break;
+            }
+            let table_dir = segment_mgr.table_dir(&db, &table);
+            let result = segment_mgr.with_table_mutation_lock(&db, &table, || {
+                tail_committer.barrier(&table_dir)?;
+                let ids = mts.iter().map(|mt| mt.id()).collect::<Vec<_>>();
+                let live_paths =
+                    crate::storage::core::durable_tail::live_tail_paths_batch(&table_dir, &ids)?;
+                let mut count = 0usize;
+                for mt in &mts {
+                    if memtable_mgr.total_estimated_memory_bytes() <= target {
+                        break;
+                    }
+                    if Self::try_spill_memtable(
+                        live_paths.get(&mt.id()).and_then(|path| path.clone()),
+                        mt,
+                    ) {
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            });
+            match result {
+                Ok(count) => spilled += count,
+                Err(error) => {
+                    tracing::warn!(db, table, error = %error, "memtable spill pass failed for table")
+                }
+            }
+        }
+        spilled
+    }
+
+    /// Spill one memtable after proving its durable tail covers exactly the
+    /// memtable's rows. Holding the table mutation lock plus the preceding
+    /// tail barrier makes that proof race-free against concurrent inserts.
+    /// The caller resolves the live tail paths in one batched directory scan.
+    fn try_spill_memtable(
+        live_tail: Option<std::path::PathBuf>,
+        mt: &Arc<crate::storage::core::memtable::MemTable>,
+    ) -> bool {
+        if mt.state() != MemTableState::Pending
+            || mt.is_transactional()
+            || mt.visibility() != crate::storage::core::memtable::TxnVisibility::Committed
+        {
+            return false;
+        }
+        let Some(path) = live_tail else {
+            return false;
+        };
+        // Only v2 tails expose their row count without decoding; legacy tails
+        // stay resident and migrate to v2 on the next append.
+        let Ok(Some(tail_rows)) = crate::storage::core::durable_tail::tail_log_rows(&path) else {
+            return false;
+        };
+        if tail_rows != mt.row_count() {
+            return false;
+        }
+        mt.spill_to_tail(path)
     }
 
     /// Flush *every* pending memtable regardless of age or size. Used under
@@ -769,10 +927,13 @@ impl BatchWriter {
         memtable_mgr: &MemTableManager,
         tail_committer: &Arc<TailCommitter>,
     ) -> Result<()> {
-        for mt in memtable_mgr.get_all_pending() {
-            if !mt.is_transactional() {
-                Self::flush_memtable(segment_mgr, &mt, tail_committer)?;
-            }
+        let mts = memtable_mgr
+            .get_all_pending()
+            .into_iter()
+            .filter(|mt| !mt.is_transactional())
+            .collect();
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(segment_mgr, &group, false, tail_committer)?;
         }
         memtable_mgr.remove_flushed();
         Ok(())
@@ -783,131 +944,7 @@ impl BatchWriter {
         mt: &Arc<crate::storage::core::memtable::MemTable>,
         tail_committer: &Arc<TailCommitter>,
     ) -> Result<()> {
-        let db = mt.db().to_string();
-        let table = mt.table().to_string();
-        let detached = segment_mgr.with_table_mutation_lock(&db, &table, || {
-            tail_committer.barrier(&segment_mgr.table_dir(&db, &table))?;
-            if mt.state() != MemTableState::Pending {
-                return Ok(None);
-            }
-            let table_dir = segment_mgr.table_dir(&db, &table);
-            if !table_dir.is_dir()
-                || !crate::storage::core::durable_tail::has_tail(&table_dir, mt.id())
-            {
-                Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)?;
-                return Ok(None);
-            }
-
-            mt.set_state(MemTableState::Flushing);
-            let Some(batch) = mt.read_snapshot_shared() else {
-                mt.set_state(MemTableState::Flushed);
-                return Ok(None);
-            };
-            if batch.num_rows() == 0 {
-                mt.set_state(MemTableState::Flushed);
-                return Ok(None);
-            }
-            let final_path = if mt.partition_key().is_empty() {
-                segment_mgr.next_segment_path(&table_dir, "")?
-            } else {
-                segment_mgr.next_partition_segment_path(&table_dir, mt.partition_key())?
-            };
-            let tmp_dir = segment_mgr.data_dir().join(".memtable_flush_tmp");
-            std::fs::create_dir_all(&tmp_dir)?;
-            let tmp_path = tmp_dir.join(format!("{}.tmp", mt.id().simple()));
-            let _ = std::fs::remove_file(&tmp_path);
-            let _ = remove_sidecar_meta(&tmp_path);
-            Ok(Some(DetachedDurableFlush {
-                memtable: Arc::clone(mt),
-                batch,
-                table_dir,
-                tmp_path,
-                final_path,
-            }))
-        })?;
-
-        let Some(detached) = detached else {
-            return Ok(());
-        };
-        let write_result = checkpoint_pool().install(|| {
-            segment_mgr.write_standalone_active_encoded_segment(
-                &detached.tmp_path,
-                detached.batch.as_ref(),
-            )
-        });
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&detached.tmp_path);
-            let _ = remove_sidecar_meta(&detached.tmp_path);
-            let _ = segment_mgr.with_table_mutation_lock(&db, &table, || {
-                if detached.memtable.state() == MemTableState::Flushing {
-                    detached.memtable.set_state(MemTableState::Pending);
-                }
-                Ok(())
-            });
-            return Err(error);
-        }
-
-        segment_mgr.with_table_mutation_lock(&db, &table, || {
-            Self::finish_detached_durable_flush(segment_mgr, detached)
-        })
-    }
-
-    fn finish_detached_durable_flush(
-        segment_mgr: &Arc<SegmentManager>,
-        detached: DetachedDurableFlush,
-    ) -> Result<()> {
-        let mt = &detached.memtable;
-        if mt.state() != MemTableState::Flushing || !detached.table_dir.is_dir() {
-            let _ = std::fs::remove_file(&detached.tmp_path);
-            let _ = remove_sidecar_meta(&detached.tmp_path);
-            return Ok(());
-        }
-        let segment_file_name = detached
-            .final_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                TaibaiError::Storage("durable tail segment path has no file name".into())
-            })?;
-        let intent = crate::storage::core::durable_tail::begin_flush(
-            &detached.table_dir,
-            mt.id(),
-            segment_file_name,
-        )?;
-        let finish_result = (|| {
-            std::fs::rename(&detached.tmp_path, &detached.final_path)?;
-            let _ = remove_sidecar_meta(&detached.tmp_path);
-            segment_mgr.open_reader(&detached.final_path)?;
-            let _ = mt.take_batch();
-            mt.set_state(MemTableState::Flushed);
-            Ok(())
-        })();
-        if let Err(error) = finish_result {
-            let _ = std::fs::remove_file(&detached.tmp_path);
-            let _ = remove_sidecar_meta(&detached.tmp_path);
-            let _ = crate::storage::core::durable_tail::cancel_flush(intent);
-            if mt.state() == MemTableState::Flushing {
-                mt.set_state(MemTableState::Pending);
-            }
-            return Err(error);
-        }
-        if let Err(error) =
-            crate::storage::core::durable_tail::finish_flush(&detached.table_dir, intent)
-        {
-            tracing::warn!(
-                db = mt.db(),
-                table = mt.table(),
-                error = %error,
-                "detached durable tail flush cleanup deferred to recovery"
-            );
-        }
-        tracing::debug!(
-            table = mt.table(),
-            rows = detached.batch.num_rows(),
-            path = %detached.final_path.display(),
-            "detached durable memtable flush completed"
-        );
-        Ok(())
+        Self::flush_memtable_inner(segment_mgr, mt, false, tail_committer)
     }
 
     fn flush_memtable_inner(
@@ -918,12 +955,36 @@ impl BatchWriter {
     ) -> Result<()> {
         let db = mt.db().to_string();
         let table = mt.table().to_string();
-        if table_lock_held {
-            return Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer);
-        }
-        segment_mgr.with_table_mutation_lock(&db, &table, || {
+        let had_rows = mt.state() == MemTableState::Pending && mt.row_count() > 0;
+        let result = if table_lock_held {
             Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)
-        })
+        } else {
+            segment_mgr.with_table_mutation_lock(&db, &table, || {
+                Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)
+            })
+        };
+        if result.is_ok() && had_rows {
+            // Rows may have landed in segments (or been carried by a concurrent
+            // winner flush); advance the epoch so unique-index snapshots stamped
+            // earlier are rebuilt before probing segment-side locations.
+            segment_mgr.note_memtable_flush(&db, &table);
+        }
+        result
+    }
+
+    /// Rollback fallback: when restoring a memtable's durable tail fails, flush
+    /// the memtable to segments under the already-held table lock and drop the
+    /// stale tail, so crash recovery cannot replay partially-restored rows.
+    pub(crate) fn flush_memtable_restore_fallback_under_table_lock(
+        &self,
+        memtable: &Arc<crate::storage::core::memtable::MemTable>,
+    ) -> Result<()> {
+        Self::flush_memtable_inner(&self.segment_mgr, memtable, true, &self.tail_committer)?;
+        let _ = crate::storage::core::durable_tail::clear(
+            &self.segment_mgr.table_dir(memtable.db(), memtable.table()),
+            memtable.id(),
+        );
+        Ok(())
     }
 
     fn flush_memtable_under_table_lock(
@@ -1002,6 +1063,429 @@ impl BatchWriter {
         Ok(())
     }
 
+    /// Group memtables that would be flushed to the same active segment
+    /// (same db/table/partition and the same txn WAL scope), preserving the
+    /// original chronological order inside each group. Flushing such a group
+    /// as one merged append cuts a single row group instead of one small row
+    /// group per memtable (close-of-day / aging / FLUSH TABLE paths).
+    fn group_memtables_for_flush(
+        mts: Vec<Arc<crate::storage::core::memtable::MemTable>>,
+    ) -> Vec<Vec<Arc<crate::storage::core::memtable::MemTable>>> {
+        let mut groups: Vec<Vec<Arc<crate::storage::core::memtable::MemTable>>> = Vec::new();
+        'outer: for mt in mts {
+            for group in groups.iter_mut() {
+                let first = &group[0];
+                if first.db() == mt.db()
+                    && first.table() == mt.table()
+                    && first.partition_key() == mt.partition_key()
+                    && first.txn_id() == mt.txn_id()
+                {
+                    group.push(mt);
+                    continue 'outer;
+                }
+            }
+            groups.push(vec![mt]);
+        }
+        groups
+    }
+
+    fn flush_memtable_group(
+        segment_mgr: &Arc<SegmentManager>,
+        group: &[Arc<crate::storage::core::memtable::MemTable>],
+        table_lock_held: bool,
+        tail_committer: &Arc<TailCommitter>,
+    ) -> Result<()> {
+        if group.len() == 1 {
+            return Self::flush_memtable_inner(
+                segment_mgr,
+                &group[0],
+                table_lock_held,
+                tail_committer,
+            );
+        }
+        let db = group[0].db().to_string();
+        let table = group[0].table().to_string();
+        let had_rows = group
+            .iter()
+            .any(|mt| mt.state() == MemTableState::Pending && mt.row_count() > 0);
+        let result = if table_lock_held {
+            Self::flush_memtable_group_under_table_lock(segment_mgr, group, tail_committer)
+        } else {
+            segment_mgr.with_table_mutation_lock(&db, &table, || {
+                Self::flush_memtable_group_under_table_lock(segment_mgr, group, tail_committer)
+            })
+        };
+        if result.is_ok() && had_rows {
+            segment_mgr.note_memtable_flush(&db, &table);
+        }
+        result
+    }
+
+    /// Flush a same-segment memtable group as ONE merged append. Mixed
+    /// tailed/untailed groups keep the legacy sequential semantics.
+    fn flush_memtable_group_under_table_lock(
+        segment_mgr: &Arc<SegmentManager>,
+        group: &[Arc<crate::storage::core::memtable::MemTable>],
+        tail_committer: &Arc<TailCommitter>,
+    ) -> Result<()> {
+        let db = group[0].db().to_string();
+        let table = group[0].table().to_string();
+        let partition_key = group[0].partition_key().to_string();
+        let txn_id = group[0].txn_id();
+        let table_dir = segment_mgr.table_dir(&db, &table);
+        tail_committer.barrier(&table_dir)?;
+
+        let pending: Vec<&Arc<crate::storage::core::memtable::MemTable>> = group
+            .iter()
+            .filter(|mt| mt.state() == MemTableState::Pending)
+            .collect();
+        let ids = pending.iter().map(|mt| mt.id()).collect::<Vec<_>>();
+        let tailed_map = crate::storage::core::durable_tail::has_tail_batch(&table_dir, &ids)?;
+        let tailed: Vec<bool> = pending
+            .iter()
+            .map(|mt| tailed_map.get(&mt.id()).copied().unwrap_or(false))
+            .collect();
+        let all_tailed = !tailed.is_empty() && tailed.iter().all(|t| *t);
+        let none_tailed = tailed.iter().all(|t| !*t);
+        if pending.len() <= 1 || (!all_tailed && !none_tailed) {
+            for mt in pending {
+                Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)?;
+            }
+            return Ok(());
+        }
+
+        // Lock the group in Flushing state and snapshot every batch.
+        let mut locked: Vec<(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)> =
+            Vec::with_capacity(pending.len());
+        for mt in pending {
+            mt.set_state(MemTableState::Flushing);
+            match mt.read_snapshot() {
+                Some(b) if b.num_rows() > 0 => locked.push((mt.clone(), b)),
+                _ => mt.set_state(MemTableState::Flushed),
+            }
+        }
+        if locked.is_empty() {
+            return Ok(());
+        }
+        if !table_dir.is_dir() {
+            // Table was dropped while the group waited on the table lock.
+            for (mt, _) in &locked {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            }
+            return Ok(());
+        }
+
+        let merged = Self::concat_flush_group_batches(&locked)?;
+        if all_tailed {
+            return Self::flush_durable_memtable_group_under_table_lock(
+                segment_mgr,
+                &locked,
+                &merged,
+                &db,
+                &table,
+                &partition_key,
+                txn_id,
+                &table_dir,
+            );
+        }
+
+        let flush_result = segment_mgr.flush_memtable_batch_if_under_table_lock(
+            &db,
+            &table,
+            &partition_key,
+            &merged,
+            txn_id,
+            || {
+                locked
+                    .iter()
+                    .all(|(mt, _)| mt.state() == MemTableState::Flushing)
+            },
+            || {
+                for (mt, _) in &locked {
+                    let _ = mt.take_batch();
+                    mt.set_state(MemTableState::Flushed);
+                }
+            },
+        );
+        let wrote = match flush_result {
+            Ok(wrote) => wrote,
+            Err(e) => {
+                for (mt, _) in &locked {
+                    if mt.state() == MemTableState::Flushing {
+                        mt.set_state(MemTableState::Pending);
+                    }
+                }
+                return Err(e);
+            }
+        };
+        if !wrote {
+            // A concurrent winner already carried these rows; drop the copies.
+            for (mt, _) in &locked {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            }
+            return Ok(());
+        }
+        for (mt, _) in &locked {
+            crate::storage::core::durable_tail::clear(&table_dir, mt.id())?;
+        }
+        tracing::debug!(
+            table = %table,
+            rows = merged.num_rows(),
+            memtables = locked.len(),
+            txn_id,
+            "memtable group flushed to active segment as one row group"
+        );
+        Ok(())
+    }
+
+    fn concat_flush_group_batches(
+        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
+    ) -> Result<RecordBatch> {
+        let mut iter = locked.iter();
+        let (_, first) = iter
+            .next()
+            .ok_or_else(|| TaibaiError::Storage("flush group is empty".into()))?;
+        let mut merged = first.clone();
+        for (_, batch) in iter {
+            for col_idx in 0..batch.num_columns() {
+                let source = batch.column(col_idx).ok_or_else(|| {
+                    TaibaiError::Storage("flush group batch is missing a column".into())
+                })?;
+                let destination = merged.column_mut(col_idx).ok_or_else(|| {
+                    TaibaiError::Storage("flush group merged batch is missing a column".into())
+                })?;
+                destination.extend(source)?;
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Durable (tailed) group flush: one flush intent per tail with cumulative
+    /// row-count watermarks over the shared target segment. The single merged
+    /// append makes every watermark true at once; a crash before the footer
+    /// reaches a watermark leaves that tail's intent for recovery, exactly as
+    /// in the single-memtable protocol.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_durable_memtable_group_under_table_lock(
+        segment_mgr: &Arc<SegmentManager>,
+        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
+        merged: &RecordBatch,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        txn_id: u64,
+        table_dir: &std::path::Path,
+    ) -> Result<()> {
+        let watermark = segment_mgr.durable_active_segment_watermark_under_table_lock(
+            db,
+            table,
+            partition_key,
+            &merged.schema,
+            merged.num_rows() as u64,
+        )?;
+        let Some((segment_file_name, expected_total_rows)) = watermark else {
+            return Self::flush_durable_memtable_group_as_new_segment(
+                segment_mgr,
+                locked,
+                merged,
+                db,
+                table,
+                partition_key,
+                txn_id,
+                table_dir,
+            );
+        };
+        let base_rows = expected_total_rows - merged.num_rows() as u64;
+        let mut intents = Vec::with_capacity(locked.len());
+        let mut cumulative = 0u64;
+        for (mt, batch) in locked {
+            cumulative += batch.num_rows() as u64;
+            match crate::storage::core::durable_tail::begin_flush(
+                table_dir,
+                mt.id(),
+                &segment_file_name,
+                base_rows + cumulative,
+            ) {
+                Ok(intent) => intents.push(intent),
+                Err(error) => {
+                    for intent in intents {
+                        let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+                    }
+                    for (mt, _) in locked {
+                        if mt.state() == MemTableState::Flushing {
+                            mt.set_state(MemTableState::Pending);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let flush_result = segment_mgr.flush_memtable_batch_if_under_table_lock(
+            db,
+            table,
+            partition_key,
+            merged,
+            0,
+            || {
+                locked
+                    .iter()
+                    .all(|(mt, _)| mt.state() == MemTableState::Flushing)
+            },
+            || {
+                for (mt, _) in locked {
+                    let _ = mt.take_batch();
+                    mt.set_state(MemTableState::Flushed);
+                }
+            },
+        );
+        let wrote = match flush_result {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                for intent in intents {
+                    let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+                }
+                for (mt, _) in locked {
+                    if mt.state() == MemTableState::Flushing {
+                        mt.set_state(MemTableState::Pending);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if !wrote {
+            for (mt, _) in locked {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            }
+            for intent in intents {
+                let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+            }
+            return Ok(());
+        }
+        if let Err(error) =
+            crate::storage::core::durable_tail::finish_flush_batch(table_dir, intents)
+        {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "durable tail group flush cleanup deferred to recovery"
+            );
+        }
+        tracing::debug!(
+            table,
+            rows = merged.num_rows(),
+            memtables = locked.len(),
+            txn_id,
+            segment = %segment_file_name,
+            expected_total_rows,
+            "durable memtable group appended to active segment as one row group"
+        );
+        Ok(())
+    }
+
+    /// Durable group flush with no appendable active segment yet: write the
+    /// merged rows as one standalone segment via tmp+rename (mirrors
+    /// `flush_durable_memtable_as_new_segment` for a group).
+    #[allow(clippy::too_many_arguments)]
+    fn flush_durable_memtable_group_as_new_segment(
+        segment_mgr: &Arc<SegmentManager>,
+        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
+        merged: &RecordBatch,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        txn_id: u64,
+        table_dir: &std::path::Path,
+    ) -> Result<()> {
+        let final_path = if partition_key.is_empty() {
+            segment_mgr.next_segment_path(table_dir, "")?
+        } else {
+            segment_mgr.next_partition_segment_path(table_dir, partition_key)?
+        };
+        let segment_file_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                TaibaiError::Storage("durable tail segment path has no file name".into())
+            })?
+            .to_string();
+        let mut intents = Vec::with_capacity(locked.len());
+        let mut cumulative = 0u64;
+        for (mt, batch) in locked {
+            cumulative += batch.num_rows() as u64;
+            match crate::storage::core::durable_tail::begin_flush(
+                table_dir,
+                mt.id(),
+                &segment_file_name,
+                cumulative,
+            ) {
+                Ok(intent) => intents.push(intent),
+                Err(error) => {
+                    for intent in intents {
+                        let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+                    }
+                    for (mt, _) in locked {
+                        if mt.state() == MemTableState::Flushing {
+                            mt.set_state(MemTableState::Pending);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let tmp_path = table_dir.join(format!(".tail_flush_{}.tmp", locked[0].0.id().simple()));
+
+        let write_result = (|| {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_sidecar_meta(&tmp_path);
+            segment_mgr.write_standalone_active_encoded_segment(&tmp_path, merged)?;
+            std::fs::rename(&tmp_path, &final_path)?;
+            let _ = remove_sidecar_meta(&tmp_path);
+            segment_mgr.open_reader(&final_path)?;
+            Ok(())
+        })();
+
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_sidecar_meta(&tmp_path);
+            for intent in intents {
+                let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+            }
+            for (mt, _) in locked {
+                if mt.state() == MemTableState::Flushing {
+                    mt.set_state(MemTableState::Pending);
+                }
+            }
+            return Err(error);
+        }
+
+        for (mt, _) in locked {
+            let _ = mt.take_batch();
+            mt.set_state(MemTableState::Flushed);
+        }
+        if let Err(error) =
+            crate::storage::core::durable_tail::finish_flush_batch(table_dir, intents)
+        {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "durable tail group flush cleanup deferred to recovery"
+            );
+        }
+        tracing::debug!(
+            table,
+            rows = merged.num_rows(),
+            memtables = locked.len(),
+            txn_id,
+            segment = %segment_file_name,
+            "durable memtable group materialized as new segment"
+        );
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     fn flush_durable_memtable_under_table_lock(
         segment_mgr: &Arc<SegmentManager>,
@@ -1013,23 +1497,120 @@ impl BatchWriter {
         txn_id: u64,
     ) -> Result<()> {
         let table_dir = segment_mgr.table_dir(db, table);
+        let watermark = segment_mgr.durable_active_segment_watermark_under_table_lock(
+            db,
+            table,
+            partition_key,
+            &batch.schema,
+            batch.num_rows() as u64,
+        )?;
+        let Some((segment_file_name, expected_rows)) = watermark else {
+            return Self::flush_durable_memtable_as_new_segment(
+                segment_mgr,
+                mt,
+                batch,
+                db,
+                table,
+                partition_key,
+                txn_id,
+                &table_dir,
+            );
+        };
+        let intent = crate::storage::core::durable_tail::begin_flush(
+            &table_dir,
+            mt.id(),
+            &segment_file_name,
+            expected_rows,
+        )?;
+        // The durable tail already protects these rows, so the shared active
+        // segment append runs without the extra transactional WAL write
+        // (txn_id = 0). The intent above carries the row-count watermark that
+        // lets recovery tell "appended and footer-synced" apart from "crash
+        // before the segment footer reached the watermark".
+        let flush_result = segment_mgr.flush_memtable_batch_if_under_table_lock(
+            db,
+            table,
+            partition_key,
+            batch,
+            0,
+            || mt.state() == MemTableState::Flushing,
+            || {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            },
+        );
+        let wrote = match flush_result {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+                if mt.state() == MemTableState::Flushing {
+                    mt.set_state(MemTableState::Pending);
+                }
+                return Err(error);
+            }
+        };
+        if !wrote {
+            let _ = mt.take_batch();
+            mt.set_state(MemTableState::Flushed);
+            let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+            return Ok(());
+        }
+
+        if let Err(error) = crate::storage::core::durable_tail::finish_flush_batch(
+            &table_dir,
+            std::iter::once(intent).collect(),
+        ) {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "durable tail flush cleanup deferred to recovery"
+            );
+        }
+        tracing::debug!(
+            table,
+            rows = batch.num_rows(),
+            txn_id,
+            segment = %segment_file_name,
+            expected_rows,
+            "durable memtable tail appended to active segment"
+        );
+        Ok(())
+    }
+
+    /// First durable flush for a partition (no appendable active segment
+    /// exists yet): write the rows as a complete standalone segment via
+    /// tmp+rename so the file only becomes discoverable with a valid embedded
+    /// footer. The segment stays unsealed, so later durable flushes find it
+    /// through the watermark lookup and append to it in place.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_durable_memtable_as_new_segment(
+        segment_mgr: &Arc<SegmentManager>,
+        mt: &Arc<crate::storage::core::memtable::MemTable>,
+        batch: &RecordBatch,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        txn_id: u64,
+        table_dir: &std::path::Path,
+    ) -> Result<()> {
         let final_path = if partition_key.is_empty() {
-            segment_mgr.next_segment_path(&table_dir, "")?
+            segment_mgr.next_segment_path(table_dir, "")?
         } else {
-            segment_mgr.next_partition_segment_path(&table_dir, partition_key)?
+            segment_mgr.next_partition_segment_path(table_dir, partition_key)?
         };
         let segment_file_name = final_path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
-                crate::common::error::TaibaiError::Storage(
-                    "durable tail segment path has no file name".into(),
-                )
-            })?;
+                TaibaiError::Storage("durable tail segment path has no file name".into())
+            })?
+            .to_string();
         let intent = crate::storage::core::durable_tail::begin_flush(
-            &table_dir,
+            table_dir,
             mt.id(),
-            segment_file_name,
+            &segment_file_name,
+            batch.num_rows() as u64,
         )?;
         let tmp_path = table_dir.join(format!(".tail_flush_{}.tmp", mt.id().simple()));
 
@@ -1038,9 +1619,6 @@ impl BatchWriter {
             let _ = remove_sidecar_meta(&tmp_path);
             segment_mgr.write_standalone_active_encoded_segment(&tmp_path, batch)?;
             std::fs::rename(&tmp_path, &final_path)?;
-            // The sealed segment contains its footer. The temporary sidecar is
-            // unnecessary and is deliberately not renamed to a shared
-            // partition sidecar path.
             let _ = remove_sidecar_meta(&tmp_path);
             segment_mgr.open_reader(&final_path)?;
             Ok(())
@@ -1050,24 +1628,423 @@ impl BatchWriter {
             let _ = std::fs::remove_file(&tmp_path);
             let _ = remove_sidecar_meta(&tmp_path);
             let _ = crate::storage::core::durable_tail::cancel_flush(intent);
-            mt.set_state(MemTableState::Pending);
+            if mt.state() == MemTableState::Flushing {
+                mt.set_state(MemTableState::Pending);
+            }
             return Err(error);
         }
 
         let _ = mt.take_batch();
         mt.set_state(MemTableState::Flushed);
-        if let Err(error) = crate::storage::core::durable_tail::finish_flush(&table_dir, intent) {
-            // The segment and intent are both durable. Recovery will suppress
-            // the source tail even if this best-effort cleanup is interrupted.
-            tracing::warn!(db, table, error = %error, "durable tail flush cleanup deferred to recovery");
+        if let Err(error) = crate::storage::core::durable_tail::finish_flush_batch(
+            table_dir,
+            std::iter::once(intent).collect(),
+        ) {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "durable tail flush cleanup deferred to recovery"
+            );
         }
         tracing::debug!(
             table,
             rows = batch.num_rows(),
             txn_id,
-            path = %final_path.display(),
-            "durable memtable tail flushed to sealed segment"
+            segment = %segment_file_name,
+            "durable memtable tail materialized as new segment"
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::storage::segment::SegmentReader;
+    use crate::types::batch::ColumnDef;
+    use crate::types::scalar::ScalarValue;
+    use std::path::{Path, PathBuf};
+
+    const TEST_DB: &str = "main";
+    const TEST_TABLE: &str = "t";
+
+    fn test_schema() -> Schema {
+        Schema::new(vec![ColumnDef::new("id", DataType::Int64)])
+    }
+
+    fn make_batch(schema: &Schema, start_id: i64, rows: usize) -> Result<RecordBatch> {
+        let mut batch = RecordBatch::new(schema.clone());
+        for offset in 0..rows {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(start_id + offset as i64)))?;
+        }
+        Ok(batch)
+    }
+
+    fn test_config(max_rows_per_memtable: u64) -> BatchWriterConfig {
+        BatchWriterConfig {
+            max_rows_per_memtable,
+            flush_interval_secs: 3600,
+            max_total_memory: 1 << 30,
+            worker_count: 1,
+            low_rate_max_rows: 1024,
+            low_rate_max_age_secs: 3600,
+            spill_enabled: true,
+            spill_min_age_secs: 0,
+        }
+    }
+
+    fn segment_files(table_dir: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(table_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("dat"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn total_segment_rows(table_dir: &Path) -> u64 {
+        segment_files(table_dir)
+            .iter()
+            .map(|path| SegmentReader::open(path).unwrap().row_count())
+            .sum()
+    }
+
+    fn tail_entries(table_dir: &Path) -> usize {
+        let tail_dir = table_dir.join("memtable_tail");
+        if !tail_dir.is_dir() {
+            return 0;
+        }
+        std::fs::read_dir(tail_dir).unwrap().flatten().count()
+    }
+
+    #[test]
+    fn full_memtables_flush_while_write_queue_stays_active() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr));
+
+        for batch_idx in 0..64 {
+            writer.write_columns(
+                TEST_DB,
+                TEST_TABLE,
+                "20251231",
+                make_batch(&schema, batch_idx * 4, 4)?,
+                schema.clone(),
+            )?;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::storage::core::durable_tail::generation_file_count(&table_dir)? > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            crate::storage::core::durable_tail::generation_file_count(&table_dir)?,
+            0
+        );
+        assert_eq!(total_segment_rows(&table_dir), 256);
+        writer.stop();
+        Ok(())
+    }
+
+    #[test]
+    fn tail_file_pressure_forces_table_flush() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+
+        for partition in 0..4 {
+            writer.write_columns(
+                TEST_DB,
+                TEST_TABLE,
+                &partition.to_string(),
+                make_batch(&schema, partition, 1)?,
+                schema.clone(),
+            )?;
+        }
+        assert_eq!(
+            crate::storage::core::durable_tail::generation_file_count(&table_dir)?,
+            4
+        );
+
+        let flushed = BatchWriter::flush_tail_file_pressure(
+            &segment_mgr,
+            writer.memtable_manager(),
+            &writer.tail_committer,
+            4,
+        )?;
+
+        assert_eq!(flushed, 1);
+        assert_eq!(
+            crate::storage::core::durable_tail::generation_file_count(&table_dir)?,
+            0
+        );
+        assert_eq!(total_segment_rows(&table_dir), 4);
+        writer.stop();
+        Ok(())
+    }
+
+    /// Repeated durable memtable flushes must append into one shared active
+    /// segment instead of sealing one small segment per memtable.
+    #[test]
+    fn durable_flushes_share_one_active_segment() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr));
+
+        for batch_idx in 0..3 {
+            let batch = make_batch(&schema, batch_idx * 4, 4)?;
+            writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+            writer.flush_table(TEST_DB, TEST_TABLE)?;
+        }
+        // A final partial memtable also lands in the same active segment.
+        let batch = make_batch(&schema, 12, 2)?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        writer.flush_table(TEST_DB, TEST_TABLE)?;
+        writer.stop();
+
+        let files = segment_files(&table_dir);
+        assert_eq!(
+            files.len(),
+            1,
+            "durable flushes should share one active segment, got {files:?}"
+        );
+        assert_eq!(total_segment_rows(&table_dir), 14);
+        assert_eq!(tail_entries(&table_dir), 0, "flushed tails must be cleared");
+        Ok(())
+    }
+
+    /// A crash before any flush leaves the durable tail on disk. Startup
+    /// recovery replays it exactly once into the active segment.
+    #[test]
+    fn crash_before_flush_replays_tail_exactly_once() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+
+        {
+            let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+            let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+            let batch = make_batch(&schema, 100, 5)?;
+            writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+            // No flush: stop only halts the background threads, leaving the
+            // group-committed tail behind like a crash would.
+            writer.stop();
+        }
+        assert!(tail_entries(&table_dir) > 0, "tail must survive the crash");
+        assert_eq!(total_segment_rows(&table_dir), 0);
+
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+        let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].batch.num_rows(), 5);
+        for tail in recovered {
+            writer.memtable_manager().restore_committed_tail(
+                tail.id,
+                TEST_DB,
+                TEST_TABLE,
+                &tail.partition_key,
+                tail.batch,
+            );
+        }
+        writer.flush_table(TEST_DB, TEST_TABLE)?;
+        writer.stop();
+
+        assert_eq!(total_segment_rows(&table_dir), 5);
+        assert!(
+            crate::storage::core::durable_tail::recover(&table_dir, &schema)?.is_empty(),
+            "replayed tail must not be recovered a second time"
+        );
+        Ok(())
+    }
+
+    /// A crash after the rows reached the segment but before tail cleanup is
+    /// detected through the flush-intent watermark: no replay, no duplicates.
+    #[test]
+    fn crash_after_segment_append_suppresses_tail_replay() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+        let batch = make_batch(&schema, 200, 6)?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        writer.flush_table(TEST_DB, TEST_TABLE)?;
+        writer.stop();
+        assert_eq!(total_segment_rows(&table_dir), 6);
+        assert_eq!(tail_entries(&table_dir), 0);
+
+        // Rebuild the crash window artificially: a tail plus a flush intent
+        // whose watermark is already satisfied by the segment contents.
+        let id = uuid::Uuid::new_v4();
+        let batch = make_batch(&schema, 200, 6)?;
+        crate::storage::core::durable_tail::persist(&table_dir, id, "", &batch)?;
+        let segment_name = segment_files(&table_dir)[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _intent =
+            crate::storage::core::durable_tail::begin_flush(&table_dir, id, &segment_name, 6)?;
+
+        let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
+        assert!(
+            recovered.is_empty(),
+            "satisfied watermark must suppress replay; got {} tail(s)",
+            recovered.len()
+        );
+        assert_eq!(tail_entries(&table_dir), 0, "recovery cleans up the intent");
+        assert_eq!(total_segment_rows(&table_dir), 6);
+        Ok(())
+    }
+
+    /// A crash in the middle of the append (segment below the watermark) must
+    /// replay the tail so no acknowledged rows are lost.
+    #[test]
+    fn crash_mid_append_replays_tail() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+        let batch = make_batch(&schema, 300, 3)?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        writer.flush_table(TEST_DB, TEST_TABLE)?;
+        writer.stop();
+        assert_eq!(total_segment_rows(&table_dir), 3);
+
+        // A second memtable (3 more rows) began flushing: intent demands 6
+        // rows in the shared segment, but the crash left only 3 durable.
+        let id = uuid::Uuid::new_v4();
+        let batch = make_batch(&schema, 303, 3)?;
+        crate::storage::core::durable_tail::persist(&table_dir, id, "", &batch)?;
+        let segment_name = segment_files(&table_dir)[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _intent =
+            crate::storage::core::durable_tail::begin_flush(&table_dir, id, &segment_name, 6)?;
+
+        let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
+        assert_eq!(recovered.len(), 1, "unsatisfied watermark must replay");
+        assert_eq!(recovered[0].batch.num_rows(), 3);
+        Ok(())
+    }
+
+    /// Under memory pressure a cold committed memtable spills to its durable
+    /// tail instead of being flushed into a small row group; a later flush
+    /// materializes the rows exactly once.
+    #[test]
+    fn memory_pressure_spills_memtable_then_flush_materializes() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+
+        let batch = make_batch(&schema, 0, 5)?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        assert!(writer.memtable_manager().total_estimated_memory_bytes() > 0);
+
+        // A 1-byte high-water mark forces the pass to spill everything.
+        let spilled = BatchWriter::spill_pressure_pass(
+            &segment_mgr,
+            writer.memtable_manager(),
+            &writer.tail_committer,
+            1,
+            0,
+        );
+        assert_eq!(spilled, 1);
+        assert_eq!(writer.memtable_manager().total_estimated_memory_bytes(), 0);
+        assert_eq!(
+            total_segment_rows(&table_dir),
+            0,
+            "spilling must not cut a row group"
+        );
+        assert!(
+            tail_entries(&table_dir) > 0,
+            "spilled rows stay in the tail"
+        );
+
+        writer.flush_table(TEST_DB, TEST_TABLE)?;
+        writer.stop();
+
+        assert_eq!(total_segment_rows(&table_dir), 5);
+        assert_eq!(tail_entries(&table_dir), 0, "flushed tails must be cleared");
+        Ok(())
+    }
+
+    /// A spilled memtable keeps serving reads by materializing from its tail,
+    /// and new inserts land on top of the recovered rows.
+    #[test]
+    fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+        std::fs::create_dir_all(&table_dir)?;
+        let schema = test_schema();
+        let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+
+        writer.write_columns(
+            TEST_DB,
+            TEST_TABLE,
+            "",
+            make_batch(&schema, 0, 3)?,
+            schema.clone(),
+        )?;
+        let spilled = BatchWriter::spill_pressure_pass(
+            &segment_mgr,
+            writer.memtable_manager(),
+            &writer.tail_committer,
+            1,
+            0,
+        );
+        assert_eq!(spilled, 1);
+
+        let memtables = writer.memtable_manager().get_by_table(TEST_DB, TEST_TABLE);
+        assert_eq!(memtables.len(), 1);
+        assert!(memtables[0].is_spilled());
+        let snapshot = memtables[0]
+            .read_snapshot()
+            .expect("spilled rows materialize");
+        assert_eq!(snapshot.num_rows(), 3);
+
+        writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 3, 2)?, schema)?;
+        let snapshot = writer.memtable_manager().get_by_table(TEST_DB, TEST_TABLE)[0]
+            .read_snapshot()
+            .unwrap();
+        assert_eq!(snapshot.num_rows(), 5);
+        drop(snapshot);
+        writer.stop();
         Ok(())
     }
 }

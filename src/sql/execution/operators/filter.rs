@@ -253,7 +253,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
         _ => {
             let vals = eval_expr_column(expr, batch)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
-                *m = !vals[i].is_null();
+                *m = matches!(vals[i], ScalarValue::Bool(Some(true)));
             }
         }
     }
@@ -484,6 +484,52 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
                     ScalarValue::Bool(Some(if *negated { !found } else { found }))
                 })
                 .collect())
+        }
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            let operand_values = operand
+                .as_deref()
+                .map(|expr| eval_expr_column(expr, batch))
+                .transpose()?;
+            let clause_values = when_clauses
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    Ok((
+                        eval_expr_column(when_expr, batch)?,
+                        eval_expr_column(then_expr, batch)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let else_values = else_clause
+                .as_deref()
+                .map(|expr| eval_expr_column(expr, batch))
+                .transpose()?;
+            let mut result = Vec::with_capacity(num_rows);
+            for row_idx in 0..num_rows {
+                let mut value = None;
+                for (when_values, then_values) in &clause_values {
+                    let matched = match &operand_values {
+                        Some(values) => {
+                            eval_comparison(&values[row_idx], &BinOp::Eq, &when_values[row_idx])
+                        }
+                        None => matches!(when_values[row_idx], ScalarValue::Bool(Some(true))),
+                    };
+                    if matched {
+                        value = Some(then_values[row_idx].clone());
+                        break;
+                    }
+                }
+                result.push(value.unwrap_or_else(|| {
+                    else_values
+                        .as_ref()
+                        .map(|values| values[row_idx].clone())
+                        .unwrap_or(ScalarValue::Int64(None))
+                }));
+            }
+            Ok(result)
         }
         LogicalExpr::Function { name, args } => {
             let arg_columns = args

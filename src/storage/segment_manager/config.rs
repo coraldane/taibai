@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 pub(super) const SEGMENT_BUFWRITER_CAP: usize = 512 * 1024;
 pub(super) const FLUSH_CHECK_INTERVAL_SECS: u64 = 10;
 pub(super) const FLUSH_IDLE_THRESHOLD_SECS: u64 = 5;
@@ -9,7 +7,6 @@ pub(super) const SIDECAR_COMPACT_MIN_BYTES: u64 = 4 * 1024 * 1024;
 
 const DEFAULT_MIN_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
-const DEFAULT_READER_CACHE_CAPACITY: usize = 1024;
 
 pub struct SegmentConfig {
     pub min_segment_size: u64,
@@ -22,28 +19,19 @@ impl Default for SegmentConfig {
         Self {
             min_segment_size: DEFAULT_MIN_SEGMENT_SIZE,
             max_segment_size: DEFAULT_MAX_SEGMENT_SIZE,
-            row_group_target_rows: 131_072,
+            row_group_target_rows: 8_192,
         }
     }
 }
 
-pub(super) fn bulk_compression_level() -> i32 {
-    static LEVEL: OnceLock<i32> = OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        std::env::var("TAIBAI_BULK_ZSTD_LEVEL")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(1)
-    })
+/// Bulk-write zstd level, installed from `compression.bulk_zstd_level` in the
+/// config file during server startup.
+pub(crate) fn bulk_compression_level() -> i32 {
+    crate::common::config::bulk_zstd_level()
 }
 
+/// Reader/meta cache capacity, installed from `storage.reader_cache_capacity`
+/// in the config file during server startup.
 pub(super) fn reader_cache_capacity() -> usize {
-    static CAPACITY: OnceLock<usize> = OnceLock::new();
-    *CAPACITY.get_or_init(|| {
-        std::env::var("TAIBAI_READER_CACHE_CAPACITY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_READER_CACHE_CAPACITY)
-    })
+    crate::common::config::reader_cache_capacity()
 }

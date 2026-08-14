@@ -1,5 +1,7 @@
 use futures::SinkExt;
 use futures::StreamExt;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -11,7 +13,7 @@ use tokio_util::codec::Framed;
 
 use crate::common::config::ServerConfig;
 use crate::common::error::{Result, TaibaiError};
-use crate::net::handler::Handler;
+use crate::net::handler::{build_error, Handler};
 use crate::net::tls::TlsMode;
 use crate::protocol::codec::MessageCodec;
 use crate::protocol::message::{
@@ -159,9 +161,12 @@ where
         MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),
     );
     let mut handler = Handler::new(config, engine.clone());
+    let mut pending_messages = VecDeque::new();
 
     let outcome = 'connection: loop {
-        let next = if idle_timeout_secs == 0 {
+        let next = if let Some(msg) = pending_messages.pop_front() {
+            Some(Ok(msg))
+        } else if idle_timeout_secs == 0 {
             framed.next().await
         } else {
             match timeout(Duration::from_secs(idle_timeout_secs), framed.next()).await {
@@ -185,12 +190,105 @@ where
 
         tracing::debug!(msg_type = msg.msg_type, "message received");
 
-        let (returned_handler, responses) =
-            run_handler_blocking(handler, msg, Arc::clone(&request_limiter)).await?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
+        let worker = run_handler(
+            handler,
+            msg,
+            Arc::clone(&request_limiter),
+            Arc::clone(&cancelled),
+            stream_sender,
+        );
+        tokio::pin!(worker);
+        let mut worker = loop {
+            tokio::select! {
+                result = &mut worker => break result?,
+                next = framed.next() => {
+                    match next {
+                        Some(Ok(msg)) => pending_messages.push_back(msg),
+                        Some(Err(error)) => {
+                            tracing::error!(%error, "decode error while waiting for request capacity");
+                            cancelled.store(true, Ordering::Release);
+                            return Err(error);
+                        }
+                        None => {
+                            cancelled.store(true, Ordering::Release);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        };
+        let mut disconnected = false;
+        let (returned_handler, responses) = loop {
+            tokio::select! {
+                result = &mut worker => {
+                    break result.map_err(|error| {
+                        TaibaiError::Internal(format!("request worker failed: {error}"))
+                    })?;
+                }
+                chunk = stream_receiver.recv() => {
+                    if let Some(chunk) = chunk {
+                        if let Err(error) = framed.send(chunk).await {
+                            tracing::error!(%error, "query stream send error");
+                            cancelled.store(true, Ordering::Release);
+                            worker.abort();
+                            return Ok(());
+                        }
+                    }
+                }
+                next = framed.next() => {
+                    match next {
+                        Some(Ok(msg)) => pending_messages.push_back(msg),
+                        Some(Err(error)) => {
+                            tracing::error!(%error, "decode error while query was running");
+                            cancelled.store(true, Ordering::Release);
+                            disconnected = true;
+                        }
+                        None => {
+                            cancelled.store(true, Ordering::Release);
+                            disconnected = true;
+                        }
+                    }
+                    if disconnected {
+                        match timeout(DISCONNECT_WORKER_WAIT, &mut worker).await {
+                            Ok(result) => {
+                                break result.map_err(|error| {
+                                    TaibaiError::Internal(format!("request worker failed: {error}"))
+                                })?;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "client disconnected but the request worker did not stop; aborting the worker and closing the connection"
+                                );
+                                worker.abort();
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        };
         handler = returned_handler;
+        if disconnected {
+            break Ok(());
+        }
+        while let Ok(chunk) = stream_receiver.try_recv() {
+            if let Err(error) = framed.send(chunk).await {
+                tracing::error!(%error, "query stream send error");
+                break 'connection Err(error);
+            }
+        }
         let responses = match responses {
             Ok(responses) => responses,
-            Err(error) => break Err(error),
+            Err(error) => {
+                tracing::error!(%error, "request handler error");
+                if let Err(send_error) = framed.send(build_error(&error.to_string())).await {
+                    tracing::error!(error = %send_error, "send error response failed");
+                    break Err(send_error);
+                }
+                break Err(error);
+            }
         };
         if responses.is_empty() {
             break Ok(());
@@ -209,29 +307,31 @@ where
     outcome
 }
 
-async fn run_handler_blocking(
+const DISCONNECT_WORKER_WAIT: Duration = Duration::from_secs(5);
+
+async fn run_handler(
     mut handler: Handler,
     msg: Message,
     request_limiter: Arc<Semaphore>,
-) -> Result<(Handler, Result<Vec<Message>>)> {
-    let permit = if is_heavy_request(msg.msg_type) {
-        Some(
-            request_limiter
-                .acquire_owned()
-                .await
-                .map_err(|_| TaibaiError::Internal("request limiter closed".into()))?,
-        )
+    cancelled: Arc<AtomicBool>,
+    stream_sender: tokio::sync::mpsc::Sender<Message>,
+) -> Result<tokio::task::JoinHandle<(Handler, Result<Vec<Message>>)>> {
+    if is_heavy_request(msg.msg_type) {
+        let permit = request_limiter
+            .acquire_owned()
+            .await
+            .map_err(|_| TaibaiError::Internal("request limiter closed".into()))?;
+        Ok(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
+            (handler, responses)
+        }))
     } else {
-        None
-    };
-
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let responses = handler.handle_message(msg);
-        (handler, responses)
-    })
-    .await
-    .map_err(|error| TaibaiError::Internal(format!("request worker failed: {error}")))
+        Ok(tokio::spawn(async move {
+            let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
+            (handler, responses)
+        }))
+    }
 }
 
 async fn cleanup_handler_blocking(mut handler: Handler, request_limiter: Arc<Semaphore>) {
@@ -240,10 +340,14 @@ async fn cleanup_handler_blocking(mut handler: Handler, request_limiter: Arc<Sem
         .as_ref()
         .is_some_and(|session| session.had_writes);
     let permit = if needs_heavy_permit {
-        let Ok(permit) = request_limiter.acquire_owned().await else {
-            return;
-        };
-        Some(permit)
+        match timeout(DISCONNECT_WORKER_WAIT, request_limiter.acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            Ok(Err(_)) => return,
+            Err(_) => {
+                tracing::warn!("request limiter busy; skipping disconnect flush");
+                return;
+            }
+        }
     } else {
         None
     };
@@ -305,7 +409,10 @@ mod tests {
     ) -> (Framed<DuplexStream, MessageCodec>, JoinHandle<Result<()>>) {
         let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);
         let config = Arc::new(ServerConfig {
-            compression: crate::common::config::CompressionSettings { enabled: false },
+            compression: crate::common::config::CompressionSettings {
+                enabled: false,
+                bulk_zstd_level: 1,
+            },
             ..ServerConfig::default()
         });
         let server = tokio::spawn(handle_framed(
@@ -340,6 +447,47 @@ mod tests {
             .expect("login response")
             .expect("login frame");
         assert_eq!(resp.msg_type, MSG_TYPE_AUTH_OK);
+    }
+
+    #[test]
+    fn lightweight_requests_do_not_use_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+
+            let (_dir, engine) = test_engine();
+            let (mut client, server) = spawn_test_connection(engine);
+            timeout(Duration::from_secs(2), login(&mut client, "root"))
+                .await
+                .expect("login should not use the saturated blocking pool");
+            client.send(Message::empty(MSG_TYPE_PING)).await.unwrap();
+            let pong = timeout(Duration::from_secs(2), client.next())
+                .await
+                .expect("ping should not use the saturated blocking pool")
+                .unwrap()
+                .unwrap();
+            assert_eq!(pong.msg_type, MSG_TYPE_PONG);
+
+            drop(client);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            timeout(Duration::from_secs(2), server)
+                .await
+                .expect("connection cleanup should complete after blocking capacity returns")
+                .unwrap()
+                .unwrap();
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -390,6 +538,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_while_waiting_for_request_capacity_closes_connection() {
+        let (_dir, engine) = test_engine();
+        let limiter = Arc::new(Semaphore::new(1));
+        let _held_permit = Arc::clone(&limiter).acquire_owned().await.unwrap();
+        let (mut client, server) = spawn_test_connection_with_limiter(engine, limiter);
+        login(&mut client, "root").await;
+        client.send(query("SELECT 1")).await.unwrap();
+        drop(client);
+
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("disconnected connection must not wait for request capacity")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handler_errors_still_release_bulk_import_session_state() {
         let (_dir, engine) = test_engine();
         let (mut client, server) = spawn_test_connection(Arc::clone(&engine));
@@ -406,6 +571,13 @@ mod tests {
             .send(Message::new(MSG_TYPE_LOGIN, Bytes::from_static(&[0])))
             .await
             .unwrap();
+        let response = timeout(Duration::from_secs(2), client.next())
+            .await
+            .expect("malformed protocol request should receive an error response")
+            .expect("server should respond before closing the connection")
+            .expect("error response should be decodable");
+        assert_eq!(response.msg_type, crate::protocol::message::MSG_TYPE_ERROR);
+        assert!(String::from_utf8_lossy(&response.payload).contains("protocol error"));
         let connection_result = timeout(Duration::from_secs(2), server)
             .await
             .expect("connection should terminate after malformed protocol request")

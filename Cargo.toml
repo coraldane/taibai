@@ -5,11 +5,12 @@ members = [
     "examples/multi_insert",
     "examples/prepare_test",
     "examples/hot_insert",
+    "examples/query_bench",
 ]
 
 [package]
 name = "taibai"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 autotests = false
 description = "An experimental Rust columnar database server for analytical workloads"

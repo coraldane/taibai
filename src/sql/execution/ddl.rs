@@ -21,6 +21,8 @@ use crate::sql::parser::ast::{
 
 const FILE_DELETE_MAX_ATTEMPTS: usize = 5;
 const FILE_DELETE_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const DDL_TABLE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const DDL_TABLE_LOCK_BLOCK_AFTER_ATTEMPTS: u32 = 1200;
 const DROP_TOMBSTONE_DIR: &str = ".taibai-drop-tombstones";
 const DATABASE_DROP_TOMBSTONE_DIR: &str = ".taibai-drop-databases";
 const TRUNCATE_TOMBSTONE_DIR: &str = ".taibai-truncate-tombstones";

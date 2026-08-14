@@ -160,6 +160,63 @@ impl SegmentManager {
         )
     }
 
+    /// Return the durability watermark for appending `batch_rows` more rows
+    /// to the *existing* active segment of the partition: the segment file
+    /// name plus the row count its footer must reach once the append and meta
+    /// flush complete. Returns `None` when no appendable active segment
+    /// exists yet; the caller must then materialize the rows through the
+    /// atomic standalone-segment path so a segment file only becomes
+    /// discoverable with a valid footer. This method never creates a file:
+    /// doing so before the append would expose a header-only segment without
+    /// an embedded footer (and leak one if the append later failed).
+    pub(crate) fn durable_active_segment_watermark_under_table_lock(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        schema: &Schema,
+        batch_rows: u64,
+    ) -> Result<Option<(String, u64)>> {
+        let table_dir = self.data_dir.join(db).join(table);
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        ensure_state_not_retired(&state, db, table)?;
+        let active_guard = state.active_segments.lock().unwrap();
+        if let Some(seg) = active_guard.get(partition_key) {
+            let file_name = Self::active_segment_file_name(&seg.path)?;
+            return Ok(Some((
+                file_name,
+                seg.total_rows + seg.buffered_rows as u64 + batch_rows,
+            )));
+        }
+
+        let unsealed = if partition_key.is_empty() {
+            Self::find_unsealed_segment(&table_dir, self.min_segment_seal_size())?
+        } else {
+            Self::find_unsealed_partition_segment(
+                &table_dir,
+                partition_key,
+                self.min_segment_seal_size(),
+            )?
+        };
+        if let Some((seg_path, existing_schema, existing_rows)) = unsealed {
+            if existing_schema.columns.len() == schema.columns.len() {
+                let file_name = Self::active_segment_file_name(&seg_path)?;
+                return Ok(Some((file_name, existing_rows + batch_rows)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn active_segment_file_name(path: &Path) -> Result<String> {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                TaibaiError::Storage("active segment path has no file name".into())
+            })
+    }
+
     pub(crate) fn flush_memtable_batch_if_under_table_lock(
         &self,
         db: &str,

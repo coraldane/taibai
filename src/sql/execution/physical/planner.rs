@@ -62,12 +62,23 @@ pub fn drain_pipeline(
     mut pipeline: Box<dyn ExecutionOp + '_>,
 ) -> Result<(Schema, Vec<RecordBatch>)> {
     let mut result_batches = Vec::new();
+    let mut retained_bytes = 0;
+    let result_limit = crate::common::query_memory::result_memory_limit_bytes();
     let mut result_schema = None;
-    while let Some(batch) = pipeline.next_batch()? {
+    loop {
+        crate::common::query_cancel::check()?;
+        let Some(batch) = pipeline.next_batch()? else {
+            break;
+        };
         if result_schema.is_none() {
             result_schema = Some(batch.schema.clone());
         }
-        result_batches.push(batch);
+        crate::common::query_memory::push_result_batch(
+            &mut result_batches,
+            &mut retained_bytes,
+            batch,
+            result_limit,
+        )?;
     }
     Ok((result_schema.unwrap_or_else(Schema::empty), result_batches))
 }
@@ -238,6 +249,7 @@ fn build_operator_with_limit(
             }
         }
         LogicalPlan::Aggregate(agg) => {
+            let agg = materialize_aggregate_arguments(agg);
             let input_schema = get_scan_schema(&agg.input);
             // Projection pushdown: if the aggregate feeds directly off a Scan,
             // restrict the scan to only the columns referenced by GROUP BY and
@@ -1914,6 +1926,44 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::Window(w) => get_scan_schema(&w.input),
         LogicalPlan::Empty => Schema::new(vec![ColumnDef::new("count(*)", DataType::Int64)]),
     }
+}
+
+fn materialize_aggregate_arguments(
+    mut aggregate: crate::sql::planner::AggregatePlan,
+) -> crate::sql::planner::AggregatePlan {
+    let input_schema = get_scan_schema(&aggregate.input);
+    let mut expressions = (0..input_schema.columns.len())
+        .map(LogicalExpr::Column)
+        .collect::<Vec<_>>();
+    let mut aliases = input_schema
+        .columns
+        .iter()
+        .map(|column| Some(column.name.clone()))
+        .collect::<Vec<_>>();
+    let mut changed = false;
+
+    for (index, aggregate_expr) in aggregate.aggregates.iter_mut().enumerate() {
+        if matches!(
+            &*aggregate_expr.arg,
+            LogicalExpr::Column(_) | LogicalExpr::Wildcard
+        ) {
+            continue;
+        }
+        let column = expressions.len();
+        expressions.push((*aggregate_expr.arg).clone());
+        aliases.push(Some(format!("__aggregate_expr_{index}")));
+        aggregate_expr.arg = Box::new(LogicalExpr::Column(column));
+        changed = true;
+    }
+
+    if changed {
+        aggregate.input = Box::new(LogicalPlan::Project(crate::sql::planner::ProjectPlan {
+            expressions,
+            aliases,
+            input: aggregate.input,
+        }));
+    }
+    aggregate
 }
 
 /// Collect all column indices referenced by the aggregate's GROUP BY keys and

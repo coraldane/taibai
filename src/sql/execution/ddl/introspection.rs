@@ -24,7 +24,7 @@ pub fn exec_show_databases(engine: &Engine) -> Result<ExecResult> {
     let schema = Schema::new(vec![ColumnDef::new("database", DataType::VarChar)]);
 
     let mut batch = RecordBatch::new(schema.clone());
-    for name in catalogs.keys() {
+    for name in catalogs.keys().filter(|name| !name.starts_with('.')) {
         batch
             .column_mut(0)
             .unwrap()
@@ -615,6 +615,14 @@ pub fn exec_optimize_table(
     };
 
     engine.index_manager().mark_index_stale(db, table);
+    let unique_index_names = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    engine
+        .index_manager()
+        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
 
     tracing::info!(
         db,

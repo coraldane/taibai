@@ -21,19 +21,63 @@ pub fn exec_replace(
     let key_sets = replace_key_sets(&materialized.batch, &constraints);
     let (survivors, replaced_inside_batch) =
         collapse_replace_batch(&materialized.batch, &constraints)?;
-    let inserted_rows = materialized.batch.num_rows() as u64;
-    let original_row_count = materialized.table_meta.row_count;
+    let affected_insert_rows = materialized.batch.num_rows() as u64;
+    let physical_insert_rows = survivors.num_rows() as u64;
+    let location_schema = materialized.schema.clone();
+    // Pseudo unique-index entries (empty segment_path) marking the replacement
+    // rows as existing. Published only after the staged insert commits, so a
+    // later plain INSERT still sees the keys without a segment location.
+    let replace_unique_constraints = unique_constraints(&materialized.table_meta, &location_schema)?;
+    let replace_unique_entries = build_unique_index_entries_for_batch(
+        &materialized.table_meta,
+        &location_schema,
+        &survivors,
+        &replace_unique_constraints,
+    )?;
     let internal_txn_id = engine.alloc_txn_id();
 
-    // Flush before taking the statement-wide table lock. The delete and the
-    // staged insert then run under one lock, so DELETE/UPDATE cannot interleave.
-    engine.flush_table_buffers(db, table)?;
-    engine
+    // No pre-flush: rows still resident in memtables are conflict-deleted in
+    // place below. The delete and the staged insert run under one lock, so
+    // DELETE/UPDATE cannot interleave.
+    let (deleted, undo) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
-            let undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
+            ensure_replace_location_indexes(
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                &location_schema,
+                &key_sets,
+            )?;
+            let memtable_plans = super::dml_delete::plan_replace_memtable_conflicts(
                 engine, db, table, &key_sets,
             )?;
+            let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                &key_sets,
+            )?;
+            // The resident hot store is append-only and cannot remove the rows
+            // replaced below. Drop it before filtering so subsequent reads
+            // rebuild from the authoritative segments plus memtables.
+            engine.hot_store_manager().remove(db, table);
+            match super::dml_delete::apply_replace_memtable_conflicts(
+                engine,
+                db,
+                table,
+                memtable_plans,
+            ) {
+                Ok(memtable_undo) => undo.merge(memtable_undo),
+                Err(error) => {
+                    let _ = super::dml_delete::restore_replace_delete_under_table_lock(
+                        engine, &undo,
+                    );
+                    return Err(error);
+                }
+            }
             let deleted = undo.deleted_rows();
 
             #[cfg(test)]
@@ -43,7 +87,6 @@ pub fn exec_replace(
                     db,
                     table,
                     &materialized.table_meta,
-                    original_row_count,
                     internal_txn_id,
                     &undo,
                 )?;
@@ -65,6 +108,8 @@ pub fn exec_replace(
                 false,
                 true,
                 materialized.missing_auto_inc,
+                false,
+                false,
             );
             if let Err(error) = insert_result {
                 rollback_replace_under_table_lock(
@@ -72,53 +117,70 @@ pub fn exec_replace(
                     db,
                     table,
                     &materialized.table_meta,
-                    original_row_count,
                     internal_txn_id,
                     &undo,
                 )?;
                 return Err(error);
             }
 
-            let finalize_result = super::dml_delete::finalize_replace_delete_under_table_lock(
-                engine,
-                db,
-                table,
-                &materialized.table_meta,
-                &undo,
-            )
-            .and_then(|_| {
-                engine
-                    .batch_writer()
-                    .commit_txn_under_table_lock(internal_txn_id)
-            });
+            let finalize_result = engine
+                .batch_writer()
+                .commit_txn_under_table_lock(internal_txn_id);
             if let Err(error) = finalize_result {
                 rollback_replace_under_table_lock(
                     engine,
                     db,
                     table,
                     &materialized.table_meta,
-                    original_row_count,
                     internal_txn_id,
                     &undo,
                 )?;
                 return Err(error);
             }
-            // The resident hot store is append-only and cannot remove the rows
-            // replaced above. Drop it so subsequent reads use the authoritative
-            // segments plus the newly committed memtable.
-            engine.hot_store_manager().remove(db, table);
 
-            // Publish the committed replacement to an on-disk segment before
-            // releasing the table lock. A following DELETE/UPDATE must not miss
-            // rows that were still resident in the committed memtable.
-            engine
-                .batch_writer()
-                .flush_table_under_table_lock(db, table)?;
+            // Publish existence markers for the committed replacement rows.
+            // Failure only downgrades later validation to a full scan; the
+            // statement is already committed and must not fail here.
+            if let Err(error) = append_unique_index_entries_after_insert(
+                engine,
+                db,
+                table,
+                replace_unique_entries,
+            ) {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "failed to publish REPLACE unique-index entries; invalidating indexes"
+                );
+                let index_names = materialized
+                    .table_meta
+                    .unique_indexes
+                    .iter()
+                    .map(|index| index.name.clone())
+                    .collect::<Vec<_>>();
+                engine
+                    .index_manager()
+                    .invalidate_table_unique_index_snapshots(db, table, &index_names);
+            }
 
-            Ok(ExecResult::Ok {
-                rows_affected: deleted + inserted_rows + replaced_inside_batch,
-            })
-        })
+            Ok((deleted, undo))
+        })?;
+
+    super::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
+    engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
+    if materialized
+        .table_meta
+        .columns
+        .iter()
+        .any(|column| column.auto_increment)
+    {
+        engine.persist_auto_increment_next_value(db, table, false)?;
+    }
+
+    Ok(ExecResult::Ok {
+        rows_affected: deleted + affected_insert_rows + replaced_inside_batch,
+    })
 }
 
 pub fn exec_insert(
@@ -171,6 +233,8 @@ fn exec_insert_inner(
         true,
         false,
         materialized.missing_auto_inc,
+        true,
+        true,
     )
 }
 
@@ -297,6 +361,8 @@ fn exec_materialized_insert_batch(
     validate_existing_constraints: bool,
     table_lock_held: bool,
     missing_auto_inc: Vec<usize>,
+    publish_unique_index_entries: bool,
+    publish_catalog: bool,
 ) -> Result<ExecResult> {
     let auto_inc_cols: Vec<usize> = schema
         .columns
@@ -377,8 +443,11 @@ fn exec_materialized_insert_batch(
         primary_keys_for_batch(&batch, &schema, &primary_key_indices)?
     };
     let auto_increment_touched = !auto_inc_cols.is_empty();
-    let unique_index_entries =
-        build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?;
+    let unique_index_entries = if publish_unique_index_entries {
+        build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?
+    } else {
+        Vec::new()
+    };
     log_insert_profile(
         "constraints",
         row_count as usize,
@@ -423,22 +492,35 @@ fn exec_materialized_insert_batch(
     log_insert_profile("write", row_count as usize, write_start.elapsed());
 
     let catalog_start = Instant::now();
-    append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
+    if publish_unique_index_entries {
+        append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
+    }
     if !primary_keys.is_empty() {
         let _ = engine
             .index_manager()
             .append_primary_keys(db, table, &primary_keys)?;
+        if publish_unique_index_entries {
+            engine
+                .index_manager()
+                .invalidate_unique_index_snapshot_if_present(
+                    db,
+                    table,
+                    crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                );
+        }
     }
 
-    engine.record_inserted_rows(
-        db,
-        table,
-        row_count as i64,
-        !bulk_import_mode && txn_id > 0,
-        !bulk_import_mode && txn_id == 0,
-    )?;
-    if auto_increment_touched {
-        engine.persist_auto_increment_next_value(db, table, !bulk_import_mode && txn_id > 0)?;
+    if publish_catalog {
+        engine.record_inserted_rows(
+            db,
+            table,
+            row_count as i64,
+            !bulk_import_mode && txn_id > 0,
+            !bulk_import_mode && txn_id == 0,
+        )?;
+        if auto_increment_touched {
+            engine.persist_auto_increment_next_value(db, table, !bulk_import_mode && txn_id > 0)?;
+        }
     }
     log_insert_profile("catalog", row_count as usize, catalog_start.elapsed());
     log_insert_profile("total_exec", row_count as usize, total_start.elapsed());
@@ -505,6 +587,70 @@ fn append_unique_index_entries_after_insert(
     Ok(())
 }
 
+fn ensure_replace_location_indexes(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Result<()> {
+    let mut indexes = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| {
+            let indices = index
+                .columns
+                .iter()
+                .map(|column| {
+                    schema.index_of(column).ok_or_else(|| {
+                        TaibaiError::Internal(format!(
+                            "unique index column '{}' is missing",
+                            column
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((index.name.as_str(), index.columns.clone(), indices))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let primary_indices = primary_key_indices(schema);
+    if !primary_indices.is_empty() {
+        indexes.push((
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+            primary_indices
+                .iter()
+                .map(|index| table_meta.columns[*index].name.clone())
+                .collect(),
+            primary_indices,
+        ));
+    }
+    for (index_name, columns, indices) in indexes {
+        let keys = key_sets
+            .iter()
+            .find(|(key_indices, _)| *key_indices == indices)
+            .map(|(_, keys)| keys.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if engine
+            .index_manager()
+            .unique_key_locations(db, table, index_name, &keys)?
+            .is_some()
+        {
+            continue;
+        }
+        let entries = collect_unique_index_entries(engine, db, table, &indices, index_name)?;
+        engine.index_manager().persist_unique_index_entries(
+            db,
+            table,
+            index_name,
+            &columns,
+            entries,
+            Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
+        )?;
+    }
+    Ok(())
+}
+
 fn replace_constraint_indices(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
@@ -543,7 +689,6 @@ fn rollback_replace_under_table_lock(
     db: &str,
     table: &str,
     table_meta: &crate::storage::catalog::schema::TableMeta,
-    original_row_count: i64,
     txn_id: u64,
     undo: &super::dml_delete::ReplaceDeleteUndo,
 ) -> Result<()> {
@@ -560,20 +705,11 @@ fn rollback_replace_under_table_lock(
             .index_manager()
             .remove_unique_index_snapshot(db, table, &index.name);
     }
-
-    let catalog_restore: Result<()> = (|| {
-        let mut catalogs = engine.catalogs().write().unwrap();
-        if let Some(catalog) = catalogs.get_mut(db) {
-            if let Some(meta) = catalog.get_table_mut(table) {
-                meta.row_count = original_row_count;
-            }
-            catalog.save(&engine.data_dir().join("meta"))?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = catalog_restore {
-        errors.push(format!("restore catalog: {}", error));
-    }
+    engine.index_manager().remove_unique_index_snapshot(
+        db,
+        table,
+        crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+    );
 
     if errors.is_empty() {
         Ok(())
@@ -582,6 +718,31 @@ fn rollback_replace_under_table_lock(
             "REPLACE rollback failed: {}",
             errors.join("; ")
         )))
+    }
+}
+
+#[cfg(test)]
+mod lock_order_tests {
+    #[test]
+    fn replace_does_not_publish_catalog_while_holding_table_lock() {
+        let source = include_str!("write.rs");
+        let replace = source
+            .split_once("pub fn exec_replace(")
+            .unwrap()
+            .1
+            .split_once("pub fn exec_insert(")
+            .unwrap()
+            .0;
+        let locked = replace
+            .split_once("with_table_mutation_lock")
+            .unwrap()
+            .1
+            .split_once("})?;")
+            .unwrap()
+            .0;
+        assert!(!locked.contains("record_inserted_rows"));
+        assert!(!locked.contains("persist_auto_increment_next_value"));
+        assert!(!locked.contains("finalize_replace_delete("));
     }
 }
 

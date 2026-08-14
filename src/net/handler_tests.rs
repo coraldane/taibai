@@ -72,6 +72,110 @@ fn test_build_error() {
 }
 
 #[test]
+fn streaming_query_stops_when_chunk_receiver_is_dropped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+    handler.session.as_mut().unwrap().streaming_results = true;
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE dropped_stream (id INT64)",
+        )
+        .unwrap();
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "INSERT INTO dropped_stream VALUES (1), (2)",
+        )
+        .unwrap();
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    drop(receiver);
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id FROM dropped_stream");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(AtomicBool::new(false)),
+            Some(sender),
+        )
+        .unwrap();
+
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_ERROR);
+    assert!(String::from_utf8_lossy(&responses[0].payload).contains("disconnected"));
+}
+
+#[test]
+fn streaming_query_emits_chunks_and_end_marker() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+    handler.session.as_mut().unwrap().binary_results = true;
+    handler.session.as_mut().unwrap().streaming_results = true;
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "CREATE TABLE stream_rows (id INT64)",
+        )
+        .unwrap();
+    engine
+        .execute(
+            handler.session.as_mut().unwrap(),
+            "INSERT INTO stream_rows VALUES (1), (2), (3)",
+        )
+        .unwrap();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let consumer = std::thread::spawn(move || {
+        let mut chunks = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            chunks.push(message);
+        }
+        chunks
+    });
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "");
+    write_len_prefixed_string(&mut payload, "SELECT id FROM stream_rows");
+    let responses = handler
+        .handle_message_cancellable(
+            Message::new(MSG_TYPE_QUERY, Bytes::from(payload)),
+            Arc::new(AtomicBool::new(false)),
+            Some(sender),
+        )
+        .unwrap();
+    drop(handler);
+    let chunks = consumer.join().unwrap();
+
+    assert!(!chunks.is_empty());
+    assert!(chunks
+        .iter()
+        .all(|message| message.msg_type == MSG_TYPE_RESULT_CHUNK));
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_RESULT_END);
+}
+
+#[test]
+fn query_response_size_reserves_timing_trailer() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let mut config = ServerConfig::default();
+    config.server.max_message_size = 64;
+    let handler = Handler::new(Arc::new(config), engine);
+
+    assert!(handler
+        .validate_query_response(Message::new(MSG_TYPE_RESULT, Bytes::from(vec![0; 36])))
+        .is_ok());
+    assert!(handler
+        .validate_query_response(Message::new(MSG_TYPE_RESULT, Bytes::from(vec![0; 37])))
+        .is_err());
+}
+
+#[test]
 fn test_login_dispatch() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
@@ -459,6 +563,98 @@ fn prepared_insert_batch_writes_all_rows_as_one_batch() {
 }
 
 #[test]
+fn prepared_replace_batch_executes_as_one_logical_replace() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
+
+    let mut sql_payload = Vec::new();
+    write_len_prefixed_string(&mut sql_payload, "main");
+    write_len_prefixed_string(
+        &mut sql_payload,
+        "CREATE TABLE batch_replace (id INT64 PRIMARY KEY, value INT64)",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+        .unwrap();
+
+    let mut insert_payload = Vec::new();
+    write_len_prefixed_string(&mut insert_payload, "main");
+    write_len_prefixed_string(
+        &mut insert_payload,
+        "INSERT INTO batch_replace VALUES (1, 10), (2, 20)",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(insert_payload)))
+        .unwrap();
+
+    let mut prep_payload = Vec::new();
+    write_len_prefixed_string(
+        &mut prep_payload,
+        "REPLACE INTO batch_replace VALUES (?, ?)",
+    );
+    let prepared = handler
+        .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+        .unwrap();
+    let stmt_id = u32::from_le_bytes(prepared[0].payload[..4].try_into().unwrap());
+
+    let mut batch_payload = Vec::new();
+    batch_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    batch_payload.extend_from_slice(&4u32.to_le_bytes());
+    for (id, value) in [(1, 11), (3, 30), (3, 31), (4, 40)] {
+        append_int64_param(&mut batch_payload, id);
+        append_int64_param(&mut batch_payload, value);
+    }
+    let response = handler
+        .handle_message(Message::new(
+            MSG_TYPE_BATCH_EXECUTE,
+            Bytes::from(batch_payload),
+        ))
+        .unwrap();
+    assert_eq!(ok_rows(&response), 6);
+
+    let mut session = Session::new("root".to_string(), "main".to_string());
+    let result = engine
+        .execute(
+            &mut session,
+            "SELECT id, value FROM batch_replace ORDER BY id",
+        )
+        .unwrap();
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result")
+    };
+    let rows = batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .map(|row| (batch.scalar(row, 0).unwrap(), batch.scalar(row, 1).unwrap()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            (ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(11))),
+            (ScalarValue::Int64(Some(2)), ScalarValue::Int64(Some(20))),
+            (ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(31))),
+            (ScalarValue::Int64(Some(4)), ScalarValue::Int64(Some(40))),
+        ]
+    );
+    assert_eq!(
+        engine
+            .catalogs()
+            .read()
+            .unwrap()
+            .get("main")
+            .unwrap()
+            .get_table("batch_replace")
+            .unwrap()
+            .row_count,
+        4
+    );
+}
+
+#[test]
 fn prepared_insert_batch_rejects_duplicates_before_writing_any_row() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
@@ -657,4 +853,40 @@ fn test_txn_error_rollback_without_active() {
     assert_eq!(resp[0].msg_type, MSG_TYPE_ERROR);
     let msg = String::from_utf8_lossy(&resp[0].payload);
     assert!(msg.contains("no active transaction"), "got: {msg}");
+}
+
+#[test]
+fn prepare_insert_returns_decimal_target_scale() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, engine, "root");
+
+    let mut query = Vec::new();
+    write_len_prefixed_string(&mut query, "main");
+    write_len_prefixed_string(
+        &mut query,
+        "CREATE TABLE prices (id INT64, amount DECIMAL(12,4))",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(query)))
+        .unwrap();
+
+    for sql in [
+        "INSERT INTO prices (id, amount) VALUES (?, ?)",
+        "INSERT INTO prices VALUES (?, ?)",
+    ] {
+        let mut prepare = Vec::new();
+        write_len_prefixed_string(&mut prepare, sql);
+        let response = handler
+            .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prepare)))
+            .unwrap();
+        assert_eq!(response[0].msg_type, MSG_TYPE_PREPARE);
+        assert_eq!(
+            u32::from_le_bytes(response[0].payload[4..8].try_into().unwrap()),
+            2
+        );
+        assert_eq!(response[0].payload[10], DataType::Decimal as u8);
+        assert_eq!(response[0].payload[11], 4);
+    }
 }

@@ -32,20 +32,31 @@ fn recover_durable_memtable_tails(
         for (table, table_meta) in &catalog.tables {
             let table_dir = data_dir.join(db).join(table);
             let schema = Schema::new(table_meta.columns.clone());
-            for tail in crate::storage::core::durable_tail::recover(&table_dir, &schema)? {
-                if tail.batch.num_rows() == 0 {
+            // Lazy recovery: tails are only indexed here (no decode), and each
+            // memtable materializes from its tail file on first access. This
+            // keeps restart time and post-restart memory independent of the
+            // amount of unflushed data.
+            for tail in crate::storage::core::durable_tail::recover_index(&table_dir, &schema)? {
+                if tail.rows == 0 {
                     continue;
                 }
-                let rows = tail.batch.num_rows();
-                batch_writer.memtable_manager().restore_committed_tail(
+                let rows = tail.rows;
+                batch_writer.memtable_manager().restore_spilled_tail(
                     tail.id,
                     db,
                     table,
                     &tail.partition_key,
-                    tail.batch,
+                    schema.clone(),
+                    rows,
+                    tail.path,
                 );
                 recovered_tables.insert((db.clone(), table.clone()));
-                tracing::info!(db, table, rows, "recovered durable low-rate memtable tail");
+                tracing::info!(
+                    db,
+                    table,
+                    rows,
+                    "recovered durable low-rate memtable tail (spilled)"
+                );
             }
         }
     }
@@ -123,7 +134,7 @@ impl Default for AutoCompactConfig {
             fragmentation_cooldown: Duration::from_secs(3600),
             fragmentation_scan_interval: Duration::from_secs(300),
             low_rate_max_rows: 1024,
-            low_rate_max_age: Duration::from_secs(7 * 24 * 60 * 60),
+            low_rate_max_age: Duration::from_secs(3600),
             interval: Duration::from_secs(60),
             max_tables_per_run: 8,
         }
@@ -200,10 +211,25 @@ fn table_physical_health(
     })
 }
 
+fn invalidate_compacted_location_indexes(
+    index_manager: &crate::storage::index::index_manager::IndexManager,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+) {
+    let index_names = table_meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    index_manager.invalidate_table_unique_index_snapshots(db, table, &index_names);
+}
+
 fn start_auto_compaction_thread(
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
     catalogs: Arc<RwLock<HashMap<String, DatabaseCatalog>>>,
+    index_manager: Arc<crate::storage::index::index_manager::IndexManager>,
     config: AutoCompactConfig,
 ) {
     if !config.enabled && !config.fragmentation_enabled {
@@ -259,6 +285,12 @@ fn start_auto_compaction_thread(
                         match compact_result {
                             Ok(stats) => {
                                 if stats.rows_dropped > 0 || stats.segments_written > 0 {
+                                    invalidate_compacted_location_indexes(
+                                        &index_manager,
+                                        &db,
+                                        &table,
+                                        &table_meta,
+                                    );
                                     compacted += 1;
                                     tracing::info!(
                                         db,
@@ -287,6 +319,12 @@ fn start_auto_compaction_thread(
                         match compactor.compact_table_for_fragmentation(&db, &table, &table_meta) {
                             Ok(stats) => {
                                 if stats.segments_written > 0 {
+                                    invalidate_compacted_location_indexes(
+                                        &index_manager,
+                                        &db,
+                                        &table,
+                                        &table_meta,
+                                    );
                                     compacted += 1;
                                     fragmentation_last_run
                                         .insert((db.clone(), table.clone()), Instant::now());
@@ -311,6 +349,12 @@ fn start_auto_compaction_thread(
                     Ok(_) => {
                         match segment_mgr.cleanup_fully_deleted_segments(&db, &table, &table_dir) {
                             Ok(removed) if removed > 0 => {
+                                invalidate_compacted_location_indexes(
+                                    &index_manager,
+                                    &db,
+                                    &table,
+                                    &table_meta,
+                                );
                                 compacted += 1;
                                 tracing::info!(
                                     db,
@@ -356,8 +400,7 @@ fn parse_hh_mm(s: &str) -> Option<(u32, u32)> {
 }
 
 /// Start the background scheduler that flushes HOT tables once per day when
-/// each table's `HOT ... CLOSE AT` time is reached. Tables without an explicit
-/// close time default to 15:30 local time.
+/// each table's explicit `HOT ... CLOSE AT` time is reached.
 pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHandle<()> {
     use chrono::{Local, Timelike};
     use std::collections::HashSet;
@@ -376,11 +419,13 @@ pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHan
                     let mut tables = Vec::new();
                     for (db, catalog) in catalogs.iter() {
                         for (table, meta) in catalog.tables.iter() {
-                            if meta.hot_time_column.is_some() {
+                            if let (Some(_), Some(close_time)) =
+                                (&meta.hot_time_column, &meta.hot_close_time)
+                            {
                                 tables.push((
                                     db.clone(),
                                     table.clone(),
-                                    meta.hot_close_time.as_deref().unwrap_or("15:30").to_string(),
+                                    close_time.clone(),
                                     meta.hot_last_close_date.clone(),
                                 ));
                             }

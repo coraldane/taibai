@@ -50,14 +50,16 @@ fn print_usage() {
         "  --clients=<n>     Parallel client connections (default: {})",
         DEFAULT_CLIENTS
     );
-    eprintln!("  --bulk            Use START/STOP BULK IMPORT mode");
-    eprintln!("  --no-bulk         Use ordinary per-batch INSERT durability path (default)");
-    eprintln!();
+    eprintln!("  --bulk            Direct-to-segment bulk import mode (default)");
     eprintln!(
-        "This tool tests regular SQL INSERT performance (INSERT ... VALUES (...), (...), ...)."
+        "  --no-bulk         Use ordinary per-batch INSERT durability path with memtable tails"
     );
-    eprintln!("The default benchmarks ordinary per-batch durability.");
-    eprintln!("For bulk binary import, use batch_import instead.");
+    eprintln!();
+    eprintln!("This tool imports through SQL INSERT syntax.");
+    eprintln!(
+        "Bulk mode avoids memtable-tail double writes and flushes segments when import ends."
+    );
+    eprintln!("Use --no-bulk only to benchmark ordinary INSERT durability.");
 }
 
 #[tokio::main]
@@ -103,7 +105,7 @@ async fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(PIPELINE_DEPTH);
 
-    let use_bulk = args.iter().any(|a| a == "--bulk");
+    let use_bulk = !args.iter().any(|a| a == "--no-bulk");
     let client_count = args
         .iter()
         .find(|a| a.starts_with("--clients="))
@@ -147,7 +149,7 @@ async fn main() {
     }
 
     if use_bulk {
-        log_msg!("Starting bulk import mode (WAL deferred sync, delayed catalog save)...");
+        log_msg!("Starting direct-to-segment bulk import mode (no memtable tails)...");
         for client in &mut clients {
             client
                 .start_bulk_import(&BulkImportConfig { disable_wal: false })

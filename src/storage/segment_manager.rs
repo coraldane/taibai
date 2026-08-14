@@ -30,6 +30,7 @@ use crate::storage::segment::{
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
+pub(crate) use config::bulk_compression_level;
 pub use config::SegmentConfig;
 pub(crate) use helpers::direct_bulk_request_to_batch;
 pub use helpers::table_key;
@@ -37,8 +38,8 @@ pub use helpers::table_key;
 use active_writer::ActiveSegmentWriter;
 use cluster_meta_cache::ClusterMetaCache;
 use config::{
-    bulk_compression_level, reader_cache_capacity, FLUSH_CHECK_INTERVAL_SECS,
-    FLUSH_IDLE_THRESHOLD_SECS, SEGMENT_BUFWRITER_CAP,
+    reader_cache_capacity, FLUSH_CHECK_INTERVAL_SECS, FLUSH_IDLE_THRESHOLD_SECS,
+    SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
     discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
@@ -50,6 +51,25 @@ use state::TableSegmentState;
 
 fn same_segment_path(a: &Path, b: &Path) -> bool {
     a == b || a.to_string_lossy().replace('\\', "/") == b.to_string_lossy().replace('\\', "/")
+}
+
+fn sanitize_component(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn read_flush_epoch_file(path: &Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 enum PreparedDirectColumns<'a> {
@@ -80,6 +100,10 @@ pub struct SegmentManager {
     reader_cache: Mutex<ReaderCache>,
     segment_meta_cache: Mutex<SegmentMetaCache>,
     cluster_meta_cache: Mutex<ClusterMetaCache>,
+    /// Per-table count of successful memtable flushes. Unique-index snapshots stamp
+    /// this epoch at build time; a later mismatch means segment rows landed after
+    /// the snapshot was built, so the snapshot must be rebuilt before probing.
+    flush_epochs: RwLock<HashMap<String, u64>>,
     flush_stop: Arc<AtomicBool>,
     flush_paused: Arc<AtomicBool>,
     next_txn_id: AtomicU64,
@@ -120,4 +144,35 @@ fn cleanup_incomplete_compaction_files(table_dir: &Path) {
 
 fn is_incomplete_compaction_file(name: &str) -> bool {
     name.ends_with(".compact_tmp") || name.ends_with(".meta.compact.tmp")
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_table_state_does_not_block_global_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SegmentManager::new(dir.path()).unwrap());
+        let state = manager.get_or_create_state(&table_key("main", "blocked"));
+        let active_guard = state.active_segments.lock().unwrap();
+
+        let blocked_manager = Arc::clone(&manager);
+        let blocked =
+            std::thread::spawn(move || blocked_manager.active_partition_keys("main", "blocked"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registry_manager = Arc::clone(&manager);
+        let registry = std::thread::spawn(move || {
+            registry_manager.get_or_create_state(&table_key("main", "other"));
+            tx.send(()).unwrap();
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("global table registry was blocked by another table's mutex");
+        drop(active_guard);
+        blocked.join().unwrap();
+        registry.join().unwrap();
+    }
 }

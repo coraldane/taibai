@@ -1,8 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::catalog::schema::{PartitionType, TableMeta};
+use crate::storage::core::memtable::{MemTable, TxnVisibility};
+use crate::storage::index::index_manager::UniqueRowLocation;
 use crate::storage::index::sort_key::compare_scalars_for_sort;
 use crate::storage::partition::pruning::ZoneMap;
 use crate::storage::partition::{
@@ -11,7 +14,7 @@ use crate::storage::partition::{
 use crate::storage::segment::delete_bitmap;
 use crate::storage::segment::{RangeOp, SegmentReader};
 use crate::storage::segment_manager::SegmentManager;
-use crate::types::batch::Schema;
+use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
@@ -21,14 +24,276 @@ use super::helpers::{
 };
 use crate::sql::parser::ast::{BinOp, Expr};
 
+#[derive(Default)]
 pub(crate) struct ReplaceDeleteUndo {
     segment_footers: Vec<(PathBuf, Vec<u8>, u64)>,
     deleted_rows: u64,
+    deleted_locations: Vec<UniqueRowLocation>,
+    /// Original batches of memtables whose conflicting rows were filtered out,
+    /// restored verbatim on rollback.
+    memtable_backups: Vec<(Arc<MemTable>, RecordBatch)>,
 }
 
 impl ReplaceDeleteUndo {
     pub(crate) fn deleted_rows(&self) -> u64 {
         self.deleted_rows
+    }
+
+    pub(crate) fn merge(&mut self, other: ReplaceDeleteUndo) {
+        self.segment_footers.extend(other.segment_footers);
+        self.deleted_rows += other.deleted_rows;
+        self.deleted_locations.extend(other.deleted_locations);
+        self.memtable_backups.extend(other.memtable_backups);
+    }
+}
+
+/// A planned memtable conflict delete: the memtable, its original batch and the
+/// batch with conflicting rows removed. Computed before any mutation so the
+/// delete stays two-phase (plan, then apply).
+pub(crate) struct ReplaceMemtableConflictPlan {
+    memtable: Arc<MemTable>,
+    original: RecordBatch,
+    filtered: RecordBatch,
+}
+
+fn replace_row_matches_key_set(
+    batch: &RecordBatch,
+    row_idx: usize,
+    indices: &[usize],
+    keys: &HashSet<Vec<ScalarValue>>,
+) -> bool {
+    if indices.len() == 1 {
+        let Some(value) = batch.scalar(row_idx, indices[0]) else {
+            return false;
+        };
+        return !value.is_null() && keys.contains(std::slice::from_ref(&value));
+    }
+    let mut key = Vec::with_capacity(indices.len());
+    for &col_idx in indices {
+        let Some(value) = batch.scalar(row_idx, col_idx) else {
+            return false;
+        };
+        if value.is_null() {
+            return false;
+        }
+        key.push(value);
+    }
+    keys.contains(&key)
+}
+
+fn filter_batch_keep(batch: &RecordBatch, keep: &[bool], keep_count: usize) -> Result<RecordBatch> {
+    let columns = batch
+        .columns
+        .iter()
+        .map(|column| column.filter_by_mask_fast(keep, keep_count))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
+}
+
+/// Scan the table's committed, non-transactional pending memtables for rows
+/// conflicting with `key_sets`. The caller holds the table mutation lock, so no
+/// INSERT or flush can mutate the memtables between this plan and
+/// `apply_replace_memtable_conflicts`.
+pub(crate) fn plan_replace_memtable_conflicts(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Result<Vec<ReplaceMemtableConflictPlan>> {
+    let mut plans = Vec::new();
+    if key_sets.is_empty() {
+        return Ok(plans);
+    }
+    for memtable in engine.memtable_manager().get_by_table(db, table) {
+        if memtable.is_transactional() || memtable.visibility() != TxnVisibility::Committed {
+            continue;
+        }
+        let planned = memtable
+            .read_with(|batch| {
+                if batch.num_rows() == 0 {
+                    return None;
+                }
+                let mut keep = vec![true; batch.num_rows()];
+                let mut removed = 0usize;
+                for row_idx in 0..batch.num_rows() {
+                    let conflicts = key_sets.iter().any(|(indices, keys)| {
+                        replace_row_matches_key_set(batch, row_idx, indices, keys)
+                    });
+                    if conflicts {
+                        keep[row_idx] = false;
+                        removed += 1;
+                    }
+                }
+                if removed == 0 {
+                    return None;
+                }
+                let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
+                Some((batch.clone(), filtered))
+            })
+            .flatten();
+        if let Some((original, filtered)) = planned {
+            plans.push(ReplaceMemtableConflictPlan {
+                memtable,
+                original,
+                filtered,
+            });
+        }
+    }
+    Ok(plans)
+}
+
+/// Scan the table's committed, non-transactional pending memtables for rows
+/// matching the DELETE predicate. Reuses the REPLACE two-phase plan/apply
+/// machinery so the physical removal and durable-tail rewrite are identical.
+/// The caller holds the table mutation lock.
+fn plan_delete_memtable_rows(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    where_clause: &Option<Expr>,
+    table_schema: &Schema,
+    target_partition_key: Option<&str>,
+) -> Result<Vec<ReplaceMemtableConflictPlan>> {
+    let mut plans = Vec::new();
+    for memtable in engine.memtable_manager().get_by_table(db, table) {
+        if memtable.is_transactional() || memtable.visibility() != TxnVisibility::Committed {
+            continue;
+        }
+        if let Some(key) = target_partition_key {
+            if memtable.partition_key() != key {
+                continue;
+            }
+        }
+        let planned = memtable
+            .read_with(|batch| {
+                if batch.num_rows() == 0 {
+                    return None;
+                }
+                let mask = match where_clause.as_ref() {
+                    Some(expr) => eval_where_clause_batch(expr, batch, table_schema).ok()?,
+                    None => vec![true; batch.num_rows()],
+                };
+                let removed = mask.iter().filter(|matches| **matches).count();
+                if removed == 0 {
+                    return None;
+                }
+                let keep = mask.iter().map(|matches| !matches).collect::<Vec<_>>();
+                let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
+                Some((batch.clone(), filtered))
+            })
+            .flatten();
+        if let Some((original, filtered)) = planned {
+            plans.push(ReplaceMemtableConflictPlan {
+                memtable,
+                original,
+                filtered,
+            });
+        }
+    }
+    Ok(plans)
+}
+
+/// Apply previously planned memtable conflict deletes: swap each memtable's
+/// batch for the filtered one and rewrite its durable tail so crash recovery
+/// cannot resurrect removed rows. On any failure everything applied so far is
+/// restored before the error is returned.
+pub(crate) fn apply_replace_memtable_conflicts(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    plans: Vec<ReplaceMemtableConflictPlan>,
+) -> Result<ReplaceDeleteUndo> {
+    let mut undo = ReplaceDeleteUndo::default();
+    if plans.is_empty() {
+        return Ok(undo);
+    }
+    // Drain group-committed tail appends so no in-flight INSERT delta can land
+    // after a rewritten tail snapshot.
+    engine.batch_writer().drain_table_tail(db, table)?;
+    let table_dir = engine.data_dir().join(db).join(table);
+    for plan in plans {
+        let removed = (plan.original.num_rows() - plan.filtered.num_rows()) as u64;
+        if !plan.memtable.replace_pending_batch(plan.filtered.clone()) {
+            let _ = restore_replace_memtable_undo(engine, &undo);
+            return Err(TaibaiError::Internal(
+                "REPLACE conflict delete raced with a memtable flush".to_string(),
+            ));
+        }
+        if let Err(error) = crate::storage::core::durable_tail::persist(
+            &table_dir,
+            plan.memtable.id(),
+            plan.memtable.partition_key(),
+            &plan.filtered,
+        ) {
+            let _ = plan.memtable.replace_pending_batch(plan.original.clone());
+            let _ = crate::storage::core::durable_tail::persist(
+                &table_dir,
+                plan.memtable.id(),
+                plan.memtable.partition_key(),
+                &plan.original,
+            );
+            let _ = restore_replace_memtable_undo(engine, &undo);
+            return Err(error);
+        }
+        undo.memtable_backups.push((plan.memtable, plan.original));
+        undo.deleted_rows += removed;
+    }
+    Ok(undo)
+}
+
+fn restore_replace_memtable_undo(engine: &Engine, undo: &ReplaceDeleteUndo) -> Result<()> {
+    let mut first_error = None;
+    for (memtable, original) in undo.memtable_backups.iter().rev() {
+        if !memtable.replace_pending_batch(original.clone()) {
+            let error = TaibaiError::Internal(
+                "REPLACE rollback could not restore a flushed memtable".to_string(),
+            );
+            tracing::error!(
+                db = memtable.db(),
+                table = memtable.table(),
+                "REPLACE rollback: memtable left pending state before restore"
+            );
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+            continue;
+        }
+        let table_dir = engine.data_dir().join(memtable.db()).join(memtable.table());
+        if let Err(error) = crate::storage::core::durable_tail::persist(
+            &table_dir,
+            memtable.id(),
+            memtable.partition_key(),
+            original,
+        ) {
+            tracing::warn!(
+                db = memtable.db(),
+                table = memtable.table(),
+                error = %error,
+                "REPLACE rollback: failed to restore durable tail; flushing memtable"
+            );
+            if let Err(flush_error) = engine
+                .batch_writer()
+                .flush_memtable_restore_fallback_under_table_lock(memtable)
+            {
+                tracing::error!(
+                    db = memtable.db(),
+                    table = memtable.table(),
+                    error = %flush_error,
+                    "REPLACE rollback: fallback flush failed"
+                );
+                if first_error.is_none() {
+                    first_error = Some(flush_error);
+                }
+                continue;
+            }
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -36,19 +301,112 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
     engine: &Engine,
     db: &str,
     table: &str,
+    table_meta: &TableMeta,
     key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
 ) -> Result<ReplaceDeleteUndo> {
     let table_dir = engine.data_dir().join(db).join(table);
-    let mut undo = ReplaceDeleteUndo {
-        segment_footers: Vec::new(),
-        deleted_rows: 0,
-    };
+    let mut undo = ReplaceDeleteUndo::default();
     if !table_dir.exists() || key_sets.is_empty() {
         return Ok(undo);
     }
 
+    let primary_key_indices = table_meta
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| column.primary_key.then_some(index))
+        .collect::<Vec<_>>();
+    let mut fallback = vec![false; key_sets.len()];
+    let schema = Schema::new(table_meta.columns.clone());
+    let mut direct_locations = Vec::new();
+    if !primary_key_indices.is_empty() {
+        if let Some((key_set_offset, (_, keys))) = key_sets
+            .iter()
+            .enumerate()
+            .find(|(_, (indices, _))| *indices == primary_key_indices)
+        {
+            let keys = keys.iter().cloned().collect::<Vec<_>>();
+            match engine.index_manager().unique_key_locations(
+                db,
+                table,
+                crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                &keys,
+            )? {
+                Some(locations) => direct_locations.extend(locations),
+                None => fallback[key_set_offset] = true,
+            }
+        }
+    }
+    for index in &table_meta.unique_indexes {
+        let indices = index
+            .columns
+            .iter()
+            .map(|column| {
+                schema.index_of(column).ok_or_else(|| {
+                    TaibaiError::Internal(format!("unique index column '{}' is missing", column))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let Some((key_set_offset, (_, keys))) = key_sets
+            .iter()
+            .enumerate()
+            .find(|(_, (key_indices, _))| *key_indices == indices)
+        else {
+            continue;
+        };
+        let keys = keys.iter().cloned().collect::<Vec<_>>();
+        match engine
+            .index_manager()
+            .unique_key_locations(db, table, &index.name, &keys)?
+        {
+            Some(locations) => direct_locations.extend(locations),
+            None => fallback[key_set_offset] = true,
+        }
+    }
+    let fallback_key_sets = key_sets
+        .iter()
+        .zip(&fallback)
+        .filter_map(|(key_set, fallback)| fallback.then_some(key_set))
+        .collect::<Vec<_>>();
+    let projected_indices = fallback_key_sets
+        .iter()
+        .flat_map(|(indices, _)| indices.iter().copied())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let key_envelopes = build_replace_key_envelopes_from_refs(&fallback_key_sets);
+    let projected_positions = fallback_key_sets
+        .iter()
+        .map(|(indices, keys)| {
+            let positions = indices
+                .iter()
+                .map(|index| {
+                    projected_indices
+                        .iter()
+                        .position(|projected| projected == index)
+                        .ok_or_else(|| {
+                            TaibaiError::Internal("replace projection is inconsistent".to_string())
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((positions, keys))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut direct_rows = HashMap::<PathBuf, HashSet<u64>>::new();
+    for location in direct_locations {
+        direct_rows
+            .entry(PathBuf::from(location.segment_path))
+            .or_default()
+            .insert(location.row_id);
+    }
     let mgr = engine.segment_mgr();
-    for seg_path in SegmentManager::discover_segments(&table_dir)? {
+    let segment_paths = if fallback_key_sets.is_empty() {
+        direct_rows.keys().map(PathBuf::from).collect::<Vec<_>>()
+    } else {
+        SegmentManager::discover_segments(&table_dir)?
+    };
+    for seg_path in segment_paths {
         let reader = mgr.open_reader_cached(&seg_path)?;
         let total_rows = reader.row_count();
         if total_rows == 0 || reader.deleted_row_count() >= total_rows {
@@ -58,17 +416,44 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         let old_deleted = reader.deleted_row_count();
         let mut new_bitmap = old_bitmap.clone();
         new_bitmap.resize(total_rows.div_ceil(8) as usize, 0);
-        let mut row_id = 0u64;
         let mut newly_deleted = 0u64;
+        let segment_name = seg_path.to_string_lossy().to_string();
+        if let Some(rows) = direct_rows.get(&seg_path) {
+            for &row_id in rows {
+                if delete_bitmap::mark_deleted(&mut new_bitmap, row_id) {
+                    newly_deleted += 1;
+                    undo.deleted_locations.push(UniqueRowLocation {
+                        segment_path: segment_name.clone(),
+                        row_id,
+                    });
+                }
+            }
+        }
 
         for rg_idx in 0..reader.num_row_groups() {
-            let batch = reader.read_row_group(rg_idx)?;
+            if fallback_key_sets.is_empty()
+                || !replace_keys_may_match_row_group_from_refs(
+                    reader.zone_maps(rg_idx),
+                    &fallback_key_sets,
+                    &key_envelopes,
+                )
+            {
+                continue;
+            }
+            let batch = reader.read_row_group_with_projection(rg_idx, &projected_indices)?;
+            let row_id = reader.row_group_start_row(rg_idx);
             for row_idx in 0..batch.num_rows() {
                 let absolute_row = row_id + row_idx as u64;
                 if delete_bitmap::is_deleted(&new_bitmap, absolute_row) {
                     continue;
                 }
-                let conflicts = key_sets.iter().any(|(indices, keys)| {
+                let conflicts = projected_positions.iter().any(|(indices, keys)| {
+                    if indices.len() == 1 {
+                        let Some(value) = batch.scalar(row_idx, indices[0]) else {
+                            return false;
+                        };
+                        return !value.is_null() && keys.contains(std::slice::from_ref(&value));
+                    }
                     let mut key = Vec::with_capacity(indices.len());
                     for &col_idx in indices {
                         let Some(value) = batch.scalar(row_idx, col_idx) else {
@@ -83,9 +468,12 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
                 });
                 if conflicts && delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row) {
                     newly_deleted += 1;
+                    undo.deleted_locations.push(UniqueRowLocation {
+                        segment_path: segment_name.clone(),
+                        row_id: absolute_row,
+                    });
                 }
             }
-            row_id += batch.num_rows() as u64;
         }
 
         if newly_deleted == 0 {
@@ -104,11 +492,90 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
     Ok(undo)
 }
 
+#[cfg(test)]
+fn build_replace_key_envelopes(
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Vec<ReplaceKeyEnvelope> {
+    build_replace_key_envelopes_from_refs(&key_sets.iter().collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+fn replace_keys_may_match_row_group(
+    zone_maps: &[ZoneMap],
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+    envelopes: &[ReplaceKeyEnvelope],
+) -> bool {
+    replace_keys_may_match_row_group_from_refs(
+        zone_maps,
+        &key_sets.iter().collect::<Vec<_>>(),
+        envelopes,
+    )
+}
+
+type ReplaceKeyEnvelope = (Vec<usize>, Vec<(ScalarValue, ScalarValue)>);
+
+fn build_replace_key_envelopes_from_refs(
+    key_sets: &[&(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Vec<ReplaceKeyEnvelope> {
+    key_sets
+        .iter()
+        .filter_map(|(indices, keys)| {
+            let first = keys.iter().next()?;
+            let mut ranges = first
+                .iter()
+                .map(|value| (value.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            for key in keys.iter().skip(1) {
+                for (value, (min, max)) in key.iter().zip(&mut ranges) {
+                    if compare_scalars_for_sort(value, min).is_lt() {
+                        *min = value.clone();
+                    }
+                    if compare_scalars_for_sort(value, max).is_gt() {
+                        *max = value.clone();
+                    }
+                }
+            }
+            Some((indices.clone(), ranges))
+        })
+        .collect()
+}
+
+fn replace_keys_may_match_row_group_from_refs(
+    zone_maps: &[ZoneMap],
+    key_sets: &[&(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+    envelopes: &[ReplaceKeyEnvelope],
+) -> bool {
+    key_sets
+        .iter()
+        .zip(envelopes)
+        .any(|((indices, keys), (_, ranges))| {
+            if keys.len() <= 64 {
+                return keys.iter().any(|key| {
+                    indices.iter().zip(key).all(|(column_index, value)| {
+                        zone_maps
+                            .get(*column_index)
+                            .map(|zone_map| zone_map.contains(value))
+                            .unwrap_or(true)
+                    })
+                });
+            }
+            indices
+                .iter()
+                .zip(ranges)
+                .all(|(column_index, (min, max))| {
+                    zone_maps
+                        .get(*column_index)
+                        .map(|zone_map| zone_map.overlaps(min, max))
+                        .unwrap_or(true)
+                })
+        })
+}
+
 pub(crate) fn restore_replace_delete_under_table_lock(
     engine: &Engine,
     undo: &ReplaceDeleteUndo,
 ) -> Result<()> {
-    let mut first_error = None;
+    let mut first_error = restore_replace_memtable_undo(engine, undo).err();
     for (path, bitmap, deleted_count) in undo.segment_footers.iter().rev() {
         if let Err(error) = engine
             .segment_mgr()
@@ -125,7 +592,7 @@ pub(crate) fn restore_replace_delete_under_table_lock(
     }
 }
 
-pub(crate) fn finalize_replace_delete_under_table_lock(
+pub(crate) fn finalize_replace_delete(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -137,15 +604,33 @@ pub(crate) fn finalize_replace_delete_under_table_lock(
     }
     engine
         .index_manager()
-        .invalidate_primary_key_index(db, table);
-    let unique_index_names = table_meta
-        .unique_indexes
-        .iter()
-        .map(|index| index.name.clone())
-        .collect::<Vec<_>>();
-    engine
-        .index_manager()
-        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+        .invalidate_primary_key_cache(db, table);
+    if table_meta.columns.iter().any(|column| column.primary_key)
+        && !engine.index_manager().append_unique_index_tombstones(
+            db,
+            table,
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+            undo.deleted_locations.clone(),
+        )?
+    {
+        engine.index_manager().invalidate_unique_index_snapshot(
+            db,
+            table,
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+        );
+    }
+    for index in &table_meta.unique_indexes {
+        if !engine.index_manager().append_unique_index_tombstones(
+            db,
+            table,
+            &index.name,
+            undo.deleted_locations.clone(),
+        )? {
+            engine
+                .index_manager()
+                .invalidate_unique_index_snapshot(db, table, &index.name);
+        }
+    }
 
     let mut catalogs = engine.catalogs().write().unwrap();
     if let Some(catalog) = catalogs.get_mut(db) {
@@ -180,20 +665,7 @@ pub fn exec_delete(
 
     let target_partition_key =
         delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
-    if let Some(partition_key) = target_partition_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
-    {
-        engine.flush_partition_buffers(db, table, partition_key)?;
-    } else {
-        engine.flush_table_buffers(db, table)?;
-    }
-
     let table_dir = engine.data_dir().join(db).join(table);
-    if !table_dir.exists() {
-        return Ok(ExecResult::Ok { rows_affected: 0 });
-    }
-
     let mgr = engine.segment_mgr();
     let mut total_deleted: u64 = 0;
     let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
@@ -203,12 +675,35 @@ pub fn exec_delete(
         .unwrap_or_default();
 
     mgr.with_table_mutation_lock(db, table, || {
-        let mut segment_files = prune_segments_by_partition(
-            SegmentManager::discover_segments(&table_dir)?,
+        // Memtable-resident rows are removed in place (no forced flush),
+        // mirroring the REPLACE conflict path; durable tails are rewritten
+        // so crash recovery cannot resurrect deleted rows.
+        let memtable_plans = plan_delete_memtable_rows(
+            engine,
+            db,
+            table,
             &resolved_where_clause,
             &table_schema,
-            &table_meta,
-        );
+            target_partition_key
+                .as_deref()
+                .filter(|key| !key.is_empty()),
+        )?;
+        if !memtable_plans.is_empty() {
+            engine.hot_store_manager().remove(db, table);
+            let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
+            total_deleted += undo.deleted_rows();
+        }
+
+        let mut segment_files = if table_dir.exists() {
+            prune_segments_by_partition(
+                SegmentManager::discover_segments(&table_dir)?,
+                &resolved_where_clause,
+                &table_schema,
+                &table_meta,
+            )
+        } else {
+            Vec::new()
+        };
         if let Some(ref pred) = predicate {
             segment_files = prune_segments_by_cluster_key(
                 segment_files,
@@ -935,3 +1430,84 @@ fn expr_matches_column(expr: &Expr, column: &str) -> bool {
 #[cfg(test)]
 #[path = "dml_delete_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod replace_pruning_tests {
+    use super::*;
+
+    fn zone(min: i64, max: i64) -> ZoneMap {
+        ZoneMap {
+            min_value: ScalarValue::Int64(Some(min)),
+            max_value: ScalarValue::Int64(Some(max)),
+            null_count: 0,
+            row_count: 10,
+        }
+    }
+
+    #[test]
+    fn replace_prunes_row_group_when_no_key_can_match() {
+        let key_sets = vec![(
+            vec![0, 1],
+            [
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(100))],
+                vec![ScalarValue::Int64(Some(20)), ScalarValue::Int64(Some(5))],
+            ]
+            .into_iter()
+            .collect(),
+        )];
+        assert!(!replace_keys_may_match_row_group(
+            &[zone(1, 10), zone(1, 10)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+    }
+
+    #[test]
+    fn replace_keeps_row_group_when_composite_key_may_match() {
+        let key_sets = vec![(
+            vec![0, 1],
+            [vec![
+                ScalarValue::Int64(Some(5)),
+                ScalarValue::Int64(Some(8)),
+            ]]
+            .into_iter()
+            .collect(),
+        )];
+        assert!(replace_keys_may_match_row_group(
+            &[zone(1, 10), zone(1, 10)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+    }
+
+    #[test]
+    fn replace_large_batch_uses_envelope_pruning() {
+        let keys = (1_000..6_000)
+            .map(|value| vec![ScalarValue::Int64(Some(value))])
+            .collect();
+        let key_sets = vec![(vec![0], keys)];
+        assert!(!replace_keys_may_match_row_group(
+            &[zone(1, 10)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+        assert!(replace_keys_may_match_row_group(
+            &[zone(2_000, 2_100)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+    }
+
+    #[test]
+    fn replace_keeps_row_group_when_zone_map_is_missing() {
+        let key_sets = vec![(
+            vec![1],
+            [vec![ScalarValue::Int64(Some(100))]].into_iter().collect(),
+        )];
+        assert!(replace_keys_may_match_row_group(
+            &[zone(1, 10)],
+            &key_sets,
+            &build_replace_key_envelopes(&key_sets),
+        ));
+    }
+}

@@ -52,10 +52,10 @@ impl Decoder for MessageCodec {
         src.advance(HEADER_SIZE);
         let payload = if payload_len > 0 {
             let raw = src.split_to(payload_len);
-            if raw.len() >= 2 && raw[0] == 0x78 {
-                match crate::protocol::compress::zlib_decompress(&raw) {
-                    Ok(decompressed) => Bytes::from(decompressed),
-                    Err(_) => raw.freeze(),
+            if raw.len() >= 8 && raw[0] == 0x78 {
+                match crate::protocol::compress::zlib_decompress_complete(&raw) {
+                    Some(decompressed) => Bytes::from(decompressed),
+                    None => raw.freeze(),
                 }
             } else {
                 raw.freeze()
