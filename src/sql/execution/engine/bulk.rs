@@ -180,6 +180,7 @@ impl Engine {
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: RecordBatch,
         disable_wal: bool,
+        force_deferred: bool,
     ) -> Result<u64> {
         self.validate_batch_unique_indexes(db, table, &batch)?;
         let resident_coverage_before_bulk = self.begin_hot_bulk_write(db, table, table_meta);
@@ -188,7 +189,7 @@ impl Engine {
         } else {
             None
         };
-        let deferred = self.is_bulk_mode();
+        let deferred = self.is_bulk_mode() || force_deferred;
         let result = match if deferred {
             self.segment_mgr
                 .bulk_insert_batch_partitioned_deferred(db, table, table_meta, batch)

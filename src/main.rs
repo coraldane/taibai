@@ -200,6 +200,7 @@ where
             .storage
             .hot_store_memory_limit_mb
             .saturating_mul(1024 * 1024),
+        config.storage.tail_async_fsync,
     ) {
         Ok(e) => e,
         Err(e) => {

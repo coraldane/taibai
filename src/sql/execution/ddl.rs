@@ -8,15 +8,15 @@ use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
 use crate::storage::catalog::schema::{
-    DatabaseCatalog, PartitionType, SecondaryIndexType, TableMeta,
+    DatabaseCatalog, PartitionType, SecondaryIndexType, TableDurability, TableMeta,
 };
 use crate::types::batch::{ColumnDef, ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{
-    AlterOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef,
-    PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
+    AlterOperation, ColumnDefAst, DefaultValue, DurabilityLevel, GrantObject, HotDef,
+    PartitionDef, PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
 };
 
 const FILE_DELETE_MAX_ATTEMPTS: usize = 5;

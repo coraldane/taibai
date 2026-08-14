@@ -10,6 +10,7 @@ pub fn exec_create_table(
     partition_by: &Option<PartitionDef>,
     ttl: &Option<TtlDef>,
     hot: &Option<HotDef>,
+    durability: &Option<DurabilityLevel>,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
@@ -86,6 +87,12 @@ pub fn exec_create_table(
         }
         if let Some(ttl_def) = ttl {
             meta.set_ttl(&ttl_def.column, ttl_def.duration_secs);
+        }
+        if let Some(level) = durability {
+            meta.durability = match level {
+                DurabilityLevel::Strict => TableDurability::Strict,
+                DurabilityLevel::Relaxed => TableDurability::Relaxed,
+            };
         }
     }
 

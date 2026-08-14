@@ -67,6 +67,9 @@ pub struct BatchWriterConfig {
     /// to their durable tails instead of flushing small row groups.
     pub spill_enabled: bool,
     pub spill_min_age_secs: u64,
+    /// Ack durable-tail appends after the page-cache write; the tail commit
+    /// thread performs the fsync for every group in the background.
+    pub tail_async_fsync: bool,
 }
 
 impl Default for BatchWriterConfig {
@@ -80,6 +83,7 @@ impl Default for BatchWriterConfig {
             low_rate_max_age_secs: DEFAULT_LOW_RATE_MAX_AGE_SECS,
             spill_enabled: true,
             spill_min_age_secs: DEFAULT_SPILL_MIN_AGE_SECS,
+            tail_async_fsync: false,
         }
     }
 }
@@ -107,7 +111,7 @@ impl BatchWriter {
         let (sender, receiver) = crossbeam_channel::bounded(8192);
         let stop = Arc::new(AtomicBool::new(false));
         let receiver = Arc::new(receiver);
-        let tail_committer = TailCommitter::start();
+        let tail_committer = TailCommitter::start(config.tail_async_fsync);
         let write_epoch = Arc::new(AtomicU64::new(0));
 
         let worker_count = config.worker_count.max(1);
@@ -1695,6 +1699,7 @@ mod tests {
             low_rate_max_age_secs: 3600,
             spill_enabled: true,
             spill_min_age_secs: 0,
+            tail_async_fsync: false,
         }
     }
 

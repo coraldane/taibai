@@ -6,6 +6,7 @@ impl Engine {
             SegmentConfig::default(),
             AutoCompactConfig::default(),
             8 * 1024 * 1024 * 1024,
+            false,
         )
     }
     pub fn new_with_storage_config(
@@ -19,6 +20,7 @@ impl Engine {
             segment_config,
             AutoCompactConfig::default(),
             8 * 1024 * 1024 * 1024,
+            false,
         )
     }
 
@@ -28,6 +30,7 @@ impl Engine {
         segment_config: SegmentConfig,
         auto_compact_config: AutoCompactConfig,
         hot_store_memory_limit_bytes: u64,
+        tail_async_fsync: bool,
     ) -> Result<Self> {
         super::ddl::recover_database_drop_tombstones(data_dir)?;
         let mut catalogs = HashMap::new();
@@ -109,6 +112,7 @@ impl Engine {
                 // tails. Use the configured memory budget for asynchronous
                 // checkpoint pressure instead of a fixed 512 MiB estimate.
                 max_total_memory: hot_store_memory_limit_bytes,
+                tail_async_fsync,
                 ..BatchWriterConfig::default()
             },
             Arc::clone(&segment_mgr),
@@ -381,6 +385,7 @@ impl Engine {
                 partition_by,
                 ttl,
                 hot,
+                durability,
             } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
@@ -396,6 +401,7 @@ impl Engine {
                     partition_by,
                     ttl,
                     hot,
+                    durability,
                 );
                 result
             }

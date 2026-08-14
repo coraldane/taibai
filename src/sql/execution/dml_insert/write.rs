@@ -386,6 +386,16 @@ fn exec_materialized_insert_batch(
         )));
     }
     let row_count = batch.num_rows() as u64;
+    // RELAXED tables opt qualifying large auto-commit multi-row INSERTs into
+    // the direct segment write path: no memtable, no durable tail, no
+    // double write. Durability/visibility of the tail of the import is
+    // bounded by the active-segment row-group flush (idle flush within
+    // seconds, or full row groups), which the DURABILITY = RELAXED contract
+    // documents.
+    let relaxed_direct_insert = txn_id == 0
+        && !bulk_import_mode
+        && table_meta.durability == TableDurability::Relaxed
+        && batch.num_rows() >= RELAXED_DIRECT_INSERT_MIN_ROWS;
     log_insert_profile(
         "cluster_sort",
         row_count as usize,
@@ -454,7 +464,7 @@ fn exec_materialized_insert_batch(
         constraint_start.elapsed(),
     );
 
-    if txn_id == 0 && !bulk_import_mode {
+    if txn_id == 0 && !bulk_import_mode && !relaxed_direct_insert {
         match engine.feed_hot_store(db, table, table_meta, &batch) {
             Ok(()) => {
                 if engine
@@ -474,9 +484,15 @@ fn exec_materialized_insert_batch(
         }
     }
     let write_start = Instant::now();
-    if bulk_import_mode {
-        engine
-            .exec_bulk_insert_partitioned_with_wal_control(db, table, table_meta, batch, false)?;
+    if bulk_import_mode || relaxed_direct_insert {
+        engine.exec_bulk_insert_partitioned_with_wal_control(
+            db,
+            table,
+            table_meta,
+            batch,
+            false,
+            relaxed_direct_insert,
+        )?;
     } else {
         write_batch_by_partition(
             engine,

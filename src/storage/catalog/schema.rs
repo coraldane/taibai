@@ -22,6 +22,22 @@ pub enum PartitionType {
     Mod = 6,
 }
 
+/// Durability contract for a table's ordinary INSERT path.
+///
+/// `Strict` (default) keeps the memtable + durable-tail pipeline: every
+/// acknowledged auto-commit INSERT is fsynced to the tail before the ack and
+/// survives a crash. `Relaxed` routes qualifying large multi-row INSERTs
+/// directly into the segment row-group buffer, skipping the durable tail
+/// entirely: acknowledged rows may be lost when the process crashes before
+/// the buffered row group is flushed, which is the documented trade for
+/// halving write amplification on bulk-style data feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TableDurability {
+    #[default]
+    Strict,
+    Relaxed,
+}
+
 /// Partition info for a table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionInfo {
@@ -167,6 +183,8 @@ pub struct TableMeta {
     pub dropped_columns: Vec<ColumnDef>,
     #[serde(default)]
     pub statistics: Option<TableStatisticsMeta>,
+    #[serde(default)]
+    pub durability: TableDurability,
 }
 
 impl TableMeta {
@@ -201,6 +219,7 @@ impl TableMeta {
             schema_version: 1,
             dropped_columns: Vec::new(),
             statistics: None,
+            durability: TableDurability::Strict,
         };
         meta.ensure_column_ids();
         meta

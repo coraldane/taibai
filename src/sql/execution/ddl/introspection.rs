@@ -308,6 +308,10 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
         create_sql.push_str(&format!(" TTL ({}, {})", ttl.column, ttl.duration_secs));
     }
 
+    if table_meta.durability == TableDurability::Relaxed {
+        create_sql.push_str(" DURABILITY = RELAXED");
+    }
+
     for secondary_index in &table_meta.secondary_indexes {
         let cols = secondary_index.columns.join(", ");
         create_sql.push_str(&format!(

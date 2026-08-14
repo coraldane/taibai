@@ -140,17 +140,23 @@ enum CommitCommand {
 /// ticket is released only after the file containing that request has been
 /// synced. The small collection window amortizes one storage barrier over all
 /// concurrently arriving INSERT statements.
+///
+/// In async-fsync mode the ticket is released once the frame bytes reach the
+/// page cache; the fsync still runs for every group inside this thread, just
+/// off the acknowledgement path. A crash between the ack and the background
+/// fsync can lose acknowledged rows — that is the documented trade selected by
+/// `storage.tail_async_fsync`.
 pub(crate) struct TailCommitter {
     sender: crossbeam_channel::Sender<CommitCommand>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl TailCommitter {
-    pub(crate) fn start() -> Arc<Self> {
+    pub(crate) fn start(async_fsync: bool) -> Arc<Self> {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let handle = std::thread::Builder::new()
             .name("taibai-tail-commit".into())
-            .spawn(move || tail_commit_loop(receiver))
+            .spawn(move || tail_commit_loop(receiver, async_fsync))
             .expect("failed to spawn durable tail commit thread");
         Arc::new(Self {
             sender,
@@ -366,7 +372,7 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
     }))
 }
 
-fn tail_commit_loop(receiver: crossbeam_channel::Receiver<CommitCommand>) {
+fn tail_commit_loop(receiver: crossbeam_channel::Receiver<CommitCommand>, async_fsync: bool) {
     let mut files = TailFileSet::default();
     let mut compressor = zstd::bulk::Compressor::new(3)
         .expect("zstd level 3 compressor must initialize for durable tail writer");
@@ -402,7 +408,7 @@ fn tail_commit_loop(receiver: crossbeam_channel::Receiver<CommitCommand>) {
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                commit_append_group(&mut files, &mut compressor, group);
+                commit_append_group(&mut files, &mut compressor, group, async_fsync);
             }
             CommitCommand::Barrier {
                 table_dir,
@@ -424,6 +430,7 @@ fn commit_append_group(
     files: &mut TailFileSet,
     compressor: &mut zstd::bulk::Compressor<'_>,
     group: Vec<AppendCommand>,
+    async_fsync: bool,
 ) {
     if crate::common::config::insert_profile_enabled() {
         let bytes = group
@@ -445,9 +452,26 @@ fn commit_append_group(
         }
     }
     for (key, completions) in by_tail {
-        let outcome = files.sync(&key).map_err(|error| error.to_string());
-        for completion in completions {
-            completion.finish(outcome.clone());
+        if async_fsync {
+            // Frames are in the page cache: release the acknowledgements now
+            // and keep the barrier off the INSERT latency path. Ordering with
+            // later commands (barriers, flush intents) is preserved because
+            // this thread processes the channel serially.
+            for completion in &completions {
+                completion.finish(Ok(()));
+            }
+            if let Err(error) = files.sync(&key) {
+                tracing::error!(
+                    tail = ?key,
+                    error = %error,
+                    "background durable tail fsync failed after acknowledgement"
+                );
+            }
+        } else {
+            let outcome = files.sync(&key).map_err(|error| error.to_string());
+            for completion in completions {
+                completion.finish(outcome.clone());
+            }
         }
     }
 }
@@ -1361,7 +1385,7 @@ mod tests {
         let id = Uuid::new_v4();
         let first = test_batch(&schema, &[1, 2])?;
         let second = test_batch(&schema, &[3, 4])?;
-        let committer = TailCommitter::start();
+        let committer = TailCommitter::start(false);
         let first_ticket = committer.submit(
             temp.path().to_path_buf(),
             id,
@@ -1384,6 +1408,33 @@ mod tests {
         assert_eq!(
             recovered[0].batch.scalar(3, 0),
             Some(ScalarValue::Int64(Some(4)))
+        );
+        committer.stop();
+        Ok(())
+    }
+
+    #[test]
+    fn async_fsync_committer_still_leaves_recoverable_tail() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+        let id = Uuid::new_v4();
+        let batch = test_batch(&schema, &[7, 8, 9])?;
+        let committer = TailCommitter::start(true);
+        let ticket = committer.submit(
+            temp.path().to_path_buf(),
+            id,
+            "2026".into(),
+            PreparedTailAppend::new(&batch),
+        );
+        ticket.wait()?;
+        committer.barrier(temp.path())?;
+
+        let recovered = recover(temp.path(), &schema)?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].batch.num_rows(), 3);
+        assert_eq!(
+            recovered[0].batch.scalar(2, 0),
+            Some(ScalarValue::Int64(Some(9)))
         );
         committer.stop();
         Ok(())

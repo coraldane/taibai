@@ -492,6 +492,14 @@ pub struct StorageSettings {
     pub hot_store_memory_limit_mb: u64,
     #[serde(default = "default_row_group_target_rows")]
     pub row_group_target_rows: usize,
+    /// Ack durable-tail appends once the bytes reach the page cache. The tail
+    /// committer thread still fsyncs every group in the background, so the
+    /// durability lag stays within one group-commit window (sub-second), but a
+    /// crash in that window can lose already-acknowledged INSERTs. Trades a
+    /// synchronous fsync on the INSERT latency path for throughput on
+    /// fsync-bound disks. Default false keeps fsync-before-ack semantics.
+    #[serde(default)]
+    pub tail_async_fsync: bool,
     /// Number of segments kept in the reader and segment-metadata caches.
     #[serde(default = "default_reader_cache_capacity")]
     pub reader_cache_capacity: usize,
@@ -671,6 +679,7 @@ fn default_storage_settings() -> StorageSettings {
         hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
+        tail_async_fsync: false,
     }
 }
 

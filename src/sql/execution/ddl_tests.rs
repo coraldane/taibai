@@ -1171,3 +1171,79 @@ fn concurrent_insert_cannot_recreate_dropped_table_directory() {
         .exists());
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn create_table_durability_default_is_strict() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(&mut session, "CREATE TABLE strict_t (id INT64)")
+        .expect("create table");
+    let meta = engine.get_table_meta("main", "strict_t").expect("meta");
+    assert_eq!(meta.durability, TableDurability::Strict);
+
+    engine
+        .execute(&mut session, "DROP TABLE strict_t")
+        .expect("drop table");
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn create_table_durability_relaxed_round_trip() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE relaxed_t (id INT64, day INT32) DURABILITY = RELAXED",
+        )
+        .expect("create relaxed table");
+    let meta = engine.get_table_meta("main", "relaxed_t").expect("meta");
+    assert_eq!(meta.durability, TableDurability::Relaxed);
+
+    match engine
+        .execute(&mut session, "SHOW CREATE TABLE relaxed_t")
+        .expect("show create table")
+    {
+        ExecResult::Query { batches, .. } => {
+            let sql = match batches[0].scalar(0, 1) {
+                Some(ScalarValue::VarChar(Some(value))) => value,
+                other => panic!("unexpected create sql: {other:?}"),
+            };
+            assert!(
+                sql.contains("DURABILITY = RELAXED"),
+                "SHOW CREATE TABLE must render durability: {sql}"
+            );
+        }
+        other => panic!("unexpected show result: {other:?}"),
+    }
+
+    engine
+        .execute(&mut session, "DROP TABLE relaxed_t")
+        .expect("drop table");
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn create_table_durability_rejects_unknown_level() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    let error = engine
+        .execute(
+            &mut session,
+            "CREATE TABLE bad_t (id INT64) DURABILITY = FAST",
+        )
+        .expect_err("unknown durability level must fail");
+    assert!(
+        error.to_string().contains("DURABILITY"),
+        "unexpected error: {error}"
+    );
+    assert!(engine.get_table_meta("main", "bad_t").is_none());
+    engine.segment_mgr().shutdown();
+}

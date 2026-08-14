@@ -100,6 +100,7 @@ pub enum Statement {
         partition_by: Option<PartitionDef>,
         ttl: Option<TtlDef>,
         hot: Option<HotDef>,
+        durability: Option<DurabilityLevel>,
     },
     DropTable {
         name: ObjectName,
@@ -329,6 +330,12 @@ pub struct HotDef {
 pub struct TtlDef {
     pub column: String,
     pub duration_secs: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityLevel {
+    Strict,
+    Relaxed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
