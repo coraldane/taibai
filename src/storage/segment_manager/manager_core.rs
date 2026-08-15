@@ -160,9 +160,18 @@ impl SegmentManager {
         epoch
     }
 
-    /// Record that a memtable flush persisted rows for this table. Any unique
-    /// index snapshot stamped with the previous epoch is now potentially
-    /// incomplete for segment-side lookups and must be rebuilt before probing.
+    /// Bump the segment-content epoch: rows were appended directly to
+    /// segments outside the memtable flush pipeline (bulk/direct writes).
+    /// Unique index snapshots stamped with the previous epoch are
+    /// potentially incomplete and must be refreshed before probing.
+    pub fn note_direct_segment_append(&self, db: &str, table: &str) {
+        self.note_memtable_flush(db, table)
+    }
+
+    /// Bump the segment-content epoch: rows reached segments for this table
+    /// (memtable flush or direct append). Unique index snapshots stamped with
+    /// the previous epoch are potentially incomplete and must be refreshed
+    /// before probing.
     pub fn note_memtable_flush(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let path = self.flush_epoch_file_path(db, table);

@@ -500,9 +500,20 @@ impl IndexManager {
         index_name: &str,
         key: &[ScalarValue],
     ) -> Result<Option<bool>> {
-        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+        let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
+        // Same staleness guard as unique_key_locations: a snapshot built
+        // before rows reached segments (memtable flush or direct append)
+        // misses live keys, so refresh it before probing.
+        if state.flush_epoch != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+            let Some(refreshed) =
+                self.refresh_stale_unique_index_state(db, table, index_name, &state)?
+            else {
+                return Ok(None);
+            };
+            state = refreshed;
+        }
         let encoded = encode_unique_key(key)?;
         Ok(Some(unique_index_state_contains_key(
             &self.segment_mgr,

@@ -72,7 +72,7 @@ impl Engine {
         Ok(())
     }
 
-    fn validate_batch_unique_indexes(
+    fn validate_batch_unique_constraints(
         &self,
         db: &str,
         table: &str,
@@ -106,6 +106,23 @@ impl Engine {
                 Some(batch),
             )?;
         }
+        let primary_key_indices = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .map(|(idx, _)| idx)
+            .collect::<Vec<_>>();
+        if !primary_key_indices.is_empty() {
+            super::dml_insert::validate_primary_key_uniqueness(
+                self,
+                db,
+                table,
+                batch,
+                &schema,
+                &primary_key_indices,
+            )?;
+        }
         Ok(())
     }
 
@@ -116,7 +133,7 @@ impl Engine {
         batch: RecordBatch,
         disable_wal: bool,
     ) -> Result<u64> {
-        self.validate_batch_unique_indexes(db, table, &batch)?;
+        self.validate_batch_unique_constraints(db, table, &batch)?;
         let table_meta_for_hot = {
             let catalogs = self.catalogs.read().unwrap();
             catalogs
@@ -153,6 +170,24 @@ impl Engine {
             if deferred {
                 self.mark_bulk_dirty_table(db, table);
             }
+            let (bulk_unique_index_names, bulk_has_primary_key) = table_meta_for_hot
+                .as_ref()
+                .map(|meta| {
+                    (
+                        meta.unique_indexes
+                            .iter()
+                            .map(|index| index.name.clone())
+                            .collect::<Vec<_>>(),
+                        meta.columns.iter().any(|column| column.primary_key),
+                    )
+                })
+                .unwrap_or((Vec::new(), false));
+            if !bulk_unique_index_names.is_empty() {
+                self.index_manager
+                    .remove_table_unique_index_snapshots(db, table, &bulk_unique_index_names);
+            } else if bulk_has_primary_key {
+                self.index_manager.invalidate_primary_key_index(db, table);
+            }
             if let (Some(table_meta), Some(batch)) =
                 (table_meta_for_hot.as_ref(), hot_batch.as_ref())
             {
@@ -182,7 +217,7 @@ impl Engine {
         disable_wal: bool,
         force_deferred: bool,
     ) -> Result<u64> {
-        self.validate_batch_unique_indexes(db, table, &batch)?;
+        self.validate_batch_unique_constraints(db, table, &batch)?;
         let resident_coverage_before_bulk = self.begin_hot_bulk_write(db, table, table_meta);
         let hot_batch = if resident_coverage_before_bulk.is_some() {
             Some(batch.clone())
@@ -264,19 +299,25 @@ impl Engine {
             && table_meta_for_hot.as_ref().is_some_and(|meta| {
                 crate::storage::core::hot_store::resolve_key_column(meta).is_some()
             });
+        let table_has_primary_key = catalog
+            .get_table(&table_name)
+            .is_some_and(|meta| meta.columns.iter().any(|column| column.primary_key));
         if let Some(table_meta) = catalog.get_table(&table_name) {
             unique_index_names = table_meta
                 .unique_indexes
                 .iter()
                 .map(|index| index.name.clone())
                 .collect();
-            if !table_meta.unique_indexes.is_empty() || table_meta.has_auto_increment() {
+            if !table_meta.unique_indexes.is_empty()
+                || table_meta.has_auto_increment()
+                || table_has_primary_key
+            {
                 let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
                 let schema = Schema::new(table_meta.columns.clone());
                 let batch =
                     crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)?;
-                if !table_meta.unique_indexes.is_empty() {
-                    self.validate_batch_unique_indexes(db, &table_name, &batch)?;
+                if !table_meta.unique_indexes.is_empty() || table_has_primary_key {
+                    self.validate_batch_unique_constraints(db, &table_name, &batch)?;
                 }
                 if let Some((col_idx, _)) = table_meta
                     .columns
@@ -351,6 +392,14 @@ impl Engine {
                 &table_name,
                 &unique_index_names,
             );
+        }
+        // Direct bulk writes bypass the memtable pipeline, so PK-driven
+        // caches and snapshots would not observe these rows; drop them so the
+        // next REPLACE rebuilds and replaces conflicts instead of skipping
+        // them.
+        if result > 0 && table_has_primary_key && unique_index_names.is_empty() {
+            self.index_manager
+                .invalidate_primary_key_index(db, &table_name);
         }
 
         if let Some(max_value) = explicit_auto_increment_max {

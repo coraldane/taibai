@@ -56,6 +56,7 @@ impl SegmentManager {
             }
         }
 
+        self.note_direct_segment_append(db, req.table_name);
         Ok(req.row_count as u64)
     }
 
@@ -202,6 +203,9 @@ impl SegmentManager {
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
             }
             written += group.row_count as u64;
+        }
+        if written > 0 {
+            self.note_direct_segment_append(db, req.table_name);
         }
         Ok(written)
     }

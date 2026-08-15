@@ -97,6 +97,7 @@ impl SegmentManager {
             batch,
             flush_immediately,
         )?;
+        self.note_direct_segment_append(db, table);
         Ok(row_count)
     }
 
@@ -127,6 +128,7 @@ impl SegmentManager {
             flush_immediately,
         )?;
 
+        self.note_direct_segment_append(db, table);
         Ok(row_count)
     }
 

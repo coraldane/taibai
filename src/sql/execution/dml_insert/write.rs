@@ -656,7 +656,7 @@ fn ensure_replace_location_indexes(
         {
             continue;
         }
-        let entries = collect_unique_index_entries(engine, db, table, &indices, index_name)?;
+        let entries = collect_unique_index_entries(engine, db, table, &indices)?;
         engine.index_manager().persist_unique_index_entries(
             db,
             table,

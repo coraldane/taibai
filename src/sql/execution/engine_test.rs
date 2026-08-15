@@ -1434,3 +1434,260 @@ fn relaxed_durability_small_insert_keeps_strict_pipeline() -> Result<()> {
     engine.segment_mgr().shutdown();
     Ok(())
 }
+
+fn inject_unvalidated_bulk_row(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    columns: Vec<(&str, DataType, Vec<u8>)>,
+) -> Result<()> {
+    let payload = bulk_payload(table, 1, columns);
+    let catalog = {
+        let catalogs = engine.catalogs().read().unwrap();
+        catalogs.get(db).cloned().expect("database exists")
+    };
+    engine
+        .segment_mgr()
+        .bulk_insert_payload_with_catalog(db, &payload, false, &catalog, true)?;
+    Ok(())
+}
+
+#[test]
+fn replace_replaces_all_preexisting_duplicate_primary_key_rows() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)",
+    )?;
+    // Simulate a legacy writer that bypassed primary-key validation and left
+    // two live rows sharing one key.
+    inject_unvalidated_bulk_row(
+        &engine,
+        "main",
+        "t",
+        vec![
+            ("id", DataType::Int64, int64_col(&[1])),
+            ("val", DataType::Int64, int64_col(&[10])),
+        ],
+    )?;
+    inject_unvalidated_bulk_row(
+        &engine,
+        "main",
+        "t",
+        vec![
+            ("id", DataType::Int64, int64_col(&[1])),
+            ("val", DataType::Int64, int64_col(&[20])),
+        ],
+    )?;
+
+    // REPLACE must never fail on pre-existing duplicates; it replaces every
+    // conflicting row.
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 30)")?;
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 1);
+    let val = first_i64(
+        engine.execute(&mut session, "SELECT val FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(val, 30);
+
+    // Same-batch duplicates keep only the last row, across a flush boundary.
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 40), (1, 50)")?;
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 1);
+    let val = first_i64(
+        engine.execute(&mut session, "SELECT val FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(val, 50);
+    Ok(())
+}
+
+#[test]
+fn insert_rejects_duplicate_primary_key_after_unvalidated_bulk_write() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)",
+    )?;
+    inject_unvalidated_bulk_row(
+        &engine,
+        "main",
+        "t",
+        vec![
+            ("id", DataType::Int64, int64_col(&[1])),
+            ("val", DataType::Int64, int64_col(&[10])),
+        ],
+    )?;
+
+    let error = engine
+        .execute(&mut session, "INSERT INTO t VALUES (1, 99)")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("duplicate"),
+        "INSERT must reject a primary key written by an unvalidated bulk write: {error}"
+    );
+    Ok(())
+}
+#[test]
+fn replace_replaces_all_preexisting_duplicate_unique_index_rows() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, code INT64, UNIQUE KEY uk_code (code))",
+    )?;
+    inject_unvalidated_bulk_row(
+        &engine,
+        "main",
+        "t",
+        vec![
+            ("id", DataType::Int64, int64_col(&[1])),
+            ("code", DataType::Int64, int64_col(&[100])),
+        ],
+    )?;
+    inject_unvalidated_bulk_row(
+        &engine,
+        "main",
+        "t",
+        vec![
+            ("id", DataType::Int64, int64_col(&[2])),
+            ("code", DataType::Int64, int64_col(&[100])),
+        ],
+    )?;
+
+    engine.execute(&mut session, "REPLACE INTO t (id, code) VALUES (3, 100)")?;
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 1);
+    let id = first_i64(
+        engine.execute(&mut session, "SELECT id FROM t WHERE code = 100")?,
+        0,
+        0,
+    );
+    assert_eq!(id, 3);
+    Ok(())
+}
+
+#[test]
+fn bulk_payload_rejects_duplicate_primary_keys() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)",
+    )?;
+
+    let dup_in_batch = bulk_payload(
+        "t",
+        2,
+        vec![
+            ("id", DataType::Int64, int64_col(&[1, 1])),
+            ("val", DataType::Int64, int64_col(&[10, 20])),
+        ],
+    );
+    assert!(engine
+        .exec_bulk_insert_payload_with_wal_control("main", &dup_in_batch, false)
+        .is_err());
+
+    let ok = bulk_payload(
+        "t",
+        1,
+        vec![
+            ("id", DataType::Int64, int64_col(&[1])),
+            ("val", DataType::Int64, int64_col(&[10])),
+        ],
+    );
+    engine.exec_bulk_insert_payload_with_wal_control("main", &ok, false)?;
+
+    let dup_existing = bulk_payload(
+        "t",
+        1,
+        vec![
+            ("id", DataType::Int64, int64_col(&[1])),
+            ("val", DataType::Int64, int64_col(&[30])),
+        ],
+    );
+    assert!(engine
+        .exec_bulk_insert_payload_with_wal_control("main", &dup_existing, false)
+        .is_err());
+
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[test]
+fn bulk_import_invalidates_primary_key_snapshot_for_replace() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)",
+    )?;
+    // The first REPLACE leaves a persisted primary-location snapshot behind.
+    engine.execute(&mut session, "REPLACE INTO t VALUES (1, 10)")?;
+
+    let payload = bulk_payload(
+        "t",
+        1,
+        vec![
+            ("id", DataType::Int64, int64_col(&[2])),
+            ("val", DataType::Int64, int64_col(&[20])),
+        ],
+    );
+    engine.exec_bulk_insert_payload_with_wal_control("main", &payload, false)?;
+
+    // The snapshot must have been invalidated, so this REPLACE rebuilds it
+    // and replaces the bulk-imported row instead of skipping it.
+    engine.execute(&mut session, "REPLACE INTO t VALUES (2, 99)")?;
+    let total = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(total, 2);
+    let with_key = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 2")?,
+        0,
+        0,
+    );
+    assert_eq!(with_key, 1);
+    let val = first_i64(
+        engine.execute(&mut session, "SELECT val FROM t WHERE id = 2")?,
+        0,
+        0,
+    );
+    assert_eq!(val, 99);
+    Ok(())
+}
