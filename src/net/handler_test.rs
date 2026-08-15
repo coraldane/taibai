@@ -2,6 +2,29 @@ use super::*;
 use crate::storage::segment_manager::SegmentManager;
 
 #[test]
+fn heartbeat_query_classifier_only_matches_select_one() {
+    for sql in [
+        "SELECT 1",
+        "select 1",
+        "SELECT\t1",
+        "SELECT 1;",
+        "select  1 ;",
+    ] {
+        assert!(is_heartbeat_query(sql), "{sql}");
+    }
+
+    for sql in [
+        "SELECT 2",
+        "SELECT 1 FROM metrics",
+        "SELECT 1, 2",
+        "SELECT 1; SELECT 2",
+        "EXPLAIN SELECT 1",
+    ] {
+        assert!(!is_heartbeat_query(sql), "{sql}");
+    }
+}
+
+#[test]
 fn query_log_classifier_only_tracks_result_set_queries() {
     for sql in [
         "SELECT * FROM metrics",

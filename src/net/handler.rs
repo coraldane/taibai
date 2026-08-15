@@ -189,7 +189,7 @@ impl Handler {
             .get(..b"INSERT".len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"INSERT"));
         let should_log_query = should_log_query_sql(sql);
-        if !is_insert {
+        if !is_insert && !is_heartbeat_query(sql) {
             tracing::info!(sql, "query received");
         }
 
@@ -1030,6 +1030,16 @@ fn log_query_if_needed(
     if should_log {
         crate::common::query_log::log_query(user, database, sql, status, elapsed);
     }
+}
+
+fn is_heartbeat_query(sql: &str) -> bool {
+    let sql = sql.trim_end();
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+    let mut tokens = sql.split_ascii_whitespace();
+    matches!(
+        (tokens.next(), tokens.next(), tokens.next()),
+        (Some(select), Some("1"), None) if select.eq_ignore_ascii_case("SELECT")
+    )
 }
 
 fn should_log_query_sql(sql: &str) -> bool {
