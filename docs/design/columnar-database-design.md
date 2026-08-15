@@ -314,14 +314,34 @@ data/mydb/
 
 | 数据类型 | 默认编码 | 备选 |
 |---------|---------|------|
-| INT64 (单调/时序) | Delta-of-delta | RLE |
+| INT64 (单调/时序) | Delta-of-delta | Delta / RLE |
 | INT64 (低基数) | Dictionary | Bit-packed |
-| FLOAT32/64 | Plain + Zstd | — |
+| FLOAT32/64 | Gorilla XOR（与 zstd(Plain) 按块竞争） | Plain + Zstd |
 | VARCHAR | Dictionary + Zstd | Plain + Zstd |
 | BOOL | Bit-packed | — |
-| TIMESTAMP | Delta-of-delta | RLE |
-| DECIMAL | Plain + Zstd (i64/i128) | Delta |
+| TIMESTAMP | Delta-of-delta | Delta / RLE |
+| DECIMAL (i64) | Gorilla XOR / Delta（与 zstd(Plain) 按块竞争） | Plain + Zstd |
 | VECTOR | Plain | — |
+
+**专用编码与 zstd 的联动（按块实测决策）**:
+
+- `MXE1` 自适应块中，GorillaXor（Float32/64/Decimal，Gorilla 位级 XOR，前导/尾随零窗口复用）和
+  DeltaOfDelta（单调整数，zigzag varint 的 dod 流）在写入时与 `zstd(Plain)` 候选按实际字节数竞争，
+  取更小者存储——不串联（位级紧凑流之上 zstd 几乎无收益且白付 CPU）。
+- 实测基准（10 万值/块，见 `column_codec_test.rs::adaptive_encoding_compression_bench`）：
+  两位小数 tick 价格 f64/Decimal 上 zstd(Plain) 更优（约 55x/143x），XOR 落选；
+  100ms 固定间隔时间戳 dod 裸存更优（约 7.1x vs 5.4x，解码约 2 倍快）。
+- 每块以明文首值开头，编码状态（前值、前导/尾随窗口）不跨块——保随机访问、崩溃恢复和
+  按行投影语义。
+- XOR/dod 适用于 ≥128 个非空值的块；谓词下推路径（predicate_scan）对两种编码提供
+  count/eq 快路径，行级过滤先解压为列数组后再走 SIMD 布局（fastscan 不感知编码）。
+
+**磁盘格式兼容性**:
+
+- 列块头部 `MXE1` 后的类型字节新增实际写入值：`4` = DeltaOfDelta，`6` = GorillaXor
+  （枚举早已预留，此前从不写出）。旧版本二进制无法解码这两种块——升级部署时需整体换代。
+- 读取端按块探测 zstd frame magic（`28 B5 2F FD`）：命中则解压，否则视为未压缩的自适应块。
+  旧数据全部为 zstd 帧，读取零回退；行组内混存两种块也安全（块级自描述）。
 
 ### 写路径 (WAL + Append-Only)
 
@@ -338,8 +358,8 @@ INSERT INTO users VALUES (1, 'Alice', 3.14)
 │    c. fsync WAL  → 数据已持久化              │
 │ 4. 追加到当前活跃段的内存缓冲区 (per-column)    │
 │ 5. 缓冲区达到 65536 行时:                     │
-│    a. 按列独立编码 (Delta/RLE/Dict/Plain)     │
-│    b. Zstd 压缩每个编码块                     │
+│    a. 按列独立编码 (dod/Delta/RLE/Dict/XOR)   │
+│    b. 专用编码与 zstd(Plain) 按块竞争取小存储  │
 │    c. 顺序追加写入当前 .dat 文件              │
 │ 6. 当前 .dat 达到 2GB 时:                    │
 │    a. 写 Footer (列偏移 + 块索引 + checksum)  │

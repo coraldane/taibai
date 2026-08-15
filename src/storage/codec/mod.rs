@@ -1,3 +1,4 @@
+pub mod bit_util;
 pub mod column_codec;
 pub mod encoding;
 pub mod fastscan;

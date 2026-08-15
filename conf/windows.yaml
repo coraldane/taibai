@@ -23,7 +23,7 @@ buffer:
 
 compression:
   enabled: true
-  bulk_zstd_level: 1
+  bulk_zstd_level: 3
 
 log:
   level: "info"

@@ -26,7 +26,7 @@ storage:
     assert_eq!(config.storage.default_database, "main");
     assert_eq!(config.buffer.batch_size, 4096);
     assert!(config.compression.enabled);
-    assert_eq!(config.compression.bulk_zstd_level, 1);
+    assert_eq!(config.compression.bulk_zstd_level, 3);
     assert_eq!(config.storage.reader_cache_capacity, 1024);
     assert!(!config.tls.enabled);
     assert_eq!(config.log.level, "info");

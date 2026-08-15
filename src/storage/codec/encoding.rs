@@ -10,6 +10,7 @@ pub enum EncodingType {
     Delta,
     DeltaOfDelta,
     BitPacked,
+    GorillaXor,
 }
 
 impl EncodingType {
@@ -21,6 +22,7 @@ impl EncodingType {
             3 => Ok(EncodingType::Delta),
             4 => Ok(EncodingType::DeltaOfDelta),
             5 => Ok(EncodingType::BitPacked),
+            6 => Ok(EncodingType::GorillaXor),
             _ => Err(crate::common::error::TaibaiError::Storage(format!(
                 "unknown encoding type: {}",
                 v
@@ -36,6 +38,7 @@ impl EncodingType {
             EncodingType::Delta => 3,
             EncodingType::DeltaOfDelta => 4,
             EncodingType::BitPacked => 5,
+            EncodingType::GorillaXor => 6,
         }
     }
 }

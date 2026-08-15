@@ -2,6 +2,7 @@ use std::io::{Cursor, Read};
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
+use crate::storage::codec::bit_util::{BitReader, BitWriter};
 use crate::storage::codec::encoding::EncodingType;
 use crate::storage::codec::io_util::{
     read_u32_le, read_varint, write_varint, zigzag_decode, zigzag_encode,
@@ -12,33 +13,94 @@ use crate::types::bitmap::NullBitmap;
 
 pub(crate) const COLUMN_ENCODING_MAGIC: &[u8; 4] = b"MXE1";
 
-pub fn encode_column(col: &ColumnArray, offset: usize, count: usize) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
+pub fn encode_column_ex(col: &ColumnArray, offset: usize, count: usize) -> Result<(Vec<u8>, bool)> {
+    let mut buf = column_bitmap_prefix(col, offset, count);
 
+    if let Some(encoded) = encode_column_adaptive(col, offset, count) {
+        buf.extend_from_slice(COLUMN_ENCODING_MAGIC);
+        buf.push(encoded.0.to_u8());
+        buf.extend_from_slice(&encoded.1);
+        let specialized = matches!(
+            encoded.0,
+            EncodingType::GorillaXor | EncodingType::DeltaOfDelta
+        );
+        return Ok((buf, specialized));
+    }
+
+    append_plain_values(&mut buf, col, offset, count);
+
+    Ok((buf, false))
+}
+
+pub fn encode_column_plain(col: &ColumnArray, offset: usize, count: usize) -> Result<Vec<u8>> {
+    let mut buf = column_bitmap_prefix(col, offset, count);
+    append_plain_values(&mut buf, col, offset, count);
+    Ok(buf)
+}
+
+fn column_bitmap_prefix(col: &ColumnArray, offset: usize, count: usize) -> Vec<u8> {
     let null_flags: Vec<bool> = (offset..offset + count)
         .map(|i| col.bitmap().is_null(i))
         .collect();
     let bitmap = NullBitmap::from_bools(&null_flags);
     let bitmap_bytes = bitmap.to_bytes();
 
+    let mut buf = Vec::new();
     buf.extend_from_slice(&(bitmap_bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(&bitmap_bytes);
+    buf
+}
 
-    if let Some(encoded) = encode_column_adaptive(col, offset, count) {
-        buf.extend_from_slice(COLUMN_ENCODING_MAGIC);
-        buf.push(encoded.0.to_u8());
-        buf.extend_from_slice(&encoded.1);
-        return Ok(buf);
-    }
-
+fn append_plain_values(buf: &mut Vec<u8>, col: &ColumnArray, offset: usize, count: usize) {
     for i in offset..offset + count {
         if col.bitmap().is_null(i) {
             continue;
         }
-        encode_value(&mut buf, col, i);
+        encode_value(buf, col, i);
+    }
+}
+
+/// Pick the smaller of two per-block storage candidates: a specialized
+/// adaptive encoding stored verbatim, or the plain encoding under zstd.
+/// Chaining zstd on top of a bit-packed XOR/DeltaOfDelta stream wastes CPU
+/// for little gain, so the two candidates compete instead of stacking.
+pub struct StoredColumnEncoding {
+    pub data: Vec<u8>,
+    pub uncompressed_size: u64,
+}
+
+pub fn choose_stored_column_encoding(
+    col: &ColumnArray,
+    offset: usize,
+    count: usize,
+    zstd_level: i32,
+    allow_verbatim: bool,
+) -> Result<StoredColumnEncoding> {
+    let (encoded, specialized) = encode_column_ex(col, offset, count)?;
+    if !specialized || !allow_verbatim {
+        let uncompressed_size = encoded.len() as u64;
+        let data = zstd::bulk::compress(&encoded, zstd_level)
+            .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+        return Ok(StoredColumnEncoding {
+            data,
+            uncompressed_size,
+        });
     }
 
-    Ok(buf)
+    let plain = encode_column_plain(col, offset, count)?;
+    let compressed = zstd::bulk::compress(&plain, zstd_level)
+        .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+    if compressed.len() < encoded.len() {
+        Ok(StoredColumnEncoding {
+            data: compressed,
+            uncompressed_size: plain.len() as u64,
+        })
+    } else {
+        Ok(StoredColumnEncoding {
+            uncompressed_size: encoded.len() as u64,
+            data: encoded,
+        })
+    }
 }
 
 fn encode_column_adaptive(
@@ -64,7 +126,7 @@ fn encode_column_adaptive(
             encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
         }
         ColumnArray::Decimal { data, bitmap } => {
-            encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
+            encode_decimal_adaptive(data, bitmap, offset, count)
         }
         ColumnArray::Date { data, bitmap } => {
             encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v as i64, 4)
@@ -89,6 +151,12 @@ fn encode_column_adaptive(
         }
         ColumnArray::UInt64 { data, bitmap } => {
             encode_unsigned_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8)
+        }
+        ColumnArray::Float32 { data, bitmap } => {
+            encode_float_adaptive(data, bitmap, offset, count, 32, |v| v.to_bits() as u64)
+        }
+        ColumnArray::Float64 { data, bitmap } => {
+            encode_float_adaptive(data, bitmap, offset, count, 64, |v| v.to_bits())
         }
         ColumnArray::VarChar { data, bitmap } => {
             encode_varchar_dictionary_adaptive(data, bitmap, offset, count)
@@ -140,6 +208,59 @@ where
     choose_numeric_encoding(&values, plain_width)
 }
 
+fn encode_float_adaptive<T, F>(
+    data: &[T],
+    bitmap: &NullBitmap,
+    offset: usize,
+    count: usize,
+    width: u32,
+    to_bits: F,
+) -> Option<(EncodingType, Vec<u8>)>
+where
+    F: Fn(&T) -> u64,
+{
+    let bits: Vec<u64> = (offset..offset + count)
+        .filter(|&i| !bitmap.is_null(i))
+        .map(|i| to_bits(&data[i]))
+        .collect();
+    if bits.len() < 128 {
+        return None;
+    }
+    let plain_size = bits.len() * (width as usize / 8);
+    let payload = encode_gorilla_xor_payload(&bits, width);
+    if payload.len() + 5 < plain_size {
+        Some((EncodingType::GorillaXor, payload))
+    } else {
+        None
+    }
+}
+
+fn encode_decimal_adaptive(
+    data: &[i64],
+    bitmap: &NullBitmap,
+    offset: usize,
+    count: usize,
+) -> Option<(EncodingType, Vec<u8>)> {
+    let mut best = encode_signed_numeric_adaptive(data, bitmap, offset, count, |v| *v, 8);
+    let bits: Vec<u64> = (offset..offset + count)
+        .filter(|&i| !bitmap.is_null(i))
+        .map(|i| data[i] as u64)
+        .collect();
+    if bits.len() >= 128 {
+        let plain_size = bits.len() * 8;
+        let payload = encode_gorilla_xor_payload(&bits, 64);
+        if payload.len() + 5 < plain_size
+            && best
+                .as_ref()
+                .map(|(_, existing)| payload.len() < existing.len())
+                .unwrap_or(true)
+        {
+            best = Some((EncodingType::GorillaXor, payload));
+        }
+    }
+    best
+}
+
 fn choose_numeric_encoding(values: &[i64], plain_width: usize) -> Option<(EncodingType, Vec<u8>)> {
     if values.len() < 128 {
         return None;
@@ -161,6 +282,16 @@ fn choose_numeric_encoding(values: &[i64], plain_width: usize) -> Option<(Encodi
                 .unwrap_or(true)
         {
             best = Some((EncodingType::Delta, delta));
+        }
+
+        let dod = encode_i64_dod_payload(values);
+        if (dod.len() + 5 < plain_size || plain_width == 8 && dod.len() < plain_size)
+            && best
+                .as_ref()
+                .map(|(_, payload)| dod.len() < payload.len())
+                .unwrap_or(true)
+        {
+            best = Some((EncodingType::DeltaOfDelta, dod));
         }
     }
 
@@ -201,6 +332,136 @@ fn encode_i64_delta_payload(values: &[i64]) -> Vec<u8> {
         prev = value;
     }
     out
+}
+
+fn encode_i64_dod_payload(values: &[i64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + values.len() * 2);
+    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    out.extend_from_slice(&values[0].to_le_bytes());
+    let mut prev = values[0];
+    let mut delta = 0i64;
+    for (i, &value) in values.iter().enumerate().skip(1) {
+        let next_delta = value.wrapping_sub(prev);
+        let encoded = if i == 1 {
+            next_delta
+        } else {
+            next_delta.wrapping_sub(delta)
+        };
+        write_varint(&mut out, zigzag_encode(encoded));
+        delta = next_delta;
+        prev = value;
+    }
+    out
+}
+
+pub(crate) fn decode_i64_dod_payload(payload: &[u8]) -> Result<Vec<i64>> {
+    let mut cursor = Cursor::new(payload);
+    let count = read_u32_le(&mut cursor)? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut base_buf = [0u8; 8];
+    cursor.read_exact(&mut base_buf)?;
+    let mut prev = i64::from_le_bytes(base_buf);
+    let mut values = Vec::with_capacity(count);
+    values.push(prev);
+    if count == 1 {
+        return Ok(values);
+    }
+    let mut delta = zigzag_decode(read_varint(&mut cursor)?);
+    prev = prev.wrapping_add(delta);
+    values.push(prev);
+    for _ in 2..count {
+        let dod = zigzag_decode(read_varint(&mut cursor)?);
+        delta = delta.wrapping_add(dod);
+        prev = prev.wrapping_add(delta);
+        values.push(prev);
+    }
+    Ok(values)
+}
+
+fn encode_gorilla_xor_payload(bits: &[u64], width: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + bits.len() * 2);
+    out.extend_from_slice(&(bits.len() as u32).to_le_bytes());
+    if width == 32 {
+        out.extend_from_slice(&(bits[0] as u32).to_le_bytes());
+    } else {
+        out.extend_from_slice(&bits[0].to_le_bytes());
+    }
+
+    let mut writer = BitWriter::with_capacity(bits.len() * 2);
+    let mut prev = bits[0];
+    let mut prev_leading = width;
+    let mut prev_trailing = width;
+    for &cur in &bits[1..] {
+        let xor = cur ^ prev;
+        if xor == 0 {
+            writer.write_bit(false);
+            continue;
+        }
+        writer.write_bit(true);
+        let leading = (xor.leading_zeros() - (64 - width)).min(31);
+        let trailing = xor.trailing_zeros().min(width - leading);
+        let meaningful_len = width - leading - trailing;
+        if leading >= prev_leading && trailing >= prev_trailing {
+            writer.write_bit(false);
+            writer.write_bits(xor >> prev_trailing, width - prev_leading - prev_trailing);
+        } else {
+            writer.write_bit(true);
+            writer.write_bits(leading as u64, 5);
+            writer.write_bits((meaningful_len - 1) as u64, 6);
+            writer.write_bits(xor >> trailing, meaningful_len);
+            prev_leading = leading;
+            prev_trailing = trailing;
+        }
+        prev = cur;
+    }
+    out.extend_from_slice(&writer.finish());
+    out
+}
+
+pub(crate) fn decode_gorilla_xor_payload(payload: &[u8], width: u32) -> Result<Vec<u64>> {
+    let mut cursor = Cursor::new(payload);
+    let count = read_u32_le(&mut cursor)? as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let first = if width == 32 {
+        let mut b = [0u8; 4];
+        cursor.read_exact(&mut b)?;
+        u32::from_le_bytes(b) as u64
+    } else {
+        let mut b = [0u8; 8];
+        cursor.read_exact(&mut b)?;
+        u64::from_le_bytes(b)
+    };
+    let bitstream = &payload[cursor.position() as usize..];
+    let mut reader = BitReader::new(bitstream);
+    let mut values = Vec::with_capacity(count);
+    let mut prev = first;
+    values.push(prev);
+    let mut prev_leading = width;
+    let mut prev_trailing = width;
+    for _ in 1..count {
+        let xor = if !reader.read_bit()? {
+            0
+        } else if !reader.read_bit()? {
+            let len = width
+                .saturating_sub(prev_leading)
+                .saturating_sub(prev_trailing);
+            reader.read_bits(len)? << prev_trailing
+        } else {
+            let leading = reader.read_bits(5)? as u32;
+            let meaningful_len = (reader.read_bits(6)? as u32) + 1;
+            let trailing = width.saturating_sub(leading).saturating_sub(meaningful_len);
+            prev_leading = leading;
+            prev_trailing = trailing;
+            reader.read_bits(meaningful_len)? << trailing
+        };
+        prev ^= xor;
+        values.push(prev);
+    }
+    Ok(values)
 }
 
 fn encode_varchar_dictionary_adaptive(
@@ -473,6 +734,24 @@ pub(crate) fn decode_adaptive_column(
             let values = decode_i64_delta_payload(payload)?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
+        EncodingType::DeltaOfDelta => {
+            let values = decode_i64_dod_payload(payload)?;
+            build_numeric_column_from_i64(values, row_count, col_def, bitmap)
+        }
+        EncodingType::GorillaXor => {
+            let width = match col_def.data_type {
+                DataType::Float32 => 32,
+                DataType::Float64 | DataType::Decimal => 64,
+                other => {
+                    return Err(TaibaiError::Storage(format!(
+                        "gorilla xor encoding cannot decode {}",
+                        other.display_name()
+                    )))
+                }
+            };
+            let bits = decode_gorilla_xor_payload(payload, width)?;
+            build_column_from_bits(bits, row_count, col_def, bitmap)
+        }
         EncodingType::Dictionary if col_def.data_type == DataType::VarChar => {
             let values = decode_varchar_dictionary_payload(payload)?;
             build_varchar_column(values, row_count, bitmap)
@@ -610,6 +889,69 @@ fn build_numeric_column_from_i64(
             )))
         }
     })
+}
+
+fn build_column_from_bits(
+    values: Vec<u64>,
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: NullBitmap,
+) -> Result<ColumnArray> {
+    let expected = row_count.saturating_sub(bitmap.null_count());
+    if values.len() != expected {
+        return Err(TaibaiError::Storage(format!(
+            "gorilla xor value count mismatch: got {}, expected {}",
+            values.len(),
+            expected
+        )));
+    }
+
+    let mut value_pos = 0usize;
+    let column = match col_def.data_type {
+        DataType::Float32 => {
+            let mut out = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                if bitmap.is_null(row) {
+                    out.push(f32::default());
+                } else {
+                    out.push(f32::from_bits(values[value_pos] as u32));
+                    value_pos += 1;
+                }
+            }
+            ColumnArray::Float32 { data: out, bitmap }
+        }
+        DataType::Float64 => {
+            let mut out = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                if bitmap.is_null(row) {
+                    out.push(f64::default());
+                } else {
+                    out.push(f64::from_bits(values[value_pos]));
+                    value_pos += 1;
+                }
+            }
+            ColumnArray::Float64 { data: out, bitmap }
+        }
+        DataType::Decimal => {
+            let mut out = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                if bitmap.is_null(row) {
+                    out.push(i64::default());
+                } else {
+                    out.push(values[value_pos] as i64);
+                    value_pos += 1;
+                }
+            }
+            ColumnArray::Decimal { data: out, bitmap }
+        }
+        other => {
+            return Err(TaibaiError::Storage(format!(
+                "gorilla xor encoding cannot decode {}",
+                other.display_name()
+            )))
+        }
+    };
+    Ok(column)
 }
 
 fn build_varchar_column(
@@ -963,3 +1305,6 @@ fn decode_selected_vector(
         bitmap: out_bitmap,
     })
 }
+#[cfg(test)]
+#[path = "column_codec_test.rs"]
+mod tests;

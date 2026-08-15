@@ -92,7 +92,7 @@ pub fn set_storage_runtime_settings(bulk_zstd_level: i32, reader_cache_capacity:
 }
 
 pub fn bulk_zstd_level() -> i32 {
-    *BULK_ZSTD_LEVEL.get().unwrap_or(&1)
+    *BULK_ZSTD_LEVEL.get().unwrap_or(&3)
 }
 
 pub fn reader_cache_capacity() -> usize {
@@ -348,7 +348,7 @@ fn default_reader_cache_capacity() -> usize {
 }
 
 fn default_bulk_zstd_level() -> i32 {
-    1
+    3
 }
 
 fn default_insert_profile() -> bool {

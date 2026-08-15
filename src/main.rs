@@ -168,6 +168,7 @@ where
             config.log.query_max_size_mb,
         ) {
             tracing::error!(error = %e, query_file, "failed to initialize query log");
+            eprintln!("taibai: failed to initialize query log: {e}");
             std::process::exit(1);
         }
         tracing::info!(
@@ -179,6 +180,7 @@ where
 
     if let Err(e) = std::fs::create_dir_all(&config.storage.data_dir) {
         tracing::error!(error = %e, "failed to create data directory");
+        eprintln!("taibai: failed to create data directory: {e}");
         std::process::exit(1);
     }
 
@@ -205,6 +207,7 @@ where
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize engine");
+            eprintln!("taibai: failed to initialize engine: {e}");
             std::process::exit(1);
         }
     };

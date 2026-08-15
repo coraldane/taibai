@@ -29,7 +29,7 @@ buffer:
 compression:
   enabled: true
   # bulk segment 写入的 zstd 压缩级别（1..=22，启动时截断）
-  bulk_zstd_level: 1
+  bulk_zstd_level: 3
 
 log:
   level: "info"
