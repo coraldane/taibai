@@ -81,6 +81,7 @@ pub enum GrantObject {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Statement {
     CreateIndex {
         name: String,

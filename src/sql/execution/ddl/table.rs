@@ -1,3 +1,4 @@
+#[allow(clippy::too_many_arguments)]
 pub fn exec_create_table(
     engine: &Engine,
     db: &str,
@@ -197,6 +198,7 @@ pub fn exec_drop_index(
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn exec_create_index(
     engine: &Engine,
     db: &str,
@@ -409,11 +411,13 @@ pub fn exec_rebuild_unique_index(
             Ok(())
         })?;
 
-    if rebuilt == 0 && index_name.is_some() {
-        return Err(TaibaiError::Sql(format!(
-            "unique index '{}' does not exist",
-            index_name.unwrap()
-        )));
+    if rebuilt == 0 {
+        if let Some(index_name) = index_name {
+            return Err(TaibaiError::Sql(format!(
+                "unique index '{}' does not exist",
+                index_name
+            )));
+        }
     }
     engine.index_manager().mark_index_stale(db, table);
     Ok(ExecResult::Ok {
@@ -474,12 +478,11 @@ pub fn exec_drop_table(
             engine.batch_writer().drain_table_tail(db, name)?;
 
             let step_start = Instant::now();
-            engine.segment_mgr().remove_wal(&table_dir);
             tracing::info!(
                 db,
                 table = name,
                 elapsed_ms = step_start.elapsed().as_millis(),
-                "drop table: removed wal handle"
+                "drop table: drained table tail"
             );
 
             let step_start = Instant::now();
@@ -568,7 +571,7 @@ pub fn exec_drop_table(
             Some(tombstone) => break (tombstone, table_meta),
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table = name,
@@ -690,8 +693,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             }
             engine.batch_writer().drain_table_tail(db, name)?;
             engine.segment_mgr().flush_table_active(db, name)?;
-            engine.segment_mgr().remove_wal(&old_table_dir);
-            engine.segment_mgr().close_table_state_handles(db, name);
+                engine.segment_mgr().close_table_state_handles(db, name);
             engine
                 .segment_mgr()
                 .invalidate_readers_under(&old_table_dir);
@@ -750,7 +752,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             Some(()) => break catalog_before,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table = name,
@@ -932,7 +934,7 @@ fn exec_partition_change(
             Some(operation_dir) => break operation_dir,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table = name,
@@ -1022,7 +1024,7 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
             Some(()) => break,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table = name,
@@ -1473,8 +1475,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
 
         let mut op = || {
             engine.batch_writer().drain_table_tail(db, table)?;
-            engine.segment_mgr().remove_wal(&table_dir);
-            engine.segment_mgr().close_table_state_handles(db, table);
+                engine.segment_mgr().close_table_state_handles(db, table);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
 
             write_before_meta(&operation_dir, &before_meta)?;
@@ -1544,7 +1545,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             Some(operation_dir) => break operation_dir,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table,

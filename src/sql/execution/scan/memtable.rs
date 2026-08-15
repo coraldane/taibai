@@ -337,7 +337,7 @@ pub fn count_memtable_rows(
                 }
             } else if spec.has_predicates() {
                 let filtered = super::row_filter::apply_predicates(
-                    &mt_batch,
+                    mt_batch,
                     &spec.eq_predicates,
                     &spec.range_predicates,
                     &spec.in_predicates,

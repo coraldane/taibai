@@ -6,21 +6,6 @@ use crate::storage::catalog::schema::TableMeta;
 
 use super::engine::Engine;
 
-pub fn write_wal(
-    engine: &Engine,
-    table_dir: &Path,
-    batch: &crate::types::batch::RecordBatch,
-) -> Result<()> {
-    if engine.is_bulk_mode() {
-        return Ok(());
-    }
-
-    let mgr = engine.segment_mgr();
-    mgr.write_wal(table_dir, batch)?;
-
-    Ok(())
-}
-
 pub fn determine_write_dir(
     _engine: &Engine,
     table_meta: &TableMeta,

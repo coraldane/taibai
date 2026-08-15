@@ -222,5 +222,5 @@ fn trim_batch_range(batch: &RecordBatch, start: usize, end: usize) -> RecordBatc
 }
 
 #[cfg(test)]
-#[path = "morsel_tests.rs"]
+#[path = "morsel_test.rs"]
 mod tests;

@@ -273,25 +273,23 @@ impl<'a> ScanExecutor<'a> {
             } else {
                 for seg_path in &filtered_segments {
                     let meta = mgr.segment_meta(seg_path).ok().flatten();
-                    let meta_candidate_indices = meta.as_ref().and_then(|meta| {
+                    let meta_candidate_indices = meta.as_ref().map(|meta| {
                         let pred = self.spec.to_row_group_predicate();
                         if !super::row_group::prune_segment_by_zone_map(
                             &pred,
                             &meta.segment_zone_maps,
                         ) {
-                            return Some(Vec::new());
+                            return Vec::new();
                         }
-                        Some(
-                            super::row_group::prune_row_group_meta(
-                                &meta.row_groups,
-                                &pred,
-                                &super::row_group::build_bloom_check_list(self.spec),
-                                &super::row_group::build_in_check_list(self.spec),
-                                &super::row_group::build_set_check_list(self.spec),
-                                &super::row_group::build_set_in_check_list(self.spec),
-                            )
-                            .candidate_indices,
+                        super::row_group::prune_row_group_meta(
+                            &meta.row_groups,
+                            &pred,
+                            &super::row_group::build_bloom_check_list(self.spec),
+                            &super::row_group::build_in_check_list(self.spec),
+                            &super::row_group::build_set_check_list(self.spec),
+                            &super::row_group::build_set_in_check_list(self.spec),
                         )
+                        .candidate_indices
                     });
                     if meta_candidate_indices
                         .as_ref()

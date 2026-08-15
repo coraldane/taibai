@@ -84,11 +84,12 @@ fn try_exec_fast_insert_sql_inner(
         &format!("{}.{}", db, table),
     ) {
         return FastInsertOutcome::Executed(Err(TaibaiError::Sql(format!(
-            "access denied for user '{}' to {:?} on {:?} '{}'",
+            "access denied for user '{}' to {:?} on {:?} '{}.{}'",
             username,
             PermissionType::Insert,
             PermissionObjectType::Table,
-            format!("{}.{}", db, table)
+            db,
+            table
         ))));
     }
 
@@ -137,7 +138,7 @@ fn try_exec_fast_insert_sql_inner(
         None
     };
 
-    let capacity = estimate_values_rows(bytes, pos).min(100_000).max(1);
+    let capacity = estimate_values_rows(bytes, pos).clamp(1, 100_000);
     let mut batch = RecordBatch::with_capacity(schema.clone(), capacity);
     let mut rows = 0usize;
     let direct_full_row = missing_auto_inc.is_empty() && col_indices.len() == schema.columns.len();
@@ -200,7 +201,7 @@ fn try_exec_fast_insert_sql_inner(
                 &auto_inc_counter,
                 &mut batch,
                 &schema,
-                &provided_by_col,
+                provided_by_col,
                 timezone_offset_hours,
                 &row_values,
             ) {
@@ -448,6 +449,7 @@ fn push_fast_insert_provided_value(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_fast_insert_row(
     engine: &Engine,
     db: &str,
@@ -578,6 +580,7 @@ fn push_fast_value_direct(col: &mut ColumnArray, value: FastValue<'_>, scale: i3
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_insert_row<F>(
     engine: &Engine,
     db: &str,
@@ -613,6 +616,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_missing_insert_value(
     engine: &Engine,
     db: &str,
@@ -726,7 +730,7 @@ fn parse_i64_bytes(text: &str, bytes: &[u8]) -> Result<i64> {
     let mut result: i64 = 0;
     while idx < bytes.len() {
         let b = bytes[idx];
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             return Err(TaibaiError::Sql(format!(
                 "invalid integer literal '{}'",
                 text
@@ -771,7 +775,7 @@ fn parse_u64_fast(value: FastValue<'_>) -> Result<u64> {
     let mut result: u64 = 0;
     while idx < bytes.len() {
         let b = bytes[idx];
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             return Err(TaibaiError::Sql(format!(
                 "invalid integer literal '{}'",
                 text
@@ -836,7 +840,7 @@ fn parse_decimal_bytes(text: &str, bytes: &[u8], scale: i32) -> Result<i64> {
             idx += 1;
             break;
         }
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             return Err(TaibaiError::Sql(format!(
                 "invalid DECIMAL literal '{}'",
                 text
@@ -860,7 +864,7 @@ fn parse_decimal_bytes(text: &str, bytes: &[u8], scale: i32) -> Result<i64> {
     let mut frac_digits = 0usize;
     while frac_digits < scale_usize && idx < len {
         let b = bytes[idx];
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             break;
         }
         seen_digit = true;
@@ -893,7 +897,7 @@ fn parse_decimal_bytes(text: &str, bytes: &[u8], scale: i32) -> Result<i64> {
     }
     if idx < len {
         let b = bytes[idx];
-        if b >= b'0' && b <= b'9' {
+        if b.is_ascii_digit() {
             if b >= b'5' {
                 value = match value.checked_add(1) {
                     Some(v) => v,
@@ -908,7 +912,7 @@ fn parse_decimal_bytes(text: &str, bytes: &[u8], scale: i32) -> Result<i64> {
             idx += 1;
             while idx < len {
                 let r = bytes[idx];
-                if r < b'0' || r > b'9' {
+                if !r.is_ascii_digit() {
                     return Err(TaibaiError::Sql(format!(
                         "invalid DECIMAL literal '{}'",
                         text

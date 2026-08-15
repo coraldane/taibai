@@ -15,8 +15,8 @@ use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{
-    AlterOperation, ColumnDefAst, DefaultValue, DurabilityLevel, GrantObject, HotDef,
-    PartitionDef, PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
+    AlterOperation, ColumnDefAst, DefaultValue, DurabilityLevel, GrantObject, HotDef, PartitionDef,
+    PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
 };
 
 const FILE_DELETE_MAX_ATTEMPTS: usize = 5;
@@ -36,8 +36,8 @@ const FRESH_DATA_DIR: &str = "fresh";
 
 #[cfg(test)]
 thread_local! {
-    static FORCE_DROP_CLEANUP_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
-    static FORCE_DDL_CLEANUP_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static FORCE_DROP_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_DDL_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn is_retryable_delete_error(error: &io::Error) -> bool {
@@ -733,5 +733,9 @@ include!("ddl/database_auth.rs");
 include!("ddl/introspection.rs");
 
 #[cfg(test)]
-#[path = "ddl_tests.rs"]
+#[path = "ddl_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ddl/analyze_histogram_test.rs"]
+mod analyze_histogram_tests;

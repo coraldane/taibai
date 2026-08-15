@@ -11,4 +11,4 @@ pub mod segment_manager;
 pub mod txn;
 
 #[cfg(test)]
-mod optimization_tests;
+mod optimization_test;

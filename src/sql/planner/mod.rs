@@ -289,5 +289,5 @@ fn plan_from_clause(
 }
 
 #[cfg(test)]
-#[path = "mod_tests.rs"]
+#[path = "mod_test.rs"]
 mod tests;

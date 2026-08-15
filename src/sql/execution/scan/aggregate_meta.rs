@@ -39,6 +39,7 @@ use crate::types::scalar::ScalarValue;
 ///
 /// `aggregates` are the (already logical-schema-indexed) aggregate expressions
 /// from the SELECT list. Returns a single-row result batch.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_simple_aggregate(
     spec: &ScanSpec,
     aggregates: &[AggregateExpr],

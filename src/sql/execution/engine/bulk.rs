@@ -366,7 +366,7 @@ impl Engine {
         if explicit_auto_increment_max.is_some() {
             self.persist_auto_increment_next_value(db, &table_name, false)?;
         }
-        if result > 0 {}
+        
         Ok(result)
     }
 
@@ -376,9 +376,7 @@ impl Engine {
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
     ) -> Option<crate::storage::core::hot_store::ResidentCoverageSnapshot> {
-        if crate::storage::core::hot_store::resolve_key_column(table_meta).is_none() {
-            return None;
-        }
+        crate::storage::core::hot_store::resolve_key_column(table_meta)?;
         let snapshot = self
             .hot_store_mgr
             .resident_coverage_snapshot(db, table)

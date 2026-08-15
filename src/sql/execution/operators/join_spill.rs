@@ -329,8 +329,8 @@ fn write_partitioned_batch(
             continue;
         }
         let partition = hash_partition(&key, partition_count);
-        for column in 0..batch.num_columns() {
-            columns[partition][column].push(
+        for (column, target) in columns[partition].iter_mut().enumerate() {
+            target.push(
                 &batch
                     .scalar(row, column)
                     .unwrap_or(ScalarValue::Int64(None)),

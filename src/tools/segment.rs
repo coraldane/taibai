@@ -489,5 +489,5 @@ fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> Result<String> {
 }
 
 #[cfg(test)]
-#[path = "segment_tests.rs"]
+#[path = "segment_test.rs"]
 mod tests;

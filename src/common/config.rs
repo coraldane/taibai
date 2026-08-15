@@ -157,6 +157,7 @@ impl Default for PerformanceBaselineConfig {
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub fn set_performance_baseline_config(
     config: PerformanceBaselineConfig,
 ) -> Result<(), PerformanceBaselineConfig> {
@@ -313,7 +314,7 @@ fn default_execution_threads() -> usize {
 }
 
 fn default_max_parallel_row_groups() -> usize {
-    default_execution_threads().min(8).max(1)
+    default_execution_threads().clamp(1, 8)
 }
 
 fn default_parallel_scan_min_row_groups() -> usize {
@@ -329,10 +330,10 @@ fn default_join_spill_partitions() -> usize {
 }
 
 fn default_max_parallel_segments() -> usize {
-    default_execution_threads().min(4).max(1)
+    default_execution_threads().clamp(1, 4)
 }
 fn default_global_io_permits() -> usize {
-    default_execution_threads().min(4).max(1)
+    default_execution_threads().clamp(1, 4)
 }
 fn default_global_cpu_permits() -> usize {
     default_execution_threads().max(1)
@@ -995,5 +996,5 @@ impl RunMode {
 }
 
 #[cfg(test)]
-#[path = "config_tests.rs"]
+#[path = "config_test.rs"]
 mod tests;

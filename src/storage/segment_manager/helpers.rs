@@ -119,11 +119,10 @@ fn compute_zone_map_from_column(
         ($values:expr, $variant:ident) => {{
             let mut min = None;
             let mut max = None;
-            for row in start_row..end_row {
+            for (row, &value) in $values.iter().enumerate().take(end_row).skip(start_row) {
                 if bitmap.is_null(row) {
                     continue;
                 }
-                let value = $values[row];
                 if min.is_none_or(|current| value < current) {
                     min = Some(value);
                 }
@@ -144,11 +143,10 @@ fn compute_zone_map_from_column(
         ($values:expr, $variant:ident) => {{
             let mut min = None;
             let mut max = None;
-            for row in start_row..end_row {
+            for (row, &value) in $values.iter().enumerate().take(end_row).skip(start_row) {
                 if bitmap.is_null(row) {
                     continue;
                 }
-                let value = $values[row];
                 if min.is_none_or(|current| value.partial_cmp(&current).is_some_and(|o| o.is_lt()))
                 {
                     min = Some(value);
@@ -171,15 +169,15 @@ fn compute_zone_map_from_column(
         ColumnArray::Bool { data, .. } => {
             let mut min = None;
             let mut max = None;
-            for row in start_row..end_row {
+            for (row, &raw) in data.iter().enumerate().take(end_row).skip(start_row) {
                 if bitmap.is_null(row) {
                     continue;
                 }
-                let value = data[row] != 0;
-                if min.is_none_or(|current| value < current) {
+                let value = raw != 0;
+                if min.is_none_or(|current: bool| !value & current) {
                     min = Some(value);
                 }
-                if max.is_none_or(|current| value > current) {
+                if max.is_none_or(|current: bool| value & !current) {
                     max = Some(value);
                 }
             }
@@ -645,43 +643,5 @@ fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<Scal
 }
 
 #[cfg(test)]
-mod zone_map_tests {
-    use super::*;
-    use crate::types::batch::ColumnDef;
-
-    #[test]
-    fn typed_zone_maps_preserve_ranges_and_null_counts() {
-        let schema = Schema::new(vec![
-            ColumnDef::new("number", DataType::Int32),
-            ColumnDef::new("text", DataType::VarChar),
-        ]);
-        let mut batch = RecordBatch::new(schema);
-        for (number, text) in [
-            (
-                ScalarValue::Int32(Some(9)),
-                ScalarValue::VarChar(Some("z".into())),
-            ),
-            (
-                ScalarValue::Int32(None),
-                ScalarValue::VarChar(Some("b".into())),
-            ),
-            (ScalarValue::Int32(Some(-4)), ScalarValue::VarChar(None)),
-            (
-                ScalarValue::Int32(Some(3)),
-                ScalarValue::VarChar(Some("m".into())),
-            ),
-        ] {
-            batch.column_mut(0).unwrap().push(&number).unwrap();
-            batch.column_mut(1).unwrap().push(&text).unwrap();
-        }
-
-        let maps = compute_zone_maps_from_batch(&batch, 0, 4);
-        assert_eq!(maps[0].min_value, ScalarValue::Int32(Some(-4)));
-        assert_eq!(maps[0].max_value, ScalarValue::Int32(Some(9)));
-        assert_eq!(maps[0].null_count, 1);
-        assert_eq!(maps[1].min_value, ScalarValue::VarChar(Some("b".into())));
-        assert_eq!(maps[1].max_value, ScalarValue::VarChar(Some("z".into())));
-        assert_eq!(maps[1].null_count, 1);
-        assert!(maps.iter().all(|map| map.row_count == 4));
-    }
-}
+#[path = "zone_map_test.rs"]
+mod zone_map_tests;

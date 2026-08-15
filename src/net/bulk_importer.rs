@@ -346,5 +346,5 @@ fn encode_column_data(col: &ColumnArray) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 #[cfg(test)]
-#[path = "bulk_importer_tests.rs"]
+#[path = "bulk_importer_test.rs"]
 mod tests;

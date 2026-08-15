@@ -192,7 +192,6 @@ impl Engine {
                 session.bulk_import_mode,
                 &session.username,
             ) {
-                let result = result;
                 if result.is_ok() && session.active_txn_id() > 0 {
                     session.mark_txn_write();
                 }
@@ -389,7 +388,8 @@ impl Engine {
             } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                let result = super::ddl::exec_create_table(
+                
+                super::ddl::exec_create_table(
                     self,
                     &db,
                     &table,
@@ -402,8 +402,7 @@ impl Engine {
                     ttl,
                     hot,
                     durability,
-                );
-                result
+                )
             }
             Statement::CreateIndex {
                 name,
@@ -436,20 +435,20 @@ impl Engine {
             Statement::DropTable { name, if_exists } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                let result = super::ddl::exec_drop_table(self, &db, &table, *if_exists);
-                result
+                
+                super::ddl::exec_drop_table(self, &db, &table, *if_exists)
             }
             Statement::AlterTable { name, operations } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                let result = super::ddl::exec_alter_table(self, &db, &table, operations);
-                result
+                
+                super::ddl::exec_alter_table(self, &db, &table, operations)
             }
             Statement::Truncate { table } => {
                 let db = table.effective_database(&session.database).to_string();
                 let table_name = table.name.clone();
-                let result = super::ddl::exec_truncate_table(self, &db, &table_name);
-                result
+                
+                super::ddl::exec_truncate_table(self, &db, &table_name)
             }
             Statement::CreateDatabase {
                 name,

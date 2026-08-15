@@ -1164,5 +1164,5 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
 }
 
 #[cfg(test)]
-#[path = "operators_fix_tests.rs"]
+#[path = "operators_fix_test.rs"]
 mod tests;

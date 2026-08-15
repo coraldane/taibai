@@ -143,9 +143,9 @@ impl NullBitmap {
         if self.is_all_valid() {
             return out;
         }
-        for i in 0..self.len {
+        for (i, flag) in out.iter_mut().enumerate() {
             if self.is_null(i) {
-                out[i] = 1;
+                *flag = 1;
             }
         }
         out
@@ -220,5 +220,5 @@ impl NullBitmap {
 }
 
 #[cfg(test)]
-#[path = "bitmap_tests.rs"]
+#[path = "bitmap_test.rs"]
 mod tests;

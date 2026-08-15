@@ -92,7 +92,7 @@ impl Transaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConcurrencyControl {
     Mvcc,
-    OptimisticConcurrencyControl,
+    Optimistic,
     TwoPhaseLocking,
 }
 
@@ -105,7 +105,7 @@ impl ConcurrencyControl {
                     | IsolationLevel::RepeatableRead
                     | IsolationLevel::Serializable
             ),
-            ConcurrencyControl::OptimisticConcurrencyControl => {
+            ConcurrencyControl::Optimistic => {
                 matches!(
                     level,
                     IsolationLevel::ReadCommitted | IsolationLevel::Serializable

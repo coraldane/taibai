@@ -255,5 +255,5 @@ impl RecordBatch {
 }
 
 #[cfg(test)]
-#[path = "batch_tests.rs"]
+#[path = "batch_test.rs"]
 mod tests;

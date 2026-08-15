@@ -320,20 +320,19 @@ async fn produce_batches(
                             &mut current_batch,
                             &mut string_pool,
                             &mut pool_strings,
-                        ) {
-                            if current_batch.len() >= batch_size {
-                                let row_count = current_batch.len();
-                                let payload = encode_columnar_tick_batch_precise(
-                                    TICK_TABLE,
-                                    &current_batch,
-                                    &pool_strings,
-                                );
+                        ) && current_batch.len() >= batch_size
+                        {
+                            let row_count = current_batch.len();
+                            let payload = encode_columnar_tick_batch_precise(
+                                TICK_TABLE,
+                                &current_batch,
+                                &pool_strings,
+                            );
 
-                                if tx.send(ParsedBatch { payload, row_count }).await.is_err() {
-                                    return Ok(());
-                                }
-                                current_batch.reset();
+                            if tx.send(ParsedBatch { payload, row_count }).await.is_err() {
+                                return Ok(());
                             }
+                            current_batch.reset();
                         }
                     }
                 }
@@ -352,18 +351,18 @@ async fn produce_batches(
         let trimmed = trim_ascii(&carry_over);
         if !trimmed.is_empty() {
             line_num += 1;
-            if !(skip_header && line_num == 1) {
-                if parse_tick_csv_line_interned(
+            if !(skip_header && line_num == 1)
+                && parse_tick_csv_line_interned(
                     trimmed,
                     &mut current_batch,
                     &mut string_pool,
                     &mut pool_strings,
-                ) {}
-            }
+                )
+            {}
         }
     }
 
-    if current_batch.len() > 0 {
+    if !current_batch.is_empty() {
         let row_count = current_batch.len();
         let payload = encode_columnar_tick_batch_precise(TICK_TABLE, &current_batch, &pool_strings);
         let _ = tx.send(ParsedBatch { payload, row_count }).await;

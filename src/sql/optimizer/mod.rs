@@ -200,5 +200,5 @@ fn expr_complexity(expr: &LogicalExpr) -> usize {
 }
 
 #[cfg(test)]
-#[path = "mod_tests.rs"]
+#[path = "mod_test.rs"]
 mod tests;

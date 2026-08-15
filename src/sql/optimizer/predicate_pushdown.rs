@@ -271,9 +271,7 @@ fn and_expr(left: LogicalExpr, right: LogicalExpr) -> LogicalExpr {
 }
 
 fn contains_conjunct(existing: &LogicalExpr, predicate: &LogicalExpr) -> bool {
-    split_conjunct_refs(existing)
-        .iter()
-        .any(|part| *part == predicate)
+    split_conjunct_refs(existing).contains(&predicate)
 }
 
 fn missing_conjuncts(existing: Option<&LogicalExpr>, predicate: LogicalExpr) -> Vec<LogicalExpr> {
@@ -533,5 +531,5 @@ fn remap_right_expr(expr: &LogicalExpr, left_ncols: usize) -> Option<LogicalExpr
 }
 
 #[cfg(test)]
-#[path = "predicate_pushdown_tests.rs"]
+#[path = "predicate_pushdown_test.rs"]
 mod tests;

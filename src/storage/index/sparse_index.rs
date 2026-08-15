@@ -346,5 +346,5 @@ impl Default for SparseIndexImpl {
 }
 
 #[cfg(test)]
-#[path = "sparse_index_tests.rs"]
+#[path = "sparse_index_test.rs"]
 mod tests;

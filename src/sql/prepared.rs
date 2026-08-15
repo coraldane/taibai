@@ -81,5 +81,5 @@ impl PreparedStatementCache {
 }
 
 #[cfg(test)]
-#[path = "prepared_tests.rs"]
+#[path = "prepared_test.rs"]
 mod tests;

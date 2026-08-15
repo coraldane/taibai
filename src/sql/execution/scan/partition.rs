@@ -184,5 +184,5 @@ pub fn extract_partition_key_from_in_predicate(
 }
 
 #[cfg(test)]
-#[path = "partition_tests.rs"]
+#[path = "partition_test.rs"]
 mod tests;

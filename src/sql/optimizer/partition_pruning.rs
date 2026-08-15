@@ -209,5 +209,5 @@ pub struct PartitionFilter {
 }
 
 #[cfg(test)]
-#[path = "partition_pruning_tests.rs"]
+#[path = "partition_pruning_test.rs"]
 mod tests;

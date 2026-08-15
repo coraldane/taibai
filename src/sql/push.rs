@@ -694,5 +694,5 @@ fn trim_batch(batch: &RecordBatch, start: usize, end: usize) -> RecordBatch {
 }
 
 #[cfg(test)]
-#[path = "push_tests.rs"]
+#[path = "push_test.rs"]
 mod tests;

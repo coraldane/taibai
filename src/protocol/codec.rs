@@ -110,5 +110,5 @@ impl Encoder<Message> for MessageCodec {
 }
 
 #[cfg(test)]
-#[path = "codec_tests.rs"]
+#[path = "codec_test.rs"]
 mod tests;

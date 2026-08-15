@@ -144,7 +144,7 @@ fn read_latest_sidecar_footer_from(meta_path: &Path) -> Result<Option<SidecarFoo
         return Ok(None);
     }
 
-    let mut file = fs::File::open(&meta_path)?;
+    let mut file = fs::File::open(meta_path)?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
 

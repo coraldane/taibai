@@ -366,6 +366,7 @@ fn eval_logical_value_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn predicate_first_read(
     reader: &crate::storage::segment::SegmentReader,
     rg_idx: usize,
@@ -503,6 +504,7 @@ pub fn predicate_first_read(
         .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cluster_key_range_read(
     reader: &crate::storage::segment::SegmentReader,
     rg_idx: usize,
@@ -1166,5 +1168,5 @@ pub fn apply_cluster_key_fast_scan(
 }
 
 #[cfg(test)]
-#[path = "row_filter_tests.rs"]
+#[path = "row_filter_test.rs"]
 mod tests;

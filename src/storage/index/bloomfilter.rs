@@ -285,5 +285,5 @@ impl BloomFilter {
 }
 
 #[cfg(test)]
-#[path = "bloomfilter_tests.rs"]
+#[path = "bloomfilter_test.rs"]
 mod tests;

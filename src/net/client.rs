@@ -1193,7 +1193,7 @@ fn parse_scaled_decimal_text(s: &str, scale: i32) -> Result<i64> {
 }
 
 #[cfg(test)]
-#[path = "client_tests.rs"]
+#[path = "client_test.rs"]
 mod tests;
 
 fn encode_scalar_param(buf: &mut Vec<u8>, val: &ScalarValue) {

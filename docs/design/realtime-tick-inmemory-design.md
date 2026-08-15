@@ -1,5 +1,7 @@
 # 实时行情当日内存存储设计 (Realtime Tick In-Memory Design)
 
+> 状态注记：经典 WAL 已移除（见 `TAIBAI_DESIGN_ZH.md`「持久化 tail」）。本文中 WAL 阈值/fsync 相关表述为历史设计，现行持久化由 durable tail 与 active segment 承担。
+
 > 场景：股票 tick 行情，每日约 2000 万行，按时序流式写入。
 > 目标：**当天单股票全量 tick 查询（约 5000 行/票）P50 < 1ms、P99 进 1ms**。
 > 历史数据查询 < 10ms（已由 PARTITION BY DAY + CLUSTER BY + mmap 覆盖，不在本文重点）。

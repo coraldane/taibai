@@ -88,5 +88,5 @@ pub fn parse_partition_seq(name: &str, partition_key: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
-#[path = "store_tests.rs"]
+#[path = "store_test.rs"]
 mod tests;

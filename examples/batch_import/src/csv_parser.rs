@@ -288,7 +288,7 @@ pub fn parse_decimal_bytes(bytes: &[u8], scale: u32) -> i64 {
             idx += 1;
             continue;
         }
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             break;
         }
         if !has_decimal || decimals < scale {
@@ -341,7 +341,7 @@ pub fn parse_int32_bytes(bytes: &[u8]) -> i32 {
 
     while idx < bytes.len() {
         let b = bytes[idx];
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             break;
         }
         result = result.wrapping_mul(10).wrapping_add((b - b'0') as i32);
@@ -386,7 +386,7 @@ pub fn parse_int64_bytes(bytes: &[u8]) -> i64 {
             idx += 1;
             continue;
         }
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             break;
         }
         if !has_decimal {
@@ -426,7 +426,7 @@ pub fn parse_timestamp_bytes(bytes: &[u8]) -> i64 {
     let minute = parse_2digits(bytes, 14) as i32;
     let second = parse_2digits(bytes, 17) as i32;
 
-    if year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 {
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return 0;
     }
 
@@ -441,8 +441,8 @@ pub fn parse_timestamp_bytes(bytes: &[u8]) -> i64 {
     }
     days += (day - 1) as i64;
 
-    let mut micros = days * 86400_000_000i64;
-    micros += hour as i64 * 3600_000_000i64;
+    let mut micros = days * 86_400_000_000i64;
+    micros += hour as i64 * 3_600_000_000i64;
     micros += minute as i64 * 60_000_000i64;
     micros += second as i64 * 1_000_000i64;
 
@@ -452,7 +452,7 @@ pub fn parse_timestamp_bytes(bytes: &[u8]) -> i64 {
         let mut pos = 20;
         while pos < bytes.len() && frac_digits < 6 {
             let b = bytes[pos];
-            if b < b'0' || b > b'9' {
+            if !b.is_ascii_digit() {
                 break;
             }
             frac = frac * 10 + (b - b'0') as i64;
@@ -494,20 +494,5 @@ fn is_leap(y: i32) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::parse_decimal_bytes;
-
-    #[test]
-    fn decimal_parser_respects_target_scale() {
-        assert_eq!(parse_decimal_bytes(b"16235.9018", 2), 1_623_590);
-        assert_eq!(parse_decimal_bytes(b"1.6500", 2), 165);
-        assert_eq!(parse_decimal_bytes(b"123", 2), 12_300);
-    }
-
-    #[test]
-    fn decimal_parser_rounds_first_discarded_digit() {
-        assert_eq!(parse_decimal_bytes(b"1.235", 2), 124);
-        assert_eq!(parse_decimal_bytes(b"-1.235", 2), -124);
-        assert_eq!(parse_decimal_bytes(b"9.999", 2), 1_000);
-    }
-}
+#[path = "csv_parser_test.rs"]
+mod tests;

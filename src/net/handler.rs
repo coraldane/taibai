@@ -65,11 +65,6 @@ impl Handler {
         }
     }
 
-    #[cfg(test)]
-    pub fn handle_message(&mut self, msg: Message) -> Result<Vec<Message>> {
-        self.handle_message_cancellable(msg, Arc::new(AtomicBool::new(false)), None)
-    }
-
     pub fn handle_message_cancellable(
         &mut self,
         msg: Message,
@@ -1262,5 +1257,5 @@ fn write_decimal_value_with_scale(buf: &mut Vec<u8>, value: i64, scale: i32) {
 }
 
 #[cfg(test)]
-#[path = "handler_tests.rs"]
+#[path = "handler_test.rs"]
 mod tests;

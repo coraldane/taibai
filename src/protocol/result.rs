@@ -142,5 +142,5 @@ fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
-#[path = "result_tests.rs"]
+#[path = "result_test.rs"]
 mod tests;

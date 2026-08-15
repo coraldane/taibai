@@ -17,8 +17,10 @@ pub enum PartitionStrategy {
     Month,
 }
 
-impl PartitionStrategy {
-    pub fn from_str(s: &str) -> Result<Self> {
+impl std::str::FromStr for PartitionStrategy {
+    type Err = TaibaiError;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
             "DAY" => Ok(PartitionStrategy::Day),
             "YEAR" => Ok(PartitionStrategy::Year),
@@ -181,5 +183,5 @@ impl PartitionPruner {
 }
 
 #[cfg(test)]
-#[path = "partition_tests.rs"]
+#[path = "partition_test.rs"]
 mod tests;

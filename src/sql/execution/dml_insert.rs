@@ -70,3 +70,7 @@ struct MaterializedInsert {
 include!("dml_insert/fast.rs");
 include!("dml_insert/write.rs");
 include!("dml_insert/constraints.rs");
+
+#[cfg(test)]
+#[path = "dml_insert/lock_order_test.rs"]
+mod lock_order_tests;

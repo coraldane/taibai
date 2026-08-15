@@ -152,7 +152,7 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
             Some(tombstone) => break (tombstone, table_indexes),
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db = name,
                         lock_attempts,

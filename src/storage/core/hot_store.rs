@@ -70,6 +70,10 @@ impl StringPool {
     pub fn len(&self) -> usize {
         self.reverse.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.reverse.is_empty()
+    }
 }
 
 impl Default for StringPool {
@@ -158,11 +162,11 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
     macro_rules! num_keys {
         ($data:expr, $conv:expr) => {{
             let data = $data;
-            for i in 0..n {
+            for (i, &row_value) in data.iter().enumerate().take(n) {
                 if bm.is_null(i) {
                     out.push(ValueKey::Null);
                 } else {
-                    out.push(($conv)(data[i]));
+                    out.push(($conv)(row_value));
                 }
             }
         }};
@@ -170,11 +174,11 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
 
     match col {
         ColumnArray::Bool { data, .. } => {
-            for i in 0..n {
+            for (i, &raw) in data.iter().enumerate().take(n) {
                 out.push(if bm.is_null(i) {
                     ValueKey::Null
                 } else {
-                    ValueKey::Bool(data[i] != 0)
+                    ValueKey::Bool(raw != 0)
                 });
             }
         }
@@ -475,10 +479,7 @@ impl HotStore {
     ) -> Option<RecordBatch> {
         let (key, partition_key) = {
             let pool = self.string_pool.read().unwrap();
-            let key = match scalar_to_key(key_value, &pool).ok()? {
-                Some(k) => k,
-                None => return None,
-            };
+            let key = scalar_to_key(key_value, &pool).ok()??;
             let partition_key = match partition_value {
                 Some(value) => scalar_to_key(value, &pool).ok()?,
                 None => None,
@@ -966,5 +967,5 @@ impl Default for HotStoreManager {
 }
 
 #[cfg(test)]
-#[path = "hot_store_tests.rs"]
+#[path = "hot_store_test.rs"]
 mod tests;

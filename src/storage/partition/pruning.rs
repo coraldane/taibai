@@ -290,5 +290,5 @@ pub fn compute_segment_zone_maps_from_row_groups(
 }
 
 #[cfg(test)]
-#[path = "pruning_tests.rs"]
+#[path = "pruning_test.rs"]
 mod tests;

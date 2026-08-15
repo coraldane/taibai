@@ -94,7 +94,7 @@ exec_insert
 
 - 数据先进入 MemTable，查询时会合并 MemTable 和 segment。
 - 非事务写入达到 MemTable 阈值后异步 flush。
-- 事务写入提交时 flush；回滚时丢弃对应 MemTable 并清理事务 WAL。
+- 事务写入提交时 flush；回滚时丢弃对应 MemTable。
 - catalog 的 `row_count` 会立即增加，并在非 bulk mode 下保存到元数据文件。
 
 ### SQL INSERT bulk mode
@@ -245,13 +245,13 @@ partition by deal_date cluster by security_id
 
 ## WAL 与持久化语义
 
-当前代码中 WAL 语义需要区分路径：
+经典 WAL（`WalWriter`/`WalRecovery`，`table/wal/` 目录）已删除：它只写不读，启动恢复从不回放，没有恢复价值。当前持久化完全由 durable tail 与 active segment 自身承担：
 
-- SQL INSERT 非 bulk mode：写入 MemTable；事务提交时会写事务 WAL 并 flush 到 segment。非事务 MemTable flush 调用 `bulk_insert_batch(..., true)`，当前参数名保留但在 `bulk_insert_batch` 内没有直接写 WAL。
-- SQL INSERT bulk mode：直接写 active segment；`disable_wal` 参数目前传入但 `SegmentManager::bulk_insert_batch` 未使用。
-- 列式二进制 bulk：`Engine::exec_bulk_insert_payload_with_wal_control` 接收 `disable_wal`，但 `SegmentManager::bulk_insert_payload_with_catalog` 当前也没有实际 WAL 写入逻辑。
+- SQL INSERT 非 bulk mode：每批先写入 `memtable_tail/{memtable_id}.tail`（组提交 fsync），flush 时物化进未 seal 的 active segment（首次建段，之后原地追加 row group），完成后 tail 删除；崩溃后由 durable tail 重放。
+- 显式事务：COMMIT 时物化 txn MemTable 进 active segment（数据与 meta 均 fsync），依赖 segment 自身持久化，不再写事务 WAL。
+- SQL INSERT bulk mode / 列式二进制 bulk：直接写 active segment；`disable_wal` 参数保留为兼容性开关，当前无独立 WAL 写入。
 
-因此，从当前实现看，bulk 导入的主要可靠性依赖 active segment flush/meta/seal，而不是完整 WAL replay。`disable_wal=true` 是 `batch_import` 的默认选择，也符合“可重放大批量导入”的定位。
+因此 bulk 导入的可靠性依赖 active segment flush/meta/seal。`disable_wal=true` 是 `batch_import` 的默认选择，符合“可重放大批量导入”的定位。旧版本遗留的 `table/wal/` 目录不会被读取，可手动删除。
 
 ## 查询可见性
 
@@ -322,7 +322,7 @@ examples/batch_import
 
 ## 后续优化建议
 
-1. 明确 bulk WAL 设计：要么实现真正的 bulk WAL，要么在文档/API 中明确 bulk import 是可重放导入语义。
+1. 明确 bulk 持久化语义：在文档/API 中明确 bulk import 是可重放导入语义（`disable_wal` 仅为兼容开关）。
 2. 在列式 bulk 直接路径中为适合的列生成 Bloom Filter。
 3. 对分区/聚簇 bulk 做流式分桶和局部排序，减少重排开销。
 4. 在 `STOP BULK IMPORT` 或 bulk 写入结束时同步更新 catalog `row_count`，避免 `SHOW STATS` 与实际 segment 行数不一致。

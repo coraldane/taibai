@@ -220,5 +220,5 @@ fn compute_deltas_of_deltas(values: &[ScalarValue]) -> Option<Vec<i64>> {
 }
 
 #[cfg(test)]
-#[path = "encoding_tests.rs"]
+#[path = "encoding_test.rs"]
 mod tests;

@@ -31,7 +31,7 @@ Taibai 采用分层架构：
 ├─────────────────────────────────┤
 │         SQL 层 (sql/)            │  解析 → 规划 → 优化 → 执行
 ├─────────────────────────────────┤
-│       存储层 (storage/)          │  段存储、WAL、目录、事务
+│       存储层 (storage/)          │  段存储、durable tail、目录、事务
 ├─────────────────────────────────┤
 │       类型层 (types/)            │  标量值、列数组、记录批
 └─────────────────────────────────┘
@@ -45,7 +45,7 @@ Taibai 采用分层架构：
 | 查询规划器 | `src/sql/planner/` | SQL AST → 逻辑计划 |
 | 查询优化器 | `src/sql/optimizer/` | 基于规则的优化管线 |
 | 执行引擎 | `src/sql/execution/` | Volcano 模型算子 |
-| 存储引擎 | `src/storage/` | 列式段存储 + WAL |
+| 存储引擎 | `src/storage/` | 列式段存储 + durable tail |
 | 网络层 | `src/net/` | 异步 TCP/TLS 服务 |
 | 协议层 | `src/protocol/` | taibai-go 协议编解码 |
 
@@ -187,11 +187,12 @@ Taibai 使用自定义的列式段存储格式：
 - **布隆过滤器**：为 CLUSTER KEY 列自动构建布隆过滤器，加速等值查询
 - **Zone Map**：每个行组维护 min/max 统计信息，用于行组裁剪
 
-### 写前日志 (WAL)
+### 持久化 tail (durable tail)
 
-- 基于 `write_compact` 的 WAL 记录格式
-- 支持事务提交与崩溃恢复
-- 批量写入优化
+- 经典 WAL 已移除：恢复从不回放，纯写路径开销
+- 活动写入先落 `memtable_tail/`（组提交 + fsync，帧含 CRC 与行数索引）
+- flush 时物化进未 seal 的 active segment（原地追加 row group，sidecar 维护元数据），完成后 tail 清理
+- 崩溃恢复按 tail/clear/flush intent generation 仲裁重放，行数 watermark 防止重复
 
 ### 分区 (Partitioning)
 
@@ -496,7 +497,7 @@ src/
 │   │   └── auth.rs            # 用户/权限
 │   ├── core/                  # 核心存储
 │   │   ├── compactor.rs       # 段压缩
-│   │   ├── wal.rs             # 写前日志
+│   │   ├── durable_tail.rs    # 持久化尾部日志
 │   │   └── mod.rs             # 模块导出
 │   ├── segment/               # 段读写
 │   ├── partition/             # 分区管理

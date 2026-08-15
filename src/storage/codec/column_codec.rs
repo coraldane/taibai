@@ -339,7 +339,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
                 });
             }
             ColumnArray::Bool {
-                data: vals.into(),
+                data: vals,
                 bitmap: bitmap.clone(),
             }
         }

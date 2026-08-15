@@ -659,5 +659,5 @@ impl<'a> Lexer<'a> {
 }
 
 #[cfg(test)]
-#[path = "lexer_tests.rs"]
+#[path = "lexer_test.rs"]
 mod tests;

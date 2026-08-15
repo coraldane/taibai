@@ -130,6 +130,7 @@ impl SegmentManager {
         Ok(row_count)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn flush_memtable_batch_if(
         &self,
         db: &str,
@@ -217,6 +218,7 @@ impl SegmentManager {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn flush_memtable_batch_if_under_table_lock(
         &self,
         db: &str,
@@ -245,13 +247,14 @@ impl SegmentManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flush_memtable_batch_under_table_lock_inner(
         &self,
         db: &str,
         table: &str,
         partition_key: &str,
         batch: &RecordBatch,
-        txn_id: u64,
+        _txn_id: u64,
         state: &TableSegmentState,
         should_write: impl FnOnce() -> bool,
         on_written: impl FnOnce(),
@@ -262,13 +265,7 @@ impl SegmentManager {
 
         let table_dir = self.data_dir.join(db).join(table);
         std::fs::create_dir_all(&table_dir)?;
-        if txn_id > 0 {
-            self.write_txn_wal(&table_dir, txn_id, batch)?;
-        }
-        self.append_batch_with_partition_locked(&table_dir, &state, partition_key, batch, true)?;
-        if txn_id > 0 {
-            self.sync_table_wal(&table_dir)?;
-        }
+        self.append_batch_with_partition_locked(&table_dir, state, partition_key, batch, true)?;
         on_written();
         Ok(true)
     }
@@ -284,14 +281,14 @@ impl SegmentManager {
         {
             let mut active_guard = state.active_segments.lock().unwrap();
             self.get_or_create_active_segment_for_partition_locked(
-                &table_dir,
+                table_dir,
                 &batch.schema,
                 partition_key,
                 &mut active_guard,
             )?;
 
             let seg = active_guard.get_mut(partition_key).unwrap();
-            seg.append_batch(&batch, &|path| self.invalidate_reader(path))?;
+            seg.append_batch(batch, &|path| self.invalidate_reader(path))?;
 
             if seg.current_size >= self.max_segment_size() {
                 seg.seal(&|path| self.invalidate_reader(path))?;

@@ -171,5 +171,5 @@ impl Default for AutoIncrementManager {
 }
 
 #[cfg(test)]
-#[path = "auto_increment_tests.rs"]
+#[path = "auto_increment_test.rs"]
 mod tests;

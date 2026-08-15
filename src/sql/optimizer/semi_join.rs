@@ -35,8 +35,8 @@ fn transform_to_semi_join(plan: LogicalPlan) -> (LogicalPlan, bool) {
                     let left_plan = *filter.input.clone();
                     if let LogicalPlan::Scan(scan) = &left_plan {
                         let semi = build_semi_join_from_in(scan, values, *negated);
-                        if semi.is_some() {
-                            return (semi.unwrap(), true);
+                        if let Some(semi_join) = semi {
+                            return (semi_join, true);
                         }
                     }
                 }

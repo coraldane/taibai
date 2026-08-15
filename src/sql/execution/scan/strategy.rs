@@ -10,6 +10,7 @@ use super::row_group::{self, RowGroupPruneResult};
 use super::spec::ScanSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum RowGroupReadStrategy {
     PlainRead,
     PredicateFirstRead,
@@ -620,5 +621,5 @@ fn set_tighter_upper(
 }
 
 #[cfg(test)]
-#[path = "strategy_tests.rs"]
+#[path = "strategy_test.rs"]
 mod tests;

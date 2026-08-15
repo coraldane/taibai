@@ -128,6 +128,7 @@ fn count_with_single_eq(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn count_with_predicates(
     spec: &ScanSpec,
     segment_files: &[std::path::PathBuf],

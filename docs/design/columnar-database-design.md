@@ -1,5 +1,7 @@
 # taibai: Rust 列式数据库架构方案
 
+> 状态注记：经典 WAL（`table/wal/`、`storage/wal.rs`）已移除，现行持久化由 durable tail（`memtable_tail/`）与 active segment 自身承担，见 `TAIBAI_DESIGN_ZH.md`。本文保留为历史设计记录。
+
 ## Context
 
 基于 taibai-go 客户端驱动已有的自定义TCP二进制协议，用 Rust 构建全新的列式数据库服务端。目标是通用数据库（非业务绑定），面向 AI 时代大数据场景，支持自研SQL引擎。

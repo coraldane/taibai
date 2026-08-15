@@ -23,7 +23,7 @@ pub enum PermissionType {
 }
 
 #[cfg(test)]
-#[path = "auth_tests.rs"]
+#[path = "auth_test.rs"]
 mod tests;
 
 impl PermissionType {

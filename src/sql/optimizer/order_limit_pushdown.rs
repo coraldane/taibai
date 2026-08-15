@@ -534,5 +534,5 @@ fn is_selective_predicate(expr: &LogicalExpr) -> bool {
 }
 
 #[cfg(test)]
-#[path = "order_limit_pushdown_tests.rs"]
+#[path = "order_limit_pushdown_test.rs"]
 mod tests;

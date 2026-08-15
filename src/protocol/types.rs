@@ -164,7 +164,7 @@ impl StorageType {
         }
     }
 
-    pub fn to_data_type(&self) -> DataType {
+    pub fn to_data_type(self) -> DataType {
         match self {
             StorageType::Int64 => DataType::Int64,
             StorageType::Int32 => DataType::Int32,

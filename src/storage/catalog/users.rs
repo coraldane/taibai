@@ -81,8 +81,10 @@ pub enum Permission {
     All,
 }
 
-impl Permission {
-    pub fn from_str(s: &str) -> Result<Self> {
+impl std::str::FromStr for Permission {
+    type Err = TaibaiError;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
             "SELECT" => Ok(Permission::Select),
             "INSERT" => Ok(Permission::Insert),
@@ -487,5 +489,5 @@ impl UserManager {
 }
 
 #[cfg(test)]
-#[path = "users_tests.rs"]
+#[path = "users_test.rs"]
 mod tests;

@@ -492,5 +492,5 @@ pub fn compare_scalars(left: &ScalarValue, right: &ScalarValue) -> std::cmp::Ord
 }
 
 #[cfg(test)]
-#[path = "sort_tests.rs"]
+#[path = "sort_test.rs"]
 mod tests;

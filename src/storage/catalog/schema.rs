@@ -762,5 +762,5 @@ impl DatabaseCatalog {
 }
 
 #[cfg(test)]
-#[path = "schema_tests.rs"]
+#[path = "schema_test.rs"]
 mod tests;

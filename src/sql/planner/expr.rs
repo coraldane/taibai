@@ -28,7 +28,7 @@ fn common_function_type(arg_types: &[DataType]) -> DataType {
     if arg_types.is_empty() {
         return DataType::Int64;
     }
-    if arg_types.iter().any(|dt| *dt == DataType::VarChar) {
+    if arg_types.contains(&DataType::VarChar) {
         return DataType::VarChar;
     }
     if arg_types
@@ -37,7 +37,7 @@ fn common_function_type(arg_types: &[DataType]) -> DataType {
     {
         return DataType::Float64;
     }
-    if arg_types.iter().any(|dt| *dt == DataType::Decimal) {
+    if arg_types.contains(&DataType::Decimal) {
         return DataType::Decimal;
     }
     if arg_types.iter().any(|dt| matches!(dt, DataType::UInt64)) {
@@ -465,6 +465,7 @@ fn resolve_qualified_column_index(
     )))
 }
 
+#[allow(clippy::only_used_in_recursion)]
 pub fn ast_expr_to_logical_join(
     expr: &Expr,
     output_schema: &Schema,
@@ -712,9 +713,9 @@ pub fn expr_to_name(expr: &Expr) -> String {
             args,
             distinct,
         } => {
-            let arg_str = if args.is_empty() {
-                "*".to_string()
-            } else if args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*") {
+            let arg_str = if args.is_empty()
+                || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
+            {
                 "*".to_string()
             } else {
                 args.iter().map(expr_to_name).collect::<Vec<_>>().join(", ")

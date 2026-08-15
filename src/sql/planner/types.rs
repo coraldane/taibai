@@ -6,6 +6,7 @@ use crate::types::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum LogicalPlan {
     Scan(ScanPlan),
     Filter(FilterPlan),

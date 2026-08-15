@@ -228,6 +228,7 @@ fn exec_literal_select(stmt: &Statement) -> Result<ExecResult> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_table_select(
     engine: &Engine,
     db: &str,
@@ -345,6 +346,7 @@ fn exec_table_select(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_table_select_materialized(
     engine: &Engine,
     table_refs: &[ResolvedTableRef],

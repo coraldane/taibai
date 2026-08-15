@@ -315,11 +315,7 @@ fn print_info(
     if verbose && !info.row_groups.is_empty() {
         println!("    row groups detail:");
         for (j, rg) in info.row_groups.iter().enumerate() {
-            let avg_size = if rg.row_count > 0 {
-                rg.length / rg.row_count
-            } else {
-                0
-            };
+            let avg_size = rg.length.checked_div(rg.row_count).unwrap_or(0);
             println!(
                 "      [{}] offset={}, rows={}, size={}, avg_row_size={}",
                 j,

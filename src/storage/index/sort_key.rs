@@ -325,5 +325,5 @@ impl SegmentIndex {
 }
 
 #[cfg(test)]
-#[path = "sort_key_tests.rs"]
+#[path = "sort_key_test.rs"]
 mod tests;

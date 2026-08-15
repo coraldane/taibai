@@ -236,5 +236,5 @@ pub fn project_column_def(expr: &LogicalExpr, schema: &Schema, alias: Option<&st
 }
 
 #[cfg(test)]
-#[path = "project_tests.rs"]
+#[path = "project_test.rs"]
 mod tests;

@@ -125,7 +125,7 @@ fn validate_null_bitmap(col_idx: usize, row_count: usize, nulls: &[u8]) -> Resul
         )));
     }
 
-    if row_count % 64 != 0 {
+    if !row_count.is_multiple_of(64) {
         let used_bits = row_count % 64;
         let last_word = u64::from_le_bytes(nulls[nulls.len() - 8..].try_into().unwrap());
         if last_word >> used_bits != 0 {
@@ -145,11 +145,13 @@ pub(crate) fn null_bit_is_set(nulls: &[u8], row_idx: usize) -> bool {
         .is_some_and(|byte| byte & (1u8 << (row_idx % 8)) != 0)
 }
 
+type BulkVariableRanges = Vec<(usize, usize)>;
+
 fn direct_column_layout(
     data_type: DataType,
     elem_count: usize,
     data: &[u8],
-) -> Result<(usize, Option<Vec<(usize, usize)>>)> {
+) -> Result<(usize, Option<BulkVariableRanges>)> {
     if let Some(width) = data_type.fixed_size() {
         let len = elem_count
             .checked_mul(width)
@@ -226,5 +228,5 @@ fn read_utf8_at<'a>(payload: &'a [u8], pos: &mut usize, len: usize) -> Result<&'
 }
 
 #[cfg(test)]
-#[path = "bulk_payload_tests.rs"]
+#[path = "bulk_payload_test.rs"]
 mod tests;

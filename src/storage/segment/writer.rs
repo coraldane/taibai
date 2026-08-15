@@ -102,8 +102,7 @@ impl SegmentWriter {
             file,
             schema,
             row_group_size: row_group_size
-                .max(1)
-                .min(crate::storage::segment::constants::MAX_COLUMN_PAGE_ROWS),
+                .clamp(1, crate::storage::segment::constants::MAX_COLUMN_PAGE_ROWS),
             row_groups: Vec::new(),
             current_group: None,
             total_rows: 0,
@@ -566,12 +565,12 @@ fn build_column_metadata(
             let mut null_count = 0u64;
             let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
             let mut values = Some(HashSet::new());
-            for row in offset..offset + count {
+            for (row, &raw) in data.iter().enumerate().skip(offset).take(count) {
                 if bitmap.is_null(row) {
                     null_count += 1;
                     continue;
                 }
-                let value = data[row] != 0;
+                let value = raw != 0;
                 min_value = Some(min_value.map_or(value, |current: bool| current.min(value)));
                 max_value = Some(max_value.map_or(value, |current: bool| current.max(value)));
                 if let Some(filter) = &mut bloom_filter {
@@ -751,12 +750,11 @@ where
     let mut null_count = 0u64;
     let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
     let mut values = Some(HashSet::new());
-    for row in offset..offset + count {
+    for (row, &value) in data.iter().enumerate().skip(offset).take(count) {
         if bitmap.is_null(row) {
             null_count += 1;
             continue;
         }
-        let value = data[row];
         min_value = Some(min_value.map_or(value, |current: T| current.min(value)));
         max_value = Some(max_value.map_or(value, |current: T| current.max(value)));
         if let Some(filter) = &mut bloom_filter {
@@ -785,12 +783,11 @@ fn metadata_float32(
     let mut null_count = 0u64;
     let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
     let mut values = Some(HashSet::new());
-    for row in offset..offset + count {
+    for (row, &value) in data.iter().enumerate().skip(offset).take(count) {
         if bitmap.is_null(row) {
             null_count += 1;
             continue;
         }
-        let value = data[row];
         if min_value.is_none_or(|current| value < current) {
             min_value = Some(value);
         }
@@ -829,12 +826,11 @@ fn metadata_float64(
     let mut null_count = 0u64;
     let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
     let mut values = Some(HashSet::new());
-    for row in offset..offset + count {
+    for (row, &value) in data.iter().enumerate().skip(offset).take(count) {
         if bitmap.is_null(row) {
             null_count += 1;
             continue;
         }
-        let value = data[row];
         if min_value.is_none_or(|current| value < current) {
             min_value = Some(value);
         }

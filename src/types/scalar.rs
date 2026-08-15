@@ -355,5 +355,5 @@ impl fmt::Display for ScalarValue {
 }
 
 #[cfg(test)]
-#[path = "scalar_tests.rs"]
+#[path = "scalar_test.rs"]
 mod tests;

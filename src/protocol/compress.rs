@@ -81,5 +81,5 @@ pub fn zlib_decompress_complete(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-#[path = "compress_tests.rs"]
+#[path = "compress_test.rs"]
 mod tests;
