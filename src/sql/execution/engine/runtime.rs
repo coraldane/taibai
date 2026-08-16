@@ -235,7 +235,11 @@ impl Engine {
     }
 
     pub fn begin_bulk_import(&self) -> usize {
-        self.bulk_mode_sessions.fetch_add(1, Ordering::AcqRel) + 1
+        let active = self.bulk_mode_sessions.fetch_add(1, Ordering::AcqRel) + 1;
+        if active == 1 {
+            self.index_manager.pause_unique_index_compaction();
+        }
+        active
     }
 
     pub fn end_bulk_import(&self) -> usize {
@@ -270,6 +274,9 @@ impl Engine {
                 .lock()
                 .unwrap()
                 .remove(&(db, table));
+        }
+        if !self.is_bulk_mode() {
+            self.index_manager.resume_unique_index_compaction();
         }
         Ok(total)
     }

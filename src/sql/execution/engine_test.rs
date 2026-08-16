@@ -1079,20 +1079,12 @@ fn bulk_payload_delta_compaction_is_amortized_against_base_size() -> Result<()> 
         base_lengths.push(std::fs::metadata(&base_file)?.len());
     }
     session.bulk_import_mode = false;
-    engine.end_bulk_import();
+    assert_eq!(engine.end_bulk_import(), 0);
 
-    let stable_prefix = base_lengths
-        .iter()
-        .take_while(|len| **len == base_lengths[0])
-        .count();
-    assert!(
-        stable_prefix >= 2,
-        "batches under the ratio threshold must not rewrite the base snapshot"
-    );
-    assert!(
-        base_lengths.iter().any(|len| *len > base_seed),
-        "crossing the ratio threshold must compact the delta into the base"
-    );
+    assert!(base_lengths.iter().all(|len| *len == base_seed));
+    assert_eq!(std::fs::metadata(&base_file)?.len(), base_seed);
+    engine.flush_bulk_dirty_tables()?;
+    assert!(std::fs::metadata(&base_file)?.len() > base_seed);
     let duplicate = engine.execute(
         &mut session,
         &format!("INSERT INTO t (id, code) VALUES ({}, 0)", next_id - 1),

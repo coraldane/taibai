@@ -21,6 +21,13 @@ pub struct IndexManager {
     primary_key_indexes: RwLock<HashMap<String, HashSet<Vec<u8>>>>,
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
+    unique_index_compaction: Mutex<UniqueIndexCompactionSchedule>,
+}
+
+#[derive(Default)]
+struct UniqueIndexCompactionSchedule {
+    pause_count: usize,
+    pending: HashSet<(String, String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +159,7 @@ impl IndexManager {
             primary_key_indexes: RwLock::new(HashMap::new()),
             segment_mgr,
             data_dir,
+            unique_index_compaction: Mutex::new(UniqueIndexCompactionSchedule::default()),
         }
     }
 
@@ -1103,7 +1111,57 @@ impl IndexManager {
             .join("unique")
     }
 
+    pub fn pause_unique_index_compaction(&self) {
+        let mut schedule = self.unique_index_compaction.lock().unwrap();
+        schedule.pause_count = schedule.pause_count.saturating_add(1);
+    }
+
+    pub fn resume_unique_index_compaction(&self) {
+        let pending = {
+            let mut schedule = self.unique_index_compaction.lock().unwrap();
+            schedule.pause_count = schedule.pause_count.saturating_sub(1);
+            if schedule.pause_count > 0 {
+                return;
+            }
+            std::mem::take(&mut schedule.pending)
+        };
+        for (db, table, index_name) in pending {
+            let cache_key = unique_index_key(&db, &table, &index_name);
+            let state = self.unique_indexes.read().unwrap().get(&cache_key).cloned();
+            let Some(state) = state else {
+                continue;
+            };
+            let delta_count = {
+                let delta = state.delta.read().unwrap();
+                delta
+                    .entry_count
+                    .saturating_add(delta.tombstones.len() as u64)
+            };
+            if unique_index_delta_needs_compaction(delta_count, state.base.entries.len()) {
+                self.dispatch_unique_index_compaction(&db, &table, &index_name, &state);
+            }
+        }
+    }
+
     fn try_dispatch_unique_index_compaction(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        state: &Arc<UniqueIndexState>,
+    ) {
+        let mut schedule = self.unique_index_compaction.lock().unwrap();
+        if schedule.pause_count > 0 {
+            schedule
+                .pending
+                .insert((db.to_string(), table.to_string(), index_name.to_string()));
+            return;
+        }
+        drop(schedule);
+        self.dispatch_unique_index_compaction(db, table, index_name, state);
+    }
+
+    fn dispatch_unique_index_compaction(
         &self,
         db: &str,
         table: &str,
@@ -1391,47 +1449,24 @@ fn unique_index_state_contains_any_key(
     }
     let tombstones = &delta.tombstones;
     let base = &state.base;
-    let base_keys = &base.encoded_keys;
-    let mut needle_idx = 0usize;
-    // Binary-search the first candidate block instead of scanning from block
-    // zero, so a small needle set never pays a pass over the whole block index.
-    let block_offset = base
-        .blocks
-        .partition_point(|block| block.first_key.as_slice() < sorted_encoded_keys[0].as_slice())
-        .saturating_sub(1);
-    for (rel_block_no, block) in base.blocks[block_offset..].iter().enumerate() {
-        let block_no = block_offset + rel_block_no;
-        while needle_idx < sorted_encoded_keys.len()
-            && sorted_encoded_keys[needle_idx].as_slice() < block.first_key.as_slice()
-        {
-            needle_idx += 1;
+    for encoded in sorted_encoded_keys {
+        let Ok(mut idx) = base
+            .encoded_keys
+            .binary_search_by(|key| key.as_slice().cmp(encoded.as_slice()))
+        else {
+            continue;
+        };
+        while idx > 0 && base.encoded_keys[idx - 1] == *encoded {
+            idx -= 1;
         }
-        if needle_idx >= sorted_encoded_keys.len() {
-            break;
-        }
-        let block_end = block.start + block.len;
-        let last_block = block_no + 1 == base.blocks.len();
-        while needle_idx < sorted_encoded_keys.len() {
-            let needle = sorted_encoded_keys[needle_idx].as_slice();
-            if !last_block && needle >= base.blocks[block_no + 1].first_key.as_slice() {
-                break;
+        while idx < base.encoded_keys.len() && base.encoded_keys[idx] == *encoded {
+            let location = &base.entries[idx].location;
+            if !unique_index_tombstones_contains(tombstones, location)
+                && unique_index_entry_location_is_live(segment_mgr, location)?
+            {
+                return Ok(true);
             }
-            let block_keys = &base_keys[block.start..block_end];
-            if let Ok(mut idx) = block_keys.binary_search_by(|key| key.as_slice().cmp(needle)) {
-                while idx > 0 && block_keys[idx - 1].as_slice() == needle {
-                    idx -= 1;
-                }
-                while idx < block_keys.len() && block_keys[idx].as_slice() == needle {
-                    let location = &base.entries[block.start + idx].location;
-                    if !unique_index_tombstones_contains(tombstones, location)
-                        && unique_index_entry_location_is_live(segment_mgr, location)?
-                    {
-                        return Ok(true);
-                    }
-                    idx += 1;
-                }
-            }
-            needle_idx += 1;
+            idx += 1;
         }
     }
     Ok(false)

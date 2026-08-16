@@ -222,7 +222,7 @@ fn delta_compaction_trigger_amortizes_by_entry_count() {
 }
 
 #[test]
-fn contains_any_key_locates_first_block_via_binary_search() -> Result<()> {
+fn contains_any_key_uses_exact_binary_search_across_base_range() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let segment_mgr = SegmentManager::new(dir.path())?;
     let mut data = UniqueIndexData {
@@ -274,6 +274,30 @@ fn contains_any_key_locates_first_block_via_binary_search() -> Result<()> {
         &segment_mgr,
         &state,
         &encoded_sorted(&[4000, 5, 4001])?
+    )?);
+
+    let mut sparse_data = UniqueIndexData {
+        db: "db".to_string(),
+        table: "ticks".to_string(),
+        index_name: "uk_value".to_string(),
+        columns: vec!["value".to_string()],
+        entries: (0..6000i64)
+            .step_by(2)
+            .map(|v| entry(v + 1, v as u64))
+            .collect(),
+        flush_epoch: None,
+        segment_watermarks: HashMap::new(),
+        tombstones: HashSet::new(),
+        encoded_keys: Vec::new(),
+        blocks: Vec::new(),
+    };
+    prepare_unique_index_data(&mut sparse_data)?;
+    let sparse_state = UniqueIndexState::new(sparse_data, UniqueIndexDeltaState::default());
+    let missing_across_range: Vec<i64> = (0..6000i64).step_by(2).collect();
+    assert!(!unique_index_state_contains_any_key(
+        &segment_mgr,
+        &sparse_state,
+        &encoded_sorted(&missing_across_range)?
     )?);
     Ok(())
 }
@@ -401,6 +425,34 @@ fn superseded_compaction_job_leaves_files_untouched() -> Result<()> {
     assert!(manager
         .unique_keys_exist("db", "t", "uk", &int64_keys(&[5]))?
         .is_none());
+    Ok(())
+}
+
+#[test]
+fn compaction_waits_until_all_pauses_are_resumed() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    seed_unique_index(&manager, 0..10)?;
+    manager.pause_unique_index_compaction();
+    manager.pause_unique_index_compaction();
+
+    let batch: Vec<UniqueIndexEntry> = (10..60).map(|v| entry(v, v as u64)).collect();
+    assert!(manager.append_unique_index_entries("db", "t", "uk", batch)?);
+    let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
+    assert_eq!(state.base.entries.len(), 10);
+    assert_eq!(state.delta.read().unwrap().entry_count, 50);
+
+    manager.resume_unique_index_compaction();
+    let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
+    assert_eq!(state.base.entries.len(), 10);
+    assert_eq!(state.delta.read().unwrap().entry_count, 50);
+
+    manager.resume_unique_index_compaction();
+    let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
+    assert_eq!(state.base.entries.len(), 60);
+    assert_eq!(state.delta.read().unwrap().entry_count, 0);
     Ok(())
 }
 
