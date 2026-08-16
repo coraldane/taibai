@@ -98,7 +98,7 @@ async fn main() {
 
     log_msg!("Starting bulk import mode...");
     client
-        .start_bulk_import(&BulkImportConfig { disable_wal: true })
+        .start_bulk_import(&BulkImportConfig)
         .await
         .expect("start bulk import failed");
 

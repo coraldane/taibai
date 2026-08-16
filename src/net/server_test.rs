@@ -57,6 +57,8 @@ async fn login(framed: &mut Framed<DuplexStream, MessageCodec>, user: &str) {
     write_len_prefixed_string(&mut payload, user);
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
     framed
         .send(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
         .await
@@ -180,10 +182,7 @@ async fn handler_errors_still_release_bulk_import_session_state() {
     let (mut client, server) = spawn_test_connection(Arc::clone(&engine));
     login(&mut client, "root").await;
 
-    client
-        .send(query("START BULK IMPORT {\"disable_wal\": true}"))
-        .await
-        .unwrap();
+    client.send(query("START BULK IMPORT")).await.unwrap();
     client.next().await.unwrap().unwrap();
     assert_eq!(engine.bulk_mode_session_count(), 1);
 

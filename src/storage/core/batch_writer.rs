@@ -907,8 +907,7 @@ impl BatchWriter {
         let Some(path) = live_tail else {
             return false;
         };
-        // Only v2 tails expose their row count without decoding; legacy tails
-        // stay resident and migrate to v2 on the next append.
+        // Current-format tails expose their row count without decoding.
         let Ok(Some(tail_rows)) = crate::storage::core::durable_tail::tail_log_rows(&path) else {
             return false;
         };
@@ -1121,8 +1120,8 @@ impl BatchWriter {
         result
     }
 
-    /// Flush a same-segment memtable group as ONE merged append. Mixed
-    /// tailed/untailed groups keep the legacy sequential semantics.
+    /// Flush a same-segment memtable group as one merged append. Mixed
+    /// tailed/untailed groups use sequential appends.
     fn flush_memtable_group_under_table_lock(
         segment_mgr: &Arc<SegmentManager>,
         group: &[Arc<crate::storage::core::memtable::MemTable>],

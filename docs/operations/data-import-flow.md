@@ -12,9 +12,9 @@
 | Pipeline SQL INSERT | `examples/multi_insert` | 多个 `MSG_TYPE_QUERY` 请求并发在途 | CSV 到多值 INSERT，适合中等批量 |
 | 列式二进制 Bulk Import | `Client::bulk_insert_columnar` / `pipeline_bulk_insert_columnar` / `examples/batch_import` | `MSG_TYPE_BULK_INSERT_COLUMNAR` | 当前最高性能路径，绕过 SQL 解析 |
 
-此外，`START BULK IMPORT {"disable_wal":...}` / `STOP BULK IMPORT` 是一种会话级模式开关：
+此外，`START BULK IMPORT` / `STOP BULK IMPORT` 是一种会话级模式开关：
 
-- `START BULK IMPORT` 会设置服务端 `Engine.bulk_mode = true`，并记录当前会话是否 `disable_wal`。
+- `START BULK IMPORT` 会设置服务端 bulk mode。
 - `STOP BULK IMPORT` 会关闭 bulk mode，并调用 `flush_all_buffers()` 刷新 MemTable 与 active segment。
 - SQL INSERT 和列式二进制 bulk 都可能在 bulk mode 下运行，但两者走的内部路径不同。
 
@@ -44,7 +44,7 @@ INSERT INTO stock_tick_multi VALUES (...), (...), ...
 它通过 `Client::send_execute()` 连续发送 SQL 请求，并用 `pipeline_depth` 控制在途请求数。开启 `--bulk` 时，会先执行：
 
 ```sql
-START BULK IMPORT {"disable_wal":false}
+START BULK IMPORT
 ```
 
 导入结束后再执行：
@@ -102,7 +102,7 @@ exec_insert
 开启 `START BULK IMPORT` 后，`exec_insert` 直接调用：
 
 ```text
-Engine::exec_bulk_insert_with_wal_control
+Engine::exec_bulk_insert
   -> SegmentManager::bulk_insert_batch
   -> SegmentManager::bulk_insert_batch_with_partition
 ```
@@ -134,7 +134,7 @@ CSV 文件
 - 表名：`stock_tick_batch`。
 - 默认 batch size：`200000` 行。
 - pipeline depth：`8`。
-- 使用 `START BULK IMPORT {"disable_wal":true}`。
+- 使用 `START BULK IMPORT`。
 - 使用 `MSG_TYPE_BULK_INSERT_COLUMNAR` 发送列式 payload。
 - 导入结束后先 `drain_pipeline()`，再 `stop_pipeline()`，最后 `STOP BULK IMPORT`。
 
@@ -177,7 +177,7 @@ repeat column_count:
 ```text
 MSG_TYPE_BULK_INSERT_COLUMNAR
   -> Handler::handle_bulk_insert
-  -> Engine::exec_bulk_insert_payload_with_wal_control
+  -> Engine::exec_bulk_insert_payload
   -> SegmentManager::bulk_insert_payload_with_catalog
 ```
 
@@ -249,9 +249,9 @@ partition by deal_date cluster by security_id
 
 - SQL INSERT 非 bulk mode：每批先写入 `memtable_tail/{memtable_id}.tail`（组提交 fsync），flush 时物化进未 seal 的 active segment（首次建段，之后原地追加 row group），完成后 tail 删除；崩溃后由 durable tail 重放。
 - 显式事务：COMMIT 时物化 txn MemTable 进 active segment（数据与 meta 均 fsync），依赖 segment 自身持久化，不再写事务 WAL。
-- SQL INSERT bulk mode / 列式二进制 bulk：直接写 active segment；`disable_wal` 参数保留为兼容性开关，当前无独立 WAL 写入。
+- SQL INSERT bulk mode / 列式二进制 bulk：直接写 active segment，当前无独立 WAL 写入。
 
-因此 bulk 导入的可靠性依赖 active segment flush/meta/seal。`disable_wal=true` 是 `batch_import` 的默认选择，符合“可重放大批量导入”的定位。旧版本遗留的 `table/wal/` 目录不会被读取，可手动删除。
+因此 bulk 导入的可靠性依赖 active segment flush/meta/seal。批量导入采用单一持久化语义，不提供绕过持久化的协议开关。
 
 ## 查询可见性
 
@@ -278,9 +278,9 @@ column N row count mismatch
 
 `examples/batch_import` 自己实现的编码函数传入的也是行数，因此示例路径和通用 `BulkImporter` 路径现在保持一致。
 
-### 3. bulk mode 下 catalog 行数更新存在路径差异
+### 3. bulk mode 下 catalog 行数更新
 
-SQL INSERT bulk mode 会在内存 catalog 中增加 `row_count`，最终由 `flush_all_buffers()` 保存。列式二进制 bulk 在 `disable_wal=true` 或 bulk mode 下不会进入当前的 catalog `row_count` 更新分支。
+SQL INSERT bulk mode 会在内存 catalog 中增加 `row_count`，最终由 `flush_all_buffers()` 保存。列式二进制 bulk 也按当前统一语义更新 catalog 行数。
 
 这不影响 `SELECT COUNT(*)`，因为 count 会读 segment footer；但会影响 `SHOW STATS` 这类读取 catalog `row_count` 的管理信息。
 
@@ -315,14 +315,12 @@ examples/batch_import
 对最高吞吐更敏感时，建议：
 
 - 尽量使用列式二进制 bulk。
-- 对可重放导入使用 `disable_wal=true`。
 - 调大 batch size 和 pipeline depth，但不要超过 `Client::start_pipeline` 当前上限 16。
 - 对无需查询裁剪的导入阶段，可通过配置文件调低 `compression.bulk_zstd_level`，减少 CPU 消耗；默认值为 `3`。
 - 若希望直接列式路径收益最大，优先导入无分区/无聚簇表，或后续再执行整理/优化。
 
 ## 后续优化建议
 
-1. 明确 bulk 持久化语义：在文档/API 中明确 bulk import 是可重放导入语义（`disable_wal` 仅为兼容开关）。
-2. 在列式 bulk 直接路径中为适合的列生成 Bloom Filter。
-3. 对分区/聚簇 bulk 做流式分桶和局部排序，减少重排开销。
-4. 在 `STOP BULK IMPORT` 或 bulk 写入结束时同步更新 catalog `row_count`，避免 `SHOW STATS` 与实际 segment 行数不一致。
+1. 在列式 bulk 直接路径中为适合的列生成 Bloom Filter。
+2. 对分区/聚簇 bulk 做流式分桶和局部排序，减少重排开销。
+3. 在 `STOP BULK IMPORT` 或 bulk 写入结束时同步更新 catalog `row_count`，避免 `SHOW STATS` 与实际 segment 行数不一致。

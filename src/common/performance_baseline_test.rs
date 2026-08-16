@@ -148,33 +148,3 @@ fn configurable_baselines_are_isolated_by_environment_and_version() {
     );
     assert!(production.entries("main").is_empty());
 }
-
-#[test]
-fn legacy_baseline_files_gain_default_labels_and_new_keys() {
-    let temp = TempDir::new().unwrap();
-    let store = PerformanceBaselineStore::load(temp.path());
-    store.record(
-        "main",
-        "legacy",
-        "Scan(metrics)",
-        PerformanceSample::default(),
-    );
-    drop(store);
-
-    let path = temp.path().join("meta").join("performance_baselines.json");
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    for entry in json["entries"].as_object_mut().unwrap().values_mut() {
-        let object = entry.as_object_mut().unwrap();
-        object.remove("environment");
-        object.remove("version");
-    }
-    std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
-
-    let migrated = PerformanceBaselineStore::load(temp.path());
-    let entries = migrated.entries("main");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].environment, "default");
-    assert_eq!(entries[0].version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(migrated.reset("main").unwrap(), 1);
-}

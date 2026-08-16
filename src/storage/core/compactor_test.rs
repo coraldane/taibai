@@ -153,7 +153,7 @@ fn optimize_interleaved_rows_across_more_than_cache_capacity() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
 
     let schema = test_schema();
-    // Forty source row groups exceed the legacy 32-entry cache. Every group
+    // Forty source row groups exceed the former 32-entry cache. Every group
     // contains interleaved keys, matching time-ordered tick ingestion where a
     // clustered output chunk touches nearly every source group.
     let owned_rows = (0..160)
@@ -358,7 +358,7 @@ fn background_fragmentation_compaction_seals_and_rewrites_active_segment() -> Re
     for id in 0..40 {
         let name = format!("row-{id}");
         let batch = make_batch(&schema, &[(id, name.as_str())])?;
-        segment_mgr.bulk_insert_batch_ref("default", "t", &batch, false)?;
+        segment_mgr.bulk_insert_batch_ref("default", "t", &batch)?;
     }
 
     let segments = SegmentManager::discover_segments(&table_dir)?;

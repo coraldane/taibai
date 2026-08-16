@@ -18,7 +18,6 @@ use crate::storage::segment::SegmentReader;
 use crate::types::batch::{RecordBatch, Schema};
 
 const TAIL_MAGIC: u32 = 0x5441_494C;
-const TAIL_LOG_MAGIC: u32 = 0x544C_4F47;
 /// V2 tail log frames carry the row count in the frame header so recovery can
 /// index a tail without decompressing any payload.
 const TAIL_LOG_MAGIC_V2: u32 = 0x544C_4F48;
@@ -36,7 +35,6 @@ const GROUP_COMMIT_MAX_REQUESTS: usize = 128;
 pub(crate) struct PreparedTailAppend {
     wal_payload: Vec<u8>,
     frame: Option<Vec<u8>>,
-    schema: Schema,
     rows: u64,
 }
 
@@ -45,7 +43,6 @@ impl PreparedTailAppend {
         Self {
             wal_payload: prepare_batch_for_wal(batch),
             frame: None,
-            schema: batch.schema.clone(),
             rows: batch.num_rows() as u64,
         }
     }
@@ -256,15 +253,8 @@ impl TailFileSet {
         }
 
         if !self.open.contains_key(&key) {
-            match open_tail_for_group_append(command)? {
-                OpenTailResult::Ready(tail) => {
-                    self.open.insert(key.clone(), tail);
-                }
-                OpenTailResult::FrameAlreadyDurable(tail) => {
-                    self.open.insert(key.clone(), tail);
-                    return Ok(key);
-                }
-            }
+            let OpenTailResult::Ready(tail) = open_tail_for_group_append(command)?;
+            self.open.insert(key.clone(), tail);
         }
 
         let tail = self.open.get_mut(&key).unwrap();
@@ -308,7 +298,6 @@ impl TailFileSet {
 
 enum OpenTailResult {
     Ready(OpenTail),
-    FrameAlreadyDurable(OpenTail),
 }
 
 fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult> {
@@ -326,32 +315,9 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
             }));
         }
 
-        // Legacy snapshot and v1 log tails are migrated to the v2 log format
-        // synchronously once. Keeping this compatibility path means every live
-        // tail becomes row-indexable without a decode.
-        let bytes = fs::read(&path)?;
-        let (old_partition_key, old_batch) = decode_tail(&bytes, &command.prepared.schema)?;
-        if old_partition_key != command.partition_key {
-            return Err(TaibaiError::Storage(
-                "durable tail partition key changed while appending".into(),
-            ));
-        }
-        let sequence = next_sequence();
-        let stem = format!("{}.{}", command.id.simple(), sequence);
-        let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
-        let final_path = tail_dir.join(format!("{stem}.tail"));
-        let mut payload = encode_tail_log(&command.partition_key, &old_batch);
-        payload.extend_from_slice(command.prepared.frame());
-        write_new_synced(&tmp_path, &payload)?;
-        fs::rename(&tmp_path, &final_path)?;
-        remove_other_generations(&tail_dir, command.id, &final_path)?;
-        let file = fs::OpenOptions::new().append(true).open(&final_path)?;
-        return Ok(OpenTailResult::FrameAlreadyDurable(OpenTail {
-            file,
-            path: final_path,
-            partition_key: command.partition_key.clone(),
-            pending_rename: None,
-        }));
+        return Err(TaibaiError::Storage(
+            "unsupported durable tail version".into(),
+        ));
     }
 
     let sequence = next_sequence();
@@ -548,25 +514,9 @@ pub fn append(table_dir: &Path, id: Uuid, partition_key: &str, delta: &RecordBat
             return Ok(());
         }
 
-        // One-time migration for tails written by versions that stored a full
-        // snapshot. Keep the old generation until the new log is durable.
-        let bytes = fs::read(&path)?;
-        let (old_partition_key, old_batch) = decode_tail(&bytes, &delta.schema)?;
-        if old_partition_key != partition_key {
-            return Err(TaibaiError::Storage(
-                "durable tail partition key changed while appending".into(),
-            ));
-        }
-        let sequence = next_sequence();
-        let stem = format!("{}.{}", id.simple(), sequence);
-        let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
-        let final_path = tail_dir.join(format!("{stem}.tail"));
-        let mut payload = encode_tail_log(partition_key, &old_batch);
-        payload.extend_from_slice(&frame);
-        write_new_synced(&tmp_path, &payload)?;
-        fs::rename(&tmp_path, &final_path)?;
-        remove_other_generations(&tail_dir, id, &final_path)?;
-        return Ok(());
+        return Err(TaibaiError::Storage(
+            "unsupported durable tail version".into(),
+        ));
     }
 
     let sequence = next_sequence();
@@ -842,30 +792,22 @@ pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> 
     Ok(recovered)
 }
 
-/// Lazy counterpart of `recover`: v2 tails are indexed from frame headers
-/// without decoding; legacy tails are decoded once only to count rows, and
-/// their payloads remain on disk either way.
-pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTailIndex>> {
+/// Lazy counterpart of `recover`: current-format tails are indexed from frame
+/// headers without decoding their payloads.
+pub fn recover_index(table_dir: &Path, _schema: &Schema) -> Result<Vec<RecoveredTailIndex>> {
     let mut recovered = Vec::new();
     for (id, path) in resolve_live_tail_paths(table_dir)? {
         let bytes = fs::read(&path)?;
-        if let Some(rows) = scan_tail_log_rows(&bytes) {
-            let partition_key = read_tail_log_partition_key(&path)?.ok_or_else(|| {
-                TaibaiError::Storage("v2 durable tail is missing its partition key".into())
-            })?;
-            recovered.push(RecoveredTailIndex {
-                id,
-                partition_key,
-                rows,
-                path,
-            });
-            continue;
-        }
-        let (partition_key, batch) = decode_tail(&bytes, schema)?;
+        let rows = scan_tail_log_rows(&bytes).ok_or_else(|| {
+            TaibaiError::Storage("unsupported or corrupt durable tail version".into())
+        })?;
+        let partition_key = read_tail_log_partition_key(&path)?.ok_or_else(|| {
+            TaibaiError::Storage("durable tail is missing its partition key".into())
+        })?;
         recovered.push(RecoveredTailIndex {
             id,
             partition_key,
-            rows: batch.num_rows() as u64,
+            rows,
             path,
         });
     }
@@ -879,8 +821,8 @@ pub fn live_tail_path(table_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     newest_live_tail_path(&table_dir.join(TAIL_DIR), id)
 }
 
-/// Row count of a v2 tail log without decompressing any frame. Returns `None`
-/// for legacy formats, which are not eligible for spilling.
+/// Row count of a current-format tail log without decompressing any frame.
+/// Returns `None` when the file is invalid or corrupt.
 pub fn tail_log_rows(path: &Path) -> Result<Option<u64>> {
     Ok(scan_tail_log_rows(&fs::read(path)?))
 }
@@ -967,55 +909,24 @@ fn verify_crc(bytes: &[u8]) -> Result<&[u8]> {
 }
 
 fn decode_tail(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
-    if bytes.len() >= 4 {
-        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if magic == TAIL_LOG_MAGIC || magic == TAIL_LOG_MAGIC_V2 {
-            return decode_tail_log(bytes, schema);
-        }
-    }
-    let body = verify_crc(bytes)?;
-    if body.len() < 16 {
-        return Err(TaibaiError::Storage("durable tail is truncated".into()));
-    }
-    let magic = u32::from_le_bytes(body[0..4].try_into().unwrap());
-    if magic != TAIL_MAGIC {
-        return Err(TaibaiError::Storage("invalid durable tail magic".into()));
-    }
-    let partition_len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
-    let partition_end = 8usize.saturating_add(partition_len);
-    if partition_end.saturating_add(8) > body.len() {
-        return Err(TaibaiError::Storage("invalid durable tail header".into()));
-    }
-    let partition_key = std::str::from_utf8(&body[8..partition_end])
-        .map_err(|_| TaibaiError::Storage("invalid durable tail partition key".into()))?
-        .to_string();
-    let batch_len =
-        u64::from_le_bytes(body[partition_end..partition_end + 8].try_into().unwrap()) as usize;
-    let batch_start = partition_end + 8;
-    let batch_end = batch_start.saturating_add(batch_len);
-    if batch_end != body.len() {
+    if bytes.len() < 4 || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
         return Err(TaibaiError::Storage(
-            "invalid durable tail payload length".into(),
+            "unsupported durable tail version".into(),
         ));
     }
-    let batch = deserialize_batch_from_wal(&body[batch_start..batch_end], schema)?;
-    Ok((partition_key, batch))
+    decode_tail_log(bytes, schema)
 }
 
 fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
     if bytes.len() < 8 {
         return Err(TaibaiError::Storage("durable tail log is truncated".into()));
     }
-    let v2 = match u32::from_le_bytes(bytes[0..4].try_into().unwrap()) {
-        TAIL_LOG_MAGIC => false,
-        TAIL_LOG_MAGIC_V2 => true,
-        _ => {
-            return Err(TaibaiError::Storage(
-                "invalid durable tail log magic".into(),
-            ));
-        }
-    };
-    let frame_header_len = if v2 { 16usize } else { 8usize };
+    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
+        return Err(TaibaiError::Storage(
+            "unsupported durable tail version".into(),
+        ));
+    }
+    let frame_header_len = 16usize;
     let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let mut offset = 8usize.saturating_add(partition_len);
     if offset > bytes.len() {
@@ -1086,12 +997,11 @@ fn read_tail_log_version(path: &Path) -> Result<Option<u32>> {
         return Err(error.into());
     }
     let magic = u32::from_le_bytes(header);
-    Ok((magic == TAIL_LOG_MAGIC || magic == TAIL_LOG_MAGIC_V2).then_some(magic))
+    Ok((magic == TAIL_LOG_MAGIC_V2).then_some(magic))
 }
 
-/// Row count of a v2 tail log obtained by walking frame headers only — no
-/// payload is decompressed. Returns `None` for legacy (v1 log / snapshot)
-/// tails or on checksum mismatch, so callers can fall back to decoding.
+/// Row count of a current-format tail log obtained by walking frame headers
+/// only. Returns `None` when the header, frame layout, or checksum is invalid.
 fn scan_tail_log_rows(bytes: &[u8]) -> Option<u64> {
     if bytes.len() < 8 {
         return None;
@@ -1142,7 +1052,7 @@ fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
         return Err(error.into());
     }
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
-    if magic != TAIL_LOG_MAGIC && magic != TAIL_LOG_MAGIC_V2 {
+    if magic != TAIL_LOG_MAGIC_V2 {
         return Ok(None);
     }
     let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
@@ -1163,9 +1073,7 @@ fn decode_flush_target(bytes: &[u8]) -> Result<(String, Option<u64>)> {
     }
     let name_len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
     let name_end = 8usize.saturating_add(name_len);
-    let expected_rows = if name_end == body.len() {
-        None
-    } else if name_end.saturating_add(8) == body.len() {
+    let expected_rows = if name_end.saturating_add(8) == body.len() {
         Some(u64::from_le_bytes(
             body[name_end..name_end + 8].try_into().unwrap(),
         ))
@@ -1186,9 +1094,7 @@ fn decode_flush_target(bytes: &[u8]) -> Result<(String, Option<u64>)> {
 }
 
 /// A recorded flush intent proves its tail is durable once the named segment
-/// is readable and, for intents carrying a row-count watermark, holds at
-/// least that many rows. Legacy intents without a watermark keep the old
-/// existence check; their target was a standalone segment written atomically.
+/// is readable and holds at least the recorded row-count watermark.
 fn flush_intent_satisfied(table_dir: &Path, bytes: &[u8]) -> Result<bool> {
     let (segment_name, expected_rows) = decode_flush_target(bytes)?;
     let segment_path = table_dir.join(segment_name);

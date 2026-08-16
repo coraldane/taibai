@@ -487,12 +487,11 @@ fn exec_materialized_insert_batch(
     }
     let write_start = Instant::now();
     if bulk_import_mode || relaxed_direct_insert {
-        engine.exec_bulk_insert_partitioned_with_wal_control(
+        engine.exec_bulk_insert_partitioned(
             db,
             table,
             table_meta,
             batch,
-            false,
             relaxed_direct_insert,
         )?;
     } else {

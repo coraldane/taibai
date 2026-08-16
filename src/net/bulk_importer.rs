@@ -15,7 +15,6 @@ const DEFAULT_BATCH_SIZE: usize = 100000;
 pub struct BulkImporterConfig {
     pub pipeline_depth: usize,
     pub batch_size: usize,
-    pub disable_wal: bool,
     pub parallel_encode: bool,
 }
 
@@ -24,7 +23,6 @@ impl Default for BulkImporterConfig {
         Self {
             pipeline_depth: DEFAULT_PIPELINE_DEPTH,
             batch_size: DEFAULT_BATCH_SIZE,
-            disable_wal: true,
             parallel_encode: true,
         }
     }
@@ -79,11 +77,7 @@ impl BulkImporter {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        self.client
-            .start_bulk_import(&BulkImportConfig {
-                disable_wal: self.config.disable_wal,
-            })
-            .await?;
+        self.client.start_bulk_import(&BulkImportConfig).await?;
 
         self.client
             .start_pipeline(self.config.pipeline_depth)

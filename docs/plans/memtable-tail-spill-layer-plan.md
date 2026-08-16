@@ -140,7 +140,7 @@ enum MemTableBacking {
   只读原始字节、不解压、不分配列向量，O(文件大小) 的顺序读；
   - 存量 v1 文件：退回一次性 eager decode（现有 `recover` 路径），解码后补物化为
     Resident——与现状一致，v1 文件随 flush 自然消亡；
-  - v1 的 legacy snapshot（非 log）tail 同理走旧路径；
+  - 当前实现仅接受现行 tail log 格式，不再读取 snapshot tail；
 - `engine.rs` 启动恢复改调 `recover_durable_memtable_tail_indices`：对每个
   `RecoveredTailIndex` 调用新的
   `MemTableManager::restore_spilled_tail(id, db, table, partition_key, path, rows)`，
@@ -194,15 +194,15 @@ Flush 命令时）接线 `try_spill_cold_memtables()`：
 
 - 存量 v1 tail 文件：惰性恢复对其退化为 eager，行为不劣于现状；v1 文件随 flush
   自然消亡；
-- 解码路径同时识别 v1/v2 magic，新旧文件可混存；
-- 整体回退：关闭 spill 即回到现状（spill 调度跳过）；v2 文件仍被解码路径兼容。
+- 当前实现仅识别现行 magic，不支持不同版本文件混存；
+- 可关闭 spill 调度；已落盘 tail 仍按当前唯一格式恢复。
 
 ## 6. 测试
 
 新增单测 8 个：
 
 - durable_tail 4 个：v2 frame 免解压行数扫描、`recover_index` 保留 tail 文件且
-  行数正确、legacy snapshot 回退统计、v1/v2 混合兼容；
+  行数正确、损坏文件拒绝和当前格式恢复；
 - memtable 2 个：spill 后惰性物化数据逐行一致、空/Flushed memtable 拒绝 spill；
 - batch_writer 2 个：spill 后读己之写与新写入可见、内存泄压时 spill 优先于
   flush 且 flush 自动物化 Spilled memtable。

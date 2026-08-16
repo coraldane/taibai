@@ -138,7 +138,6 @@ fn streaming_query_emits_chunks_and_end_marker() {
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
     let config = Arc::new(ServerConfig::default());
     let mut handler = logged_in_handler(config, Arc::clone(&engine), "root");
-    handler.session.as_mut().unwrap().binary_results = true;
     handler.session.as_mut().unwrap().streaming_results = true;
     engine
         .execute(
@@ -191,10 +190,16 @@ fn query_response_size_reserves_timing_trailer() {
     let handler = Handler::new(Arc::new(config), engine);
 
     assert!(handler
-        .validate_query_response(Message::new(MSG_TYPE_RESULT, Bytes::from(vec![0; 36])))
+        .validate_query_response(Message::new(
+            MSG_TYPE_BINARY_QUERY_RESULT,
+            Bytes::from(vec![0; 36])
+        ))
         .is_ok());
     assert!(handler
-        .validate_query_response(Message::new(MSG_TYPE_RESULT, Bytes::from(vec![0; 37])))
+        .validate_query_response(Message::new(
+            MSG_TYPE_BINARY_QUERY_RESULT,
+            Bytes::from(vec![0; 37])
+        ))
         .is_err());
 }
 
@@ -209,6 +214,8 @@ fn test_login_dispatch() {
     write_len_prefixed_string(&mut payload, "root");
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
 
     let msg = Message::new(MSG_TYPE_LOGIN, Bytes::from(payload));
     let responses = handler.handle_message(msg).unwrap();
@@ -243,17 +250,13 @@ fn bulk_import_mode_is_reference_counted_across_connections() {
     let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "first");
     let mut second = logged_in_handler(config, Arc::clone(&engine), "second");
 
-    ok_rows(
-        &first
-            .handle_start_bulk_import("START BULK IMPORT {\"disable_wal\": true}")
-            .unwrap(),
-    );
+    ok_rows(&first.handle_start_bulk_import("START BULK IMPORT").unwrap());
     assert!(engine.is_bulk_mode());
     assert_eq!(engine.bulk_mode_session_count(), 1);
 
     ok_rows(
         &second
-            .handle_start_bulk_import("START BULK IMPORT {\"disable_wal\": true}")
+            .handle_start_bulk_import("START BULK IMPORT")
             .unwrap(),
     );
     assert!(engine.is_bulk_mode());
@@ -281,14 +284,10 @@ fn bulk_import_disconnect_releases_only_that_connection() {
     let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "first");
     let mut second = logged_in_handler(config, Arc::clone(&engine), "second");
 
-    ok_rows(
-        &first
-            .handle_start_bulk_import("START BULK IMPORT {\"disable_wal\": true}")
-            .unwrap(),
-    );
+    ok_rows(&first.handle_start_bulk_import("START BULK IMPORT").unwrap());
     ok_rows(
         &second
-            .handle_start_bulk_import("START BULK IMPORT {\"disable_wal\": true}")
+            .handle_start_bulk_import("START BULK IMPORT")
             .unwrap(),
     );
 
@@ -419,6 +418,8 @@ fn test_prepare_and_execute() {
     write_len_prefixed_string(&mut payload, "root");
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
     handler
         .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
         .unwrap();
@@ -441,7 +442,7 @@ fn test_prepare_and_execute() {
     let resp = handler
         .handle_message(Message::new(MSG_TYPE_EXECUTE, exec_payload))
         .unwrap();
-    assert_eq!(resp[0].msg_type, MSG_TYPE_RESULT);
+    assert_eq!(resp[0].msg_type, MSG_TYPE_BINARY_QUERY_RESULT);
 
     let close_payload = Bytes::copy_from_slice(&1u32.to_le_bytes());
     let resp = handler
@@ -461,6 +462,8 @@ fn test_prepare_execute_with_params() {
     write_len_prefixed_string(&mut payload, "root");
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
     handler
         .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
         .unwrap();
@@ -503,7 +506,7 @@ fn test_prepare_execute_with_params() {
     let resp = handler
         .handle_message(Message::new(MSG_TYPE_EXECUTE, Bytes::from(exec_payload)))
         .unwrap();
-    assert_eq!(resp[0].msg_type, MSG_TYPE_RESULT);
+    assert_eq!(resp[0].msg_type, MSG_TYPE_BINARY_QUERY_RESULT);
 
     // Execute with Int64 param = 999 (should return 0 rows)
     let mut exec_payload = Vec::new();
@@ -514,7 +517,7 @@ fn test_prepare_execute_with_params() {
     let resp = handler
         .handle_message(Message::new(MSG_TYPE_EXECUTE, Bytes::from(exec_payload)))
         .unwrap();
-    assert_eq!(resp[0].msg_type, MSG_TYPE_RESULT);
+    assert_eq!(resp[0].msg_type, MSG_TYPE_BINARY_QUERY_RESULT);
 
     // Close
     let close_payload = Bytes::copy_from_slice(&stmt_id.to_le_bytes());
@@ -738,6 +741,8 @@ fn test_prepare_execute_with_null_param() {
     write_len_prefixed_string(&mut payload, "root");
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
     handler
         .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
         .unwrap();
@@ -783,6 +788,8 @@ fn test_transaction_messages() {
     write_len_prefixed_string(&mut payload, "root");
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
     handler
         .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
         .unwrap();
@@ -817,6 +824,8 @@ fn test_txn_error_nested_begin() {
     write_len_prefixed_string(&mut payload, "root");
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
     handler
         .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
         .unwrap();
@@ -843,6 +852,8 @@ fn test_txn_error_commit_without_active() {
     write_len_prefixed_string(&mut payload, "root");
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
     handler
         .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
         .unwrap();
@@ -866,6 +877,8 @@ fn test_txn_error_rollback_without_active() {
     write_len_prefixed_string(&mut payload, "root");
     write_len_prefixed_string(&mut payload, "taibai");
     write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
     handler
         .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
         .unwrap();

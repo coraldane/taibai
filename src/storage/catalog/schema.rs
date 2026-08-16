@@ -533,9 +533,6 @@ impl DatabaseCatalog {
                 table.ensure_column_ids();
             }
             Ok(catalog)
-        } else if let Some(catalog) = Self::load_legacy_catalog(meta_dir, db_name)? {
-            catalog.save(meta_dir)?;
-            Ok(catalog)
         } else {
             let catalog = DatabaseCatalog::new(db_name);
             catalog.save(meta_dir)?;
@@ -566,30 +563,6 @@ impl DatabaseCatalog {
 
     pub fn catalog_dir(meta_dir: &Path) -> PathBuf {
         meta_dir.join("catalogs")
-    }
-
-    fn load_legacy_catalog(meta_dir: &Path, db_name: &str) -> Result<Option<Self>> {
-        let legacy_path = meta_dir.join("schema.json");
-        if !legacy_path.exists() {
-            return Ok(None);
-        }
-        let data = fs::read_to_string(&legacy_path).map_err(|e| {
-            TaibaiError::Storage(format!("failed to read legacy schema.json: {}", e))
-        })?;
-        let mut catalog: DatabaseCatalog = serde_json::from_str(&data).map_err(|e| {
-            TaibaiError::Storage(format!("failed to parse legacy schema.json: {}", e))
-        })?;
-        if catalog.name != db_name {
-            return Ok(None);
-        }
-        catalog.name = db_name.to_string();
-        for table in catalog.tables.values_mut() {
-            table.database = db_name.to_string();
-            table.update_partition_key_idx();
-            table.update_ttl_column_idx();
-            table.ensure_column_ids();
-        }
-        Ok(Some(catalog))
     }
 
     pub fn create_table(&mut self, name: &str, columns: Vec<ColumnDef>) -> Result<()> {

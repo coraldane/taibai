@@ -117,36 +117,6 @@ fn async_fsync_committer_still_leaves_recoverable_tail() -> Result<()> {
 }
 
 #[test]
-fn appending_migrates_legacy_snapshot_tail() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
-    let id = Uuid::new_v4();
-    let partition_key = "legacy";
-    let legacy_batch = test_batch(&schema, &[1])?;
-    let batch_payload = serialize_batch_for_wal(&legacy_batch);
-    let mut legacy = Vec::new();
-    legacy.extend_from_slice(&TAIL_MAGIC.to_le_bytes());
-    legacy.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
-    legacy.extend_from_slice(partition_key.as_bytes());
-    legacy.extend_from_slice(&(batch_payload.len() as u64).to_le_bytes());
-    legacy.extend_from_slice(&batch_payload);
-    let legacy = append_crc(legacy);
-    let tail_dir = temp.path().join(TAIL_DIR);
-    fs::create_dir_all(&tail_dir)?;
-    fs::write(tail_dir.join(format!("{}.1.tail", id.simple())), legacy)?;
-
-    append(temp.path(), id, partition_key, &test_batch(&schema, &[2])?)?;
-    let recovered = recover(temp.path(), &schema)?;
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].batch.num_rows(), 2);
-    assert_eq!(
-        recovered[0].batch.scalar(1, 0),
-        Some(ScalarValue::Int64(Some(2)))
-    );
-    Ok(())
-}
-
-#[test]
 fn recovery_ignores_incomplete_final_tail_frame() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
@@ -334,35 +304,5 @@ fn recover_index_counts_rows_and_keeps_tail_on_disk() -> Result<()> {
 
     // Arbitration cleanup is idempotent across repeated index passes.
     assert_eq!(recover_index(temp.path(), &schema)?.len(), 1);
-    Ok(())
-}
-
-#[test]
-fn recover_index_counts_legacy_snapshot_tail_rows() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
-    let id = Uuid::new_v4();
-    let partition_key = "legacy";
-    let legacy_batch = test_batch(&schema, &[7, 8])?;
-    let batch_payload = serialize_batch_for_wal(&legacy_batch);
-    let mut legacy = Vec::new();
-    legacy.extend_from_slice(&TAIL_MAGIC.to_le_bytes());
-    legacy.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
-    legacy.extend_from_slice(partition_key.as_bytes());
-    legacy.extend_from_slice(&(batch_payload.len() as u64).to_le_bytes());
-    legacy.extend_from_slice(&batch_payload);
-    let legacy = append_crc(legacy);
-    let tail_dir = temp.path().join(TAIL_DIR);
-    fs::create_dir_all(&tail_dir)?;
-    fs::write(tail_dir.join(format!("{}.1.tail", id.simple())), legacy)?;
-
-    let index = recover_index(temp.path(), &schema)?;
-    assert_eq!(index.len(), 1);
-    assert_eq!(index[0].partition_key, "legacy");
-    assert_eq!(index[0].rows, 2);
-    assert!(index[0].path.is_file());
-
-    let (_, batch) = decode_tail_file(&index[0].path, &schema)?;
-    assert_eq!(batch.num_rows(), 2);
     Ok(())
 }

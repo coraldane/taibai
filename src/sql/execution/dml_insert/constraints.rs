@@ -110,8 +110,7 @@ pub fn validate_unique_key_uniqueness(
 }
 
 /// Collect one entry per live row for the given key columns. Rows sharing a
-/// duplicate key (e.g. written by legacy imports before primary-key
-/// validation) are all preserved: REPLACE treats every location as a
+/// duplicate key from an unvalidated write is preserved: REPLACE treats every location as a
 /// replaceable conflict, so callers must see each one instead of failing on
 /// pre-existing dirty data.
 pub fn collect_unique_index_entries(

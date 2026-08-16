@@ -51,7 +51,7 @@ CSV → 二进制列式编码 → Pipeline发送 → 服务端直接解析payloa
 ```
 
 - ✅ 跳过 SQL 解析
-- ✅ 跳过 WAL（`disable_wal: true`）
+- ✅ 使用当前统一的 active segment 持久化路径
 - ✅ Pipeline 模式（8个并发请求）
 - ✅ 生产者-消费者双线程架构
 - ✅ 字符串池化（security_id 零拷贝）

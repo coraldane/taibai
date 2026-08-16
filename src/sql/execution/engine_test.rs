@@ -949,7 +949,7 @@ fn bulk_payload_invalidates_rebuilt_unique_index() -> Result<()> {
             ("name", DataType::Int64, int64_col(&[2])),
         ],
     );
-    engine.exec_bulk_insert_payload_with_wal_control("main", &payload, false)?;
+    engine.exec_bulk_insert_payload_with_options("main", &payload, false)?;
 
     let duplicate = engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (2, 3)");
     assert!(duplicate.is_err());
@@ -977,7 +977,7 @@ fn concurrent_bulk_payload_workers_complete_without_catalog_lock_upgrade() -> Re
                 vec![("id", DataType::Int64, int64_col(&[worker_id]))],
             );
             barrier.wait();
-            let result = engine.exec_bulk_insert_payload_with_wal_control("main", &payload, false);
+            let result = engine.exec_bulk_insert_payload_with_options("main", &payload, false);
             tx.send(result).unwrap();
         }));
     }
@@ -1022,8 +1022,7 @@ fn mixed_read_write_flush_workers_keep_making_progress() -> Result<()> {
                             1,
                             vec![("id", DataType::Int64, int64_col(&[value]))],
                         );
-                        engine
-                            .exec_bulk_insert_payload_with_wal_control("main", &payload, false)?;
+                        engine.exec_bulk_insert_payload_with_options("main", &payload, false)?;
                     }
                 } else if worker_id < 7 {
                     let mut worker_session = session();
@@ -1448,7 +1447,7 @@ fn inject_unvalidated_bulk_row(
     };
     engine
         .segment_mgr()
-        .bulk_insert_payload_with_catalog(db, &payload, false, &catalog, true)?;
+        .bulk_insert_payload_with_catalog(db, &payload, &catalog, true)?;
     Ok(())
 }
 
@@ -1462,7 +1461,7 @@ fn replace_replaces_all_preexisting_duplicate_primary_key_rows() -> Result<()> {
         &mut session,
         "CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)",
     )?;
-    // Simulate a legacy writer that bypassed primary-key validation and left
+    // Simulate an unvalidated writer that bypassed primary-key validation and left
     // two live rows sharing one key.
     inject_unvalidated_bulk_row(
         &engine,
@@ -1611,7 +1610,7 @@ fn bulk_payload_rejects_duplicate_primary_keys() -> Result<()> {
         ],
     );
     assert!(engine
-        .exec_bulk_insert_payload_with_wal_control("main", &dup_in_batch, false)
+        .exec_bulk_insert_payload_with_options("main", &dup_in_batch, false)
         .is_err());
 
     let ok = bulk_payload(
@@ -1622,7 +1621,7 @@ fn bulk_payload_rejects_duplicate_primary_keys() -> Result<()> {
             ("val", DataType::Int64, int64_col(&[10])),
         ],
     );
-    engine.exec_bulk_insert_payload_with_wal_control("main", &ok, false)?;
+    engine.exec_bulk_insert_payload_with_options("main", &ok, false)?;
 
     let dup_existing = bulk_payload(
         "t",
@@ -1633,7 +1632,7 @@ fn bulk_payload_rejects_duplicate_primary_keys() -> Result<()> {
         ],
     );
     assert!(engine
-        .exec_bulk_insert_payload_with_wal_control("main", &dup_existing, false)
+        .exec_bulk_insert_payload_with_options("main", &dup_existing, false)
         .is_err());
 
     let count = first_i64(
@@ -1666,7 +1665,7 @@ fn bulk_import_invalidates_primary_key_snapshot_for_replace() -> Result<()> {
             ("val", DataType::Int64, int64_col(&[20])),
         ],
     );
-    engine.exec_bulk_insert_payload_with_wal_control("main", &payload, false)?;
+    engine.exec_bulk_insert_payload_with_options("main", &payload, false)?;
 
     // The snapshot must have been invalidated, so this REPLACE rebuilds it
     // and replaces the bulk-imported row instead of skipping it.

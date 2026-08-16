@@ -177,7 +177,7 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 
 - 协议支持列式批量插入消息。
 - 服务端支持 `START BULK IMPORT` / `STOP BULK IMPORT` 模式。
-- `START BULK IMPORT {"disable_wal":true}` 为兼容保留参数，当前无独立 WAL 写入。
+- `START BULK IMPORT` 启用统一的批量导入模式；当前无独立 WAL 写入。
 - 客户端支持 pipeline，在多个批次请求未完成时继续发送后续批次。
 - `examples/batch_import` 针对股票 tick CSV 数据实现了高性能导入示例，包括块读取、字符串池化、列式编码、批大小控制和进度输出。
 

@@ -81,9 +81,8 @@ pub struct UniqueIndexData {
     pub index_name: String,
     pub columns: Vec<String>,
     pub entries: Vec<UniqueIndexEntry>,
-    /// Memtable-flush epoch stamped when this snapshot was built. `None` (legacy
-    /// files) is treated as stale: the first probe rebuilds the snapshot so its
-    /// segment coverage is guaranteed before it is trusted for row locations.
+    /// Memtable-flush epoch stamped when this snapshot was built. A missing
+    /// epoch is treated as stale and causes the first probe to rebuild it.
     #[serde(default)]
     pub flush_epoch: Option<u64>,
     /// Per-segment row-count watermark captured when this snapshot's entries
@@ -973,12 +972,7 @@ impl IndexManager {
     }
 }
 
-const UNIQUE_INDEX_MAGIC_V1: &[u8; 8] = b"TBIUKV1\0";
-const UNIQUE_INDEX_MAGIC_V2: &[u8; 8] = b"TBIUKV2\0";
-const UNIQUE_INDEX_MAGIC_V3: &[u8; 8] = b"TBIUKV3\0";
-const UNIQUE_INDEX_MAGIC_V4: &[u8; 8] = b"TBIUKV4\0";
 const UNIQUE_INDEX_MAGIC_V5: &[u8; 8] = b"TBIUKV5\0";
-const UNIQUE_INDEX_DELTA_MAGIC_V1: &[u8; 8] = b"TBIUKD1\0";
 const UNIQUE_INDEX_DELTA_MAGIC_V2: &[u8; 8] = b"TBIUKD2\0";
 const UNIQUE_INDEX_BLOCK_SIZE: usize = 256;
 #[cfg(test)]
@@ -1430,9 +1424,6 @@ fn decode_unique_index_delta(bytes: &[u8]) -> Result<UniqueIndexDelta> {
     let mut cursor = Cursor::new(bytes);
     let mut magic = [0u8; 8];
     cursor.read_exact(&mut magic)?;
-    if &magic == UNIQUE_INDEX_DELTA_MAGIC_V1 {
-        return decode_unique_index_delta_v1(bytes, cursor);
-    }
     if &magic != UNIQUE_INDEX_DELTA_MAGIC_V2 {
         return Err(TaibaiError::Storage(
             "invalid unique index delta file".to_string(),
@@ -1479,128 +1470,6 @@ fn decode_unique_index_delta(bytes: &[u8]) -> Result<UniqueIndexDelta> {
     Ok(delta)
 }
 
-fn decode_unique_index_delta_v1(
-    bytes: &[u8],
-    mut cursor: Cursor<&[u8]>,
-) -> Result<UniqueIndexDelta> {
-    let mut delta = UniqueIndexDelta::default();
-    while (cursor.position() as usize) < bytes.len() {
-        let len = read_u32(&mut cursor)? as usize;
-        let start = cursor.position() as usize;
-        let end = start + len;
-        if end > bytes.len() {
-            return Err(TaibaiError::Storage(
-                "truncated unique index delta record".to_string(),
-            ));
-        }
-        let record = &bytes[start..end];
-        let mut record_cursor = Cursor::new(record);
-        let encoded_key = read_bytes(&mut record_cursor)?;
-        let entry = read_unique_index_entry(&mut record_cursor)?;
-        delta
-            .entries
-            .push(PreparedUniqueIndexEntry { encoded_key, entry });
-        cursor.set_position(end as u64);
-    }
-    Ok(delta)
-}
-
-fn write_u32<W: Write>(writer: &mut W, value: u32) -> Result<()> {
-    writer.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-fn decode_unique_index_data(bytes: &[u8]) -> Result<Option<UniqueIndexData>> {
-    let mut cursor = Cursor::new(bytes);
-    let mut magic = [0u8; 8];
-    cursor.read_exact(&mut magic)?;
-    if &magic == UNIQUE_INDEX_MAGIC_V1 {
-        return decode_unique_index_data_v1(&mut cursor);
-    }
-    if &magic == UNIQUE_INDEX_MAGIC_V2 {
-        return decode_unique_index_data_v2(&mut cursor);
-    }
-    if &magic == UNIQUE_INDEX_MAGIC_V3 {
-        return decode_unique_index_data_v3(&mut cursor);
-    }
-    if &magic == UNIQUE_INDEX_MAGIC_V4 {
-        return decode_unique_index_data_v4(&mut cursor);
-    }
-    if &magic == UNIQUE_INDEX_MAGIC_V5 {
-        return decode_unique_index_data_v5(&mut cursor);
-    }
-    Err(TaibaiError::Storage(
-        "invalid unique index binary file".to_string(),
-    ))
-}
-
-fn decode_unique_index_data_v1(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
-    let db = read_string(cursor)?;
-    let table = read_string(cursor)?;
-    let index_name = read_string(cursor)?;
-    let column_count = read_u32(cursor)? as usize;
-    let mut columns = Vec::with_capacity(column_count);
-    for _ in 0..column_count {
-        columns.push(read_string(cursor)?);
-    }
-    let entry_count = read_u64(cursor)? as usize;
-    let mut entries = Vec::with_capacity(entry_count);
-    for _ in 0..entry_count {
-        entries.push(read_unique_index_entry(cursor)?);
-    }
-    Ok(Some(UniqueIndexData {
-        db,
-        table,
-        index_name,
-        columns,
-        entries,
-        flush_epoch: None,
-        segment_watermarks: HashMap::new(),
-        tombstones: HashSet::new(),
-        encoded_keys: Vec::new(),
-        blocks: Vec::new(),
-    }))
-}
-
-fn decode_unique_index_data_v2(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
-    let db = read_string(cursor)?;
-    let table = read_string(cursor)?;
-    let index_name = read_string(cursor)?;
-    let column_count = read_u32(cursor)? as usize;
-    let mut columns = Vec::with_capacity(column_count);
-    for _ in 0..column_count {
-        columns.push(read_string(cursor)?);
-    }
-    let entry_count = read_u64(cursor)? as usize;
-    let _block_size = read_u32(cursor)? as usize;
-    let block_count = read_u32(cursor)? as usize;
-    let mut blocks = Vec::with_capacity(block_count);
-    for _ in 0..block_count {
-        blocks.push(UniqueIndexBlock {
-            start: read_u64(cursor)? as usize,
-            len: read_u32(cursor)? as usize,
-            first_key: read_bytes(cursor)?,
-        });
-    }
-    let mut entries = Vec::with_capacity(entry_count);
-    let mut encoded_keys = Vec::with_capacity(entry_count);
-    for _ in 0..entry_count {
-        encoded_keys.push(read_bytes(cursor)?);
-        entries.push(read_unique_index_entry(cursor)?);
-    }
-    Ok(Some(UniqueIndexData {
-        db,
-        table,
-        index_name,
-        columns,
-        entries,
-        flush_epoch: None,
-        segment_watermarks: HashMap::new(),
-        tombstones: HashSet::new(),
-        encoded_keys,
-        blocks,
-    }))
-}
-
 fn read_unique_index_entry(cursor: &mut Cursor<&[u8]>) -> Result<UniqueIndexEntry> {
     let key_len = read_u32(cursor)? as usize;
     let mut key = Vec::with_capacity(key_len);
@@ -1618,8 +1487,20 @@ fn read_unique_index_entry(cursor: &mut Cursor<&[u8]>) -> Result<UniqueIndexEntr
     })
 }
 
-fn decode_unique_index_data_v3(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
-    decode_unique_index_data_blocks(cursor).map(|result| result.map(|(data, _)| data))
+fn write_u32<W: Write>(writer: &mut W, value: u32) -> Result<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+fn decode_unique_index_data(bytes: &[u8]) -> Result<Option<UniqueIndexData>> {
+    let mut cursor = Cursor::new(bytes);
+    let mut magic = [0u8; 8];
+    cursor.read_exact(&mut magic)?;
+    if &magic != UNIQUE_INDEX_MAGIC_V5 {
+        return Err(TaibaiError::Storage(
+            "unsupported unique index version".to_string(),
+        ));
+    }
+    decode_unique_index_data_v5(&mut cursor)
 }
 
 fn decode_unique_index_data_v5(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
@@ -1643,23 +1524,6 @@ fn decode_unique_index_data_v5(cursor: &mut Cursor<&[u8]>) -> Result<Option<Uniq
             .insert(segment_path.clone(), row_count);
     }
     Ok(Some(data))
-}
-
-fn decode_unique_index_data_v4(cursor: &mut Cursor<&[u8]>) -> Result<Option<UniqueIndexData>> {
-    let Some((mut data, _paths)) = decode_unique_index_data_blocks_with_paths(cursor)? else {
-        return Ok(None);
-    };
-    let mut flag = [0u8; 1];
-    cursor.read_exact(&mut flag)?;
-    let epoch = read_u64(cursor)?;
-    data.flush_epoch = (flag[0] == 1).then_some(epoch);
-    Ok(Some(data))
-}
-
-fn decode_unique_index_data_blocks(
-    cursor: &mut Cursor<&[u8]>,
-) -> Result<Option<(UniqueIndexData, Vec<String>)>> {
-    decode_unique_index_data_blocks_with_paths(cursor)
 }
 
 fn decode_unique_index_data_blocks_with_paths(

@@ -457,36 +457,6 @@ fn stock_minute_index_data(entry_count: u32, path: &str) -> UniqueIndexData {
     }
 }
 
-fn encode_legacy_v2_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.extend_from_slice(UNIQUE_INDEX_MAGIC_V2);
-    put_string(&mut out, &data.db);
-    put_string(&mut out, &data.table);
-    put_string(&mut out, &data.index_name);
-    put_u32(&mut out, data.columns.len() as u32);
-    for column in &data.columns {
-        put_string(&mut out, column);
-    }
-    put_u64(&mut out, data.entries.len() as u64);
-    put_u32(&mut out, UNIQUE_INDEX_BLOCK_SIZE as u32);
-    put_u32(&mut out, data.blocks.len() as u32);
-    for block in &data.blocks {
-        put_u64(&mut out, block.start as u64);
-        put_u32(&mut out, block.len as u32);
-        put_bytes(&mut out, &block.first_key);
-    }
-    for (idx, entry) in data.entries.iter().enumerate() {
-        put_bytes(&mut out, &data.encoded_keys[idx]);
-        put_u32(&mut out, entry.key.len() as u32);
-        for value in &entry.key {
-            encode_scalar_value(&mut out, value)?;
-        }
-        put_string(&mut out, &entry.location.segment_path);
-        put_u64(&mut out, entry.location.row_id);
-    }
-    Ok(out)
-}
-
 #[test]
 fn unique_index_data_v5_roundtrip_preserves_entries_and_watermarks() -> Result<()> {
     let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
@@ -518,54 +488,6 @@ fn unique_index_data_v5_roundtrip_preserves_entries_and_watermarks() -> Result<(
         assert_eq!(decoded_block.start, expected_block.start);
         assert_eq!(decoded_block.len, expected_block.len);
         assert_eq!(decoded_block.first_key, expected_block.first_key);
-    }
-    Ok(())
-}
-
-#[test]
-fn unique_index_data_v4_without_watermarks_still_decodes() -> Result<()> {
-    let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
-    let mut data = stock_minute_index_data(3000, path);
-    data.flush_epoch = Some(7);
-    prepare_unique_index_data(&mut data)?;
-    let v5_bytes = encode_unique_index_data(&data)?;
-    // With no watermarks the v5 layout is exactly v4 plus a trailing
-    // zero-count u32; stripping it and downgrading the magic
-    // reconstructs a legacy v4 payload.
-    let mut v4_bytes = v5_bytes[..v5_bytes.len() - 4].to_vec();
-    v4_bytes[..8].copy_from_slice(UNIQUE_INDEX_MAGIC_V4);
-    assert_eq!(&v4_bytes[..8], UNIQUE_INDEX_MAGIC_V4);
-    let decoded = decode_unique_index_data(&v4_bytes)?.unwrap();
-    assert_eq!(decoded.flush_epoch, Some(7));
-    assert_eq!(decoded.entries.len(), data.entries.len());
-    assert!(decoded.segment_watermarks.is_empty());
-    Ok(())
-}
-
-#[test]
-fn unique_index_data_v3_shrinks_shared_path_keyset() -> Result<()> {
-    let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
-    let mut data = stock_minute_index_data(2000, path);
-    prepare_unique_index_data(&mut data)?;
-    let v2_bytes = encode_legacy_v2_unique_index_data(&data)?;
-    let v3_bytes = encode_unique_index_data(&data)?;
-    assert!(v3_bytes.len() * 3 < v2_bytes.len());
-    assert!(v3_bytes.len() < data.entries.len() * 40);
-    Ok(())
-}
-
-#[test]
-fn unique_index_data_v2_snapshot_still_decodes() -> Result<()> {
-    let path = "/data/monitor-data/taibai_data/quant_base/t_stock_minute/p2026_0007.dat";
-    let mut data = stock_minute_index_data(600, path);
-    prepare_unique_index_data(&mut data)?;
-    let v2_bytes = encode_legacy_v2_unique_index_data(&data)?;
-    let decoded = decode_unique_index_data(&v2_bytes)?.unwrap();
-    assert_eq!(decoded.entries.len(), data.entries.len());
-    assert_eq!(decoded.encoded_keys, data.encoded_keys);
-    for (decoded_entry, expected_entry) in decoded.entries.iter().zip(&data.entries) {
-        assert_eq!(decoded_entry.key, expected_entry.key);
-        assert_eq!(decoded_entry.location, expected_entry.location);
     }
     Ok(())
 }

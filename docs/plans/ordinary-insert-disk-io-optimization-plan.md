@@ -58,9 +58,9 @@ tail v3 帧 = 与 segment 行组**同构**的列式 zstd chunk。flush 从"解�
 - 收益：flush 的 CPU 解码/重编码归零；写 I/O 变为纯顺序大块拷贝（macOS
   `clonefile` / Linux `copy_file_range` 可进一步降拷贝开销）。
 - 局限：瞬态字节仍是 2×（tail 在 flush 前存在）——只把"双写"变廉价，未消除。
-- 改动面：`durable_tail.rs` 帧编码 + v3 magic + v1/v2 兼容解码；`flush_memtable_group`
+- 改动面：`durable_tail.rs` 帧编码与当前 magic；`flush_memtable_group`
   拼接路径；恢复路径复用 generation 仲裁不变。
-- 回退：解码路径保留 v2 兼容，v3 文件随 flush 自然消亡。
+- 格式切换不保留旧版解码路径，已有数据需重新导入。
 
 ### P2 — 多值 INSERT 自动直写（结构性消除 C1，需解决恢复语义）
 

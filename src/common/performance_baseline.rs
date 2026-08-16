@@ -18,9 +18,7 @@ pub struct PerformanceSample {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PerformanceBaselineEntry {
     pub database: String,
-    #[serde(default = "legacy_environment")]
     pub environment: String,
-    #[serde(default = "legacy_version")]
     pub version: String,
     pub fingerprint: String,
     pub query_shape: String,
@@ -63,7 +61,6 @@ impl PerformanceBaselineStore {
         let mut state = load_state(&path)
             .or_else(|| load_state(&backup_path(&path)))
             .unwrap_or_default();
-        migrate_keys(&mut state);
         evict_oldest(&mut state.entries, config.max_entries);
         Self {
             path,
@@ -330,19 +327,6 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_extension("json.bak")
 }
 
-fn migrate_keys(state: &mut PerformanceBaselineState) {
-    let entries = std::mem::take(&mut state.entries);
-    for (_, entry) in entries {
-        let key = baseline_key(
-            &entry.database,
-            &entry.environment,
-            &entry.version,
-            &entry.fingerprint,
-        );
-        state.entries.insert(key, entry);
-    }
-}
-
 fn baseline_key(database: &str, environment: &str, version: &str, fingerprint: &str) -> String {
     format!(
         "{}\0{}\0{}\0{}",
@@ -351,14 +335,6 @@ fn baseline_key(database: &str, environment: &str, version: &str, fingerprint: &
         version,
         fingerprint
     )
-}
-
-fn legacy_environment() -> String {
-    "default".to_string()
-}
-
-fn legacy_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
 }
 
 fn status_rank(status: &str) -> u8 {

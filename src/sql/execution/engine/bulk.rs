@@ -126,12 +126,11 @@ impl Engine {
         Ok(())
     }
 
-    pub fn exec_bulk_insert_with_wal_control(
+    pub fn exec_bulk_insert(
         &self,
         db: &str,
         table: &str,
         batch: RecordBatch,
-        disable_wal: bool,
     ) -> Result<u64> {
         self.validate_batch_unique_constraints(db, table, &batch)?;
         let table_meta_for_hot = {
@@ -152,10 +151,10 @@ impl Engine {
         let deferred = self.is_bulk_mode();
         let result = match if deferred {
             self.segment_mgr
-                .bulk_insert_batch_deferred(db, table, batch, disable_wal)
+                .bulk_insert_batch_deferred(db, table, batch)
         } else {
             self.segment_mgr
-                .bulk_insert_batch(db, table, batch, disable_wal)
+                .bulk_insert_batch(db, table, batch)
         } {
             Ok(result) => result,
             Err(e) => {
@@ -208,13 +207,12 @@ impl Engine {
         Ok(result)
     }
 
-    pub fn exec_bulk_insert_partitioned_with_wal_control(
+    pub fn exec_bulk_insert_partitioned(
         &self,
         db: &str,
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: RecordBatch,
-        disable_wal: bool,
         force_deferred: bool,
     ) -> Result<u64> {
         self.validate_batch_unique_constraints(db, table, &batch)?;
@@ -233,7 +231,7 @@ impl Engine {
                 .bulk_insert_batch_partitioned(db, table, table_meta, batch)
         } else {
             self.segment_mgr
-                .bulk_insert_batch(db, table, batch, disable_wal)
+                .bulk_insert_batch(db, table, batch)
         } {
             Ok(result) => result,
             Err(e) => {
@@ -266,20 +264,10 @@ impl Engine {
         Ok(result)
     }
 
-    pub fn exec_bulk_insert_payload_with_wal_control(
-        &self,
-        db: &str,
-        payload: &[u8],
-        disable_wal: bool,
-    ) -> Result<u64> {
-        self.exec_bulk_insert_payload_with_options(db, payload, disable_wal, false)
-    }
-
     pub fn exec_bulk_insert_payload_with_options(
         &self,
         db: &str,
         payload: &[u8],
-        disable_wal: bool,
         bulk_import_mode: bool,
     ) -> Result<u64> {
         let _op_guard = self.begin_operation();
@@ -356,7 +344,6 @@ impl Engine {
         let result = match self.segment_mgr.bulk_insert_payload_with_catalog(
             db,
             payload,
-            disable_wal,
             &catalog,
             !bulk_import_mode,
         ) {
@@ -407,7 +394,7 @@ impl Engine {
                 .advance_past(db, &table_name, max_value)?;
         }
 
-        if !disable_wal && !bulk_import_mode {
+        if !bulk_import_mode {
             self.record_inserted_rows(db, &table_name, result as i64, true, false)?;
             return Ok(result);
         }

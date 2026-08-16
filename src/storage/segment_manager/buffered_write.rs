@@ -4,7 +4,6 @@ impl SegmentManager {
         db: &str,
         table: &str,
         batch: RecordBatch,
-        _disable_wal: bool,
     ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true)
     }
@@ -14,7 +13,6 @@ impl SegmentManager {
         db: &str,
         table: &str,
         batch: &RecordBatch,
-        _disable_wal: bool,
     ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
     }
@@ -24,7 +22,6 @@ impl SegmentManager {
         db: &str,
         table: &str,
         batch: RecordBatch,
-        _disable_wal: bool,
     ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, false)
     }

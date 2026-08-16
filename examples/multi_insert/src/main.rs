@@ -151,7 +151,7 @@ async fn main() {
         log_msg!("Starting direct-to-segment bulk import mode (no memtable tails)...");
         for client in &mut clients {
             client
-                .start_bulk_import(&BulkImportConfig { disable_wal: false })
+                .start_bulk_import(&BulkImportConfig)
                 .await
                 .expect("start bulk import failed");
         }
