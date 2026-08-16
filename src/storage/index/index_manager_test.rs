@@ -193,6 +193,257 @@ fn compact_prepared_entries_drops_tombstones_and_dedups_placeholders() -> Result
 }
 
 #[test]
+fn delta_compaction_trigger_amortizes_by_entry_count() {
+    assert!(!unique_index_delta_needs_compaction(0, 0));
+    assert!(unique_index_delta_needs_compaction(
+        UNIQUE_INDEX_DELTA_COMPACT_MIN_ENTRIES,
+        0
+    ));
+    let base = UNIQUE_INDEX_DELTA_COMPACT_MIN_ENTRIES * UNIQUE_INDEX_DELTA_COMPACT_BASE_RATIO;
+    assert!(!unique_index_delta_needs_compaction(
+        UNIQUE_INDEX_DELTA_COMPACT_MIN_ENTRIES - 1,
+        base as usize
+    ));
+    assert!(unique_index_delta_needs_compaction(
+        UNIQUE_INDEX_DELTA_COMPACT_MIN_ENTRIES,
+        base as usize
+    ));
+    // The absolute ceiling bounds delta memory once the base grows huge.
+    let huge_base =
+        (UNIQUE_INDEX_DELTA_COMPACT_MAX_ENTRIES * UNIQUE_INDEX_DELTA_COMPACT_BASE_RATIO) as usize;
+    assert!(!unique_index_delta_needs_compaction(
+        UNIQUE_INDEX_DELTA_COMPACT_MAX_ENTRIES - 1,
+        huge_base
+    ));
+    assert!(unique_index_delta_needs_compaction(
+        UNIQUE_INDEX_DELTA_COMPACT_MAX_ENTRIES,
+        huge_base
+    ));
+}
+
+#[test]
+fn contains_any_key_locates_first_block_via_binary_search() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = SegmentManager::new(dir.path())?;
+    let mut data = UniqueIndexData {
+        db: "db".to_string(),
+        table: "ticks".to_string(),
+        index_name: "uk_value".to_string(),
+        columns: vec!["value".to_string()],
+        entries: (0..3000i64).map(|v| entry(v, v as u64)).collect(),
+        flush_epoch: None,
+        segment_watermarks: HashMap::new(),
+        tombstones: HashSet::new(),
+        encoded_keys: Vec::new(),
+        blocks: Vec::new(),
+    };
+    prepare_unique_index_data(&mut data)?;
+    assert!(data.blocks.len() >= 12, "seed must span multiple blocks");
+
+    fn encoded_sorted(values: &[i64]) -> Result<Vec<Vec<u8>>> {
+        let mut keys: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| encode_unique_key(&[ScalarValue::Int64(Some(*v))]))
+            .collect::<Result<_>>()?;
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    let state = UniqueIndexState::new(data, UniqueIndexDeltaState::default());
+    // Needles confined to the last block must still be found.
+    assert!(unique_index_state_contains_any_key(
+        &segment_mgr,
+        &state,
+        &encoded_sorted(&[2990, 2991, 2999])?
+    )?);
+    // Needles inside a middle block.
+    assert!(unique_index_state_contains_any_key(
+        &segment_mgr,
+        &state,
+        &encoded_sorted(&[1024, 1025])?
+    )?);
+    // All needles beyond the key range.
+    assert!(!unique_index_state_contains_any_key(
+        &segment_mgr,
+        &state,
+        &encoded_sorted(&[3000, 3001, 5000])?
+    )?);
+    // Missing needles mixed with a present one.
+    assert!(unique_index_state_contains_any_key(
+        &segment_mgr,
+        &state,
+        &encoded_sorted(&[4000, 5, 4001])?
+    )?);
+    Ok(())
+}
+
+fn int64_keys(values: &[i64]) -> Vec<Vec<ScalarValue>> {
+    values
+        .iter()
+        .map(|value| vec![ScalarValue::Int64(Some(*value))])
+        .collect()
+}
+
+fn seed_unique_index(manager: &IndexManager, values: std::ops::Range<i64>) -> Result<()> {
+    manager.persist_unique_index_entries(
+        "db",
+        "t",
+        "uk",
+        &["value".to_string()],
+        values.map(|v| entry(v, v as u64)).collect(),
+        Some(0),
+        Some(HashMap::new()),
+    )
+}
+
+#[test]
+fn background_compaction_preserves_appends_that_raced_the_merge() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    seed_unique_index(&manager, 0..10)?;
+    let batch: Vec<UniqueIndexEntry> = (10..40).map(|v| entry(v, v as u64)).collect();
+    assert!(manager.append_unique_index_entries("db", "t", "uk", batch)?);
+
+    let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
+    let job = UniqueIndexCompactionJob {
+        db: "db".to_string(),
+        table: "t".to_string(),
+        index_name: "uk".to_string(),
+        state: Arc::clone(&state),
+        unique_indexes: Arc::clone(&manager.unique_indexes),
+        data_dir: dir.path().to_path_buf(),
+    };
+    let snapshot = job.snapshot()?.unwrap();
+
+    let window: Vec<UniqueIndexEntry> = (40..50).map(|v| entry(v, v as u64)).collect();
+    let prepared = manager.prepare_unique_index_entries(window)?;
+    append_prepared_unique_index_delta(&job.delta_path(), &prepared)?;
+    {
+        let mut delta = state.delta.write().unwrap();
+        for addition in prepared {
+            delta
+                .key_locations
+                .entry(addition.encoded_key.clone())
+                .or_default()
+                .push(addition.entry.location.clone());
+            delta.entry_count += 1;
+        }
+    }
+
+    let (tmp_path, data) = job.build_compacted_base(&snapshot)?;
+    assert!(job.publish(snapshot.delta_bytes.len(), &tmp_path, data)?);
+
+    assert_eq!(
+        manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 25, 45]))?,
+        Some(true)
+    );
+    assert_eq!(
+        manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[99]))?,
+        Some(false)
+    );
+
+    let delta_bytes = std::fs::read(job.delta_path())?;
+    assert_eq!(decode_unique_index_delta(&delta_bytes)?.entries.len(), 10);
+
+    let merged = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
+    assert_eq!(merged.base.entries.len(), 40);
+    assert_eq!(merged.delta.read().unwrap().entry_count, 10);
+    assert!(!merged.compaction_in_flight.load(Ordering::Acquire));
+
+    let manager2 = IndexManager::new_with_data_dir(
+        Arc::new(SegmentManager::new(dir.path())?),
+        dir.path().to_path_buf(),
+    );
+    assert_eq!(
+        manager2.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 25, 45]))?,
+        Some(true)
+    );
+    assert_eq!(
+        manager2.unique_keys_exist("db", "t", "uk", &int64_keys(&[99]))?,
+        Some(false)
+    );
+    Ok(())
+}
+
+#[test]
+fn superseded_compaction_job_leaves_files_untouched() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    seed_unique_index(&manager, 0..10)?;
+    let batch: Vec<UniqueIndexEntry> = (10..20).map(|v| entry(v, v as u64)).collect();
+    assert!(manager.append_unique_index_entries("db", "t", "uk", batch)?);
+
+    let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
+    let job = UniqueIndexCompactionJob {
+        db: "db".to_string(),
+        table: "t".to_string(),
+        index_name: "uk".to_string(),
+        state: Arc::clone(&state),
+        unique_indexes: Arc::clone(&manager.unique_indexes),
+        data_dir: dir.path().to_path_buf(),
+    };
+    let snapshot = job.snapshot()?.unwrap();
+    let delta_before = std::fs::read(job.delta_path())?;
+    let base_before = std::fs::read(job.base_path())?;
+    let (tmp_path, data) = job.build_compacted_base(&snapshot)?;
+
+    manager.invalidate_unique_index_snapshot("db", "t", "uk");
+    assert!(!job.publish(snapshot.delta_bytes.len(), &tmp_path, data)?);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    assert_eq!(std::fs::read(job.delta_path())?, delta_before);
+    assert_eq!(std::fs::read(job.base_path())?, base_before);
+    assert!(manager
+        .unique_keys_exist("db", "t", "uk", &int64_keys(&[5]))?
+        .is_none());
+    Ok(())
+}
+
+#[test]
+fn dispatched_delta_compaction_publishes_new_base_and_resets_flag() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    seed_unique_index(&manager, 0..10)?;
+    let batch: Vec<UniqueIndexEntry> = (10..60).map(|v| entry(v, v as u64)).collect();
+    assert!(manager.append_unique_index_entries("db", "t", "uk", batch)?);
+
+    let state = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
+    assert_eq!(state.base.entries.len(), 60);
+    assert_eq!(state.delta.read().unwrap().entry_count, 0);
+    assert!(!state.compaction_in_flight.load(Ordering::Acquire));
+    assert!(!manager
+        .unique_index_dir("db", "t")
+        .join("uk.delta.tbi")
+        .exists());
+
+    assert_eq!(
+        manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 55]))?,
+        Some(true)
+    );
+    assert_eq!(
+        manager.unique_keys_exist("db", "t", "uk", &int64_keys(&[99]))?,
+        Some(false)
+    );
+
+    let manager2 = IndexManager::new_with_data_dir(
+        Arc::new(SegmentManager::new(dir.path())?),
+        dir.path().to_path_buf(),
+    );
+    assert_eq!(
+        manager2.unique_keys_exist("db", "t", "uk", &int64_keys(&[5, 55]))?,
+        Some(true)
+    );
+    Ok(())
+}
+
+#[test]
 fn refresh_collapses_duplicate_memtable_placeholders_at_compaction() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("db").join("ticks");

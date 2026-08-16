@@ -53,7 +53,7 @@
 - delta 保存后续追加和 tombstone；
 - `segment_watermarks` 记录每个 segment 已被索引覆盖的行数；
 - `flush_epoch` 标识索引覆盖的 segment 内容版本；
-- delta 达到阈值后压实回 base。
+- delta 达到阈值后在后台线程压实回 base（阈值按条目数对 base 大小摊还并设绝对上限，导入路径只追加 delta）。
 
 内存 `primary_key_indexes: HashSet` 只作为热点缓存，不能作为主键正确性的唯一索引。重启后应从持久化的 `PRIMARY_LOCATION_INDEX_NAME` 状态加载或探测，而不是回退为全表扫描后只安装内存 HashSet。
 
@@ -310,7 +310,7 @@ Vec<SegmentAppendRange> {
 
 1. `UniqueIndexState` 的刷新进度从 base 快照中分离为独立的 `UniqueIndexProgress`（flush epoch + 各 segment watermark），持久化为 `{name}.progress.tbi` sidecar，重启后与 base+delta 合并加载，崩溃或截断时回退为从 watermark 0 全量重扫，保证不漏报。
 2. `refresh_stale_unique_index_state` 增加 `allow_delta_append` 门控：
-   - direct bulk 写后通过 `IndexManager::refresh_unique_index_state` 走快路径：只扫描 watermark 之后的新 segment 尾部，把新增条目追加到 `{name}.delta.tbi` 并发布新 progress，不再重写 base 快照；delta 超过压实阈值时回退完整物化并压实。
+   - direct bulk 写后通过 `IndexManager::refresh_unique_index_state` 走快路径：只扫描 watermark 之后的新 segment 尾部，把新增条目追加到 `{name}.delta.tbi` 并发布新 progress，不再重写 base 快照；delta 超过按条目数摊还的压实阈值时派发后台压实，合并计算不持锁，发布阶段仅短暂持锁，合并窗口内的新增追加以文件后缀形式保留在新 delta 中，不在导入路径上同步重写 base。
    - 普通探测路径（`unique_keys_exist` / `unique_key_locations`）保持完整物化行为，继续折叠同一键的重复 memtable 占位条目，维持原有清理不变量。
 3. direct bulk 写后不再用批量 `unique_keys_exist` 探测来顺带触发刷新，而是直接调用 `refresh_unique_index_state`，消除每批对百万级键的无谓探测。
 

@@ -1102,6 +1102,47 @@ fn bulk_payload_delta_compaction_is_amortized_against_base_size() -> Result<()> 
 }
 
 #[test]
+#[ignore = "diagnostic: run manually with --ignored --nocapture"]
+fn bulk_stage_timing_drift_diagnostic() -> Result<()> {
+    crate::common::config::set_insert_profile_enabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)",
+    )?;
+    let batches = 12;
+    let rows_per_batch = 400_000i64;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    let mut next_id = 0i64;
+    for batch in 0..batches {
+        let ids: Vec<i64> = (next_id..next_id + rows_per_batch).collect();
+        let vs: Vec<i64> = ids.iter().map(|v| v * 3).collect();
+        let payload = bulk_payload(
+            "t",
+            rows_per_batch as u32,
+            vec![
+                ("id", DataType::Int64, int64_col(&ids)),
+                ("v", DataType::Int64, int64_col(&vs)),
+            ],
+        );
+        let start = std::time::Instant::now();
+        engine.exec_bulk_insert_payload_with_options("main", &payload, true)?;
+        println!(
+            "[drift] batch={} total_ms={}",
+            batch,
+            start.elapsed().as_millis()
+        );
+        next_id += rows_per_batch;
+    }
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    Ok(())
+}
+
+#[test]
 fn bulk_payload_unique_indexes_survive_restart_and_multiple_batches() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {

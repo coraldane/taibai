@@ -2,6 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ pub const PRIMARY_LOCATION_INDEX_NAME: &str = "__taibai_primary_location";
 
 pub struct IndexManager {
     indexes: RwLock<HashMap<String, HashMap<String, Arc<SparseIndexImpl>>>>,
-    unique_indexes: RwLock<HashMap<String, Arc<UniqueIndexState>>>,
+    unique_indexes: Arc<RwLock<HashMap<String, Arc<UniqueIndexState>>>>,
     primary_key_indexes: RwLock<HashMap<String, HashSet<Vec<u8>>>>,
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
@@ -54,6 +55,7 @@ struct UniqueIndexState {
     delta: RwLock<UniqueIndexDeltaState>,
     progress: RwLock<UniqueIndexProgress>,
     mutation_lock: Mutex<()>,
+    compaction_in_flight: AtomicBool,
 }
 
 #[derive(Default, Clone)]
@@ -88,6 +90,7 @@ impl UniqueIndexState {
             delta: RwLock::new(delta),
             progress: RwLock::new(progress),
             mutation_lock: Mutex::new(()),
+            compaction_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -145,7 +148,7 @@ impl IndexManager {
     pub fn new_with_data_dir(segment_mgr: Arc<SegmentManager>, data_dir: PathBuf) -> Self {
         Self {
             indexes: RwLock::new(HashMap::new()),
-            unique_indexes: RwLock::new(HashMap::new()),
+            unique_indexes: Arc::new(RwLock::new(HashMap::new())),
             primary_key_indexes: RwLock::new(HashMap::new()),
             segment_mgr,
             data_dir,
@@ -443,6 +446,25 @@ impl IndexManager {
         Ok(Some(current))
     }
 
+    fn materialize_unique_index_state(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        state: &UniqueIndexState,
+    ) -> Result<UniqueIndexData> {
+        let tombstones = state.delta.read().unwrap().tombstones.clone();
+        let dir = self.unique_index_dir(db, table);
+        let base = sanitize_file_component(index_name);
+        let delta_path = dir.join(format!("{}.delta.tbi", base));
+        let delta_bytes = if delta_path.exists() {
+            std::fs::read(&delta_path)?
+        } else {
+            Vec::new()
+        };
+        materialize_unique_index_state_parts(&state.base, &delta_bytes, &tombstones)
+    }
+
     pub fn load_unique_index_data(
         &self,
         db: &str,
@@ -674,36 +696,30 @@ impl IndexManager {
         let delta_path = self
             .unique_index_dir(db, table)
             .join(format!("{}.delta.tbi", sanitize_file_component(index_name)));
-        let delta_bytes = std::fs::metadata(&delta_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        if delta_bytes < self.unique_index_delta_compaction_threshold(db, table, index_name) {
-            append_prepared_unique_index_delta(&delta_path, &prepared_additions)?;
-            {
-                let mut delta = state.delta.write().unwrap();
-                for addition in prepared_additions {
-                    delta
-                        .key_locations
-                        .entry(addition.encoded_key.clone())
-                        .or_default()
-                        .push(addition.entry.location.clone());
-                    delta.entry_count += 1;
-                }
+        append_prepared_unique_index_delta(&delta_path, &prepared_additions)?;
+        let delta_count = {
+            let mut delta = state.delta.write().unwrap();
+            for addition in prepared_additions {
+                delta
+                    .key_locations
+                    .entry(addition.encoded_key.clone())
+                    .or_default()
+                    .push(addition.entry.location.clone());
+                delta.entry_count += 1;
             }
-            state.set_progress(Some(epoch_before), watermarks);
-            self.persist_unique_index_progress(db, table, index_name)?;
-            return Ok(Some(Arc::clone(state)));
+            delta
+                .entry_count
+                .saturating_add(delta.tombstones.len() as u64)
+        };
+        let needs_compaction =
+            unique_index_delta_needs_compaction(delta_count, state.base.entries.len());
+        state.set_progress(Some(epoch_before), watermarks);
+        self.persist_unique_index_progress(db, table, index_name)?;
+        drop(_mutation_guard);
+        if needs_compaction {
+            self.try_dispatch_unique_index_compaction(db, table, index_name, state);
         }
-        let mut data = self.materialize_unique_index_state(db, table, index_name, state)?;
-        merge_prepared_unique_index_entries(&mut data, prepared_additions)?;
-        compact_prepared_unique_index_entries(&mut data);
-        data.flush_epoch = Some(epoch_before);
-        data.segment_watermarks = watermarks;
-        self.persist_prepared_unique_index_data(db, table, index_name, data)?;
-        match self.unique_indexes.read().unwrap().get(&cache_key) {
-            Some(state) => Ok(Some(Arc::clone(state))),
-            None => Ok(None),
-        }
+        Ok(Some(Arc::clone(state)))
     }
 
     /// Persist the in-memory refresh progress (epoch plus per-segment
@@ -866,13 +882,17 @@ impl IndexManager {
             };
             state = refreshed;
         }
-        for key in keys {
-            let encoded = encode_unique_key(key)?;
-            if unique_index_state_contains_key(&self.segment_mgr, &state, &encoded)? {
-                return Ok(Some(true));
-            }
-        }
-        Ok(Some(false))
+        let mut encoded_keys = keys
+            .iter()
+            .map(|key| encode_unique_key(key))
+            .collect::<Result<Vec<_>>>()?;
+        encoded_keys.sort();
+        encoded_keys.dedup();
+        Ok(Some(unique_index_state_contains_any_key(
+            &self.segment_mgr,
+            &state,
+            &encoded_keys,
+        )?))
     }
 
     pub fn prepare_unique_index_entries(
@@ -903,44 +923,45 @@ impl IndexManager {
         let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(false);
         };
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
-        let cache_key = unique_index_key(db, table, index_name);
-        let is_current = self
-            .unique_indexes
-            .read()
-            .unwrap()
-            .get(&cache_key)
-            .is_some_and(|current| Arc::ptr_eq(current, &state));
-        if !is_current {
-            drop(_mutation_guard);
-            return self.append_prepared_unique_index_entries(db, table, index_name, entries);
-        }
-        let dir = self.unique_index_dir(db, table);
-        std::fs::create_dir_all(&dir)?;
-        let base = sanitize_file_component(index_name);
-        let delta_path = dir.join(format!("{}.delta.tbi", base));
-        append_prepared_unique_index_delta(&delta_path, &entries)?;
-        {
-            let mut delta = state.delta.write().unwrap();
-            for addition in entries {
-                delta
-                    .key_locations
-                    .entry(addition.encoded_key.clone())
-                    .or_default()
-                    .push(addition.entry.location.clone());
-                delta.entry_count += 1;
+        let needs_compaction = {
+            let _mutation_guard = state.mutation_lock.lock().unwrap();
+            let cache_key = unique_index_key(db, table, index_name);
+            let is_current = self
+                .unique_indexes
+                .read()
+                .unwrap()
+                .get(&cache_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &state));
+            if !is_current {
+                drop(_mutation_guard);
+                return self.append_prepared_unique_index_entries(db, table, index_name, entries);
             }
-        }
-        if std::fs::metadata(&delta_path)?.len()
-            >= self.unique_index_delta_compaction_threshold(db, table, index_name)
-        {
-            let mut data = self.materialize_unique_index_state(db, table, index_name, &state)?;
-            // Delta compaction preserves the snapshot's epoch: flushing since the
-            // snapshot was built keeps it stale so the next probe refreshes it.
-            data.segment_watermarks = state.progress_watermarks();
-            data.flush_epoch = state.progress_epoch();
-            compact_prepared_unique_index_entries(&mut data);
-            self.persist_prepared_unique_index_data(db, table, index_name, data)?;
+            let dir = self.unique_index_dir(db, table);
+            std::fs::create_dir_all(&dir)?;
+            let base = sanitize_file_component(index_name);
+            let delta_path = dir.join(format!("{}.delta.tbi", base));
+            append_prepared_unique_index_delta(&delta_path, &entries)?;
+            {
+                let mut delta = state.delta.write().unwrap();
+                for addition in entries {
+                    delta
+                        .key_locations
+                        .entry(addition.encoded_key.clone())
+                        .or_default()
+                        .push(addition.entry.location.clone());
+                    delta.entry_count += 1;
+                }
+            }
+            let delta_count = {
+                let delta = state.delta.read().unwrap();
+                delta
+                    .entry_count
+                    .saturating_add(delta.tombstones.len() as u64)
+            };
+            unique_index_delta_needs_compaction(delta_count, state.base.entries.len())
+        };
+        if needs_compaction {
+            self.try_dispatch_unique_index_compaction(db, table, index_name, &state);
         }
         Ok(true)
     }
@@ -969,36 +990,40 @@ impl IndexManager {
         let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(false);
         };
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
-        let cache_key = unique_index_key(db, table, index_name);
-        let is_current = self
-            .unique_indexes
-            .read()
-            .unwrap()
-            .get(&cache_key)
-            .is_some_and(|current| Arc::ptr_eq(current, &state));
-        if !is_current {
-            drop(_mutation_guard);
-            return self.append_unique_index_tombstones(db, table, index_name, tombstones);
-        }
-        let dir = self.unique_index_dir(db, table);
-        let base = sanitize_file_component(index_name);
-        let data_path = dir.join(format!("{}.keys.tbi", base));
-        if !data_path.exists() {
-            return Ok(false);
-        }
-        std::fs::create_dir_all(&dir)?;
-        let delta_path = dir.join(format!("{}.delta.tbi", base));
-        append_unique_index_tombstone_delta(&delta_path, &tombstones)?;
-        state.delta.write().unwrap().tombstones.extend(tombstones);
-        if std::fs::metadata(&delta_path)?.len()
-            >= self.unique_index_delta_compaction_threshold(db, table, index_name)
-        {
-            let mut data = self.materialize_unique_index_state(db, table, index_name, &state)?;
-            data.segment_watermarks = state.progress_watermarks();
-            data.flush_epoch = state.progress_epoch();
-            compact_prepared_unique_index_entries(&mut data);
-            self.persist_prepared_unique_index_data(db, table, index_name, data)?;
+        let needs_compaction = {
+            let _mutation_guard = state.mutation_lock.lock().unwrap();
+            let cache_key = unique_index_key(db, table, index_name);
+            let is_current = self
+                .unique_indexes
+                .read()
+                .unwrap()
+                .get(&cache_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &state));
+            if !is_current {
+                drop(_mutation_guard);
+                return self.append_unique_index_tombstones(db, table, index_name, tombstones);
+            }
+            let dir = self.unique_index_dir(db, table);
+            let base = sanitize_file_component(index_name);
+            let data_path = dir.join(format!("{}.keys.tbi", base));
+            if !data_path.exists() {
+                return Ok(false);
+            }
+            std::fs::create_dir_all(&dir)?;
+            let delta_path = dir.join(format!("{}.delta.tbi", base));
+            append_unique_index_tombstone_delta(&delta_path, &tombstones)?;
+            let delta_count = {
+                let mut delta = state.delta.write().unwrap();
+                delta.tombstones.extend(tombstones);
+                (delta.entry_count, delta.tombstones.len() as u64)
+            };
+            unique_index_delta_needs_compaction(
+                delta_count.0.saturating_add(delta_count.1),
+                state.base.entries.len(),
+            )
+        };
+        if needs_compaction {
+            self.try_dispatch_unique_index_compaction(db, table, index_name, &state);
         }
         Ok(true)
     }
@@ -1078,43 +1103,228 @@ impl IndexManager {
             .join("unique")
     }
 
-    fn unique_index_delta_compaction_threshold(
+    fn try_dispatch_unique_index_compaction(
         &self,
         db: &str,
         table: &str,
         index_name: &str,
-    ) -> u64 {
-        let base_bytes = std::fs::metadata(
-            self.unique_index_dir(db, table)
-                .join(format!("{}.keys.tbi", sanitize_file_component(index_name))),
-        )
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-        UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES
-            .max(base_bytes / UNIQUE_INDEX_DELTA_COMPACT_BASE_RATIO)
+        state: &Arc<UniqueIndexState>,
+    ) {
+        if state.compaction_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let job = UniqueIndexCompactionJob {
+            db: db.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+            state: Arc::clone(state),
+            unique_indexes: Arc::clone(&self.unique_indexes),
+            data_dir: self.data_dir.clone(),
+        };
+        #[cfg(test)]
+        {
+            job.run();
+        }
+        #[cfg(not(test))]
+        {
+            if std::thread::Builder::new()
+                .name("taibai-unique-index-compaction".to_string())
+                .spawn(move || job.run())
+                .is_err()
+            {
+                state.compaction_in_flight.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Merges a base snapshot with serialized delta records and a set of
+/// in-memory tombstones into one materialized `UniqueIndexData`. Progress
+/// fields are copied from the base; callers override them as needed.
+fn materialize_unique_index_state_parts(
+    state_base: &UniqueIndexData,
+    delta_bytes: &[u8],
+    tombstones: &HashSet<UniqueRowLocation>,
+) -> Result<UniqueIndexData> {
+    let decoded = if delta_bytes.is_empty() {
+        UniqueIndexDelta::default()
+    } else {
+        decode_unique_index_delta(delta_bytes)?
+    };
+    let mut data = UniqueIndexData {
+        db: state_base.db.clone(),
+        table: state_base.table.clone(),
+        index_name: state_base.index_name.clone(),
+        columns: state_base.columns.clone(),
+        entries: state_base
+            .entries
+            .iter()
+            .map(|entry| UniqueIndexEntry {
+                key: if entry.location.segment_path.is_empty() {
+                    entry.key.clone()
+                } else {
+                    Vec::new()
+                },
+                location: entry.location.clone(),
+            })
+            .collect(),
+        flush_epoch: state_base.flush_epoch,
+        segment_watermarks: state_base.segment_watermarks.clone(),
+        tombstones: state_base.tombstones.clone(),
+        encoded_keys: state_base.encoded_keys.clone(),
+        blocks: Vec::new(),
+    };
+    data.tombstones.extend(tombstones.iter().cloned());
+    data.tombstones.extend(decoded.tombstones.iter().cloned());
+    merge_prepared_unique_index_entries(&mut data, decoded.entries)?;
+    Ok(data)
+}
+
+struct UniqueIndexCompactionSnapshot {
+    delta_bytes: Vec<u8>,
+    tombstones: HashSet<UniqueRowLocation>,
+}
+
+/// Single-flight background compaction of the delta back into the base
+/// snapshot. Split into snapshot -> unlocked merge -> publish so appends
+/// that race the merge (records appended past the snapshot length) are
+/// preserved: publish rewrites the delta file to exactly that suffix.
+struct UniqueIndexCompactionJob {
+    db: String,
+    table: String,
+    index_name: String,
+    state: Arc<UniqueIndexState>,
+    unique_indexes: Arc<RwLock<HashMap<String, Arc<UniqueIndexState>>>>,
+    data_dir: PathBuf,
+}
+
+impl UniqueIndexCompactionJob {
+    /// Best effort: any failure leaves the pre-compaction base and delta
+    /// untouched (still a valid, merely larger, index) and the next
+    /// threshold crossing retries.
+    fn run(self) {
+        if let Err(_error) = self.execute() {}
+        self.state
+            .compaction_in_flight
+            .store(false, Ordering::Release);
     }
 
-    fn materialize_unique_index_state(
-        &self,
-        db: &str,
-        table: &str,
-        index_name: &str,
-        state: &UniqueIndexState,
-    ) -> Result<UniqueIndexData> {
-        let tombstones = state.delta.read().unwrap().tombstones.clone();
-        let dir = self.unique_index_dir(db, table);
-        let base = sanitize_file_component(index_name);
-        let delta_path = dir.join(format!("{}.delta.tbi", base));
-        let decoded = if delta_path.exists() {
-            decode_unique_index_delta(&std::fs::read(&delta_path)?)?
-        } else {
-            UniqueIndexDelta::default()
+    fn execute(&self) -> Result<()> {
+        let Some(snapshot) = self.snapshot()? else {
+            return Ok(());
         };
-        let mut data = (*state.base).clone();
-        data.tombstones.extend(tombstones);
-        data.tombstones.extend(decoded.tombstones);
-        merge_prepared_unique_index_entries(&mut data, decoded.entries)?;
-        Ok(data)
+        let (tmp_path, data) = self.build_compacted_base(&snapshot)?;
+        if !self.publish(snapshot.delta_bytes.len(), &tmp_path, data)? {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<Option<UniqueIndexCompactionSnapshot>> {
+        let _guard = self.state.mutation_lock.lock().unwrap();
+        if !self.state_is_current() {
+            return Ok(None);
+        }
+        let delta_path = self.delta_path();
+        let delta_bytes = if delta_path.exists() {
+            std::fs::read(&delta_path)?
+        } else {
+            Vec::new()
+        };
+        let tombstones = self.state.delta.read().unwrap().tombstones.clone();
+        Ok(Some(UniqueIndexCompactionSnapshot {
+            delta_bytes,
+            tombstones,
+        }))
+    }
+
+    fn state_is_current(&self) -> bool {
+        self.unique_indexes
+            .read()
+            .unwrap()
+            .get(&unique_index_key(&self.db, &self.table, &self.index_name))
+            .is_some_and(|current| Arc::ptr_eq(current, &self.state))
+    }
+
+    fn index_dir(&self) -> PathBuf {
+        self.data_dir
+            .join(&self.db)
+            .join(&self.table)
+            .join("indexes")
+            .join("unique")
+    }
+
+    fn delta_path(&self) -> PathBuf {
+        self.index_dir().join(format!(
+            "{}.delta.tbi",
+            sanitize_file_component(&self.index_name)
+        ))
+    }
+
+    fn base_path(&self) -> PathBuf {
+        self.index_dir().join(format!(
+            "{}.keys.tbi",
+            sanitize_file_component(&self.index_name)
+        ))
+    }
+
+    fn build_compacted_base(
+        &self,
+        snapshot: &UniqueIndexCompactionSnapshot,
+    ) -> Result<(PathBuf, UniqueIndexData)> {
+        let mut data = materialize_unique_index_state_parts(
+            &self.state.base,
+            &snapshot.delta_bytes,
+            &snapshot.tombstones,
+        )?;
+        // Embed the snapshot progress: the progress sidecar file may
+        // advance during the merge and outranks this on restart.
+        data.flush_epoch = self.state.progress_epoch();
+        data.segment_watermarks = self.state.progress_watermarks();
+        compact_prepared_unique_index_entries(&mut data);
+        let tmp = self.base_path().with_extension("keys.tbi.tmp");
+        std::fs::create_dir_all(self.index_dir())?;
+        std::fs::write(&tmp, encode_unique_index_data(&data)?)?;
+        Ok((tmp, data))
+    }
+
+    /// Publishes the compacted base. Appends that raced the merge (records
+    /// past `snapshot_len`) survive as the rewritten delta file's only
+    /// content. The base rename happens before the delta rewrite: a crash
+    /// in between leaves duplicate-but-benign entries, never lost ones.
+    fn publish(&self, snapshot_len: usize, tmp_path: &Path, data: UniqueIndexData) -> Result<bool> {
+        let _guard = self.state.mutation_lock.lock().unwrap();
+        if !self.state_is_current() {
+            return Ok(false);
+        }
+        let delta_path = self.delta_path();
+        let current = if delta_path.exists() {
+            std::fs::read(&delta_path)?
+        } else {
+            Vec::new()
+        };
+        let suffix = current[snapshot_len.min(current.len())..].to_vec();
+        let suffix_state = decode_unique_index_delta_records(&suffix, 0)?.into_state()?;
+        std::fs::rename(tmp_path, self.base_path())?;
+        if suffix.is_empty() {
+            let _ = std::fs::remove_file(&delta_path);
+        } else {
+            let mut suffix_file = UNIQUE_INDEX_DELTA_MAGIC_V2.to_vec();
+            suffix_file.extend_from_slice(&suffix);
+            let delta_tmp = delta_path.with_extension("delta.tbi.tmp");
+            std::fs::write(&delta_tmp, suffix_file)?;
+            std::fs::rename(delta_tmp, &delta_path)?;
+        }
+        let progress = self.state.progress.read().unwrap().clone();
+        self.unique_indexes.write().unwrap().insert(
+            unique_index_key(&self.db, &self.table, &self.index_name),
+            Arc::new(UniqueIndexState::with_progress(
+                data,
+                suffix_state,
+                progress,
+            )),
+        );
+        Ok(true)
     }
 }
 
@@ -1123,10 +1333,23 @@ const UNIQUE_INDEX_DELTA_MAGIC_V2: &[u8; 8] = b"TBIUKD2\0";
 const UNIQUE_INDEX_PROGRESS_MAGIC: &[u8; 8] = b"TBIUKP1\0";
 const UNIQUE_INDEX_BLOCK_SIZE: usize = 256;
 #[cfg(test)]
-const UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 4096;
+const UNIQUE_INDEX_DELTA_COMPACT_MIN_ENTRIES: u64 = 32;
 #[cfg(not(test))]
-const UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+const UNIQUE_INDEX_DELTA_COMPACT_MIN_ENTRIES: u64 = 262_144;
+#[cfg(test)]
+const UNIQUE_INDEX_DELTA_COMPACT_MAX_ENTRIES: u64 = 4_096;
+#[cfg(not(test))]
+/// Absolute ceiling that keeps the in-memory delta map bounded even when the
+/// base snapshot is far larger than the ratio threshold alone would imply.
+const UNIQUE_INDEX_DELTA_COMPACT_MAX_ENTRIES: u64 = 4_194_304;
 const UNIQUE_INDEX_DELTA_COMPACT_BASE_RATIO: u64 = 2;
+
+fn unique_index_delta_needs_compaction(delta_count: u64, base_count: usize) -> bool {
+    let threshold = UNIQUE_INDEX_DELTA_COMPACT_MIN_ENTRIES
+        .max(base_count as u64 / UNIQUE_INDEX_DELTA_COMPACT_BASE_RATIO)
+        .min(UNIQUE_INDEX_DELTA_COMPACT_MAX_ENTRIES);
+    delta_count >= threshold
+}
 
 fn unique_index_key(db: &str, table: &str, index_name: &str) -> String {
     format!("{}\0{}\0{}", db, table, index_name.to_ascii_lowercase())
@@ -1144,6 +1367,74 @@ fn projected_unique_key_for_row(batch: &RecordBatch, row_idx: usize) -> Option<V
         key.push(value);
     }
     Some(key)
+}
+
+fn unique_index_state_contains_any_key(
+    segment_mgr: &SegmentManager,
+    state: &UniqueIndexState,
+    sorted_encoded_keys: &[Vec<u8>],
+) -> Result<bool> {
+    if sorted_encoded_keys.is_empty() {
+        return Ok(false);
+    }
+    let delta = state.delta.read().unwrap();
+    for encoded in sorted_encoded_keys {
+        if let Some(locations) = delta.key_locations.get(encoded.as_slice()) {
+            for location in locations {
+                if !unique_index_tombstones_contains(&delta.tombstones, location)
+                    && unique_index_entry_location_is_live(segment_mgr, location)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    let tombstones = &delta.tombstones;
+    let base = &state.base;
+    let base_keys = &base.encoded_keys;
+    let mut needle_idx = 0usize;
+    // Binary-search the first candidate block instead of scanning from block
+    // zero, so a small needle set never pays a pass over the whole block index.
+    let block_offset = base
+        .blocks
+        .partition_point(|block| block.first_key.as_slice() < sorted_encoded_keys[0].as_slice())
+        .saturating_sub(1);
+    for (rel_block_no, block) in base.blocks[block_offset..].iter().enumerate() {
+        let block_no = block_offset + rel_block_no;
+        while needle_idx < sorted_encoded_keys.len()
+            && sorted_encoded_keys[needle_idx].as_slice() < block.first_key.as_slice()
+        {
+            needle_idx += 1;
+        }
+        if needle_idx >= sorted_encoded_keys.len() {
+            break;
+        }
+        let block_end = block.start + block.len;
+        let last_block = block_no + 1 == base.blocks.len();
+        while needle_idx < sorted_encoded_keys.len() {
+            let needle = sorted_encoded_keys[needle_idx].as_slice();
+            if !last_block && needle >= base.blocks[block_no + 1].first_key.as_slice() {
+                break;
+            }
+            let block_keys = &base_keys[block.start..block_end];
+            if let Ok(mut idx) = block_keys.binary_search_by(|key| key.as_slice().cmp(needle)) {
+                while idx > 0 && block_keys[idx - 1].as_slice() == needle {
+                    idx -= 1;
+                }
+                while idx < block_keys.len() && block_keys[idx].as_slice() == needle {
+                    let location = &base.entries[block.start + idx].location;
+                    if !unique_index_tombstones_contains(tombstones, location)
+                        && unique_index_entry_location_is_live(segment_mgr, location)?
+                    {
+                        return Ok(true);
+                    }
+                    idx += 1;
+                }
+            }
+            needle_idx += 1;
+        }
+    }
+    Ok(false)
 }
 
 fn unique_index_state_contains_key(
@@ -1602,17 +1893,26 @@ fn decode_unique_index_delta(bytes: &[u8]) -> Result<UniqueIndexDelta> {
             "invalid unique index delta file".to_string(),
         ));
     }
+    decode_unique_index_delta_records(bytes, cursor.position() as usize)
+}
+
+/// Decodes length-framed delta records starting at `offset`. Offset 8 skips
+/// the file magic; offset 0 decodes a suffix appended after a compaction
+/// snapshot, which is how appends that raced an in-flight merge survive.
+fn decode_unique_index_delta_records(bytes: &[u8], offset: usize) -> Result<UniqueIndexDelta> {
+    let tail = &bytes[offset.min(bytes.len())..];
     let mut delta = UniqueIndexDelta::default();
-    while (cursor.position() as usize) < bytes.len() {
+    let mut cursor = Cursor::new(tail);
+    while (cursor.position() as usize) < tail.len() {
         let len = read_u32(&mut cursor)? as usize;
         let start = cursor.position() as usize;
         let end = start + len;
-        if end > bytes.len() {
+        if end > tail.len() {
             return Err(TaibaiError::Storage(
                 "truncated unique index delta record".to_string(),
             ));
         }
-        let record = &bytes[start..end];
+        let record = &tail[start..end];
         let mut record_cursor = Cursor::new(record);
         let record_type = read_u8(&mut record_cursor)?;
         match record_type {
