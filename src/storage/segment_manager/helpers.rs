@@ -254,7 +254,7 @@ pub(crate) fn direct_bulk_request_to_batch(
     RecordBatch::try_new(schema.clone(), columns)
 }
 
-pub(super) fn direct_bulk_column_scalar_at(
+pub(crate) fn direct_bulk_column_scalar_at(
     col: &DirectBulkColumn<'_>,
     row_idx: usize,
 ) -> Result<ScalarValue> {

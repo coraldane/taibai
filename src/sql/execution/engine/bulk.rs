@@ -1,3 +1,158 @@
+fn log_direct_bulk_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
+    if crate::common::config::insert_profile_enabled() {
+        eprintln!(
+            "[insert-profile] stage=direct_bulk_{} rows={} elapsed_us={}",
+            stage,
+            rows,
+            elapsed.as_micros()
+        );
+    }
+}
+
+type DirectBulkConstraintEntries = (
+    Vec<Vec<crate::types::scalar::ScalarValue>>,
+    Vec<(
+        String,
+        Vec<crate::storage::index::index_manager::UniqueIndexEntry>,
+    )>,
+);
+
+fn prepare_direct_bulk_constraint_entries(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    req: &crate::storage::bulk_payload::DirectBulkRequest<'_>,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+) -> Result<DirectBulkConstraintEntries> {
+    use crate::storage::index::index_manager::{
+        UniqueIndexEntry, UniqueRowLocation, PRIMARY_LOCATION_INDEX_NAME,
+    };
+
+    let primary_indices = super::dml_insert::primary_key_indices(schema);
+    let unique_constraints = super::dml_insert::unique_constraints(table_meta, schema)?;
+    let mut primary_keys = Vec::with_capacity(req.row_count);
+    let mut primary_seen = HashSet::with_capacity(req.row_count);
+    if !primary_indices.is_empty() {
+        for row_idx in 0..req.row_count {
+            let mut key = Vec::with_capacity(primary_indices.len());
+            for &col_idx in &primary_indices {
+                let value = crate::storage::segment_manager::direct_bulk_column_scalar_at(
+                    &req.columns[col_idx],
+                    row_idx,
+                )?;
+                if value.is_null() {
+                    return Err(TaibaiError::Sql(format!(
+                        "primary key column '{}' cannot be NULL",
+                        schema.columns[col_idx].name
+                    )));
+                }
+                key.push(value);
+            }
+            if !primary_seen.insert(key.clone()) {
+                return Err(TaibaiError::Sql(format!(
+                    "duplicate primary key for table '{}'",
+                    table
+                )));
+            }
+            primary_keys.push(key);
+        }
+        match engine.index_manager().unique_keys_exist(
+            db,
+            table,
+            PRIMARY_LOCATION_INDEX_NAME,
+            &primary_keys,
+        )? {
+            Some(true) => {
+                return Err(TaibaiError::Sql(format!(
+                    "duplicate primary key for table '{}'",
+                    table
+                )))
+            }
+            Some(false) => {}
+            None => {
+                let batch =
+                    crate::storage::segment_manager::direct_bulk_request_to_batch(req, schema)?;
+                super::dml_insert::validate_primary_key_uniqueness(
+                    engine,
+                    db,
+                    table,
+                    &batch,
+                    schema,
+                    &primary_indices,
+                )?;
+            }
+        }
+    }
+
+    let mut entries_by_index = Vec::with_capacity(unique_constraints.len());
+    for (index_name, indices) in unique_constraints {
+        let mut keys = Vec::with_capacity(req.row_count);
+        let mut seen = HashSet::with_capacity(req.row_count);
+        let mut entries = Vec::with_capacity(req.row_count);
+        for row_idx in 0..req.row_count {
+            let mut key = Vec::with_capacity(indices.len());
+            let mut has_null = false;
+            for &col_idx in &indices {
+                let value = crate::storage::segment_manager::direct_bulk_column_scalar_at(
+                    &req.columns[col_idx],
+                    row_idx,
+                )?;
+                if value.is_null() {
+                    has_null = true;
+                    break;
+                }
+                key.push(value);
+            }
+            if has_null {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                return Err(TaibaiError::Sql(format!(
+                    "duplicate unique key '{}' for table '{}'",
+                    index_name, table
+                )));
+            }
+            keys.push(key.clone());
+            entries.push(UniqueIndexEntry {
+                key,
+                location: UniqueRowLocation {
+                    segment_path: String::new(),
+                    row_id: row_idx as u64,
+                },
+            });
+        }
+        match engine
+            .index_manager()
+            .unique_keys_exist(db, table, &index_name, &keys)?
+        {
+            Some(true) => {
+                return Err(TaibaiError::Sql(format!(
+                    "duplicate unique key '{}' for table '{}'",
+                    index_name, table
+                )))
+            }
+            Some(false) => {}
+            None => {
+                let batch =
+                    crate::storage::segment_manager::direct_bulk_request_to_batch(req, schema)?;
+                super::dml_insert::validate_unique_key_uniqueness(
+                    engine,
+                    db,
+                    table,
+                    schema,
+                    &indices,
+                    &index_name,
+                    Some(&batch),
+                )?;
+            }
+        }
+        entries_by_index.push((index_name, entries));
+    }
+
+    Ok((primary_keys, entries_by_index))
+}
+
 impl Engine {
     fn mark_bulk_dirty_table(&self, db: &str, table: &str) {
         self.bulk_dirty_tables
@@ -126,13 +281,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn exec_bulk_insert(
-        &self,
-        db: &str,
-        table: &str,
-        batch: RecordBatch,
-    ) -> Result<u64> {
-        self.validate_batch_unique_constraints(db, table, &batch)?;
+    pub fn exec_bulk_insert(&self, db: &str, table: &str, batch: RecordBatch) -> Result<u64> {
         let table_meta_for_hot = {
             let catalogs = self.catalogs.read().unwrap();
             catalogs
@@ -140,21 +289,46 @@ impl Engine {
                 .and_then(|catalog| catalog.get_table(table))
                 .cloned()
         };
+        let has_unique_constraints = table_meta_for_hot.as_ref().is_some_and(|meta| {
+            !meta.unique_indexes.is_empty() || meta.columns.iter().any(|column| column.primary_key)
+        });
+        let _constraint_guard = has_unique_constraints.then(|| {
+            super::dml_insert::constraint_insert_lock(db, table)
+                .lock()
+                .unwrap()
+        });
+        self.validate_batch_unique_constraints(db, table, &batch)?;
+        let (primary_keys, unique_index_entries) = if let Some(table_meta) = &table_meta_for_hot {
+            let schema = Schema::new(table_meta.columns.clone());
+            let constraints = super::dml_insert::unique_constraints(table_meta, &schema)?;
+            let entries = super::dml_insert::build_unique_index_entries_for_batch(
+                table_meta,
+                &schema,
+                &batch,
+                &constraints,
+            )?;
+            let primary_indices = super::dml_insert::primary_key_indices(&schema);
+            let keys = if primary_indices.is_empty() {
+                Vec::new()
+            } else {
+                super::dml_insert::primary_keys_for_batch(&batch, &schema, &primary_indices)?
+            };
+            (keys, entries)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let resident_coverage_before_bulk = table_meta_for_hot
             .as_ref()
             .and_then(|meta| self.begin_hot_bulk_write(db, table, meta));
-        let hot_batch = if resident_coverage_before_bulk.is_some() {
-            Some(batch.clone())
-        } else {
-            None
-        };
+        let hot_batch = resident_coverage_before_bulk
+            .is_some()
+            .then(|| batch.clone());
         let deferred = self.is_bulk_mode();
         let result = match if deferred {
             self.segment_mgr
                 .bulk_insert_batch_deferred(db, table, batch)
         } else {
-            self.segment_mgr
-                .bulk_insert_batch(db, table, batch)
+            self.segment_mgr.bulk_insert_batch(db, table, batch)
         } {
             Ok(result) => result,
             Err(e) => {
@@ -169,23 +343,19 @@ impl Engine {
             if deferred {
                 self.mark_bulk_dirty_table(db, table);
             }
-            let (bulk_unique_index_names, bulk_has_primary_key) = table_meta_for_hot
-                .as_ref()
-                .map(|meta| {
-                    (
-                        meta.unique_indexes
-                            .iter()
-                            .map(|index| index.name.clone())
-                            .collect::<Vec<_>>(),
-                        meta.columns.iter().any(|column| column.primary_key),
-                    )
-                })
-                .unwrap_or((Vec::new(), false));
-            if !bulk_unique_index_names.is_empty() {
+            if !primary_keys.is_empty() {
+                self.index_manager.refresh_unique_index_state(
+                    db,
+                    table,
+                    crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                )?;
+                let _ = self
+                    .index_manager
+                    .append_primary_keys(db, table, &primary_keys)?;
+            }
+            for (index_name, _entries) in &unique_index_entries {
                 self.index_manager
-                    .remove_table_unique_index_snapshots(db, table, &bulk_unique_index_names);
-            } else if bulk_has_primary_key {
-                self.index_manager.invalidate_primary_key_index(db, table);
+                    .refresh_unique_index_state(db, table, index_name)?;
             }
             if let (Some(table_meta), Some(batch)) =
                 (table_meta_for_hot.as_ref(), hot_batch.as_ref())
@@ -230,8 +400,7 @@ impl Engine {
             self.segment_mgr
                 .bulk_insert_batch_partitioned(db, table, table_meta, batch)
         } else {
-            self.segment_mgr
-                .bulk_insert_batch(db, table, batch)
+            self.segment_mgr.bulk_insert_batch(db, table, batch)
         } {
             Ok(result) => result,
             Err(e) => {
@@ -271,6 +440,7 @@ impl Engine {
         bulk_import_mode: bool,
     ) -> Result<u64> {
         let _op_guard = self.begin_operation();
+        let total_start = std::time::Instant::now();
         let table_name = bulk_payload_table_name(payload)?.to_string();
         let catalog = {
             let catalogs = self.catalogs.read().unwrap();
@@ -281,7 +451,8 @@ impl Engine {
         };
 
         let mut explicit_auto_increment_max = None;
-        let mut unique_index_names = Vec::new();
+        let mut unique_index_entries = Vec::new();
+        let mut primary_keys = Vec::new();
         let table_meta_for_hot = catalog.get_table(&table_name).cloned();
         let hot_payload_should_feed = !bulk_import_mode
             && table_meta_for_hot.as_ref().is_some_and(|meta| {
@@ -290,22 +461,36 @@ impl Engine {
         let table_has_primary_key = catalog
             .get_table(&table_name)
             .is_some_and(|meta| meta.columns.iter().any(|column| column.primary_key));
+        let has_unique_constraints = table_meta_for_hot.as_ref().is_some_and(|meta| {
+            !meta.unique_indexes.is_empty() || meta.columns.iter().any(|column| column.primary_key)
+        });
+        let _constraint_guard = has_unique_constraints.then(|| {
+            super::dml_insert::constraint_insert_lock(db, &table_name)
+                .lock()
+                .unwrap()
+        });
         if let Some(table_meta) = catalog.get_table(&table_name) {
-            unique_index_names = table_meta
-                .unique_indexes
-                .iter()
-                .map(|index| index.name.clone())
-                .collect();
             if !table_meta.unique_indexes.is_empty()
                 || table_meta.has_auto_increment()
                 || table_has_primary_key
             {
                 let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
                 let schema = Schema::new(table_meta.columns.clone());
-                let batch =
-                    crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)?;
                 if !table_meta.unique_indexes.is_empty() || table_has_primary_key {
-                    self.validate_batch_unique_constraints(db, &table_name, &batch)?;
+                    let constraint_start = std::time::Instant::now();
+                    (primary_keys, unique_index_entries) = prepare_direct_bulk_constraint_entries(
+                        self,
+                        db,
+                        &table_name,
+                        &req,
+                        table_meta,
+                        &schema,
+                    )?;
+                    log_direct_bulk_profile(
+                        "constraints",
+                        req.row_count,
+                        constraint_start.elapsed(),
+                    );
                 }
                 if let Some((col_idx, _)) = table_meta
                     .columns
@@ -314,10 +499,11 @@ impl Engine {
                     .find(|(_, col)| col.auto_increment)
                 {
                     let mut max_value = None;
-                    for row_idx in 0..batch.num_rows() {
-                        let Some(value) = batch.scalar(row_idx, col_idx) else {
-                            continue;
-                        };
+                    for row_idx in 0..req.row_count {
+                        let value = crate::storage::segment_manager::direct_bulk_column_scalar_at(
+                            &req.columns[col_idx],
+                            row_idx,
+                        )?;
                         let Some(int_value) = value.integer_i128() else {
                             continue;
                         };
@@ -341,6 +527,7 @@ impl Engine {
         } else {
             None
         };
+        let write_start = std::time::Instant::now();
         let result = match self.segment_mgr.bulk_insert_payload_with_catalog(
             db,
             payload,
@@ -356,6 +543,7 @@ impl Engine {
                 return Err(e);
             }
         };
+        log_direct_bulk_profile("write", result as usize, write_start.elapsed());
         if result > 0 && (bulk_import_mode || self.is_bulk_mode()) {
             self.mark_bulk_dirty_table(db, &table_name);
         }
@@ -373,20 +561,23 @@ impl Engine {
             self.hot_store_mgr.clear_resident_coverage(db, &table_name);
         }
 
-        if result > 0 && !unique_index_names.is_empty() {
-            self.index_manager.remove_table_unique_index_snapshots(
-                db,
-                &table_name,
-                &unique_index_names,
-            );
-        }
-        // Direct bulk writes bypass the memtable pipeline, so PK-driven
-        // caches and snapshots would not observe these rows; drop them so the
-        // next REPLACE rebuilds and replaces conflicts instead of skipping
-        // them.
-        if result > 0 && table_has_primary_key && unique_index_names.is_empty() {
-            self.index_manager
-                .invalidate_primary_key_index(db, &table_name);
+        if result > 0 {
+            let index_start = std::time::Instant::now();
+            if !primary_keys.is_empty() {
+                self.index_manager.refresh_unique_index_state(
+                    db,
+                    &table_name,
+                    crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                )?;
+                let _ = self
+                    .index_manager
+                    .append_primary_keys(db, &table_name, &primary_keys)?;
+            }
+            for (index_name, _entries) in &unique_index_entries {
+                self.index_manager
+                    .refresh_unique_index_state(db, &table_name, index_name)?;
+            }
+            log_direct_bulk_profile("index_refresh", result as usize, index_start.elapsed());
         }
 
         if let Some(max_value) = explicit_auto_increment_max {
@@ -396,13 +587,15 @@ impl Engine {
 
         if !bulk_import_mode {
             self.record_inserted_rows(db, &table_name, result as i64, true, false)?;
+            log_direct_bulk_profile("total", result as usize, total_start.elapsed());
             return Ok(result);
         }
 
         if explicit_auto_increment_max.is_some() {
             self.persist_auto_increment_next_value(db, &table_name, false)?;
         }
-        
+
+        log_direct_bulk_profile("total", result as usize, total_start.elapsed());
         Ok(result)
     }
 

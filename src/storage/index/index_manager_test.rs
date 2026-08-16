@@ -193,7 +193,7 @@ fn compact_prepared_entries_drops_tombstones_and_dedups_placeholders() -> Result
 }
 
 #[test]
-fn refresh_collapses_duplicate_memtable_placeholders() -> Result<()> {
+fn refresh_collapses_duplicate_memtable_placeholders_at_compaction() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("db").join("ticks");
     std::fs::create_dir_all(&table_dir)?;
@@ -228,14 +228,29 @@ fn refresh_collapses_duplicate_memtable_placeholders() -> Result<()> {
         Some(HashMap::from([(seg0.clone(), 3)])),
     )?;
 
-    write_value_segment(&table_dir.join("seg_00001.dat"), &[4, 5])?;
+    // A later flush appends a tail large enough to cross the amortized
+    // compaction threshold once it has been indexed into the delta.
+    let tail: Vec<i64> = (4..54).collect();
+    write_value_segment(&table_dir.join("seg_00001.dat"), &tail)?;
+    segment_mgr.note_memtable_flush("db", "ticks");
+    // The first refresh appends the tail to the delta without rewriting base.
+    assert!(manager
+        .unique_key_locations(
+            "db",
+            "ticks",
+            "uk_value",
+            &[vec![ScalarValue::Int64(Some(53))]],
+        )?
+        .is_some());
+    // The next refresh past the threshold compacts the delta back into the
+    // base snapshot, collapsing duplicate memtable placeholders per key.
     segment_mgr.note_memtable_flush("db", "ticks");
     assert!(manager
         .unique_key_locations(
             "db",
             "ticks",
             "uk_value",
-            &[vec![ScalarValue::Int64(Some(5))]],
+            &[vec![ScalarValue::Int64(Some(53))]],
         )?
         .is_some());
 
@@ -253,10 +268,14 @@ fn refresh_collapses_duplicate_memtable_placeholders() -> Result<()> {
         .count();
     assert_eq!(
         placeholder_count, 1,
-        "refresh must collapse duplicate memtable placeholders per key"
+        "compaction must collapse duplicate memtable placeholders per key"
     );
     let total = state.base.entries.len();
-    assert_eq!(total, 4, "keys 1, 2, 4, 5 each keep exactly one entry");
+    assert_eq!(
+        total,
+        2 + tail.len(),
+        "keys 1 and 2 plus the tail each keep exactly one entry"
+    );
     Ok(())
 }
 

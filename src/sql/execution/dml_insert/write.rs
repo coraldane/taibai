@@ -28,7 +28,8 @@ pub fn exec_replace(
     // Pseudo unique-index entries (empty segment_path) marking the replacement
     // rows as existing. Published only after the staged insert commits, so a
     // later plain INSERT still sees the keys without a segment location.
-    let replace_unique_constraints = unique_constraints(&materialized.table_meta, &location_schema)?;
+    let replace_unique_constraints =
+        unique_constraints(&materialized.table_meta, &location_schema)?;
     let replace_unique_entries = build_unique_index_entries_for_batch(
         &materialized.table_meta,
         &location_schema,
@@ -51,9 +52,8 @@ pub fn exec_replace(
                 &location_schema,
                 &key_sets,
             )?;
-            let memtable_plans = super::dml_delete::plan_replace_memtable_conflicts(
-                engine, db, table, &key_sets,
-            )?;
+            let memtable_plans =
+                super::dml_delete::plan_replace_memtable_conflicts(engine, db, table, &key_sets)?;
             let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
                 engine,
                 db,
@@ -73,9 +73,8 @@ pub fn exec_replace(
             ) {
                 Ok(memtable_undo) => undo.merge(memtable_undo),
                 Err(error) => {
-                    let _ = super::dml_delete::restore_replace_delete_under_table_lock(
-                        engine, &undo,
-                    );
+                    let _ =
+                        super::dml_delete::restore_replace_delete_under_table_lock(engine, &undo);
                     return Err(error);
                 }
             }
@@ -142,12 +141,9 @@ pub fn exec_replace(
             // Publish existence markers for the committed replacement rows.
             // Failure only downgrades later validation to a full scan; the
             // statement is already committed and must not fail here.
-            if let Err(error) = append_unique_index_entries_after_insert(
-                engine,
-                db,
-                table,
-                replace_unique_entries,
-            ) {
+            if let Err(error) =
+                append_unique_index_entries_after_insert(engine, db, table, replace_unique_entries)
+            {
                 tracing::warn!(
                     db,
                     table,
@@ -487,13 +483,7 @@ fn exec_materialized_insert_batch(
     }
     let write_start = Instant::now();
     if bulk_import_mode || relaxed_direct_insert {
-        engine.exec_bulk_insert_partitioned(
-            db,
-            table,
-            table_meta,
-            batch,
-            relaxed_direct_insert,
-        )?;
+        engine.exec_bulk_insert_partitioned(db, table, table_meta, batch, relaxed_direct_insert)?;
     } else {
         write_batch_by_partition(
             engine,
@@ -547,7 +537,7 @@ fn exec_materialized_insert_batch(
     })
 }
 
-fn build_unique_index_entries_for_batch(
+pub(crate) fn build_unique_index_entries_for_batch(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
     batch: &RecordBatch,
@@ -581,7 +571,7 @@ fn build_unique_index_entries_for_batch(
     Ok(result)
 }
 
-fn append_unique_index_entries_after_insert(
+pub(crate) fn append_unique_index_entries_after_insert(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -738,8 +728,6 @@ fn rollback_replace_under_table_lock(
         )))
     }
 }
-
-
 
 fn replace_key_for_row(
     batch: &RecordBatch,

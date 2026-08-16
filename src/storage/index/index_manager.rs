@@ -50,27 +50,59 @@ pub struct PreparedUniqueIndexEntry {
 }
 
 struct UniqueIndexState {
-    flush_epoch: Option<u64>,
     base: Arc<UniqueIndexData>,
     delta: RwLock<UniqueIndexDeltaState>,
+    progress: RwLock<UniqueIndexProgress>,
     mutation_lock: Mutex<()>,
+}
+
+#[derive(Default, Clone)]
+struct UniqueIndexProgress {
+    flush_epoch: Option<u64>,
+    segment_watermarks: HashMap<String, u64>,
 }
 
 #[derive(Default)]
 struct UniqueIndexDeltaState {
-    entries: Vec<PreparedUniqueIndexEntry>,
+    entry_count: u64,
     key_locations: HashMap<Vec<u8>, Vec<UniqueRowLocation>>,
     tombstones: HashSet<UniqueRowLocation>,
 }
 
 impl UniqueIndexState {
     fn new(base: UniqueIndexData, delta: UniqueIndexDeltaState) -> Self {
-        Self {
+        let progress = UniqueIndexProgress {
             flush_epoch: base.flush_epoch,
+            segment_watermarks: base.segment_watermarks.clone(),
+        };
+        Self::with_progress(base, delta, progress)
+    }
+
+    fn with_progress(
+        base: UniqueIndexData,
+        delta: UniqueIndexDeltaState,
+        progress: UniqueIndexProgress,
+    ) -> Self {
+        Self {
             base: Arc::new(base),
             delta: RwLock::new(delta),
+            progress: RwLock::new(progress),
             mutation_lock: Mutex::new(()),
         }
+    }
+
+    fn progress_epoch(&self) -> Option<u64> {
+        self.progress.read().unwrap().flush_epoch
+    }
+
+    fn progress_watermarks(&self) -> HashMap<String, u64> {
+        self.progress.read().unwrap().segment_watermarks.clone()
+    }
+
+    fn set_progress(&self, flush_epoch: Option<u64>, segment_watermarks: HashMap<String, u64>) {
+        let mut progress = self.progress.write().unwrap();
+        progress.flush_epoch = flush_epoch;
+        progress.segment_watermarks = segment_watermarks;
     }
 }
 
@@ -329,6 +361,7 @@ impl IndexManager {
         std::fs::rename(data_tmp, data_path)?;
         let delta_path = dir.join(format!("{}.delta.tbi", base));
         let _ = std::fs::remove_file(delta_path);
+        let _ = std::fs::remove_file(dir.join(format!("{}.progress.tbi", base)));
         let _ = std::fs::remove_file(invalid_path);
         self.unique_indexes.write().unwrap().insert(
             unique_index_key(db, table, index_name),
@@ -355,7 +388,7 @@ impl IndexManager {
             table: state.base.table.clone(),
             index_name: state.base.index_name.clone(),
             columns: state.base.columns.clone(),
-            key_count: state.base.entries.len() + delta.entries.len(),
+            key_count: state.base.entries.len() + delta.entry_count as usize,
         }))
     }
 
@@ -393,7 +426,13 @@ impl IndexManager {
         } else {
             UniqueIndexDeltaState::default()
         };
-        let state = Arc::new(UniqueIndexState::new(data, delta));
+        let progress_path = dir.join(format!("{}.progress.tbi", base));
+        let state = if progress_path.exists() {
+            let progress = decode_unique_index_progress(&std::fs::read(progress_path)?);
+            Arc::new(UniqueIndexState::with_progress(data, delta, progress))
+        } else {
+            Arc::new(UniqueIndexState::new(data, delta))
+        };
         let current = self
             .unique_indexes
             .write()
@@ -413,7 +452,9 @@ impl IndexManager {
         let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        Ok(Some(Arc::new(materialize_unique_index_state(&state)?)))
+        Ok(Some(Arc::new(self.materialize_unique_index_state(
+            db, table, index_name, &state,
+        )?)))
     }
 
     pub fn unique_index_columns(
@@ -505,7 +546,7 @@ impl IndexManager {
         // Same staleness guard as unique_key_locations: a snapshot built
         // before rows reached segments (memtable flush or direct append)
         // misses live keys, so refresh it before probing.
-        if state.flush_epoch != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+        if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
             let Some(refreshed) =
                 self.refresh_stale_unique_index_state(db, table, index_name, &state)?
             else {
@@ -567,10 +608,12 @@ impl IndexManager {
                 .unwrap()
                 .get(&cache_key)
                 .filter(|current| {
-                    current.flush_epoch == Some(self.segment_mgr.memtable_flush_epoch(db, table))
+                    current.progress_epoch()
+                        == Some(self.segment_mgr.memtable_flush_epoch(db, table))
                 })
                 .cloned());
         }
+        let progress_watermarks = state.progress_watermarks();
         let mut additions = Vec::new();
         let mut watermarks = HashMap::new();
         let table_dir = self.data_dir.join(db).join(table);
@@ -579,12 +622,7 @@ impl IndexManager {
                 let reader = self.segment_mgr.open_reader_cached(&seg_path)?;
                 let current_rows = reader.row_count();
                 let segment_path = seg_path.to_string_lossy().to_string();
-                let watermark = state
-                    .base
-                    .segment_watermarks
-                    .get(&segment_path)
-                    .copied()
-                    .unwrap_or(0);
+                let watermark = progress_watermarks.get(&segment_path).copied().unwrap_or(0);
                 watermarks.insert(segment_path, current_rows);
                 if current_rows <= watermark {
                     continue;
@@ -632,9 +670,32 @@ impl IndexManager {
                 }
             }
         }
-        let mut data = materialize_unique_index_state(state)?;
-        let additions = self.prepare_unique_index_entries(additions)?;
-        merge_prepared_unique_index_entries(&mut data, additions)?;
+        let prepared_additions = self.prepare_unique_index_entries(additions)?;
+        let delta_path = self
+            .unique_index_dir(db, table)
+            .join(format!("{}.delta.tbi", sanitize_file_component(index_name)));
+        let delta_bytes = std::fs::metadata(&delta_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if delta_bytes < self.unique_index_delta_compaction_threshold(db, table, index_name) {
+            append_prepared_unique_index_delta(&delta_path, &prepared_additions)?;
+            {
+                let mut delta = state.delta.write().unwrap();
+                for addition in prepared_additions {
+                    delta
+                        .key_locations
+                        .entry(addition.encoded_key.clone())
+                        .or_default()
+                        .push(addition.entry.location.clone());
+                    delta.entry_count += 1;
+                }
+            }
+            state.set_progress(Some(epoch_before), watermarks);
+            self.persist_unique_index_progress(db, table, index_name)?;
+            return Ok(Some(Arc::clone(state)));
+        }
+        let mut data = self.materialize_unique_index_state(db, table, index_name, state)?;
+        merge_prepared_unique_index_entries(&mut data, prepared_additions)?;
         compact_prepared_unique_index_entries(&mut data);
         data.flush_epoch = Some(epoch_before);
         data.segment_watermarks = watermarks;
@@ -643,6 +704,46 @@ impl IndexManager {
             Some(state) => Ok(Some(Arc::clone(state))),
             None => Ok(None),
         }
+    }
+
+    /// Persist the in-memory refresh progress (epoch plus per-segment
+    /// watermarks) as a small sidecar file so restarts resume from it
+    /// instead of rescanning already-indexed segment tails.
+    fn persist_unique_index_progress(&self, db: &str, table: &str, index_name: &str) -> Result<()> {
+        let cache_key = unique_index_key(db, table, index_name);
+        let Some(state) = self.unique_indexes.read().unwrap().get(&cache_key).cloned() else {
+            return Ok(());
+        };
+        let progress = state.progress.read().unwrap().clone();
+        let dir = self.unique_index_dir(db, table);
+        std::fs::create_dir_all(&dir)?;
+        let base = sanitize_file_component(index_name);
+        let path = dir.join(format!("{}.progress.tbi", base));
+        let tmp = dir.join(format!("{}.progress.tbi.tmp", base));
+        std::fs::write(&tmp, encode_unique_index_progress(&progress))?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    /// Bring a persisted unique-index snapshot up to the current
+    /// segment-content epoch without probing keys: the incremental refresh
+    /// appends only the newly written segment tail to the delta. Bulk write
+    /// paths call this after a successful write so the next batch starts
+    /// against an up-to-date index instead of paying a full snapshot rewrite.
+    pub fn refresh_unique_index_state(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) -> Result<()> {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            return Ok(());
+        };
+        if state.progress_epoch() == Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+            return Ok(());
+        }
+        self.refresh_stale_unique_index_state(db, table, index_name, &state)?;
+        Ok(())
     }
 
     pub fn unique_key_locations(
@@ -660,7 +761,7 @@ impl IndexManager {
         // snapshot (scanning only rows appended past its per-segment
         // watermarks) instead of forcing a full rebuild; fall back to the
         // rebuild path only when the incremental refresh is not possible.
-        if state.flush_epoch != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+        if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
             let Some(refreshed) =
                 self.refresh_stale_unique_index_state(db, table, index_name, &state)?
             else {
@@ -757,7 +858,7 @@ impl IndexManager {
         // Same staleness guard as unique_key_locations, resolved by the same
         // incremental refresh; a full rebuild is only needed when the refresh
         // cannot run.
-        if state.flush_epoch != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+        if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
             let Some(refreshed) =
                 self.refresh_stale_unique_index_state(db, table, index_name, &state)?
             else {
@@ -827,14 +928,17 @@ impl IndexManager {
                     .entry(addition.encoded_key.clone())
                     .or_default()
                     .push(addition.entry.location.clone());
-                delta.entries.push(addition);
+                delta.entry_count += 1;
             }
         }
-        if std::fs::metadata(&delta_path)?.len() >= UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES {
-            let mut data = materialize_unique_index_state(&state)?;
+        if std::fs::metadata(&delta_path)?.len()
+            >= self.unique_index_delta_compaction_threshold(db, table, index_name)
+        {
+            let mut data = self.materialize_unique_index_state(db, table, index_name, &state)?;
             // Delta compaction preserves the snapshot's epoch: flushing since the
             // snapshot was built keeps it stale so the next probe refreshes it.
-            data.segment_watermarks = state.base.segment_watermarks.clone();
+            data.segment_watermarks = state.progress_watermarks();
+            data.flush_epoch = state.progress_epoch();
             compact_prepared_unique_index_entries(&mut data);
             self.persist_prepared_unique_index_data(db, table, index_name, data)?;
         }
@@ -887,9 +991,12 @@ impl IndexManager {
         let delta_path = dir.join(format!("{}.delta.tbi", base));
         append_unique_index_tombstone_delta(&delta_path, &tombstones)?;
         state.delta.write().unwrap().tombstones.extend(tombstones);
-        if std::fs::metadata(&delta_path)?.len() >= UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES {
-            let mut data = materialize_unique_index_state(&state)?;
-            data.segment_watermarks = state.base.segment_watermarks.clone();
+        if std::fs::metadata(&delta_path)?.len()
+            >= self.unique_index_delta_compaction_threshold(db, table, index_name)
+        {
+            let mut data = self.materialize_unique_index_state(db, table, index_name, &state)?;
+            data.segment_watermarks = state.progress_watermarks();
+            data.flush_epoch = state.progress_epoch();
             compact_prepared_unique_index_entries(&mut data);
             self.persist_prepared_unique_index_data(db, table, index_name, data)?;
         }
@@ -970,15 +1077,56 @@ impl IndexManager {
             .join("indexes")
             .join("unique")
     }
+
+    fn unique_index_delta_compaction_threshold(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+    ) -> u64 {
+        let base_bytes = std::fs::metadata(
+            self.unique_index_dir(db, table)
+                .join(format!("{}.keys.tbi", sanitize_file_component(index_name))),
+        )
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+        UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES
+            .max(base_bytes / UNIQUE_INDEX_DELTA_COMPACT_BASE_RATIO)
+    }
+
+    fn materialize_unique_index_state(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        state: &UniqueIndexState,
+    ) -> Result<UniqueIndexData> {
+        let tombstones = state.delta.read().unwrap().tombstones.clone();
+        let dir = self.unique_index_dir(db, table);
+        let base = sanitize_file_component(index_name);
+        let delta_path = dir.join(format!("{}.delta.tbi", base));
+        let decoded = if delta_path.exists() {
+            decode_unique_index_delta(&std::fs::read(&delta_path)?)?
+        } else {
+            UniqueIndexDelta::default()
+        };
+        let mut data = (*state.base).clone();
+        data.tombstones.extend(tombstones);
+        data.tombstones.extend(decoded.tombstones);
+        merge_prepared_unique_index_entries(&mut data, decoded.entries)?;
+        Ok(data)
+    }
 }
 
 const UNIQUE_INDEX_MAGIC_V5: &[u8; 8] = b"TBIUKV5\0";
 const UNIQUE_INDEX_DELTA_MAGIC_V2: &[u8; 8] = b"TBIUKD2\0";
+const UNIQUE_INDEX_PROGRESS_MAGIC: &[u8; 8] = b"TBIUKP1\0";
 const UNIQUE_INDEX_BLOCK_SIZE: usize = 256;
 #[cfg(test)]
 const UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 4096;
 #[cfg(not(test))]
 const UNIQUE_INDEX_DELTA_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+const UNIQUE_INDEX_DELTA_COMPACT_BASE_RATIO: u64 = 2;
 
 fn unique_index_key(db: &str, table: &str, index_name: &str) -> String {
     format!("{}\0{}\0{}", db, table, index_name.to_ascii_lowercase())
@@ -996,16 +1144,6 @@ fn projected_unique_key_for_row(batch: &RecordBatch, row_idx: usize) -> Option<V
         key.push(value);
     }
     Some(key)
-}
-
-fn materialize_unique_index_state(state: &UniqueIndexState) -> Result<UniqueIndexData> {
-    let delta = state.delta.read().unwrap();
-    let mut data = (*state.base).clone();
-    let additions = delta.entries.clone();
-    data.tombstones.extend(delta.tombstones.iter().cloned());
-    drop(delta);
-    merge_prepared_unique_index_entries(&mut data, additions)?;
-    Ok(data)
 }
 
 fn unique_index_state_contains_key(
@@ -1402,11 +1540,11 @@ struct UniqueIndexDelta {
 impl UniqueIndexDelta {
     fn into_state(self) -> Result<UniqueIndexDeltaState> {
         let mut state = UniqueIndexDeltaState {
-            entries: self.entries,
+            entry_count: self.entries.len() as u64,
             tombstones: self.tombstones.into_iter().collect(),
             key_locations: HashMap::new(),
         };
-        for addition in &state.entries {
+        for addition in &self.entries {
             state
                 .key_locations
                 .entry(addition.encoded_key.clone())
@@ -1415,6 +1553,41 @@ impl UniqueIndexDelta {
         }
         Ok(state)
     }
+}
+
+fn encode_unique_index_progress(progress: &UniqueIndexProgress) -> Vec<u8> {
+    let mut out = UNIQUE_INDEX_PROGRESS_MAGIC.to_vec();
+    out.push(if progress.flush_epoch.is_some() { 1 } else { 0 });
+    put_u64(&mut out, progress.flush_epoch.unwrap_or(0));
+    put_u32(&mut out, progress.segment_watermarks.len() as u32);
+    for (path, row_count) in &progress.segment_watermarks {
+        put_string(&mut out, path);
+        put_u64(&mut out, *row_count);
+    }
+    out
+}
+
+fn decode_unique_index_progress(bytes: &[u8]) -> UniqueIndexProgress {
+    if bytes.len() < 8 || &bytes[..8] != UNIQUE_INDEX_PROGRESS_MAGIC {
+        return UniqueIndexProgress::default();
+    }
+    let mut cursor = Cursor::new(&bytes[8..]);
+    let mut progress = UniqueIndexProgress::default();
+    let (Ok(flag), Ok(epoch), Ok(count)) = (
+        read_u8(&mut cursor),
+        read_u64(&mut cursor),
+        read_u32(&mut cursor),
+    ) else {
+        return UniqueIndexProgress::default();
+    };
+    progress.flush_epoch = (flag == 1).then_some(epoch);
+    for _ in 0..count {
+        let (Ok(path), Ok(row_count)) = (read_string(&mut cursor), read_u64(&mut cursor)) else {
+            return UniqueIndexProgress::default();
+        };
+        progress.segment_watermarks.insert(path, row_count);
+    }
+    progress
 }
 
 fn decode_unique_index_delta(bytes: &[u8]) -> Result<UniqueIndexDelta> {

@@ -36,7 +36,7 @@ lazy_static::lazy_static! {
     static ref FAST_INSERT_PLAN_CACHE: Mutex<HashMap<String, Arc<FastInsertPlan>>> = Mutex::new(HashMap::new());
 }
 
-fn constraint_insert_lock(db: &str, table: &str) -> &'static Mutex<()> {
+pub(super) fn constraint_insert_lock(db: &str, table: &str) -> &'static Mutex<()> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     db.hash(&mut hasher);
     table.hash(&mut hasher);

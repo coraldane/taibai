@@ -930,7 +930,7 @@ fn delete_removes_memtable_rows_without_flushing() -> Result<()> {
 }
 
 #[test]
-fn bulk_payload_invalidates_rebuilt_unique_index() -> Result<()> {
+fn bulk_payload_incrementally_maintains_rebuilt_unique_index() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
@@ -953,6 +953,215 @@ fn bulk_payload_invalidates_rebuilt_unique_index() -> Result<()> {
 
     let duplicate = engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (2, 3)");
     assert!(duplicate.is_err());
+    Ok(())
+}
+
+#[test]
+fn bulk_payload_refresh_appends_delta_without_rewriting_base_snapshot() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, code INT64, UNIQUE KEY uk_code (code))",
+    )?;
+    let index_dir = dir
+        .path()
+        .join("main")
+        .join("t")
+        .join("indexes")
+        .join("unique");
+    let mut next_id = 0i64;
+    for _ in 0..2 {
+        let ids = vec![next_id, next_id + 1];
+        let codes = vec![next_id * 10, next_id * 10 + 1];
+        let payload = bulk_payload(
+            "t",
+            2,
+            vec![
+                ("id", DataType::Int64, int64_col(&ids)),
+                ("code", DataType::Int64, int64_col(&codes)),
+            ],
+        );
+        engine.exec_bulk_insert_payload_with_options("main", &payload, false)?;
+        next_id += 2;
+    }
+    engine.execute(&mut session, "REBUILD UNIQUE INDEX uk_code ON t")?;
+    let base_path = index_dir.join("uk_code.keys.tbi");
+    let base_before = std::fs::read(&base_path)?;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    for _ in 0..4 {
+        let ids = vec![next_id, next_id + 1];
+        let codes = vec![next_id * 10, next_id * 10 + 1];
+        let payload = bulk_payload(
+            "t",
+            2,
+            vec![
+                ("id", DataType::Int64, int64_col(&ids)),
+                ("code", DataType::Int64, int64_col(&codes)),
+            ],
+        );
+        engine.exec_bulk_insert_payload_with_options("main", &payload, true)?;
+        next_id += 2;
+    }
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+    assert_eq!(std::fs::read(&base_path)?, base_before);
+    assert!(index_dir.join("uk_code.delta.tbi").exists());
+    assert!(index_dir.join("uk_code.progress.tbi").exists());
+    let duplicate = engine.execute(
+        &mut session,
+        &format!(
+            "INSERT INTO t (id, code) VALUES ({}, {})",
+            next_id,
+            (next_id - 2) * 10
+        ),
+    );
+    assert!(duplicate.is_err());
+    Ok(())
+}
+
+#[test]
+fn bulk_payload_delta_compaction_is_amortized_against_base_size() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, code INT64, UNIQUE KEY uk_id (id))",
+    )?;
+    let index_dir = dir
+        .path()
+        .join("main")
+        .join("t")
+        .join("indexes")
+        .join("unique");
+    let base_file = index_dir.join("uk_id.keys.tbi");
+    let mut next_id = 0i64;
+    for _ in 0..8 {
+        let ids: Vec<i64> = (next_id..next_id + 250).collect();
+        let codes: Vec<i64> = ids.iter().map(|v| v * 3).collect();
+        let payload = bulk_payload(
+            "t",
+            250,
+            vec![
+                ("id", DataType::Int64, int64_col(&ids)),
+                ("code", DataType::Int64, int64_col(&codes)),
+            ],
+        );
+        engine.exec_bulk_insert_payload_with_options("main", &payload, false)?;
+        next_id += 250;
+    }
+    engine.execute(&mut session, "REBUILD UNIQUE INDEX uk_id ON t")?;
+    let base_seed = std::fs::metadata(&base_file)?.len();
+    assert!(
+        base_seed > 2 * 4096,
+        "seed base must dominate the absolute floor"
+    );
+
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    let mut base_lengths = Vec::new();
+    for _ in 0..40 {
+        let ids: Vec<i64> = (next_id..next_id + 50).collect();
+        let codes: Vec<i64> = ids.iter().map(|v| v * 3).collect();
+        let payload = bulk_payload(
+            "t",
+            50,
+            vec![
+                ("id", DataType::Int64, int64_col(&ids)),
+                ("code", DataType::Int64, int64_col(&codes)),
+            ],
+        );
+        engine.exec_bulk_insert_payload_with_options("main", &payload, true)?;
+        next_id += 50;
+        base_lengths.push(std::fs::metadata(&base_file)?.len());
+    }
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+
+    let stable_prefix = base_lengths
+        .iter()
+        .take_while(|len| **len == base_lengths[0])
+        .count();
+    assert!(
+        stable_prefix >= 2,
+        "batches under the ratio threshold must not rewrite the base snapshot"
+    );
+    assert!(
+        base_lengths.iter().any(|len| *len > base_seed),
+        "crossing the ratio threshold must compact the delta into the base"
+    );
+    let duplicate = engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, code) VALUES ({}, 0)", next_id - 1),
+    );
+    assert!(duplicate.is_err());
+    Ok(())
+}
+
+#[test]
+fn bulk_payload_unique_indexes_survive_restart_and_multiple_batches() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+        engine.execute(
+            &mut session,
+            "CREATE TABLE t (id INT64 PRIMARY KEY, code INT64, UNIQUE KEY uk_code (code))",
+        )?;
+        for value in 1..=4i64 {
+            let payload = bulk_payload(
+                "t",
+                1,
+                vec![
+                    ("id", DataType::Int64, int64_col(&[value])),
+                    ("code", DataType::Int64, int64_col(&[value * 10])),
+                ],
+            );
+            assert_eq!(
+                engine.exec_bulk_insert_payload_with_options("main", &payload, false)?,
+                1
+            );
+        }
+    }
+
+    let engine = Engine::new(dir.path(), "main")?;
+    let primary_duplicate = bulk_payload(
+        "t",
+        1,
+        vec![
+            ("id", DataType::Int64, int64_col(&[2])),
+            ("code", DataType::Int64, int64_col(&[90])),
+        ],
+    );
+    assert!(engine
+        .exec_bulk_insert_payload_with_options("main", &primary_duplicate, false)
+        .is_err());
+    let unique_duplicate = bulk_payload(
+        "t",
+        1,
+        vec![
+            ("id", DataType::Int64, int64_col(&[9])),
+            ("code", DataType::Int64, int64_col(&[30])),
+        ],
+    );
+    assert!(engine
+        .exec_bulk_insert_payload_with_options("main", &unique_duplicate, false)
+        .is_err());
+    let new_row = bulk_payload(
+        "t",
+        1,
+        vec![
+            ("id", DataType::Int64, int64_col(&[9])),
+            ("code", DataType::Int64, int64_col(&[90])),
+        ],
+    );
+    assert_eq!(
+        engine.exec_bulk_insert_payload_with_options("main", &new_row, false)?,
+        1
+    );
     Ok(())
 }
 
@@ -1645,7 +1854,51 @@ fn bulk_payload_rejects_duplicate_primary_keys() -> Result<()> {
 }
 
 #[test]
-fn bulk_import_invalidates_primary_key_snapshot_for_replace() -> Result<()> {
+fn concurrent_bulk_payload_rejects_duplicate_primary_key() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main")?);
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)",
+    )?;
+
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut workers = Vec::new();
+    for value in [10, 20] {
+        let engine = Arc::clone(&engine);
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            let payload = bulk_payload(
+                "t",
+                1,
+                vec![
+                    ("id", DataType::Int64, int64_col(&[1])),
+                    ("val", DataType::Int64, int64_col(&[value])),
+                ],
+            );
+            barrier.wait();
+            engine.exec_bulk_insert_payload_with_options("main", &payload, false)
+        }));
+    }
+
+    let successes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .filter(Result::is_ok)
+        .count();
+    assert_eq!(successes, 1);
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[test]
+fn bulk_import_refreshes_primary_key_snapshot_for_replace() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
@@ -1654,7 +1907,6 @@ fn bulk_import_invalidates_primary_key_snapshot_for_replace() -> Result<()> {
         &mut session,
         "CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)",
     )?;
-    // The first REPLACE leaves a persisted primary-location snapshot behind.
     engine.execute(&mut session, "REPLACE INTO t VALUES (1, 10)")?;
 
     let payload = bulk_payload(
@@ -1667,8 +1919,6 @@ fn bulk_import_invalidates_primary_key_snapshot_for_replace() -> Result<()> {
     );
     engine.exec_bulk_insert_payload_with_options("main", &payload, false)?;
 
-    // The snapshot must have been invalidated, so this REPLACE rebuilds it
-    // and replaces the bulk-imported row instead of skipping it.
     engine.execute(&mut session, "REPLACE INTO t VALUES (2, 99)")?;
     let total = first_i64(
         engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,

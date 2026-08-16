@@ -1,4 +1,4 @@
-fn unique_constraints(
+pub(crate) fn unique_constraints(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
 ) -> Result<Vec<(String, Vec<usize>)>> {
@@ -92,11 +92,7 @@ pub fn validate_unique_key_uniqueness(
                                 .unique_key_exists(db, table, index_name, key)?
                                 .unwrap_or(false)
                             {
-                                return Err(duplicate_unique_key_error(
-                                    table,
-                                    index_name,
-                                    key,
-                                ));
+                                return Err(duplicate_unique_key_error(table, index_name, key));
                             }
                         }
                         return Ok(());
@@ -202,13 +198,7 @@ fn load_existing_unique_keys(
     }
     for memtable in engine.memtable_manager().get_by_table(db, table) {
         if let Some(batch) = memtable.read() {
-            check_existing_unique_batch_with_indices(
-                table,
-                index_name,
-                &batch,
-                indices,
-                new_keys,
-            )?;
+            check_existing_unique_batch_with_indices(table, index_name, &batch, indices, new_keys)?;
         }
     }
     Ok(())
@@ -303,7 +293,7 @@ fn duplicate_unique_key_error(table: &str, index_name: &str, key: &[ScalarValue]
     ))
 }
 
-fn primary_key_indices(schema: &Schema) -> Vec<usize> {
+pub(crate) fn primary_key_indices(schema: &Schema) -> Vec<usize> {
     schema
         .columns
         .iter()
@@ -333,7 +323,7 @@ fn validate_primary_key_values_present(
     Ok(())
 }
 
-fn primary_keys_for_batch(
+pub(crate) fn primary_keys_for_batch(
     batch: &RecordBatch,
     schema: &Schema,
     primary_key_indices: &[usize],
@@ -357,6 +347,21 @@ pub fn validate_primary_key_uniqueness(
         if !unique.insert(key.clone()) {
             return Err(duplicate_primary_key_error(table, key));
         }
+    }
+
+    if let Some(exists) = engine.index_manager().unique_keys_exist(
+        db,
+        table,
+        crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+        &keys,
+    )? {
+        if exists {
+            return Err(TaibaiError::Sql(format!(
+                "duplicate primary key for table '{}'",
+                table
+            )));
+        }
+        return Ok(());
     }
 
     if let Some(exists) = engine

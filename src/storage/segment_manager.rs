@@ -31,8 +31,8 @@ use crate::types::scalar::ScalarValue;
 
 pub(crate) use config::bulk_compression_level;
 pub use config::SegmentConfig;
-pub(crate) use helpers::direct_bulk_request_to_batch;
 pub use helpers::table_key;
+pub(crate) use helpers::{direct_bulk_column_scalar_at, direct_bulk_request_to_batch};
 
 use active_writer::ActiveSegmentWriter;
 use cluster_meta_cache::ClusterMetaCache;
