@@ -518,6 +518,44 @@ impl BatchWriter {
         Ok(())
     }
 
+    pub(crate) fn checkpoint_before_rewrite_under_table_lock(
+        &self,
+        db: &str,
+        table: &str,
+        affected_rows: usize,
+    ) -> Result<bool> {
+        const MIN_REWRITE_ROWS: u64 = 4096;
+        const MAX_AFFECTED_RATIO: u64 = 4;
+
+        let pending_rows = self
+            .memtable_mgr
+            .get_by_table(db, table)
+            .into_iter()
+            .filter(|memtable| {
+                memtable.state() == MemTableState::Pending
+                    && !memtable.is_transactional()
+                    && memtable.visibility()
+                        == crate::storage::core::memtable::TxnVisibility::Committed
+            })
+            .map(|memtable| memtable.row_count())
+            .sum::<u64>();
+        if pending_rows < MIN_REWRITE_ROWS
+            || (affected_rows as u64).saturating_mul(MAX_AFFECTED_RATIO) >= pending_rows
+        {
+            return Ok(false);
+        }
+
+        self.flush_table_under_table_lock(db, table)?;
+        tracing::info!(
+            db,
+            table,
+            pending_rows,
+            affected_rows,
+            "checkpointed large pending tail before row rewrite"
+        );
+        Ok(true)
+    }
+
     pub fn flush_all(&self) -> Result<()> {
         let mts = self.memtable_mgr.get_all_pending();
         for group in Self::group_memtables_for_flush(mts) {

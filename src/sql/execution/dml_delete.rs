@@ -644,6 +644,9 @@ pub fn exec_delete(
         .unwrap_or_default();
 
     mgr.with_table_mutation_lock(db, table, || {
+        engine
+            .batch_writer()
+            .checkpoint_before_rewrite_under_table_lock(db, table, 1)?;
         // Memtable-resident rows are removed in place (no forced flush),
         // mirroring the REPLACE conflict path; durable tails are rewritten
         // so crash recovery cannot resurrect deleted rows.

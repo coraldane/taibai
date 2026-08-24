@@ -44,6 +44,11 @@ pub fn exec_replace(
     let (deleted, undo) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
+            engine.batch_writer().checkpoint_before_rewrite_under_table_lock(
+                db,
+                table,
+                physical_insert_rows as usize,
+            )?;
             ensure_replace_location_indexes(
                 engine,
                 db,
