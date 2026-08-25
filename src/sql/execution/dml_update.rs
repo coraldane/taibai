@@ -54,7 +54,9 @@ pub fn exec_update(
     let target_partition_key =
         super::dml_delete::delete_partition_eq_key(where_clause, &table_schema, &table_meta);
 
-    engine.batch_writer().checkpoint_before_rewrite(db, table, 1)?;
+    engine
+        .batch_writer()
+        .checkpoint_before_rewrite(db, table, 1)?;
 
     let updated_count = mgr.with_table_mutation_lock(db, table, || {
         let mut updated_count = 0u64;
@@ -290,24 +292,45 @@ pub fn exec_update(
         // later INSERTs while older memtable rows are still live.
         engine.hot_store_manager().invalidate(db, table);
 
+        // UPDATE rewrites rows into new segments, so old index locations die.
+        // Rebuild the location-index snapshots from a fresh scan while still
+        // holding the table lock so the next statement stays incremental; a
+        // failure falls back to wholesale invalidation, whose lazy rebuild on
+        // the next probe preserves correctness.
+        if updated_count > 0 {
+            if let Err(error) = super::dml_insert::rebuild_table_location_indexes(
+                engine,
+                db,
+                table,
+                &table_meta,
+                &table_schema,
+            ) {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "UPDATE index auto-rebuild failed; falling back to snapshot invalidation"
+                );
+                engine
+                    .index_manager()
+                    .invalidate_primary_key_index(db, table);
+                let unique_index_names = table_meta
+                    .unique_indexes
+                    .iter()
+                    .map(|index| index.name.clone())
+                    .collect::<Vec<_>>();
+                engine
+                    .index_manager()
+                    .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+            }
+        }
+
         Ok(updated_count)
     })?;
 
     if updated_count == 0 {
         return Ok(ExecResult::Ok { rows_affected: 0 });
     }
-
-    engine
-        .index_manager()
-        .invalidate_primary_key_index(db, table);
-    let unique_index_names = table_meta
-        .unique_indexes
-        .iter()
-        .map(|index| index.name.clone())
-        .collect::<Vec<_>>();
-    engine
-        .index_manager()
-        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
 
     let mut catalogs = engine.catalogs().write().unwrap();
     if let Some(catalog) = catalogs.get_mut(db) {

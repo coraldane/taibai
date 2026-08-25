@@ -114,10 +114,7 @@ impl CommitCompletion {
                     timeout.as_millis()
                 )));
             }
-            let (new_guard, _) = self
-                .ready
-                .wait_timeout(guard, timeout - elapsed)
-                .unwrap();
+            let (new_guard, _) = self.ready.wait_timeout(guard, timeout - elapsed).unwrap();
             guard = new_guard;
         }
         let waited = start.elapsed();

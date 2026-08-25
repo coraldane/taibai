@@ -612,6 +612,250 @@ pub(crate) fn finalize_replace_delete(
     Ok(())
 }
 
+/// Upper bound on per-statement precise index maintenance. Deletes larger
+/// than this abandon incremental bookkeeping and fall back to one wholesale
+/// snapshot invalidation, where a single amortized rebuild is cheaper than
+/// recording every deleted row.
+const MAX_PRECISELY_MAINTAINED_DELETE_ROWS: usize = 65_536;
+
+/// Incremental unique-index bookkeeping for DELETE: per-index key sets and
+/// segment row locations of every deleted row, applied as location
+/// tombstones plus key removals after the physical delete, instead of
+/// invalidating the snapshots and forcing a full-table rebuild.
+pub(crate) struct DeleteIndexMaintenance {
+    indexes: Vec<(String, Vec<usize>)>,
+    /// Key-column positions inside a full-schema batch, per index.
+    schema_key_positions: Vec<Vec<usize>>,
+    keys: Vec<HashSet<Vec<ScalarValue>>>,
+    locations: Vec<UniqueRowLocation>,
+    maintained: bool,
+    rows_seen: usize,
+}
+
+impl DeleteIndexMaintenance {
+    fn plan(table_meta: &TableMeta, schema: &Schema) -> Self {
+        let mut indexes = Vec::new();
+        for index in &table_meta.unique_indexes {
+            let indices = index
+                .columns
+                .iter()
+                .map(|column| schema.index_of(column))
+                .collect::<Option<Vec<_>>>();
+            if let Some(indices) = indices {
+                indexes.push((index.name.clone(), indices));
+            }
+        }
+        let primary_indices = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .map(|(idx, _)| idx)
+            .collect::<Vec<_>>();
+        if !primary_indices.is_empty() {
+            indexes.push((
+                crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
+                primary_indices,
+            ));
+        }
+        let schema_key_positions = indexes.iter().map(|(_, indices)| indices.clone()).collect();
+        let keys = vec![HashSet::new(); indexes.len()];
+        Self {
+            indexes,
+            schema_key_positions,
+            keys,
+            locations: Vec::new(),
+            maintained: true,
+            rows_seen: 0,
+        }
+    }
+
+    fn has_indexes(&self) -> bool {
+        !self.indexes.is_empty()
+    }
+
+    fn still_maintaining(&self) -> bool {
+        self.maintained && self.has_indexes()
+    }
+
+    fn admit_row(&mut self) -> bool {
+        if !self.has_indexes() || !self.maintained {
+            return false;
+        }
+        if self.rows_seen >= MAX_PRECISELY_MAINTAINED_DELETE_ROWS {
+            self.maintained = false;
+            for key_set in &mut self.keys {
+                key_set.clear();
+            }
+            self.locations.clear();
+            return false;
+        }
+        self.rows_seen += 1;
+        true
+    }
+
+    /// Row-group projection covering the WHERE columns plus every index key
+    /// column. Identical to the predicate-only projection when the table has
+    /// no unique indexes.
+    fn projection(&self, predicate_projection: &[usize]) -> Vec<usize> {
+        if !self.has_indexes() {
+            return predicate_projection.to_vec();
+        }
+        let mut projection = predicate_projection.to_vec();
+        for (_, indices) in &self.indexes {
+            projection.extend(indices.iter().copied());
+        }
+        projection.sort_unstable();
+        projection.dedup();
+        projection
+    }
+
+    /// For each index, the positions of its key columns inside the merged
+    /// row-group projection.
+    fn projected_key_positions(&self, projection: &[usize]) -> Vec<Vec<usize>> {
+        self.indexes
+            .iter()
+            .map(|(_, indices)| {
+                indices
+                    .iter()
+                    .map(|index| {
+                        projection
+                            .iter()
+                            .position(|projected| projected == index)
+                            .expect("projection contains every index key column")
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn record_memtable_rows(&mut self, plans: &[ReplaceMemtableConflictPlan]) {
+        for plan in plans {
+            for &row_idx in &plan.removed_positions {
+                if !self.admit_row() {
+                    return;
+                }
+                self.record_keys_from_positions(&plan.original, row_idx as usize);
+            }
+        }
+    }
+
+    fn record_keys_from_positions(&mut self, batch: &RecordBatch, row_idx: usize) {
+        for (index_offset, key_positions) in self.schema_key_positions.iter().enumerate() {
+            let mut key = Vec::with_capacity(key_positions.len());
+            let mut valid = true;
+            for &position in key_positions {
+                let value = batch.scalar(row_idx, position).unwrap_or_else(|| {
+                    ScalarValue::null_for_type(batch.schema.columns[position].data_type)
+                });
+                if value.is_null() {
+                    valid = false;
+                    break;
+                }
+                key.push(value);
+            }
+            if valid {
+                self.keys[index_offset].insert(key);
+            }
+        }
+    }
+
+    fn record_segment_row(
+        &mut self,
+        segment_path: &str,
+        row_id: u64,
+        batch: &RecordBatch,
+        row_idx: usize,
+        projected_positions: &[Vec<usize>],
+    ) {
+        if !self.admit_row() {
+            return;
+        }
+        self.locations.push(UniqueRowLocation {
+            segment_path: segment_path.to_string(),
+            row_id,
+        });
+        for (index_offset, key_positions) in projected_positions.iter().enumerate() {
+            let mut key = Vec::with_capacity(key_positions.len());
+            let mut valid = true;
+            for &position in key_positions {
+                let value = batch.scalar(row_idx, position).unwrap_or_else(|| {
+                    ScalarValue::null_for_type(batch.schema.columns[position].data_type)
+                });
+                if value.is_null() {
+                    valid = false;
+                    break;
+                }
+                key.push(value);
+            }
+            if valid {
+                self.keys[index_offset].insert(key);
+            }
+        }
+    }
+
+    /// Publishes the recorded maintenance. Any failure means the caller must
+    /// fall back to wholesale snapshot invalidation.
+    fn apply(&self, engine: &Engine, db: &str, table: &str) -> bool {
+        if !self.has_indexes() {
+            return true;
+        }
+        if !self.maintained {
+            return false;
+        }
+        for (index_offset, (index_name, _)) in self.indexes.iter().enumerate() {
+            let snapshot_missing = || {
+                matches!(
+                    engine
+                        .index_manager()
+                        .unique_index_columns(db, table, index_name),
+                    Ok(None)
+                )
+            };
+            match engine.index_manager().append_unique_index_tombstones(
+                db,
+                table,
+                index_name,
+                self.locations.clone(),
+            ) {
+                Ok(true) => {}
+                Ok(false) if snapshot_missing() => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    tracing::warn!(
+                        db,
+                        table,
+                        index = %index_name,
+                        error = %error,
+                        "DELETE failed to append index tombstones; falling back to invalidation"
+                    );
+                    return false;
+                }
+            }
+            let keys = self.keys[index_offset].iter().cloned().collect::<Vec<_>>();
+            match engine
+                .index_manager()
+                .remove_unique_index_keys(db, table, index_name, &keys)
+            {
+                Ok(true) => {}
+                Ok(false) if snapshot_missing() => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    tracing::warn!(
+                        db,
+                        table,
+                        index = %index_name,
+                        error = %error,
+                        "DELETE failed to remove index keys; falling back to invalidation"
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
 pub fn exec_delete(
     engine: &Engine,
     db: &str,
@@ -643,9 +887,13 @@ pub fn exec_delete(
         .map(|expr| collect_expr_column_indices(expr, &table_schema))
         .unwrap_or_default();
 
-    engine.batch_writer().checkpoint_before_rewrite(db, table, 1)?;
+    engine
+        .batch_writer()
+        .checkpoint_before_rewrite(db, table, 1)?;
 
-    mgr.with_table_mutation_lock(db, table, || {
+    let mut index_maintenance = DeleteIndexMaintenance::plan(&table_meta, &table_schema);
+
+    let indexes_maintained = mgr.with_table_mutation_lock(db, table, || {
         // Memtable-resident rows are removed in place (no forced flush),
         // mirroring the REPLACE conflict path; durable tails are rewritten
         // so crash recovery cannot resurrect deleted rows.
@@ -660,6 +908,7 @@ pub fn exec_delete(
                 .filter(|key| !key.is_empty()),
         )?;
         if !memtable_plans.is_empty() {
+            index_maintenance.record_memtable_rows(&memtable_plans);
             engine.hot_store_manager().remove(db, table);
             let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
             total_deleted += undo.deleted_rows();
@@ -684,6 +933,8 @@ pub fn exec_delete(
                 pred,
             )?;
         }
+        let key_projection = index_maintenance.projection(&predicate_projection);
+        let projected_key_positions = index_maintenance.projected_key_positions(&key_projection);
         for seg_path in segment_files {
             let (new_bitmap, new_deleted_count, prev_deleted) = {
                 let reader = mgr.open_reader_cached(&seg_path)?;
@@ -696,6 +947,9 @@ pub fn exec_delete(
                         continue;
                     }
                 }
+                let segment_path_string = index_maintenance
+                    .still_maintaining()
+                    .then(|| seg_path.to_string_lossy().to_string());
                 let prev_bitmap = reader.delete_bitmap().to_vec();
                 let prev_deleted = reader.deleted_row_count();
                 let bitmap_bytes = total_rows.div_ceil(8) as usize;
@@ -722,10 +976,10 @@ pub fn exec_delete(
                     }
 
                     if let Some(ref where_expr) = resolved_where_clause {
-                        let batch = if predicate_projection.is_empty() {
+                        let batch = if key_projection.is_empty() {
                             reader.read_row_group(rg_idx)?
                         } else {
-                            reader.read_row_group_with_projection(rg_idx, &predicate_projection)?
+                            reader.read_row_group_with_projection(rg_idx, &key_projection)?
                         };
                         let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
                         for (i, matches) in mask.into_iter().enumerate() {
@@ -733,9 +987,37 @@ pub fn exec_delete(
                                 && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
                             {
                                 newly_deleted += 1;
+                                if let Some(segment_path) = segment_path_string.as_deref() {
+                                    index_maintenance.record_segment_row(
+                                        segment_path,
+                                        row_id + i as u64,
+                                        &batch,
+                                        i,
+                                        &projected_key_positions,
+                                    );
+                                }
                             }
                         }
                         row_id += batch.num_rows() as u64;
+                    } else if let Some(segment_path) = segment_path_string.as_deref() {
+                        let batch = if key_projection.is_empty() {
+                            reader.read_row_group(rg_idx)?
+                        } else {
+                            reader.read_row_group_with_projection(rg_idx, &key_projection)?
+                        };
+                        for i in 0..batch.num_rows() {
+                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64) {
+                                newly_deleted += 1;
+                                index_maintenance.record_segment_row(
+                                    segment_path,
+                                    row_id + i as u64,
+                                    &batch,
+                                    i,
+                                    &projected_key_positions,
+                                );
+                            }
+                        }
+                        row_id += rg_rows;
                     } else {
                         for i in 0..rg_rows {
                             if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
@@ -757,21 +1039,34 @@ pub fn exec_delete(
 
             mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count)?;
         }
-        Ok(())
+
+        Ok(index_maintenance.apply(engine, db, table))
     })?;
 
     if total_deleted > 0 {
-        engine
-            .index_manager()
-            .invalidate_primary_key_index(db, table);
-        let unique_index_names = table_meta
-            .unique_indexes
-            .iter()
-            .map(|index| index.name.clone())
-            .collect::<Vec<_>>();
-        engine
-            .index_manager()
-            .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+        if !indexes_maintained {
+            tracing::warn!(
+                db,
+                table,
+                deleted_rows = total_deleted,
+                "DELETE fell back to unique-index snapshot invalidation"
+            );
+            engine
+                .index_manager()
+                .invalidate_primary_key_index(db, table);
+            let unique_index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            engine
+                .index_manager()
+                .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+        } else {
+            engine
+                .index_manager()
+                .invalidate_primary_key_cache(db, table);
+        }
 
         let mut catalogs = engine.catalogs().write().unwrap();
         if let Some(catalog) = catalogs.get_mut(db) {

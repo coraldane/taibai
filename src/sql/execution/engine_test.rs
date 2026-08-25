@@ -531,7 +531,8 @@ fn delete_then_insert_same_unique_key_after_rebuild() -> Result<()> {
     let invalid_file = index_dir.join("uk_id.invalid");
     engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
     assert!(base_file.exists());
-    assert!(invalid_file.exists());
+    assert!(!invalid_file.exists());
+    assert!(index_dir.join("uk_id.delta.tbi").exists());
     assert_eq!(
         engine.index_manager().unique_key_exists(
             "main",
@@ -539,7 +540,7 @@ fn delete_then_insert_same_unique_key_after_rebuild() -> Result<()> {
             "uk_id",
             &[ScalarValue::Int64(Some(1))]
         )?,
-        None
+        Some(false)
     );
     engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (1, 'b')")?;
 
@@ -549,6 +550,62 @@ fn delete_then_insert_same_unique_key_after_rebuild() -> Result<()> {
         0,
     );
     assert_eq!(name, "b");
+
+    // Flush moves rows into segments; DELETE must maintain the index
+    // incrementally for physical rows too (no invalidation marker) and the
+    // removal must survive an engine restart via the persisted delta.
+    engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (2, 'c')")?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
+    assert!(!invalid_file.exists());
+    assert_eq!(
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_id",
+            &[ScalarValue::Int64(Some(1))]
+        )?,
+        Some(false)
+    );
+    assert_eq!(
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_id",
+            &[ScalarValue::Int64(Some(2))]
+        )?,
+        Some(true)
+    );
+
+    drop(engine);
+    let engine = Engine::new(dir.path(), "main")?;
+    assert_eq!(
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_id",
+            &[ScalarValue::Int64(Some(1))]
+        )?,
+        Some(false)
+    );
+    let duplicate = engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (2, 'dup')");
+    assert!(duplicate.is_err());
+    engine.execute(
+        &mut session,
+        "REPLACE INTO t (id, name) VALUES (1, 'again')",
+    )?;
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 1")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "again");
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 2);
     Ok(())
 }
 
@@ -707,10 +764,12 @@ fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()>
         .load_unique_index_snapshot("main", "t", index_name)?
         .is_some());
     engine.execute(&mut session, "INSERT INTO t VALUES (1, 'old')")?;
+    // INSERT appends a placeholder delta entry instead of invalidating the
+    // primary-key location snapshot.
     assert!(engine
         .index_manager()
         .load_unique_index_snapshot("main", "t", index_name)?
-        .is_none());
+        .is_some());
 
     engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'new')")?;
     // Replacement rows stay memtable-resident, so location probes skip their
@@ -739,7 +798,9 @@ fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()>
     assert!(locations.is_empty());
 
     engine.execute(&mut session, "OPTIMIZE TABLE t")?;
-    assert!(engine
+    // OPTIMIZE flushes memtables and rewrites segments, so the location index
+    // is rebuilt eagerly and the key now has a physical location again.
+    let locations = engine
         .index_manager()
         .unique_key_locations(
             "main",
@@ -747,7 +808,9 @@ fn primary_key_replace_rebuilds_and_maintains_physical_locations() -> Result<()>
             index_name,
             &[vec![ScalarValue::Int64(Some(1))]],
         )?
-        .is_none());
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
     engine.execute(&mut session, "REPLACE INTO t VALUES (1, 'optimized')")?;
     let locations = engine
         .index_manager()
@@ -817,6 +880,126 @@ fn update_unique_key_after_rebuild_allows_old_key_reuse() -> Result<()> {
     engine.execute(&mut session, "UPDATE t SET code = 20 WHERE id = 1")?;
     engine.execute(&mut session, "INSERT INTO t (id, code) VALUES (2, 10)")?;
 
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 2);
+    Ok(())
+}
+
+#[test]
+fn update_rewrites_segments_and_auto_rebuilds_index() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, code INT64, UNIQUE KEY uk_code (code))",
+    )?;
+    engine.execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+    engine.execute(&mut session, "REBUILD UNIQUE INDEX uk_code ON t")?;
+
+    let index_dir = dir
+        .path()
+        .join("main")
+        .join("t")
+        .join("indexes")
+        .join("unique");
+    let invalid_file = index_dir.join("uk_code.invalid");
+    assert!(!invalid_file.exists());
+
+    // Updating a non-key column rewrites the segment; the location index must
+    // be rebuilt eagerly rather than invalidated for a lazy rebuild.
+    engine.execute(&mut session, "UPDATE t SET code = 21 WHERE id = 1")?;
+    assert!(!invalid_file.exists());
+    let locations = engine
+        .index_manager()
+        .unique_key_locations(
+            "main",
+            "t",
+            "uk_code",
+            &[vec![ScalarValue::Int64(Some(21))]],
+        )?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
+    assert_eq!(
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_code",
+            &[ScalarValue::Int64(Some(10))]
+        )?,
+        Some(false)
+    );
+
+    // The freed key is reusable and the new key stays unique.
+    engine.execute(&mut session, "INSERT INTO t VALUES (3, 10)")?;
+    let duplicate = engine.execute(&mut session, "INSERT INTO t VALUES (4, 21)");
+    assert!(duplicate.is_err());
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 3);
+    Ok(())
+}
+
+#[test]
+fn optimize_table_auto_rebuilds_index() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, name VARCHAR, UNIQUE KEY uk_id (id))",
+    )?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+    engine.execute(&mut session, "REBUILD UNIQUE INDEX uk_id ON t")?;
+
+    let index_dir = dir
+        .path()
+        .join("main")
+        .join("t")
+        .join("indexes")
+        .join("unique");
+    let invalid_file = index_dir.join("uk_id.invalid");
+    assert!(!invalid_file.exists());
+
+    // The deleted row makes OPTIMIZE rewrite the segment instead of skipping
+    // it; the index must be rebuilt to the new locations, not invalidated.
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 3")?;
+    engine.execute(&mut session, "OPTIMIZE TABLE t")?;
+    assert!(!invalid_file.exists());
+    let locations = engine
+        .index_manager()
+        .unique_key_locations("main", "t", "uk_id", &[vec![ScalarValue::Int64(Some(1))]])?
+        .unwrap();
+    assert_eq!(locations.len(), 1);
+    assert!(!locations[0].segment_path.is_empty());
+    assert_eq!(
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_id",
+            &[ScalarValue::Int64(Some(3))]
+        )?,
+        Some(false)
+    );
+
+    // The rebuilt snapshot still enforces uniqueness.
+    let duplicate = engine.execute(&mut session, "INSERT INTO t VALUES (1, 'dup')");
+    assert!(duplicate.is_err());
     let count = first_i64(
         engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
         0,

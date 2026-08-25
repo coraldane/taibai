@@ -390,8 +390,13 @@ pub fn exec_rebuild_unique_index(
                     continue;
                 }
                 let indices = resolve_unique_index_columns(&table_schema, &index.columns)?;
-                let entries =
-                    super::dml_insert::collect_unique_index_entries(engine, db, table, &indices)?;
+                let entries = super::dml_insert::collect_unique_index_entries(
+                    engine,
+                    db,
+                    table,
+                    &indices,
+                    "REBUILD UNIQUE INDEX statement",
+                )?;
                 engine.index_manager().persist_unique_index_entries(
                     db,
                     table,

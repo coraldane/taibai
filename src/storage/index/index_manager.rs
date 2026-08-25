@@ -76,6 +76,10 @@ struct UniqueIndexDeltaState {
     entry_count: u64,
     key_locations: HashMap<Vec<u8>, Vec<UniqueRowLocation>>,
     tombstones: HashSet<UniqueRowLocation>,
+    /// Encoded keys whose entries were removed by deletes. Replays in record
+    /// order during materialization so a later re-insert of the same key
+    /// survives; also blocks placeholder resurrection on reload.
+    removed_keys: HashSet<Vec<u8>>,
 }
 
 impl UniqueIndexState {
@@ -461,7 +465,10 @@ impl IndexManager {
         index_name: &str,
         state: &UniqueIndexState,
     ) -> Result<UniqueIndexData> {
-        let tombstones = state.delta.read().unwrap().tombstones.clone();
+        let (tombstones, removed_keys) = {
+            let delta = state.delta.read().unwrap();
+            (delta.tombstones.clone(), delta.removed_keys.clone())
+        };
         let dir = self.unique_index_dir(db, table);
         let base = sanitize_file_component(index_name);
         let delta_path = dir.join(format!("{}.delta.tbi", base));
@@ -470,7 +477,7 @@ impl IndexManager {
         } else {
             Vec::new()
         };
-        materialize_unique_index_state_parts(&state.base, &delta_bytes, &tombstones)
+        materialize_unique_index_state_parts(&state.base, &delta_bytes, &tombstones, &removed_keys)
     }
 
     pub fn load_unique_index_data(
@@ -1036,6 +1043,74 @@ impl IndexManager {
         Ok(true)
     }
 
+    /// Removes every delta entry for the given keys (memtable placeholders
+    /// and segment-backed locations recorded after a flush) and persists the
+    /// removal as an ordered delta record, so reloads and compaction replay
+    /// it before any later re-insert of the same key. Base entries for these
+    /// keys are expected to be handled by location tombstones. Returns
+    /// Ok(false) when the snapshot cannot be maintained (base file missing
+    /// under a live state); callers fall back to snapshot invalidation.
+    pub fn remove_unique_index_keys(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        keys: &[Vec<ScalarValue>],
+    ) -> Result<bool> {
+        let mut encoded_keys = keys
+            .iter()
+            .map(|key| encode_unique_key(key))
+            .collect::<Result<Vec<_>>>()?;
+        encoded_keys.sort();
+        encoded_keys.dedup();
+        if encoded_keys.is_empty() {
+            return Ok(true);
+        }
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            return Ok(true);
+        };
+        let needs_compaction = {
+            let _mutation_guard = state.mutation_lock.lock().unwrap();
+            let cache_key = unique_index_key(db, table, index_name);
+            let is_current = self
+                .unique_indexes
+                .read()
+                .unwrap()
+                .get(&cache_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &state));
+            if !is_current {
+                drop(_mutation_guard);
+                return self.remove_unique_index_keys(db, table, index_name, keys);
+            }
+            let dir = self.unique_index_dir(db, table);
+            let base = sanitize_file_component(index_name);
+            if !dir.join(format!("{}.keys.tbi", base)).exists() {
+                return Ok(false);
+            }
+            std::fs::create_dir_all(&dir)?;
+            let delta_path = dir.join(format!("{}.delta.tbi", base));
+            append_unique_index_removed_key_delta(&delta_path, &encoded_keys)?;
+            let delta_count = {
+                let mut delta = state.delta.write().unwrap();
+                for encoded in &encoded_keys {
+                    if let Some(locations) = delta.key_locations.remove(encoded) {
+                        delta.entry_count =
+                            delta.entry_count.saturating_sub(locations.len() as u64);
+                    }
+                    delta.removed_keys.insert(encoded.clone());
+                }
+                delta
+                    .entry_count
+                    .saturating_add(delta.tombstones.len() as u64)
+            };
+            unique_index_delta_needs_compaction(delta_count, state.base.entries.len())
+        };
+        if needs_compaction {
+            self.try_dispatch_unique_index_compaction(db, table, index_name, &state);
+        }
+        Ok(true)
+    }
+
     pub fn invalidate_unique_index_snapshot_if_present(
         &self,
         db: &str,
@@ -1199,10 +1274,15 @@ impl IndexManager {
 /// Merges a base snapshot with serialized delta records and a set of
 /// in-memory tombstones into one materialized `UniqueIndexData`. Progress
 /// fields are copied from the base; callers override them as needed.
+///
+/// Records replay strictly in file order: a removed key only erases entries
+/// recorded before the removal, so a later re-insert of the same key in the
+/// same delta file survives (mirrors the in-memory mutation order).
 fn materialize_unique_index_state_parts(
     state_base: &UniqueIndexData,
     delta_bytes: &[u8],
     tombstones: &HashSet<UniqueRowLocation>,
+    removed_keys: &HashSet<Vec<u8>>,
 ) -> Result<UniqueIndexData> {
     let decoded = if delta_bytes.is_empty() {
         UniqueIndexDelta::default()
@@ -1233,14 +1313,70 @@ fn materialize_unique_index_state_parts(
         blocks: Vec::new(),
     };
     data.tombstones.extend(tombstones.iter().cloned());
-    data.tombstones.extend(decoded.tombstones.iter().cloned());
-    merge_prepared_unique_index_entries(&mut data, decoded.entries)?;
+    let mut rows: Vec<(Vec<u8>, UniqueIndexEntry)> = data
+        .encoded_keys
+        .iter()
+        .cloned()
+        .zip(data.entries.iter().cloned())
+        .collect();
+    let mut dead: Vec<bool> = vec![false; rows.len()];
+    let mut positions_by_key: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    for (idx, (encoded, _)) in rows.iter().enumerate() {
+        positions_by_key
+            .entry(encoded.clone())
+            .or_default()
+            .push(idx);
+    }
+    let kill_key_rows =
+        |key: &[u8],
+         rows: &mut Vec<(Vec<u8>, UniqueIndexEntry)>,
+         dead: &mut Vec<bool>,
+         positions_by_key: &mut HashMap<Vec<u8>, Vec<usize>>| {
+            if let Some(positions) = positions_by_key.remove(key) {
+                for position in positions {
+                    rows[position].0 = Vec::new();
+                    dead[position] = true;
+                }
+            }
+        };
+    for removed in removed_keys {
+        kill_key_rows(removed, &mut rows, &mut dead, &mut positions_by_key);
+    }
+    for record in decoded.records {
+        match record {
+            UniqueIndexDeltaRecord::Entry(addition) => {
+                positions_by_key
+                    .entry(addition.encoded_key.clone())
+                    .or_default()
+                    .push(rows.len());
+                rows.push((addition.encoded_key, addition.entry));
+                dead.push(false);
+            }
+            UniqueIndexDeltaRecord::Tombstone(location) => {
+                data.tombstones.insert(location);
+            }
+            UniqueIndexDeltaRecord::RemovedKey(encoded) => {
+                kill_key_rows(&encoded, &mut rows, &mut dead, &mut positions_by_key);
+            }
+        }
+    }
+    let mut kept: Vec<(Vec<u8>, UniqueIndexEntry)> = Vec::with_capacity(rows.len());
+    for (idx, row) in rows.into_iter().enumerate() {
+        if !dead[idx] {
+            kept.push(row);
+        }
+    }
+    kept.sort_by(|left, right| left.0.cmp(&right.0));
+    data.encoded_keys = kept.iter().map(|(encoded, _)| encoded.clone()).collect();
+    data.entries = kept.into_iter().map(|(_, entry)| entry).collect();
+    data.blocks = build_unique_index_blocks(&data.encoded_keys);
     Ok(data)
 }
 
 struct UniqueIndexCompactionSnapshot {
     delta_bytes: Vec<u8>,
     tombstones: HashSet<UniqueRowLocation>,
+    removed_keys: HashSet<Vec<u8>>,
 }
 
 /// Single-flight background compaction of the delta back into the base
@@ -1289,10 +1425,14 @@ impl UniqueIndexCompactionJob {
         } else {
             Vec::new()
         };
-        let tombstones = self.state.delta.read().unwrap().tombstones.clone();
+        let (tombstones, removed_keys) = {
+            let delta = self.state.delta.read().unwrap();
+            (delta.tombstones.clone(), delta.removed_keys.clone())
+        };
         Ok(Some(UniqueIndexCompactionSnapshot {
             delta_bytes,
             tombstones,
+            removed_keys,
         }))
     }
 
@@ -1334,6 +1474,7 @@ impl UniqueIndexCompactionJob {
             &self.state.base,
             &snapshot.delta_bytes,
             &snapshot.tombstones,
+            &snapshot.removed_keys,
         )?;
         // Embed the snapshot progress: the progress sidecar file may
         // advance during the merge and outranks this on restart.
@@ -1809,20 +1950,25 @@ fn append_prepared_unique_index_delta(
 }
 
 fn append_unique_index_delta(path: &Path, entries: &[UniqueIndexEntry]) -> Result<()> {
-    append_unique_index_delta_records(path, entries, &[])
+    append_unique_index_delta_records(path, entries, &[], &[])
 }
 
 fn append_unique_index_tombstone_delta(
     path: &Path,
     tombstones: &[UniqueRowLocation],
 ) -> Result<()> {
-    append_unique_index_delta_records(path, &[], tombstones)
+    append_unique_index_delta_records(path, &[], tombstones, &[])
+}
+
+fn append_unique_index_removed_key_delta(path: &Path, removed_keys: &[Vec<u8>]) -> Result<()> {
+    append_unique_index_delta_records(path, &[], &[], removed_keys)
 }
 
 fn append_unique_index_delta_records(
     path: &Path,
     entries: &[UniqueIndexEntry],
     tombstones: &[UniqueRowLocation],
+    removed_keys: &[Vec<u8>],
 ) -> Result<()> {
     let is_new = !path.exists() || std::fs::metadata(path)?.len() == 0;
     let mut file = std::fs::OpenOptions::new()
@@ -1853,29 +1999,52 @@ fn append_unique_index_delta_records(
         write_u32(&mut file, record.len() as u32)?;
         file.write_all(&record)?;
     }
+    for encoded in removed_keys {
+        let mut record = Vec::new();
+        record.push(3);
+        put_bytes(&mut record, encoded);
+        write_u32(&mut file, record.len() as u32)?;
+        file.write_all(&record)?;
+    }
     file.sync_all()?;
     Ok(())
 }
 
+enum UniqueIndexDeltaRecord {
+    Entry(PreparedUniqueIndexEntry),
+    Tombstone(UniqueRowLocation),
+    RemovedKey(Vec<u8>),
+}
+
 #[derive(Default)]
 struct UniqueIndexDelta {
-    entries: Vec<PreparedUniqueIndexEntry>,
-    tombstones: Vec<UniqueRowLocation>,
+    records: Vec<UniqueIndexDeltaRecord>,
 }
 
 impl UniqueIndexDelta {
     fn into_state(self) -> Result<UniqueIndexDeltaState> {
-        let mut state = UniqueIndexDeltaState {
-            entry_count: self.entries.len() as u64,
-            tombstones: self.tombstones.into_iter().collect(),
-            key_locations: HashMap::new(),
-        };
-        for addition in &self.entries {
-            state
-                .key_locations
-                .entry(addition.encoded_key.clone())
-                .or_default()
-                .push(addition.entry.location.clone());
+        let mut state = UniqueIndexDeltaState::default();
+        for record in self.records {
+            match record {
+                UniqueIndexDeltaRecord::Entry(addition) => {
+                    state
+                        .key_locations
+                        .entry(addition.encoded_key.clone())
+                        .or_default()
+                        .push(addition.entry.location);
+                    state.entry_count += 1;
+                }
+                UniqueIndexDeltaRecord::Tombstone(location) => {
+                    state.tombstones.insert(location);
+                }
+                UniqueIndexDeltaRecord::RemovedKey(encoded) => {
+                    if let Some(locations) = state.key_locations.remove(&encoded) {
+                        state.entry_count =
+                            state.entry_count.saturating_sub(locations.len() as u64);
+                    }
+                    state.removed_keys.insert(encoded);
+                }
+            }
         }
         Ok(state)
     }
@@ -1955,16 +2124,27 @@ fn decode_unique_index_delta_records(bytes: &[u8], offset: usize) -> Result<Uniq
                 let encoded_key = read_bytes(&mut record_cursor)?;
                 let entry = read_unique_index_entry(&mut record_cursor)?;
                 delta
-                    .entries
-                    .push(PreparedUniqueIndexEntry { encoded_key, entry });
+                    .records
+                    .push(UniqueIndexDeltaRecord::Entry(PreparedUniqueIndexEntry {
+                        encoded_key,
+                        entry,
+                    }));
             }
             2 => {
                 let segment_path = read_string(&mut record_cursor)?;
                 let row_id = read_u64(&mut record_cursor)?;
-                delta.tombstones.push(UniqueRowLocation {
-                    segment_path,
-                    row_id,
-                });
+                delta
+                    .records
+                    .push(UniqueIndexDeltaRecord::Tombstone(UniqueRowLocation {
+                        segment_path,
+                        row_id,
+                    }));
+            }
+            3 => {
+                let encoded_key = read_bytes(&mut record_cursor)?;
+                delta
+                    .records
+                    .push(UniqueIndexDeltaRecord::RemovedKey(encoded_key));
             }
             other => {
                 return Err(TaibaiError::Storage(format!(

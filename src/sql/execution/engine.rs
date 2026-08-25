@@ -211,25 +211,54 @@ fn table_physical_health(
     })
 }
 
-fn invalidate_compacted_location_indexes(
-    index_manager: &crate::storage::index::index_manager::IndexManager,
+fn rebuild_compacted_location_indexes(
+    index_manager: &IndexManager,
+    segment_mgr: &SegmentManager,
+    memtable_manager: &MemTableManager,
+    data_dir: &Path,
     db: &str,
     table: &str,
     table_meta: &crate::storage::catalog::schema::TableMeta,
 ) {
-    let index_names = table_meta
-        .unique_indexes
-        .iter()
-        .map(|index| index.name.clone())
-        .collect::<Vec<_>>();
-    index_manager.invalidate_table_unique_index_snapshots(db, table, &index_names);
+    let schema = Schema::new(table_meta.columns.clone());
+    let memtables = memtable_manager.get_by_table(db, table);
+    let result = segment_mgr.with_table_mutation_lock(db, table, || {
+        super::dml_insert::rebuild_table_location_indexes_from(
+            index_manager,
+            segment_mgr,
+            &memtables,
+            data_dir,
+            db,
+            table,
+            table_meta,
+            &schema,
+        )
+    });
+    match result {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "auto-compact index auto-rebuild failed; falling back to snapshot invalidation"
+            );
+            let index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            index_manager.invalidate_table_unique_index_snapshots(db, table, &index_names);
+        }
+    }
 }
 
 fn start_auto_compaction_thread(
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
     catalogs: Arc<RwLock<HashMap<String, DatabaseCatalog>>>,
-    index_manager: Arc<crate::storage::index::index_manager::IndexManager>,
+    index_manager: Arc<IndexManager>,
+    memtable_manager: Arc<MemTableManager>,
     config: AutoCompactConfig,
 ) {
     if !config.enabled && !config.fragmentation_enabled {
@@ -285,8 +314,11 @@ fn start_auto_compaction_thread(
                         match compact_result {
                             Ok(stats) => {
                                 if stats.rows_dropped > 0 || stats.segments_written > 0 {
-                                    invalidate_compacted_location_indexes(
+                                    rebuild_compacted_location_indexes(
                                         &index_manager,
+                                        &segment_mgr,
+                                        &memtable_manager,
+                                        &data_dir,
                                         &db,
                                         &table,
                                         &table_meta,
@@ -319,8 +351,11 @@ fn start_auto_compaction_thread(
                         match compactor.compact_table_for_fragmentation(&db, &table, &table_meta) {
                             Ok(stats) => {
                                 if stats.segments_written > 0 {
-                                    invalidate_compacted_location_indexes(
+                                    rebuild_compacted_location_indexes(
                                         &index_manager,
+                                        &segment_mgr,
+                                        &memtable_manager,
+                                        &data_dir,
                                         &db,
                                         &table,
                                         &table_meta,
@@ -349,8 +384,11 @@ fn start_auto_compaction_thread(
                     Ok(_) => {
                         match segment_mgr.cleanup_fully_deleted_segments(&db, &table, &table_dir) {
                             Ok(removed) if removed > 0 => {
-                                invalidate_compacted_location_indexes(
+                                rebuild_compacted_location_indexes(
                                     &index_manager,
+                                    &segment_mgr,
+                                    &memtable_manager,
+                                    &data_dir,
                                     &db,
                                     &table,
                                     &table_meta,

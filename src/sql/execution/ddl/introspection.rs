@@ -618,14 +618,37 @@ pub fn exec_optimize_table(
     };
 
     engine.index_manager().mark_index_stale(db, table);
-    let unique_index_names = table_meta
-        .unique_indexes
-        .iter()
-        .map(|index| index.name.clone())
-        .collect::<Vec<_>>();
-    engine
-        .index_manager()
-        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+    // The rewrite moved rows to new segment locations, so rebuild the
+    // location-index snapshots eagerly instead of invalidating them for a
+    // lazy rebuild on the next probe. Skip when compaction was a no-op.
+    if stats.segments_written > 0 || stats.rows_dropped > 0 {
+        let schema = Schema::new(table_meta.columns.clone());
+        let rebuilt = engine.segment_mgr().with_table_mutation_lock(db, table, || {
+            super::dml_insert::rebuild_table_location_indexes(
+                engine,
+                db,
+                table,
+                &table_meta,
+                &schema,
+            )
+        });
+        if let Err(error) = rebuilt {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "OPTIMIZE TABLE index auto-rebuild failed; falling back to snapshot invalidation"
+            );
+            let unique_index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            engine
+                .index_manager()
+                .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+        }
+    }
 
     tracing::info!(
         db,

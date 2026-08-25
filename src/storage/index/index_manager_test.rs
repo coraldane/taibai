@@ -370,7 +370,14 @@ fn background_compaction_preserves_appends_that_raced_the_merge() -> Result<()> 
     );
 
     let delta_bytes = std::fs::read(job.delta_path())?;
-    assert_eq!(decode_unique_index_delta(&delta_bytes)?.entries.len(), 10);
+    assert_eq!(
+        decode_unique_index_delta(&delta_bytes)?
+            .records
+            .iter()
+            .filter(|record| { matches!(record, UniqueIndexDeltaRecord::Entry(_)) })
+            .count(),
+        10
+    );
 
     let merged = manager.load_unique_index_state("db", "t", "uk")?.unwrap();
     assert_eq!(merged.base.entries.len(), 40);

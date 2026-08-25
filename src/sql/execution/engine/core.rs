@@ -152,6 +152,7 @@ impl Engine {
             data_dir.to_path_buf(),
             Arc::clone(&catalogs),
             Arc::clone(&index_manager),
+            Arc::clone(batch_writer.memtable_manager()),
             auto_compact_config,
         );
 

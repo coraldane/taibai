@@ -447,18 +447,36 @@ impl Engine {
         } else if !dirty_partitions.is_empty() {
             stats = compactor.optimize_table(db, table, &table_meta)?;
         }
-        if stats.segments_written > 0 {
+        if stats.segments_written > 0 || stats.rows_dropped > 0 {
             self.index_manager.mark_index_stale(db, table);
-            let unique_index_names = table_meta
-                .unique_indexes
-                .iter()
-                .map(|index| index.name.clone())
-                .collect::<Vec<_>>();
-            self.index_manager.invalidate_table_unique_index_snapshots(
-                db,
-                table,
-                &unique_index_names,
-            );
+            let schema = Schema::new(table_meta.columns.clone());
+            let rebuilt = self.segment_mgr.with_table_mutation_lock(db, table, || {
+                super::dml_insert::rebuild_table_location_indexes(
+                    self,
+                    db,
+                    table,
+                    &table_meta,
+                    &schema,
+                )
+            });
+            if let Err(error) = rebuilt {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "close-of-day index auto-rebuild failed; falling back to snapshot invalidation"
+                );
+                let unique_index_names = table_meta
+                    .unique_indexes
+                    .iter()
+                    .map(|index| index.name.clone())
+                    .collect::<Vec<_>>();
+                self.index_manager.invalidate_table_unique_index_snapshots(
+                    db,
+                    table,
+                    &unique_index_names,
+                );
+            }
         }
         let today = chrono::Local::now().date_naive().to_string();
         {

@@ -30,12 +30,23 @@ pub fn exec_replace(
     // later plain INSERT still sees the keys without a segment location.
     let replace_unique_constraints =
         unique_constraints(&materialized.table_meta, &location_schema)?;
-    let replace_unique_entries = build_unique_index_entries_for_batch(
+    let mut replace_unique_entries = build_unique_index_entries_for_batch(
         &materialized.table_meta,
         &location_schema,
         &survivors,
         &replace_unique_constraints,
     )?;
+    let replace_primary_indices = primary_key_indices(&location_schema);
+    if !replace_primary_indices.is_empty() {
+        replace_unique_entries.push((
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
+            primary_location_entries_for_batch(
+                &location_schema,
+                &survivors,
+                &replace_primary_indices,
+            ),
+        ));
+    }
     let internal_txn_id = engine.alloc_txn_id();
 
     // Checkpoint large pending tails BEFORE taking the table mutation lock so
@@ -505,11 +516,17 @@ fn exec_materialized_insert_batch(
         primary_keys_for_batch(&batch, &schema, &primary_key_indices)?
     };
     let auto_increment_touched = !auto_inc_cols.is_empty();
-    let unique_index_entries = if publish_unique_index_entries {
+    let mut unique_index_entries = if publish_unique_index_entries {
         build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?
     } else {
         Vec::new()
     };
+    if publish_unique_index_entries && !primary_key_indices.is_empty() {
+        unique_index_entries.push((
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
+            primary_location_entries_for_batch(&schema, &batch, &primary_key_indices),
+        ));
+    }
     log_insert_profile(
         "constraints",
         row_count as usize,
@@ -558,15 +575,6 @@ fn exec_materialized_insert_batch(
         let _ = engine
             .index_manager()
             .append_primary_keys(db, table, &primary_keys)?;
-        if publish_unique_index_entries {
-            engine
-                .index_manager()
-                .invalidate_unique_index_snapshot_if_present(
-                    db,
-                    table,
-                    crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
-                );
-        }
     }
 
     if publish_catalog {
@@ -623,6 +631,31 @@ pub(crate) fn build_unique_index_entries_for_batch(
     Ok(result)
 }
 
+/// Pseudo existence entries (empty segment_path) for the primary-key
+/// location index. Keeping this index incrementally maintained on INSERT
+/// and REPLACE avoids a full-table rebuild on the next REPLACE conflict
+/// lookup that `invalidate_unique_index_snapshot_if_present` used to cause.
+pub(crate) fn primary_location_entries_for_batch(
+    schema: &Schema,
+    batch: &RecordBatch,
+    indices: &[usize],
+) -> Vec<UniqueIndexEntry> {
+    let mut entries = Vec::new();
+    for row_idx in 0..batch.num_rows() {
+        let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
+            continue;
+        };
+        entries.push(UniqueIndexEntry {
+            key,
+            location: UniqueRowLocation {
+                segment_path: String::new(),
+                row_id: row_idx as u64,
+            },
+        });
+    }
+    entries
+}
+
 pub(crate) fn append_unique_index_entries_after_insert(
     engine: &Engine,
     db: &str,
@@ -646,14 +679,15 @@ pub(crate) fn append_unique_index_entries_after_insert(
     Ok(())
 }
 
-fn ensure_replace_location_indexes(
-    engine: &Engine,
-    db: &str,
-    table: &str,
+/// Every location index of a table: named unique indexes plus the implicit
+/// primary-key location index. Each entry is (index name, key columns,
+/// key-column indices in the table schema); the list is empty when the table
+/// has neither unique indexes nor a primary key.
+#[allow(clippy::type_complexity)]
+pub(crate) fn location_indexes_for_table(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
-    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
-) -> Result<()> {
+) -> Result<Vec<(String, Vec<String>, Vec<usize>)>> {
     let mut indexes = table_meta
         .unique_indexes
         .iter()
@@ -670,13 +704,13 @@ fn ensure_replace_location_indexes(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok((index.name.as_str(), index.columns.clone(), indices))
+            Ok((index.name.as_str().to_string(), index.columns.clone(), indices))
         })
         .collect::<Result<Vec<_>>>()?;
     let primary_indices = primary_key_indices(schema);
     if !primary_indices.is_empty() {
         indexes.push((
-            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
             primary_indices
                 .iter()
                 .map(|index| table_meta.columns[*index].name.clone())
@@ -684,6 +718,87 @@ fn ensure_replace_location_indexes(
             primary_indices,
         ));
     }
+    Ok(indexes)
+}
+
+/// Rebuild every location index snapshot from a fresh full scan after a
+/// physical segment rewrite (UPDATE, OPTIMIZE, background compaction): the
+/// rewritten rows live at new segment locations, so the previous snapshots
+/// are unusable. Rebuilding eagerly keeps the next statement on the
+/// incremental path instead of paying the scan lazily. The primary-key
+/// in-memory cache is dropped because updated rows may have changed keys;
+/// the location index rebuilt here is the authoritative probe path.
+pub(crate) fn rebuild_table_location_indexes(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+) -> Result<()> {
+    rebuild_table_location_indexes_from(
+        engine.index_manager(),
+        engine.segment_mgr(),
+        &engine.memtable_manager().get_by_table(db, table),
+        engine.data_dir(),
+        db,
+        table,
+        table_meta,
+        schema,
+    )
+}
+
+/// Component-level twin of `rebuild_table_location_indexes` for callers
+/// without an `Engine` handle (the background auto-compaction thread). The
+/// caller is responsible for holding the table mutation lock, matching the
+/// REPLACE path's `ensure_replace_location_indexes`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rebuild_table_location_indexes_from(
+    index_manager: &crate::storage::index::index_manager::IndexManager,
+    segment_mgr: &SegmentManager,
+    memtables: &[std::sync::Arc<crate::storage::core::memtable::MemTable>],
+    data_dir: &std::path::Path,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+) -> Result<()> {
+    let indexes = location_indexes_for_table(table_meta, schema)?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let table_dir = data_dir.join(db).join(table);
+    for (index_name, columns, indices) in indexes {
+        let entries = collect_unique_index_entries_from(
+            segment_mgr,
+            memtables,
+            &table_dir,
+            table,
+            &indices,
+            "segment rewrite auto rebuild",
+        )?;
+        index_manager.persist_unique_index_entries(
+            db,
+            table,
+            &index_name,
+            &columns,
+            entries,
+            Some(segment_mgr.memtable_flush_epoch(db, table)),
+            None,
+        )?;
+    }
+    index_manager.invalidate_primary_key_cache(db, table);
+    Ok(())
+}
+
+fn ensure_replace_location_indexes(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Result<()> {
+    let indexes = location_indexes_for_table(table_meta, schema)?;
     for (index_name, columns, indices) in indexes {
         let keys = key_sets
             .iter()
@@ -692,16 +807,22 @@ fn ensure_replace_location_indexes(
             .unwrap_or_default();
         if engine
             .index_manager()
-            .unique_key_locations(db, table, index_name, &keys)?
+            .unique_key_locations(db, table, &index_name, &keys)?
             .is_some()
         {
             continue;
         }
-        let entries = collect_unique_index_entries(engine, db, table, &indices)?;
+        let entries = collect_unique_index_entries(
+            engine,
+            db,
+            table,
+            &indices,
+            "replace location index bootstrap",
+        )?;
         engine.index_manager().persist_unique_index_entries(
             db,
             table,
-            index_name,
+            &index_name,
             &columns,
             entries,
             Some(engine.segment_mgr().memtable_flush_epoch(db, table)),

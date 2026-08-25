@@ -114,12 +114,31 @@ pub fn collect_unique_index_entries(
     db: &str,
     table: &str,
     indices: &[usize],
+    reason: &str,
 ) -> Result<Vec<UniqueIndexEntry>> {
+    collect_unique_index_entries_from(
+        engine.segment_mgr(),
+        &engine.memtable_manager().get_by_table(db, table),
+        &engine.data_dir().join(db).join(table),
+        table,
+        indices,
+        reason,
+    )
+}
+
+pub(crate) fn collect_unique_index_entries_from(
+    segment_mgr: &SegmentManager,
+    memtables: &[std::sync::Arc<crate::storage::core::memtable::MemTable>],
+    table_dir: &std::path::Path,
+    table: &str,
+    indices: &[usize],
+    reason: &str,
+) -> Result<Vec<UniqueIndexEntry>> {
+    let started = std::time::Instant::now();
     let mut entries = Vec::new();
-    let table_dir = engine.data_dir().join(db).join(table);
     if table_dir.exists() {
-        for seg_path in SegmentManager::discover_segments(&table_dir)? {
-            let reader = engine.segment_mgr().open_reader_cached(&seg_path)?;
+        for seg_path in SegmentManager::discover_segments(table_dir)? {
+            let reader = segment_mgr.open_reader_cached(&seg_path)?;
             for rg_idx in 0..reader.num_row_groups() {
                 let mut batch = reader.read_row_group_with_projection(rg_idx, indices)?;
                 let rg_start = reader.row_group_start_row(rg_idx);
@@ -148,7 +167,7 @@ pub fn collect_unique_index_entries(
             }
         }
     }
-    for memtable in engine.memtable_manager().get_by_table(db, table) {
+    for memtable in memtables {
         if let Some(batch) = memtable.read() {
             for row_idx in 0..batch.num_rows() {
                 let Some(key) = unique_key_for_row(&batch, row_idx, indices, &batch.schema) else {
@@ -164,6 +183,14 @@ pub fn collect_unique_index_entries(
             }
         }
     }
+    tracing::warn!(
+        table,
+        key_columns = indices.len(),
+        entries = entries.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        reason,
+        "unique index snapshot rebuild from full-table scan"
+    );
     Ok(entries)
 }
 
@@ -377,7 +404,13 @@ pub fn validate_primary_key_uniqueness(
         return Ok(());
     }
 
-    let entries = collect_unique_index_entries(engine, db, table, primary_key_indices)?;
+    let entries = collect_unique_index_entries(
+        engine,
+        db,
+        table,
+        primary_key_indices,
+        "primary key uniqueness fallback",
+    )?;
     let historical_keys = entries
         .into_iter()
         .map(|entry| entry.key)
