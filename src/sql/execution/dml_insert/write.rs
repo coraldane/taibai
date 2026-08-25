@@ -38,17 +38,20 @@ pub fn exec_replace(
     )?;
     let internal_txn_id = engine.alloc_txn_id();
 
+    // Checkpoint large pending tails BEFORE taking the table mutation lock so
+    // the flush I/O does not extend the critical section. Rows arriving after
+    // the checkpoint are conflict-deleted in place below.
+    engine
+        .batch_writer()
+        .checkpoint_before_rewrite(db, table, physical_insert_rows as usize)?;
+
     // No pre-flush: rows still resident in memtables are conflict-deleted in
     // place below. The delete and the staged insert run under one lock, so
     // DELETE/UPDATE cannot interleave.
-    let (deleted, undo) = engine
+    let lock_start = Instant::now();
+    let (deleted, undo, pending_commits) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
-            engine.batch_writer().checkpoint_before_rewrite_under_table_lock(
-                db,
-                table,
-                physical_insert_rows as usize,
-            )?;
             ensure_replace_location_indexes(
                 engine,
                 db,
@@ -130,18 +133,21 @@ pub fn exec_replace(
 
             let finalize_result = engine
                 .batch_writer()
-                .commit_txn_under_table_lock(internal_txn_id);
-            if let Err(error) = finalize_result {
-                rollback_replace_under_table_lock(
-                    engine,
-                    db,
-                    table,
-                    &materialized.table_meta,
-                    internal_txn_id,
-                    &undo,
-                )?;
-                return Err(error);
-            }
+                .commit_txn_submit_under_table_lock(internal_txn_id);
+            let pending_commits = match finalize_result {
+                Ok(pending_commits) => pending_commits,
+                Err(error) => {
+                    rollback_replace_under_table_lock(
+                        engine,
+                        db,
+                        table,
+                        &materialized.table_meta,
+                        internal_txn_id,
+                        &undo,
+                    )?;
+                    return Err(error);
+                }
+            };
 
             // Publish existence markers for the committed replacement rows.
             // Failure only downgrades later validation to a full scan; the
@@ -166,8 +172,49 @@ pub fn exec_replace(
                     .invalidate_table_unique_index_snapshots(db, table, &index_names);
             }
 
-            Ok((deleted, undo))
+            Ok((deleted, undo, pending_commits))
         })?;
+
+    let lock_elapsed = lock_start.elapsed();
+    let lock_warn_after = std::time::Duration::from_millis(
+        crate::common::config::storage_timeouts()
+            .mutation_lock_warn_ms
+            .max(1),
+    );
+    if lock_elapsed >= lock_warn_after {
+        tracing::warn!(
+            db,
+            table,
+            hold_ms = lock_elapsed.as_millis() as u64,
+            inserted_rows = physical_insert_rows,
+            "REPLACE held the table mutation lock for a long critical section"
+        );
+    }
+
+    if let Err(error) = engine
+        .batch_writer()
+        .wait_pending_tail_commits(pending_commits)
+    {
+        let rollback_result = engine.segment_mgr().with_table_mutation_lock(db, table, || {
+            rollback_replace_under_table_lock(
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                internal_txn_id,
+                &undo,
+            )
+        });
+        if let Err(rollback_error) = rollback_result {
+            tracing::warn!(
+                db,
+                table,
+                error = %rollback_error,
+                "failed to restore replaced rows after durable commit failure"
+            );
+        }
+        return Err(error);
+    }
 
     super::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
     engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;

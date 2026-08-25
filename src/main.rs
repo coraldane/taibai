@@ -192,6 +192,12 @@ where
         config.compression.bulk_zstd_level,
         config.storage.reader_cache_capacity,
     );
+    crate::common::config::set_storage_timeouts(crate::common::config::StorageTimeouts {
+        mutation_lock_timeout_ms: config.storage.mutation_lock_timeout_ms,
+        mutation_lock_warn_ms: config.storage.mutation_lock_warn_ms,
+        tail_commit_timeout_ms: config.storage.tail_commit_timeout_ms,
+        tail_commit_warn_ms: config.storage.tail_commit_warn_ms,
+    });
 
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),

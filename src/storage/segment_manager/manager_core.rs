@@ -562,7 +562,7 @@ impl SegmentManager {
     ) -> Result<T> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _guard = state.mutation_lock.lock().unwrap();
+        let _guard = acquire_mutation_lock(&state, &key)?;
         ensure_state_not_retired(&state, db, table)?;
         f()
     }
@@ -583,10 +583,11 @@ impl SegmentManager {
             .iter()
             .map(|key| self.get_or_create_state(key))
             .collect::<Vec<_>>();
-        let _guards = states
-            .iter()
-            .map(|state| state.mutation_lock.lock().unwrap())
-            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(states.len());
+        for (key, state) in keys.iter().zip(states.iter()) {
+            guards.push(acquire_mutation_lock(state, key)?);
+        }
+        let _guards = guards;
         f()
     }
 
@@ -810,6 +811,50 @@ impl SegmentManager {
         for state in states {
             state.retired.store(true, Ordering::Release);
             state.active_segments.lock().unwrap().clear();
+        }
+    }
+}
+
+/// Acquire a table mutation lock with a bounded wait. A stalled lock holder
+/// (slow fsync, durable-tail rewrite, compaction) must surface as an explicit
+/// timeout error instead of blocking the caller forever, and slow acquisitions
+/// are logged so lock queueing is visible in the server log.
+fn acquire_mutation_lock<'a>(
+    state: &'a TableSegmentState,
+    key: &str,
+) -> Result<std::sync::MutexGuard<'a, ()>> {
+    let timeouts = crate::common::config::storage_timeouts();
+    let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
+    let warn_after = Duration::from_millis(timeouts.mutation_lock_warn_ms.max(1));
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match state.mutation_lock.try_lock() {
+            Ok(guard) => {
+                let waited = start.elapsed();
+                if waited >= warn_after {
+                    tracing::warn!(
+                        table = key,
+                        wait_ms = waited.as_millis() as u64,
+                        "table mutation lock acquisition was slow"
+                    );
+                }
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if start.elapsed() >= timeout {
+                    return Err(TaibaiError::ResourceBusy(format!(
+                        "table mutation lock timeout after {}ms waiting on {}",
+                        timeout.as_millis(),
+                        key
+                    )));
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(16));
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("table mutation lock poisoned: {}", poisoned)
+            }
         }
     }
 }

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -102,6 +102,44 @@ impl CommitCompletion {
             Err(message) => Err(TaibaiError::Storage(message.clone())),
         }
     }
+
+    fn wait_bounded(&self, timeout: Duration, warn_after: Duration) -> Result<()> {
+        let start = Instant::now();
+        let mut guard = self.outcome.lock().unwrap();
+        while guard.is_none() {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Err(TaibaiError::Storage(format!(
+                    "durable tail commit timed out after {}ms",
+                    timeout.as_millis()
+                )));
+            }
+            let (new_guard, _) = self
+                .ready
+                .wait_timeout(guard, timeout - elapsed)
+                .unwrap();
+            guard = new_guard;
+        }
+        let waited = start.elapsed();
+        if waited >= warn_after {
+            tracing::warn!(
+                wait_ms = waited.as_millis() as u64,
+                "durable tail commit acknowledgement was slow"
+            );
+        }
+        match guard.as_ref().unwrap() {
+            Ok(()) => Ok(()),
+            Err(message) => Err(TaibaiError::Storage(message.clone())),
+        }
+    }
+}
+
+fn tail_commit_timeouts() -> (Duration, Duration) {
+    let timeouts = crate::common::config::storage_timeouts();
+    (
+        Duration::from_millis(timeouts.tail_commit_timeout_ms.max(1)),
+        Duration::from_millis(timeouts.tail_commit_warn_ms.max(1)),
+    )
 }
 
 pub(crate) struct TailCommitTicket {
@@ -110,7 +148,8 @@ pub(crate) struct TailCommitTicket {
 
 impl TailCommitTicket {
     pub(crate) fn wait(self) -> Result<()> {
-        self.completion.wait()
+        let (timeout, warn_after) = tail_commit_timeouts();
+        self.completion.wait_bounded(timeout, warn_after)
     }
 }
 
@@ -146,18 +185,22 @@ enum CommitCommand {
 pub(crate) struct TailCommitter {
     sender: crossbeam_channel::Sender<CommitCommand>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    queued: Arc<AtomicUsize>,
 }
 
 impl TailCommitter {
     pub(crate) fn start(async_fsync: bool) -> Arc<Self> {
         let (sender, receiver) = crossbeam_channel::unbounded();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let loop_queued = Arc::clone(&queued);
         let handle = std::thread::Builder::new()
             .name("taibai-tail-commit".into())
-            .spawn(move || tail_commit_loop(receiver, async_fsync))
+            .spawn(move || tail_commit_loop(receiver, async_fsync, loop_queued))
             .expect("failed to spawn durable tail commit thread");
         Arc::new(Self {
             sender,
             handle: Mutex::new(Some(handle)),
+            queued,
         })
     }
 
@@ -169,6 +212,7 @@ impl TailCommitter {
         prepared: PreparedTailAppend,
     ) -> TailCommitTicket {
         let completion = CommitCompletion::new();
+        self.queued.fetch_add(1, Ordering::Relaxed);
         if self
             .sender
             .send(CommitCommand::Append(AppendCommand {
@@ -180,6 +224,7 @@ impl TailCommitter {
             }))
             .is_err()
         {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
             completion.finish(Err("durable tail commit thread stopped".into()));
         }
         TailCommitTicket { completion }
@@ -189,6 +234,13 @@ impl TailCommitter {
     /// its cached handles so flush/rename/delete operations are safe on Windows.
     pub(crate) fn barrier(&self, table_dir: &Path) -> Result<()> {
         let completion = CommitCompletion::new();
+        let backlog = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        if backlog > 1024 {
+            tracing::warn!(
+                backlog,
+                "durable tail committer backlog is large; fsync throughput cannot keep up with writes"
+            );
+        }
         if self
             .sender
             .send(CommitCommand::Barrier {
@@ -197,11 +249,13 @@ impl TailCommitter {
             })
             .is_err()
         {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
             return Err(TaibaiError::Storage(
                 "durable tail commit thread stopped".into(),
             ));
         }
-        completion.wait()
+        let (timeout, warn_after) = tail_commit_timeouts();
+        completion.wait_bounded(timeout, warn_after)
     }
 
     pub(crate) fn stop(&self) {
@@ -337,7 +391,17 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
     }))
 }
 
-fn tail_commit_loop(receiver: crossbeam_channel::Receiver<CommitCommand>, async_fsync: bool) {
+fn unqueue(queued: &AtomicUsize, counted: bool) {
+    if counted {
+        queued.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn tail_commit_loop(
+    receiver: crossbeam_channel::Receiver<CommitCommand>,
+    async_fsync: bool,
+    queued: Arc<AtomicUsize>,
+) {
     let mut files = TailFileSet::default();
     let mut compressor = zstd::bulk::Compressor::new(3)
         .expect("zstd level 3 compressor must initialize for durable tail writer");
@@ -346,7 +410,10 @@ fn tail_commit_loop(receiver: crossbeam_channel::Receiver<CommitCommand>, async_
         let command = match deferred.take() {
             Some(command) => command,
             None => match receiver.recv() {
-                Ok(command) => command,
+                Ok(command) => {
+                    unqueue(&queued, !matches!(command, CommitCommand::Shutdown { .. }));
+                    command
+                }
                 Err(_) => break,
             },
         };
@@ -362,10 +429,12 @@ fn tail_commit_loop(receiver: crossbeam_channel::Receiver<CommitCommand>, async_
                     }
                     match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
                         Ok(CommitCommand::Append(next)) => {
+                            unqueue(&queued, true);
                             bytes = bytes.saturating_add(next.prepared.encoded_len());
                             group.push(next);
                         }
                         Ok(other) => {
+                            unqueue(&queued, matches!(other, CommitCommand::Barrier { .. }));
                             deferred = Some(other);
                             break;
                         }
@@ -433,7 +502,17 @@ fn commit_append_group(
                 );
             }
         } else {
+            let sync_start = Instant::now();
             let outcome = files.sync(&key).map_err(|error| error.to_string());
+            let sync_elapsed = sync_start.elapsed();
+            let warn_after = tail_commit_timeouts().1;
+            if sync_elapsed >= warn_after {
+                tracing::warn!(
+                    tail = ?key,
+                    fsync_ms = sync_elapsed.as_millis() as u64,
+                    "durable tail fsync was slow"
+                );
+            }
             for completion in completions {
                 completion.finish(outcome.clone());
             }

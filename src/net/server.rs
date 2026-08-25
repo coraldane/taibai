@@ -156,6 +156,7 @@ where
         usize::MAX
     };
     let idle_timeout_secs = config.server.connection_idle_timeout_secs;
+    let request_queue_timeout_ms = config.server.request_queue_timeout_ms;
     let mut framed = Framed::new(
         stream,
         MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),
@@ -198,6 +199,7 @@ where
             Arc::clone(&request_limiter),
             Arc::clone(&cancelled),
             stream_sender,
+            request_queue_timeout_ms,
         );
         tokio::pin!(worker);
         let mut worker = loop {
@@ -315,12 +317,31 @@ async fn run_handler(
     request_limiter: Arc<Semaphore>,
     cancelled: Arc<AtomicBool>,
     stream_sender: tokio::sync::mpsc::Sender<Message>,
+    queue_timeout_ms: u64,
 ) -> Result<tokio::task::JoinHandle<(Handler, Result<Vec<Message>>)>> {
     if is_heavy_request(msg.msg_type) {
-        let permit = request_limiter
-            .acquire_owned()
-            .await
-            .map_err(|_| TaibaiError::Internal("request limiter closed".into()))?;
+        let queue_timeout = Duration::from_millis(queue_timeout_ms.max(1));
+        let permit = match timeout(queue_timeout, request_limiter.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(TaibaiError::Internal("request limiter closed".into()));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    msg_type = msg.msg_type,
+                    queue_timeout_ms,
+                    "request queue wait timeout; rejecting request with overload error"
+                );
+                return Ok(tokio::spawn(async move {
+                    (
+                        handler,
+                        Ok(vec![build_error(
+                            "server overloaded: request queue wait timeout",
+                        )]),
+                    )
+                }));
+            }
+        };
         Ok(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));

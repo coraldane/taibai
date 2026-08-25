@@ -28,6 +28,26 @@ fn default_tls_handshake_timeout_secs() -> u64 {
     10
 }
 
+fn default_request_queue_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_mutation_lock_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_mutation_lock_warn_ms() -> u64 {
+    1_000
+}
+
+fn default_tail_commit_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_tail_commit_warn_ms() -> u64 {
+    2_000
+}
+
 /// Process-global runtime limits consulted by query operators (aggregation,
 /// streaming scans, ...). Populated once at startup from `BufferSettings` via
 /// [`set_query_limits`]. Operators read via [`query_limits`]; before startup
@@ -72,6 +92,40 @@ static PERFORMANCE_BASELINE_CONFIG: OnceLock<PerformanceBaselineConfig> = OnceLo
 static INSERT_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static BULK_ZSTD_LEVEL: OnceLock<i32> = OnceLock::new();
 static READER_CACHE_CAPACITY: OnceLock<usize> = OnceLock::new();
+static STORAGE_TIMEOUTS: OnceLock<StorageTimeouts> = OnceLock::new();
+
+/// Process-wide deadlines for the blocking waits on the write path (table
+/// mutation lock acquisition and durable-tail commit acknowledgement). Every
+/// such wait must be bounded so a stalled lock holder or a slow disk surfaces
+/// as an explicit timeout error instead of an indefinite hang.
+#[derive(Debug, Clone, Copy)]
+pub struct StorageTimeouts {
+    pub mutation_lock_timeout_ms: u64,
+    pub mutation_lock_warn_ms: u64,
+    pub tail_commit_timeout_ms: u64,
+    pub tail_commit_warn_ms: u64,
+}
+
+impl Default for StorageTimeouts {
+    fn default() -> Self {
+        Self {
+            mutation_lock_timeout_ms: default_mutation_lock_timeout_ms(),
+            mutation_lock_warn_ms: default_mutation_lock_warn_ms(),
+            tail_commit_timeout_ms: default_tail_commit_timeout_ms(),
+            tail_commit_warn_ms: default_tail_commit_warn_ms(),
+        }
+    }
+}
+
+/// Install storage wait timeouts sourced from the `storage.*` config section.
+/// Called once during server startup; defaults apply when unset.
+pub fn set_storage_timeouts(timeouts: StorageTimeouts) {
+    let _ = STORAGE_TIMEOUTS.set(timeouts);
+}
+
+pub fn storage_timeouts() -> StorageTimeouts {
+    *STORAGE_TIMEOUTS.get_or_init(StorageTimeouts::default)
+}
 
 /// Enable per-stage INSERT profiling logs. Configured from `log.insert_profile`
 /// in the config file at startup; defaults to off.
@@ -447,6 +501,11 @@ pub struct ServerSettings {
     /// Maximum time allowed for an incoming TLS handshake. Set to 0 to disable.
     #[serde(default = "default_tls_handshake_timeout_secs")]
     pub tls_handshake_timeout_secs: u64,
+    /// Maximum time a heavy request may wait for an execution slot before the
+    /// server rejects it with an overload error. Bounds queueing so a
+    /// saturated engine surfaces backpressure instead of silently hanging.
+    #[serde(default = "default_request_queue_timeout_ms")]
+    pub request_queue_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,6 +563,22 @@ pub struct StorageSettings {
     /// Number of segments kept in the reader and segment-metadata caches.
     #[serde(default = "default_reader_cache_capacity")]
     pub reader_cache_capacity: usize,
+    /// Maximum time a write may wait for the per-table mutation lock before
+    /// failing with a lock timeout error instead of blocking forever.
+    #[serde(default = "default_mutation_lock_timeout_ms")]
+    pub mutation_lock_timeout_ms: u64,
+    /// Log a warning when acquiring the per-table mutation lock takes longer
+    /// than this threshold, making lock queueing visible in the server log.
+    #[serde(default = "default_mutation_lock_warn_ms")]
+    pub mutation_lock_warn_ms: u64,
+    /// Maximum time a request waits for durable-tail group commit (fsync)
+    /// acknowledgement before failing with a commit timeout error.
+    #[serde(default = "default_tail_commit_timeout_ms")]
+    pub tail_commit_timeout_ms: u64,
+    /// Log a warning when durable-tail commit acknowledgement takes longer
+    /// than this threshold, surfacing slow fsync/disks.
+    #[serde(default = "default_tail_commit_warn_ms")]
+    pub tail_commit_warn_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -653,6 +728,7 @@ fn default_server_settings() -> ServerSettings {
         max_concurrent_requests: default_max_concurrent_requests(),
         connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
         tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+        request_queue_timeout_ms: default_request_queue_timeout_ms(),
     }
 }
 
@@ -681,6 +757,10 @@ fn default_storage_settings() -> StorageSettings {
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
         tail_async_fsync: false,
+        mutation_lock_timeout_ms: default_mutation_lock_timeout_ms(),
+        mutation_lock_warn_ms: default_mutation_lock_warn_ms(),
+        tail_commit_timeout_ms: default_tail_commit_timeout_ms(),
+        tail_commit_warn_ms: default_tail_commit_warn_ms(),
     }
 }
 

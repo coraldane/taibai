@@ -54,10 +54,9 @@ pub fn exec_update(
     let target_partition_key =
         super::dml_delete::delete_partition_eq_key(where_clause, &table_schema, &table_meta);
 
+    engine.batch_writer().checkpoint_before_rewrite(db, table, 1)?;
+
     let updated_count = mgr.with_table_mutation_lock(db, table, || {
-        engine
-            .batch_writer()
-            .checkpoint_before_rewrite_under_table_lock(db, table, 1)?;
         let mut updated_count = 0u64;
         let mut memtable_updates = Vec::new();
         for memtable in engine

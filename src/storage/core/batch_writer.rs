@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::core::durable_tail::{PreparedTailAppend, TailCommitTicket, TailCommitter};
-use crate::storage::core::memtable::{MemTableManager, MemTableState};
+use crate::storage::core::memtable::{MemTable, MemTableManager, MemTableState};
 use crate::storage::segment::meta::remove_sidecar_meta;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
@@ -107,6 +107,15 @@ type LockedWriteOutcome = (
         Arc<crate::storage::core::memtable::MemTable>,
     )>,
 );
+
+/// A committed transaction whose durable tail frame has been handed to the
+/// group committer but whose fsync acknowledgement is still pending. The
+/// table mutation lock is released before `wait` runs, so consecutive
+/// writers pipeline through one fsync group instead of serializing on it.
+pub(crate) struct PendingTailCommit {
+    ticket: TailCommitTicket,
+    memtable: Arc<MemTable>,
+}
 
 impl BatchWriter {
     pub fn new(config: BatchWriterConfig, segment_mgr: Arc<SegmentManager>) -> Self {
@@ -429,41 +438,38 @@ impl BatchWriter {
     }
 
     pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
-        self.commit_txn_inner(txn_id, false)
+        let pending = self.commit_txn_submit_inner(txn_id, false)?;
+        self.wait_pending_tail_commits(pending)
     }
 
-    pub(crate) fn commit_txn_under_table_lock(&self, txn_id: u64) -> Result<()> {
-        self.commit_txn_inner(txn_id, true)
+    pub(crate) fn commit_txn_submit_under_table_lock(
+        &self,
+        txn_id: u64,
+    ) -> Result<Vec<PendingTailCommit>> {
+        self.commit_txn_submit_inner(txn_id, true)
     }
 
-    fn commit_txn_inner(&self, txn_id: u64, table_lock_held: bool) -> Result<()> {
+    fn commit_txn_submit_inner(
+        &self,
+        txn_id: u64,
+        table_lock_held: bool,
+    ) -> Result<Vec<PendingTailCommit>> {
         let committed_mts = self.memtable_mgr.commit_txn(txn_id);
+        let mut pending = Vec::new();
         for memtable in &committed_mts {
-            let persist = || {
-                if let Err(error) = self.persist_memtable_tail(memtable) {
-                    tracing::warn!(
-                        db = memtable.db(),
-                        table = memtable.table(),
-                        error = %error,
-                        "committed durable tail write failed; flushing target memtable"
-                    );
-                    Self::flush_memtable_inner(
-                        &self.segment_mgr,
-                        memtable,
-                        true,
-                        &self.tail_committer,
-                    )?;
-                }
-                Ok(())
-            };
             if table_lock_held {
-                persist()?;
+                if let Some(submitted) = self.submit_memtable_tail(memtable)? {
+                    pending.push(submitted);
+                }
             } else {
-                self.segment_mgr.with_table_mutation_lock(
+                let submitted = self.segment_mgr.with_table_mutation_lock(
                     memtable.db(),
                     memtable.table(),
-                    persist,
+                    || self.submit_memtable_tail(memtable),
                 )?;
+                if let Some(submitted) = submitted {
+                    pending.push(submitted);
+                }
             }
         }
         let rows_committed = committed_mts.iter().map(|mt| mt.row_count()).sum::<u64>();
@@ -473,6 +479,48 @@ impl BatchWriter {
             rows_committed,
             "transaction committed to visible memtables"
         );
+        Ok(pending)
+    }
+
+    fn submit_memtable_tail(&self, memtable: &Arc<MemTable>) -> Result<Option<PendingTailCommit>> {
+        if memtable.state() != MemTableState::Pending
+            || memtable.is_transactional()
+            || memtable.visibility() != crate::storage::core::memtable::TxnVisibility::Committed
+        {
+            return Ok(None);
+        }
+        let Some(batch) = memtable.read_snapshot() else {
+            return Ok(None);
+        };
+        let prepared = PreparedTailAppend::new(&batch);
+        let ticket = self.tail_committer.submit(
+            self.segment_mgr.table_dir(memtable.db(), memtable.table()),
+            memtable.id(),
+            memtable.partition_key().to_string(),
+            prepared,
+        );
+        Ok(Some(PendingTailCommit {
+            ticket,
+            memtable: Arc::clone(memtable),
+        }))
+    }
+
+    pub(crate) fn wait_pending_tail_commits(&self, pending: Vec<PendingTailCommit>) -> Result<()> {
+        for pending_commit in pending {
+            if let Err(error) = pending_commit.ticket.wait() {
+                tracing::warn!(
+                    db = pending_commit.memtable.db(),
+                    table = pending_commit.memtable.table(),
+                    error = %error,
+                    "group-committed durable tail write failed; flushing target memtable"
+                );
+                Self::flush_memtable(
+                    &self.segment_mgr,
+                    &pending_commit.memtable,
+                    &self.tail_committer,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -518,17 +566,35 @@ impl BatchWriter {
         Ok(())
     }
 
-    pub(crate) fn checkpoint_before_rewrite_under_table_lock(
+    /// Flush large committed pending tails before a row rewrite. Callers must
+    /// NOT hold the table mutation lock: the flush acquires it per memtable
+    /// group internally, keeping rewrite critical sections free of segment
+    /// write I/O. Rows arriving after the checkpoint are handled by the
+    /// normal memtable conflict path under the lock.
+    pub fn checkpoint_before_rewrite(
         &self,
         db: &str,
         table: &str,
         affected_rows: usize,
     ) -> Result<bool> {
-        const MIN_REWRITE_ROWS: u64 = 4096;
-        const MAX_AFFECTED_RATIO: u64 = 4;
+        let pending_rows = self.pending_committed_rows(db, table);
+        if !Self::should_checkpoint_before_rewrite(pending_rows, affected_rows) {
+            return Ok(false);
+        }
 
-        let pending_rows = self
-            .memtable_mgr
+        self.flush_table(db, table)?;
+        tracing::info!(
+            db,
+            table,
+            pending_rows,
+            affected_rows,
+            "checkpointed large pending tail before row rewrite"
+        );
+        Ok(true)
+    }
+
+    fn pending_committed_rows(&self, db: &str, table: &str) -> u64 {
+        self.memtable_mgr
             .get_by_table(db, table)
             .into_iter()
             .filter(|memtable| {
@@ -538,22 +604,14 @@ impl BatchWriter {
                         == crate::storage::core::memtable::TxnVisibility::Committed
             })
             .map(|memtable| memtable.row_count())
-            .sum::<u64>();
-        if pending_rows < MIN_REWRITE_ROWS
-            || (affected_rows as u64).saturating_mul(MAX_AFFECTED_RATIO) >= pending_rows
-        {
-            return Ok(false);
-        }
+            .sum()
+    }
 
-        self.flush_table_under_table_lock(db, table)?;
-        tracing::info!(
-            db,
-            table,
-            pending_rows,
-            affected_rows,
-            "checkpointed large pending tail before row rewrite"
-        );
-        Ok(true)
+    fn should_checkpoint_before_rewrite(pending_rows: u64, affected_rows: usize) -> bool {
+        const MIN_REWRITE_ROWS: u64 = 4096;
+        const MAX_AFFECTED_RATIO: u64 = 4;
+        pending_rows >= MIN_REWRITE_ROWS
+            && (affected_rows as u64).saturating_mul(MAX_AFFECTED_RATIO) < pending_rows
     }
 
     pub fn flush_all(&self) -> Result<()> {
