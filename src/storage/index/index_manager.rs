@@ -685,22 +685,21 @@ impl IndexManager {
                     if rg_start + rg_rows <= watermark {
                         continue;
                     }
-                    let mut batch = reader.read_row_group_with_projection(rg_idx, &indices)?;
-                    if !reader.delete_bitmap().is_empty() {
-                        batch = crate::storage::segment::delete_bitmap::filter_batch(
-                            &batch,
-                            rg_start,
-                            reader.delete_bitmap(),
-                        )?;
-                    }
+                    let batch = reader.read_row_group_with_projection(rg_idx, &indices)?;
+                    let delete_bitmap = reader.delete_bitmap();
                     for row_idx in 0..batch.num_rows() {
+                        let row_id = rg_start + row_idx as u64;
+                        if crate::storage::segment::delete_bitmap::is_deleted(delete_bitmap, row_id)
+                        {
+                            continue;
+                        }
                         let key = projected_unique_key_for_row(&batch, row_idx);
                         let Some(key) = key else { continue };
                         additions.push(UniqueIndexEntry {
                             key,
                             location: UniqueRowLocation {
                                 segment_path: seg_path.to_string_lossy().to_string(),
-                                row_id: rg_start + row_idx as u64,
+                                row_id,
                             },
                         });
                     }

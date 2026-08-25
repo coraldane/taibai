@@ -1,5 +1,40 @@
 use super::*;
 
+#[test]
+fn sql_like_match_handles_wildcards_and_escapes() {
+    assert!(sql_like_match("apple", "%appl%"));
+    assert!(sql_like_match("apple", "app%"));
+    assert!(sql_like_match("apple", "appl_"));
+    assert!(sql_like_match("apple", "apple"));
+    assert!(sql_like_match("apple", "%"));
+    assert!(sql_like_match("", "%"));
+    assert!(!sql_like_match("", "_"));
+    assert!(!sql_like_match("apple", "Apple%"));
+    assert!(!sql_like_match("banana", "%appl%"));
+    assert!(sql_like_match("100%", "100\\%"));
+    assert!(!sql_like_match("100x", "100\\%"));
+    assert!(sql_like_match("a_b", "a\\_b"));
+    assert!(!sql_like_match("axb", "a\\_b"));
+    assert!(sql_like_match("axb", "a_b"));
+    assert!(sql_like_match("abcabc", "%abc"));
+    assert!(!sql_like_match("abcabd", "%abc"));
+    assert!(sql_like_match("日本語", "日_語"));
+}
+
+#[test]
+fn scalar_like_matches_never_matches_null() {
+    assert!(!scalar_like_matches(&ScalarValue::VarChar(None), "%"));
+    assert!(!scalar_like_matches(&ScalarValue::VarChar(None), "a%"));
+    assert!(scalar_like_matches(
+        &ScalarValue::VarChar(Some("apple".to_string())),
+        "%pp%"
+    ));
+    assert!(!scalar_like_matches(
+        &ScalarValue::VarChar(Some("apple".to_string())),
+        "%zz%"
+    ));
+}
+
 fn eval(value: ScalarValue, dt: DataType, scale: i32) -> Result<ScalarValue> {
     eval_expr_to_scalar_with_scale_timezone(&Expr::Literal(value), &dt, scale, 0)
 }

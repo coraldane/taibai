@@ -314,6 +314,24 @@ fn eval_logical_expr_batch(
                 })
                 .collect())
         }
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let vals = eval_logical_value_batch(expr, batch)?;
+            Ok(vals
+                .iter()
+                .map(|val| {
+                    let matched = crate::sql::execution::helpers::scalar_like_matches(val, pattern);
+                    if *negated && !val.is_null() {
+                        !matched
+                    } else {
+                        matched
+                    }
+                })
+                .collect())
+        }
         _ => Ok(vec![true; num_rows]),
     }
 }

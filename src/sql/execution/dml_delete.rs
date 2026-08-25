@@ -395,6 +395,34 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
     } else {
         SegmentManager::discover_segments(&table_dir)?
     };
+    // Direct index locations are trusted only after verifying the physical row
+    // still carries a conflicting key: a stale or misaligned location must
+    // never delete an unrelated live row.
+    let verify_indices = key_sets
+        .iter()
+        .flat_map(|(indices, _)| indices.iter().copied())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let verify_positions = key_sets
+        .iter()
+        .map(|(indices, keys)| {
+            let positions = indices
+                .iter()
+                .map(|index| {
+                    verify_indices
+                        .iter()
+                        .position(|projected| projected == index)
+                        .ok_or_else(|| {
+                            TaibaiError::Internal(
+                                "replace verification projection is inconsistent".to_string(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((positions, keys))
+        })
+        .collect::<Result<Vec<(Vec<usize>, &HashSet<Vec<ScalarValue>>)>>>()?;
     for seg_path in segment_paths {
         let reader = mgr.open_reader_cached(&seg_path)?;
         let total_rows = reader.row_count();
@@ -407,55 +435,85 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         new_bitmap.resize(total_rows.div_ceil(8) as usize, 0);
         let mut newly_deleted = 0u64;
         let segment_name = seg_path.to_string_lossy().to_string();
-        if let Some(rows) = direct_rows.get(&seg_path) {
-            for &row_id in rows {
-                if delete_bitmap::mark_deleted(&mut new_bitmap, row_id) {
-                    newly_deleted += 1;
-                    undo.deleted_locations.push(UniqueRowLocation {
-                        segment_path: segment_name.clone(),
-                        row_id,
-                    });
-                }
-            }
-        }
-
+        let direct_rows_in_segment = direct_rows.get(&seg_path);
+        let direct_rows_in_segment = direct_rows_in_segment.as_ref().map(|rows| {
+            rows.iter()
+                .copied()
+                .filter(|row_id| *row_id < total_rows)
+                .collect::<Vec<_>>()
+        });
+        let direct_row_sets = direct_rows_in_segment
+            .as_deref()
+            .map(|rows| (rows, &verify_positions));
         for rg_idx in 0..reader.num_row_groups() {
-            if fallback_key_sets.is_empty()
-                || !replace_keys_may_match_row_group_from_refs(
-                    reader.zone_maps(rg_idx),
-                    &fallback_key_sets,
-                    &key_envelopes,
-                )
+            let rg_start = reader.row_group_start_row(rg_idx);
+            let rg_rows = reader.row_group_rows(rg_idx);
+            if fallback_key_sets.is_empty() {
+                let Some((candidate_rows, positions)) = direct_row_sets.as_ref() else {
+                    break;
+                };
+                let candidates = candidate_rows
+                    .iter()
+                    .copied()
+                    .filter(|row_id| *row_id >= rg_start && *row_id < rg_start + rg_rows)
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    continue;
+                }
+                let batch = reader.read_row_group_with_projection(rg_idx, &verify_indices)?;
+                for row_id in candidates {
+                    let row_idx = (row_id - rg_start) as usize;
+                    if !replace_row_conflicts(&batch, row_idx, positions) {
+                        tracing::warn!(
+                            db,
+                            table,
+                            segment = %segment_name,
+                            row_id,
+                            "skipping stale unique-index location during REPLACE conflict delete"
+                        );
+                        continue;
+                    }
+                    if delete_bitmap::mark_deleted(&mut new_bitmap, row_id) {
+                        newly_deleted += 1;
+                        undo.deleted_locations.push(UniqueRowLocation {
+                            segment_path: segment_name.clone(),
+                            row_id,
+                        });
+                    }
+                }
+                continue;
+            }
+            if !replace_keys_may_match_row_group_from_refs(
+                reader.zone_maps(rg_idx),
+                &fallback_key_sets,
+                &key_envelopes,
+            ) && direct_row_sets.is_none()
             {
                 continue;
             }
             let batch = reader.read_row_group_with_projection(rg_idx, &projected_indices)?;
-            let row_id = reader.row_group_start_row(rg_idx);
             for row_idx in 0..batch.num_rows() {
-                let absolute_row = row_id + row_idx as u64;
+                let absolute_row = rg_start + row_idx as u64;
                 if delete_bitmap::is_deleted(&new_bitmap, absolute_row) {
                     continue;
                 }
-                let conflicts = projected_positions.iter().any(|(indices, keys)| {
-                    if indices.len() == 1 {
-                        let Some(value) = batch.scalar(row_idx, indices[0]) else {
-                            return false;
-                        };
-                        return !value.is_null() && keys.contains(std::slice::from_ref(&value));
-                    }
-                    let mut key = Vec::with_capacity(indices.len());
-                    for &col_idx in indices {
-                        let Some(value) = batch.scalar(row_idx, col_idx) else {
-                            return false;
-                        };
-                        if value.is_null() {
-                            return false;
+                let conflicts = replace_row_conflicts(&batch, row_idx, &projected_positions);
+                if !conflicts {
+                    if let Some((candidate_rows, positions)) = direct_row_sets.as_ref() {
+                        if candidate_rows.contains(&absolute_row)
+                            && replace_row_conflicts(&batch, row_idx, positions)
+                            && delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row)
+                        {
+                            newly_deleted += 1;
+                            undo.deleted_locations.push(UniqueRowLocation {
+                                segment_path: segment_name.clone(),
+                                row_id: absolute_row,
+                            });
                         }
-                        key.push(value);
                     }
-                    keys.contains(&key)
-                });
-                if conflicts && delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row) {
+                    continue;
+                }
+                if delete_bitmap::mark_deleted(&mut new_bitmap, absolute_row) {
                     newly_deleted += 1;
                     undo.deleted_locations.push(UniqueRowLocation {
                         segment_path: segment_name.clone(),
@@ -482,6 +540,36 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
 }
 
 type ReplaceKeyEnvelope = (Vec<usize>, Vec<(ScalarValue, ScalarValue)>);
+
+/// Whether the row at `row_idx` carries a key conflicting with any REPLACE
+/// key set. Each item pairs per-set key positions inside the projected batch
+/// with that set's keys. Shared by the full-scan fallback and the
+/// direct-location verification so both apply identical conflict rules.
+fn replace_row_conflicts(
+    batch: &RecordBatch,
+    row_idx: usize,
+    paired_positions: &[(Vec<usize>, &HashSet<Vec<ScalarValue>>)],
+) -> bool {
+    paired_positions.iter().any(|(positions, keys)| {
+        if positions.len() == 1 {
+            let Some(value) = batch.scalar(row_idx, positions[0]) else {
+                return false;
+            };
+            return !value.is_null() && keys.contains(std::slice::from_ref(&value));
+        }
+        let mut key = Vec::with_capacity(positions.len());
+        for &col_idx in positions {
+            let Some(value) = batch.scalar(row_idx, col_idx) else {
+                return false;
+            };
+            if value.is_null() {
+                return false;
+            }
+            key.push(value);
+        }
+        keys.contains(&key)
+    })
+}
 
 fn build_replace_key_envelopes_from_refs(
     key_sets: &[&(Vec<usize>, HashSet<Vec<ScalarValue>>)],

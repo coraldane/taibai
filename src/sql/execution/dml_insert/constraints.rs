@@ -140,17 +140,15 @@ pub(crate) fn collect_unique_index_entries_from(
         for seg_path in SegmentManager::discover_segments(table_dir)? {
             let reader = segment_mgr.open_reader_cached(&seg_path)?;
             for rg_idx in 0..reader.num_row_groups() {
-                let mut batch = reader.read_row_group_with_projection(rg_idx, indices)?;
+                let batch = reader.read_row_group_with_projection(rg_idx, indices)?;
                 let rg_start = reader.row_group_start_row(rg_idx);
-                if !reader.delete_bitmap().is_empty() {
-                    batch = crate::storage::segment::delete_bitmap::filter_batch(
-                        &batch,
-                        rg_start,
-                        reader.delete_bitmap(),
-                    )?;
-                }
+                let delete_bitmap = reader.delete_bitmap();
                 let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
                 for row_idx in 0..batch.num_rows() {
+                    let row_id = rg_start + row_idx as u64;
+                    if crate::storage::segment::delete_bitmap::is_deleted(delete_bitmap, row_id) {
+                        continue;
+                    }
                     let Some(key) =
                         unique_key_for_row(&batch, row_idx, &projected_indices, &batch.schema)
                     else {
@@ -160,7 +158,7 @@ pub(crate) fn collect_unique_index_entries_from(
                         key,
                         location: UniqueRowLocation {
                             segment_path: seg_path.to_string_lossy().to_string(),
-                            row_id: rg_start + row_idx as u64,
+                            row_id,
                         },
                     });
                 }

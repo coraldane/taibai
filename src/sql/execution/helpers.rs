@@ -210,6 +210,9 @@ pub fn eval_where_clause_batch(
         }
         Expr::Literal(v) => Ok(vec![!v.is_null(); num_rows]),
         Expr::Column(_) => Ok(vec![true; num_rows]),
+        Expr::Like { .. } => (0..num_rows)
+            .map(|i| eval_where_clause(expr, batch, i, schema))
+            .collect(),
         _ => Ok(vec![true; num_rows]),
     }
 }
@@ -284,7 +287,22 @@ pub fn eval_where_clause(
         Expr::UnaryMinus(_) => Ok(true),
         Expr::Between { .. } => Ok(true),
         Expr::Case { .. } => Ok(true),
-        Expr::Like { .. } => Ok(true),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+            let pattern_value = eval_expr_for_row(pattern, batch, row_idx, schema)?;
+            if value.is_null() || pattern_value.is_null() {
+                return Ok(false);
+            }
+            let Some(pattern_text) = pattern_value.to_text() else {
+                return Ok(false);
+            };
+            let matched = scalar_like_matches(&value, &pattern_text);
+            Ok(if *negated { !matched } else { matched })
+        }
         Expr::Exists(_) => Ok(true),
         Expr::Subquery(_) => Ok(true),
         Expr::WindowFunction { .. } => Ok(true),
@@ -347,7 +365,26 @@ pub fn eval_expr_for_row(
         Expr::In { .. } => Ok(ScalarValue::Bool(None)),
         Expr::Between { .. } => Ok(ScalarValue::Bool(None)),
         Expr::Case { .. } => Ok(ScalarValue::Int64(None)),
-        Expr::Like { .. } => Ok(ScalarValue::Bool(None)),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+            let pattern_value = eval_expr_for_row(pattern, batch, row_idx, schema)?;
+            if value.is_null() || pattern_value.is_null() {
+                return Ok(ScalarValue::Bool(None));
+            }
+            let Some(pattern_text) = pattern_value.to_text() else {
+                return Ok(ScalarValue::Bool(None));
+            };
+            let matched = scalar_like_matches(&value, &pattern_text);
+            Ok(ScalarValue::Bool(Some(if *negated {
+                !matched
+            } else {
+                matched
+            })))
+        }
         Expr::Exists(_) => Ok(ScalarValue::Bool(None)),
         Expr::Subquery(_) => Ok(ScalarValue::Int64(None)),
         Expr::WindowFunction { .. } => Ok(ScalarValue::Int64(None)),
@@ -374,6 +411,79 @@ fn scalar_values_equal(a: &ScalarValue, b: &ScalarValue) -> bool {
         (ScalarValue::Int32(Some(a)), ScalarValue::Int64(Some(b))) => *a as i64 == *b,
         (ScalarValue::Int64(Some(a)), ScalarValue::Int32(Some(b))) => *a == *b as i64,
         _ => a == b,
+    }
+}
+
+/// SQL LIKE pattern match with `%` (any run) and `_` (single char) wildcards.
+/// A backslash escapes `%`, `_` and itself. Case-sensitive, char-based.
+pub fn sql_like_match(value: &str, pattern: &str) -> bool {
+    enum Token {
+        Char(char),
+        Percent,
+        Underscore,
+    }
+    let mut tokens = Vec::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped @ ('%' | '_' | '\\')) => tokens.push(Token::Char(escaped)),
+                Some(other) => {
+                    tokens.push(Token::Char('\\'));
+                    tokens.push(Token::Char(other));
+                }
+                None => tokens.push(Token::Char('\\')),
+            },
+            '%' => tokens.push(Token::Percent),
+            '_' => tokens.push(Token::Underscore),
+            other => tokens.push(Token::Char(other)),
+        }
+    }
+    let value: Vec<char> = value.chars().collect();
+    let (mut vi, mut ti) = (0usize, 0usize);
+    let (mut star_token, mut star_value) = (usize::MAX, 0usize);
+    while vi < value.len() {
+        match tokens.get(ti) {
+            Some(Token::Underscore) => {
+                vi += 1;
+                ti += 1;
+            }
+            Some(Token::Char(c)) if *c == value[vi] => {
+                vi += 1;
+                ti += 1;
+            }
+            Some(Token::Percent) => {
+                star_token = ti;
+                star_value = vi;
+                ti += 1;
+            }
+            _ => {
+                if star_token == usize::MAX {
+                    return false;
+                }
+                star_value += 1;
+                vi = star_value;
+                ti = star_token + 1;
+            }
+        }
+    }
+    while matches!(tokens.get(ti), Some(Token::Percent)) {
+        ti += 1;
+    }
+    ti == tokens.len()
+}
+
+/// LIKE semantics for one scalar: NULL never matches (also under NOT LIKE).
+/// Non-string values are coerced through their text form.
+pub fn scalar_like_matches(value: &ScalarValue, pattern: &str) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    match value {
+        ScalarValue::VarChar(Some(text)) => sql_like_match(text, pattern),
+        other => other
+            .to_text()
+            .is_some_and(|text| sql_like_match(&text, pattern)),
     }
 }
 

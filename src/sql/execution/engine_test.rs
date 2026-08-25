@@ -2156,3 +2156,326 @@ fn bulk_import_refreshes_primary_key_snapshot_for_replace() -> Result<()> {
     assert_eq!(val, 99);
     Ok(())
 }
+
+#[test]
+fn rebuild_location_index_after_delete_keeps_physical_rows() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, name VARCHAR, UNIQUE KEY uk_id (id))",
+    )?;
+    let mut values = String::new();
+    for id in 1..=20i64 {
+        if !values.is_empty() {
+            values.push_str(", ");
+        }
+        values.push_str(&format!("({}, 'a')", id));
+    }
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES {}", values),
+    )?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+
+    // In-segment DELETE leaves a delete bitmap hole; rebuilding the location
+    // index (the same full scan UPDATE/OPTIMIZE/compaction rebuilds run) must
+    // keep row locations aligned with physical rows.
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 5")?;
+    engine.execute(&mut session, "REBUILD UNIQUE INDEX uk_id ON t")?;
+
+    for (key, expected_row) in [(6i64, 5u64), (9, 8), (10, 9), (11, 10), (20, 19)] {
+        let locations = engine
+            .index_manager()
+            .unique_key_locations("main", "t", "uk_id", &[vec![ScalarValue::Int64(Some(key))]])?
+            .expect("location snapshot present");
+        assert_eq!(locations.len(), 1, "key {} must have one location", key);
+        assert_eq!(
+            locations[0].row_id, expected_row,
+            "key {} must keep its physical row location",
+            key
+        );
+    }
+
+    // REPLACE must delete exactly the conflicting row: with shifted locations
+    // it previously deleted the row before the target and duplicated the key.
+    engine.execute(&mut session, "REPLACE INTO t (id, name) VALUES (10, 'new')")?;
+    let total = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(total, 19);
+    let id9 = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 9")?,
+        0,
+        0,
+    );
+    assert_eq!(id9, 1, "row before the replaced key must survive");
+    let id10 = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 10")?,
+        0,
+        0,
+    );
+    assert_eq!(id10, 1, "replaced key must stay unique");
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 10")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "new");
+    Ok(())
+}
+
+#[test]
+fn replace_after_delete_keeps_unrelated_rows_after_incremental_refresh() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, name VARCHAR, PRIMARY KEY (id))",
+    )?;
+    let n: i64 = 24;
+    let mut first_batch = String::new();
+    for id in 1..=n {
+        if !first_batch.is_empty() {
+            first_batch.push_str(", ");
+        }
+        first_batch.push_str(&format!("({}, 'first')", id));
+    }
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES {}", first_batch),
+    )?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+
+    let mut second_batch = String::new();
+    for id in (n + 1)..=(2 * n) {
+        if !second_batch.is_empty() {
+            second_batch.push_str(", ");
+        }
+        second_batch.push_str(&format!("({}, 'second')", id));
+    }
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES {}", second_batch),
+    )?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+
+    // Delete a row inside the latest flushed range, then flush again so the
+    // location index refresh re-scans row groups that now contain deleted
+    // rows. Locations must keep pointing at physical rows.
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 15")?;
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES ({}, 'third')", 3 * n),
+    )?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+
+    engine.execute(
+        &mut session,
+        "REPLACE INTO t (id, name) VALUES (16, 'replaced')",
+    )?;
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 16")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "replaced");
+    let total = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(total, 2 * n);
+    let neighbors = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE id > 15 AND id <= 24",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(neighbors, 9);
+    Ok(())
+}
+
+#[test]
+fn replace_after_update_rebuild_keeps_rows_following_deleted_rows() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, name VARCHAR, PRIMARY KEY (id))",
+    )?;
+    let n: i64 = 20;
+    let mut values = String::new();
+    for id in 1..=n {
+        if !values.is_empty() {
+            values.push_str(", ");
+        }
+        values.push_str(&format!("({}, 'first')", id));
+    }
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES {}", values),
+    )?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
+    // UPDATE rewrites segments and eagerly rebuilds the location index; the
+    // rebuild scan must not shift row locations past the deleted row.
+    engine.execute(&mut session, "UPDATE t SET name = 'updated' WHERE id = 2")?;
+
+    engine.execute(
+        &mut session,
+        "REPLACE INTO t (id, name) VALUES (3, 'replaced')",
+    )?;
+    let total = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(total, n - 1);
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 2")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "updated");
+    let name = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 3")?,
+        0,
+        0,
+    );
+    assert_eq!(name, "replaced");
+    let survivors = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id >= 4")?,
+        0,
+        0,
+    );
+    assert_eq!(survivors, n - 3);
+    Ok(())
+}
+
+#[test]
+fn like_predicate_filters_rows_in_scan() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, name VARCHAR)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, name) VALUES (1, 'apple'), (2, 'apply'), (3, 'banana'), (4, 'Apple'), (5, NULL)",
+    )?;
+
+    let contains = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE name LIKE '%appl%'",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(contains, 2);
+    let prefix = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE name LIKE 'app%'",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(prefix, 2);
+    let underscore = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE name LIKE 'banan_'",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(underscore, 1);
+    let underscore_two = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE name LIKE 'appl_'",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(underscore_two, 2);
+    let exact = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE name LIKE 'banana'",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(exact, 1);
+    let negated = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE name NOT LIKE '%an%'",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(negated, 3);
+    let no_match = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE name LIKE '%zz%'",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(no_match, 0);
+
+    // Same predicate after a flush must filter on segment data as well.
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+    let contains = first_i64(
+        engine.execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE name LIKE '%appl%'",
+        )?,
+        0,
+        0,
+    );
+    assert_eq!(contains, 2);
+    Ok(())
+}
+
+#[test]
+fn delete_with_like_predicate_only_removes_matching_rows() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, name VARCHAR)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, name) VALUES (1, 'apple'), (2, 'apply'), (3, 'banana'), (4, 'Apple')",
+    )?;
+    engine.execute(&mut session, "DELETE FROM t WHERE name LIKE '%appl%'")?;
+    let total = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(total, 2);
+    let remaining = first_text(
+        engine.execute(&mut session, "SELECT name FROM t WHERE id = 3")?,
+        0,
+        0,
+    );
+    assert_eq!(remaining, "banana");
+    Ok(())
+}

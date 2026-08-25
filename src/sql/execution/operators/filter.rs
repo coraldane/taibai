@@ -242,6 +242,22 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                 *m = if *negated { !found } else { found };
             }
         }
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let vals = eval_expr_column(expr, batch)?;
+            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
+                let matched =
+                    crate::sql::execution::helpers::scalar_like_matches(&vals[i], pattern);
+                *m = if *negated && !vals[i].is_null() {
+                    !matched
+                } else {
+                    matched
+                };
+            }
+        }
         LogicalExpr::Literal(v) => {
             for m in mask.iter_mut().take(num_rows) {
                 *m = match v {

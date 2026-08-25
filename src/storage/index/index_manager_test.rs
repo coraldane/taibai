@@ -605,6 +605,79 @@ fn write_value_segment(path: &Path, values: &[i64]) -> Result<()> {
 }
 
 #[test]
+fn stale_epoch_refresh_keeps_physical_rows_with_delete_bitmap() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("db").join("ticks");
+    std::fs::create_dir_all(&table_dir)?;
+    write_value_segment(
+        &table_dir.join("seg_00000.dat"),
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    )?;
+
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    let seg0_path = table_dir.join("seg_00000.dat");
+    let seg0 = seg0_path.to_string_lossy().to_string();
+
+    // Snapshot whose per-segment watermark covers only the first five rows.
+    let mut watermarks = HashMap::new();
+    watermarks.insert(seg0.clone(), 5u64);
+    let snapshot_entries = (0..5u64)
+        .map(|row_id| UniqueIndexEntry {
+            key: vec![ScalarValue::Int64(Some(row_id as i64 + 1))],
+            location: UniqueRowLocation {
+                segment_path: seg0.clone(),
+                row_id,
+            },
+        })
+        .collect::<Vec<_>>();
+    manager.persist_unique_index_entries(
+        "db",
+        "ticks",
+        "uk_value",
+        &["value".to_string()],
+        snapshot_entries,
+        Some(segment_mgr.memtable_flush_epoch("db", "ticks")),
+        Some(watermarks),
+    )?;
+
+    // Delete rows 2 and 3 in place. The next flush-epoch bump makes the
+    // refresh re-scan the row group crossing the watermark; recorded
+    // locations must stay aligned with physical rows instead of filtered
+    // positions.
+    let mut bitmap = vec![0u8; 10usize.div_ceil(8)];
+    crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 2);
+    crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 3);
+    segment_mgr.rewrite_delete_footer(&seg0_path, &bitmap, 2)?;
+    segment_mgr.note_memtable_flush("db", "ticks");
+
+    let locations = manager.unique_key_locations(
+        "db",
+        "ticks",
+        "uk_value",
+        &[
+            vec![ScalarValue::Int64(Some(6))],
+            vec![ScalarValue::Int64(Some(10))],
+        ],
+    )?;
+    assert_eq!(
+        locations,
+        Some(vec![
+            UniqueRowLocation {
+                segment_path: seg0.clone(),
+                row_id: 5,
+            },
+            UniqueRowLocation {
+                segment_path: seg0,
+                row_id: 9,
+            },
+        ])
+    );
+    Ok(())
+}
+
+#[test]
 fn stale_epoch_refresh_scans_only_new_segment_rows() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("db").join("ticks");
