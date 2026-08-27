@@ -615,12 +615,14 @@ impl Handler {
                 tracing::warn!(
                     stmt_id,
                     live_statements = session.prepared_statements.len(),
+                    next_unissued_id = session.prepared_statements.next_id(),
                     "prepared statement lookup failed on execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
                 );
                 return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1)",
+                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
                     stmt_id,
-                    session.prepared_statements.len()
+                    session.prepared_statements.len(),
+                    session.prepared_statements.next_id()
                 ))]);
             }
         };
@@ -632,7 +634,10 @@ impl Handler {
         {
             if !stmt.param_types.is_empty() && stmt.param_types != current_types {
                 return Ok(Self::reject_stale_prepared_statement(
-                    &self.engine, session, stmt, stmt_id,
+                    &self.engine,
+                    session,
+                    stmt,
+                    stmt_id,
                 ));
             }
         }
@@ -872,12 +877,14 @@ impl Handler {
                 tracing::warn!(
                     stmt_id,
                     live_statements = session.prepared_statements.len(),
+                    next_unissued_id = session.prepared_statements.next_id(),
                     "prepared statement lookup failed on batch execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
                 );
                 return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1)",
+                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
                     stmt_id,
-                    session.prepared_statements.len()
+                    session.prepared_statements.len(),
+                    session.prepared_statements.next_id()
                 ))]);
             }
         };
@@ -889,7 +896,10 @@ impl Handler {
         {
             if !stmt.param_types.is_empty() && stmt.param_types != current_types {
                 return Ok(Self::reject_stale_prepared_statement(
-                    &self.engine, session, stmt, stmt_id,
+                    &self.engine,
+                    session,
+                    stmt,
+                    stmt_id,
                 ));
             }
         }

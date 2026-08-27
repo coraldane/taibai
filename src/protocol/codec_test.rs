@@ -26,6 +26,21 @@ fn test_encode_decode_large_payload_compressed() {
 }
 
 #[test]
+fn test_prepare_response_is_not_compressed() {
+    let mut codec = MessageCodec::new(1024 * 1024).with_compression(8);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&4096u32.to_le_bytes());
+    payload.extend(std::iter::repeat(7u8).take(4096));
+    let msg = Message::new(MSG_TYPE_PREPARE, Bytes::from(payload.clone()));
+    let mut buf = BytesMut::new();
+    codec.encode(msg, &mut buf).unwrap();
+
+    assert_eq!(buf.len(), HEADER_SIZE + payload.len());
+    assert_eq!(&buf[HEADER_SIZE..HEADER_SIZE + 4], &1u32.to_le_bytes());
+}
+
+#[test]
 fn test_decode_incomplete() {
     let mut codec = MessageCodec::new(1024 * 1024);
     let mut buf = BytesMut::from(&[0x01, 0xDB, 0x01, 0x00, 0x00, 0x00][..]);

@@ -116,6 +116,10 @@ impl PreparedStatementCache {
         self.max_size
     }
 
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
     pub fn clear(&mut self) {
         self.statements.clear();
     }

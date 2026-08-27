@@ -2,7 +2,9 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::common::error::{Result, TaibaiError};
-use crate::protocol::message::{Message, MessageHeader, HEADER_SIZE, MSG_TYPE_QUERY};
+use crate::protocol::message::{
+    Message, MessageHeader, HEADER_SIZE, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
+};
 
 pub struct MessageCodec {
     max_message_size: usize,
@@ -77,7 +79,9 @@ impl Encoder<Message> for MessageCodec {
     fn encode(&mut self, msg: Message, dst: &mut BytesMut) -> Result<()> {
         let is_bulk = msg.msg_type == 0x20 || msg.msg_type == 0x21 || msg.msg_type == 0x23;
         let is_query = msg.msg_type == MSG_TYPE_QUERY;
-        let should_compress = !is_bulk && !is_query && msg.payload.len() > self.compress_threshold;
+        let is_prepare = msg.msg_type == MSG_TYPE_PREPARE;
+        let should_compress =
+            !is_bulk && !is_query && !is_prepare && msg.payload.len() > self.compress_threshold;
 
         let payload = if should_compress {
             match crate::protocol::compress::zlib_compress(&msg.payload) {

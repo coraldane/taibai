@@ -274,6 +274,54 @@ fn duplicate_login_is_rejected_and_preserves_existing_session_state() {
 }
 
 #[test]
+fn unknown_statement_id_error_includes_next_unissued_id_hint() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = logged_in_handler(config, engine, "root");
+    handler
+        .session
+        .as_mut()
+        .unwrap()
+        .prepared_statements
+        .prepare("INSERT INTO t (a) VALUES (?)")
+        .unwrap();
+
+    let bogus_id: u32 = 3_182_271_608;
+
+    let mut exec_payload = Vec::new();
+    exec_payload.extend_from_slice(&bogus_id.to_le_bytes());
+    exec_payload.extend_from_slice(&0u32.to_le_bytes());
+    let response = handler
+        .handle_message(Message::new(MSG_TYPE_EXECUTE, Bytes::from(exec_payload)))
+        .unwrap();
+    assert_eq!(response[0].msg_type, MSG_TYPE_ERROR);
+    let message = String::from_utf8_lossy(&response[0].payload).to_string();
+    assert!(message.contains("not found"), "message: {message}");
+    assert!(
+        message.contains("next unissued id is 2"),
+        "message: {message}"
+    );
+
+    let mut batch_payload = Vec::new();
+    batch_payload.extend_from_slice(&bogus_id.to_le_bytes());
+    batch_payload.extend_from_slice(&0u32.to_le_bytes());
+    let response = handler
+        .handle_message(Message::new(
+            MSG_TYPE_BATCH_EXECUTE,
+            Bytes::from(batch_payload),
+        ))
+        .unwrap();
+    assert_eq!(response[0].msg_type, MSG_TYPE_ERROR);
+    let message = String::from_utf8_lossy(&response[0].payload).to_string();
+    assert!(message.contains("not found"), "message: {message}");
+    assert!(
+        message.contains("next unissued id is 2"),
+        "message: {message}"
+    );
+}
+
+#[test]
 fn prepared_insert_rejected_after_schema_change() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
@@ -332,7 +380,10 @@ fn prepared_insert_rejected_after_schema_change() {
 
     let mut alter_payload = Vec::new();
     write_len_prefixed_string(&mut alter_payload, "main");
-    write_len_prefixed_string(&mut alter_payload, "ALTER TABLE drift ADD COLUMN value VARCHAR");
+    write_len_prefixed_string(
+        &mut alter_payload,
+        "ALTER TABLE drift ADD COLUMN value VARCHAR",
+    );
     let response = handler
         .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(alter_payload)))
         .unwrap();
