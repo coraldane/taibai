@@ -241,7 +241,12 @@ impl Engine {
         self.ensure_permissions(session, &stmt)?;
         match &stmt {
             Statement::Select { .. } => {
-                if let Some(plan) = prepared.cached_plan.as_ref() {
+                let plan_matches_database = prepared
+                    .planned_database
+                    .as_deref()
+                    .is_some_and(|db| db == session.database);
+                if let (Some(plan), true) = (prepared.cached_plan.as_ref(), plan_matches_database)
+                {
                     super::query::exec_select_with_plan_and_txn(
                         self,
                         &session.database,
@@ -325,7 +330,11 @@ impl Engine {
                     values: bound_values,
                     ..
                 } => values.extend(bound_values),
-                _ => unreachable!("prepared statement kind was checked above"),
+                _ => {
+                    return Err(TaibaiError::Sql(
+                        "prepared statement changed kind during batch binding".into(),
+                    ));
+                }
             }
         }
 

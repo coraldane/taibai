@@ -299,3 +299,62 @@ fn test_count_and_has_placeholders_consistent() {
         assert!(count > 0, "expected at least one placeholder in: {}", sql);
     }
 }
+
+// --- PreparedStatementCache behaviour ---
+
+#[test]
+fn cache_assigns_monotonic_ids_from_one() {
+    let mut cache = PreparedStatementCache::new();
+    let a = cache.prepare("INSERT INTO t (a) VALUES (?)").unwrap();
+    let b = cache.prepare("SELECT * FROM t WHERE id = ?").unwrap();
+    assert_eq!(a.id, 1);
+    assert_eq!(b.id, 2);
+    assert_eq!(cache.len(), 2);
+}
+
+#[test]
+fn cache_keeps_statements_execute_after_reinsert() {
+    let mut cache = PreparedStatementCache::new();
+    let stmt = cache.prepare("INSERT INTO t (a) VALUES (?)").unwrap();
+    let id = stmt.id;
+    let removed = cache.remove(id).expect("statement should exist");
+    cache.insert(removed);
+    assert!(cache.get(id).is_some());
+}
+
+#[test]
+fn cache_does_not_evict_live_statements_beyond_legacy_lru_limit() {
+    let mut cache = PreparedStatementCache::new();
+    let first_id = cache.prepare("INSERT INTO t (a) VALUES (?)").unwrap().id;
+    for _ in 0..300 {
+        cache.prepare("SELECT * FROM t WHERE id = ?").unwrap();
+    }
+    assert_eq!(cache.len(), 301);
+    assert!(
+        cache.get(first_id).is_some(),
+        "oldest statement must stay usable; silent eviction caused 'prepared statement not found'"
+    );
+}
+
+#[test]
+fn cache_rejects_prepare_over_explicit_limit() {
+    let mut cache = PreparedStatementCache::with_max_size(3);
+    for _ in 0..3 {
+        cache.prepare("SELECT * FROM t WHERE id = ?").unwrap();
+    }
+    let err = cache
+        .prepare("SELECT * FROM t WHERE id = ?")
+        .expect_err("prepare over limit must fail loudly");
+    assert!(err.to_string().contains("too many prepared statements"));
+    assert_eq!(cache.len(), 3);
+}
+
+#[test]
+fn cache_clear_then_prepare_never_reuses_ids() {
+    let mut cache = PreparedStatementCache::new();
+    cache.prepare("SELECT * FROM t WHERE id = ?").unwrap();
+    cache.clear();
+    let next = cache.prepare("SELECT * FROM t WHERE id = ?").unwrap();
+    assert_eq!(next.id, 2);
+    assert!(cache.is_empty() == false);
+}

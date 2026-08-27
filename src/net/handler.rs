@@ -153,6 +153,16 @@ impl Handler {
             ))]);
         }
 
+        if self.session.is_some() {
+            tracing::warn!(
+                username,
+                "duplicate login on an authenticated connection rejected to preserve existing session state (prepared statements, active transaction)"
+            );
+            return Ok(vec![build_auth_fail(
+                "connection already logged in; reuse the established session or open a new connection",
+            )]);
+        }
+
         let mut session = Session::new(username.to_string(), database);
         session.streaming_results = streaming_results;
         session.timezone_offset_hours = timezone_offset_hours;
@@ -470,10 +480,67 @@ impl Handler {
                         }
                     }
                 }
+                if let Some((_, param_types)) =
+                    Self::current_insert_param_types(&self.engine, session, &stmt)
+                {
+                    if let Some(cached) = session.prepared_statements.get_mut(stmt.id) {
+                        cached.param_types = param_types;
+                    }
+                }
                 Ok(vec![Message::new(MSG_TYPE_PREPARE, Bytes::from(buf))])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
         }
+    }
+
+    fn current_insert_param_types(
+        engine: &Engine,
+        session: &Session,
+        stmt: &crate::sql::execution::prepared::PreparedStatement,
+    ) -> Option<(String, Vec<crate::protocol::types::DataType>)> {
+        let (table, columns) = match &stmt.stmt {
+            Statement::Insert { table, columns, .. }
+            | Statement::Replace { table, columns, .. } => (table, columns),
+            _ => return None,
+        };
+        let database = table.effective_database(&session.database);
+        let meta = engine.get_table_meta(database, &table.name)?;
+        let mut types = Vec::with_capacity(stmt.param_count);
+        for param_index in 0..stmt.param_count {
+            let column = if columns.is_empty() {
+                meta.columns.get(param_index)
+            } else {
+                columns.get(param_index).and_then(|name| {
+                    meta.columns
+                        .iter()
+                        .find(|column| column.name.eq_ignore_ascii_case(name))
+                })
+            };
+            types.push(column?.data_type);
+        }
+        Some((format!("{}.{}", database, table.name), types))
+    }
+
+    fn reject_stale_prepared_statement(
+        engine: &Engine,
+        session: &mut Session,
+        stmt: crate::sql::execution::prepared::PreparedStatement,
+        stmt_id: u32,
+    ) -> Vec<Message> {
+        let qualified_name = Self::current_insert_param_types(engine, session, &stmt)
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| "unknown table".to_string());
+        session.prepared_statements.insert(stmt);
+        tracing::warn!(
+            stmt_id,
+            table = %qualified_name,
+            "prepared statement rejected: table schema changed after PREPARE"
+        );
+        vec![build_error(&format!(
+            "prepared statement {} no longer matches current schema of {} \
+             (table altered after PREPARE); re-prepare the statement",
+            stmt_id, qualified_name
+        ))]
     }
 
     fn handle_execute(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -545,14 +612,30 @@ impl Handler {
         let mut stmt = match session.prepared_statements.remove(stmt_id) {
             Some(s) => s,
             None => {
+                tracing::warn!(
+                    stmt_id,
+                    live_statements = session.prepared_statements.len(),
+                    "prepared statement lookup failed on execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
+                );
                 return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found",
-                    stmt_id
-                ))])
+                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1)",
+                    stmt_id,
+                    session.prepared_statements.len()
+                ))]);
             }
         };
 
         stmt.params = params;
+
+        if let Some((_, current_types)) =
+            Self::current_insert_param_types(&self.engine, session, &stmt)
+        {
+            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
+                return Ok(Self::reject_stale_prepared_statement(
+                    &self.engine, session, stmt, stmt_id,
+                ));
+            }
+        }
 
         let execute_start = Instant::now();
         let result = self.engine.execute_prepared(session, &mut stmt);
@@ -786,14 +869,30 @@ impl Handler {
         let mut stmt = match session.prepared_statements.remove(stmt_id) {
             Some(s) => s,
             None => {
+                tracing::warn!(
+                    stmt_id,
+                    live_statements = session.prepared_statements.len(),
+                    "prepared statement lookup failed on batch execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
+                );
                 return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found",
-                    stmt_id
-                ))])
+                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1)",
+                    stmt_id,
+                    session.prepared_statements.len()
+                ))]);
             }
         };
 
         let param_count = stmt.param_count;
+
+        if let Some((_, current_types)) =
+            Self::current_insert_param_types(&self.engine, session, &stmt)
+        {
+            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
+                return Ok(Self::reject_stale_prepared_statement(
+                    &self.engine, session, stmt, stmt_id,
+                ));
+            }
+        }
         let mut parameter_batch = Vec::with_capacity(batch_size);
 
         for row_idx in 0..batch_size {

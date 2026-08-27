@@ -231,6 +231,156 @@ fn logged_in_handler(config: Arc<ServerConfig>, engine: Arc<Engine>, username: &
     handler
 }
 
+#[test]
+fn duplicate_login_is_rejected_and_preserves_existing_session_state() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = Handler::new(config, engine);
+    {
+        let session = Session::new("root".to_string(), "main".to_string());
+        handler.session = Some(session);
+    }
+    let prepared = handler
+        .session
+        .as_mut()
+        .unwrap()
+        .prepared_statements
+        .prepare("INSERT INTO t (a) VALUES (?)")
+        .unwrap();
+    let live_id = prepared.id;
+
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "root");
+    write_len_prefixed_string(&mut payload, "taibai");
+    write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
+
+    let responses = handler
+        .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+        .unwrap();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].msg_type, MSG_TYPE_AUTH_FAIL);
+    let message = String::from_utf8_lossy(&responses[0].payload).to_string();
+    assert!(message.contains("already logged in"), "message: {message}");
+
+    let session = handler.session.as_ref().unwrap();
+    assert_eq!(session.username, "root");
+    assert!(
+        session.prepared_statements.get(live_id).is_some(),
+        "existing prepared statements must survive a rejected duplicate login"
+    );
+}
+
+#[test]
+fn prepared_insert_rejected_after_schema_change() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
+    let config = Arc::new(ServerConfig::default());
+    let mut handler = Handler::new(config, engine);
+
+    let mut payload = Vec::new();
+    write_len_prefixed_string(&mut payload, "root");
+    write_len_prefixed_string(&mut payload, "taibai");
+    write_len_prefixed_string(&mut payload, "main");
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.push(0);
+    handler
+        .handle_message(Message::new(MSG_TYPE_LOGIN, Bytes::from(payload)))
+        .unwrap();
+
+    let mut sql_payload = Vec::new();
+    write_len_prefixed_string(&mut sql_payload, "main");
+    write_len_prefixed_string(
+        &mut sql_payload,
+        "CREATE TABLE drift (id INT64, value INT64)",
+    );
+    handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(sql_payload)))
+        .unwrap();
+
+    let mut prep_payload = Vec::new();
+    write_len_prefixed_string(&mut prep_payload, "INSERT INTO drift VALUES (?, ?)");
+    let prepared = handler
+        .handle_message(Message::new(MSG_TYPE_PREPARE, Bytes::from(prep_payload)))
+        .unwrap();
+    let stmt_id = u32::from_le_bytes(prepared[0].payload[..4].try_into().unwrap());
+
+    let mut exec_payload = Vec::new();
+    exec_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    exec_payload.extend_from_slice(&2u32.to_le_bytes());
+    append_int64_param(&mut exec_payload, 1);
+    append_int64_param(&mut exec_payload, 100);
+    let response = handler
+        .handle_message(Message::new(MSG_TYPE_EXECUTE, Bytes::from(exec_payload)))
+        .unwrap();
+    assert_eq!(ok_rows(&response), 1);
+
+    let mut alter_payload = Vec::new();
+    write_len_prefixed_string(&mut alter_payload, "main");
+    write_len_prefixed_string(&mut alter_payload, "ALTER TABLE drift DROP COLUMN value");
+    let response = handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(alter_payload)))
+        .unwrap();
+    assert_eq!(
+        response[0].msg_type,
+        MSG_TYPE_OK,
+        "drop column failed: {}",
+        String::from_utf8_lossy(&response[0].payload)
+    );
+
+    let mut alter_payload = Vec::new();
+    write_len_prefixed_string(&mut alter_payload, "main");
+    write_len_prefixed_string(&mut alter_payload, "ALTER TABLE drift ADD COLUMN value VARCHAR");
+    let response = handler
+        .handle_message(Message::new(MSG_TYPE_QUERY, Bytes::from(alter_payload)))
+        .unwrap();
+    assert_eq!(
+        response[0].msg_type,
+        MSG_TYPE_OK,
+        "add column failed: {}",
+        String::from_utf8_lossy(&response[0].payload)
+    );
+
+    let mut exec_payload = Vec::new();
+    exec_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    exec_payload.extend_from_slice(&2u32.to_le_bytes());
+    append_int64_param(&mut exec_payload, 2);
+    append_int64_param(&mut exec_payload, 200);
+    let response = handler
+        .handle_message(Message::new(MSG_TYPE_EXECUTE, Bytes::from(exec_payload)))
+        .unwrap();
+    assert_eq!(response[0].msg_type, MSG_TYPE_ERROR);
+    let message = String::from_utf8_lossy(&response[0].payload).to_string();
+    assert!(message.contains("re-prepare"), "message: {message}");
+    assert!(
+        handler
+            .session
+            .as_ref()
+            .unwrap()
+            .prepared_statements
+            .get(stmt_id)
+            .is_some(),
+        "rejected statement must remain cached so subsequent errors stay actionable"
+    );
+
+    let mut batch_payload = Vec::new();
+    batch_payload.extend_from_slice(&stmt_id.to_le_bytes());
+    batch_payload.extend_from_slice(&1u32.to_le_bytes());
+    append_int64_param(&mut batch_payload, 3);
+    append_int64_param(&mut batch_payload, 300);
+    let response = handler
+        .handle_message(Message::new(
+            MSG_TYPE_BATCH_EXECUTE,
+            Bytes::from(batch_payload),
+        ))
+        .unwrap();
+    assert_eq!(response[0].msg_type, MSG_TYPE_ERROR);
+    let message = String::from_utf8_lossy(&response[0].payload).to_string();
+    assert!(message.contains("re-prepare"), "message: {message}");
+}
+
 fn ok_rows(resp: &[Message]) -> u64 {
     assert_eq!(resp.len(), 1);
     assert_eq!(resp[0].msg_type, MSG_TYPE_OK);
