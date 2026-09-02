@@ -1,7 +1,8 @@
 use super::*;
 use crate::protocol::types::DataType;
 use crate::storage::segment::writer::SegmentWriter;
-use crate::types::batch::{ColumnDef, Schema};
+use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+use std::sync::atomic::Ordering;
 
 fn entry(value: i64, row_id: u64) -> UniqueIndexEntry {
     UniqueIndexEntry {

@@ -520,5 +520,5 @@ fn bulk_payload_table_name(payload: &[u8]) -> Result<&str> {
 }
 
 #[cfg(test)]
-#[path = "engine_test.rs"]
+#[path = "engine_test/mod.rs"]
 mod tests;
