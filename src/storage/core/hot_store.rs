@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! In-memory hot acceleration store.
 //!
 //! An append-only columnar buffer that indexes the **leading cluster-key
@@ -61,10 +60,6 @@ impl StringPool {
     /// never been appended, hence there can be no matching rows.
     pub fn lookup(&self, s: &str) -> Option<u32> {
         self.forward.get(s).copied()
-    }
-
-    pub fn lookup_value(&self, id: u32) -> Option<&str> {
-        self.reverse.get(id as usize).map(|s| s.as_str())
     }
 
     pub fn len(&self) -> usize {
@@ -563,14 +558,6 @@ impl HotStore {
 
     /// Count rows whose index-column value equals `key_value` without
     /// materialising the batch.
-    pub fn count_by_key(&self, key_value: &ScalarValue) -> Option<u64> {
-        self.count_by_key_from(key_value, 0)
-    }
-
-    pub fn count_by_key_from(&self, key_value: &ScalarValue, min_offset: u64) -> Option<u64> {
-        self.count_by_key_partition_from(key_value, None, min_offset)
-    }
-
     pub fn count_by_key_partition_from(
         &self,
         key_value: &ScalarValue,
@@ -664,10 +651,6 @@ impl HotStore {
         self.estimated_memory_bytes() > self.memory_soft_limit
     }
 
-    pub fn hard_limit_exceeded(&self) -> bool {
-        self.estimated_memory_bytes() > self.memory_hard_limit
-    }
-
     /// Drop the leading `requested` rows (the append-prefix already persisted to
     /// segments) to reclaim resident memory under backpressure. Returns the
     /// number of rows actually dropped. Remaining rows keep their relative
@@ -726,13 +709,6 @@ impl HotStore {
         }
         self.row_count.fetch_sub(n as u64, Ordering::Release);
         n as u64
-    }
-
-    /// How many appended rows have already been persisted to segments (the
-    /// reclaimable prefix), derived from total appended minus live memtable rows
-    /// supplied by the caller. Used by the engine to size `compact_prefix`.
-    pub fn reclaimable_prefix(&self, live_memtable_rows: u64) -> u64 {
-        self.row_count().saturating_sub(live_memtable_rows)
     }
 }
 
@@ -888,12 +864,6 @@ impl HotStoreManager {
         store.append(batch)
     }
 
-    /// Drop every resident store (eviction handoff hook).
-    pub fn evict_all(&self) {
-        let mut stores = self.stores.write().unwrap();
-        stores.clear();
-    }
-
     /// Reclaim the persisted prefix of one table's resident store (backpressure).
     pub fn compact_prefix(&self, db: &str, table: &str, n: u64) -> u64 {
         let stores = self.stores.read().unwrap();
@@ -901,12 +871,6 @@ impl HotStoreManager {
             .get(&(db.to_string(), table.to_string()))
             .map(|s| s.compact_prefix(n))
             .unwrap_or(0)
-    }
-
-    /// True when any resident store is past its soft memory limit.
-    pub fn any_soft_limit_exceeded(&self) -> bool {
-        let stores = self.stores.read().unwrap();
-        stores.values().any(|s| s.soft_limit_exceeded())
     }
 
     pub fn soft_limit_exceeded_for(&self, db: &str, table: &str) -> bool {

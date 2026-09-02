@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -8,7 +7,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::common::error::{Result, TaibaiError};
-use crate::storage::index::sparse_index::SparseIndexImpl;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::RecordBatch;
 use crate::types::scalar::ScalarValue;
@@ -16,7 +14,6 @@ use crate::types::scalar::ScalarValue;
 pub const PRIMARY_LOCATION_INDEX_NAME: &str = "__taibai_primary_location";
 
 pub struct IndexManager {
-    indexes: RwLock<HashMap<String, HashMap<String, Arc<SparseIndexImpl>>>>,
     unique_indexes: Arc<RwLock<HashMap<String, Arc<UniqueIndexState>>>>,
     primary_key_indexes: RwLock<HashMap<String, HashSet<Vec<u8>>>>,
     segment_mgr: Arc<SegmentManager>,
@@ -158,166 +155,11 @@ impl IndexManager {
 
     pub fn new_with_data_dir(segment_mgr: Arc<SegmentManager>, data_dir: PathBuf) -> Self {
         Self {
-            indexes: RwLock::new(HashMap::new()),
             unique_indexes: Arc::new(RwLock::new(HashMap::new())),
             primary_key_indexes: RwLock::new(HashMap::new()),
             segment_mgr,
             data_dir,
             unique_index_compaction: Mutex::new(UniqueIndexCompactionSchedule::default()),
-        }
-    }
-
-    pub fn get_or_create_index(&self, db: &str, table: &str) -> Arc<SparseIndexImpl> {
-        let indexes = self.indexes.read().unwrap();
-
-        if let Some(db_indexes) = indexes.get(db) {
-            if let Some(idx) = db_indexes.get(table) {
-                return idx.clone();
-            }
-        }
-
-        drop(indexes);
-
-        let new_index = Arc::new(SparseIndexImpl::new());
-        let mut indexes = self.indexes.write().unwrap();
-
-        indexes
-            .entry(db.to_string())
-            .or_default()
-            .insert(table.to_string(), new_index.clone());
-
-        new_index
-    }
-
-    pub fn rebuild_index_from_segments(
-        &self,
-        db: &str,
-        table: &str,
-        segments: &[String],
-    ) -> Result<()> {
-        let index = self.get_or_create_index(db, table);
-        index.clear();
-
-        let mut current_row_id: i64 = 0;
-        let mut block_data = Vec::new();
-
-        for seg_path in segments.iter() {
-            let reader = self.segment_mgr.open_reader(Path::new(seg_path))?;
-
-            let num_row_groups = reader.num_row_groups();
-            for rg_idx in 0..num_row_groups {
-                let rg_row_count = reader.row_group_rows(rg_idx) as i64;
-
-                if rg_row_count == 0 {
-                    continue;
-                }
-
-                block_data.push(crate::storage::index::sparse_index::SparseBlockData {
-                    block_id: block_data.len(),
-                    zone_map: None,
-                    bloom_filter: None,
-                    start_row_id: current_row_id,
-                    row_count: rg_row_count,
-                });
-
-                current_row_id += rg_row_count;
-            }
-        }
-
-        index.rebuild_from_blocks(block_data);
-        Ok(())
-    }
-
-    pub fn search(&self, db: &str, table: &str, value: &ScalarValue) -> Option<Vec<i64>> {
-        let indexes = self.indexes.read().unwrap();
-
-        let idx = indexes.get(db).and_then(|db_idx| db_idx.get(table))?;
-
-        Some(idx.search(value))
-    }
-
-    pub fn range_search(
-        &self,
-        db: &str,
-        table: &str,
-        min: &ScalarValue,
-        max: &ScalarValue,
-    ) -> Option<Vec<i64>> {
-        let indexes = self.indexes.read().unwrap();
-
-        let idx = indexes.get(db).and_then(|db_idx| db_idx.get(table))?;
-
-        Some(idx.range_search(min, max))
-    }
-
-    pub fn get_index(&self, db: &str, table: &str) -> Option<Arc<SparseIndexImpl>> {
-        let indexes = self.indexes.read().unwrap();
-        indexes
-            .get(db)
-            .and_then(|db_idx| db_idx.get(table))
-            .cloned()
-    }
-
-    pub fn update_index(&self, db: &str, table: &str, key: &ScalarValue, row_id: i64) {
-        if let Some(idx) = self.get_index(db, table) {
-            idx.insert(key, row_id);
-        }
-    }
-
-    pub fn mark_index_stale(&self, db: &str, table: &str) {
-        if let Some(idx) = self.get_index(db, table) {
-            idx.mark_stale();
-        }
-    }
-
-    pub fn is_index_stale(&self, db: &str, table: &str) -> bool {
-        if let Some(idx) = self.get_index(db, table) {
-            idx.is_stale()
-        } else {
-            false
-        }
-    }
-
-    pub fn clear_index(&self, db: &str, table: &str) {
-        if let Some(idx) = self.get_index(db, table) {
-            idx.clear();
-        }
-    }
-
-    pub fn remove_index(&self, db: &str, table: &str) {
-        let mut indexes = self.indexes.write().unwrap();
-        if let Some(db_indexes) = indexes.get_mut(db) {
-            db_indexes.remove(table);
-        }
-    }
-
-    pub fn rename_index(&self, db: &str, old_name: &str, new_name: &str) {
-        let mut indexes = self.indexes.write().unwrap();
-        if let Some(db_indexes) = indexes.get_mut(db) {
-            if let Some(idx) = db_indexes.remove(old_name) {
-                db_indexes.insert(new_name.to_string(), idx);
-            }
-        }
-    }
-
-    pub fn remove_database_indexes(&self, db: &str) {
-        let mut indexes = self.indexes.write().unwrap();
-        indexes.remove(db);
-    }
-
-    pub fn index_size(&self, db: &str, table: &str) -> i64 {
-        if let Some(idx) = self.get_index(db, table) {
-            idx.size()
-        } else {
-            0
-        }
-    }
-
-    pub fn index_block_count(&self, db: &str, table: &str) -> usize {
-        if let Some(idx) = self.get_index(db, table) {
-            idx.block_count()
-        } else {
-            0
         }
     }
 
@@ -1650,44 +1492,6 @@ fn unique_index_state_contains_key(
     Ok(false)
 }
 
-fn merge_prepared_unique_index_entries(
-    data: &mut UniqueIndexData,
-    mut additions: Vec<PreparedUniqueIndexEntry>,
-) -> Result<()> {
-    additions.sort_by(|left, right| left.encoded_key.cmp(&right.encoded_key));
-    let existing_entries = std::mem::take(&mut data.entries);
-    let existing_keys = std::mem::take(&mut data.encoded_keys);
-    let mut existing = existing_keys.into_iter().zip(existing_entries).peekable();
-    let mut additions = additions.into_iter().peekable();
-    let capacity = existing.size_hint().0 + additions.size_hint().0;
-    let mut merged_entries = Vec::with_capacity(capacity);
-    let mut merged_keys = Vec::with_capacity(capacity);
-    while existing.peek().is_some() && additions.peek().is_some() {
-        let take_existing = existing.peek().unwrap().0 <= additions.peek().unwrap().encoded_key;
-        if take_existing {
-            let (key, entry) = existing.next().unwrap();
-            merged_keys.push(key);
-            merged_entries.push(entry);
-        } else {
-            let addition = additions.next().unwrap();
-            merged_keys.push(addition.encoded_key);
-            merged_entries.push(addition.entry);
-        }
-    }
-    for (key, entry) in existing {
-        merged_keys.push(key);
-        merged_entries.push(entry);
-    }
-    for addition in additions {
-        merged_keys.push(addition.encoded_key);
-        merged_entries.push(addition.entry);
-    }
-    data.entries = merged_entries;
-    data.encoded_keys = merged_keys;
-    data.blocks = build_unique_index_blocks(&data.encoded_keys);
-    Ok(())
-}
-
 fn prepare_unique_index_data(data: &mut UniqueIndexData) -> Result<()> {
     let mut encoded = data
         .entries
@@ -1707,22 +1511,6 @@ fn prepare_unique_index_data(data: &mut UniqueIndexData) -> Result<()> {
     Ok(())
 }
 
-fn merge_unique_index_entries(
-    data: &mut UniqueIndexData,
-    entries: Vec<UniqueIndexEntry>,
-) -> Result<()> {
-    let additions = entries
-        .into_iter()
-        .map(|entry| {
-            Ok(PreparedUniqueIndexEntry {
-                encoded_key: encode_unique_key(&entry.key)?,
-                entry,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    merge_prepared_unique_index_entries(data, additions)
-}
-
 fn build_unique_index_blocks(encoded_keys: &[Vec<u8>]) -> Vec<UniqueIndexBlock> {
     let mut blocks = Vec::new();
     let mut start = 0usize;
@@ -1736,32 +1524,6 @@ fn build_unique_index_blocks(encoded_keys: &[Vec<u8>]) -> Vec<UniqueIndexBlock> 
         start += len;
     }
     blocks
-}
-
-fn unique_index_data_contains_key(
-    segment_mgr: &SegmentManager,
-    data: &UniqueIndexData,
-    key: &[ScalarValue],
-) -> Result<bool> {
-    let needle = encode_unique_key(key)?;
-    if data.encoded_keys.is_empty() {
-        return Ok(false);
-    }
-    let Ok(mut idx) = data.encoded_keys.binary_search(&needle) else {
-        return Ok(false);
-    };
-    while idx > 0 && data.encoded_keys[idx - 1] == needle {
-        idx -= 1;
-    }
-    while idx < data.encoded_keys.len() && data.encoded_keys[idx] == needle {
-        if !unique_index_tombstones_contains(&data.tombstones, &data.entries[idx].location)
-            && unique_index_entry_location_is_live(segment_mgr, &data.entries[idx].location)?
-        {
-            return Ok(true);
-        }
-        idx += 1;
-    }
-    Ok(false)
 }
 
 /// In-place snapshot compaction for prepared data (entries aligned with
@@ -1946,10 +1708,6 @@ fn append_prepared_unique_index_delta(
     }
     file.sync_all()?;
     Ok(())
-}
-
-fn append_unique_index_delta(path: &Path, entries: &[UniqueIndexEntry]) -> Result<()> {
-    append_unique_index_delta_records(path, entries, &[], &[])
 }
 
 fn append_unique_index_tombstone_delta(

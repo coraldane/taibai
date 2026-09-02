@@ -7,10 +7,6 @@ use super::Rule;
 pub struct PredicatePushdownRule;
 
 impl Rule for PredicatePushdownRule {
-    fn name(&self) -> &str {
-        "predicate_pushdown"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         push_predicates(plan)
     }

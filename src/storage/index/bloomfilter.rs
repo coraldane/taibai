@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -241,6 +240,10 @@ impl BloomFilter {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|&b| b == 0)
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8 + self.bits.len());
         buf.extend_from_slice(&(self.num_bits as u64).to_le_bytes());
@@ -267,20 +270,6 @@ impl BloomFilter {
             num_bits,
             num_hashes,
         })
-    }
-
-    pub fn clear(&mut self) {
-        for byte in self.bits.iter_mut() {
-            *byte = 0;
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bits.iter().all(|&b| b == 0)
-    }
-
-    pub fn size_in_bytes(&self) -> usize {
-        self.bits.len()
     }
 }
 

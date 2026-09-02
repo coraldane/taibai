@@ -43,13 +43,6 @@ pub fn read_latest_sidecar_footer(segment_path: &Path) -> Result<Option<SidecarF
     read_latest_sidecar_footer_from(&sidecar_meta_path(segment_path))
 }
 
-pub fn read_latest_segment_meta(segment_path: &Path) -> Result<Option<SegmentMetaSnapshot>> {
-    let Some(sidecar) = read_latest_sidecar_footer(segment_path)? else {
-        return Ok(None);
-    };
-    Ok(Some(segment_meta_snapshot(sidecar)?))
-}
-
 /// Read only the embedded footer at the end of a segment file.
 ///
 /// This path deliberately avoids mmap and never reads column payload bytes. It

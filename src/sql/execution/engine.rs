@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

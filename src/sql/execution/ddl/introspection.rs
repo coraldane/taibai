@@ -617,7 +617,6 @@ pub fn exec_optimize_table(
         compactor.optimize_table(db, table, &table_meta)?
     };
 
-    engine.index_manager().mark_index_stale(db, table);
     // The rewrite moved rows to new segment locations, so rebuild the
     // location-index snapshots eagerly instead of invalidating them for a
     // lazy rebuild on the next probe. Skip when compaction was a no-op.

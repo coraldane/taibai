@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,24 +33,7 @@ fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
 }
 
 enum WriteCommand {
-    WriteColumns {
-        db: String,
-        table: String,
-        partition_key: String,
-        batch: RecordBatch,
-        schema: Schema,
-        txn_id: u64,
-    },
-    Flush {
-        db: String,
-        table: String,
-    },
-    TxnCommit {
-        txn_id: u64,
-    },
-    TxnRollback {
-        txn_id: u64,
-    },
+    Flush { db: String, table: String },
     Shutdown,
 }
 
@@ -770,7 +751,6 @@ impl BatchWriter {
                 rx.recv_timeout(std::time::Duration::from_secs(1))
             };
             match command {
-                Ok(WriteCommand::WriteColumns { .. }) => {}
                 Ok(WriteCommand::Flush { db, table }) => {
                     last_write_epoch = write_epoch.load(Ordering::Acquire);
                     pending_tables.remove(&(db.clone(), table.clone()));
@@ -785,20 +765,6 @@ impl BatchWriter {
                         pending_tables.insert((db, table));
                     }
                     checkpoint_idle = false;
-                }
-                Ok(WriteCommand::TxnCommit { txn_id }) => {
-                    memtable_mgr.commit_txn(txn_id);
-                    if let Err(e) = segment_mgr.commit_txn(txn_id) {
-                        tracing::warn!(error = %e, txn_id, "failed to commit transaction in storage");
-                    }
-                }
-                Ok(WriteCommand::TxnRollback { txn_id }) => {
-                    let rolled_back_rows = memtable_mgr.rollback_txn(txn_id);
-                    tracing::debug!(
-                        txn_id,
-                        rows_discarded = rolled_back_rows,
-                        "transaction rolled back in worker"
-                    );
                 }
                 Ok(WriteCommand::Shutdown) => break,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {

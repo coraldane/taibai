@@ -384,25 +384,6 @@ impl ActiveSegmentWriter {
         self.flush_meta(invalidate_reader)
     }
 
-    pub(super) fn write_final_footer(&mut self) -> Result<()> {
-        self.file.flush()?;
-        self.file.get_ref().set_len(self.data_end)?;
-        self.file.seek(SeekFrom::Start(self.data_end))?;
-        self.file.get_ref().sync_all()?;
-
-        let footer = self.encode_footer()?;
-        self.file.write_all(&footer)?;
-        self.file.write_all(&self.data_end.to_le_bytes())?;
-        self.file.flush()?;
-        self.file.get_ref().sync_all()?;
-        remove_sidecar_meta(&self.path)?;
-
-        self.current_size = self.data_end + footer.len() as u64 + 8;
-        self.sidecar_row_groups_flushed = self.row_groups.len();
-        self.dirty_meta = false;
-        Ok(())
-    }
-
     pub(super) fn finalize(&mut self) -> Result<()> {
         self.file.flush()?;
         self.file.get_ref().sync_all()?;

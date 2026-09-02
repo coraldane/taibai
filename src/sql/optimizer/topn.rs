@@ -7,10 +7,6 @@ use super::Rule;
 pub struct TopNRule;
 
 impl Rule for TopNRule {
-    fn name(&self) -> &str {
-        "topn"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         apply_topn(plan)
     }

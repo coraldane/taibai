@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -268,16 +267,6 @@ impl MemTable {
         guard.as_ref().map(|batch| batch.as_ref().clone())
     }
 
-    /// Freeze a zero-copy snapshot for an out-of-lock checkpoint. Once the
-    /// memtable enters `Flushing`, INSERTs switch to a new memtable, so this
-    /// shared batch remains immutable without copying all column buffers.
-    pub fn read_snapshot_shared(&self) -> Option<Arc<RecordBatch>> {
-        if self.ensure_resident().is_err() {
-            return None;
-        }
-        self.batch.read().unwrap().clone()
-    }
-
     pub fn is_spilled(&self) -> bool {
         matches!(
             *self.backing.read().unwrap(),
@@ -484,8 +473,6 @@ impl MemTable {
 /// conflict filtering removes rows. Probing with this index replaces the
 /// per-statement full scan of every committed memtable.
 pub struct ReplaceKeyIndex {
-    db: String,
-    table: String,
     signature: Vec<Vec<usize>>,
     content_version: u64,
     rows_indexed: u64,
@@ -727,8 +714,6 @@ impl MemTableManager {
         let entry = indexes
             .entry(memtable.id())
             .or_insert_with(|| ReplaceKeyIndex {
-                db: memtable.db().to_string(),
-                table: memtable.table().to_string(),
                 signature: signature.clone(),
                 content_version: version,
                 rows_indexed: 0,
@@ -860,23 +845,6 @@ impl MemTableManager {
         });
         drop(memtables);
         self.prune_replace_key_indexes();
-    }
-
-    /// Drop every `Archived` memtable across all tables (full close-of-day).
-    pub fn remove_all_archived(&self) {
-        let mut memtables = self.memtables.write().unwrap();
-        memtables.retain(|mt| mt.state() != MemTableState::Archived);
-        drop(memtables);
-        self.prune_replace_key_indexes();
-    }
-
-    pub fn get_by_txn(&self, txn_id: u64) -> Vec<Arc<MemTable>> {
-        let memtables = self.memtables.read().unwrap();
-        memtables
-            .iter()
-            .filter(|mt| mt.txn_id() == txn_id && mt.state() == MemTableState::Pending)
-            .cloned()
-            .collect()
     }
 
     pub fn get_visible_to(&self, db: &str, table: &str, reader_txn_id: u64) -> Vec<Arc<MemTable>> {
@@ -1052,15 +1020,6 @@ impl MemTableManager {
         committed
     }
 
-    pub fn total_row_count(&self) -> u64 {
-        let memtables = self.memtables.read().unwrap();
-        memtables
-            .iter()
-            .filter(|mt| mt.state() == MemTableState::Pending)
-            .map(|mt| mt.row_count())
-            .sum()
-    }
-
     /// Approximate resident bytes owned by pending memtables. Spilled
     /// memtables contribute only metadata (counted as zero), since their rows
     /// live in the durable tail.
@@ -1071,27 +1030,6 @@ impl MemTableManager {
             .filter(|mt| mt.state() == MemTableState::Pending)
             .map(|mt| mt.estimated_memory_bytes())
             .sum()
-    }
-
-    pub fn txn_row_count(&self, txn_id: u64) -> u64 {
-        let memtables = self.memtables.read().unwrap();
-        memtables
-            .iter()
-            .filter(|mt| mt.txn_id() == txn_id && mt.state() == MemTableState::Pending)
-            .map(|mt| mt.row_count())
-            .sum()
-    }
-
-    pub fn txn_tables(&self, txn_id: u64) -> HashMap<(String, String), u64> {
-        let memtables = self.memtables.read().unwrap();
-        let mut result = HashMap::new();
-        for mt in memtables.iter() {
-            if mt.txn_id() == txn_id && mt.state() == MemTableState::Pending {
-                let key = (mt.db().to_string(), mt.table().to_string());
-                *result.entry(key).or_insert(0) += mt.row_count();
-            }
-        }
-        result
     }
 }
 

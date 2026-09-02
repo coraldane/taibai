@@ -7,10 +7,6 @@ use super::Rule;
 pub struct SemiJoinRule;
 
 impl Rule for SemiJoinRule {
-    fn name(&self) -> &str {
-        "semi_join"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         transform_to_semi_join(plan)
     }
@@ -191,10 +187,6 @@ fn extract_schema(plan: &LogicalPlan) -> crate::types::batch::Schema {
 pub struct SemiJoinColumnPruningRule;
 
 impl Rule for SemiJoinColumnPruningRule {
-    fn name(&self) -> &str {
-        "semi_join_column_pruning"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         prune_semi_join_columns(plan)
     }

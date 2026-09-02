@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-use crate::storage::codec::fastscan::{apply_filter_mask_fast, FastScanEQ};
+use crate::storage::codec::fastscan::apply_filter_mask_fast;
 use crate::storage::codec::predicate_scan::selected_eq_rows_from_raw;
 use crate::storage::partition::pruning::RangeOp;
 use crate::types::array::ColumnArray;
@@ -1149,40 +1148,6 @@ fn scalar_eq(a: &ScalarValue, b: &ScalarValue) -> bool {
         return false;
     }
     crate::storage::index::sort_key::compare_scalars_for_sort(a, b) == std::cmp::Ordering::Equal
-}
-
-pub fn apply_cluster_key_fast_scan(
-    batches: &mut Vec<RecordBatch>,
-    cluster_key: &[String],
-    eq_predicates: &[(usize, ScalarValue)],
-    table_schema: &crate::types::batch::Schema,
-) {
-    if cluster_key.is_empty() || eq_predicates.is_empty() {
-        return;
-    }
-    let key_col = match cluster_key.first() {
-        Some(k) => k,
-        None => return,
-    };
-    let col_idx = match table_schema.index_of(key_col) {
-        Some(idx) => idx,
-        None => return,
-    };
-    let value = match eq_predicates.iter().find(|(idx, _)| *idx == col_idx) {
-        Some((_, v)) => v.clone(),
-        None => return,
-    };
-
-    let fast_scan = FastScanEQ::new(col_idx, value);
-    let mut filtered = Vec::with_capacity(batches.len());
-    for batch in batches.drain(..) {
-        if let Some(result) = fast_scan.scan_batch_sorted(&batch, &[col_idx]) {
-            if result.num_rows() > 0 {
-                filtered.push(result);
-            }
-        }
-    }
-    *batches = filtered;
 }
 
 #[cfg(test)]

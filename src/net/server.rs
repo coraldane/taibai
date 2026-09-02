@@ -397,6 +397,5 @@ fn is_heavy_request(msg_type: u8) -> bool {
 }
 
 #[cfg(test)]
-#[allow(dead_code, unused_imports)]
 #[path = "server_test.rs"]
 mod tests;

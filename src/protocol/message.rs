@@ -108,8 +108,3 @@ pub fn write_len_prefixed_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);
 }
-
-pub fn write_len_prefixed_bytes(buf: &mut Vec<u8>, data: &[u8]) {
-    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    buf.extend_from_slice(data);
-}

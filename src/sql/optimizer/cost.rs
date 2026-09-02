@@ -31,29 +31,6 @@ impl CostEstimator {
         Self { stats }
     }
 
-    pub fn estimate_scan_cost(
-        &self,
-        filter: Option<&LogicalExpr>,
-        prunable_row_groups: usize,
-        total_row_groups: usize,
-        limit: Option<usize>,
-    ) -> f64 {
-        let selectivity = filter
-            .map(|expr| self.estimate_selectivity(expr))
-            .unwrap_or(1.0);
-        let prune_ratio = if total_row_groups == 0 {
-            1.0
-        } else {
-            (prunable_row_groups as f64 / total_row_groups as f64).clamp(0.0, 1.0)
-        };
-        let rows_after_pruning = self.stats.row_count.max(0) as f64 * (1.0 - prune_ratio);
-        let mut cost = rows_after_pruning * selectivity;
-        if let Some(limit) = limit {
-            cost = cost.min(limit as f64);
-        }
-        cost.max(0.0)
-    }
-
     pub fn estimate_rows(&self, filter: Option<&LogicalExpr>) -> u64 {
         let selectivity = filter
             .map(|expr| self.estimate_selectivity(expr))

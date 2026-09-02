@@ -1,5 +1,4 @@
 use crate::storage::index::bloomfilter::BloomFilter;
-use crate::storage::index::sparse_index::{SparseBlock, SparseBlockData, SparseIndexImpl};
 use crate::storage::segment::{RangeClause, RangeOp, RowGroupPredicate, ZoneMap};
 use crate::types::scalar::ScalarValue;
 
@@ -100,73 +99,6 @@ fn test_zone_map_overlaps() {
         &ScalarValue::Int32(Some(101)),
         &ScalarValue::Int32(Some(200))
     ));
-}
-
-#[test]
-fn test_sparse_index_basic() {
-    let index = SparseIndexImpl::new();
-    index.add_block(SparseBlock::new(0, 0, 300));
-
-    // Insert some values
-    index.insert(&ScalarValue::Int32(Some(1)), 0);
-    index.insert(&ScalarValue::Int32(Some(5)), 100);
-    index.insert(&ScalarValue::Int32(Some(10)), 200);
-
-    // Search for exact match
-    let found = index.search(&ScalarValue::Int32(Some(5)));
-    assert!(found.contains(&100));
-
-    // Search for non-existent value
-    let not_found = index.search(&ScalarValue::Int32(Some(999)));
-    assert!(not_found.is_empty());
-}
-
-#[test]
-fn test_sparse_index_range_search() {
-    let index = SparseIndexImpl::new();
-    index.add_block(SparseBlock::new(0, 0, 100));
-
-    for i in 0..100 {
-        index.insert(&ScalarValue::Int32(Some(i * 10)), i as i64);
-    }
-
-    // Range search [30, 70]
-    let found = index.range_search(&ScalarValue::Int32(Some(30)), &ScalarValue::Int32(Some(70)));
-
-    // Should contain values 30, 40, 50, 60, 70
-    assert!(found.contains(&3)); // value 30
-    assert!(found.contains(&4)); // value 40
-    assert!(found.contains(&5)); // value 50
-    assert!(found.contains(&6)); // value 60
-    assert!(found.contains(&7)); // value 70
-}
-
-#[test]
-fn test_sparse_index_rebuild() {
-    let index = SparseIndexImpl::new();
-
-    // Initial data
-    let blocks = vec![
-        SparseBlockData {
-            block_id: 0,
-            zone_map: None,
-            bloom_filter: None,
-            start_row_id: 0,
-            row_count: 1000,
-        },
-        SparseBlockData {
-            block_id: 1,
-            zone_map: None,
-            bloom_filter: None,
-            start_row_id: 1000,
-            row_count: 1000,
-        },
-    ];
-
-    index.rebuild_from_blocks(blocks);
-
-    assert_eq!(index.block_count(), 2);
-    assert_eq!(index.size(), 2000);
 }
 
 #[test]

@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn test_counter_sequence() {
-    let counter = AutoIncrementCounter::new("t", "id", 1);
+    let counter = AutoIncrementCounter::new("id", 1);
     assert_eq!(counter.next_value(), 1);
     assert_eq!(counter.next_value(), 2);
     assert_eq!(counter.next_value(), 3);
@@ -16,7 +16,7 @@ fn test_counter_sequence() {
 #[test]
 fn test_counter_thread_safety() {
     use std::thread;
-    let counter = Arc::new(AutoIncrementCounter::new("t", "id", 1));
+    let counter = Arc::new(AutoIncrementCounter::new("id", 1));
     let mut handles = vec![];
 
     for _ in 0..10 {

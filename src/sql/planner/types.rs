@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;

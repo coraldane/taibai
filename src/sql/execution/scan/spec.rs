@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
 use crate::sql::planner::{AggregateExpr, LogicalExpr, LogicalPlan, TimeRange};
 use crate::storage::catalog::schema::{SecondaryIndexType, TableMeta};
@@ -92,10 +90,6 @@ impl ScanSpec {
             || self.remaining_predicate.is_some()
     }
 
-    pub fn has_eq_predicate(&self) -> bool {
-        !self.eq_predicates.is_empty()
-    }
-
     pub fn all_predicate_columns(&self) -> Vec<usize> {
         let mut cols = Vec::new();
         for (idx, _) in &self.eq_predicates {
@@ -124,14 +118,6 @@ impl ScanSpec {
             .iter()
             .find(|(idx, _)| *idx == col_idx)
             .map(|(_, v)| v)
-    }
-
-    pub fn bloom_check_columns(&self) -> Vec<(usize, &ScalarValue)> {
-        self.eq_predicates
-            .iter()
-            .filter(|(idx, _)| self.bloom_index_columns.contains(idx))
-            .map(|(idx, v)| (*idx, v))
-            .collect()
     }
 
     pub fn to_row_group_predicate(&self) -> crate::storage::partition::pruning::RowGroupPredicate {

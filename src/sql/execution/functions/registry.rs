@@ -3,31 +3,10 @@
 use std::collections::HashMap;
 
 use crate::common::error::{Result, TaibaiError};
-use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
 /// Function handler signature.
 pub type FunctionHandler = fn(&[ScalarValue]) -> Result<ScalarValue>;
-
-/// Aggregate function accumulator trait.
-pub trait AggregateFunction: Send + Sync {
-    fn name(&self) -> &str;
-    fn new_accumulator(&self) -> Box<dyn Accumulator>;
-    fn return_type(&self, arg_types: &[DataType]) -> DataType;
-}
-
-/// Accumulator trait for aggregate functions.
-pub trait Accumulator: Send + Sync {
-    fn update(&mut self, value: &ScalarValue) -> Result<()>;
-    fn update_batch(&mut self, values: &[ScalarValue]) -> Result<()> {
-        for v in values {
-            self.update(v)?;
-        }
-        Ok(())
-    }
-    fn finalize(&self) -> Result<ScalarValue>;
-    fn reset(&mut self);
-}
 
 /// The global function registry.
 pub struct FunctionRegistry {

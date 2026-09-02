@@ -356,5 +356,5 @@ fn cache_clear_then_prepare_never_reuses_ids() {
     cache.clear();
     let next = cache.prepare("SELECT * FROM t WHERE id = ?").unwrap();
     assert_eq!(next.id, 2);
-    assert!(cache.is_empty() == false);
+    assert!(!cache.is_empty());
 }

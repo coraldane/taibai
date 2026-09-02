@@ -18,12 +18,6 @@ impl SelectionVector {
         Self { indices }
     }
 
-    pub fn all(len: usize) -> Self {
-        Self {
-            indices: (0..len as u32).collect(),
-        }
-    }
-
     pub fn indices(&self) -> &[u32] {
         &self.indices
     }

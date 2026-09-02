@@ -5,10 +5,6 @@ use super::Rule;
 pub struct LimitPushdownRule;
 
 impl Rule for LimitPushdownRule {
-    fn name(&self) -> &str {
-        "limit_pushdown"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         apply_limit_pushdown(plan)
     }

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::sql::execution::functions::registry::FunctionRegistry;

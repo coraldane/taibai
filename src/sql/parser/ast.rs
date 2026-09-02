@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 

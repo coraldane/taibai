@@ -1478,20 +1478,6 @@ fn arg_column_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     }
 }
 
-/// Build a single-row RecordBatch containing only `row` from `batch`.
-fn slice_batch_single_row(batch: &RecordBatch, row: usize) -> Option<RecordBatch> {
-    let ncols = batch.num_columns();
-    let mut cols = Vec::with_capacity(ncols);
-    for c in 0..ncols {
-        let col = batch.column(c)?;
-        let sv = col.scalar(row);
-        let mut new_col = ColumnArray::empty(col.data_type());
-        new_col.push(&sv).ok()?;
-        cols.push(new_col);
-    }
-    RecordBatch::try_new(batch.schema.clone(), cols).ok()
-}
-
 pub fn format_aggregate_name(agg: &AggregateExpr, schema: &Schema) -> String {
     let arg_name = match &*agg.arg {
         LogicalExpr::Wildcard => "*".to_string(),

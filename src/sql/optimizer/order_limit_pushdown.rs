@@ -6,10 +6,6 @@ use super::Rule;
 pub struct OrderLimitPushdownRule;
 
 impl Rule for OrderLimitPushdownRule {
-    fn name(&self) -> &str {
-        "order_limit_pushdown"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         push_order_limit_to_scan(plan)
     }
@@ -163,10 +159,6 @@ fn is_orderable_type(dt: crate::protocol::types::DataType) -> bool {
 pub struct TopNPushdownRule;
 
 impl Rule for TopNPushdownRule {
-    fn name(&self) -> &str {
-        "topn_pushdown"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         push_topn_to_scan(plan)
     }

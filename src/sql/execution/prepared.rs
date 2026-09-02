@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashMap;
 
 use crate::common::error::{Result, TaibaiError};
@@ -110,10 +109,6 @@ impl PreparedStatementCache {
 
     pub fn is_empty(&self) -> bool {
         self.statements.is_empty()
-    }
-
-    pub fn max_size(&self) -> usize {
-        self.max_size
     }
 
     pub fn next_id(&self) -> u32 {

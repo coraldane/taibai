@@ -14,43 +14,6 @@ fn entry(value: i64, row_id: u64) -> UniqueIndexEntry {
 }
 
 #[test]
-fn incremental_unique_index_merge_keeps_entries_sorted_and_aligned() -> Result<()> {
-    let mut data = UniqueIndexData {
-        db: "db".to_string(),
-        table: "ticks".to_string(),
-        index_name: "uk_value".to_string(),
-        columns: vec!["value".to_string()],
-        entries: vec![entry(2, 2), entry(4, 4)],
-        flush_epoch: None,
-        segment_watermarks: HashMap::new(),
-        tombstones: HashSet::new(),
-        encoded_keys: Vec::new(),
-        blocks: Vec::new(),
-    };
-    prepare_unique_index_data(&mut data)?;
-
-    merge_unique_index_entries(
-        &mut data,
-        vec![entry(5, 5), entry(1, 1), entry(4, 40), entry(3, 3)],
-    )?;
-
-    assert_eq!(data.entries.len(), 6);
-    assert!(data.encoded_keys.windows(2).all(|keys| keys[0] <= keys[1]));
-    for (encoded, entry) in data.encoded_keys.iter().zip(&data.entries) {
-        assert_eq!(*encoded, encode_unique_key(&entry.key)?);
-    }
-    assert_eq!(
-        data.entries
-            .iter()
-            .filter(|entry| entry.key == vec![ScalarValue::Int64(Some(4))])
-            .count(),
-        2
-    );
-    assert_eq!(data.blocks.len(), 1);
-    Ok(())
-}
-
-#[test]
 fn direct_location_lookup_skips_transient_locations() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let manager = IndexManager::new_with_data_dir(
@@ -778,39 +741,6 @@ fn stale_epoch_refresh_scans_only_new_segment_rows() -> Result<()> {
             segment_path: seg1,
             row_id: 1,
         }])
-    );
-    Ok(())
-}
-
-#[test]
-fn incremental_unique_index_merge_handles_many_batches() -> Result<()> {
-    let mut data = UniqueIndexData {
-        db: "db".to_string(),
-        table: "ticks".to_string(),
-        index_name: "uk_value".to_string(),
-        columns: vec!["value".to_string()],
-        entries: Vec::new(),
-        flush_epoch: None,
-        segment_watermarks: HashMap::new(),
-        tombstones: HashSet::new(),
-        encoded_keys: Vec::new(),
-        blocks: Vec::new(),
-    };
-
-    for batch in 0..100 {
-        let start = batch * 100;
-        let entries = (0..100)
-            .rev()
-            .map(|offset| entry((start + offset) as i64, (start + offset) as u64))
-            .collect();
-        merge_unique_index_entries(&mut data, entries)?;
-    }
-
-    assert_eq!(data.entries.len(), 10_000);
-    assert!(data.encoded_keys.windows(2).all(|keys| keys[0] <= keys[1]));
-    assert_eq!(
-        data.blocks.len(),
-        data.entries.len().div_ceil(UNIQUE_INDEX_BLOCK_SIZE)
     );
     Ok(())
 }

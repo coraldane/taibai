@@ -17,15 +17,6 @@ impl SegmentManager {
         self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
     }
 
-    pub fn bulk_insert_batch_deferred(
-        &self,
-        db: &str,
-        table: &str,
-        batch: RecordBatch,
-    ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, false)
-    }
-
     pub fn bulk_insert_batch_with_partition(
         &self,
         db: &str,
@@ -39,32 +30,6 @@ impl SegmentManager {
             partition_key,
             batch,
             true,
-        )
-    }
-
-    pub fn bulk_insert_batch_with_partition_ref(
-        &self,
-        db: &str,
-        table: &str,
-        partition_key: &str,
-        batch: &RecordBatch,
-    ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, true)
-    }
-
-    pub fn bulk_insert_batch_with_partition_deferred(
-        &self,
-        db: &str,
-        table: &str,
-        partition_key: &str,
-        batch: RecordBatch,
-    ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_owned_inner(
-            db,
-            table,
-            partition_key,
-            batch,
-            false,
         )
     }
 
@@ -129,6 +94,10 @@ impl SegmentManager {
         Ok(row_count)
     }
 
+    /// Test-only helper: flush one batch through the memtable path when
+    /// `should_write` returns true. Production writes go through the bulk
+    /// insert paths above; DDL tests use this to force deterministic flushes.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn flush_memtable_batch_if(
         &self,

@@ -1,7 +1,3 @@
-#![allow(dead_code)]
-use std::io::Cursor;
-
-use crate::storage::codec::scalar_tag::decode_scalar_with_tag;
 use crate::types::scalar::ScalarValue;
 
 #[derive(Debug, Clone)]
@@ -61,39 +57,6 @@ impl ZoneMap {
         !crate::storage::index::sort_key::scalar_lt(max, &self.min_value)
             && !crate::storage::index::sort_key::scalar_lt(&self.max_value, min)
     }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        crate::storage::codec::scalar_tag::encode_scalar_with_tag(&mut buf, &self.min_value);
-        crate::storage::codec::scalar_tag::encode_scalar_with_tag(&mut buf, &self.max_value);
-        buf.extend_from_slice(&self.null_count.to_le_bytes());
-        buf.extend_from_slice(&self.row_count.to_le_bytes());
-        buf
-    }
-
-    pub fn deserialize(data: &[u8]) -> Option<(Self, usize)> {
-        let mut cursor = Cursor::new(data);
-        let min_value = decode_scalar_with_tag(&mut cursor).ok()?;
-        let max_value = decode_scalar_with_tag(&mut cursor).ok()?;
-
-        let pos = cursor.position() as usize;
-        if data.len() < pos + 16 {
-            return None;
-        }
-
-        let null_count = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
-        let row_count = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().ok()?);
-
-        Some((
-            Self {
-                min_value,
-                max_value,
-                null_count,
-                row_count,
-            },
-            pos + 16,
-        ))
-    }
 }
 
 impl Default for ZoneMap {
@@ -130,19 +93,6 @@ pub struct ScanStats {
     pub bytes_read_compressed: u64,
 }
 
-impl ScanStats {
-    pub fn merge(&mut self, other: &ScanStats) {
-        self.segments_opened += other.segments_opened;
-        self.segments_pruned_by_cluster_key += other.segments_pruned_by_cluster_key;
-        self.row_groups_total += other.row_groups_total;
-        self.row_groups_read += other.row_groups_read;
-        self.row_groups_pruned += other.row_groups_pruned;
-        self.rows_scanned += other.rows_scanned;
-        self.rows_filtered_by_delete_bitmap += other.rows_filtered_by_delete_bitmap;
-        self.bytes_read_compressed += other.bytes_read_compressed;
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct RowGroupPredicate {
     pub clauses: Vec<RangeClause>,
@@ -158,10 +108,6 @@ pub enum PredicateMatch {
 impl RowGroupPredicate {
     pub fn new(clauses: Vec<RangeClause>) -> Self {
         Self { clauses }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.clauses.is_empty()
     }
 
     pub fn classify_row_group(&self, zone_maps: &[ZoneMap]) -> PredicateMatch {

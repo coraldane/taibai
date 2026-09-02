@@ -188,10 +188,8 @@ pub fn exec_drop_index(
         engine
             .index_manager()
             .remove_unique_index_snapshot(db, table, index_name);
-        engine.index_manager().mark_index_stale(db, table);
     } else {
         table_meta.drop_secondary_index(index_name)?;
-        engine.index_manager().mark_index_stale(db, table);
     }
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
@@ -419,7 +417,6 @@ pub fn exec_rebuild_unique_index(
             )));
         }
     }
-    engine.index_manager().mark_index_stale(db, table);
     Ok(ExecResult::Ok {
         rows_affected: rebuilt,
     })
@@ -588,7 +585,6 @@ pub fn exec_drop_table(
     drop(catalogs);
 
     engine.auto_increment_manager().unregister(db, name);
-    engine.index_manager().remove_index(db, name);
     let unique_index_names = table_meta
         .unique_indexes
         .iter()
@@ -771,7 +767,6 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
     engine
         .auto_increment_manager()
         .rename_table(db, name, new_name);
-    engine.index_manager().rename_index(db, name, new_name);
     let unique_index_names = catalog_before
         .get_table(name)
         .map(|meta| {
@@ -906,7 +901,6 @@ fn exec_partition_change(
                 "partition change cleared resident memtables and flushed active segments"
             );
             engine.hot_store_manager().remove(db, name);
-            engine.index_manager().mark_index_stale(db, name);
             let unique_index_names = before_meta
                 .unique_indexes
                 .iter()
@@ -1202,10 +1196,8 @@ pub fn exec_alter_table(
                     engine
                         .index_manager()
                         .remove_unique_index_snapshot(db, name, index_name);
-                    engine.index_manager().mark_index_stale(db, name);
                 } else {
                     table_meta.drop_secondary_index(index_name)?;
-                    engine.index_manager().mark_index_stale(db, name);
                 }
             }
             AlterOperation::RenameColumn { old_name, new_name } => {
@@ -1517,7 +1509,6 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             engine.batch_writer().clear_memtables(db, table);
             engine.segment_mgr().remove_table_state(db, table);
             engine.hot_store_manager().remove(db, table);
-            engine.index_manager().clear_index(db, table);
             let unique_index_names = before_meta
                 .unique_indexes
                 .iter()

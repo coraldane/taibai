@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 pub mod bulk_importer;
 pub mod client;
 pub mod handler;

@@ -71,23 +71,6 @@ pub(super) fn discover_max_partition_seq(
     max_seq
 }
 
-#[allow(dead_code)]
-pub(super) fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
-    schema
-        .columns
-        .iter()
-        .map(|col| {
-            let null = crate::storage::codec::scalar_tag::null_for_dtype(col.data_type);
-            ZoneMap {
-                min_value: null.clone(),
-                max_value: null,
-                null_count: 0,
-                row_count,
-            }
-        })
-        .collect()
-}
-
 pub(super) fn compute_zone_maps_from_batch(
     batch: &RecordBatch,
     start_row: usize,
@@ -344,46 +327,6 @@ fn direct_bulk_variable_range_at(
         "bulk column '{}' row {} not found",
         col.name, target_row
     )))
-}
-
-pub(super) fn sort_batch_by_key_indices(
-    batch: &RecordBatch,
-    key_indices: &[usize],
-) -> Result<RecordBatch> {
-    if batch.num_rows() <= 1 {
-        return Ok(batch.clone());
-    }
-
-    let mut rows: Vec<usize> = (0..batch.num_rows()).collect();
-    rows.sort_by(|left, right| {
-        for &col_idx in key_indices {
-            let left_value = batch.scalar(*left, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
-            });
-            let right_value = batch.scalar(*right, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
-            });
-            let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(
-                &left_value,
-                &right_value,
-            );
-            if cmp != std::cmp::Ordering::Equal {
-                return cmp;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
-
-    let mut sorted = RecordBatch::new(batch.schema.clone());
-    for row_idx in rows {
-        for col_idx in 0..batch.num_columns() {
-            let value = batch.scalar(row_idx, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
-            });
-            sorted.column_mut(col_idx).unwrap().push(&value)?;
-        }
-    }
-    Ok(sorted)
 }
 
 pub(super) fn filter_batch_by_mask(

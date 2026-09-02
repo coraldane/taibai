@@ -517,7 +517,6 @@ fn commit_append_group(
     }
 }
 
-#[allow(dead_code)] // still used by crash-recovery tests
 pub struct RecoveredTail {
     pub id: Uuid,
     pub partition_key: String,
@@ -854,7 +853,6 @@ fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf)>> {
     Ok(resolved)
 }
 
-#[allow(dead_code)] // still used by crash-recovery tests
 pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> {
     let mut recovered = Vec::new();
     for (id, path) in resolve_live_tail_paths(table_dir)? {
@@ -868,7 +866,7 @@ pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> 
     Ok(recovered)
 }
 
-/// Lazy counterpart of `recover`: current-format tails are indexed from frame
+/// Recover tail metadata: current-format tails are indexed from frame
 /// headers without decoding their payloads.
 pub fn recover_index(table_dir: &Path, _schema: &Schema) -> Result<Vec<RecoveredTailIndex>> {
     let mut recovered = Vec::new();
@@ -892,7 +890,6 @@ pub fn recover_index(table_dir: &Path, _schema: &Schema) -> Result<Vec<Recovered
 
 /// Newest live tail file for a memtable, applying the same clear/flush-intent
 /// arbitration as crash recovery. Used by the spill path.
-#[allow(dead_code)] // still used by spill/recovery tests
 pub fn live_tail_path(table_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     newest_live_tail_path(&table_dir.join(TAIL_DIR), id)
 }

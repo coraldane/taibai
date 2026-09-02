@@ -174,7 +174,6 @@ pub fn exec_drop_database(engine: &Engine, name: &str, if_exists: bool) -> Resul
         );
     }
     engine.auto_increment_manager().unregister_database(name);
-    engine.index_manager().remove_database_indexes(name);
     drop(catalogs);
 
     if let Some(tombstone) = tombstone {

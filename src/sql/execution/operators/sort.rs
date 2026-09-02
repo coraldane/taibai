@@ -252,21 +252,6 @@ fn evaluate_batch_sort_keys(
         .collect()
 }
 
-fn compare_key_values(
-    left: &[ScalarValue],
-    right: &[ScalarValue],
-    sort_exprs: &[(LogicalExpr, bool)],
-) -> std::cmp::Ordering {
-    for (idx, (_, desc)) in sort_exprs.iter().enumerate() {
-        let ordering = compare_scalars(&left[idx], &right[idx]);
-        let ordering = if *desc { ordering.reverse() } else { ordering };
-        if ordering != std::cmp::Ordering::Equal {
-            return ordering;
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
 struct SpillCursor {
     _spill: SpillFile,
     reader: SegmentReader,

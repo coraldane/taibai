@@ -8,13 +8,13 @@ fn test_no_nulls() {
         assert!(bm.is_valid(i));
     }
     assert_eq!(bm.null_count(), 0);
-    assert_eq!(bm.valid_count(), 100);
     assert!(bm.is_all_valid());
 }
 
 #[test]
-fn test_all_nulls() {
-    let bm = NullBitmap::new_all_null(100);
+fn test_all_nulls_via_bools() {
+    let flags = vec![true; 100];
+    let bm = NullBitmap::from_bools(&flags);
     for i in 0..100 {
         assert!(bm.is_null(i));
         assert!(!bm.is_valid(i));
@@ -32,8 +32,8 @@ fn test_mixed_nulls() {
     assert!(!bm.is_null(2));
     assert!(bm.is_null(4));
     assert_eq!(bm.null_count(), 4);
-    assert_eq!(bm.valid_count(), 4);
     assert!(!bm.is_all_valid());
+    assert_eq!(bm.len() - bm.null_count(), 4);
 }
 
 #[test]
@@ -42,8 +42,6 @@ fn test_set_clear() {
     assert!(!bm.is_null(5));
     bm.set_null(5);
     assert!(bm.is_null(5));
-    bm.set_valid(5);
-    assert!(!bm.is_null(5));
 }
 
 #[test]
@@ -88,4 +86,27 @@ fn test_extend_unaligned_uses_correct_word_boundaries() {
             );
         }
     }
+}
+
+#[test]
+fn test_push_valid_and_null() {
+    let mut bm = NullBitmap::with_capacity(4);
+    bm.push_valid();
+    bm.push_null();
+    bm.push_valid();
+    bm.push_null();
+    assert_eq!(bm.len(), 4);
+    assert!(!bm.is_null(0));
+    assert!(bm.is_null(1));
+    assert!(!bm.is_null(2));
+    assert!(bm.is_null(3));
+    assert_eq!(bm.null_count(), 2);
+}
+
+#[test]
+fn test_null_flag_bytes() {
+    let bm = NullBitmap::from_bools(&[false, true, false]);
+    assert_eq!(bm.null_flag_bytes(), vec![0u8, 1, 0]);
+    let all_valid = NullBitmap::new_valid(3);
+    assert_eq!(all_valid.null_flag_bytes(), vec![0u8, 0, 0]);
 }

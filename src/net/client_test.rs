@@ -1,5 +1,4 @@
 use super::*;
-use crate::protocol::message::write_len_prefixed_string;
 
 #[test]
 fn parses_binary_decimal_result() {
@@ -41,27 +40,4 @@ fn parses_binary_decimal_result() {
         batches[0].scalar(0, 1).unwrap(),
         ScalarValue::Decimal(Some(12345))
     );
-}
-
-fn write_column_meta(
-    buf: &mut Vec<u8>,
-    name: &str,
-    data_type: DataType,
-    scale: i32,
-    precision: i32,
-) {
-    write_len_prefixed_string(buf, name);
-    buf.push(data_type as u8);
-    buf.push(scale as u8);
-    buf.push(precision as u8);
-}
-
-fn write_varchar_cell(buf: &mut Vec<u8>, value: &str) {
-    buf.push(0);
-    write_len_prefixed_string(buf, value);
-}
-
-fn write_decimal_cell(buf: &mut Vec<u8>, value: &str) {
-    buf.push(0);
-    write_len_prefixed_string(buf, value);
 }

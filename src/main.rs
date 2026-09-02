@@ -1,10 +1,4 @@
-mod common;
-mod net;
-mod protocol;
-mod sql;
-mod storage;
-mod types;
-mod version;
+use taibai::{common, net, sql, storage, types, version};
 
 use std::sync::Arc;
 
@@ -184,15 +178,15 @@ where
         std::process::exit(1);
     }
 
-    let _ = crate::common::config::set_performance_baseline_config(
-        crate::common::config::PerformanceBaselineConfig::from(&config.performance),
+    let _ = common::config::set_performance_baseline_config(
+        common::config::PerformanceBaselineConfig::from(&config.performance),
     );
-    crate::common::config::set_insert_profile_enabled(config.log.insert_profile);
-    crate::common::config::set_storage_runtime_settings(
+    common::config::set_insert_profile_enabled(config.log.insert_profile);
+    common::config::set_storage_runtime_settings(
         config.compression.bulk_zstd_level,
         config.storage.reader_cache_capacity,
     );
-    crate::common::config::set_storage_timeouts(crate::common::config::StorageTimeouts {
+    common::config::set_storage_timeouts(common::config::StorageTimeouts {
         mutation_lock_timeout_ms: config.storage.mutation_lock_timeout_ms,
         mutation_lock_warn_ms: config.storage.mutation_lock_warn_ms,
         tail_commit_timeout_ms: config.storage.tail_commit_timeout_ms,
@@ -221,7 +215,7 @@ where
     let config = Arc::new(config);
     // Publish process-global query runtime limits for operators (aggregation,
     // streaming scans) to consult.
-    let _ = crate::common::config::set_query_limits(crate::common::config::QueryLimits {
+    let _ = common::config::set_query_limits(common::config::QueryLimits {
         query_memory_limit_mb: config.buffer.query_memory_limit_mb,
         max_result_message_bytes: config.server.max_message_size,
         max_aggregate_groups: config.buffer.max_aggregate_groups,
@@ -238,7 +232,7 @@ where
         .num_threads(config.buffer.execution_threads.max(1))
         .thread_name(|idx| format!("taibai-exec-{idx}"))
         .build_global();
-    crate::sql::execution::engine::start_close_of_day_scheduler(engine.clone());
+    sql::execution::engine::start_close_of_day_scheduler(engine.clone());
     tracing::info!("close-of-day scheduler started");
 
     let server = Server::new(config, engine.clone());

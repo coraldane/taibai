@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -322,10 +321,6 @@ impl AuthStore {
 
     pub fn get_user(&self, name: &str) -> Option<&UserInfo> {
         self.users.get(name)
-    }
-
-    pub fn get_role(&self, name: &str) -> Option<&RoleInfo> {
-        self.roles.get(name)
     }
 
     pub fn is_admin_user(&self, name: &str) -> bool {

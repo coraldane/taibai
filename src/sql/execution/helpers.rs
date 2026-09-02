@@ -1,26 +1,9 @@
-#![allow(dead_code)]
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{BinOp, Expr};
-
-pub fn eval_expr_to_int(expr: &Expr) -> Result<i64> {
-    match expr {
-        Expr::Literal(ScalarValue::Int64(Some(v))) => Ok(*v),
-        Expr::Literal(ScalarValue::Int32(Some(v))) => Ok(*v as i64),
-        Expr::Literal(ScalarValue::UInt64(Some(v))) => Ok(*v as i64),
-        Expr::Literal(ScalarValue::UInt32(Some(v))) => Ok(*v as i64),
-        Expr::Literal(v) => Err(TaibaiError::Sql(format!(
-            "expected integer literal for OFFSET/LIMIT, got {:?}",
-            v
-        ))),
-        _ => Err(TaibaiError::Sql(
-            "OFFSET/LIMIT requires a constant integer expression".into(),
-        )),
-    }
-}
 
 pub fn eval_where_clause_batch(
     expr: &Expr,
@@ -646,14 +629,6 @@ pub fn eval_expr_to_scalar(expr: &Expr, dt: &DataType) -> Result<ScalarValue> {
     eval_expr_to_scalar_with_scale_timezone(expr, dt, 0, 0)
 }
 
-pub fn eval_expr_to_scalar_with_timezone(
-    expr: &Expr,
-    dt: &DataType,
-    timezone_offset_hours: i32,
-) -> Result<ScalarValue> {
-    eval_expr_to_scalar_with_scale_timezone(expr, dt, 0, timezone_offset_hours)
-}
-
 pub fn eval_expr_to_scalar_with_scale_timezone(
     expr: &Expr,
     dt: &DataType,
@@ -865,62 +840,6 @@ pub fn sort_batch_by_key(
         .map(|column| column.take(&rows))
         .collect();
     RecordBatch::try_new(batch.schema.clone(), columns)
-}
-
-pub fn apply_row_group_predicate(
-    batch: &RecordBatch,
-    pred: &crate::storage::segment::RowGroupPredicate,
-) -> Vec<RecordBatch> {
-    let num_rows = batch.num_rows();
-    if num_rows == 0 || pred.is_empty() {
-        return vec![batch.clone()];
-    }
-    let mut matched = RecordBatch::new(batch.schema.clone());
-    for row_idx in 0..num_rows {
-        let mut passes = true;
-        for clause in &pred.clauses {
-            let val =
-                batch
-                    .scalar(row_idx, clause.column_index)
-                    .unwrap_or(ScalarValue::null_for_type(
-                        batch.schema.columns[clause.column_index].data_type,
-                    ));
-            if !eval_range_clause(&val, clause) {
-                passes = false;
-                break;
-            }
-        }
-        if passes {
-            for col_idx in 0..batch.num_columns() {
-                let val = batch
-                    .scalar(row_idx, col_idx)
-                    .unwrap_or(ScalarValue::null_for_type(
-                        batch.schema.columns[col_idx].data_type,
-                    ));
-                let _ = matched.column_mut(col_idx).unwrap().push(&val);
-            }
-        }
-    }
-    if matched.num_rows() > 0 {
-        vec![matched]
-    } else {
-        vec![]
-    }
-}
-
-fn eval_range_clause(val: &ScalarValue, clause: &crate::storage::segment::RangeClause) -> bool {
-    use crate::storage::segment::RangeOp;
-    match clause.op {
-        RangeOp::Eq => val == &clause.value,
-        RangeOp::Lt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Less),
-        RangeOp::Le => {
-            compare_scalars(val, &clause.value).is_some_and(|o| o != std::cmp::Ordering::Greater)
-        }
-        RangeOp::Gt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Greater),
-        RangeOp::Ge => {
-            compare_scalars(val, &clause.value).is_some_and(|o| o != std::cmp::Ordering::Less)
-        }
-    }
 }
 
 pub fn build_row_group_predicate(

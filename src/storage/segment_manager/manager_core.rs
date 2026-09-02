@@ -67,10 +67,6 @@ impl SegmentManager {
         })
     }
 
-    pub fn set_config(&mut self, config: SegmentConfig) {
-        self.config = config;
-    }
-
     fn min_segment_seal_size(&self) -> u64 {
         self.config.min_segment_size
     }
@@ -122,10 +118,6 @@ impl SegmentManager {
     pub fn resume_flush(&self) {
         self.flush_paused.store(false, Ordering::Release);
         tracing::info!("flush thread resumed");
-    }
-
-    pub fn is_flush_paused(&self) -> bool {
-        self.flush_paused.load(Ordering::Acquire)
     }
 
     pub fn alloc_txn_id(&self) -> u64 {
@@ -783,15 +775,6 @@ impl SegmentManager {
         let state = self.tables.read().unwrap().get(&key).cloned();
         if let Some(state) = state {
             state.active_segments.lock().unwrap().clear();
-        }
-    }
-
-    pub fn rename_table_state(&self, db: &str, old_name: &str, new_name: &str) {
-        let old_key = table_key(db, old_name);
-        let new_key = table_key(db, new_name);
-        let mut tables = self.tables.write().unwrap();
-        if let Some(state) = tables.remove(&old_key) {
-            tables.insert(new_key, state);
         }
     }
 

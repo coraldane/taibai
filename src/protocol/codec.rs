@@ -57,10 +57,7 @@ impl Decoder for MessageCodec {
             let raw = src.split_to(payload_len);
             let is_prepared = matches!(
                 header.msg_type,
-                MSG_TYPE_PREPARE
-                    | MSG_TYPE_EXECUTE
-                    | MSG_TYPE_CLOSE_STMT
-                    | MSG_TYPE_BATCH_EXECUTE
+                MSG_TYPE_PREPARE | MSG_TYPE_EXECUTE | MSG_TYPE_CLOSE_STMT | MSG_TYPE_BATCH_EXECUTE
             );
             if !is_prepared && raw.len() >= 8 && raw[0] == 0x78 {
                 match crate::protocol::compress::zlib_decompress_complete(&raw) {

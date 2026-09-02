@@ -81,11 +81,6 @@ impl ColumnDef {
         self.default_value = default_value;
         self
     }
-
-    pub fn with_column_id(mut self, column_id: u32) -> Self {
-        self.column_id = column_id;
-        self
-    }
 }
 
 fn column_matches_name_or_alias(column: &ColumnDef, name: &str) -> bool {
@@ -140,11 +135,6 @@ impl Schema {
     /// Returns an iterator over column names.
     pub fn column_names(&self) -> impl Iterator<Item = &str> {
         self.columns.iter().map(|c| c.name.as_str())
-    }
-
-    /// Returns an iterator over data types.
-    pub fn data_types(&self) -> impl Iterator<Item = DataType> + '_ {
-        self.columns.iter().map(|c| c.data_type)
     }
 }
 

@@ -31,7 +31,7 @@ fn test_prepare_response_is_not_compressed() {
     let mut payload = Vec::new();
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(&4096u32.to_le_bytes());
-    payload.extend(std::iter::repeat(7u8).take(4096));
+    payload.extend(std::iter::repeat_n(7u8, 4096));
     let msg = Message::new(MSG_TYPE_PREPARE, Bytes::from(payload.clone()));
     let mut buf = BytesMut::new();
     codec.encode(msg, &mut buf).unwrap();

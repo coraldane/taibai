@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,17 +17,8 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-#[allow(dead_code)]
 pub struct BulkImportConfig;
 
-#[allow(dead_code)]
-pub struct PipelineStats {
-    pub sent: i64,
-    pub completed: i64,
-    pub errors: i64,
-}
-
-#[allow(dead_code)]
 pub struct Client {
     framed: Framed<tokio::net::TcpStream, MessageCodec>,
     session_id: Option<String>,
@@ -448,14 +438,6 @@ impl Client {
         self.send(Message::empty(MSG_TYPE_PING)).await?;
         self.recv().await?;
         Ok(())
-    }
-
-    pub fn get_pipeline_stats(&self) -> PipelineStats {
-        PipelineStats {
-            sent: self.pending_count.load(Ordering::Relaxed),
-            completed: self.response_handled.load(Ordering::Relaxed),
-            errors: 0,
-        }
     }
 
     pub async fn drain_pipeline(&mut self) -> Result<()> {

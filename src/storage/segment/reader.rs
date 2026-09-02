@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use std::fs;
@@ -23,7 +22,6 @@ use super::RowGroupMeta;
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 struct SegmentFooter {
-    version: u32,
     row_count: u64,
     row_groups: Vec<RowGroupMeta>,
     schema: Schema,
@@ -35,7 +33,6 @@ struct SegmentFooter {
 impl From<ParsedSegmentFooter> for SegmentFooter {
     fn from(f: ParsedSegmentFooter) -> Self {
         Self {
-            version: f.version,
             row_count: f.row_count,
             row_groups: f.row_groups,
             schema: f.schema,
@@ -250,10 +247,6 @@ impl SegmentReader {
         file.flush()?;
         file.sync_all()?;
         Ok(())
-    }
-
-    fn read_footer_bytes(path: &Path) -> Result<Vec<u8>> {
-        Ok(Self::read_footer_source(path, None)?.footer)
     }
 
     fn read_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {

@@ -57,7 +57,6 @@ pub struct QueryLimits {
     /// Soft per-query memory ceiling in MB. Query operators and final result
     /// materialization enforce this limit to abort oversized queries before
     /// they can exhaust process memory.
-    #[allow(dead_code)]
     pub query_memory_limit_mb: u64,
     pub max_result_message_bytes: usize,
     pub max_aggregate_groups: usize,

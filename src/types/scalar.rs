@@ -3,7 +3,6 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -211,100 +210,6 @@ impl ScalarValue {
             DataType::VarChar => ScalarValue::VarChar(None),
             DataType::Blob => ScalarValue::Blob(None),
             DataType::Vector => ScalarValue::Vector(None),
-        }
-    }
-
-    /// Parse a string value into a ScalarValue for the given DataType.
-    pub fn parse_from_str(s: &str, dt: DataType) -> Result<Self> {
-        if s.is_empty() {
-            return Ok(Self::null_for_type(dt));
-        }
-        match dt {
-            DataType::Bool => {
-                Ok(ScalarValue::Bool(Some(s.parse::<bool>().map_err(|e| {
-                    TaibaiError::Sql(format!("invalid bool '{}': {}", s, e))
-                })?)))
-            }
-            DataType::Int8 => {
-                Ok(ScalarValue::Int8(Some(s.parse::<i8>().map_err(|e| {
-                    TaibaiError::Sql(format!("invalid int8 '{}': {}", s, e))
-                })?)))
-            }
-            DataType::Int16 => {
-                Ok(ScalarValue::Int16(Some(s.parse::<i16>().map_err(|e| {
-                    TaibaiError::Sql(format!("invalid int16 '{}': {}", s, e))
-                })?)))
-            }
-            DataType::Int32 => {
-                Ok(ScalarValue::Int32(Some(s.parse::<i32>().map_err(|e| {
-                    TaibaiError::Sql(format!("invalid int32 '{}': {}", s, e))
-                })?)))
-            }
-            DataType::Int64 => {
-                Ok(ScalarValue::Int64(Some(s.parse::<i64>().map_err(|e| {
-                    TaibaiError::Sql(format!("invalid int64 '{}': {}", s, e))
-                })?)))
-            }
-            DataType::UInt8 => {
-                Ok(ScalarValue::UInt8(Some(s.parse::<u8>().map_err(|e| {
-                    TaibaiError::Sql(format!("invalid uint8 '{}': {}", s, e))
-                })?)))
-            }
-            DataType::UInt16 => Ok(ScalarValue::UInt16(Some(
-                s.parse::<u16>()
-                    .map_err(|e| TaibaiError::Sql(format!("invalid uint16 '{}': {}", s, e)))?,
-            ))),
-            DataType::UInt32 => Ok(ScalarValue::UInt32(Some(
-                s.parse::<u32>()
-                    .map_err(|e| TaibaiError::Sql(format!("invalid uint32 '{}': {}", s, e)))?,
-            ))),
-            DataType::UInt64 => Ok(ScalarValue::UInt64(Some(
-                s.parse::<u64>()
-                    .map_err(|e| TaibaiError::Sql(format!("invalid uint64 '{}': {}", s, e)))?,
-            ))),
-            DataType::Float32 => Ok(ScalarValue::Float32(Some(
-                s.parse::<f32>()
-                    .map_err(|e| TaibaiError::Sql(format!("invalid float32 '{}': {}", s, e)))?,
-            ))),
-            DataType::Float64 => Ok(ScalarValue::Float64(Some(
-                s.parse::<f64>()
-                    .map_err(|e| TaibaiError::Sql(format!("invalid float64 '{}': {}", s, e)))?,
-            ))),
-            DataType::Decimal => Ok(ScalarValue::Decimal(Some(
-                s.parse::<i64>()
-                    .map_err(|e| TaibaiError::Sql(format!("invalid decimal '{}': {}", s, e)))?,
-            ))),
-            DataType::Date => {
-                Ok(ScalarValue::Date(Some(s.parse::<i32>().map_err(|e| {
-                    TaibaiError::Sql(format!("invalid date '{}': {}", s, e))
-                })?)))
-            }
-            DataType::VarChar => Ok(ScalarValue::VarChar(Some(s.to_string()))),
-            DataType::Timestamp => Ok(ScalarValue::Timestamp(Some(
-                s.parse::<i64>()
-                    .map_err(|e| TaibaiError::Sql(format!("invalid timestamp '{}': {}", s, e)))?,
-            ))),
-            DataType::Time => {
-                Ok(ScalarValue::Time(Some(s.parse::<i64>().map_err(|e| {
-                    TaibaiError::Sql(format!("invalid time '{}': {}", s, e))
-                })?)))
-            }
-            DataType::Interval => Ok(ScalarValue::Interval(Some(
-                s.parse::<i64>()
-                    .map_err(|e| TaibaiError::Sql(format!("invalid interval '{}': {}", s, e)))?,
-            ))),
-            DataType::Blob => Ok(ScalarValue::Blob(Some(s.as_bytes().to_vec()))),
-            DataType::Vector => {
-                let floats: Result<Vec<f32>> = s
-                    .split(',')
-                    .map(|p| {
-                        p.trim().parse::<f32>().map_err(|e| {
-                            TaibaiError::Sql(format!("invalid vector element '{}': {}", p, e))
-                        })
-                    })
-                    .collect();
-                Ok(ScalarValue::Vector(Some(floats?)))
-            }
         }
     }
 }

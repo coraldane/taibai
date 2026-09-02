@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -330,12 +329,6 @@ impl TableMeta {
             return None;
         }
         Some(self.partition_key_idx as usize)
-    }
-
-    pub fn data_path(&self, base_dir: &str) -> PathBuf {
-        PathBuf::from(base_dir)
-            .join(&self.database)
-            .join(&self.name)
     }
 
     pub fn partition_strategy(

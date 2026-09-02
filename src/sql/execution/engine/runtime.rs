@@ -367,20 +367,6 @@ impl Engine {
         Ok(0)
     }
 
-    /// Close-of-day archival (design 鎼?.2): flush every live memtable, seal all
-    /// active segments (and clear WALs), then evict every resident hot store and
-    /// drop Archived memtables. After this the day's data is fully handed off to
-    /// the history layer; the next trading day starts with empty resident state.
-    /// Intended to be triggered by an external scheduler at market close.
-    pub fn close_of_day_flush(&self) -> Result<()> {
-        tracing::info!("close-of-day: flushing all resident data to history");
-        self.flush_all_buffers()?;
-        self.hot_store_mgr.evict_all();
-        self.batch_writer.memtable_manager().remove_all_archived();
-        tracing::info!("close-of-day: complete, resident state evicted");
-        Ok(())
-    }
-
     pub fn close_of_day_flush_table(&self, db: &str, table: &str) -> Result<()> {
         tracing::info!(
             db,
@@ -448,7 +434,6 @@ impl Engine {
             stats = compactor.optimize_table(db, table, &table_meta)?;
         }
         if stats.segments_written > 0 || stats.rows_dropped > 0 {
-            self.index_manager.mark_index_stale(db, table);
             let schema = Schema::new(table_meta.columns.clone());
             let rebuilt = self.segment_mgr.with_table_mutation_lock(db, table, || {
                 super::dml_insert::rebuild_table_location_indexes(

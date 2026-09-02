@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::common::error::{Result, TaibaiError};
 
 /// SQL token types.
@@ -50,7 +49,6 @@ pub enum Token {
     Partition,
     Hot,
     Keep,
-    ByKW,
     Update,
     Set,
     Delete,
@@ -191,7 +189,6 @@ impl std::fmt::Display for Token {
             Token::Partition => write!(f, "PARTITION"),
             Token::Hot => write!(f, "HOT"),
             Token::Keep => write!(f, "KEEP"),
-            Token::ByKW => write!(f, "BY"),
             Token::Update => write!(f, "UPDATE"),
             Token::Set => write!(f, "SET"),
             Token::Delete => write!(f, "DELETE"),

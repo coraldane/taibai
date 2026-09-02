@@ -196,30 +196,6 @@ pub fn instr(args: &[ScalarValue]) -> Result<ScalarValue> {
     }
 }
 
-pub fn locate(args: &[ScalarValue]) -> Result<ScalarValue> {
-    // LOCATE(substr, str) or LOCATE(substr, str, pos)
-    let substr = args_to_string(args, 0);
-    let s = args_to_string(args, 1);
-    let start_pos = args_to_i64(args, 2).unwrap_or(1);
-    match (substr, s) {
-        (Some(sub), Some(s)) => {
-            let start = if start_pos > 0 {
-                (start_pos - 1) as usize
-            } else {
-                0
-            };
-            if start >= s.len() {
-                return Ok(ScalarValue::Int64(Some(0)));
-            }
-            match s[start..].find(&sub) {
-                Some(idx) => Ok(ScalarValue::Int64(Some((start + idx + 1) as i64))),
-                None => Ok(ScalarValue::Int64(Some(0))),
-            }
-        }
-        _ => Ok(ScalarValue::Int64(None)),
-    }
-}
-
 pub fn repeat(args: &[ScalarValue]) -> Result<ScalarValue> {
     let s = args_to_string(args, 0);
     let n = args_to_i64(args, 1);

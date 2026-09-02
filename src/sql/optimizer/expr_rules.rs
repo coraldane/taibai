@@ -15,10 +15,6 @@ use crate::sql::planner::LogicalPlan;
 pub struct ExpressionSimplificationRule;
 
 impl Rule for ExpressionSimplificationRule {
-    fn name(&self) -> &str {
-        "expression_simplification"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         simplify_plan(plan)
     }

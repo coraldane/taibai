@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 /// Join Hash Table implementation inspired by DuckDB's columnar JoinHashTable.
 /// Uses a two-phase approach: Build (insert keys) -> Probe (lookup matches).
 /// Stores data in columnar format using RecordBatch for cache efficiency.
@@ -230,11 +229,6 @@ impl JoinHashTable {
     /// Number of rows in the hash table.
     pub fn row_count(&self) -> usize {
         self.total_rows
-    }
-
-    /// Number of unique keys.
-    pub fn key_count(&self) -> usize {
-        self.table.len()
     }
 
     pub fn unique_key_values(&self) -> Vec<Vec<ScalarValue>> {

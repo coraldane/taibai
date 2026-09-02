@@ -5,7 +5,6 @@ use tempfile::TempDir;
 use tokio::io::DuplexStream;
 use tokio::task::JoinHandle;
 
-use crate::net::session::Session;
 use crate::protocol::message::{
     write_len_prefixed_string, Message, MAX_MESSAGE_SIZE, MSG_TYPE_AUTH_OK, MSG_TYPE_LOGIN,
     MSG_TYPE_PING, MSG_TYPE_PONG, MSG_TYPE_QUERY,

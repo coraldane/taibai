@@ -93,7 +93,7 @@ fn lookup_unknown_value_returns_none() {
         )
         .is_none());
     assert_eq!(
-        store.count_by_key(&ScalarValue::VarChar(Some("zzz".into()))),
+        store.count_by_key_partition_from(&ScalarValue::VarChar(Some("zzz".into())), None, 0),
         None
     );
 }
@@ -129,7 +129,7 @@ fn incremental_index_across_appends() {
     assert_eq!(store.row_count(), 4);
     assert_eq!(store.distinct_key_count(), 2);
     assert_eq!(
-        store.count_by_key(&ScalarValue::VarChar(Some("A".into()))),
+        store.count_by_key_partition_from(&ScalarValue::VarChar(Some("A".into())), None, 0),
         Some(3)
     );
     let a = store
@@ -242,7 +242,7 @@ fn lookup_uses_key_partition_index_and_reverse_offsets() {
     // The persisted-prefix watermark is resolved by binary search over sorted
     // append offsets rather than scanning the entire key posting list.
     assert_eq!(
-        store.count_by_key_from(&ScalarValue::VarChar(Some("A".to_string())), 2),
+        store.count_by_key_partition_from(&ScalarValue::VarChar(Some("A".to_string())), None, 2),
         Some(1)
     );
 }
@@ -271,7 +271,10 @@ fn integer_key_point_lookup() {
     mgr.try_append("main", "kv", &meta, &batch).unwrap();
 
     let store = mgr.get("main", "kv").unwrap();
-    assert_eq!(store.count_by_key(&ScalarValue::Int64(Some(10))), Some(2));
+    assert_eq!(
+        store.count_by_key_partition_from(&ScalarValue::Int64(Some(10)), None, 0),
+        Some(2)
+    );
     let r = store
         .lookup(&ScalarValue::Int64(Some(10)), None, None, 0, false)
         .unwrap();

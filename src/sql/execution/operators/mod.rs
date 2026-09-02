@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod aggregate;
 pub mod filter;
 pub mod join;
@@ -9,7 +8,6 @@ pub mod project;
 pub mod scan;
 pub mod semi_join;
 pub mod sort;
-pub mod window;
 
 use std::collections::HashMap;
 

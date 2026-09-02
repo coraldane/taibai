@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 mod active_writer;
 mod cluster_meta_cache;
 mod config;

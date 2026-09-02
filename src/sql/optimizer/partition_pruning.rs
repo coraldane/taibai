@@ -8,10 +8,6 @@ use super::Rule;
 pub struct PartitionPruningRule;
 
 impl Rule for PartitionPruningRule {
-    fn name(&self) -> &str {
-        "partition_pruning"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         apply_partition_pruning(plan)
     }

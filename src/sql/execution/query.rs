@@ -104,16 +104,6 @@ pub fn exec_select_with_txn(
     exec_select_inner(engine, db, stmt, None, None, reader_txn_id, None)
 }
 
-#[allow(dead_code)]
-pub fn exec_select_with_plan(
-    engine: &Engine,
-    db: &str,
-    stmt: &Statement,
-    cached_plan: LogicalPlan,
-) -> Result<ExecResult> {
-    exec_select_with_plan_and_txn(engine, db, stmt, cached_plan, 0)
-}
-
 pub fn exec_select_with_plan_and_txn(
     engine: &Engine,
     db: &str,
@@ -130,16 +120,6 @@ pub fn exec_select_with_plan_and_txn(
         reader_txn_id,
         None,
     )
-}
-
-#[allow(dead_code)]
-pub fn exec_select_with_stats(
-    engine: &Engine,
-    db: &str,
-    stmt: &Statement,
-    stats: &mut HashMap<String, ScanStats>,
-) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, Some(stats), None, 0, None)
 }
 
 pub(crate) fn exec_select_with_profile(
