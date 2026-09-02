@@ -63,6 +63,13 @@ impl<'a> ScanExecutor<'a> {
     }
 
     pub fn execute(&mut self) -> Result<Vec<RecordBatch>> {
+        let segment_mgr = self.runtime.segment_mgr().clone();
+        let db = self.db.to_string();
+        let table = self.spec.table_name.clone();
+        segment_mgr.with_table_flush_read_lock(&db, &table, || self.execute_unlocked())
+    }
+
+    fn execute_unlocked(&mut self) -> Result<Vec<RecordBatch>> {
         if let Some(aggs) = self.spec.simple_metadata_aggregates.clone() {
             return self.execute_simple_metadata_aggregate(&aggs);
         }

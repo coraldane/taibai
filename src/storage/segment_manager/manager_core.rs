@@ -1,3 +1,22 @@
+static FLUSH_TRANSITION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+impl SegmentManager {
+    pub fn set_flush_transition_delay_for_tests(&self, ms: u64) {
+        FLUSH_TRANSITION_DELAY_MS.store(ms, Ordering::Release);
+    }
+
+    pub(crate) fn flush_transition_delay() -> u64 {
+        FLUSH_TRANSITION_DELAY_MS.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn sleep_flush_transition_delay() {
+        let ms = Self::flush_transition_delay();
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+}
+
 impl SegmentManager {
     pub fn new(data_dir: &Path) -> Result<Self> {
         Self::with_config(data_dir, SegmentConfig::default())
@@ -186,6 +205,37 @@ impl SegmentManager {
             }
         }
         epochs.insert(key, next);
+    }
+
+    /// Run `f` while holding the table's flush-visibility read lock. Scan and
+    /// count paths use this so a concurrent memtable flush cannot expose the
+    /// same rows via both a segment and the still-readable memtable.
+    pub fn with_table_flush_read_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _guard = state.flush_visibility.read().unwrap();
+        f()
+    }
+
+    /// Run `f` while holding the table's flush-visibility write lock. The
+    /// memtable flush transition (rows become segment-visible, then the
+    /// memtable is retired) runs under this so readers observe either the
+    /// memtable or the segment, never both.
+    pub(crate) fn with_flush_transition<T>(
+        &self,
+        db: &str,
+        table: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _guard = state.flush_visibility.write().unwrap();
+        f()
     }
 
     fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {

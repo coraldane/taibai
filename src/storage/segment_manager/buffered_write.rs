@@ -233,7 +233,9 @@ impl SegmentManager {
 
         let table_dir = self.data_dir.join(db).join(table);
         std::fs::create_dir_all(&table_dir)?;
+        let _visibility = state.flush_visibility.write().unwrap();
         self.append_batch_with_partition_locked(&table_dir, state, partition_key, batch, true)?;
+        Self::sleep_flush_transition_delay();
         on_written();
         Ok(true)
     }

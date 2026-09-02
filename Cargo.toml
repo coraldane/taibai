@@ -10,7 +10,7 @@ members = [
 
 [package]
 name = "taibai"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 autotests = false
 description = "An experimental Rust columnar database server for analytical workloads"
@@ -133,6 +133,10 @@ path = "tests/hot_store_fast_path_test.rs"
 [[test]]
 name = "aggregate_streaming_test"
 path = "tests/aggregate_streaming_test.rs"
+
+[[test]]
+name = "aggregate_regression_test"
+path = "tests/aggregate_regression_test.rs"
 
 [[test]]
 name = "analyze_statistics_test"

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use crate::storage::segment_manager::active_writer::ActiveSegmentWriter;
 
@@ -9,6 +9,7 @@ pub(super) struct TableSegmentState {
     pub(super) partition_seq: Mutex<HashMap<String, u32>>,
     pub(super) active_segments: Mutex<HashMap<String, ActiveSegmentWriter>>,
     pub(super) mutation_lock: Mutex<()>,
+    pub(super) flush_visibility: RwLock<()>,
     pub(super) retired: AtomicBool,
 }
 
@@ -26,6 +27,7 @@ impl TableSegmentState {
             partition_seq: Mutex::new(partition_seq),
             active_segments: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
+            flush_visibility: RwLock::new(()),
             retired: AtomicBool::new(false),
         }
     }

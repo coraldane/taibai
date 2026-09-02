@@ -168,7 +168,11 @@ impl Accumulator {
             Accumulator::Count { count, col } => match *col {
                 CountKind::Star => *count += batch.num_rows() as u64,
                 CountKind::Column(c) => {
-                    if let Some(col_arr) = batch.column(c) {
+                    // `col_idx_opt` carries the batch-remapped column index;
+                    // the stored index is logical and may be stale after
+                    // projection pushdown.
+                    let column = col_idx_opt.unwrap_or(c);
+                    if let Some(col_arr) = batch.column(column) {
                         *count += col_arr.col_count_non_null();
                     }
                 }
@@ -310,6 +314,7 @@ impl Accumulator {
             Accumulator::Count { count, col } => match *col {
                 CountKind::Star => *count += 1,
                 CountKind::Column(column) => {
+                    let column = col_idx_opt.unwrap_or(column);
                     if batch
                         .column(column)
                         .is_some_and(|col| !col.bitmap().is_null(row))
@@ -778,7 +783,13 @@ impl ExecutionOp for HashAggregateExec {
                 .expect("spill merge initialized")
                 .next_batch();
         }
-        let result = self.finalize_grouped(&group_keys, &groups, &aggregates, &physical_schema)?;
+        let result = self.finalize_grouped(
+            &group_by,
+            &group_keys,
+            &groups,
+            &aggregates,
+            &physical_schema,
+        )?;
         Ok(Some(result))
     }
 }
@@ -793,9 +804,7 @@ impl HashAggregateExec {
     ) -> Result<RecordBatch> {
         let mut col_defs = Vec::new();
         for agg in aggregates {
-            let name = format_aggregate_name(agg, physical_schema);
-            let dt = aggregate_result_type(agg, physical_schema);
-            col_defs.push(ColumnDef::new(&name, dt));
+            col_defs.push(aggregate_result_column_def(agg, physical_schema));
         }
         let schema = Schema::new(col_defs);
         let mut result_batch = RecordBatch::new(schema);
@@ -823,20 +832,20 @@ impl HashAggregateExec {
 
     fn finalize_grouped(
         &self,
+        group_by: &[LogicalExpr],
         group_keys: &[(Vec<u8>, Vec<ScalarValue>)],
         groups: &HashMap<Vec<u8>, Vec<Accumulator>>,
         aggregates: &[AggregateExpr],
         physical_schema: &Schema,
     ) -> Result<RecordBatch> {
         let mut col_defs = Vec::new();
-        let ngb = self.group_by.len();
+        let ngb = group_by.len();
         // group-by output columns keep their original physical types
-        for (i, _) in self.group_by.iter().enumerate() {
+        for (i, _) in group_by.iter().enumerate() {
             // Recover the type from the first representative scalar instead of
             // relying on physical_schema (the remapped logical indices already
             // match physical_schema here, so both are fine).
-            let dt = self
-                .group_by
+            let dt = group_by
                 .get(i)
                 .and_then(|e| match e {
                     LogicalExpr::Column(idx) => physical_schema.columns.get(*idx),
@@ -844,8 +853,7 @@ impl HashAggregateExec {
                 })
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::VarChar);
-            let name = self
-                .group_by
+            let name = group_by
                 .get(i)
                 .and_then(|e| match e {
                     LogicalExpr::Column(idx) => physical_schema.columns.get(*idx),
@@ -853,12 +861,17 @@ impl HashAggregateExec {
                 })
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| format!("col_{}", i));
-            col_defs.push(ColumnDef::new(&name, dt));
+            let mut def = ColumnDef::new(&name, dt);
+            if let LogicalExpr::Column(idx) = &group_by[i] {
+                if let Some(source) = physical_schema.columns.get(*idx) {
+                    def.scale = source.scale;
+                    def.precision = source.precision;
+                }
+            }
+            col_defs.push(def);
         }
         for agg in aggregates {
-            let name = format_aggregate_name(agg, physical_schema);
-            let dt = aggregate_result_type(agg, physical_schema);
-            col_defs.push(ColumnDef::new(&name, dt));
+            col_defs.push(aggregate_result_column_def(agg, physical_schema));
         }
         let schema = Schema::new(col_defs);
         let mut result_batch = RecordBatch::new(schema);
@@ -936,10 +949,7 @@ fn grouped_output_schema(
         }
     }
     for aggregate in aggregates {
-        columns.push(ColumnDef::new(
-            &format_aggregate_name(aggregate, physical_schema),
-            aggregate_result_type(aggregate, physical_schema),
-        ));
+        columns.push(aggregate_result_column_def(aggregate, physical_schema));
     }
     Schema::new(columns)
 }
@@ -1521,6 +1531,23 @@ fn null_scalar_of_type(dt: DataType) -> ScalarValue {
         DataType::Vector => ScalarValue::Vector(None),
         _ => ScalarValue::Int64(None),
     }
+}
+
+/// Output column definition for an aggregate expression. Decimal results
+/// inherit the argument column's scale/precision so clients can render the
+/// decimal point correctly.
+pub fn aggregate_result_column_def(agg: &AggregateExpr, schema: &Schema) -> ColumnDef {
+    let dt = aggregate_result_type(agg, schema);
+    let mut def = ColumnDef::new(&format_aggregate_name(agg, schema), dt);
+    if dt == DataType::Decimal {
+        if let LogicalExpr::Column(idx) = &*agg.arg {
+            if let Some(source) = schema.columns.get(*idx) {
+                def.scale = source.scale;
+                def.precision = source.precision;
+            }
+        }
+    }
+    def
 }
 
 pub fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {

@@ -232,6 +232,26 @@ pub fn project_column_def(expr: &LogicalExpr, schema: &Schema, alias: Option<&st
         }
     }
 
+    if let LogicalExpr::Aggregate(agg) = expr {
+        let agg_prefix = match agg.func {
+            crate::sql::planner::AggFunc::Count => "count",
+            crate::sql::planner::AggFunc::Sum => "sum",
+            crate::sql::planner::AggFunc::Avg => "avg",
+            crate::sql::planner::AggFunc::Min => "min",
+            crate::sql::planner::AggFunc::Max => "max",
+        };
+        if let Some(column) = schema.columns.iter().find(|c| {
+            let name = c.name.to_ascii_lowercase();
+            name.starts_with(&format!("{}(", agg_prefix)) || name == format!("{}(*)", agg_prefix)
+        }) {
+            let mut col_def = column.clone();
+            if let Some(alias) = alias {
+                col_def.name = alias.to_string();
+            }
+            return col_def;
+        }
+    }
+
     ColumnDef::new(alias.unwrap_or("expr"), infer_type(expr, schema))
 }
 

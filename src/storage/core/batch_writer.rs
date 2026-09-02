@@ -1503,9 +1503,6 @@ impl BatchWriter {
             let _ = std::fs::remove_file(&tmp_path);
             let _ = remove_sidecar_meta(&tmp_path);
             segment_mgr.write_standalone_active_encoded_segment(&tmp_path, merged)?;
-            std::fs::rename(&tmp_path, &final_path)?;
-            let _ = remove_sidecar_meta(&tmp_path);
-            segment_mgr.open_reader(&final_path)?;
             Ok(())
         })();
 
@@ -1523,9 +1520,29 @@ impl BatchWriter {
             return Err(error);
         }
 
-        for (mt, _) in locked {
-            let _ = mt.take_batch();
-            mt.set_state(MemTableState::Flushed);
+        let transition_result = segment_mgr.with_flush_transition(db, table, || {
+            std::fs::rename(&tmp_path, &final_path)?;
+            let _ = remove_sidecar_meta(&tmp_path);
+            segment_mgr.open_reader(&final_path)?;
+            crate::storage::segment_manager::SegmentManager::sleep_flush_transition_delay();
+            for (mt, _) in locked {
+                let _ = mt.take_batch();
+                mt.set_state(MemTableState::Flushed);
+            }
+            Ok::<(), TaibaiError>(())
+        });
+        if let Err(error) = transition_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_sidecar_meta(&tmp_path);
+            for intent in intents {
+                let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+            }
+            for (mt, _) in locked {
+                if mt.state() == MemTableState::Flushing {
+                    mt.set_state(MemTableState::Pending);
+                }
+            }
+            return Err(error);
         }
         if let Err(error) =
             crate::storage::core::durable_tail::finish_flush_batch(table_dir, intents)
@@ -1679,9 +1696,6 @@ impl BatchWriter {
             let _ = std::fs::remove_file(&tmp_path);
             let _ = remove_sidecar_meta(&tmp_path);
             segment_mgr.write_standalone_active_encoded_segment(&tmp_path, batch)?;
-            std::fs::rename(&tmp_path, &final_path)?;
-            let _ = remove_sidecar_meta(&tmp_path);
-            segment_mgr.open_reader(&final_path)?;
             Ok(())
         })();
 
@@ -1695,8 +1709,24 @@ impl BatchWriter {
             return Err(error);
         }
 
-        let _ = mt.take_batch();
-        mt.set_state(MemTableState::Flushed);
+        let transition_result = segment_mgr.with_flush_transition(db, table, || {
+            std::fs::rename(&tmp_path, &final_path)?;
+            let _ = remove_sidecar_meta(&tmp_path);
+            segment_mgr.open_reader(&final_path)?;
+            crate::storage::segment_manager::SegmentManager::sleep_flush_transition_delay();
+            let _ = mt.take_batch();
+            mt.set_state(MemTableState::Flushed);
+            Ok::<(), TaibaiError>(())
+        });
+        if let Err(error) = transition_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = remove_sidecar_meta(&tmp_path);
+            let _ = crate::storage::core::durable_tail::cancel_flush(intent);
+            if mt.state() == MemTableState::Flushing {
+                mt.set_state(MemTableState::Pending);
+            }
+            return Err(error);
+        }
         if let Err(error) = crate::storage::core::durable_tail::finish_flush_batch(
             table_dir,
             std::iter::once(intent).collect(),
