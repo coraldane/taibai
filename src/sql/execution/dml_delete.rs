@@ -997,7 +997,6 @@ pub fn exec_delete(
         )?;
         if !memtable_plans.is_empty() {
             index_maintenance.record_memtable_rows(&memtable_plans);
-            engine.hot_store_manager().remove(db, table);
             let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
             total_deleted += undo.deleted_rows();
         }
@@ -1126,6 +1125,10 @@ pub fn exec_delete(
             }
 
             mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count)?;
+        }
+
+        if total_deleted > 0 {
+            engine.hot_store_manager().invalidate(db, table);
         }
 
         Ok(index_maintenance.apply(engine, db, table))

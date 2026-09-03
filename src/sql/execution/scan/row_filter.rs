@@ -399,7 +399,17 @@ pub fn predicate_first_read(
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
 
-    let mut mask: Vec<bool> = vec![true; pred_batch.num_rows()];
+    let mut mask: Vec<bool> = if reader.delete_bitmap().is_empty() {
+        vec![true; pred_batch.num_rows()]
+    } else {
+        let rg_start_row = reader.row_group_start_row(rg_idx);
+        (0..pred_batch.num_rows() as u64)
+            .map(|i| !reader.is_row_deleted(rg_start_row + i))
+            .collect()
+    };
+    if mask.iter().all(|m| !m) {
+        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+    }
 
     let pred_to_batch_pos: std::collections::HashMap<usize, usize> = predicate_cols
         .iter()
