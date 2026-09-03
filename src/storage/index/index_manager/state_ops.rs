@@ -158,6 +158,9 @@ pub(super) fn unique_index_state_contains_any_key(
     let tombstones = &delta.tombstones;
     let base = &state.base;
     for encoded in sorted_encoded_keys {
+        if delta.removed_keys.contains(encoded.as_slice()) {
+            continue;
+        }
         let Ok(mut idx) = base
             .encoded_keys
             .binary_search_by(|key| key.as_slice().cmp(encoded.as_slice()))
@@ -194,6 +197,9 @@ pub(super) fn unique_index_state_contains_key(
                 return Ok(true);
             }
         }
+    }
+    if delta.removed_keys.contains(encoded_key) {
+        return Ok(false);
     }
     let tombstones = &delta.tombstones;
     let base = &state.base;

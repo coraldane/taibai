@@ -46,6 +46,67 @@ fn direct_location_lookup_skips_transient_locations() -> Result<()> {
 }
 
 #[test]
+fn removed_key_hides_base_placeholder_entries_until_reinsert() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);
+    let manager =
+        IndexManager::new_with_data_dir(Arc::clone(&segment_mgr), dir.path().to_path_buf());
+    manager.persist_unique_index_entries(
+        "db",
+        "ticks",
+        "uk_value",
+        &["value".to_string()],
+        vec![entry(1, 0)],
+        Some(segment_mgr.memtable_flush_epoch("db", "ticks")),
+        None,
+    )?;
+    assert_eq!(
+        manager.unique_key_exists(
+            "db",
+            "ticks",
+            "uk_value",
+            &[ScalarValue::Int64(Some(1))],
+        )?,
+        Some(true)
+    );
+    assert!(manager.remove_unique_index_keys(
+        "db",
+        "ticks",
+        "uk_value",
+        &[vec![ScalarValue::Int64(Some(1))]]
+    )?);
+    assert_eq!(
+        manager.unique_key_exists(
+            "db",
+            "ticks",
+            "uk_value",
+            &[ScalarValue::Int64(Some(1))],
+        )?,
+        Some(false)
+    );
+    assert_eq!(
+        manager.unique_keys_exist(
+            "db",
+            "ticks",
+            "uk_value",
+            &[vec![ScalarValue::Int64(Some(1))]]
+        )?,
+        Some(false)
+    );
+    manager.append_unique_index_entries("db", "ticks", "uk_value", vec![entry(1, 0)])?;
+    assert_eq!(
+        manager.unique_key_exists(
+            "db",
+            "ticks",
+            "uk_value",
+            &[ScalarValue::Int64(Some(1))],
+        )?,
+        Some(true)
+    );
+    Ok(())
+}
+
+#[test]
 fn flush_epoch_mismatch_refreshes_snapshot_incrementally() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let segment_mgr = Arc::new(SegmentManager::new(dir.path())?);

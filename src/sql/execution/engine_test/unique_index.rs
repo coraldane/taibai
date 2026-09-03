@@ -35,6 +35,97 @@ fn rebuild_unique_index_persists_snapshot_and_show_reports_it() -> Result<()> {
 }
 
 #[test]
+fn delete_then_reinsert_reuses_compacted_memtable_placeholder_keys() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, name VARCHAR, UNIQUE KEY uk_id (id))",
+    )?;
+    let mut values = String::new();
+    for id in 1..=40i64 {
+        if !values.is_empty() {
+            values.push_str(", ");
+        }
+        values.push_str(&format!("({}, 'a')", id));
+    }
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES {}", values),
+    )?;
+    engine.execute(&mut session, "DELETE FROM t")?;
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES {}", values),
+    )?;
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 40);
+    let duplicate = engine.execute(&mut session, "INSERT INTO t (id, name) VALUES (1, 'dup')");
+    assert!(duplicate.is_err());
+    Ok(())
+}
+
+#[test]
+fn delete_then_reinsert_reuses_keys_after_flush_and_refresh() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, name VARCHAR, UNIQUE KEY uk_id (id))",
+    )?;
+    let mut values = String::new();
+    for id in 1..=40i64 {
+        if !values.is_empty() {
+            values.push_str(", ");
+        }
+        values.push_str(&format!("({}, 'a')", id));
+    }
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES {}", values),
+    )?;
+    engine.execute(&mut session, "FLUSH TABLE t")?;
+    assert_eq!(
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_id",
+            &[ScalarValue::Int64(Some(1))]
+        )?,
+        Some(true)
+    );
+    engine.execute(&mut session, "DELETE FROM t")?;
+    assert_eq!(
+        engine.index_manager().unique_key_exists(
+            "main",
+            "t",
+            "uk_id",
+            &[ScalarValue::Int64(Some(1))]
+        )?,
+        Some(false)
+    );
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t (id, name) VALUES {}", values),
+    )?;
+    let count = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+        0,
+        0,
+    );
+    assert_eq!(count, 40);
+    Ok(())
+}
+
+#[test]
 fn drop_unique_index_removes_persisted_snapshot() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;
