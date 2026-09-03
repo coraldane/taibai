@@ -27,7 +27,7 @@ pub fn zlib_decompress_complete(data: &[u8]) -> Option<Vec<u8>> {
         let input = &data[decompress.total_in() as usize..];
         let before_out = decompress.total_out();
         let status = decompress
-            .decompress(input, &mut chunk, FlushDecompress::Finish)
+            .decompress(input, &mut chunk, FlushDecompress::None)
             .ok()?;
         let produced = (decompress.total_out() - before_out) as usize;
         out.extend_from_slice(&chunk[..produced]);
