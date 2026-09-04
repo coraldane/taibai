@@ -773,6 +773,7 @@ impl ExecutionOp for HashAggregateExec {
                 output_schema,
                 aggregates,
                 physical_schema,
+                self.input_schema.clone(),
                 self.having.clone(),
                 self.max_groups,
                 spill_rows,
@@ -825,7 +826,7 @@ impl HashAggregateExec {
             result_batch = apply_distinct(result_batch);
         }
         if let Some(ref having_pred) = self.having {
-            result_batch = apply_having(result_batch, having_pred)?;
+            result_batch = apply_having(result_batch, having_pred, &self.input_schema)?;
         }
         Ok(result_batch)
     }
@@ -900,7 +901,7 @@ impl HashAggregateExec {
             result_batch = apply_distinct(result_batch);
         }
         if let Some(ref having_pred) = self.having {
-            result_batch = apply_having(result_batch, having_pred)?;
+            result_batch = apply_having(result_batch, having_pred, &self.input_schema)?;
         }
         Ok(result_batch)
     }
@@ -1098,6 +1099,7 @@ struct GroupSpillMerge {
     output_schema: Schema,
     aggregates: Vec<AggregateExpr>,
     physical_schema: Schema,
+    input_schema: Schema,
     having: Option<LogicalExpr>,
     max_groups: usize,
     emitted_groups: usize,
@@ -1110,6 +1112,7 @@ impl GroupSpillMerge {
         output_schema: Schema,
         aggregates: Vec<AggregateExpr>,
         physical_schema: Schema,
+        input_schema: Schema,
         having: Option<LogicalExpr>,
         max_groups: usize,
         batch_rows: usize,
@@ -1133,6 +1136,7 @@ impl GroupSpillMerge {
             output_schema,
             aggregates,
             physical_schema,
+            input_schema,
             having,
             max_groups,
             emitted_groups: 0,
@@ -1236,7 +1240,7 @@ impl GroupSpillMerge {
             }
 
             if let Some(having) = self.having.as_ref() {
-                output = apply_having(output, having)?;
+                output = apply_having(output, having, &self.input_schema)?;
             }
             if output.num_rows() > 0 {
                 return Ok(Some(output));
@@ -1812,10 +1816,15 @@ fn apply_distinct(batch: RecordBatch) -> RecordBatch {
 }
 
 /// Apply HAVING filter to aggregated results.
-fn apply_having(batch: RecordBatch, _predicate: &LogicalExpr) -> Result<RecordBatch> {
+fn apply_having(
+    batch: RecordBatch,
+    predicate: &LogicalExpr,
+    logical_schema: &Schema,
+) -> Result<RecordBatch> {
     // HAVING is evaluated using the same filter logic as WHERE
     // but operates on the aggregated result schema
-    let mask = crate::sql::execution::operators::filter::eval_filter(_predicate, &batch)?;
+    let remapped = remap_expr_for_batch(predicate, logical_schema, &batch.schema);
+    let mask = crate::sql::execution::operators::filter::eval_filter(&remapped, &batch)?;
     Ok(super::apply_filter_mask(&batch, &mask))
 }
 

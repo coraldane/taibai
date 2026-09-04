@@ -139,6 +139,10 @@ name = "aggregate_regression_test"
 path = "tests/aggregate_regression_test.rs"
 
 [[test]]
+name = "having_clause_test"
+path = "tests/having_clause_test.rs"
+
+[[test]]
 name = "analyze_statistics_test"
 path = "tests/analyze_statistics_test.rs"
 

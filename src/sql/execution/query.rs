@@ -694,16 +694,17 @@ fn remove_redundant_pushed_filter(plan: LogicalPlan, table_name: &str) -> Logica
 }
 
 fn detect_count_star(stmt: &Statement, table_names: &[String]) -> bool {
-    let (select_list, group_by) = match stmt {
+    let (select_list, group_by, having) = match stmt {
         Statement::Select {
             select_list,
             group_by,
+            having,
             ..
-        } => (select_list, group_by),
+        } => (select_list, group_by, having),
         _ => return false,
     };
 
-    if !group_by.is_empty() || table_names.len() != 1 || select_list.len() != 1 {
+    if having.is_some() || !group_by.is_empty() || table_names.len() != 1 || select_list.len() != 1 {
         return false;
     }
 

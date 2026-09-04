@@ -281,12 +281,11 @@ fn build_operator_with_limit(
                 profile,
                 depth + 1,
             )?;
-            Ok(Box::new(HashAggregateExec::new(
-                agg.group_by,
-                agg.aggregates,
-                input,
-                input_schema,
-            )))
+            let mut exec = HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
+            if let Some(having) = agg.having {
+                exec = exec.with_having(having);
+            }
+            Ok(Box::new(exec))
         }
         LogicalPlan::Join(join) => {
             let build_left = if join.join_type == JoinType::Inner {

@@ -95,12 +95,11 @@ pub fn build_pipeline(
         LogicalPlan::Aggregate(agg) => {
             let input_schema = get_scan_schema(&agg.input);
             let input = build_pipeline(*agg.input, table_batches)?;
-            Ok(Box::new(HashAggregateExec::new(
-                agg.group_by,
-                agg.aggregates,
-                input,
-                input_schema,
-            )))
+            let mut exec = HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
+            if let Some(having) = agg.having {
+                exec = exec.with_having(having);
+            }
+            Ok(Box::new(exec))
         }
         LogicalPlan::Join(join) => {
             let left = build_pipeline(*join.left, table_batches)?;

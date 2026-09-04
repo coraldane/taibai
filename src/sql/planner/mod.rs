@@ -45,7 +45,7 @@ pub fn plan_select(
 }
 
 pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Result<LogicalPlan> {
-    let (select_list, from, where_clause, group_by, _having, order_by, limit, offset, _distinct) =
+    let (select_list, from, where_clause, group_by, having, order_by, limit, offset, _distinct) =
         match stmt {
             Statement::Select {
                 select_list,
@@ -116,11 +116,16 @@ pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Resul
             })
             .collect();
 
+        let having_expr = having
+            .as_ref()
+            .map(|h| expr::ast_expr_to_logical_with_context(h, &schema, &alias_map, ctx))
+            .transpose()?;
+
         plan = LogicalPlan::Aggregate(AggregatePlan {
             group_by: group_exprs,
             aggregates: agg_exprs,
             input: Box::new(plan),
-            having: None,
+            having: having_expr,
             distinct: false,
         });
     }
