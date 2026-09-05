@@ -121,8 +121,23 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
             .map(|c| c.data_type)
             .unwrap_or(DataType::Int64),
         LogicalExpr::Literal(v) => v.data_type(),
-        LogicalExpr::BinaryOp { op: BinOp::Div, .. } => DataType::Float64,
-        LogicalExpr::BinaryOp { .. } => DataType::Int64,
+        LogicalExpr::BinaryOp { op, left, right } => match op {
+            BinOp::Eq
+            | BinOp::Neq
+            | BinOp::Lt
+            | BinOp::Gt
+            | BinOp::Lte
+            | BinOp::Gte
+            | BinOp::And
+            | BinOp::Or => DataType::Bool,
+            BinOp::Div => DataType::Float64,
+            BinOp::Like | BinOp::NotLike | BinOp::In | BinOp::NotIn => DataType::Bool,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {
+                let lt = infer_type(left, schema);
+                let rt = infer_type(right, schema);
+                crate::sql::binder::type_resolver::common_type(&lt, &rt)
+            }
+        },
         LogicalExpr::Aggregate(agg) => {
             let agg_prefix = match agg.func {
                 crate::sql::planner::AggFunc::Count => "count",

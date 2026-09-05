@@ -104,6 +104,182 @@ pub fn exec_select_with_txn(
     exec_select_inner(engine, db, stmt, None, None, reader_txn_id, None)
 }
 
+pub fn exec_union_with_txn(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    reader_txn_id: u64,
+) -> Result<ExecResult> {
+    let Statement::Union {
+        left,
+        right,
+        all,
+        order_by,
+        limit,
+        offset,
+    } = stmt
+    else {
+        return Err(TaibaiError::Internal(
+            "exec_union called with non-UNION".into(),
+        ));
+    };
+
+    let (left_result, right_result) = (
+        exec_select_with_txn(engine, db, left, reader_txn_id)?,
+        exec_select_with_txn(engine, db, right, reader_txn_id)?,
+    );
+    let (
+        ExecResult::Query {
+            schema: left_schema,
+            ..
+        },
+        ExecResult::Query {
+            batches: right_batches,
+            ..
+        },
+    ) = (&left_result, &right_result)
+    else {
+        return Err(TaibaiError::Sql(
+            "UNION operands must be SELECT queries".into(),
+        ));
+    };
+    let left_schema = left_schema.clone();
+    let left_batches = match left_result {
+        ExecResult::Query { batches, .. } => batches,
+        _ => unreachable!(),
+    };
+
+    if left_schema.columns.len() != right_schema_col_count(&right_result) {
+        return Err(TaibaiError::Sql(format!(
+            "UNION operands must have the same column count ({} vs {})",
+            left_schema.columns.len(),
+            right_schema_col_count(&right_result)
+        )));
+    }
+
+    let mut rows: Vec<Vec<ScalarValue>> = Vec::new();
+    for batch in left_batches.iter().chain(right_batches.iter()) {
+        if batch.num_columns() == 0 {
+            continue;
+        }
+        for row_idx in 0..batch.num_rows() {
+            rows.push(
+                (0..batch.num_columns())
+                    .map(|c| batch.scalar(row_idx, c).unwrap_or(ScalarValue::Int64(None)))
+                    .collect(),
+            );
+        }
+    }
+
+    if !*all {
+        let mut seen = std::collections::HashSet::new();
+        rows.retain(|row| {
+            let key = row
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\u{1f}");
+            seen.insert(key)
+        });
+    }
+
+    if !order_by.is_empty() {
+        let mut keys: Vec<(usize, bool)> = Vec::with_capacity(order_by.len());
+        for item in order_by {
+            let idx = match &item.expr {
+                Expr::Column(name) => left_schema.index_of(name).ok_or_else(|| {
+                    TaibaiError::Sql(format!("unknown ORDER BY column '{name}' in UNION"))
+                })?,
+                Expr::Literal(ScalarValue::Int64(Some(value))) => {
+                    let idx = (*value).max(1) as usize - 1;
+                    if idx >= left_schema.columns.len() {
+                        return Err(TaibaiError::Sql(format!(
+                            "ORDER BY position {value} is out of range in UNION"
+                        )));
+                    }
+                    idx
+                }
+                other => {
+                    return Err(TaibaiError::Sql(format!(
+                        "unsupported UNION ORDER BY expression: {other:?}"
+                    )));
+                }
+            };
+            keys.push((idx, item.desc));
+        }
+        rows.sort_by(|a, b| {
+            for (idx, desc) in &keys {
+                let mut ord = union_scalar_cmp(&a[*idx], &b[*idx]);
+                if *desc {
+                    ord = ord.reverse();
+                }
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    let offset_val = offset
+        .as_ref()
+        .map(crate::sql::planner::types::eval_const_usize)
+        .transpose()?
+        .unwrap_or(0);
+    if offset_val > 0 {
+        if offset_val >= rows.len() {
+            rows.clear();
+        } else {
+            rows = rows.split_off(offset_val);
+        }
+    }
+    if let Some(limit_expr) = limit {
+        let limit_val = crate::sql::planner::types::eval_const_usize(limit_expr)?;
+        rows.truncate(limit_val);
+    }
+
+    let mut columns: Vec<crate::types::array::ColumnArray> =
+        Vec::with_capacity(left_schema.columns.len());
+    for (col_idx, def) in left_schema.columns.iter().enumerate() {
+        let mut array = crate::types::array::ColumnArray::empty(def.data_type);
+        for row in &rows {
+            array.push(&row[col_idx])?;
+        }
+        columns.push(array);
+    }
+    let batch = RecordBatch::try_new(left_schema.clone(), columns)?;
+    Ok(ExecResult::Query {
+        schema: left_schema,
+        batches: vec![batch],
+    })
+}
+
+fn right_schema_col_count(result: &ExecResult) -> usize {
+    match result {
+        ExecResult::Query { schema, .. } => schema.columns.len(),
+        ExecResult::Ok { .. } => 0,
+    }
+}
+
+fn union_scalar_cmp(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
+    a.numeric_cmp(b)
+        .or_else(|| match (a, b) {
+            (ScalarValue::VarChar(Some(x)), ScalarValue::VarChar(Some(y))) => Some(x.cmp(y)),
+            (ScalarValue::Date(Some(x)), ScalarValue::Date(Some(y))) => Some(x.cmp(y)),
+            (ScalarValue::Timestamp(Some(x)), ScalarValue::Timestamp(Some(y))) => Some(x.cmp(y)),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            let (null_a, null_b) = (a.is_null(), b.is_null());
+            match (null_a, null_b) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => a.to_string().cmp(&b.to_string()),
+            }
+        })
+}
+
 pub fn exec_select_with_plan_and_txn(
     engine: &Engine,
     db: &str,
@@ -481,7 +657,11 @@ fn exec_table_select_materialized(
     })
 }
 
-fn resolve_in_subqueries(engine: &Engine, db: &str, stmt: &Statement) -> Result<Statement> {
+pub(crate) fn resolve_in_subqueries(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+) -> Result<Statement> {
     let mut stmt = stmt.clone();
     resolve_stmt_in_subqueries(engine, db, &mut stmt)?;
     Ok(stmt)
@@ -557,8 +737,15 @@ fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &mut Expr) -> Res
         Expr::UnaryNot(inner)
         | Expr::UnaryMinus(inner)
         | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner)
-        | Expr::Exists(inner) => resolve_expr_in_subqueries(engine, db, inner)?,
+        | Expr::IsNotNull(inner) => resolve_expr_in_subqueries(engine, db, inner)?,
+        Expr::Exists(inner) => {
+            if let Expr::Subquery(subquery) = inner.as_ref() {
+                let exists = execute_exists_subquery(engine, db, subquery)?;
+                *expr = Expr::Literal(ScalarValue::Bool(Some(exists)));
+            } else {
+                resolve_expr_in_subqueries(engine, db, inner)?;
+            }
+        }
         Expr::In {
             expr: inner,
             values,
@@ -601,7 +788,10 @@ fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &mut Expr) -> Res
             resolve_expr_in_subqueries(engine, db, expr)?;
             resolve_expr_in_subqueries(engine, db, pattern)?;
         }
-        Expr::Subquery(subquery) => resolve_stmt_in_subqueries(engine, db, subquery)?,
+        Expr::Subquery(subquery) => {
+            let value = execute_scalar_subquery(engine, db, subquery)?;
+            *expr = Expr::Literal(value);
+        }
         Expr::Function { args, .. } => {
             for arg in args {
                 resolve_expr_in_subqueries(engine, db, arg)?;
@@ -646,6 +836,46 @@ fn execute_in_subquery(
         }
     }
     Ok(values)
+}
+
+pub(crate) fn execute_scalar_subquery(
+    engine: &Engine,
+    db: &str,
+    subquery: &Statement,
+) -> Result<ScalarValue> {
+    let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
+        return Err(TaibaiError::Sql("scalar subquery must be a SELECT".into()));
+    };
+    let mut first: Option<ScalarValue> = None;
+    let mut rows = 0usize;
+    for batch in batches {
+        if batch.num_columns() == 0 {
+            continue;
+        }
+        for row_idx in 0..batch.num_rows() {
+            rows += 1;
+            if first.is_none() {
+                first = Some(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
+            }
+        }
+    }
+    if rows > 1 {
+        return Err(TaibaiError::Sql(format!(
+            "scalar subquery returned more than one row ({rows})"
+        )));
+    }
+    Ok(first.unwrap_or(ScalarValue::Int64(None)))
+}
+
+pub(crate) fn execute_exists_subquery(
+    engine: &Engine,
+    db: &str,
+    subquery: &Statement,
+) -> Result<bool> {
+    let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
+        return Err(TaibaiError::Sql("EXISTS subquery must be a SELECT".into()));
+    };
+    Ok(batches.iter().any(|batch| batch.num_rows() > 0))
 }
 
 fn remove_redundant_pushed_filter(plan: LogicalPlan, table_name: &str) -> LogicalPlan {
@@ -704,7 +934,8 @@ fn detect_count_star(stmt: &Statement, table_names: &[String]) -> bool {
         _ => return false,
     };
 
-    if having.is_some() || !group_by.is_empty() || table_names.len() != 1 || select_list.len() != 1 {
+    if having.is_some() || !group_by.is_empty() || table_names.len() != 1 || select_list.len() != 1
+    {
         return false;
     }
 
@@ -868,11 +1099,7 @@ pub fn extract_table_refs(from: &FromClause, default_db: &str) -> Vec<ResolvedTa
     match from {
         FromClause::Table(t) => match t {
             TableRef::Table { name, .. } => vec![ResolvedTableRef::new(name, default_db)],
-            TableRef::Subquery { alias, .. } => vec![ResolvedTableRef {
-                key: alias.clone(),
-                database: default_db.to_string(),
-                table: alias.clone(),
-            }],
+            TableRef::Subquery { .. } => Vec::new(),
         },
         FromClause::Join(join_expr) => {
             let mut refs = Vec::new();
@@ -890,22 +1117,14 @@ fn collect_table_refs_from_join(
     match &*join_expr.left {
         FromClause::Table(t) => match t {
             TableRef::Table { name, .. } => refs.push(ResolvedTableRef::new(name, default_db)),
-            TableRef::Subquery { alias, .. } => refs.push(ResolvedTableRef {
-                key: alias.clone(),
-                database: default_db.to_string(),
-                table: alias.clone(),
-            }),
+            TableRef::Subquery { .. } => {}
         },
         FromClause::Join(inner) => collect_table_refs_from_join(inner, default_db, refs),
     }
     for jc in &join_expr.joins {
         match &jc.right {
             TableRef::Table { name, .. } => refs.push(ResolvedTableRef::new(name, default_db)),
-            TableRef::Subquery { alias, .. } => refs.push(ResolvedTableRef {
-                key: alias.clone(),
-                database: default_db.to_string(),
-                table: alias.clone(),
-            }),
+            TableRef::Subquery { .. } => {}
         }
     }
 }

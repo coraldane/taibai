@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
-use crate::sql::execution::operators::aggregate::HashAggregateExec;
+use crate::sql::execution::operators::aggregate::{aggregate_result_column_def, HashAggregateExec};
 use crate::sql::execution::operators::filter::FilterExec;
 use crate::sql::execution::operators::join::HashJoinExec;
 use crate::sql::execution::operators::limit::LimitExec;
@@ -281,7 +281,8 @@ fn build_operator_with_limit(
                 profile,
                 depth + 1,
             )?;
-            let mut exec = HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
+            let mut exec =
+                HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
             if let Some(having) = agg.having {
                 exec = exec.with_having(having);
             }
@@ -352,15 +353,20 @@ fn build_operator_with_limit(
                 semi.is_anti,
             )))
         }
-        LogicalPlan::Distinct(distinct) => build_operator_with_limit(
-            *distinct.input,
-            ctx,
-            None,
-            table_batches,
-            scan_seeds,
-            profile,
-            depth + 1,
-        ),
+        LogicalPlan::Distinct(distinct) => {
+            let input = build_operator_with_limit(
+                *distinct.input,
+                ctx,
+                None,
+                table_batches,
+                scan_seeds,
+                profile,
+                depth + 1,
+            )?;
+            Ok(Box::new(
+                crate::sql::execution::operators::DistinctExec::new(input),
+            ))
+        }
         LogicalPlan::Window(window) => build_operator_with_limit(
             *window.input,
             ctx,
@@ -1879,7 +1885,7 @@ fn annotate_scan(
     }
 }
 
-fn get_scan_schema(plan: &LogicalPlan) -> Schema {
+pub(crate) fn get_scan_schema(plan: &LogicalPlan) -> Schema {
     match plan {
         LogicalPlan::Scan(s) => s.schema.clone(),
         LogicalPlan::Filter(f) => get_scan_schema(&f.input),
@@ -1918,7 +1924,24 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         }
         LogicalPlan::Sort(s) => get_scan_schema(&s.input),
         LogicalPlan::Limit(l) => get_scan_schema(&l.input),
-        LogicalPlan::Aggregate(a) => get_scan_schema(&a.input),
+        LogicalPlan::Aggregate(a) => {
+            let input = get_scan_schema(&a.input);
+            let mut columns = Vec::with_capacity(a.group_by.len() + a.aggregates.len());
+            for (position, key) in a.group_by.iter().enumerate() {
+                let def = match key {
+                    LogicalExpr::Column(index) => input.columns.get(*index).cloned(),
+                    _ => None,
+                }
+                .unwrap_or_else(|| {
+                    ColumnDef::new(&format!("group_expr_{position}"), DataType::VarChar)
+                });
+                columns.push(def);
+            }
+            for agg in &a.aggregates {
+                columns.push(aggregate_result_column_def(agg, &input));
+            }
+            Schema::new(columns)
+        }
         LogicalPlan::Join(j) => j.output_schema.clone(),
         LogicalPlan::SemiJoin(s) => s.left_schema.clone(),
         LogicalPlan::TopN(t) => get_scan_schema(&t.input),

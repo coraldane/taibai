@@ -582,22 +582,24 @@ fn eval_constant_binary(left: &ScalarValue, op: BinOp, right: &ScalarValue) -> R
     }
 
     if let (Some(left), Some(right)) = (left.integer_i128(), right.integer_i128()) {
-        let value = match op {
-            BinOp::Add => left.checked_add(right),
-            BinOp::Sub => left.checked_sub(right),
-            BinOp::Mul => left.checked_mul(right),
-            BinOp::Div => {
-                if right == 0 {
-                    return Err(TaibaiError::Sql("division by zero".to_string()));
+        if !matches!(op, BinOp::Div) {
+            let value = match op {
+                BinOp::Add => left.checked_add(right),
+                BinOp::Sub => left.checked_sub(right),
+                BinOp::Mul => left.checked_mul(right),
+                BinOp::Mod => {
+                    if right == 0 {
+                        return Ok(ScalarValue::Int64(None));
+                    }
+                    left.checked_rem(right)
                 }
-                left.checked_div(right)
+                _ => None,
             }
-            _ => None,
+            .ok_or_else(|| TaibaiError::Sql("integer constant expression overflow".to_string()))?;
+            return i64::try_from(value)
+                .map(|value| ScalarValue::Int64(Some(value)))
+                .map_err(|_| TaibaiError::Sql("integer constant expression overflow".to_string()));
         }
-        .ok_or_else(|| TaibaiError::Sql("integer constant expression overflow".to_string()))?;
-        return i64::try_from(value)
-            .map(|value| ScalarValue::Int64(Some(value)))
-            .map_err(|_| TaibaiError::Sql("integer constant expression overflow".to_string()));
     }
 
     let left = left.numeric_f64().ok_or_else(|| {
@@ -615,6 +617,12 @@ fn eval_constant_binary(left: &ScalarValue, op: BinOp, right: &ScalarValue) -> R
                 return Err(TaibaiError::Sql("division by zero".to_string()));
             }
             left / right
+        }
+        BinOp::Mod => {
+            if right == 0.0 {
+                return Ok(ScalarValue::Float64(None));
+            }
+            left % right
         }
         _ => {
             return Err(TaibaiError::Sql(

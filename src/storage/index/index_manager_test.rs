@@ -61,12 +61,7 @@ fn removed_key_hides_base_placeholder_entries_until_reinsert() -> Result<()> {
         None,
     )?;
     assert_eq!(
-        manager.unique_key_exists(
-            "db",
-            "ticks",
-            "uk_value",
-            &[ScalarValue::Int64(Some(1))],
-        )?,
+        manager.unique_key_exists("db", "ticks", "uk_value", &[ScalarValue::Int64(Some(1))],)?,
         Some(true)
     );
     assert!(manager.remove_unique_index_keys(
@@ -76,12 +71,7 @@ fn removed_key_hides_base_placeholder_entries_until_reinsert() -> Result<()> {
         &[vec![ScalarValue::Int64(Some(1))]]
     )?);
     assert_eq!(
-        manager.unique_key_exists(
-            "db",
-            "ticks",
-            "uk_value",
-            &[ScalarValue::Int64(Some(1))],
-        )?,
+        manager.unique_key_exists("db", "ticks", "uk_value", &[ScalarValue::Int64(Some(1))],)?,
         Some(false)
     );
     assert_eq!(
@@ -95,12 +85,7 @@ fn removed_key_hides_base_placeholder_entries_until_reinsert() -> Result<()> {
     );
     manager.append_unique_index_entries("db", "ticks", "uk_value", vec![entry(1, 0)])?;
     assert_eq!(
-        manager.unique_key_exists(
-            "db",
-            "ticks",
-            "uk_value",
-            &[ScalarValue::Int64(Some(1))],
-        )?,
+        manager.unique_key_exists("db", "ticks", "uk_value", &[ScalarValue::Int64(Some(1))],)?,
         Some(true)
     );
     Ok(())

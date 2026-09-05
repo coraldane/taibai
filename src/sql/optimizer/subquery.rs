@@ -1,11 +1,12 @@
-use crate::common::error::Result;
-use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr, LogicalPlan};
-use crate::types::array::ColumnArray;
-use crate::types::batch::{RecordBatch, Schema};
-use crate::types::scalar::ScalarValue;
+use crate::sql::planner::{AggregateExpr, LogicalExpr, LogicalPlan};
 
 use super::Rule;
 
+/// Subquery expressions (`ScalarSubquery` / `ExistsSubquery` / `InSubquery`)
+/// are resolved against real data at AST level by the execution layer (see
+/// `query::resolve_in_subqueries`) before planning. This rule only walks the
+/// plan; it must NOT try to "evaluate" subqueries on fabricated empty data,
+/// which silently produced wrong constants (EXISTS -> false, scalar -> NULL).
 pub struct SubqueryRule;
 
 impl Rule for SubqueryRule {
@@ -114,46 +115,8 @@ fn optimize_subqueries(plan: LogicalPlan) -> (LogicalPlan, bool) {
 
 fn replace_subquery_expr(expr: LogicalExpr, _context_plan: &LogicalPlan) -> (LogicalExpr, bool) {
     match expr {
-        LogicalExpr::ScalarSubquery(subquery_plan) => {
-            let result = evaluate_scalar_subquery(&subquery_plan);
-            match result {
-                Ok(Some(val)) => (LogicalExpr::Literal(val), true),
-                Ok(None) => (LogicalExpr::Literal(ScalarValue::Int64(None)), true),
-                Err(_) => (LogicalExpr::ScalarSubquery(subquery_plan), false),
-            }
-        }
-        LogicalExpr::ExistsSubquery(subquery_plan) => {
-            let result = evaluate_exists_subquery(&subquery_plan);
-            match result {
-                Ok(exists) => (LogicalExpr::Literal(ScalarValue::Bool(Some(exists))), true),
-                Err(_) => (LogicalExpr::ExistsSubquery(subquery_plan), false),
-            }
-        }
-        LogicalExpr::InSubquery {
-            expr: inner_expr,
-            subquery,
-            negated,
-        } => {
-            let result = evaluate_in_subquery(&subquery);
-            match result {
-                Ok(values) => (
-                    LogicalExpr::In {
-                        expr: inner_expr,
-                        values,
-                        negated,
-                    },
-                    true,
-                ),
-                Err(_) => (
-                    LogicalExpr::InSubquery {
-                        expr: inner_expr,
-                        subquery,
-                        negated,
-                    },
-                    false,
-                ),
-            }
-        }
+        LogicalExpr::ScalarSubquery(_) | LogicalExpr::ExistsSubquery(_) => (expr, false),
+        LogicalExpr::InSubquery { .. } => (expr, false),
         LogicalExpr::BinaryOp { left, op, right } => {
             let (new_left, lc) = replace_subquery_expr(*left, _context_plan);
             let (new_right, rc) = replace_subquery_expr(*right, _context_plan);
@@ -292,110 +255,4 @@ fn replace_subquery_expr(expr: LogicalExpr, _context_plan: &LogicalPlan) -> (Log
         }
         other => (other, false),
     }
-}
-
-fn evaluate_scalar_subquery(plan: &LogicalPlan) -> Result<Option<ScalarValue>> {
-    let batch = execute_simple_plan(plan)?;
-    if batch.num_rows() == 0 || batch.num_columns() == 0 {
-        return Ok(None);
-    }
-    let val = batch.scalar(0, 0);
-    Ok(val)
-}
-
-fn evaluate_exists_subquery(plan: &LogicalPlan) -> Result<bool> {
-    let batch = execute_simple_plan(plan)?;
-    Ok(batch.num_rows() > 0)
-}
-
-fn evaluate_in_subquery(plan: &LogicalPlan) -> Result<Vec<ScalarValue>> {
-    let batch = execute_simple_plan(plan)?;
-    if batch.num_columns() == 0 {
-        return Ok(Vec::new());
-    }
-    let values: Vec<ScalarValue> = (0..batch.num_rows())
-        .map(|i| batch.scalar(i, 0).unwrap_or(ScalarValue::Int64(None)))
-        .collect();
-    Ok(values)
-}
-
-fn execute_simple_plan(plan: &LogicalPlan) -> Result<RecordBatch> {
-    match plan {
-        LogicalPlan::Scan(scan) => Ok(RecordBatch::new(scan.schema.clone())),
-        LogicalPlan::Aggregate(agg) => {
-            let input_batch = execute_simple_plan(&agg.input)?;
-            let mut result_batch = RecordBatch::new(input_batch.schema.clone());
-            for agg_expr in &agg.aggregates {
-                let val = compute_simple_aggregate(agg_expr, &input_batch);
-                if !result_batch.schema.columns.is_empty() {
-                    result_batch.column_mut(0).unwrap().push(&val)?;
-                }
-            }
-            Ok(result_batch)
-        }
-        LogicalPlan::Filter(filter) => {
-            let input_batch = execute_simple_plan(&filter.input)?;
-            Ok(input_batch)
-        }
-        LogicalPlan::Limit(limit) => {
-            let input_batch = execute_simple_plan(&limit.input)?;
-            let end = limit.offset + limit.limit.min(input_batch.num_rows() - limit.offset);
-            if limit.offset >= input_batch.num_rows() {
-                return Ok(RecordBatch::new(input_batch.schema.clone()));
-            }
-            Ok(trim_batch(&input_batch, limit.offset, end))
-        }
-        LogicalPlan::Project(proj) => execute_simple_plan(&proj.input),
-        LogicalPlan::Sort(sort) => execute_simple_plan(&sort.input),
-        LogicalPlan::TopN(topn) => execute_simple_plan(&topn.input),
-        LogicalPlan::Empty => Ok(RecordBatch::new(Schema::empty())),
-        _ => Ok(RecordBatch::new(Schema::empty())),
-    }
-}
-
-fn compute_simple_aggregate(agg: &AggregateExpr, batch: &RecordBatch) -> ScalarValue {
-    let col_idx = match &*agg.arg {
-        LogicalExpr::Column(idx) => Some(*idx),
-        LogicalExpr::Wildcard => None,
-        _ => None,
-    };
-
-    match agg.func {
-        AggFunc::Count => {
-            if let Some(idx) = col_idx {
-                let non_null = (0..batch.num_rows())
-                    .filter(|i| {
-                        !batch
-                            .scalar(*i, idx)
-                            .unwrap_or(ScalarValue::Int64(None))
-                            .is_null()
-                    })
-                    .count();
-                ScalarValue::Int64(Some(non_null as i64))
-            } else {
-                ScalarValue::Int64(Some(batch.num_rows() as i64))
-            }
-        }
-        AggFunc::Sum => ScalarValue::Float64(None),
-        AggFunc::Avg => ScalarValue::Float64(None),
-        AggFunc::Min => ScalarValue::Int64(None),
-        AggFunc::Max => ScalarValue::Int64(None),
-    }
-}
-
-fn trim_batch(batch: &RecordBatch, start: usize, end: usize) -> RecordBatch {
-    if start >= end || start >= batch.num_rows() {
-        return RecordBatch::new(batch.schema.clone());
-    }
-    let end = end.min(batch.num_rows());
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for col_idx in 0..batch.num_columns() {
-        let col = batch.column(col_idx).unwrap();
-        let mut new_col = ColumnArray::empty(col.data_type());
-        for i in start..end {
-            new_col.push(&col.scalar(i)).unwrap();
-        }
-        columns.push(new_col);
-    }
-    RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
 }

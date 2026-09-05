@@ -157,3 +157,7 @@ path = "tests/performance_baseline_test.rs"
 [[test]]
 name = "delete_visibility_regression_test"
 path = "tests/delete_visibility_regression_test.rs"
+
+[[test]]
+name = "sql_semantics_regression_test"
+path = "tests/sql_semantics_regression_test.rs"

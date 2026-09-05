@@ -266,8 +266,13 @@ impl Engine {
                         if !has_placeholders {
                             let table_schemas =
                                 self.gather_table_schemas(&session.database, &stmt)?;
+                            let planned_stmt = super::query::resolve_in_subqueries(
+                                self,
+                                &session.database,
+                                &stmt,
+                            )?;
                             if let Ok(plan) =
-                                crate::sql::planner::plan_select(&stmt, &table_schemas)
+                                crate::sql::planner::plan_select(&planned_stmt, &table_schemas)
                             {
                                 prepared.cached_plan = Some(crate::sql::optimizer::optimize(plan));
                                 prepared.planned_database = Some(session.database.clone());
@@ -722,7 +727,7 @@ impl Engine {
                 let table_name = table.as_ref().map(|t| t.name.clone());
                 super::ddl::exec_flush_table(self, db, &table_name)
             }
-            Statement::Union { .. } => super::query::exec_select_with_txn(
+            Statement::Union { .. } => super::query::exec_union_with_txn(
                 self,
                 &session.database,
                 stmt,

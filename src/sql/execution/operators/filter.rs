@@ -1,5 +1,6 @@
 use crate::common::error::Result;
 use crate::sql::execution::functions::registry::FunctionRegistry;
+use crate::sql::execution::helpers::scalar_like_matches;
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::{AggregateExpr, LogicalExpr};
 use crate::types::batch::{RecordBatch, Schema};
@@ -563,91 +564,183 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             }
             Ok(result)
         }
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let vals = eval_expr_column(expr, batch)?;
+            let lows = eval_expr_column(low, batch)?;
+            let highs = eval_expr_column(high, batch)?;
+            Ok((0..num_rows)
+                .map(|row_idx| {
+                    let inside = eval_comparison(&vals[row_idx], &BinOp::Gte, &lows[row_idx])
+                        && eval_comparison(&vals[row_idx], &BinOp::Lte, &highs[row_idx]);
+                    ScalarValue::Bool(Some(if *negated { !inside } else { inside }))
+                })
+                .collect())
+        }
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let vals = eval_expr_column(expr, batch)?;
+            Ok(vals
+                .iter()
+                .map(|v| {
+                    if v.is_null() {
+                        return ScalarValue::Bool(None);
+                    }
+                    let matched = scalar_like_matches(v, pattern);
+                    ScalarValue::Bool(Some(matched != *negated))
+                })
+                .collect())
+        }
         _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
     }
 }
 
 fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> ScalarValue {
+    use BinOp::*;
     if left.is_null() || right.is_null() {
-        return ScalarValue::Int64(None);
-    }
-    if matches!(op, BinOp::Div) {
-        let Some(l) = left.numeric_f64() else {
-            return ScalarValue::Float64(None);
-        };
-        let Some(r) = right.numeric_f64() else {
-            return ScalarValue::Float64(None);
-        };
-        if r == 0.0 {
-            return ScalarValue::Float64(None);
-        }
-        return ScalarValue::Float64(Some(l / r));
-    }
-    if let (Some(l), Some(r)) = (left.integer_i128(), right.integer_i128()) {
         return match op {
-            BinOp::Add => i64::try_from(l + r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Sub => i64::try_from(l - r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Mul => i64::try_from(l * r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Div => unreachable!("division is handled before integer arithmetic"),
-            BinOp::Mod if r != 0 => i64::try_from(l % r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
-            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
-            BinOp::Lt => ScalarValue::Bool(Some(l < r)),
-            BinOp::Gt => ScalarValue::Bool(Some(l > r)),
-            BinOp::Lte => ScalarValue::Bool(Some(l <= r)),
-            BinOp::Gte => ScalarValue::Bool(Some(l >= r)),
-            _ => ScalarValue::Bool(None),
+            Eq | Neq | Lt | Gt | Lte | Gte | And | Or => ScalarValue::Bool(None),
+            _ => ScalarValue::Int64(None),
         };
     }
-    match (left, right) {
-        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => match op {
-            BinOp::And => ScalarValue::Bool(Some(*l && *r)),
-            BinOp::Or => ScalarValue::Bool(Some(*l || *r)),
-            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
-            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
-            _ => ScalarValue::Bool(None),
-        },
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => match op {
-            BinOp::Add => ScalarValue::Int64(Some(l + r)),
-            BinOp::Sub => ScalarValue::Int64(Some(l - r)),
-            BinOp::Mul => ScalarValue::Int64(Some(l * r)),
-            BinOp::Div => unreachable!("division is handled before integer arithmetic"),
-            BinOp::Mod if *r != 0 => ScalarValue::Int64(Some(l % r)),
-            BinOp::Mod => ScalarValue::Int64(None),
-            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
-            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
-            BinOp::Lt => ScalarValue::Bool(Some(l < r)),
-            BinOp::Gt => ScalarValue::Bool(Some(l > r)),
-            BinOp::Lte => ScalarValue::Bool(Some(l <= r)),
-            BinOp::Gte => ScalarValue::Bool(Some(l >= r)),
-            BinOp::And | BinOp::Or => ScalarValue::Bool(None),
-            _ => ScalarValue::Bool(None),
-        },
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => match op {
-            BinOp::Add => ScalarValue::Float64(Some(l + r)),
-            BinOp::Sub => ScalarValue::Float64(Some(l - r)),
-            BinOp::Mul => ScalarValue::Float64(Some(l * r)),
-            BinOp::Div => ScalarValue::Float64(Some(l / r)),
-            BinOp::Mod => ScalarValue::Float64(Some(l % r)),
-            _ => ScalarValue::Bool(None),
-        },
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => match op {
-            BinOp::Add => ScalarValue::Int32(Some(l + r)),
-            BinOp::Sub => ScalarValue::Int32(Some(l - r)),
-            _ => ScalarValue::Bool(None),
-        },
-        _ => ScalarValue::Int64(None),
+    match op {
+        And => {
+            let (l, r) = (as_bool(left), as_bool(right));
+            if l == Some(false) || r == Some(false) {
+                ScalarValue::Bool(Some(false))
+            } else if let (Some(l), Some(r)) = (l, r) {
+                ScalarValue::Bool(Some(l && r))
+            } else {
+                ScalarValue::Bool(None)
+            }
+        }
+        Or => {
+            let (l, r) = (as_bool(left), as_bool(right));
+            if l == Some(true) || r == Some(true) {
+                ScalarValue::Bool(Some(true))
+            } else if let (Some(l), Some(r)) = (l, r) {
+                ScalarValue::Bool(Some(l || r))
+            } else {
+                ScalarValue::Bool(None)
+            }
+        }
+        Eq | Neq | Lt | Gt | Lte | Gte => {
+            let matched = match (left, right) {
+                (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => Some(if l == r {
+                    std::cmp::Ordering::Equal
+                } else if *l {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }),
+                _ => left.numeric_cmp(right).or_else(|| match (left, right) {
+                    (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => {
+                        Some(l.cmp(r))
+                    }
+                    (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => Some(l.cmp(r)),
+                    (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => {
+                        Some(l.cmp(r))
+                    }
+                    _ => None,
+                }),
+            };
+            match matched.map(|ord| match op {
+                Eq => ord == std::cmp::Ordering::Equal,
+                Neq => ord != std::cmp::Ordering::Equal,
+                Lt => ord == std::cmp::Ordering::Less,
+                Gt => ord == std::cmp::Ordering::Greater,
+                Lte => ord != std::cmp::Ordering::Greater,
+                Gte => ord != std::cmp::Ordering::Less,
+                _ => unreachable!(),
+            }) {
+                Some(v) => ScalarValue::Bool(Some(v)),
+                None => ScalarValue::Bool(None),
+            }
+        }
+        Add | Sub | Mul | Mod | Div => {
+            if matches!(op, Div) {
+                let (Some(l), Some(r)) = (left.numeric_f64(), right.numeric_f64()) else {
+                    return ScalarValue::Float64(None);
+                };
+                if r == 0.0 {
+                    return ScalarValue::Float64(None);
+                }
+                return ScalarValue::Float64(Some(l / r));
+            }
+            if let (Some(l), Some(r)) = (left.integer_i128(), right.integer_i128()) {
+                return match op {
+                    Div | Mod if r == 0 => ScalarValue::Int64(None),
+                    Mod => i64::try_from(l % r)
+                        .ok()
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .unwrap_or(ScalarValue::Int64(None)),
+                    Add => i64::try_from(l + r)
+                        .ok()
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .unwrap_or(ScalarValue::Int64(None)),
+                    Sub => i64::try_from(l - r)
+                        .ok()
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .unwrap_or(ScalarValue::Int64(None)),
+                    Mul => l
+                        .checked_mul(r)
+                        .and_then(|v| i64::try_from(v).ok())
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .unwrap_or(ScalarValue::Int64(None)),
+                    Div => unreachable!("integer division falls through to floating point"),
+                    _ => unreachable!("non-arithmetic operator in arithmetic evaluation"),
+                };
+            }
+            if matches!(
+                (left, right),
+                (ScalarValue::VarChar(Some(_)), ScalarValue::VarChar(Some(_)))
+            ) {
+                if let (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) =
+                    (left, right)
+                {
+                    return match op {
+                        Add => ScalarValue::VarChar(Some(format!("{l}{r}"))),
+                        _ => ScalarValue::Bool(None),
+                    };
+                }
+            }
+            let (Some(l), Some(r)) = (left.numeric_f64(), right.numeric_f64()) else {
+                return ScalarValue::Int64(None);
+            };
+            let value = match op {
+                Add => l + r,
+                Sub => l - r,
+                Mul => l * r,
+                Div => {
+                    if r == 0.0 {
+                        return ScalarValue::Float64(None);
+                    }
+                    l / r
+                }
+                Mod => {
+                    if r == 0.0 {
+                        return ScalarValue::Float64(None);
+                    }
+                    l % r
+                }
+                _ => unreachable!(),
+            };
+            ScalarValue::Float64(Some(value))
+        }
+        Like | NotLike | In | NotIn => ScalarValue::Bool(None),
+    }
+}
+
+fn as_bool(value: &ScalarValue) -> Option<bool> {
+    match value {
+        ScalarValue::Bool(Some(b)) => Some(*b),
+        _ => None,
     }
 }

@@ -85,13 +85,12 @@ pub fn ast_expr_to_logical_with_context(
     match expr {
         Expr::Literal(v) => Ok(LogicalExpr::Literal(v.clone())),
         Expr::Column(name) => {
-            let idx = schema
-                .index_of(name)
-                .ok_or_else(|| TaibaiError::Sql(format!("column '{}' not found", name)))?;
+            let idx = resolve_column_index_with_outer(name, schema, ctx)?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
-            let idx = resolve_qualified_column_index(table, column, schema, alias_map)?;
+            let idx =
+                resolve_qualified_column_index(table, column, schema, alias_map, ctx.outer.as_ref())?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::BinaryOp { left, op, right } => {
@@ -219,14 +218,34 @@ pub fn ast_expr_to_logical_with_context(
         }
         Expr::Subquery(subquery_stmt) => {
             use super::plan_select_with_context;
-            let subquery_plan = plan_select_with_context(subquery_stmt, ctx)?;
-            Ok(LogicalExpr::ScalarSubquery(Box::new(subquery_plan)))
+            let mut inner_ctx = ctx.clone();
+            inner_ctx.outer = None;
+            match plan_select_with_context(subquery_stmt, &inner_ctx) {
+                Ok(subquery_plan) => Ok(LogicalExpr::ScalarSubquery(Box::new(subquery_plan))),
+                Err(e) if is_correlation_binding_error(&e) => Err(TaibaiError::Sql(format!(
+                    "subquery could not be resolved: {e}. Correlated references are only \
+                     supported in top-level WHERE conjuncts (EXISTS / NOT EXISTS / IN (SELECT ...)); \
+                     outer columns must be qualified with their table alias"
+                ))),
+                Err(e) => Err(e),
+            }
         }
         Expr::Exists(inner) => match inner.as_ref() {
             Expr::Subquery(subquery_stmt) => {
                 use super::plan_select_with_context;
-                let subquery_plan = plan_select_with_context(subquery_stmt, ctx)?;
-                Ok(LogicalExpr::ExistsSubquery(Box::new(subquery_plan)))
+                let mut inner_ctx = ctx.clone();
+                inner_ctx.outer = None;
+                match plan_select_with_context(subquery_stmt, &inner_ctx) {
+                    Ok(subquery_plan) => {
+                        Ok(LogicalExpr::ExistsSubquery(Box::new(subquery_plan)))
+                    }
+                    Err(e) if is_correlation_binding_error(&e) => Err(TaibaiError::Sql(
+                        "correlated EXISTS is only supported as a top-level WHERE conjunct \
+                         (AND-separated), not inside OR / SELECT list / HAVING"
+                            .into(),
+                    )),
+                    Err(e) => Err(e),
+                }
             }
             _ => Err(TaibaiError::Sql("EXISTS requires a subquery".into())),
         },
@@ -251,7 +270,9 @@ pub fn ast_expr_to_logical_with_context(
                 })
             } else {
                 Err(TaibaiError::Sql(
-                    "IN subquery not yet supported in execution".into(),
+                    "IN (SELECT ...) is only supported as an uncorrelated subquery or as a \
+                     top-level WHERE conjunct (AND-separated)"
+                        .into(),
                 ))
             }
         }
@@ -273,7 +294,7 @@ pub fn ast_expr_to_logical(
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
-            let idx = resolve_qualified_column_index(table, column, schema, alias_map)?;
+            let idx = resolve_qualified_column_index(table, column, schema, alias_map, None)?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::BinaryOp { left, op, right } => {
@@ -427,6 +448,7 @@ fn resolve_qualified_column_index(
     column: &str,
     schema: &Schema,
     alias_map: &AliasMap,
+    outer: Option<&crate::sql::planner::OuterScope>,
 ) -> Result<usize> {
     let table_lower = table.to_lowercase();
     if let Some(binding) = alias_map.get(&table_lower) {
@@ -446,22 +468,61 @@ fn resolve_qualified_column_index(
         )));
     }
 
-    let matching_indices: Vec<usize> = schema
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.name.eq_ignore_ascii_case(column))
-        .map(|(i, _)| i)
-        .collect();
-
-    if matching_indices.len() == 1 {
-        return Ok(matching_indices[0]);
+    if let Some(outer) = outer {
+        if let Some(binding) = outer.alias_map.get(&table_lower) {
+            for idx in binding.start..binding.end {
+                if schema
+                    .columns
+                    .get(idx)
+                    .map(|c| c.name.eq_ignore_ascii_case(column))
+                    .unwrap_or(false)
+                {
+                    return Ok(idx);
+                }
+            }
+            return Err(TaibaiError::Sql(format!(
+                "column '{}' not found in table '{}'",
+                column, table
+            )));
+        }
     }
 
     Err(TaibaiError::Sql(format!(
-        "table '{}' not found or column '{}' is ambiguous",
-        table, column
+        "unknown table or alias '{}' (correlated references are only supported in top-level WHERE conjuncts)",
+        table
     )))
+}
+
+fn resolve_column_index_with_outer(
+    name: &str,
+    schema: &Schema,
+    ctx: &crate::sql::planner::PlannerContext,
+) -> Result<usize> {
+    if let Some(outer) = &ctx.outer {
+        let outer_len = outer.outer_len;
+        if let Some(idx) = schema.columns[outer_len.min(schema.columns.len())..]
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(outer_len + idx);
+        }
+        if let Some(idx) = schema.columns[..outer_len.min(schema.columns.len())]
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(idx);
+        }
+        return Err(TaibaiError::Sql(format!("column '{name}' not found")));
+    }
+    schema
+        .index_of(name)
+        .ok_or_else(|| TaibaiError::Sql(format!("column '{name}' not found")))
+}
+
+pub fn is_correlation_binding_error(err: &TaibaiError) -> bool {
+    let msg = err.to_string();
+    msg.contains("unknown table or alias")
+        || (msg.contains("column '") && msg.contains("not found"))
 }
 
 #[allow(clippy::only_used_in_recursion)]
@@ -669,6 +730,331 @@ pub fn extract_aggregates(select_list: &[SelectItem]) -> Vec<(AggFunc, Option<Ex
     aggs
 }
 
+/// Recursively collect aggregate calls from an arbitrary expression tree
+/// (select items, HAVING, ORDER BY). Errors on window functions so they fail
+/// loudly instead of silently producing NULL columns.
+pub fn collect_aggregate_calls(
+    expr: &Expr,
+    aggs: &mut Vec<(AggFunc, Option<Expr>, bool)>,
+) -> Result<()> {
+    match expr {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
+            if aggregate_func(name).is_some() {
+                let arg = if args.is_empty()
+                    || (args.len() == 1 && matches!(&args[0], Expr::Column(n) if n == "*"))
+                {
+                    None
+                } else {
+                    Some(args[0].clone())
+                };
+                aggs.push((aggregate_func(name).unwrap(), arg, *distinct));
+                return Ok(());
+            }
+            for arg in args {
+                collect_aggregate_calls(arg, aggs)?;
+            }
+        }
+        Expr::WindowFunction { .. } => {
+            return Err(TaibaiError::Sql(
+                "window functions are not supported yet".to_string(),
+            ));
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_aggregate_calls(left, aggs)?;
+            collect_aggregate_calls(right, aggs)?;
+        }
+        Expr::UnaryNot(inner) | Expr::UnaryMinus(inner) => {
+            collect_aggregate_calls(inner, aggs)?;
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_aggregate_calls(inner, aggs)?;
+        }
+        Expr::In { expr, values, .. } => {
+            collect_aggregate_calls(expr, aggs)?;
+            for value in values {
+                collect_aggregate_calls(value, aggs)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_aggregate_calls(expr, aggs)?;
+            collect_aggregate_calls(low, aggs)?;
+            collect_aggregate_calls(high, aggs)?;
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                collect_aggregate_calls(operand, aggs)?;
+            }
+            for (when_expr, then_expr) in when_clauses {
+                collect_aggregate_calls(when_expr, aggs)?;
+                collect_aggregate_calls(then_expr, aggs)?;
+            }
+            if let Some(else_expr) = else_clause {
+                collect_aggregate_calls(else_expr, aggs)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_aggregate_calls(expr, aggs)?;
+            collect_aggregate_calls(pattern, aggs)?;
+        }
+        Expr::Exists(inner) => collect_aggregate_calls(inner, aggs)?,
+        Expr::Subquery(stmt) => {
+            if let Statement::Select { select_list, .. } = stmt.as_ref() {
+                for item in select_list {
+                    if let SelectItem::Expr(inner, _) = item {
+                        collect_aggregate_calls(inner, aggs)?;
+                    }
+                }
+            }
+        }
+        Expr::Literal(_)
+        | Expr::Placeholder(_)
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. } => {}
+    }
+    Ok(())
+}
+
+/// Replace bare column references that match a select-list alias (and do not
+/// resolve against the input schema) with the aliased expression. Used for
+/// HAVING / ORDER BY / GROUP BY alias references.
+pub fn substitute_select_aliases(expr: &Expr, aliases: &[(String, Expr)], schema: &Schema) -> Expr {
+    match expr {
+        Expr::Column(name) => {
+            if schema.index_of(name).is_some() {
+                return expr.clone();
+            }
+            let lower = name.to_lowercase();
+            match aliases.iter().find(|(alias, _)| *alias == lower) {
+                Some((_, replacement)) => replacement.clone(),
+                None => expr.clone(),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_select_aliases(left, aliases, schema)),
+            op: *op,
+            right: Box::new(substitute_select_aliases(right, aliases, schema)),
+        },
+        Expr::UnaryNot(inner) => {
+            Expr::UnaryNot(Box::new(substitute_select_aliases(inner, aliases, schema)))
+        }
+        Expr::UnaryMinus(inner) => {
+            Expr::UnaryMinus(Box::new(substitute_select_aliases(inner, aliases, schema)))
+        }
+        Expr::IsNull(inner) => {
+            Expr::IsNull(Box::new(substitute_select_aliases(inner, aliases, schema)))
+        }
+        Expr::IsNotNull(inner) => {
+            Expr::IsNotNull(Box::new(substitute_select_aliases(inner, aliases, schema)))
+        }
+        Expr::In {
+            expr,
+            values,
+            negated,
+        } => Expr::In {
+            expr: Box::new(substitute_select_aliases(expr, aliases, schema)),
+            values: values
+                .iter()
+                .map(|v| substitute_select_aliases(v, aliases, schema))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(substitute_select_aliases(expr, aliases, schema)),
+            low: Box::new(substitute_select_aliases(low, aliases, schema)),
+            high: Box::new(substitute_select_aliases(high, aliases, schema)),
+            negated: *negated,
+        },
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(substitute_select_aliases(e, aliases, schema))),
+            when_clauses: when_clauses
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        substitute_select_aliases(w, aliases, schema),
+                        substitute_select_aliases(t, aliases, schema),
+                    )
+                })
+                .collect(),
+            else_clause: else_clause
+                .as_ref()
+                .map(|e| Box::new(substitute_select_aliases(e, aliases, schema))),
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(substitute_select_aliases(expr, aliases, schema)),
+            pattern: Box::new(substitute_select_aliases(pattern, aliases, schema)),
+            negated: *negated,
+        },
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_select_aliases(a, aliases, schema))
+                .collect(),
+            distinct: *distinct,
+        },
+        other => other.clone(),
+    }
+}
+
+/// After an Aggregate node is planned, references in HAVING / ORDER BY /
+/// projection must point at the aggregate OUTPUT layout:
+///   [group keys..., aggregate results...]
+/// - `Column(i)` matching a GROUP BY key `Column(i)` becomes `Column(group_pos)`.
+/// - `Aggregate(a)` matching a planned aggregate becomes `Column(n_groups + k)`.
+pub fn rewrite_agg_refs(
+    expr: LogicalExpr,
+    group_by: &[LogicalExpr],
+    aggregates: &[AggregateExpr],
+) -> LogicalExpr {
+    if let Some(position) = group_by.iter().position(|g| g == &expr) {
+        return LogicalExpr::Column(position);
+    }
+    match expr {
+        LogicalExpr::Column(_) => {
+            if let Some(position) = group_by.iter().position(|g| g == &expr) {
+                LogicalExpr::Column(position)
+            } else {
+                expr
+            }
+        }
+        LogicalExpr::Aggregate(ref agg) => {
+            if let Some(k) = aggregates.iter().position(|a| a == agg) {
+                LogicalExpr::Column(group_by.len() + k)
+            } else {
+                expr
+            }
+        }
+        LogicalExpr::BinaryOp { left, op, right } => LogicalExpr::BinaryOp {
+            left: Box::new(rewrite_agg_refs(*left, group_by, aggregates)),
+            op,
+            right: Box::new(rewrite_agg_refs(*right, group_by, aggregates)),
+        },
+        LogicalExpr::Not(inner) => {
+            LogicalExpr::Not(Box::new(rewrite_agg_refs(*inner, group_by, aggregates)))
+        }
+        LogicalExpr::IsNull(inner) => {
+            LogicalExpr::IsNull(Box::new(rewrite_agg_refs(*inner, group_by, aggregates)))
+        }
+        LogicalExpr::IsNotNull(inner) => {
+            LogicalExpr::IsNotNull(Box::new(rewrite_agg_refs(*inner, group_by, aggregates)))
+        }
+        LogicalExpr::In {
+            expr,
+            values,
+            negated,
+        } => LogicalExpr::In {
+            expr: Box::new(rewrite_agg_refs(*expr, group_by, aggregates)),
+            values,
+            negated,
+        },
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => LogicalExpr::Between {
+            expr: Box::new(rewrite_agg_refs(*expr, group_by, aggregates)),
+            low: Box::new(rewrite_agg_refs(*low, group_by, aggregates)),
+            high: Box::new(rewrite_agg_refs(*high, group_by, aggregates)),
+            negated,
+        },
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => LogicalExpr::Case {
+            operand: operand.map(|e| Box::new(rewrite_agg_refs(*e, group_by, aggregates))),
+            when_clauses: when_clauses
+                .into_iter()
+                .map(|(w, t)| {
+                    (
+                        rewrite_agg_refs(w, group_by, aggregates),
+                        rewrite_agg_refs(t, group_by, aggregates),
+                    )
+                })
+                .collect(),
+            else_clause: else_clause.map(|e| Box::new(rewrite_agg_refs(*e, group_by, aggregates))),
+        },
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => LogicalExpr::Like {
+            expr: Box::new(rewrite_agg_refs(*expr, group_by, aggregates)),
+            pattern,
+            negated,
+        },
+        LogicalExpr::Function { name, args } => LogicalExpr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| rewrite_agg_refs(a, group_by, aggregates))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+/// True when the logical expression contains an aggregate call.
+pub fn contains_aggregate(expr: &LogicalExpr) -> bool {
+    match expr {
+        LogicalExpr::Aggregate(_) => true,
+        LogicalExpr::BinaryOp { left, right, .. } => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        LogicalExpr::Not(inner) | LogicalExpr::IsNull(inner) | LogicalExpr::IsNotNull(inner) => {
+            contains_aggregate(inner)
+        }
+        LogicalExpr::In { expr, .. } => contains_aggregate(expr),
+        LogicalExpr::Between {
+            expr, low, high, ..
+        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand.as_deref().is_some_and(contains_aggregate)
+                || when_clauses
+                    .iter()
+                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
+                || else_clause.as_deref().is_some_and(contains_aggregate)
+        }
+        LogicalExpr::Like { expr, .. } => contains_aggregate(expr),
+        LogicalExpr::Function { args, .. } => args.iter().any(contains_aggregate),
+        _ => false,
+    }
+}
+
 fn extract_aggs_from_expr(expr: &Expr, aggs: &mut Vec<(AggFunc, Option<Expr>, bool)>) {
     if let Expr::Function {
         name,
@@ -703,6 +1089,7 @@ pub fn expr_to_name(expr: &Expr) -> String {
                 BinOp::Sub => "-",
                 BinOp::Mul => "*",
                 BinOp::Div => "/",
+                BinOp::Mod => "%",
                 _ => "?",
             };
             format!("{} {} {}", l, op_str, r)
@@ -826,7 +1213,33 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
             .map(|c| c.data_type)
             .unwrap_or(DataType::Int64),
         LogicalExpr::Literal(v) => v.data_type(),
-        LogicalExpr::BinaryOp { .. } => DataType::Int64,
+        LogicalExpr::BinaryOp { left, op, right } => {
+            if matches!(
+                op,
+                BinOp::Eq
+                    | BinOp::Neq
+                    | BinOp::Lt
+                    | BinOp::Gt
+                    | BinOp::Lte
+                    | BinOp::Gte
+                    | BinOp::And
+                    | BinOp::Or
+            ) {
+                return DataType::Bool;
+            }
+            let left_type = infer_type(left, schema);
+            let right_type = infer_type(right, schema);
+            if matches!(op, BinOp::Div) {
+                return if matches!(left_type, DataType::Decimal)
+                    || matches!(right_type, DataType::Decimal)
+                {
+                    DataType::Decimal
+                } else {
+                    DataType::Float64
+                };
+            }
+            crate::sql::binder::type_resolver::common_type(&left_type, &right_type)
+        }
         LogicalExpr::Aggregate(agg) => match agg.func {
             AggFunc::Count => DataType::Int64,
             _ => DataType::Float64,

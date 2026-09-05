@@ -1205,7 +1205,12 @@ fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &Expr) -> Result<
             Expr::IsNotNull(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
         }
         Expr::Exists(inner) => {
-            Expr::Exists(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
+            if let Expr::Subquery(subquery) = inner.as_ref() {
+                let exists = super::query::execute_exists_subquery(engine, db, subquery)?;
+                Expr::Literal(ScalarValue::Bool(Some(exists)))
+            } else {
+                Expr::Exists(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
+            }
         }
         Expr::In {
             expr: inner,
@@ -1286,7 +1291,8 @@ fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &Expr) -> Result<
             distinct: *distinct,
         },
         Expr::Subquery(subquery) => {
-            Expr::Subquery(Box::new(resolve_stmt_in_subqueries(engine, db, subquery)?))
+            let value = super::query::execute_scalar_subquery(engine, db, subquery)?;
+            Expr::Literal(value)
         }
         Expr::WindowFunction {
             func,

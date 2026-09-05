@@ -53,7 +53,9 @@ fn insert_rows_offset(engine: &Engine, session: &mut Session, key: &str, count: 
             .map(|t| {
                 format!(
                     "('{}', {}, {}, 1788485400000, 1788485400000, 100.5, 99.5, 1, 1.0)",
-                    key, DEAL_DATE, offset + t
+                    key,
+                    DEAL_DATE,
+                    offset + t
                 )
             })
             .collect();
@@ -143,11 +145,8 @@ fn replace_rows(engine: &Engine, session: &mut Session, key: &str, count: i64) {
     }
 }
 
-fn assert_groups(label: &str, engine: &Engine, session: &mut Session, expected: &[( &str, i64)]) {
-    let mut want: Vec<(String, i64)> = expected
-        .iter()
-        .map(|(k, c)| (k.to_string(), *c))
-        .collect();
+fn assert_groups(label: &str, engine: &Engine, session: &mut Session, expected: &[(&str, i64)]) {
+    let mut want: Vec<(String, i64)> = expected.iter().map(|(k, c)| (k.to_string(), *c)).collect();
     want.sort();
     let got = group_by_counts(engine, session);
     assert_eq!(got, want, "{}: group by mismatch", label);
@@ -163,20 +162,51 @@ fn delete_visibility_after_flush() {
         .execute(&mut session, "FLUSH TABLE t_repro")
         .expect("flush");
 
-    assert_groups("baseline", &engine, &mut session, &[(KEY_A, 200), (KEY_B, 200)]);
+    assert_groups(
+        "baseline",
+        &engine,
+        &mut session,
+        &[(KEY_A, 200), (KEY_B, 200)],
+    );
 
     delete_key(&engine, &mut session, KEY_A);
-    assert_eq!(point_count(&engine, &mut session, KEY_A), 0, "count after delete");
-    assert_eq!(point_select(&engine, &mut session, KEY_A), 0, "point select after delete");
+    assert_eq!(
+        point_count(&engine, &mut session, KEY_A),
+        0,
+        "count after delete"
+    );
+    assert_eq!(
+        point_select(&engine, &mut session, KEY_A),
+        0,
+        "point select after delete"
+    );
     assert_groups("after delete", &engine, &mut session, &[(KEY_B, 200)]);
 
     replace_rows(&engine, &mut session, KEY_A, 200);
-    assert_eq!(point_count(&engine, &mut session, KEY_A), 200, "count after replace");
-    assert_groups("after replace", &engine, &mut session, &[(KEY_A, 200), (KEY_B, 200)]);
+    assert_eq!(
+        point_count(&engine, &mut session, KEY_A),
+        200,
+        "count after replace"
+    );
+    assert_groups(
+        "after replace",
+        &engine,
+        &mut session,
+        &[(KEY_A, 200), (KEY_B, 200)],
+    );
 
     delete_key(&engine, &mut session, KEY_A);
-    assert_groups("after second delete", &engine, &mut session, &[(KEY_B, 200)]);
-    assert_eq!(point_select(&engine, &mut session, KEY_A), 0, "point select after second delete");
+    assert_groups(
+        "after second delete",
+        &engine,
+        &mut session,
+        &[(KEY_B, 200)],
+    );
+    assert_eq!(
+        point_select(&engine, &mut session, KEY_A),
+        0,
+        "point select after second delete"
+    );
 
     engine.segment_mgr().shutdown();
 }
@@ -189,12 +219,25 @@ fn delete_visibility_memtable_only() {
     insert_rows(&engine, &mut session, KEY_B, 200);
 
     delete_key(&engine, &mut session, KEY_A);
-    assert_eq!(point_count(&engine, &mut session, KEY_A), 0, "count after delete");
-    assert_eq!(point_select(&engine, &mut session, KEY_A), 0, "point select after delete");
+    assert_eq!(
+        point_count(&engine, &mut session, KEY_A),
+        0,
+        "count after delete"
+    );
+    assert_eq!(
+        point_select(&engine, &mut session, KEY_A),
+        0,
+        "point select after delete"
+    );
     assert_groups("after delete", &engine, &mut session, &[(KEY_B, 200)]);
 
     replace_rows(&engine, &mut session, KEY_A, 200);
-    assert_groups("after replace", &engine, &mut session, &[(KEY_A, 200), (KEY_B, 200)]);
+    assert_groups(
+        "after replace",
+        &engine,
+        &mut session,
+        &[(KEY_A, 200), (KEY_B, 200)],
+    );
 
     engine.segment_mgr().shutdown();
 }
@@ -208,7 +251,12 @@ fn delete_visibility_replace_after_flush() {
     engine
         .execute(&mut session, "FLUSH TABLE t_repro")
         .expect("flush");
-    assert_groups("baseline", &engine, &mut session, &[(KEY_A, 200), (KEY_B, 200)]);
+    assert_groups(
+        "baseline",
+        &engine,
+        &mut session,
+        &[(KEY_A, 200), (KEY_B, 200)],
+    );
 
     for round in 1..=3u32 {
         replace_rows(&engine, &mut session, KEY_A, 200);
@@ -231,12 +279,7 @@ fn delete_visibility_replace_after_flush() {
             "point select after delete round {}",
             round
         );
-        assert_groups(
-            "after delete",
-            &engine,
-            &mut session,
-            &[(KEY_B, 200)],
-        );
+        assert_groups("after delete", &engine, &mut session, &[(KEY_B, 200)]);
     }
 
     engine.segment_mgr().shutdown();
@@ -260,8 +303,16 @@ fn delete_visibility_mixed_memtable_and_segment() {
         &[(KEY_A, 400), (KEY_B, 200)],
     );
     delete_key(&engine, &mut session, KEY_A);
-    assert_eq!(point_count(&engine, &mut session, KEY_A), 0, "count after delete");
-    assert_eq!(point_select(&engine, &mut session, KEY_A), 0, "point select after delete");
+    assert_eq!(
+        point_count(&engine, &mut session, KEY_A),
+        0,
+        "count after delete"
+    );
+    assert_eq!(
+        point_select(&engine, &mut session, KEY_A),
+        0,
+        "point select after delete"
+    );
     assert_groups("after delete", &engine, &mut session, &[(KEY_B, 200)]);
 
     engine.segment_mgr().shutdown();

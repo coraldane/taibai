@@ -243,7 +243,12 @@ impl Parser {
 
             let is_join = matches!(
                 self.peek(),
-                Token::Join | Token::Inner | Token::Left | Token::Right | Token::Cross
+                Token::Join
+                    | Token::Inner
+                    | Token::Left
+                    | Token::Right
+                    | Token::Full
+                    | Token::Cross
             );
             if !is_join {
                 break;
@@ -295,6 +300,7 @@ impl Parser {
                         | Token::Inner
                         | Token::Left
                         | Token::Right
+                        | Token::Full
                         | Token::Cross
                         | Token::On
                         | Token::Where
@@ -331,6 +337,13 @@ impl Parser {
             }
             self.expect(&Token::Join)?;
             JoinType::Right
+        } else if self.peek() == &Token::Full {
+            self.advance();
+            if self.peek() == &Token::Outer {
+                self.advance();
+            }
+            self.expect(&Token::Join)?;
+            JoinType::Full
         } else if self.peek() == &Token::Cross {
             self.advance();
             self.expect(&Token::Join)?;

@@ -33,6 +33,65 @@ pub trait ExecutionOp {
     }
 }
 
+pub struct DistinctExec {
+    input: Box<dyn ExecutionOp>,
+    emitted: bool,
+}
+
+impl DistinctExec {
+    pub fn new(input: Box<dyn ExecutionOp>) -> Self {
+        Self {
+            input,
+            emitted: false,
+        }
+    }
+}
+
+impl ExecutionOp for DistinctExec {
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        let mut seen = std::collections::HashSet::new();
+        let mut columns: Vec<crate::types::array::ColumnArray> = Vec::new();
+        let mut output_schema: Option<Schema> = None;
+        while let Some(batch) = self.input.next_batch()? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if output_schema.is_none() {
+                output_schema = Some(batch.schema.clone());
+                for def in &batch.schema.columns {
+                    columns.push(crate::types::array::ColumnArray::empty(def.data_type));
+                }
+            }
+            for row in 0..batch.num_rows() {
+                let key = (0..batch.num_columns())
+                    .map(|c| {
+                        batch
+                            .scalar(row, c)
+                            .map(|v| v.to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\u{1f}");
+                if seen.insert(key) {
+                    for (col_idx, out) in columns.iter_mut().enumerate() {
+                        if let Some(value) = batch.scalar(row, col_idx) {
+                            out.push(&value)?;
+                        }
+                    }
+                }
+            }
+        }
+        match output_schema {
+            Some(schema) => Ok(Some(RecordBatch::try_new(schema, columns)?)),
+            None => Ok(None),
+        }
+    }
+}
+
 pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
     if mask.iter().all(|&m| m) {
         return batch.clone();
@@ -95,7 +154,8 @@ pub fn build_pipeline(
         LogicalPlan::Aggregate(agg) => {
             let input_schema = get_scan_schema(&agg.input);
             let input = build_pipeline(*agg.input, table_batches)?;
-            let mut exec = HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
+            let mut exec =
+                HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
             if let Some(having) = agg.having {
                 exec = exec.with_having(having);
             }
@@ -144,7 +204,7 @@ pub fn build_pipeline(
         }
         LogicalPlan::Distinct(distinct) => {
             let input = build_pipeline(*distinct.input, table_batches)?;
-            Ok(input)
+            Ok(Box::new(DistinctExec::new(input)))
         }
         LogicalPlan::Window(window) => {
             let input = build_pipeline(*window.input, table_batches)?;
@@ -158,10 +218,11 @@ fn get_scan_schema(plan: &LogicalPlan) -> Schema {
     match plan {
         LogicalPlan::Scan(s) => s.schema.clone(),
         LogicalPlan::Filter(f) => get_scan_schema(&f.input),
-        LogicalPlan::Project(p) => get_scan_schema(&p.input),
+        LogicalPlan::Project(_) | LogicalPlan::Aggregate(_) => {
+            crate::sql::execution::physical::planner::get_scan_schema(plan)
+        }
         LogicalPlan::Sort(s) => get_scan_schema(&s.input),
         LogicalPlan::Limit(l) => get_scan_schema(&l.input),
-        LogicalPlan::Aggregate(a) => get_scan_schema(&a.input),
         LogicalPlan::Join(j) => j.output_schema.clone(),
         LogicalPlan::SemiJoin(s) => s.left_schema.clone(),
         LogicalPlan::TopN(t) => get_scan_schema(&t.input),

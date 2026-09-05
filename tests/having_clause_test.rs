@@ -73,8 +73,15 @@ fn having_filters_groups_by_aggregate_predicate() {
             .expect("having query"),
     );
 
-    assert_eq!(rows.len(), 1, "only the violating group must survive: {rows:?}");
-    assert_eq!(rows[0][0], ScalarValue::VarChar(Some("000862.SZ".to_string())));
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the violating group must survive: {rows:?}"
+    );
+    assert_eq!(
+        rows[0][0],
+        ScalarValue::VarChar(Some("000862.SZ".to_string()))
+    );
     assert_eq!(rows[0][1], ScalarValue::Int32(Some(925)));
     assert_eq!(rows[0][2], ScalarValue::Int32(Some(1459)));
 }
@@ -97,7 +104,10 @@ fn having_false_predicate_returns_no_rows() {
             .expect("having query"),
     );
 
-    assert!(rows.is_empty(), "always-false HAVING must filter everything: {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "always-false HAVING must filter everything: {rows:?}"
+    );
 }
 
 #[test]
@@ -118,8 +128,15 @@ fn having_supports_group_column_equality() {
             .expect("having group column query"),
     );
 
-    assert_eq!(rows.len(), 1, "HAVING on group column must keep exactly one group: {rows:?}");
-    assert_eq!(rows[0][0], ScalarValue::VarChar(Some("603050.SH".to_string())));
+    assert_eq!(
+        rows.len(),
+        1,
+        "HAVING on group column must keep exactly one group: {rows:?}"
+    );
+    assert_eq!(
+        rows[0][0],
+        ScalarValue::VarChar(Some("603050.SH".to_string()))
+    );
 }
 
 #[test]
@@ -136,7 +153,10 @@ fn having_without_group_by_filters_global_aggregate() {
             .expect("having global aggregate query"),
     );
 
-    assert!(rows.is_empty(), "global HAVING count > 100 must filter the single row: {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "global HAVING count > 100 must filter the single row: {rows:?}"
+    );
 }
 
 #[test]
@@ -157,8 +177,15 @@ fn having_and_predicate_combinations() {
             .expect("having and query"),
     );
 
-    assert_eq!(rows.len(), 1, "AND combination must keep only the 925 group: {rows:?}");
-    assert_eq!(rows[0][0], ScalarValue::VarChar(Some("000862.SZ".to_string())));
+    assert_eq!(
+        rows.len(),
+        1,
+        "AND combination must keep only the 925 group: {rows:?}"
+    );
+    assert_eq!(
+        rows[0][0],
+        ScalarValue::VarChar(Some("000862.SZ".to_string()))
+    );
 }
 
 #[test]

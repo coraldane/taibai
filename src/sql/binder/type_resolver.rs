@@ -6,6 +6,7 @@ pub fn common_type(a: &DataType, b: &DataType) -> DataType {
     }
     match (a, b) {
         (DataType::Decimal, _) | (_, DataType::Decimal) => DataType::Decimal,
+        (DataType::VarChar, DataType::VarChar) => DataType::VarChar,
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float32,
         (DataType::UInt64, _) | (_, DataType::UInt64) => DataType::UInt64,

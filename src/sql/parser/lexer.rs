@@ -369,6 +369,10 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                     Token::Ident("/".into())
                 }
+                b'%' => {
+                    self.pos += 1;
+                    Token::Ident("%".into())
+                }
                 b'-' => {
                     self.pos += 1;
                     if self
