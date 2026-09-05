@@ -190,6 +190,9 @@ fn expr_complexity(expr: &LogicalExpr) -> usize {
         LogicalExpr::InSubquery { expr, subquery, .. } => {
             1 + expr_complexity(expr) + plan_complexity(subquery)
         }
+        LogicalExpr::CorrelatedSubquery(corr) => {
+            1 + corr.lhs.as_ref().map(|e| expr_complexity(e)).unwrap_or(0)
+        }
     }
 }
 

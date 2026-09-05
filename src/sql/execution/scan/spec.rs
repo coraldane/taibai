@@ -209,6 +209,13 @@ fn secondary_index_columns(
 
 fn collect_expr_columns(expr: &LogicalExpr, cols: &mut Vec<usize>) {
     match expr {
+        LogicalExpr::CorrelatedSubquery(corr) => {
+            for (_, outer_idx) in &corr.params {
+                if !cols.contains(outer_idx) {
+                    cols.push(*outer_idx);
+                }
+            }
+        }
         LogicalExpr::Column(idx) => {
             if !cols.contains(idx) {
                 cols.push(*idx);
@@ -292,8 +299,23 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
         LogicalPlan::Filter(f) => collect_from_plan(&f.input, table_name, schema, spec),
         LogicalPlan::Project(p) => {
             collect_from_plan(&p.input, table_name, schema, spec);
-            if spec.remaining_predicate.is_none() && !spec.has_join {
-                if let Some(cols) = plain_projection_columns(&p.expressions) {
+            // Above an Aggregate, projection expressions index the aggregate
+            // OUTPUT, not this table's columns; slicing the scan by them
+            // would drop group-key columns (materialized pipeline only).
+            if spec.remaining_predicate.is_none() && !spec.has_join && !spec.has_aggregate {
+                if let Some(mut cols) = plain_projection_columns(&p.expressions) {
+                    // Filters sitting between this projection and the scan
+                    // still evaluate over the scan output; predicates that
+                    // were not pushed into the scan (e.g. correlated
+                    // subqueries) must keep their columns alive.
+                    let mut filter_cols = Vec::new();
+                    collect_intermediate_filter_cols(&p.input, &mut filter_cols);
+                    for idx in filter_cols {
+                        if !cols.contains(&idx) {
+                            cols.push(idx);
+                        }
+                    }
+                    cols.sort_unstable();
                     spec.projection = Some(cols);
                 }
             }
@@ -357,6 +379,32 @@ fn collect_sort_keys(
         if !spec.order_by.contains(&sort_key) {
             spec.order_by.push(sort_key);
         }
+    }
+}
+
+/// Columns referenced by predicates that remain as explicit Filter
+/// operators between `plan` and its scan (not pushed into the scan spec).
+fn collect_intermediate_filter_cols(plan: &LogicalPlan, cols: &mut Vec<usize>) {
+    match plan {
+        LogicalPlan::Filter(f) => {
+            crate::sql::planner::collect_cols_from_expr(&f.predicate, cols);
+            collect_intermediate_filter_cols(&f.input, cols);
+        }
+        LogicalPlan::Sort(s) => {
+            for key in &s.sort_keys {
+                crate::sql::planner::collect_cols_from_expr(&key.expr, cols);
+            }
+            collect_intermediate_filter_cols(&s.input, cols);
+        }
+        LogicalPlan::Limit(l) => collect_intermediate_filter_cols(&l.input, cols),
+        LogicalPlan::Distinct(d) => collect_intermediate_filter_cols(&d.input, cols),
+        LogicalPlan::TopN(t) => {
+            for key in &t.sort_keys {
+                crate::sql::planner::collect_cols_from_expr(&key.expr, cols);
+            }
+            collect_intermediate_filter_cols(&t.input, cols);
+        }
+        _ => {}
     }
 }
 

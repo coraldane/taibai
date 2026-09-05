@@ -161,3 +161,9 @@ path = "tests/delete_visibility_regression_test.rs"
 [[test]]
 name = "sql_semantics_regression_test"
 path = "tests/sql_semantics_regression_test.rs"
+
+[[test]]
+name = "subquery_derived_table_test"
+path = "tests/subquery_derived_table_test.rs"
+
+

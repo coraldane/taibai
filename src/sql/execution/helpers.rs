@@ -287,6 +287,9 @@ pub fn eval_where_clause(
             Ok(if *negated { !matched } else { matched })
         }
         Expr::Exists(_) => Ok(true),
+        Expr::Correlated(_) => Err(TaibaiError::Sql(
+            "correlated subqueries are not supported in this context".to_string(),
+        )),
         Expr::Subquery(_) => Ok(true),
         Expr::WindowFunction { .. } => Ok(true),
         Expr::Placeholder(_) => Ok(true),
@@ -369,6 +372,9 @@ pub fn eval_expr_for_row(
             })))
         }
         Expr::Exists(_) => Ok(ScalarValue::Bool(None)),
+        Expr::Correlated(_) => Err(TaibaiError::Sql(
+            "correlated subqueries are not supported in this context".to_string(),
+        )),
         Expr::Subquery(_) => Ok(ScalarValue::Int64(None)),
         Expr::WindowFunction { .. } => Ok(ScalarValue::Int64(None)),
         Expr::Placeholder(_) => Ok(ScalarValue::Int64(None)),
@@ -893,6 +899,7 @@ fn collect_expr_column_indices_inner(expr: &Expr, schema: &Schema, indices: &mut
         | Expr::IsNull(inner)
         | Expr::IsNotNull(inner)
         | Expr::Exists(inner) => collect_expr_column_indices_inner(inner, schema, indices),
+        Expr::Correlated(_) => {}
         Expr::In { expr, values, .. } => {
             collect_expr_column_indices_inner(expr, schema, indices);
             for item in values {

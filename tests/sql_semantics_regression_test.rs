@@ -354,15 +354,13 @@ fn order_by_and_limit_offset() {
         "LIMIT with OFFSET"
     );
 
-    let message = query_err(
+    // Derived table with its own LIMIT, aggregated outside.
+    let rows = query(
         &engine,
         &mut session,
         "SELECT COUNT(*) FROM (SELECT 1 AS x FROM t_quote LIMIT 5) sub",
     );
-    assert!(
-        message.contains("not yet supported"),
-        "derived table in FROM must report a clear error, got: {message}"
-    );
+    assert_eq!(rows, vec![vec![i64(5)]], "derived table with LIMIT");
 
     let rows = query(
         &engine,
@@ -851,27 +849,23 @@ fn subqueries_in_where() {
     );
     assert_eq!(rows, vec![vec![i64(4)]], "NOT IN subquery");
 
-    let message = query_err(
+    // Correlated subqueries are supported: 11 of 12 quote rows have a
+    // matching security (only 688001.SH is missing from t_security).
+    let rows = query(
         &engine,
         &mut session,
         "SELECT COUNT(*) FROM t_quote q WHERE EXISTS
             (SELECT 1 FROM t_security sec WHERE sec.security_id = q.security_id)",
     );
-    assert!(
-        message.contains("correlated subqueries are not supported"),
-        "correlated EXISTS must fail loudly instead of returning wrong data, got: {message}"
-    );
+    assert_eq!(rows, vec![vec![i64(11)]], "correlated EXISTS");
 
-    let message = query_err(
+    let rows = query(
         &engine,
         &mut session,
         "SELECT COUNT(*) FROM t_quote q WHERE NOT EXISTS
             (SELECT 1 FROM t_security sec WHERE sec.security_id = q.security_id)",
     );
-    assert!(
-        message.contains("correlated subqueries are not supported"),
-        "correlated NOT EXISTS must fail loudly instead of returning wrong data, got: {message}"
-    );
+    assert_eq!(rows, vec![vec![i64(1)]], "correlated NOT EXISTS");
 
     let rows = query(
         &engine,
@@ -883,21 +877,17 @@ fn subqueries_in_where() {
 }
 
 #[test]
-fn derived_table_reports_clear_error() {
+fn derived_table_basic_count() {
     let (_temp_dir, engine, mut session) = create_engine();
     seed_quote_tables(&engine, &mut session);
 
-    let message = query_err(
+    // FROM derived tables are fully supported (previously a planner error).
+    let rows = query(
         &engine,
         &mut session,
         "SELECT COUNT(*) FROM (SELECT security_id FROM t_quote) sub",
     );
-    assert!(
-        message.contains("not yet supported")
-            || message.contains("alias")
-            || message.contains("subquery"),
-        "derived table should fail with a clear error, got: {message}"
-    );
+    assert_eq!(rows, vec![vec![i64(12)]], "derived table count");
 }
 
 #[test]

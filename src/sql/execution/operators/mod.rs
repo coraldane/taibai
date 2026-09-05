@@ -15,6 +15,8 @@ use crate::common::error::Result;
 use crate::sql::planner::*;
 use crate::types::batch::{RecordBatch, Schema};
 
+use crate::sql::execution::subquery_runtime::SubqueryRegistry;
+
 use aggregate::HashAggregateExec;
 use filter::FilterExec;
 use join::HashJoinExec;
@@ -107,6 +109,18 @@ pub fn build_pipeline(
     plan: LogicalPlan,
     table_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<Box<dyn ExecutionOp>> {
+    build_pipeline_with_subqueries(plan, table_batches, None)
+}
+
+/// Build a materialized pipeline. `subqueries` carries the per-query
+/// snapshot registry that lets Filter/Project evaluate correlated subquery
+/// nodes; nested subquery execution always passes `None` (nested correlated
+/// subqueries are rejected at bind time).
+pub fn build_pipeline_with_subqueries(
+    plan: LogicalPlan,
+    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    subqueries: Option<&SubqueryRegistry>,
+) -> Result<Box<dyn ExecutionOp>> {
     match plan {
         LogicalPlan::Scan(scan) => {
             let batches = table_batches
@@ -119,31 +133,33 @@ pub fn build_pipeline(
         }
         LogicalPlan::Filter(filter) => {
             let schema = get_scan_schema(&filter.input);
-            let input = build_pipeline(*filter.input, table_batches)?;
+            let input = build_pipeline_with_subqueries(*filter.input, table_batches, subqueries)?;
             Ok(Box::new(FilterExec {
                 predicate: filter.predicate,
                 input,
                 schema: schema.clone(),
+                subqueries: subqueries.cloned(),
             }))
         }
         LogicalPlan::Project(proj) => {
             let input_schema = get_scan_schema(&proj.input);
-            let input = build_pipeline(*proj.input, table_batches)?;
+            let input = build_pipeline_with_subqueries(*proj.input, table_batches, subqueries)?;
             Ok(Box::new(ProjectExec {
                 expressions: proj.expressions,
                 aliases: proj.aliases,
                 input,
                 input_schema,
+                subqueries: subqueries.cloned(),
             }))
         }
         LogicalPlan::Sort(sort) => {
             let schema = get_scan_schema(&sort.input);
-            let input = build_pipeline(*sort.input, table_batches)?;
+            let input = build_pipeline_with_subqueries(*sort.input, table_batches, subqueries)?;
             Ok(Box::new(SortExec::new(sort.sort_keys, input, schema)))
         }
         LogicalPlan::Limit(limit) => {
             let schema = get_scan_schema(&limit.input);
-            let input = build_pipeline(*limit.input, table_batches)?;
+            let input = build_pipeline_with_subqueries(*limit.input, table_batches, subqueries)?;
             Ok(Box::new(LimitExec::new(
                 limit.limit,
                 limit.offset,
@@ -153,7 +169,7 @@ pub fn build_pipeline(
         }
         LogicalPlan::Aggregate(agg) => {
             let input_schema = get_scan_schema(&agg.input);
-            let input = build_pipeline(*agg.input, table_batches)?;
+            let input = build_pipeline_with_subqueries(*agg.input, table_batches, subqueries)?;
             let mut exec =
                 HashAggregateExec::new(agg.group_by, agg.aggregates, input, input_schema);
             if let Some(having) = agg.having {
@@ -162,8 +178,8 @@ pub fn build_pipeline(
             Ok(Box::new(exec))
         }
         LogicalPlan::Join(join) => {
-            let left = build_pipeline(*join.left, table_batches)?;
-            let right = build_pipeline(*join.right, table_batches)?;
+            let left = build_pipeline_with_subqueries(*join.left, table_batches, subqueries)?;
+            let right = build_pipeline_with_subqueries(*join.right, table_batches, subqueries)?;
             Ok(Box::new(HashJoinExec::new(
                 left,
                 right,
@@ -175,8 +191,8 @@ pub fn build_pipeline(
             )))
         }
         LogicalPlan::SemiJoin(semi) => {
-            let left = build_pipeline(*semi.left, table_batches)?;
-            let right = build_pipeline(*semi.right, table_batches)?;
+            let left = build_pipeline_with_subqueries(*semi.left, table_batches, subqueries)?;
+            let right = build_pipeline_with_subqueries(*semi.right, table_batches, subqueries)?;
             Ok(Box::new(SemiJoinExec::new(
                 left,
                 right,
@@ -188,7 +204,7 @@ pub fn build_pipeline(
         }
         LogicalPlan::TopN(topn) => {
             let schema = get_scan_schema(&topn.input);
-            let input = build_pipeline(*topn.input, table_batches)?;
+            let input = build_pipeline_with_subqueries(*topn.input, table_batches, subqueries)?;
             let sorted = SortExec::new(topn.sort_keys, input, schema.clone())
                 .with_limit(topn.limit.saturating_add(topn.offset));
             if topn.offset == 0 {
@@ -203,11 +219,11 @@ pub fn build_pipeline(
             }
         }
         LogicalPlan::Distinct(distinct) => {
-            let input = build_pipeline(*distinct.input, table_batches)?;
+            let input = build_pipeline_with_subqueries(*distinct.input, table_batches, subqueries)?;
             Ok(Box::new(DistinctExec::new(input)))
         }
         LogicalPlan::Window(window) => {
-            let input = build_pipeline(*window.input, table_batches)?;
+            let input = build_pipeline_with_subqueries(*window.input, table_batches, subqueries)?;
             Ok(input)
         }
         LogicalPlan::Empty => Ok(Box::new(ScanExec::new(vec![], None))),

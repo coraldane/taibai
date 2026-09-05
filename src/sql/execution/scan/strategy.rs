@@ -388,13 +388,13 @@ pub fn read_plain_row_group(
     }
 
     if spec.has_predicates() {
-        Ok(row_filter::apply_predicates(
+        row_filter::apply_predicates(
             &batch,
             &spec.eq_predicates,
             &spec.range_predicates,
             &spec.in_predicates,
             spec.remaining_predicate.as_ref(),
-        ))
+        )
     } else {
         Ok(batch)
     }

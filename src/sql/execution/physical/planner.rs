@@ -108,40 +108,47 @@ fn build_operator_with_limit(
     });
     let operator: Result<Box<dyn ExecutionOp>> = match plan {
         LogicalPlan::Scan(scan) => {
-            let (physical_table_name, database) = {
-                let table_ref = ctx.table_ref(&scan.table_name).ok_or_else(|| {
-                    TaibaiError::Internal(format!("missing table ref for '{}'", scan.table_name))
-                })?;
-                (table_ref.table.clone(), table_ref.database.clone())
-            };
-            let schema = ctx.schema(&scan.table_name).cloned().ok_or_else(|| {
-                TaibaiError::Internal(format!("missing schema for '{}'", scan.table_name))
-            })?;
-            let meta = ctx.meta(&scan.table_name).cloned().ok_or_else(|| {
-                TaibaiError::Internal(format!("missing metadata for '{}'", scan.table_name))
-            })?;
-            let mut spec = compile_scan_spec(
-                &LogicalPlan::Scan(scan.clone()),
-                &scan.table_name,
-                &schema,
-                &meta,
-            );
-            spec.table_name = physical_table_name;
-            if let Some(limit) = limit_hint {
-                spec.limit = Some(spec.limit.map_or(limit, |current| current.min(limit)));
-            }
-            if ctx.is_count_star {
-                spec.is_count_star = true;
-            }
-            if let Some(table_batches) = table_batches {
+            if table_batches.is_some() {
+                // Materialized path: pseudo tables (derived tables,
+                // decorrelated subquery snapshots) carry their schema in the
+                // plan and have no storage metadata.
                 let batches = table_batches
+                    .unwrap()
                     .get(&scan.table_name)
                     .cloned()
                     .unwrap_or_default();
                 Ok(Box::new(
-                    ScanExec::new(batches, scan.projection).with_table_schema(schema),
+                    ScanExec::new(batches, scan.projection).with_table_schema(scan.schema),
                 ))
             } else {
+                let (physical_table_name, database) = {
+                    let table_ref = ctx.table_ref(&scan.table_name).ok_or_else(|| {
+                        TaibaiError::Internal(format!(
+                            "missing table ref for '{}'",
+                            scan.table_name
+                        ))
+                    })?;
+                    (table_ref.table.clone(), table_ref.database.clone())
+                };
+                let schema = ctx.schema(&scan.table_name).cloned().ok_or_else(|| {
+                    TaibaiError::Internal(format!("missing schema for '{}'", scan.table_name))
+                })?;
+                let meta = ctx.meta(&scan.table_name).cloned().ok_or_else(|| {
+                    TaibaiError::Internal(format!("missing metadata for '{}'", scan.table_name))
+                })?;
+                let mut spec = compile_scan_spec(
+                    &LogicalPlan::Scan(scan.clone()),
+                    &scan.table_name,
+                    &schema,
+                    &meta,
+                );
+                spec.table_name = physical_table_name;
+                if let Some(limit) = limit_hint {
+                    spec.limit = Some(spec.limit.map_or(limit, |current| current.min(limit)));
+                }
+                if ctx.is_count_star {
+                    spec.is_count_star = true;
+                }
                 Ok(Box::new(ScanExec::deferred(
                     spec,
                     ctx.scan_runtime.clone(),
@@ -166,6 +173,7 @@ fn build_operator_with_limit(
                 predicate: filter.predicate,
                 input,
                 schema,
+                subqueries: ctx.subqueries.clone(),
             }))
         }
         LogicalPlan::Project(project) => {
@@ -184,6 +192,7 @@ fn build_operator_with_limit(
                 aliases: project.aliases,
                 input,
                 input_schema,
+                subqueries: ctx.subqueries.clone(),
             }))
         }
         LogicalPlan::Sort(sort) => {

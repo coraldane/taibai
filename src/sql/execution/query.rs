@@ -12,7 +12,10 @@ use super::physical::{
     build_physical_pipeline, build_profiled_materialized_pipeline, can_use_physical_pipeline,
     drain_pipeline, PhysicalContext,
 };
-use crate::sql::parser::ast::{Expr, FromClause, ObjectName, SelectItem, Statement, TableRef};
+use crate::sql::parser::ast::{
+    CorrelatedKind, CorrelatedSubquery, Expr, FromClause, ObjectName, SelectItem, Statement,
+    TableRef,
+};
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
 use super::scan::spec::compile_scan_spec;
@@ -34,6 +37,12 @@ where
     else {
         return Ok(None);
     };
+    // Queries with subqueries or derived tables go through the materialized
+    // execution path, which owns subquery resolution and the correlated
+    // runtime.
+    if stmt_has_subquery_or_derived(stmt) {
+        return Ok(None);
+    }
     let resolved_stmt = resolve_in_subqueries(engine, db, stmt)?;
     let resolved_from = match &resolved_stmt {
         Statement::Select {
@@ -101,7 +110,7 @@ pub fn exec_select_with_txn(
     stmt: &Statement,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    exec_select_inner(engine, db, stmt, None, None, reader_txn_id, None)
+    exec_select_inner(engine, db, stmt, None, None, reader_txn_id, None, None)
 }
 
 pub fn exec_union_with_txn(
@@ -295,6 +304,7 @@ pub fn exec_select_with_plan_and_txn(
         Some(cached_plan),
         reader_txn_id,
         None,
+        None,
     )
 }
 
@@ -305,6 +315,7 @@ pub(crate) fn exec_select_with_profile(
     stats: &mut HashMap<String, ScanStats>,
     prepared_plan: LogicalPlan,
     profile: &QueryProfile,
+    pre_resolved: Option<PreResolvedExec<'_>>,
 ) -> Result<ExecResult> {
     exec_select_inner(
         engine,
@@ -314,9 +325,11 @@ pub(crate) fn exec_select_with_profile(
         Some(prepared_plan),
         0,
         Some(profile),
+        pre_resolved,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_select_inner(
     engine: &Engine,
     db: &str,
@@ -325,6 +338,7 @@ fn exec_select_inner(
     cached_plan: Option<LogicalPlan>,
     reader_txn_id: u64,
     profile: Option<&QueryProfile>,
+    pre_resolved: Option<PreResolvedExec<'_>>,
 ) -> Result<ExecResult> {
     let from = match stmt {
         Statement::Select { from, .. } => from,
@@ -336,7 +350,10 @@ fn exec_select_inner(
     };
 
     match from {
-        None => exec_literal_select(stmt),
+        None => {
+            let resolved = resolve_in_subqueries(engine, db, stmt)?;
+            exec_literal_select(&resolved)
+        }
         Some(from_clause) => exec_table_select(
             engine,
             db,
@@ -346,6 +363,7 @@ fn exec_select_inner(
             cached_plan,
             reader_txn_id,
             profile,
+            pre_resolved,
         ),
     }
 }
@@ -394,10 +412,33 @@ fn exec_table_select(
     cached_plan: Option<LogicalPlan>,
     reader_txn_id: u64,
     profile: Option<&QueryProfile>,
+    pre_resolved: Option<PreResolvedExec<'_>>,
 ) -> Result<ExecResult> {
+    let resolved;
     let resolved_stmt;
-    let (stmt, from_clause) = if cached_plan.is_none() {
-        resolved_stmt = resolve_in_subqueries(engine, db, stmt)?;
+    let derived_tables;
+    let mut decorrelated_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let subquery_registry;
+    let has_correlated;
+    let (stmt, from_clause) = if let Some(pre) = pre_resolved {
+        resolved_stmt = pre.resolved.stmt.clone();
+        derived_tables = pre.resolved.derived.clone();
+        subquery_registry = pre.resolved.registry.clone();
+        has_correlated = pre.resolved.has_correlated;
+        decorrelated_batches = pre.extra_batches.clone();
+        let resolved_from = match &resolved_stmt {
+            Statement::Select {
+                from: Some(from), ..
+            } => from,
+            _ => from_clause,
+        };
+        (&resolved_stmt, resolved_from)
+    } else if cached_plan.is_none() {
+        resolved = resolve_query(engine, db, stmt)?;
+        derived_tables = resolved.derived;
+        subquery_registry = resolved.registry;
+        has_correlated = resolved.has_correlated;
+        resolved_stmt = resolved.stmt;
         let resolved_from = match &resolved_stmt {
             Statement::Select {
                 from: Some(from), ..
@@ -406,8 +447,12 @@ fn exec_table_select(
         };
         (&resolved_stmt, resolved_from)
     } else {
+        derived_tables = HashMap::new();
+        subquery_registry = super::subquery_runtime::new_registry();
+        has_correlated = false;
         (stmt, from_clause)
     };
+    let has_derived = !derived_tables.is_empty();
 
     let table_refs = extract_table_refs(from_clause, db);
     let table_names: Vec<String> = table_refs.iter().map(|t| t.key.clone()).collect();
@@ -420,6 +465,16 @@ fn exec_table_select(
         let catalogs = engine.catalogs().read().unwrap();
 
         for table_ref in &table_refs {
+            if table_ref.database == DERIVED_DB {
+                let (schema, _) = derived_tables.get(&table_ref.key).ok_or_else(|| {
+                    TaibaiError::Internal(format!(
+                        "missing materialized derived table '{}'",
+                        table_ref.key
+                    ))
+                })?;
+                table_schemas.insert(table_ref.key.clone(), schema.clone());
+                continue;
+            }
             let catalog = catalogs.get(&table_ref.database).ok_or_else(|| {
                 TaibaiError::Sql(format!("database '{}' does not exist", table_ref.database))
             })?;
@@ -444,16 +499,23 @@ fn exec_table_select(
         Some(p) => p,
         None => {
             let plan = crate::sql::planner::plan_select(stmt, &table_schemas)?;
-            crate::sql::optimizer::optimize(plan)
+            let plan = crate::sql::optimizer::optimize(plan);
+            // Rewrite correlated markers into semi/anti joins where the
+            // shape allows; the rest keep evaluating per-row.
+            let outcome = super::decorrelate::decorrelate(plan, &subquery_registry);
+            decorrelated_batches = outcome.extra_batches;
+            outcome.plan
         }
     };
 
-    let is_count_star = detect_count_star(stmt, &table_names);
+    let is_count_star = !has_derived && !has_correlated && detect_count_star(stmt, &table_names);
     // Simple metadata-aggregate fast path: COUNT/MIN/MAX without GROUP BY.
     // Only detected on a single-table, committed-read query with no stats sink.
     let simple_metadata_aggregates = if reader_txn_id == 0
         && stats.is_none()
         && !is_count_star
+        && !has_derived
+        && !has_correlated
         && table_names.len() == 1
         && detect_simple_metadata_aggregate(stmt, &table_names)
     {
@@ -467,6 +529,8 @@ fn exec_table_select(
         && stats.is_none()
         && !is_count_star
         && !is_simple_metadata
+        && !has_derived
+        && !has_correlated
         && can_use_physical_pipeline(&plan)
     {
         let mut physical_ctx = PhysicalContext::new(
@@ -499,6 +563,9 @@ fn exec_table_select(
         stats,
         reader_txn_id,
         profile,
+        derived_tables,
+        decorrelated_batches,
+        has_correlated.then_some(&subquery_registry),
     )
 }
 
@@ -516,12 +583,18 @@ fn exec_table_select_materialized(
     mut stats: Option<&mut HashMap<String, ScanStats>>,
     reader_txn_id: u64,
     profile: Option<&QueryProfile>,
+    derived_batches: HashMap<String, (Schema, Vec<RecordBatch>)>,
+    decorrelated_batches: HashMap<String, Vec<RecordBatch>>,
+    subqueries: Option<&super::subquery_runtime::SubqueryRegistry>,
 ) -> Result<ExecResult> {
     let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
     let mut scan_seeds: HashMap<String, ScanProfileSeed> = HashMap::new();
 
     for table_ref in table_refs {
+        if table_ref.database == DERIVED_DB {
+            continue;
+        }
         let table_name = &table_ref.key;
         let schema = table_schemas.get(table_name).unwrap().clone();
         let meta = table_metas.get(table_name).unwrap().clone();
@@ -602,9 +675,16 @@ fn exec_table_select_materialized(
         try_skip_sort_for_cluster_key(plan, &table_batches, &table_cluster_keys, &table_schemas)
     };
 
+    for (key, (_, batches)) in derived_batches {
+        table_batches.insert(key, batches);
+    }
+    for (key, batches) in decorrelated_batches {
+        table_batches.entry(key).or_insert(batches);
+    }
     let mut pipeline = if let Some(profile) = profile {
         let mut physical_ctx =
-            PhysicalContext::new(engine, table_refs, &table_schemas, &table_metas, false);
+            PhysicalContext::new(engine, table_refs, &table_schemas, &table_metas, false)
+                .with_subqueries(subqueries.cloned());
         build_profiled_materialized_pipeline(
             plan,
             &mut physical_ctx,
@@ -613,7 +693,7 @@ fn exec_table_select_materialized(
             profile,
         )?
     } else {
-        super::operators::build_pipeline(plan, &table_batches)?
+        super::operators::build_pipeline_with_subqueries(plan, &table_batches, subqueries)?
     };
     tracing::debug!("query: materialized pipeline built, starting next_batch loop");
     let mut result_batches = Vec::new();
@@ -809,6 +889,7 @@ fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &mut Expr) -> Res
                 resolve_expr_in_subqueries(engine, db, &mut item.expr)?;
             }
         }
+        Expr::Correlated(_) => {}
         Expr::Literal(_)
         | Expr::Placeholder(_)
         | Expr::Column(_)
@@ -1126,5 +1207,1091 @@ fn collect_table_refs_from_join(
             TableRef::Table { name, .. } => refs.push(ResolvedTableRef::new(name, default_db)),
             TableRef::Subquery { .. } => {}
         }
+    }
+}
+
+// ============================================================================
+// Derived tables and correlated subqueries
+// ============================================================================
+
+/// Synthetic database that backs materialized derived tables
+/// (`FROM (SELECT ...) alias`). Queries never see it; it only keeps the
+/// rewritten pseudo-table scans out of the real catalog namespace.
+pub const DERIVED_DB: &str = "__derived__";
+
+/// One query block's binding scope: the concatenated FROM schema and the
+/// table alias map, matching how the planner assigns column offsets.
+pub(crate) struct QueryBlockScope {
+    pub schema: Schema,
+    pub alias_map: crate::sql::planner::AliasMap,
+}
+
+/// The fully resolved form of a SELECT: derived tables materialized into
+/// pseudo-table scans, uncorrelated subqueries collapsed into literals, and
+/// correlated subqueries bound into markers registered in `registry`.
+pub(crate) struct ResolvedQuery {
+    pub stmt: Statement,
+    pub derived: HashMap<String, (Schema, Vec<RecordBatch>)>,
+    pub registry: super::subquery_runtime::SubqueryRegistry,
+    pub has_correlated: bool,
+}
+
+/// Carries an already-resolved query (with its derived tables and subquery
+/// registry) into an execution that would otherwise re-resolve. Used by
+/// EXPLAIN ANALYZE, which plans/resolves up front and then executes the
+/// cached plan for profiling.
+pub(crate) struct PreResolvedExec<'a> {
+    pub resolved: &'a ResolvedQuery,
+    /// Decorrelated right-side pseudo-table batches produced alongside the
+    /// cached plan.
+    pub extra_batches: &'a HashMap<String, Vec<RecordBatch>>,
+}
+
+/// Resolve a SELECT statement for execution or planning (also used by
+/// EXPLAIN).
+pub(crate) fn resolve_query(engine: &Engine, db: &str, stmt: &Statement) -> Result<ResolvedQuery> {
+    let mut working = stmt.clone();
+    // 1. Materialize derived tables (FROM (SELECT ...) alias) into
+    //    pseudo-table scans backed by the materialized batches.
+    let derived = materialize_derived_tables(engine, db, &mut working)?;
+    let working_from = match &working {
+        Statement::Select {
+            from: Some(from), ..
+        } => from.clone(),
+        _ => {
+            return Err(TaibaiError::Internal(
+                "resolve_query called with non-SELECT".into(),
+            ))
+        }
+    };
+    // 2. Build the query block scope (concatenated schema + alias map).
+    let mut scope_schemas = HashMap::new();
+    {
+        let catalogs = engine.catalogs().read().unwrap();
+        for table_ref in extract_table_refs(&working_from, db) {
+            if table_ref.database == DERIVED_DB {
+                let (schema, _) = derived.get(&table_ref.key).ok_or_else(|| {
+                    TaibaiError::Internal(format!(
+                        "missing materialized derived table '{}'",
+                        table_ref.key
+                    ))
+                })?;
+                scope_schemas.insert(table_ref.key.clone(), schema.clone());
+            } else {
+                let catalog = catalogs.get(&table_ref.database).ok_or_else(|| {
+                    TaibaiError::Sql(format!("database '{}' does not exist", table_ref.database))
+                })?;
+                let meta = catalog.get_table(&table_ref.table).ok_or_else(|| {
+                    TaibaiError::Sql(format!(
+                        "table '{}.{}' does not exist",
+                        table_ref.database, table_ref.table
+                    ))
+                })?;
+                scope_schemas.insert(table_ref.key.clone(), Schema::new(meta.columns.clone()));
+            }
+        }
+    }
+    let (schema, alias_map) =
+        crate::sql::planner::build_scope_bindings(&working_from, &scope_schemas);
+    let scope = QueryBlockScope { schema, alias_map };
+    // 3. Resolve expression-level subqueries: uncorrelated ones execute
+    //    eagerly; correlated ones are bound into per-row markers.
+    let registry = super::subquery_runtime::new_registry();
+    resolve_query_subqueries(engine, db, &mut working, Some(&scope), &registry, true)?;
+    let has_correlated = super::subquery_runtime::registry_has_snapshots(&registry);
+    Ok(ResolvedQuery {
+        stmt: working,
+        derived,
+        registry,
+        has_correlated,
+    })
+}
+
+/// Rewrite every `FROM (SELECT ...) alias` of the query block into a scan of
+/// a synthetic table, executing each subquery once and keeping its batches.
+fn materialize_derived_tables(
+    engine: &Engine,
+    db: &str,
+    stmt: &mut Statement,
+) -> Result<HashMap<String, (Schema, Vec<RecordBatch>)>> {
+    let mut derived = HashMap::new();
+    if let Statement::Select {
+        from: Some(from), ..
+    } = stmt
+    {
+        let mut counter = 0usize;
+        rewrite_derived_in_from(from, engine, db, &mut counter, &mut derived)?;
+    }
+    Ok(derived)
+}
+
+fn rewrite_derived_in_from(
+    from: &mut FromClause,
+    engine: &Engine,
+    db: &str,
+    counter: &mut usize,
+    derived: &mut HashMap<String, (Schema, Vec<RecordBatch>)>,
+) -> Result<()> {
+    match from {
+        FromClause::Table(table_ref) => {
+            rewrite_derived_table_ref(table_ref, engine, db, counter, derived)
+        }
+        FromClause::Join(join_expr) => {
+            rewrite_derived_in_from(&mut join_expr.left, engine, db, counter, derived)?;
+            for join_clause in &mut join_expr.joins {
+                rewrite_derived_table_ref(&mut join_clause.right, engine, db, counter, derived)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn rewrite_derived_table_ref(
+    table_ref: &mut TableRef,
+    engine: &Engine,
+    db: &str,
+    counter: &mut usize,
+    derived: &mut HashMap<String, (Schema, Vec<RecordBatch>)>,
+) -> Result<()> {
+    if let TableRef::Subquery { query, alias } = table_ref {
+        let subquery = (**query).clone();
+        let (schema, batches) = exec_query_materialized(engine, db, &subquery)?;
+        let pseudo = format!("__derived_{}", *counter);
+        *counter += 1;
+        let object = ObjectName {
+            database: Some(DERIVED_DB.to_string()),
+            name: pseudo,
+        };
+        derived.insert(object.plan_key(), (schema, batches));
+        *table_ref = TableRef::Table {
+            name: object,
+            alias: Some(alias.clone()),
+        };
+    }
+    Ok(())
+}
+
+fn exec_query_materialized(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+) -> Result<(Schema, Vec<RecordBatch>)> {
+    let result = match stmt {
+        Statement::Union { .. } => exec_union_with_txn(engine, db, stmt, 0)?,
+        _ => exec_select(engine, db, stmt)?,
+    };
+    match result {
+        ExecResult::Query { schema, batches } => Ok((schema, batches)),
+        _ => Err(TaibaiError::Sql("derived table must be a query".into())),
+    }
+}
+
+/// Walk a statement, resolving expression-level subqueries. Uncorrelated
+/// subqueries execute eagerly and collapse into literals (existing
+/// behavior); correlated ones — when `allow_correlated` and an enclosing
+/// scope are available — are rewritten into `Expr::Correlated` markers and
+/// registered in `registry`.
+fn resolve_query_subqueries(
+    engine: &Engine,
+    db: &str,
+    stmt: &mut Statement,
+    scope: Option<&QueryBlockScope>,
+    registry: &super::subquery_runtime::SubqueryRegistry,
+    allow_correlated: bool,
+) -> Result<()> {
+    match stmt {
+        Statement::Select {
+            select_list,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            for item in select_list {
+                if let SelectItem::Expr(expr, _) = item {
+                    resolve_query_expr(engine, db, expr, scope, registry, allow_correlated)?;
+                }
+            }
+            if let Some(expr) = where_clause {
+                resolve_query_expr(engine, db, expr, scope, registry, allow_correlated)?;
+            }
+            for expr in group_by {
+                resolve_query_expr(engine, db, expr, scope, registry, allow_correlated)?;
+            }
+            if let Some(expr) = having {
+                resolve_query_expr(engine, db, expr, scope, registry, allow_correlated)?;
+            }
+            for item in order_by {
+                resolve_query_expr(
+                    engine,
+                    db,
+                    &mut item.expr,
+                    scope,
+                    registry,
+                    allow_correlated,
+                )?;
+            }
+            if let Some(expr) = limit {
+                resolve_query_expr(engine, db, expr, scope, registry, allow_correlated)?;
+            }
+            if let Some(expr) = offset {
+                resolve_query_expr(engine, db, expr, scope, registry, allow_correlated)?;
+            }
+        }
+        Statement::Union {
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            // Each UNION branch is its own query block; correlated references
+            // crossing the UNION boundary are not supported.
+            resolve_query_subqueries(engine, db, left, None, registry, false)?;
+            resolve_query_subqueries(engine, db, right, None, registry, false)?;
+            for item in order_by {
+                resolve_query_expr(engine, db, &mut item.expr, None, registry, false)?;
+            }
+            if let Some(expr) = limit {
+                resolve_query_expr(engine, db, expr, None, registry, false)?;
+            }
+            if let Some(expr) = offset {
+                resolve_query_expr(engine, db, expr, None, registry, false)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_query_expr(
+    engine: &Engine,
+    db: &str,
+    expr: &mut Expr,
+    scope: Option<&QueryBlockScope>,
+    registry: &super::subquery_runtime::SubqueryRegistry,
+    allow_correlated: bool,
+) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            resolve_query_expr(engine, db, left, scope, registry, allow_correlated)?;
+            resolve_query_expr(engine, db, right, scope, registry, allow_correlated)?;
+        }
+        Expr::UnaryNot(inner)
+        | Expr::UnaryMinus(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner) => {
+            resolve_query_expr(engine, db, inner, scope, registry, allow_correlated)?;
+        }
+        Expr::Exists(inner) => {
+            if let Expr::Subquery(subquery) = inner.as_ref() {
+                let subquery = (**subquery).clone();
+                *expr = resolve_subquery_node(
+                    engine,
+                    db,
+                    CorrelatedKind::Exists { negated: false },
+                    None,
+                    &subquery,
+                    scope,
+                    registry,
+                    allow_correlated,
+                )?;
+            } else {
+                resolve_query_expr(engine, db, inner, scope, registry, allow_correlated)?;
+            }
+        }
+        Expr::In {
+            expr: inner,
+            values,
+            negated,
+        } => {
+            resolve_query_expr(engine, db, inner, scope, registry, allow_correlated)?;
+            let subquery = match values.as_slice() {
+                [Expr::Subquery(sub)] => Some((**sub).clone()),
+                _ => None,
+            };
+            if let Some(subquery) = subquery {
+                let lhs = (**inner).clone();
+                *expr = resolve_subquery_node(
+                    engine,
+                    db,
+                    CorrelatedKind::In { negated: *negated },
+                    Some(lhs),
+                    &subquery,
+                    scope,
+                    registry,
+                    allow_correlated,
+                )?;
+            } else {
+                for value in values {
+                    resolve_query_expr(engine, db, value, scope, registry, allow_correlated)?;
+                }
+            }
+        }
+        Expr::Subquery(subquery) => {
+            let subquery = (**subquery).clone();
+            *expr = resolve_subquery_node(
+                engine,
+                db,
+                CorrelatedKind::Scalar,
+                None,
+                &subquery,
+                scope,
+                registry,
+                allow_correlated,
+            )?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            resolve_query_expr(engine, db, expr, scope, registry, allow_correlated)?;
+            resolve_query_expr(engine, db, low, scope, registry, allow_correlated)?;
+            resolve_query_expr(engine, db, high, scope, registry, allow_correlated)?;
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                resolve_query_expr(engine, db, operand, scope, registry, allow_correlated)?;
+            }
+            for (when_expr, then_expr) in when_clauses {
+                resolve_query_expr(engine, db, when_expr, scope, registry, allow_correlated)?;
+                resolve_query_expr(engine, db, then_expr, scope, registry, allow_correlated)?;
+            }
+            if let Some(else_expr) = else_clause {
+                resolve_query_expr(engine, db, else_expr, scope, registry, allow_correlated)?;
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            resolve_query_expr(engine, db, expr, scope, registry, allow_correlated)?;
+            resolve_query_expr(engine, db, pattern, scope, registry, allow_correlated)?;
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                resolve_query_expr(engine, db, arg, scope, registry, allow_correlated)?;
+            }
+        }
+        Expr::WindowFunction {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for part in partition_by {
+                resolve_query_expr(engine, db, part, scope, registry, allow_correlated)?;
+            }
+            for item in order_by {
+                resolve_query_expr(
+                    engine,
+                    db,
+                    &mut item.expr,
+                    scope,
+                    registry,
+                    allow_correlated,
+                )?;
+            }
+        }
+        Expr::Correlated(_)
+        | Expr::Literal(_)
+        | Expr::Placeholder(_)
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. } => {}
+    }
+    Ok(())
+}
+
+/// Resolve one subquery occurrence: try eager uncorrelated execution first;
+/// on a correlation-shaped binding error, bind it as a correlated subquery.
+#[allow(clippy::too_many_arguments)]
+fn resolve_subquery_node(
+    engine: &Engine,
+    db: &str,
+    kind: CorrelatedKind,
+    lhs: Option<Expr>,
+    subquery: &Statement,
+    scope: Option<&QueryBlockScope>,
+    registry: &super::subquery_runtime::SubqueryRegistry,
+    allow_correlated: bool,
+) -> Result<Expr> {
+    let eager: Result<Expr> = (|| match kind {
+        CorrelatedKind::Exists { negated } => {
+            let exists = execute_exists_subquery(engine, db, subquery)?;
+            Ok(Expr::Literal(ScalarValue::Bool(Some(if negated {
+                !exists
+            } else {
+                exists
+            }))))
+        }
+        CorrelatedKind::Scalar => {
+            let value = execute_scalar_subquery(engine, db, subquery)?;
+            Ok(Expr::Literal(value))
+        }
+        CorrelatedKind::In { negated } => {
+            let lhs = lhs.clone().expect("IN subquery carries a lhs expression");
+            let values = execute_in_subquery(engine, db, subquery)?
+                .into_iter()
+                .map(Expr::Literal)
+                .collect();
+            Ok(Expr::In {
+                expr: Box::new(lhs),
+                values,
+                negated,
+            })
+        }
+    })();
+    match eager {
+        Ok(resolved) => Ok(resolved),
+        Err(e)
+            if allow_correlated
+                && scope.is_some()
+                && crate::sql::planner::expr::is_correlation_binding_error(&e) =>
+        {
+            bind_correlated_subquery(
+                engine,
+                db,
+                kind,
+                lhs,
+                subquery,
+                scope.expect("scope checked above"),
+                registry,
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Bind a correlated subquery against its enclosing block:
+/// 1. reject user parameter markers inside,
+/// 2. materialize the inner block's own derived tables,
+/// 3. eagerly resolve the inner block's own (uncorrelated) subqueries,
+/// 4. snapshot the inner tables (schemas + batches) into the registry,
+/// 5. split the inner WHERE into local and correlated conjuncts, rewriting
+///    outer references to `Placeholder` markers,
+/// 6. capture the scalar result type.
+#[allow(clippy::too_many_arguments)]
+fn bind_correlated_subquery(
+    engine: &Engine,
+    db: &str,
+    kind: CorrelatedKind,
+    lhs: Option<Expr>,
+    inner_stmt: &Statement,
+    scope: &QueryBlockScope,
+    registry: &super::subquery_runtime::SubqueryRegistry,
+) -> Result<Expr> {
+    if !matches!(inner_stmt, Statement::Select { .. }) {
+        return Err(TaibaiError::Sql(
+            "correlated subqueries must be a single SELECT".into(),
+        ));
+    }
+    let mut inner = inner_stmt.clone();
+    if stmt_contains_placeholder(&inner) {
+        return Err(TaibaiError::Sql(
+            "parameter markers (?) are not supported inside correlated subqueries".into(),
+        ));
+    }
+
+    let inner_derived = materialize_derived_tables(engine, db, &mut inner)?;
+    if let Err(e) = resolve_query_subqueries(engine, db, &mut inner, None, registry, false) {
+        if crate::sql::planner::expr::is_correlation_binding_error(&e) {
+            return Err(TaibaiError::Sql(format!(
+                "nested correlated subqueries are not supported (only one level of \
+                 correlation is supported): {e}"
+            )));
+        }
+        return Err(e);
+    }
+
+    // Snapshot the inner FROM tables so per-row evaluation never needs the
+    // engine.
+    let inner_from = match &inner {
+        Statement::Select {
+            from: Some(from), ..
+        } => Some(from.clone()),
+        _ => None,
+    };
+    let mut snapshot_schemas: HashMap<String, Schema> = HashMap::new();
+    let mut snapshot_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    if let Some(from) = &inner_from {
+        for table_ref in extract_table_refs(from, db) {
+            if table_ref.database == DERIVED_DB {
+                let (schema, batches) = inner_derived.get(&table_ref.key).ok_or_else(|| {
+                    TaibaiError::Internal(format!(
+                        "missing materialized derived table '{}'",
+                        table_ref.key
+                    ))
+                })?;
+                snapshot_schemas.insert(table_ref.key.clone(), schema.clone());
+                snapshot_batches.insert(table_ref.key.clone(), batches.clone());
+            } else {
+                let (schema, batches) = snapshot_table(engine, &table_ref)?;
+                snapshot_schemas.insert(table_ref.key.clone(), schema);
+                snapshot_batches.insert(table_ref.key.clone(), batches);
+            }
+        }
+    }
+
+    let (inner_schema, inner_alias_map) = match &inner_from {
+        Some(from) => crate::sql::planner::build_scope_bindings(from, &snapshot_schemas),
+        None => (Schema::empty(), HashMap::new()),
+    };
+
+    // Pre-resolve select-list aliases in GROUP BY / HAVING / ORDER BY the
+    // same way the planner would, so alias references don't look like
+    // unresolvable (correlated) columns during marking.
+    if let Statement::Select {
+        select_list,
+        group_by,
+        having,
+        order_by,
+        ..
+    } = &mut inner
+    {
+        let alias_entries: Vec<(String, Expr)> = select_list
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::Expr(e, Some(alias)) => Some((alias.to_lowercase(), e.clone())),
+                _ => None,
+            })
+            .collect();
+        if !alias_entries.is_empty() {
+            let substitute = |expr: &mut Expr| {
+                *expr = crate::sql::planner::expr::substitute_select_aliases(
+                    expr,
+                    &alias_entries,
+                    &inner_schema,
+                );
+            };
+            for expr in group_by {
+                substitute(expr);
+            }
+            if let Some(expr) = having {
+                substitute(expr);
+            }
+            for item in order_by {
+                substitute(&mut item.expr);
+            }
+        }
+    }
+
+    let mut binder = MarkerBinder {
+        inner_schema: &inner_schema,
+        inner_alias_map: &inner_alias_map,
+        outer_schema: &scope.schema,
+        outer_alias_map: &scope.alias_map,
+        next_id: 0,
+        params: Vec::new(),
+    };
+
+    // Split the inner WHERE into local and correlated conjuncts.
+    let where_expr = match &mut inner {
+        Statement::Select { where_clause, .. } => where_clause.take(),
+        _ => None,
+    };
+    let mut correlated_conjuncts: Vec<Expr> = Vec::new();
+    let mut local_conjuncts: Vec<Expr> = Vec::new();
+    if let Some(where_expr) = where_expr {
+        for conjunct in split_and_conjuncts(where_expr) {
+            let marked = binder.mark_expr(conjunct)?;
+            if expr_contains_placeholder(&marked) {
+                correlated_conjuncts.push(marked);
+            } else {
+                local_conjuncts.push(marked);
+            }
+        }
+    }
+    if let Statement::Select { where_clause, .. } = &mut inner {
+        *where_clause = combine_conjuncts(local_conjuncts);
+    }
+
+    // Mark remaining expression positions (select list, GROUP BY, HAVING,
+    // ORDER BY). Those markers stay in place and are substituted per row.
+    if let Statement::Select {
+        select_list,
+        group_by,
+        having,
+        order_by,
+        ..
+    } = &mut inner
+    {
+        for item in select_list {
+            if let SelectItem::Expr(expr, _) = item {
+                *expr = binder.mark_expr(expr.clone())?;
+            }
+        }
+        for expr in group_by {
+            *expr = binder.mark_expr(expr.clone())?;
+        }
+        if let Some(expr) = having {
+            *expr = binder.mark_expr(expr.clone())?;
+        }
+        for item in order_by {
+            item.expr = binder.mark_expr(item.expr.clone())?;
+        }
+    }
+
+    let result_type = match kind {
+        CorrelatedKind::Exists { .. } | CorrelatedKind::In { .. } => {
+            crate::protocol::types::DataType::Bool
+        }
+        CorrelatedKind::Scalar => {
+            // Probe the output type with a single-row execution of the local
+            // part. Fall back to Int64 when the probe cannot run cleanly
+            // (e.g. markers remain in the select list); projection coerces.
+            let mut probe = inner.clone();
+            if let Statement::Select { limit, offset, .. } = &mut probe {
+                *limit = Some(Expr::Literal(ScalarValue::Int64(Some(1))));
+                *offset = None;
+            }
+            match exec_select(engine, db, &probe) {
+                Ok(ExecResult::Query { schema, .. }) if !schema.columns.is_empty() => {
+                    schema.columns[0].data_type
+                }
+                _ => crate::protocol::types::DataType::Int64,
+            }
+        }
+    };
+
+    let id = registry
+        .lock()
+        .unwrap()
+        .allocate(super::subquery_runtime::CorrelatedSnapshot {
+            schemas: snapshot_schemas,
+            batches: snapshot_batches,
+            cache: HashMap::new(),
+        });
+
+    Ok(Expr::Correlated(Box::new(CorrelatedSubquery {
+        id,
+        kind,
+        lhs: lhs.map(Box::new),
+        stmt: Box::new(inner),
+        conjuncts: correlated_conjuncts,
+        params: binder.params,
+        result_type,
+    })))
+}
+
+/// Rewrites references that resolve outside the inner block into
+/// `Placeholder` markers and records their enclosing-block column indexes.
+struct MarkerBinder<'a> {
+    inner_schema: &'a Schema,
+    inner_alias_map: &'a crate::sql::planner::AliasMap,
+    outer_schema: &'a Schema,
+    outer_alias_map: &'a crate::sql::planner::AliasMap,
+    next_id: usize,
+    params: Vec<(usize, usize)>,
+}
+
+impl<'a> MarkerBinder<'a> {
+    fn new_marker(&mut self, outer_idx: usize) -> Expr {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.params.push((id, outer_idx));
+        Expr::Placeholder(id)
+    }
+
+    fn mark_expr(&mut self, expr: Expr) -> Result<Expr> {
+        match expr {
+            // `COUNT(*)` is spelled as a Function over Column("*"); the star
+            // is not a real column reference.
+            Expr::Column(ref name) if name == "*" => Ok(expr),
+            Expr::Column(name) => {
+                if self.inner_schema.index_of(&name).is_some() {
+                    return Ok(Expr::Column(name));
+                }
+                if let Some(idx) = self.outer_schema.index_of(&name) {
+                    return Ok(self.new_marker(idx));
+                }
+                Err(TaibaiError::Sql(format!("column '{name}' not found")))
+            }
+            Expr::QualifiedColumn { table, column } => {
+                let table_lower = table.to_lowercase();
+                if let Some(binding) = self.inner_alias_map.get(&table_lower) {
+                    if col_in_range(self.inner_schema, binding, &column).is_some() {
+                        return Ok(Expr::QualifiedColumn { table, column });
+                    }
+                    return Err(TaibaiError::Sql(format!(
+                        "column '{column}' not found in table '{table}'"
+                    )));
+                }
+                if let Some(binding) = self.outer_alias_map.get(&table_lower) {
+                    if let Some(idx) = col_in_range(self.outer_schema, binding, &column) {
+                        return Ok(self.new_marker(idx));
+                    }
+                    return Err(TaibaiError::Sql(format!(
+                        "column '{column}' not found in table '{table}'"
+                    )));
+                }
+                Err(TaibaiError::Sql(format!(
+                    "unknown table or alias '{table}' (correlated references must resolve to \
+                     the immediately enclosing query block)"
+                )))
+            }
+            Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+                left: Box::new(self.mark_expr(*left)?),
+                op,
+                right: Box::new(self.mark_expr(*right)?),
+            }),
+            Expr::UnaryNot(inner) => Ok(Expr::UnaryNot(Box::new(self.mark_expr(*inner)?))),
+            Expr::UnaryMinus(inner) => Ok(Expr::UnaryMinus(Box::new(self.mark_expr(*inner)?))),
+            Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(self.mark_expr(*inner)?))),
+            Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(self.mark_expr(*inner)?))),
+            Expr::In {
+                expr,
+                values,
+                negated,
+            } => Ok(Expr::In {
+                expr: Box::new(self.mark_expr(*expr)?),
+                values: values
+                    .into_iter()
+                    .map(|v| self.mark_expr(v))
+                    .collect::<Result<Vec<_>>>()?,
+                negated,
+            }),
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Ok(Expr::Between {
+                expr: Box::new(self.mark_expr(*expr)?),
+                low: Box::new(self.mark_expr(*low)?),
+                high: Box::new(self.mark_expr(*high)?),
+                negated,
+            }),
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => Ok(Expr::Case {
+                operand: operand
+                    .map(|e| self.mark_expr(*e))
+                    .transpose()?
+                    .map(Box::new),
+                when_clauses: when_clauses
+                    .into_iter()
+                    .map(|(w, t)| Ok((self.mark_expr(w)?, self.mark_expr(t)?)))
+                    .collect::<Result<Vec<_>>>()?,
+                else_clause: else_clause
+                    .map(|e| self.mark_expr(*e))
+                    .transpose()?
+                    .map(Box::new),
+            }),
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+            } => Ok(Expr::Like {
+                expr: Box::new(self.mark_expr(*expr)?),
+                pattern: Box::new(self.mark_expr(*pattern)?),
+                negated,
+            }),
+            Expr::Function {
+                name,
+                args,
+                distinct,
+            } => Ok(Expr::Function {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|a| self.mark_expr(a))
+                    .collect::<Result<Vec<_>>>()?,
+                distinct,
+            }),
+            other => Ok(other),
+        }
+    }
+}
+
+fn col_in_range(
+    schema: &Schema,
+    binding: &crate::sql::planner::TableBinding,
+    column: &str,
+) -> Option<usize> {
+    (binding.start..binding.end).find(|&idx| {
+        schema
+            .columns
+            .get(idx)
+            .map(|c| c.name.eq_ignore_ascii_case(column))
+            .unwrap_or(false)
+    })
+}
+
+fn split_and_conjuncts(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: crate::sql::parser::ast::BinOp::And,
+            right,
+        } => {
+            let mut conjuncts = split_and_conjuncts(*left);
+            conjuncts.extend(split_and_conjuncts(*right));
+            conjuncts
+        }
+        other => vec![other],
+    }
+}
+
+fn combine_conjuncts(conjuncts: Vec<Expr>) -> Option<Expr> {
+    let mut combined: Option<Expr> = None;
+    for conjunct in conjuncts {
+        combined = Some(match combined {
+            Some(prev) => Expr::BinaryOp {
+                left: Box::new(prev),
+                op: crate::sql::parser::ast::BinOp::And,
+                right: Box::new(conjunct),
+            },
+            None => conjunct,
+        });
+    }
+    combined
+}
+
+fn expr_contains_placeholder(expr: &Expr) -> bool {
+    match expr {
+        Expr::Placeholder(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_placeholder(left) || expr_contains_placeholder(right)
+        }
+        Expr::UnaryNot(inner)
+        | Expr::UnaryMinus(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner) => expr_contains_placeholder(inner),
+        Expr::In { expr, values, .. } => {
+            expr_contains_placeholder(expr) || values.iter().any(expr_contains_placeholder)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_placeholder(expr)
+                || expr_contains_placeholder(low)
+                || expr_contains_placeholder(high)
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand
+                .as_ref()
+                .map(|e| expr_contains_placeholder(e))
+                .unwrap_or(false)
+                || when_clauses
+                    .iter()
+                    .any(|(w, t)| expr_contains_placeholder(w) || expr_contains_placeholder(t))
+                || else_clause
+                    .as_ref()
+                    .map(|e| expr_contains_placeholder(e))
+                    .unwrap_or(false)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_contains_placeholder(expr) || expr_contains_placeholder(pattern)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_placeholder),
+        Expr::WindowFunction {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            partition_by.iter().any(expr_contains_placeholder)
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_placeholder(&item.expr))
+        }
+        Expr::Exists(inner) => expr_contains_placeholder(inner),
+        _ => false,
+    }
+}
+
+fn stmt_contains_placeholder(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Select {
+            select_list,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            select_list
+                .iter()
+                .any(|item| matches!(item, SelectItem::Expr(e, _) if expr_contains_placeholder(e)))
+                || where_clause
+                    .as_ref()
+                    .map(expr_contains_placeholder)
+                    .unwrap_or(false)
+                || group_by.iter().any(expr_contains_placeholder)
+                || having
+                    .as_ref()
+                    .map(expr_contains_placeholder)
+                    .unwrap_or(false)
+                || order_by
+                    .iter()
+                    .any(|item| expr_contains_placeholder(&item.expr))
+                || limit
+                    .as_ref()
+                    .map(expr_contains_placeholder)
+                    .unwrap_or(false)
+                || offset
+                    .as_ref()
+                    .map(expr_contains_placeholder)
+                    .unwrap_or(false)
+        }
+        Statement::Union { left, right, .. } => {
+            stmt_contains_placeholder(left) || stmt_contains_placeholder(right)
+        }
+        _ => false,
+    }
+}
+
+fn expr_has_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_) | Expr::Correlated(_) => true,
+        Expr::Exists(inner) => match inner.as_ref() {
+            Expr::Subquery(_) => true,
+            other => expr_has_subquery(other),
+        },
+        Expr::In { expr, values, .. } => {
+            expr_has_subquery(expr)
+                || values.iter().any(|v| matches!(v, Expr::Subquery(_)))
+                || values.iter().any(expr_has_subquery)
+        }
+        Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        Expr::UnaryNot(inner)
+        | Expr::UnaryMinus(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner) => expr_has_subquery(inner),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand
+                .as_ref()
+                .map(|e| expr_has_subquery(e))
+                .unwrap_or(false)
+                || when_clauses
+                    .iter()
+                    .any(|(w, t)| expr_has_subquery(w) || expr_has_subquery(t))
+                || else_clause
+                    .as_ref()
+                    .map(|e| expr_has_subquery(e))
+                    .unwrap_or(false)
+        }
+        Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),
+        Expr::Function { args, .. } => args.iter().any(expr_has_subquery),
+        Expr::WindowFunction {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            partition_by.iter().any(expr_has_subquery)
+                || order_by.iter().any(|item| expr_has_subquery(&item.expr))
+        }
+        _ => false,
+    }
+}
+
+fn from_has_derived(from: &FromClause) -> bool {
+    match from {
+        FromClause::Table(t) => matches!(t, TableRef::Subquery { .. }),
+        FromClause::Join(join_expr) => {
+            from_has_derived(&join_expr.left)
+                || join_expr.joins.iter().any(|jc| {
+                    matches!(&jc.right, TableRef::Subquery { .. })
+                        || jc
+                            .condition
+                            .as_ref()
+                            .map(expr_has_subquery)
+                            .unwrap_or(false)
+                })
+        }
+    }
+}
+
+/// Fast pre-check used by the streaming path to defer subquery/derived-table
+/// queries to the materialized execution path.
+pub(crate) fn stmt_has_subquery_or_derived(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Select {
+            select_list,
+            from,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            from.as_ref().map(from_has_derived).unwrap_or(false)
+                || select_list
+                    .iter()
+                    .any(|item| matches!(item, SelectItem::Expr(e, _) if expr_has_subquery(e)))
+                || where_clause
+                    .as_ref()
+                    .map(expr_has_subquery)
+                    .unwrap_or(false)
+                || group_by.iter().any(expr_has_subquery)
+                || having.as_ref().map(expr_has_subquery).unwrap_or(false)
+                || order_by.iter().any(|item| expr_has_subquery(&item.expr))
+                || limit.as_ref().map(expr_has_subquery).unwrap_or(false)
+                || offset.as_ref().map(expr_has_subquery).unwrap_or(false)
+        }
+        Statement::Union {
+            left,
+            right,
+            order_by,
+            limit,
+            offset,
+            ..
+        } => {
+            stmt_has_subquery_or_derived(left)
+                || stmt_has_subquery_or_derived(right)
+                || order_by.iter().any(|item| expr_has_subquery(&item.expr))
+                || limit.as_ref().map(expr_has_subquery).unwrap_or(false)
+                || offset.as_ref().map(expr_has_subquery).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Materialize a full snapshot of one base table for the correlated-subquery
+/// runtime. The snapshot is plain data, so per-row evaluation never needs the
+/// engine.
+fn snapshot_table(
+    engine: &Engine,
+    table_ref: &ResolvedTableRef,
+) -> Result<(Schema, Vec<RecordBatch>)> {
+    let stmt = Statement::Select {
+        select_list: vec![SelectItem::Star],
+        from: Some(FromClause::Table(TableRef::Table {
+            name: ObjectName::qualified(table_ref.database.clone(), table_ref.table.clone()),
+            alias: None,
+        })),
+        where_clause: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+    };
+    match exec_select(engine, &table_ref.database, &stmt)? {
+        ExecResult::Query { schema, batches } => Ok((schema, batches)),
+        _ => Err(TaibaiError::Sql(format!(
+            "failed to snapshot table '{}.{}'",
+            table_ref.database, table_ref.table
+        ))),
     }
 }

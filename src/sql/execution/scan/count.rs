@@ -198,7 +198,7 @@ fn count_with_predicates(
                     &spec.range_predicates,
                     &spec.in_predicates,
                     spec.remaining_predicate.as_ref(),
-                )
+                )?
             } else {
                 row_filter::apply_predicates_with_column_map(
                     &batch,

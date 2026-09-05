@@ -7,18 +7,22 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::{ExecutionOp, RuntimeInFilter};
+use crate::sql::execution::subquery_runtime::SubqueryRegistry;
 
 pub struct FilterExec {
     pub predicate: LogicalExpr,
     pub input: Box<dyn ExecutionOp>,
     pub schema: Schema,
+    /// Snapshot registry for correlated subqueries, when the query contains
+    /// any. `None` makes evaluation of such nodes fail loudly.
+    pub subqueries: Option<SubqueryRegistry>,
 }
 
 impl ExecutionOp for FilterExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         while let Some(batch) = self.input.next_batch()? {
             let predicate = remap_expr_for_batch(&self.predicate, &self.schema, &batch.schema);
-            let mask = eval_filter(&predicate, &batch)?;
+            let mask = eval_filter_with(&predicate, &batch, self.subqueries.as_ref())?;
             let filtered = super::apply_filter_mask(&batch, &mask);
             if filtered.num_rows() > 0 {
                 return Ok(Some(filtered));
@@ -138,8 +142,46 @@ pub fn remap_expr_for_batch(
                 .map(|arg| remap_expr_for_batch(arg, logical_schema, batch_schema))
                 .collect(),
         },
+        LogicalExpr::CorrelatedSubquery(corr_box) => {
+            let mut corr = (*corr_box).clone();
+            // Params point at the enclosing block's logical columns; remap
+            // them to the physical batch layout the same way plain columns
+            // are remapped.
+            corr.params = corr
+                .params
+                .iter()
+                .map(|(marker, logical_idx)| {
+                    let batch_idx = logical_schema
+                        .columns
+                        .get(*logical_idx)
+                        .and_then(|col| {
+                            if batch_schema.columns.get(*logical_idx) == Some(col) {
+                                Some(*logical_idx)
+                            } else {
+                                batch_schema.index_of(&col.name)
+                            }
+                        })
+                        .unwrap_or(*logical_idx);
+                    (*marker, batch_idx)
+                })
+                .collect();
+            if let Some(lhs) = &corr.lhs {
+                corr.lhs = Some(Box::new(remap_expr_for_batch(
+                    lhs,
+                    logical_schema,
+                    batch_schema,
+                )));
+            }
+            LogicalExpr::CorrelatedSubquery(corr)
+        }
         _ => expr.clone(),
     }
+}
+
+/// Equality with the same semantics as `eval_comparison(.., Eq, ..)`: NULL
+/// never equals anything.
+pub(crate) fn values_equal(left: &ScalarValue, right: &ScalarValue) -> bool {
+    eval_comparison(left, &BinOp::Eq, right)
 }
 
 fn aggregate_output_name(agg: &AggregateExpr, logical_schema: &Schema) -> Option<String> {
@@ -172,21 +214,29 @@ pub fn remap_aggregate_for_batch(
 }
 
 pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>> {
+    eval_filter_with(expr, batch, None)
+}
+
+pub fn eval_filter_with(
+    expr: &LogicalExpr,
+    batch: &RecordBatch,
+    subqueries: Option<&SubqueryRegistry>,
+) -> Result<Vec<bool>> {
     let num_rows = batch.num_rows();
     let mut mask = vec![true; num_rows];
 
     match expr {
         LogicalExpr::BinaryOp { left, op, right } => match op {
             BinOp::And => {
-                let left_mask = eval_filter(left, batch)?;
-                let right_mask = eval_filter(right, batch)?;
+                let left_mask = eval_filter_with(left, batch, subqueries)?;
+                let right_mask = eval_filter_with(right, batch, subqueries)?;
                 for i in 0..num_rows {
                     mask[i] = left_mask[i] && right_mask[i];
                 }
             }
             BinOp::Or => {
-                let left_mask = eval_filter(left, batch)?;
-                let right_mask = eval_filter(right, batch)?;
+                let left_mask = eval_filter_with(left, batch, subqueries)?;
+                let right_mask = eval_filter_with(right, batch, subqueries)?;
                 for i in 0..num_rows {
                     mask[i] = left_mask[i] || right_mask[i];
                 }
@@ -195,15 +245,15 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                 if let Some(vector_mask) = eval_column_literal_comparison(left, op, right, batch) {
                     return Ok(vector_mask);
                 }
-                let left_vals = eval_expr_column(left, batch)?;
-                let right_vals = eval_expr_column(right, batch)?;
+                let left_vals = eval_expr_column_with(left, batch, subqueries)?;
+                let right_vals = eval_expr_column_with(right, batch, subqueries)?;
                 for i in 0..num_rows {
                     mask[i] = eval_comparison(&left_vals[i], op, &right_vals[i]);
                 }
             }
         },
         LogicalExpr::Not(inner) => {
-            let inner_mask = eval_filter(inner, batch)?;
+            let inner_mask = eval_filter_with(inner, batch, subqueries)?;
             for i in 0..num_rows {
                 mask[i] = !inner_mask[i];
             }
@@ -214,7 +264,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                     return Ok(column.is_null_vec());
                 }
             }
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             for i in 0..num_rows {
                 mask[i] = vals[i].is_null();
             }
@@ -225,7 +275,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                     return Ok(column.is_not_null_vec());
                 }
             }
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 *m = !vals[i].is_null();
             }
@@ -235,7 +285,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
             values,
             negated,
         } => {
-            let vals = eval_expr_column(expr, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 let found = values
                     .iter()
@@ -248,7 +298,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
             pattern,
             negated,
         } => {
-            let vals = eval_expr_column(expr, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 let matched =
                     crate::sql::execution::helpers::scalar_like_matches(&vals[i], pattern);
@@ -268,7 +318,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
             }
         }
         _ => {
-            let vals = eval_expr_column(expr, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 *m = matches!(vals[i], ScalarValue::Bool(Some(true)));
             }
@@ -412,6 +462,14 @@ fn cmp_f64(l: f64, op: &BinOp, r: f64) -> bool {
 }
 
 pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<ScalarValue>> {
+    eval_expr_column_with(expr, batch, None)
+}
+
+pub fn eval_expr_column_with(
+    expr: &LogicalExpr,
+    batch: &RecordBatch,
+    subqueries: Option<&SubqueryRegistry>,
+) -> Result<Vec<ScalarValue>> {
     let num_rows = batch.num_rows();
     match expr {
         LogicalExpr::Column(idx) => Ok((0..num_rows)
@@ -419,8 +477,8 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             .collect()),
         LogicalExpr::Literal(v) => Ok(vec![v.clone(); num_rows]),
         LogicalExpr::BinaryOp { left, op, right } => {
-            let lv = eval_expr_column(left, batch)?;
-            let rv = eval_expr_column(right, batch)?;
+            let lv = eval_expr_column_with(left, batch, subqueries)?;
+            let rv = eval_expr_column_with(right, batch, subqueries)?;
             let mut result = Vec::with_capacity(num_rows);
             for i in 0..num_rows {
                 result.push(eval_binary_scalar(&lv[i], op, &rv[i]));
@@ -463,21 +521,21 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             }
         }
         LogicalExpr::IsNull(inner) => {
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|v| ScalarValue::Bool(Some(v.is_null())))
                 .collect())
         }
         LogicalExpr::IsNotNull(inner) => {
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|v| ScalarValue::Bool(Some(!v.is_null())))
                 .collect())
         }
         LogicalExpr::Not(inner) => {
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|v| match v {
@@ -491,7 +549,7 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             values,
             negated,
         } => {
-            let vals = eval_expr_column(expr, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|val| {
@@ -509,20 +567,20 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
         } => {
             let operand_values = operand
                 .as_deref()
-                .map(|expr| eval_expr_column(expr, batch))
+                .map(|expr| eval_expr_column_with(expr, batch, subqueries))
                 .transpose()?;
             let clause_values = when_clauses
                 .iter()
                 .map(|(when_expr, then_expr)| {
                     Ok((
-                        eval_expr_column(when_expr, batch)?,
-                        eval_expr_column(then_expr, batch)?,
+                        eval_expr_column_with(when_expr, batch, subqueries)?,
+                        eval_expr_column_with(then_expr, batch, subqueries)?,
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let else_values = else_clause
                 .as_deref()
-                .map(|expr| eval_expr_column(expr, batch))
+                .map(|expr| eval_expr_column_with(expr, batch, subqueries))
                 .transpose()?;
             let mut result = Vec::with_capacity(num_rows);
             for row_idx in 0..num_rows {
@@ -551,7 +609,7 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
         LogicalExpr::Function { name, args } => {
             let arg_columns = args
                 .iter()
-                .map(|arg| eval_expr_column(arg, batch))
+                .map(|arg| eval_expr_column_with(arg, batch, subqueries))
                 .collect::<Result<Vec<_>>>()?;
             let registry = FunctionRegistry::default();
             let mut result = Vec::with_capacity(num_rows);
@@ -570,9 +628,9 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             high,
             negated,
         } => {
-            let vals = eval_expr_column(expr, batch)?;
-            let lows = eval_expr_column(low, batch)?;
-            let highs = eval_expr_column(high, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
+            let lows = eval_expr_column_with(low, batch, subqueries)?;
+            let highs = eval_expr_column_with(high, batch, subqueries)?;
             Ok((0..num_rows)
                 .map(|row_idx| {
                     let inside = eval_comparison(&vals[row_idx], &BinOp::Gte, &lows[row_idx])
@@ -586,7 +644,7 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             pattern,
             negated,
         } => {
-            let vals = eval_expr_column(expr, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|v| {
@@ -597,6 +655,9 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
                     ScalarValue::Bool(Some(matched != *negated))
                 })
                 .collect())
+        }
+        LogicalExpr::CorrelatedSubquery(node) => {
+            crate::sql::execution::subquery_runtime::eval_correlated_column(node, batch, subqueries)
         }
         _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
     }

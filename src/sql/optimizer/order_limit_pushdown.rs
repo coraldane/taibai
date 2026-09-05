@@ -448,6 +448,7 @@ fn expr_contains_conjunct(existing: &LogicalExpr, predicate: &LogicalExpr) -> bo
 
 fn expr_columns_within(expr: &LogicalExpr, upper_bound: usize) -> bool {
     match expr {
+        LogicalExpr::CorrelatedSubquery(_) => false,
         LogicalExpr::Column(idx) => *idx < upper_bound,
         LogicalExpr::Literal(_) | LogicalExpr::Wildcard => true,
         LogicalExpr::BinaryOp { left, right, .. } => {

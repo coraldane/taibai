@@ -1,7 +1,8 @@
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
 use crate::sql::execution::helpers::coerce_scalar_for_dtype;
-use crate::sql::execution::operators::filter::{eval_expr_column, remap_expr_for_batch};
+use crate::sql::execution::operators::filter::{eval_expr_column_with, remap_expr_for_batch};
+use crate::sql::execution::subquery_runtime::SubqueryRegistry;
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::LogicalExpr;
 use crate::types::array::ColumnArray;
@@ -14,6 +15,9 @@ pub struct ProjectExec {
     pub aliases: Vec<Option<String>>,
     pub input: Box<dyn ExecutionOp>,
     pub input_schema: Schema,
+    /// Snapshot registry for correlated subqueries, when the query contains
+    /// any.
+    pub subqueries: Option<SubqueryRegistry>,
 }
 
 impl ExecutionOp for ProjectExec {
@@ -35,7 +39,7 @@ impl ExecutionOp for ProjectExec {
 
                 for (i, expr) in self.expressions.iter().enumerate() {
                     let expr = remap_expr_for_batch(expr, &self.input_schema, &batch.schema);
-                    let vals = eval_expr_column(&expr, &batch)?;
+                    let vals = eval_expr_column_with(&expr, &batch, self.subqueries.as_ref())?;
                     let col_def =
                         project_column_def(&expr, &batch.schema, self.aliases[i].as_deref());
                     let mut col = ColumnArray::empty(col_def.data_type);

@@ -8,7 +8,7 @@ use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
-pub use expr::{collect_cols_from_expr, collect_column_refs};
+pub use expr::{collect_cols_from_expr, collect_column_refs, contains_correlated_subquery};
 pub use types::*;
 
 #[derive(Debug, Clone)]
@@ -57,6 +57,56 @@ pub fn plan_select(
 ) -> Result<LogicalPlan> {
     let ctx = PlannerContext::new(table_schemas.clone());
     plan_select_with_context(stmt, &ctx)
+}
+
+/// Compute the query block's concatenated schema and table alias bindings
+/// for a FROM clause, mirroring exactly how `plan_from_clause` assigns column
+/// offsets. Used by the execution layer to build the scope in which
+/// subqueries are resolved / correlated references are bound.
+pub fn build_scope_bindings(
+    from: &FromClause,
+    table_schemas: &HashMap<String, Schema>,
+) -> (Schema, AliasMap) {
+    match from {
+        FromClause::Table(table_ref) => match table_ref {
+            TableRef::Table { name, alias } => {
+                let table_name = name.plan_key();
+                let mut alias_map = AliasMap::new();
+                if let Some(schema) = table_schemas.get(&table_name) {
+                    let binding = TableBinding::new(0, schema.columns.len());
+                    if let Some(a) = alias {
+                        alias_map.insert(a.to_lowercase(), binding.clone());
+                    }
+                    alias_map.insert(name.name.to_lowercase(), binding.clone());
+                    alias_map.insert(table_name.to_lowercase(), binding);
+                    (schema.clone(), alias_map)
+                } else {
+                    (Schema::empty(), alias_map)
+                }
+            }
+            TableRef::Subquery { .. } => (Schema::empty(), AliasMap::new()),
+        },
+        FromClause::Join(join_expr) => {
+            let (mut schema, mut alias_map) = build_scope_bindings(&join_expr.left, table_schemas);
+            for join_clause in &join_expr.joins {
+                if let TableRef::Table { name, alias } = &join_clause.right {
+                    let right_table = name.plan_key();
+                    if let Some(right_schema) = table_schemas.get(&right_table) {
+                        let right_start = schema.columns.len();
+                        let right_end = right_start + right_schema.columns.len();
+                        let binding = TableBinding::new(right_start, right_end);
+                        if let Some(a) = alias {
+                            alias_map.insert(a.to_lowercase(), binding.clone());
+                        }
+                        alias_map.insert(name.name.to_lowercase(), binding.clone());
+                        alias_map.insert(right_table.to_lowercase(), binding);
+                        schema = types::merge_schemas(&schema, right_schema);
+                    }
+                }
+            }
+            (schema, alias_map)
+        }
+    }
 }
 
 pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Result<LogicalPlan> {

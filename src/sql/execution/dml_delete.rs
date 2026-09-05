@@ -1316,6 +1316,7 @@ fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &Expr) -> Result<
                 .collect::<Result<Vec<_>>>()?,
             frame: frame.clone(),
         },
+        Expr::Correlated(_) => expr.clone(),
         Expr::Literal(_)
         | Expr::Placeholder(_)
         | Expr::Column(_)

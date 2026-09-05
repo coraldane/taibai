@@ -14,7 +14,15 @@ impl Rule for PredicatePushdownRule {
 
 fn push_predicates(plan: LogicalPlan) -> (LogicalPlan, bool) {
     match plan {
-        LogicalPlan::Filter(filter) => push_filter(*filter.input, filter.predicate),
+        LogicalPlan::Filter(filter) => {
+            if contains_correlated_subquery(&filter.predicate) {
+                // The predicate must stay with the operator that owns the
+                // subquery registry; it can neither be pushed into a scan
+                // nor below a projection.
+                return (LogicalPlan::Filter(filter), false);
+            }
+            push_filter(*filter.input, filter.predicate)
+        }
         LogicalPlan::Project(mut proj) => {
             let (input, changed) = push_predicates(*proj.input);
             proj.input = Box::new(input);
@@ -151,6 +159,10 @@ fn push_filter(input: LogicalPlan, predicate: LogicalExpr) -> (LogicalPlan, bool
             let mut changed = false;
 
             for part in split_conjuncts(predicate) {
+                if contains_correlated_subquery(&part) {
+                    residuals.push(part);
+                    continue;
+                }
                 match expr_side(&part, left_ncols, total_cols) {
                     ExprSide::Left if can_push_filter_through_join(join.join_type, true) => {
                         left_filters.push(part.clone());
@@ -440,6 +452,7 @@ fn normalize_join_columns(
 
 fn remap_right_expr(expr: &LogicalExpr, left_ncols: usize) -> Option<LogicalExpr> {
     match expr {
+        LogicalExpr::CorrelatedSubquery(_) => None,
         LogicalExpr::Column(idx) => idx.checked_sub(left_ncols).map(LogicalExpr::Column),
         LogicalExpr::Literal(_) | LogicalExpr::Wildcard => Some(expr.clone()),
         LogicalExpr::BinaryOp { left, op, right } => Some(LogicalExpr::BinaryOp {

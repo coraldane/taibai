@@ -1,4 +1,5 @@
 pub mod ddl;
+pub mod decorrelate;
 pub mod dml_delete;
 pub mod dml_insert;
 pub mod dml_update;
@@ -14,6 +15,7 @@ pub mod prepared;
 pub mod query;
 pub mod scan;
 pub mod spill;
+pub mod subquery_runtime;
 pub mod wal_helper;
 
 pub use engine::{AutoCompactConfig, Engine, ExecResult};

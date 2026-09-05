@@ -266,16 +266,24 @@ impl Engine {
                         if !has_placeholders {
                             let table_schemas =
                                 self.gather_table_schemas(&session.database, &stmt)?;
-                            let planned_stmt = super::query::resolve_in_subqueries(
+                            // Plan caching is best-effort: statements whose
+                            // subqueries cannot be eagerly resolved (e.g.
+                            // correlated subqueries) simply re-resolve on
+                            // every execution.
+                            if let Ok(planned_stmt) = super::query::resolve_in_subqueries(
                                 self,
                                 &session.database,
                                 &stmt,
-                            )?;
-                            if let Ok(plan) =
-                                crate::sql::planner::plan_select(&planned_stmt, &table_schemas)
-                            {
-                                prepared.cached_plan = Some(crate::sql::optimizer::optimize(plan));
-                                prepared.planned_database = Some(session.database.clone());
+                            ) {
+                                if let Ok(plan) = crate::sql::planner::plan_select(
+                                    &planned_stmt,
+                                    &table_schemas,
+                                ) {
+                                    prepared.cached_plan =
+                                        Some(crate::sql::optimizer::optimize(plan));
+                                    prepared.planned_database =
+                                        Some(session.database.clone());
+                                }
                             }
                         }
                     }

@@ -21,9 +21,9 @@ pub fn apply_predicates(
     range_predicates: &[crate::storage::partition::pruning::RangeClause],
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
-) -> RecordBatch {
+) -> crate::common::error::Result<RecordBatch> {
     if batch.num_rows() == 0 {
-        return batch.clone();
+        return Ok(batch.clone());
     }
 
     let mut mask: Vec<bool> = vec![true; batch.num_rows()];
@@ -31,37 +31,37 @@ pub fn apply_predicates(
     for (col_idx, value) in eq_predicates {
         apply_eq_mask(batch, *col_idx, value, &mut mask);
         if mask.iter().all(|m| !m) {
-            return empty_like(batch);
+            return Ok(empty_like(batch));
         }
     }
 
     for clause in range_predicates {
         apply_range_mask(batch, clause, &mut mask);
         if mask.iter().all(|m| !m) {
-            return empty_like(batch);
+            return Ok(empty_like(batch));
         }
     }
 
     for pred in in_predicates {
         apply_in_mask(batch, pred, &mut mask);
         if mask.iter().all(|m| !m) {
-            return empty_like(batch);
+            return Ok(empty_like(batch));
         }
     }
 
     if let Some(expr) = remaining_predicate {
-        apply_remaining_mask(batch, expr, &mut mask);
+        apply_remaining_mask(batch, expr, &mut mask)?;
     }
 
     let match_count = mask.iter().filter(|&&m| m).count();
     if match_count == batch.num_rows() {
-        return batch.clone();
+        return Ok(batch.clone());
     }
     if match_count == 0 {
-        return empty_like(batch);
+        return Ok(empty_like(batch));
     }
 
-    apply_filter_mask_fast(batch, &mask)
+    Ok(apply_filter_mask_fast(batch, &mask))
 }
 
 pub fn apply_predicates_with_column_map(
@@ -83,13 +83,13 @@ pub fn apply_predicates_with_column_map(
     let remapped_remaining = remaining_predicate
         .map(|expr| remap_expr(expr, &col_pos_by_original))
         .transpose()?;
-    Ok(apply_predicates(
+    apply_predicates(
         batch,
         &remapped_eq,
         &remapped_range,
         &remapped_in,
         remapped_remaining.as_ref(),
-    ))
+    )
 }
 
 pub fn apply_eq_mask(batch: &RecordBatch, col_idx: usize, value: &ScalarValue, mask: &mut [bool]) {
@@ -147,12 +147,12 @@ fn apply_remaining_mask(
     batch: &RecordBatch,
     expr: &crate::sql::planner::LogicalExpr,
     mask: &mut [bool],
-) {
-    if let Ok(row_mask) = crate::sql::execution::operators::filter::eval_filter(expr, batch) {
-        for (i, m) in row_mask.iter().enumerate() {
-            mask[i] = mask[i] && *m;
-        }
+) -> crate::common::error::Result<()> {
+    let row_mask = crate::sql::execution::operators::filter::eval_filter(expr, batch)?;
+    for (i, m) in row_mask.iter().enumerate() {
+        mask[i] = mask[i] && *m;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -245,7 +245,7 @@ pub fn predicate_first_read(
 
     if let Some(expr) = remaining_predicate {
         let remapped_expr = remap_expr(expr, &pred_to_batch_pos)?;
-        apply_remaining_mask(&pred_batch, &remapped_expr, &mut mask);
+        apply_remaining_mask(&pred_batch, &remapped_expr, &mut mask)?;
     }
 
     let match_count = mask.iter().filter(|&&m| m).count();
@@ -438,7 +438,7 @@ pub fn cluster_key_range_read(
         &remapped_range,
         &remapped_in,
         remapped_remaining.as_ref(),
-    );
+    )?;
 
     project_filtered_union(&filtered, &union_cols, projection_cols)
 }

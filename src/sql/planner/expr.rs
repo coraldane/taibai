@@ -89,8 +89,13 @@ pub fn ast_expr_to_logical_with_context(
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
-            let idx =
-                resolve_qualified_column_index(table, column, schema, alias_map, ctx.outer.as_ref())?;
+            let idx = resolve_qualified_column_index(
+                table,
+                column,
+                schema,
+                alias_map,
+                ctx.outer.as_ref(),
+            )?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::BinaryOp { left, op, right } => {
@@ -236,9 +241,7 @@ pub fn ast_expr_to_logical_with_context(
                 let mut inner_ctx = ctx.clone();
                 inner_ctx.outer = None;
                 match plan_select_with_context(subquery_stmt, &inner_ctx) {
-                    Ok(subquery_plan) => {
-                        Ok(LogicalExpr::ExistsSubquery(Box::new(subquery_plan)))
-                    }
+                    Ok(subquery_plan) => Ok(LogicalExpr::ExistsSubquery(Box::new(subquery_plan))),
                     Err(e) if is_correlation_binding_error(&e) => Err(TaibaiError::Sql(
                         "correlated EXISTS is only supported as a top-level WHERE conjunct \
                          (AND-separated), not inside OR / SELECT list / HAVING"
@@ -275,6 +278,25 @@ pub fn ast_expr_to_logical_with_context(
                         .into(),
                 ))
             }
+        }
+        Expr::Correlated(corr) => {
+            let lhs = corr
+                .lhs
+                .as_deref()
+                .map(|e| ast_expr_to_logical_with_context(e, schema, alias_map, ctx))
+                .transpose()?
+                .map(Box::new);
+            Ok(LogicalExpr::CorrelatedSubquery(Box::new(
+                CorrelatedSubqueryPlan {
+                    id: corr.id,
+                    kind: corr.kind,
+                    lhs,
+                    stmt: (*corr.stmt).clone(),
+                    conjuncts: corr.conjuncts.clone(),
+                    params: corr.params.clone(),
+                    result_type: corr.result_type,
+                },
+            )))
         }
         _ => Err(TaibaiError::Sql("unsupported expression type".to_string())),
     }
@@ -439,6 +461,25 @@ pub fn ast_expr_to_logical(
                 args: bound_args,
             })
         }
+        Expr::Correlated(corr) => {
+            let lhs = corr
+                .lhs
+                .as_deref()
+                .map(|e| ast_expr_to_logical(e, schema, alias_map))
+                .transpose()?
+                .map(Box::new);
+            Ok(LogicalExpr::CorrelatedSubquery(Box::new(
+                CorrelatedSubqueryPlan {
+                    id: corr.id,
+                    kind: corr.kind,
+                    lhs,
+                    stmt: (*corr.stmt).clone(),
+                    conjuncts: corr.conjuncts.clone(),
+                    params: corr.params.clone(),
+                    result_type: corr.result_type,
+                },
+            )))
+        }
         _ => Err(TaibaiError::Sql("unsupported expression type".to_string())),
     }
 }
@@ -542,7 +583,8 @@ pub fn ast_expr_to_logical_join(
             Ok(LogicalExpr::Column(idx))
         }
         Expr::QualifiedColumn { table, column } => {
-            let idx = resolve_qualified_column_index(table, column, output_schema, alias_map)?;
+            let idx =
+                resolve_qualified_column_index(table, column, output_schema, alias_map, None)?;
             Ok(LogicalExpr::Column(idx))
         }
         Expr::BinaryOp { left, op, right } => {
@@ -807,6 +849,10 @@ pub fn collect_aggregate_calls(
             collect_aggregate_calls(pattern, aggs)?;
         }
         Expr::Exists(inner) => collect_aggregate_calls(inner, aggs)?,
+        Expr::Correlated(_) => {
+            // The inner statement belongs to the subquery's own block; its
+            // aggregates must not leak into the outer aggregate set.
+        }
         Expr::Subquery(stmt) => {
             if let Statement::Select { select_list, .. } = stmt.as_ref() {
                 for item in select_list {
@@ -1201,6 +1247,15 @@ pub fn collect_cols_from_expr(expr: &LogicalExpr, cols: &mut Vec<usize>) {
             }
         }
         LogicalExpr::Like { expr, .. } => collect_cols_from_expr(expr, cols),
+        LogicalExpr::CorrelatedSubquery(corr) => {
+            // Outer columns feeding the subquery must survive column pruning.
+            for (_, outer_idx) in &corr.params {
+                cols.push(*outer_idx);
+            }
+            if let Some(lhs) = &corr.lhs {
+                collect_cols_from_expr(lhs, cols);
+            }
+        }
         _ => {}
     }
 }
@@ -1264,6 +1319,48 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
                 .reduce(|left, right| crate::sql::binder::type_resolver::common_type(&left, &right))
                 .unwrap_or(DataType::Int64)
         }
+        LogicalExpr::CorrelatedSubquery(corr) => corr.result_type,
         _ => DataType::Int64,
+    }
+}
+
+/// True when the logical expression contains a correlated subquery node.
+/// Such predicates must stay with the operator that owns the subquery
+/// registry (FilterExec / ProjectExec); they can neither be pushed into
+/// scans nor evaluated by join/aggregate condition code.
+pub fn contains_correlated_subquery(expr: &LogicalExpr) -> bool {
+    match expr {
+        LogicalExpr::CorrelatedSubquery(_) => true,
+        LogicalExpr::BinaryOp { left, right, .. } => {
+            contains_correlated_subquery(left) || contains_correlated_subquery(right)
+        }
+        LogicalExpr::Not(inner) | LogicalExpr::IsNull(inner) | LogicalExpr::IsNotNull(inner) => {
+            contains_correlated_subquery(inner)
+        }
+        LogicalExpr::In { expr, .. } => contains_correlated_subquery(expr),
+        LogicalExpr::Between {
+            expr, low, high, ..
+        } => {
+            contains_correlated_subquery(expr)
+                || contains_correlated_subquery(low)
+                || contains_correlated_subquery(high)
+        }
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand.as_deref().is_some_and(contains_correlated_subquery)
+                || when_clauses.iter().any(|(w, t)| {
+                    contains_correlated_subquery(w) || contains_correlated_subquery(t)
+                })
+                || else_clause
+                    .as_deref()
+                    .is_some_and(contains_correlated_subquery)
+        }
+        LogicalExpr::Like { expr, .. } => contains_correlated_subquery(expr),
+        LogicalExpr::Function { args, .. } => args.iter().any(contains_correlated_subquery),
+        LogicalExpr::Aggregate(agg) => contains_correlated_subquery(&agg.arg),
+        _ => false,
     }
 }
