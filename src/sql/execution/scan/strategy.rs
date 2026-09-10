@@ -126,13 +126,12 @@ impl<'a> ScanPlanner<'a> {
         let order_key_pos = cluster_key
             .iter()
             .position(|key| key.eq_ignore_ascii_case(order_col_name))?;
-        if order_key_pos == 0 {
-            return None;
-        }
 
-        for key in cluster_key.iter().take(order_key_pos) {
-            let key_idx = self.table_schema.index_of(key)?;
-            self.spec.eq_value_for_column(key_idx)?;
+        if order_key_pos > 0 {
+            for key in cluster_key.iter().take(order_key_pos) {
+                let key_idx = self.table_schema.index_of(key)?;
+                self.spec.eq_value_for_column(key_idx)?;
+            }
         }
 
         Some(OrderedClusterLimit {

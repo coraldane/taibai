@@ -293,7 +293,56 @@ Validation:
 - `cargo check` passes with no new warnings.
 - `cargo test` passes (all suites, 435 tests, 0 failures).
 
-### Status Summary
+#### 2026-09-11 Dedicated TopN Operator
+
+Completed:
+
+- Added `src/sql/execution/operators/topn.rs` (`TopNExec`), a streaming bounded-heap Top-N operator:
+  - Input batches are drained once; only the best `limit + offset` rows are retained, so memory is O(K) instead of the previous O(N) full materialization in `SortExec::with_limit` (which merged all rows into one `RecordBatch` before `select_nth_unstable_by`).
+  - Accepted rows are stored in bounded chunks; evicted slots become dead and trigger periodic compaction via `ColumnArray::take`, keeping storage within a small multiple of K.
+  - Heap entries carry `Vec<ScalarValue>` keys compared through the shared `compare_scalars`, so ordering (including NULLs-last and per-key descending) matches `SortExec`; equal keys break by input order (deterministic).
+  - Expression sort keys are remapped to the first physical batch schema, reusing `remap_expr_for_batch`/`eval_expr_column`; non-expression columns keep the typed fast path in the final gather.
+- Wired `TopNExec` into both Top-N build sites: the physical planner (`LogicalPlan::TopN`) and the materialized fallback (`build_pipeline_with_subqueries`). `LimitExec` still trims offset when present. `SortExec` remains for unbounded `LogicalPlan::Sort`.
+- Added `topn_test.rs`: asc/desc selection, deterministic ties, worst-case eviction stream with compaction, reference parity against full sort, expression keys, empty/zero-capacity, and NULL ordering.
+
+Validation:
+
+- `cargo check` passes; `rustfmt --check` clean on touched files.
+- `cargo clippy --lib` introduces no new warnings.
+- `cargo test --workspace` passes with 0 failures (403 lib tests plus all integration suites).
+
+#### 2026-09-11 Cluster-Key Ordered TopN Early Stop
+
+Completed:
+
+- Extended `ScanPlanner::ordered_cluster_order` (`src/sql/execution/scan/strategy.rs`) to accept an
+  ORDER BY column that IS the first cluster-key column. Previously only the equality-pinned prefix
+  case (`WHERE k = ? ORDER BY next_key LIMIT n`) enabled the ordered-limit scan; ordering directly by
+  the first cluster key returned `None`, so `ORDER BY ck LIMIT n` and every Top-N query on the
+  cluster key drained the whole table into the Top-N heap. Plan-level engagement is still gated by
+  the existing runtime guards: the scan disables the ordered read (and the early-stop limit) when
+  memtable rows are pending or when sealed segments fail the cluster-key monotonicity check.
+- Fixed a latent ordering bug in `ScanExecutor` (`src/sql/execution/scan/executor.rs`): with an
+  ordered ASC limit plus pushed predicates, `rank_row_groups_for_limit` could reorder candidate row
+  groups by estimated predicate density before the ordered read, breaking cluster-key order for the
+  limit. Row-group ranking is now skipped whenever `ordered_limit` is active (ASC or DESC).
+- With these changes, `ORDER BY <first cluster key> [DESC] LIMIT n [OFFSET m]` reads only the
+  leading (or trailing, for DESC) cluster-ordered rows — O(limit + offset) I/O instead of a full
+  scan — while non-monotonic storage and memtable tails keep the previous full-read correctness.
+- Added regression tests:
+  - `strategy_test.rs`: position-0 ordered limit allowed (asc and desc); ordering by a later cluster
+    key without an equality prefix is still rejected.
+  - `topn_offset_test.rs`: end-to-end asc/desc/offset and range-predicated Top-N over two monotonic
+    flushed segments; fallback parity when segments are non-monotonic in discovery order; memtable
+    tail holding a smaller cluster key than sealed segments is still returned under `LIMIT`.
+
+Validation:
+
+- `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets --all-features` clean.
+- `cargo test --workspace` passes with 0 failures (403 lib tests plus all integration suites).
+
+## Status Summary
 
 All planned phases are now implemented:
 

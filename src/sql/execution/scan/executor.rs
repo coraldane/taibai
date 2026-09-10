@@ -339,7 +339,10 @@ impl<'a> ScanExecutor<'a> {
                     let mut candidate_indices = candidate_indices;
                     if ordered_limit.is_some_and(|order| order.desc) {
                         candidate_indices.reverse();
-                    } else if scan_limit.is_some() && self.spec.has_predicates() {
+                    } else if ordered_limit.is_none()
+                        && scan_limit.is_some()
+                        && self.spec.has_predicates()
+                    {
                         super::strategy::rank_row_groups_for_limit(
                             self.spec,
                             &reader,

@@ -8,6 +8,7 @@ pub mod project;
 pub mod scan;
 pub mod semi_join;
 pub mod sort;
+pub mod topn;
 
 use std::collections::HashMap;
 
@@ -205,8 +206,12 @@ pub fn build_pipeline_with_subqueries(
         LogicalPlan::TopN(topn) => {
             let schema = get_scan_schema(&topn.input);
             let input = build_pipeline_with_subqueries(*topn.input, table_batches, subqueries)?;
-            let sorted = SortExec::new(topn.sort_keys, input, schema.clone())
-                .with_limit(topn.limit.saturating_add(topn.offset));
+            let sorted = crate::sql::execution::operators::topn::TopNExec::new(
+                topn.sort_keys,
+                input,
+                schema.clone(),
+            )
+            .with_capacity(topn.limit.saturating_add(topn.offset));
             if topn.offset == 0 {
                 Ok(Box::new(sorted))
             } else {

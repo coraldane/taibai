@@ -11,6 +11,7 @@ use crate::sql::execution::operators::project::ProjectExec;
 use crate::sql::execution::operators::scan::ScanExec;
 use crate::sql::execution::operators::semi_join::SemiJoinExec;
 use crate::sql::execution::operators::sort::SortExec;
+use crate::sql::execution::operators::topn::TopNExec;
 use crate::sql::execution::operators::ExecutionOp;
 use crate::sql::execution::scan::spec::compile_scan_spec;
 use crate::sql::optimizer::cost::{ColumnStats, CostEstimator, TableStats};
@@ -244,8 +245,8 @@ fn build_operator_with_limit(
                 profile,
                 depth + 1,
             )?;
-            let sorted = SortExec::new(topn.sort_keys, input, schema.clone())
-                .with_limit(topn.limit.saturating_add(topn.offset));
+            let sorted = TopNExec::new(topn.sort_keys, input, schema.clone())
+                .with_capacity(topn.limit.saturating_add(topn.offset));
             if topn.offset == 0 {
                 Ok(Box::new(sorted))
             } else {

@@ -90,3 +90,53 @@ fn ordered_cluster_limit_requires_eq_prefix() {
     assert_eq!(plan.scan_limit, None);
     assert_eq!(plan.ordered_limit, None);
 }
+
+#[test]
+fn ordered_cluster_limit_allows_first_cluster_key_without_eq_prefix() {
+    let schema = clustered_schema();
+    let meta = clustered_meta(&schema);
+    let mut spec = ScanSpec::new("test_table");
+    spec.cluster_key = Some(meta.cluster_key.clone());
+    spec.has_order_by = true;
+    spec.limit = Some(121);
+    spec.order_by.push(ScanSortKey {
+        column_index: 0,
+        desc: false,
+    });
+
+    let plan = ScanPlanner::new(&spec, &schema, &meta).build();
+
+    assert_eq!(plan.scan_limit, Some(121));
+    assert_eq!(
+        plan.ordered_limit,
+        Some(OrderedClusterLimit {
+            order_column_index: 0,
+            desc: false
+        })
+    );
+}
+
+#[test]
+fn ordered_cluster_limit_allows_first_cluster_key_desc() {
+    let schema = clustered_schema();
+    let meta = clustered_meta(&schema);
+    let mut spec = ScanSpec::new("test_table");
+    spec.cluster_key = Some(meta.cluster_key.clone());
+    spec.has_order_by = true;
+    spec.limit = Some(121);
+    spec.order_by.push(ScanSortKey {
+        column_index: 0,
+        desc: true,
+    });
+
+    let plan = ScanPlanner::new(&spec, &schema, &meta).build();
+
+    assert_eq!(plan.scan_limit, Some(121));
+    assert_eq!(
+        plan.ordered_limit,
+        Some(OrderedClusterLimit {
+            order_column_index: 0,
+            desc: true
+        })
+    );
+}
