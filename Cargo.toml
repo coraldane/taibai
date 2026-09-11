@@ -166,4 +166,8 @@ path = "tests/sql_semantics_regression_test.rs"
 name = "subquery_derived_table_test"
 path = "tests/subquery_derived_table_test.rs"
 
+[[test]]
+name = "realtime_write_scaling_test"
+path = "tests/realtime_write_scaling_test.rs"
+
 

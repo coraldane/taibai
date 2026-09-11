@@ -193,6 +193,7 @@ Taibai 使用自定义的列式段存储格式：
 - 活动写入先落 `memtable_tail/`（组提交 + fsync，帧含 CRC 与行数索引）
 - flush 时物化进未 seal 的 active segment（原地追加 row group，sidecar 维护元数据），完成后 tail 清理
 - 崩溃恢复按 tail/clear/flush intent generation 仲裁重放，行数 watermark 防止重复
+- 恢复契约：已提交帧 CRC 损坏时整体报错（fail-loud，不静默丢行）；不足完整 header 的 tail 文件视为不存在（可安全跳过并新建）；损坏或撕裂的 flush intent 标记视为未满足，回退到更早的 tail 代际。以上行为由 `durable_tail_test.rs` 的崩溃注入测试锁定。
 
 ### 分区 (Partitioning)
 

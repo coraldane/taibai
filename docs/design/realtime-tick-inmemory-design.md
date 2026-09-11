@@ -1,6 +1,8 @@
 # 实时行情当日内存存储设计 (Realtime Tick In-Memory Design)
 
 > 状态注记：经典 WAL 已移除（见 `TAIBAI_DESIGN_ZH.md`「持久化 tail」）。本文中 WAL 阈值/fsync 相关表述为历史设计，现行持久化由 durable tail 与 active segment 承担。
+>
+> 实现进度（2026-09）：Step 1 性能核心已落地——`ColumnArray::take(&[u32])` 随机行 gather（`src/types/array/analytics.rs`，含 VarChar 无堆克隆路径）、`StringPool` sym 字典化与 `HotStore`/`HotStoreManager`（per-sym 倒排索引、resident coverage、内存软限与 `compact_prefix` 兜底）已实现于 `src/storage/core/hot_store.rs`，查询接线见 `src/sql/execution/scan/memtable.rs`，端到端验证见 `tests/hot_store_fast_path_test.rs`。本文其余部分保留为设计记录，以代码为准。
 
 > 场景：股票 tick 行情，每日约 2000 万行，按时序流式写入。
 > 目标：**当天单股票全量 tick 查询（约 5000 行/票）P50 < 1ms、P99 进 1ms**。

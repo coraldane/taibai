@@ -26,8 +26,37 @@ const TAIL_DIR: &str = "memtable_tail";
 static TAIL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const GROUP_COMMIT_MAX_DELAY: Duration = Duration::from_micros(500);
+/// Once the previous group held several statements the workload is
+/// concurrent: widen the collection window so one storage barrier amortizes
+/// over the whole in-flight burst instead of splitting into singleton fsyncs.
+const GROUP_COMMIT_CONCURRENT_DELAY: Duration = Duration::from_millis(2);
+/// Async-fsync mode bounds the acknowledged-but-not-yet-fsynced window by
+/// bytes and time; the commit thread also syncs after the write stream stays
+/// quiet even if neither bound is reached. The quiescence period must exceed
+/// the natural gap between bursts of a busy workload, otherwise every
+/// inter-group gap would trigger a sync. It also scales with the observed
+/// fsync cost: paying a 30ms stall for 5ms of silence is a bad trade, so the
+/// effective quiet period is `max(base, 2 x moving-average sync cost)`,
+/// capped at `ASYNC_FSYNC_MAX_DELAY` to respect the durability deadline.
+const ASYNC_FSYNC_MAX_DIRTY_BYTES: usize = 8 * 1024 * 1024;
+const ASYNC_FSYNC_MAX_DELAY: Duration = Duration::from_millis(200);
+const ASYNC_FSYNC_QUIESCE_DELAY: Duration = Duration::from_millis(5);
 const GROUP_COMMIT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const GROUP_COMMIT_MAX_REQUESTS: usize = 128;
+
+fn observe_sync_cost(previous: Duration, observed: Duration) -> Duration {
+    if previous.is_zero() {
+        observed
+    } else {
+        (previous * 3 + observed) / 4
+    }
+}
+
+fn async_quiesce_delay(sync_cost: Duration) -> Duration {
+    ASYNC_FSYNC_QUIESCE_DELAY
+        .max(sync_cost.saturating_mul(2))
+        .min(ASYNC_FSYNC_MAX_DELAY)
+}
 
 /// A WAL frame prepared by the request thread. Serialization and zstd level 3
 /// compression therefore happen in parallel and outside the table mutation
@@ -403,22 +432,95 @@ fn tail_commit_loop(
     let mut compressor = zstd::bulk::Compressor::new(3)
         .expect("zstd level 3 compressor must initialize for durable tail writer");
     let mut deferred = None;
+    let mut last_group_size = 0usize;
+    let mut dirty_tails: HashSet<TailKey> = HashSet::new();
+    let mut dirty_bytes = 0usize;
+    let mut last_sync = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut sync_cost = Duration::ZERO;
     loop {
+        if async_fsync && !dirty_tails.is_empty() {
+            let quiesced = last_activity.elapsed() >= async_quiesce_delay(sync_cost);
+            if quiesced
+                || dirty_bytes >= ASYNC_FSYNC_MAX_DIRTY_BYTES
+                || last_sync.elapsed() >= ASYNC_FSYNC_MAX_DELAY
+            {
+                let sync_started = Instant::now();
+                sync_dirty_tails(
+                    &mut files,
+                    &mut dirty_tails,
+                    &mut dirty_bytes,
+                    &mut last_sync,
+                );
+                sync_cost = observe_sync_cost(sync_cost, sync_started.elapsed());
+            }
+        }
         let command = match deferred.take() {
-            Some(command) => command,
-            None => match receiver.recv() {
-                Ok(command) => {
-                    unqueue(&queued, !matches!(command, CommitCommand::Shutdown { .. }));
-                    command
+            Some(command) => {
+                last_activity = Instant::now();
+                command
+            }
+            None => {
+                // With a deferred fsync backlog the loop must wake up before
+                // the durability deadline even when the channel goes quiet.
+                let dirty_wait = if async_fsync && !dirty_tails.is_empty() {
+                    let time_bound = ASYNC_FSYNC_MAX_DELAY.saturating_sub(last_sync.elapsed());
+                    let quiesce_bound = async_quiesce_delay(sync_cost)
+                        .saturating_sub(last_activity.elapsed())
+                        .max(Duration::from_micros(200));
+                    Some(time_bound.min(quiesce_bound))
+                } else {
+                    None
+                };
+                match dirty_wait {
+                    Some(wait) => match receiver.recv_timeout(wait) {
+                        Ok(command) => {
+                            unqueue(&queued, !matches!(command, CommitCommand::Shutdown { .. }));
+                            last_activity = Instant::now();
+                            command
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            sync_dirty_tails(
+                                &mut files,
+                                &mut dirty_tails,
+                                &mut dirty_bytes,
+                                &mut last_sync,
+                            );
+                            files.open.clear();
+                            break;
+                        }
+                    },
+                    None => match receiver.recv() {
+                        Ok(command) => {
+                            unqueue(&queued, !matches!(command, CommitCommand::Shutdown { .. }));
+                            last_activity = Instant::now();
+                            command
+                        }
+                        Err(_) => {
+                            sync_dirty_tails(
+                                &mut files,
+                                &mut dirty_tails,
+                                &mut dirty_bytes,
+                                &mut last_sync,
+                            );
+                            files.open.clear();
+                            break;
+                        }
+                    },
                 }
-                Err(_) => break,
-            },
+            }
         };
         match command {
             CommitCommand::Append(first) => {
+                let window = if last_group_size > 1 {
+                    GROUP_COMMIT_CONCURRENT_DELAY
+                } else {
+                    GROUP_COMMIT_MAX_DELAY
+                };
                 let mut bytes = first.prepared.encoded_len();
                 let mut group = vec![first];
-                let deadline = Instant::now() + GROUP_COMMIT_MAX_DELAY;
+                let deadline = Instant::now() + window;
                 while group.len() < GROUP_COMMIT_MAX_REQUESTS && bytes < GROUP_COMMIT_MAX_BYTES {
                     let now = Instant::now();
                     if now >= deadline {
@@ -427,6 +529,7 @@ fn tail_commit_loop(
                     match receiver.recv_timeout(deadline.saturating_duration_since(now)) {
                         Ok(CommitCommand::Append(next)) => {
                             unqueue(&queued, true);
+                            last_activity = Instant::now();
                             bytes = bytes.saturating_add(next.prepared.encoded_len());
                             group.push(next);
                         }
@@ -439,16 +542,45 @@ fn tail_commit_loop(
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                commit_append_group(&mut files, &mut compressor, group, async_fsync);
+                last_group_size = group.len();
+                let written = write_append_group(&mut files, &mut compressor, group);
+                if async_fsync {
+                    // Frames are in the page cache: release the
+                    // acknowledgements now and keep the storage barrier off
+                    // the INSERT latency path. The dirty tails are synced on
+                    // quiescence, byte, or time bounds above; ordering with
+                    // later commands (barriers, flush intents) is preserved
+                    // because this thread processes the channel serially.
+                    for group in written {
+                        dirty_tails.insert(group.key);
+                        dirty_bytes = dirty_bytes.saturating_add(group.bytes);
+                        for completion in group.completions {
+                            completion.finish(Ok(()));
+                        }
+                    }
+                } else {
+                    sync_append_group(&mut files, written);
+                }
             }
             CommitCommand::Barrier {
                 table_dir,
                 completion,
             } => {
+                let sync_started = Instant::now();
+                sync_dirty_tails_for_table(&mut files, &mut dirty_tails, &table_dir);
+                if async_fsync {
+                    sync_cost = observe_sync_cost(sync_cost, sync_started.elapsed());
+                }
                 files.evict_table(&table_dir);
                 completion.finish(Ok(()));
             }
             CommitCommand::Shutdown { completion } => {
+                sync_dirty_tails(
+                    &mut files,
+                    &mut dirty_tails,
+                    &mut dirty_bytes,
+                    &mut last_sync,
+                );
                 files.open.clear();
                 completion.finish(Ok(()));
                 break;
@@ -457,12 +589,17 @@ fn tail_commit_loop(
     }
 }
 
-fn commit_append_group(
+struct WrittenTailGroup {
+    key: TailKey,
+    completions: Vec<Arc<CommitCompletion>>,
+    bytes: usize,
+}
+
+fn write_append_group(
     files: &mut TailFileSet,
     compressor: &mut zstd::bulk::Compressor<'_>,
     group: Vec<AppendCommand>,
-    async_fsync: bool,
-) {
+) -> Vec<WrittenTailGroup> {
     if crate::common::config::insert_profile_enabled() {
         let bytes = group
             .iter()
@@ -474,45 +611,85 @@ fn commit_append_group(
             bytes
         );
     }
-    let mut by_tail = HashMap::<TailKey, Vec<Arc<CommitCompletion>>>::new();
+    let mut by_tail = HashMap::<TailKey, (Vec<Arc<CommitCompletion>>, usize)>::new();
     for mut command in group {
+        let frame_bytes = command.prepared.encoded_len();
         command.prepared.finish(compressor);
         match files.append(&command) {
-            Ok(key) => by_tail.entry(key).or_default().push(command.completion),
+            Ok(key) => {
+                let entry = by_tail.entry(key).or_insert_with(|| (Vec::new(), 0));
+                entry.0.push(command.completion);
+                entry.1 += frame_bytes;
+            }
             Err(error) => command.completion.finish(Err(error.to_string())),
         }
     }
-    for (key, completions) in by_tail {
-        if async_fsync {
-            // Frames are in the page cache: release the acknowledgements now
-            // and keep the barrier off the INSERT latency path. Ordering with
-            // later commands (barriers, flush intents) is preserved because
-            // this thread processes the channel serially.
-            for completion in &completions {
-                completion.finish(Ok(()));
-            }
-            if let Err(error) = files.sync(&key) {
-                tracing::error!(
-                    tail = ?key,
-                    error = %error,
-                    "background durable tail fsync failed after acknowledgement"
-                );
-            }
-        } else {
-            let sync_start = Instant::now();
-            let outcome = files.sync(&key).map_err(|error| error.to_string());
-            let sync_elapsed = sync_start.elapsed();
-            let warn_after = tail_commit_timeouts().1;
-            if sync_elapsed >= warn_after {
-                tracing::warn!(
-                    tail = ?key,
-                    fsync_ms = sync_elapsed.as_millis() as u64,
-                    "durable tail fsync was slow"
-                );
-            }
-            for completion in completions {
-                completion.finish(outcome.clone());
-            }
+    by_tail
+        .into_iter()
+        .map(|(key, (completions, bytes))| WrittenTailGroup {
+            key,
+            completions,
+            bytes,
+        })
+        .collect()
+}
+
+fn sync_append_group(files: &mut TailFileSet, written: Vec<WrittenTailGroup>) {
+    for group in written {
+        let sync_start = Instant::now();
+        let outcome = files.sync(&group.key).map_err(|error| error.to_string());
+        let sync_elapsed = sync_start.elapsed();
+        let warn_after = tail_commit_timeouts().1;
+        if sync_elapsed >= warn_after {
+            tracing::warn!(
+                tail = ?group.key,
+                fsync_ms = sync_elapsed.as_millis() as u64,
+                "durable tail fsync was slow"
+            );
+        }
+        for completion in group.completions {
+            completion.finish(outcome.clone());
+        }
+    }
+}
+
+fn sync_dirty_tails(
+    files: &mut TailFileSet,
+    dirty_tails: &mut HashSet<TailKey>,
+    dirty_bytes: &mut usize,
+    last_sync: &mut Instant,
+) {
+    for key in std::mem::take(dirty_tails) {
+        if let Err(error) = files.sync(&key) {
+            tracing::error!(
+                tail = ?key,
+                error = %error,
+                "deferred durable tail fsync failed"
+            );
+        }
+    }
+    *dirty_bytes = 0;
+    *last_sync = Instant::now();
+}
+
+fn sync_dirty_tails_for_table(
+    files: &mut TailFileSet,
+    dirty_tails: &mut HashSet<TailKey>,
+    table_dir: &Path,
+) {
+    let keys: Vec<TailKey> = dirty_tails
+        .iter()
+        .filter(|key| key.table_dir == table_dir)
+        .cloned()
+        .collect();
+    for key in keys {
+        dirty_tails.remove(&key);
+        if let Err(error) = files.sync(&key) {
+            tracing::error!(
+                tail = ?key,
+                error = %error,
+                "durable tail fsync before barrier evict failed"
+            );
         }
     }
 }
@@ -828,12 +1005,23 @@ fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf)>> {
         for generation in &generations {
             match generation.kind {
                 GenerationKind::Tail => {
+                    if !tail_file_has_header(&generation.path) {
+                        discard_unusable_tail(&generation.path);
+                        continue;
+                    }
                     live_path = Some(generation.path.clone());
                     break;
                 }
                 GenerationKind::Clear => break,
                 GenerationKind::Flush => {
-                    if flush_intent_satisfied(table_dir, &fs::read(&generation.path)?)? {
+                    // A torn or corrupt intent marker proves nothing about the
+                    // tail: treat it as unsatisfied so the preceding tail stays
+                    // authoritative instead of failing table recovery.
+                    let satisfied = fs::read(&generation.path)
+                        .ok()
+                        .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
+                        .unwrap_or(false);
+                    if satisfied {
                         remove_other_generations(&tail_dir, id, &generation.path)?;
                         remove_file_if_exists(&generation.path)?;
                         break;
@@ -872,6 +1060,9 @@ pub fn recover_index(table_dir: &Path, _schema: &Schema) -> Result<Vec<Recovered
     let mut recovered = Vec::new();
     for (id, path) in resolve_live_tail_paths(table_dir)? {
         let bytes = fs::read(&path)?;
+        if bytes.len() < TAIL_LOG_HEADER_LEN as usize {
+            continue;
+        }
         let rows = scan_tail_log_rows(&bytes).ok_or_else(|| {
             TaibaiError::Storage("unsupported or corrupt durable tail version".into())
         })?;
@@ -1194,6 +1385,21 @@ fn next_sequence() -> u64 {
     nanos.saturating_add(counter & 0xFFFF)
 }
 
+/// A tail file shorter than the V2 log header cannot hold even one committed
+/// frame: nothing was fsynced into it, so recovery must treat it as absent
+/// instead of failing the whole table's recovery.
+const TAIL_LOG_HEADER_LEN: u64 = 8;
+
+fn tail_file_has_header(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|meta| meta.len() >= TAIL_LOG_HEADER_LEN)
+        .unwrap_or(false)
+}
+
+fn discard_unusable_tail(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
 fn parse_generation(path: &Path) -> Option<(Uuid, Generation)> {
     let name = path.file_name()?.to_str()?;
     let mut parts = name.split('.');
@@ -1256,16 +1462,24 @@ fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
     for generation in generations {
         match generation.kind {
-            GenerationKind::Tail => return Ok(Some(generation.path)),
+            GenerationKind::Tail => {
+                if !tail_file_has_header(&generation.path) {
+                    discard_unusable_tail(&generation.path);
+                    continue;
+                }
+                return Ok(Some(generation.path));
+            }
             GenerationKind::Clear => return Ok(None),
             GenerationKind::Flush => {
-                let Ok(bytes) = fs::read(&generation.path) else {
-                    continue;
-                };
                 let table_dir = tail_dir.parent().unwrap_or(tail_dir);
-                if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
+                let satisfied = fs::read(&generation.path)
+                    .ok()
+                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
+                    .unwrap_or(false);
+                if satisfied {
                     return Ok(None);
                 }
+                let _ = fs::remove_file(&generation.path);
             }
         }
     }
