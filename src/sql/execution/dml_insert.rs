@@ -9,6 +9,7 @@ use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
 use crate::storage::catalog::auto_increment::AutoIncrementCounter;
+use crate::storage::catalog::schema::TableDurability;
 use crate::storage::index::index_manager::{UniqueIndexEntry, UniqueRowLocation};
 use crate::storage::index::sort_key::SortKeyInserter;
 use crate::storage::segment_manager::SegmentManager;
@@ -22,6 +23,12 @@ use crate::sql::parser::ast::Expr;
 
 const CONSTRAINT_INSERT_LOCK_STRIPES: usize = 256;
 
+/// Minimum rows per auto-commit INSERT statement for a DURABILITY = RELAXED
+/// table to take the direct segment write path. Small statements keep the
+/// strict memtable pipeline so mixed OLTP traffic retains immediate
+/// visibility and per-statement durability.
+const RELAXED_DIRECT_INSERT_MIN_ROWS: usize = 1024;
+
 lazy_static::lazy_static! {
     static ref CONSTRAINT_INSERT_LOCKS: Vec<Mutex<()>> = (0..CONSTRAINT_INSERT_LOCK_STRIPES)
         .map(|_| Mutex::new(()))
@@ -29,7 +36,7 @@ lazy_static::lazy_static! {
     static ref FAST_INSERT_PLAN_CACHE: Mutex<HashMap<String, Arc<FastInsertPlan>>> = Mutex::new(HashMap::new());
 }
 
-fn constraint_insert_lock(db: &str, table: &str) -> &'static Mutex<()> {
+pub(super) fn constraint_insert_lock(db: &str, table: &str) -> &'static Mutex<()> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     db.hash(&mut hasher);
     table.hash(&mut hasher);
@@ -63,3 +70,7 @@ struct MaterializedInsert {
 include!("dml_insert/fast.rs");
 include!("dml_insert/write.rs");
 include!("dml_insert/constraints.rs");
+
+#[cfg(test)]
+#[path = "dml_insert/lock_order_test.rs"]
+mod lock_order_tests;

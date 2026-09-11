@@ -8,14 +8,14 @@ use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::auth::{Permission, PermissionObjectType, PermissionType};
 use crate::storage::catalog::schema::{
-    DatabaseCatalog, PartitionType, SecondaryIndexType, TableMeta,
+    DatabaseCatalog, PartitionType, SecondaryIndexType, TableDurability, TableMeta,
 };
 use crate::types::batch::{ColumnDef, ColumnDefaultValue, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
 use crate::sql::parser::ast::{
-    AlterOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef, PartitionDef,
+    AlterOperation, ColumnDefAst, DefaultValue, DurabilityLevel, GrantObject, HotDef, PartitionDef,
     PartitionStrategy, Privilege, TtlDef, UniqueKeyDef,
 };
 
@@ -36,8 +36,8 @@ const FRESH_DATA_DIR: &str = "fresh";
 
 #[cfg(test)]
 thread_local! {
-    static FORCE_DROP_CLEANUP_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
-    static FORCE_DDL_CLEANUP_FAILURE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static FORCE_DROP_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_DDL_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn is_retryable_delete_error(error: &io::Error) -> bool {
@@ -359,13 +359,6 @@ fn stage_partition_files(
                 path.clone(),
                 crate::storage::segment::meta::sidecar_meta_path(&path),
             ] {
-                if candidate.exists() && seen.insert(candidate.clone()) {
-                    paths.push(candidate);
-                }
-            }
-            if let Some(candidate) =
-                crate::storage::segment::meta::legacy_partition_sidecar_meta_path(&path)
-            {
                 if candidate.exists() && seen.insert(candidate.clone()) {
                     paths.push(candidate);
                 }
@@ -733,5 +726,9 @@ include!("ddl/database_auth.rs");
 include!("ddl/introspection.rs");
 
 #[cfg(test)]
-#[path = "ddl_tests.rs"]
+#[path = "ddl_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ddl/analyze_histogram_test.rs"]
+mod analyze_histogram_tests;

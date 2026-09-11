@@ -478,7 +478,7 @@ fn bulk_import_insert_is_visible_before_stop_bulk_import() {
 
     let payload = encode_columnar_bulk_insert("t_stock_daily", &batch).expect("encode payload");
     let inserted = engine
-        .exec_bulk_insert_payload_with_options("main", &payload, true, true)
+        .exec_bulk_insert_payload_with_options("main", &payload, true)
         .expect("bulk insert payload");
     assert_eq!(inserted, 2);
 

@@ -63,6 +63,13 @@ impl<'a> ScanExecutor<'a> {
     }
 
     pub fn execute(&mut self) -> Result<Vec<RecordBatch>> {
+        let segment_mgr = self.runtime.segment_mgr().clone();
+        let db = self.db.to_string();
+        let table = self.spec.table_name.clone();
+        segment_mgr.with_table_flush_read_lock(&db, &table, || self.execute_unlocked())
+    }
+
+    fn execute_unlocked(&mut self) -> Result<Vec<RecordBatch>> {
         if let Some(aggs) = self.spec.simple_metadata_aggregates.clone() {
             return self.execute_simple_metadata_aggregate(&aggs);
         }
@@ -273,25 +280,23 @@ impl<'a> ScanExecutor<'a> {
             } else {
                 for seg_path in &filtered_segments {
                     let meta = mgr.segment_meta(seg_path).ok().flatten();
-                    let meta_candidate_indices = meta.as_ref().and_then(|meta| {
+                    let meta_candidate_indices = meta.as_ref().map(|meta| {
                         let pred = self.spec.to_row_group_predicate();
                         if !super::row_group::prune_segment_by_zone_map(
                             &pred,
                             &meta.segment_zone_maps,
                         ) {
-                            return Some(Vec::new());
+                            return Vec::new();
                         }
-                        Some(
-                            super::row_group::prune_row_group_meta(
-                                &meta.row_groups,
-                                &pred,
-                                &super::row_group::build_bloom_check_list(self.spec),
-                                &super::row_group::build_in_check_list(self.spec),
-                                &super::row_group::build_set_check_list(self.spec),
-                                &super::row_group::build_set_in_check_list(self.spec),
-                            )
-                            .candidate_indices,
+                        super::row_group::prune_row_group_meta(
+                            &meta.row_groups,
+                            &pred,
+                            &super::row_group::build_bloom_check_list(self.spec),
+                            &super::row_group::build_in_check_list(self.spec),
+                            &super::row_group::build_set_check_list(self.spec),
+                            &super::row_group::build_set_in_check_list(self.spec),
                         )
+                        .candidate_indices
                     });
                     if meta_candidate_indices
                         .as_ref()
@@ -334,7 +339,10 @@ impl<'a> ScanExecutor<'a> {
                     let mut candidate_indices = candidate_indices;
                     if ordered_limit.is_some_and(|order| order.desc) {
                         candidate_indices.reverse();
-                    } else if scan_limit.is_some() && self.spec.has_predicates() {
+                    } else if ordered_limit.is_none()
+                        && scan_limit.is_some()
+                        && self.spec.has_predicates()
+                    {
                         super::strategy::rank_row_groups_for_limit(
                             self.spec,
                             &reader,

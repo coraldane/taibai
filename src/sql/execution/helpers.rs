@@ -1,26 +1,9 @@
-#![allow(dead_code)]
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{BinOp, Expr};
-
-pub fn eval_expr_to_int(expr: &Expr) -> Result<i64> {
-    match expr {
-        Expr::Literal(ScalarValue::Int64(Some(v))) => Ok(*v),
-        Expr::Literal(ScalarValue::Int32(Some(v))) => Ok(*v as i64),
-        Expr::Literal(ScalarValue::UInt64(Some(v))) => Ok(*v as i64),
-        Expr::Literal(ScalarValue::UInt32(Some(v))) => Ok(*v as i64),
-        Expr::Literal(v) => Err(TaibaiError::Sql(format!(
-            "expected integer literal for OFFSET/LIMIT, got {:?}",
-            v
-        ))),
-        _ => Err(TaibaiError::Sql(
-            "OFFSET/LIMIT requires a constant integer expression".into(),
-        )),
-    }
-}
 
 pub fn eval_where_clause_batch(
     expr: &Expr,
@@ -210,6 +193,9 @@ pub fn eval_where_clause_batch(
         }
         Expr::Literal(v) => Ok(vec![!v.is_null(); num_rows]),
         Expr::Column(_) => Ok(vec![true; num_rows]),
+        Expr::Like { .. } => (0..num_rows)
+            .map(|i| eval_where_clause(expr, batch, i, schema))
+            .collect(),
         _ => Ok(vec![true; num_rows]),
     }
 }
@@ -284,8 +270,26 @@ pub fn eval_where_clause(
         Expr::UnaryMinus(_) => Ok(true),
         Expr::Between { .. } => Ok(true),
         Expr::Case { .. } => Ok(true),
-        Expr::Like { .. } => Ok(true),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+            let pattern_value = eval_expr_for_row(pattern, batch, row_idx, schema)?;
+            if value.is_null() || pattern_value.is_null() {
+                return Ok(false);
+            }
+            let Some(pattern_text) = pattern_value.to_text() else {
+                return Ok(false);
+            };
+            let matched = scalar_like_matches(&value, &pattern_text);
+            Ok(if *negated { !matched } else { matched })
+        }
         Expr::Exists(_) => Ok(true),
+        Expr::Correlated(_) => Err(TaibaiError::Sql(
+            "correlated subqueries are not supported in this context".to_string(),
+        )),
         Expr::Subquery(_) => Ok(true),
         Expr::WindowFunction { .. } => Ok(true),
         Expr::Placeholder(_) => Ok(true),
@@ -347,8 +351,30 @@ pub fn eval_expr_for_row(
         Expr::In { .. } => Ok(ScalarValue::Bool(None)),
         Expr::Between { .. } => Ok(ScalarValue::Bool(None)),
         Expr::Case { .. } => Ok(ScalarValue::Int64(None)),
-        Expr::Like { .. } => Ok(ScalarValue::Bool(None)),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+            let pattern_value = eval_expr_for_row(pattern, batch, row_idx, schema)?;
+            if value.is_null() || pattern_value.is_null() {
+                return Ok(ScalarValue::Bool(None));
+            }
+            let Some(pattern_text) = pattern_value.to_text() else {
+                return Ok(ScalarValue::Bool(None));
+            };
+            let matched = scalar_like_matches(&value, &pattern_text);
+            Ok(ScalarValue::Bool(Some(if *negated {
+                !matched
+            } else {
+                matched
+            })))
+        }
         Expr::Exists(_) => Ok(ScalarValue::Bool(None)),
+        Expr::Correlated(_) => Err(TaibaiError::Sql(
+            "correlated subqueries are not supported in this context".to_string(),
+        )),
         Expr::Subquery(_) => Ok(ScalarValue::Int64(None)),
         Expr::WindowFunction { .. } => Ok(ScalarValue::Int64(None)),
         Expr::Placeholder(_) => Ok(ScalarValue::Int64(None)),
@@ -374,6 +400,79 @@ fn scalar_values_equal(a: &ScalarValue, b: &ScalarValue) -> bool {
         (ScalarValue::Int32(Some(a)), ScalarValue::Int64(Some(b))) => *a as i64 == *b,
         (ScalarValue::Int64(Some(a)), ScalarValue::Int32(Some(b))) => *a == *b as i64,
         _ => a == b,
+    }
+}
+
+/// SQL LIKE pattern match with `%` (any run) and `_` (single char) wildcards.
+/// A backslash escapes `%`, `_` and itself. Case-sensitive, char-based.
+pub fn sql_like_match(value: &str, pattern: &str) -> bool {
+    enum Token {
+        Char(char),
+        Percent,
+        Underscore,
+    }
+    let mut tokens = Vec::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped @ ('%' | '_' | '\\')) => tokens.push(Token::Char(escaped)),
+                Some(other) => {
+                    tokens.push(Token::Char('\\'));
+                    tokens.push(Token::Char(other));
+                }
+                None => tokens.push(Token::Char('\\')),
+            },
+            '%' => tokens.push(Token::Percent),
+            '_' => tokens.push(Token::Underscore),
+            other => tokens.push(Token::Char(other)),
+        }
+    }
+    let value: Vec<char> = value.chars().collect();
+    let (mut vi, mut ti) = (0usize, 0usize);
+    let (mut star_token, mut star_value) = (usize::MAX, 0usize);
+    while vi < value.len() {
+        match tokens.get(ti) {
+            Some(Token::Underscore) => {
+                vi += 1;
+                ti += 1;
+            }
+            Some(Token::Char(c)) if *c == value[vi] => {
+                vi += 1;
+                ti += 1;
+            }
+            Some(Token::Percent) => {
+                star_token = ti;
+                star_value = vi;
+                ti += 1;
+            }
+            _ => {
+                if star_token == usize::MAX {
+                    return false;
+                }
+                star_value += 1;
+                vi = star_value;
+                ti = star_token + 1;
+            }
+        }
+    }
+    while matches!(tokens.get(ti), Some(Token::Percent)) {
+        ti += 1;
+    }
+    ti == tokens.len()
+}
+
+/// LIKE semantics for one scalar: NULL never matches (also under NOT LIKE).
+/// Non-string values are coerced through their text form.
+pub fn scalar_like_matches(value: &ScalarValue, pattern: &str) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    match value {
+        ScalarValue::VarChar(Some(text)) => sql_like_match(text, pattern),
+        other => other
+            .to_text()
+            .is_some_and(|text| sql_like_match(&text, pattern)),
     }
 }
 
@@ -489,22 +588,24 @@ fn eval_constant_binary(left: &ScalarValue, op: BinOp, right: &ScalarValue) -> R
     }
 
     if let (Some(left), Some(right)) = (left.integer_i128(), right.integer_i128()) {
-        let value = match op {
-            BinOp::Add => left.checked_add(right),
-            BinOp::Sub => left.checked_sub(right),
-            BinOp::Mul => left.checked_mul(right),
-            BinOp::Div => {
-                if right == 0 {
-                    return Err(TaibaiError::Sql("division by zero".to_string()));
+        if !matches!(op, BinOp::Div) {
+            let value = match op {
+                BinOp::Add => left.checked_add(right),
+                BinOp::Sub => left.checked_sub(right),
+                BinOp::Mul => left.checked_mul(right),
+                BinOp::Mod => {
+                    if right == 0 {
+                        return Ok(ScalarValue::Int64(None));
+                    }
+                    left.checked_rem(right)
                 }
-                left.checked_div(right)
+                _ => None,
             }
-            _ => None,
+            .ok_or_else(|| TaibaiError::Sql("integer constant expression overflow".to_string()))?;
+            return i64::try_from(value)
+                .map(|value| ScalarValue::Int64(Some(value)))
+                .map_err(|_| TaibaiError::Sql("integer constant expression overflow".to_string()));
         }
-        .ok_or_else(|| TaibaiError::Sql("integer constant expression overflow".to_string()))?;
-        return i64::try_from(value)
-            .map(|value| ScalarValue::Int64(Some(value)))
-            .map_err(|_| TaibaiError::Sql("integer constant expression overflow".to_string()));
     }
 
     let left = left.numeric_f64().ok_or_else(|| {
@@ -523,6 +624,12 @@ fn eval_constant_binary(left: &ScalarValue, op: BinOp, right: &ScalarValue) -> R
             }
             left / right
         }
+        BinOp::Mod => {
+            if right == 0.0 {
+                return Ok(ScalarValue::Float64(None));
+            }
+            left % right
+        }
         _ => {
             return Err(TaibaiError::Sql(
                 "unsupported operator in constant expression".to_string(),
@@ -534,14 +641,6 @@ fn eval_constant_binary(left: &ScalarValue, op: BinOp, right: &ScalarValue) -> R
 
 pub fn eval_expr_to_scalar(expr: &Expr, dt: &DataType) -> Result<ScalarValue> {
     eval_expr_to_scalar_with_scale_timezone(expr, dt, 0, 0)
-}
-
-pub fn eval_expr_to_scalar_with_timezone(
-    expr: &Expr,
-    dt: &DataType,
-    timezone_offset_hours: i32,
-) -> Result<ScalarValue> {
-    eval_expr_to_scalar_with_scale_timezone(expr, dt, 0, timezone_offset_hours)
 }
 
 pub fn eval_expr_to_scalar_with_scale_timezone(
@@ -757,62 +856,6 @@ pub fn sort_batch_by_key(
     RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
-pub fn apply_row_group_predicate(
-    batch: &RecordBatch,
-    pred: &crate::storage::segment::RowGroupPredicate,
-) -> Vec<RecordBatch> {
-    let num_rows = batch.num_rows();
-    if num_rows == 0 || pred.is_empty() {
-        return vec![batch.clone()];
-    }
-    let mut matched = RecordBatch::new(batch.schema.clone());
-    for row_idx in 0..num_rows {
-        let mut passes = true;
-        for clause in &pred.clauses {
-            let val =
-                batch
-                    .scalar(row_idx, clause.column_index)
-                    .unwrap_or(ScalarValue::null_for_type(
-                        batch.schema.columns[clause.column_index].data_type,
-                    ));
-            if !eval_range_clause(&val, clause) {
-                passes = false;
-                break;
-            }
-        }
-        if passes {
-            for col_idx in 0..batch.num_columns() {
-                let val = batch
-                    .scalar(row_idx, col_idx)
-                    .unwrap_or(ScalarValue::null_for_type(
-                        batch.schema.columns[col_idx].data_type,
-                    ));
-                let _ = matched.column_mut(col_idx).unwrap().push(&val);
-            }
-        }
-    }
-    if matched.num_rows() > 0 {
-        vec![matched]
-    } else {
-        vec![]
-    }
-}
-
-fn eval_range_clause(val: &ScalarValue, clause: &crate::storage::segment::RangeClause) -> bool {
-    use crate::storage::segment::RangeOp;
-    match clause.op {
-        RangeOp::Eq => val == &clause.value,
-        RangeOp::Lt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Less),
-        RangeOp::Le => {
-            compare_scalars(val, &clause.value).is_some_and(|o| o != std::cmp::Ordering::Greater)
-        }
-        RangeOp::Gt => compare_scalars(val, &clause.value) == Some(std::cmp::Ordering::Greater),
-        RangeOp::Ge => {
-            compare_scalars(val, &clause.value).is_some_and(|o| o != std::cmp::Ordering::Less)
-        }
-    }
-}
-
 pub fn build_row_group_predicate(
     where_clause: &Option<Expr>,
     schema: &Schema,
@@ -856,6 +899,7 @@ fn collect_expr_column_indices_inner(expr: &Expr, schema: &Schema, indices: &mut
         | Expr::IsNull(inner)
         | Expr::IsNotNull(inner)
         | Expr::Exists(inner) => collect_expr_column_indices_inner(inner, schema, indices),
+        Expr::Correlated(_) => {}
         Expr::In { expr, values, .. } => {
             collect_expr_column_indices_inner(expr, schema, indices);
             for item in values {
@@ -962,63 +1006,5 @@ fn extract_range_clauses(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn eval(value: ScalarValue, dt: DataType, scale: i32) -> Result<ScalarValue> {
-        eval_expr_to_scalar_with_scale_timezone(&Expr::Literal(value), &dt, scale, 0)
-    }
-
-    #[test]
-    fn coerces_int32_param_into_varchar_column() {
-        let got = eval(ScalarValue::Int32(Some(42)), DataType::VarChar, 0).unwrap();
-        assert_eq!(got, ScalarValue::VarChar(Some("42".to_string())));
-    }
-
-    #[test]
-    fn coerces_numeric_and_bool_params_into_varchar_column() {
-        let cases = vec![
-            (ScalarValue::Int64(Some(-7)), "-7"),
-            (ScalarValue::Int8(Some(8)), "8"),
-            (ScalarValue::UInt64(Some(9)), "9"),
-            (ScalarValue::Float64(Some(1.5)), "1.5"),
-            (ScalarValue::Float32(Some(2.5)), "2.5"),
-            (ScalarValue::Bool(Some(true)), "true"),
-        ];
-        for (input, want) in cases {
-            let got = eval(input, DataType::VarChar, 0).unwrap();
-            assert_eq!(got, ScalarValue::VarChar(Some(want.to_string())));
-        }
-    }
-
-    #[test]
-    fn coerces_int32_param_into_decimal_column_with_scale() {
-        let got = eval(ScalarValue::Int32(Some(42)), DataType::Decimal, 4).unwrap();
-        assert_eq!(got, ScalarValue::Decimal(Some(420000)));
-    }
-
-    #[test]
-    fn coerces_cross_integer_params_via_fallback() {
-        let got = eval(ScalarValue::Int32(Some(7)), DataType::Int64, 0).unwrap();
-        assert_eq!(got, ScalarValue::Int64(Some(7)));
-
-        let got = eval(ScalarValue::Int64(Some(300)), DataType::Int16, 0).unwrap();
-        assert_eq!(got, ScalarValue::Int16(Some(300)));
-    }
-
-    #[test]
-    fn incompatible_param_type_returns_sql_error_not_internal_mismatch() {
-        let err = eval(ScalarValue::VarChar(Some("abc".into())), DataType::Int32, 0).unwrap_err();
-        assert!(
-            matches!(err, TaibaiError::Sql(_)),
-            "expected Sql error, got {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn null_param_stays_null_for_target_type() {
-        let got = eval(ScalarValue::Int32(None), DataType::VarChar, 0).unwrap();
-        assert_eq!(got, ScalarValue::VarChar(None));
-    }
-}
+#[path = "helpers_test.rs"]
+mod tests;

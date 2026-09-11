@@ -7,10 +7,6 @@ use super::Rule;
 pub struct IndexSelectionRule;
 
 impl Rule for IndexSelectionRule {
-    fn name(&self) -> &str {
-        "index_selection"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         apply_index_selection(plan)
     }

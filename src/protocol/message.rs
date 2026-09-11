@@ -6,7 +6,6 @@ pub const HEADER_SIZE: usize = 7;
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 pub const MSG_TYPE_QUERY: u8 = 0x01;
-pub const MSG_TYPE_RESULT: u8 = 0x02;
 pub const MSG_TYPE_ERROR: u8 = 0x03;
 pub const MSG_TYPE_PING: u8 = 0x04;
 pub const MSG_TYPE_PONG: u8 = 0x05;
@@ -108,9 +107,4 @@ pub fn write_len_prefixed_string(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);
-}
-
-pub fn write_len_prefixed_bytes(buf: &mut Vec<u8>, data: &[u8]) {
-    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    buf.extend_from_slice(data);
 }

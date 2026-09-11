@@ -5,10 +5,6 @@ use super::Rule;
 pub struct ColumnPruningRule;
 
 impl Rule for ColumnPruningRule {
-    fn name(&self) -> &str {
-        "column_pruning"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         prune_columns(plan)
     }

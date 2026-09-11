@@ -1,3 +1,22 @@
+static FLUSH_TRANSITION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+impl SegmentManager {
+    pub fn set_flush_transition_delay_for_tests(&self, ms: u64) {
+        FLUSH_TRANSITION_DELAY_MS.store(ms, Ordering::Release);
+    }
+
+    pub(crate) fn flush_transition_delay() -> u64 {
+        FLUSH_TRANSITION_DELAY_MS.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn sleep_flush_transition_delay() {
+        let ms = Self::flush_transition_delay();
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+}
+
 impl SegmentManager {
     pub fn new(data_dir: &Path) -> Result<Self> {
         Self::with_config(data_dir, SegmentConfig::default())
@@ -67,10 +86,6 @@ impl SegmentManager {
         })
     }
 
-    pub fn set_config(&mut self, config: SegmentConfig) {
-        self.config = config;
-    }
-
     fn min_segment_seal_size(&self) -> u64 {
         self.config.min_segment_size
     }
@@ -124,10 +139,6 @@ impl SegmentManager {
         tracing::info!("flush thread resumed");
     }
 
-    pub fn is_flush_paused(&self) -> bool {
-        self.flush_paused.load(Ordering::Acquire)
-    }
-
     pub fn alloc_txn_id(&self) -> u64 {
         self.next_txn_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -160,9 +171,18 @@ impl SegmentManager {
         epoch
     }
 
-    /// Record that a memtable flush persisted rows for this table. Any unique
-    /// index snapshot stamped with the previous epoch is now potentially
-    /// incomplete for segment-side lookups and must be rebuilt before probing.
+    /// Bump the segment-content epoch: rows were appended directly to
+    /// segments outside the memtable flush pipeline (bulk/direct writes).
+    /// Unique index snapshots stamped with the previous epoch are
+    /// potentially incomplete and must be refreshed before probing.
+    pub fn note_direct_segment_append(&self, db: &str, table: &str) {
+        self.note_memtable_flush(db, table)
+    }
+
+    /// Bump the segment-content epoch: rows reached segments for this table
+    /// (memtable flush or direct append). Unique index snapshots stamped with
+    /// the previous epoch are potentially incomplete and must be refreshed
+    /// before probing.
     pub fn note_memtable_flush(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let path = self.flush_epoch_file_path(db, table);
@@ -185,6 +205,37 @@ impl SegmentManager {
             }
         }
         epochs.insert(key, next);
+    }
+
+    /// Run `f` while holding the table's flush-visibility read lock. Scan and
+    /// count paths use this so a concurrent memtable flush cannot expose the
+    /// same rows via both a segment and the still-readable memtable.
+    pub fn with_table_flush_read_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _guard = state.flush_visibility.read().unwrap();
+        f()
+    }
+
+    /// Run `f` while holding the table's flush-visibility write lock. The
+    /// memtable flush transition (rows become segment-visible, then the
+    /// memtable is retired) runs under this so readers observe either the
+    /// memtable or the segment, never both.
+    pub(crate) fn with_flush_transition<T>(
+        &self,
+        db: &str,
+        table: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let _guard = state.flush_visibility.write().unwrap();
+        f()
     }
 
     fn get_or_create_state(&self, key: &str) -> Arc<TableSegmentState> {
@@ -553,7 +604,7 @@ impl SegmentManager {
     ) -> Result<T> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _guard = state.mutation_lock.lock().unwrap();
+        let _guard = acquire_mutation_lock(&state, &key)?;
         ensure_state_not_retired(&state, db, table)?;
         f()
     }
@@ -574,10 +625,11 @@ impl SegmentManager {
             .iter()
             .map(|key| self.get_or_create_state(key))
             .collect::<Vec<_>>();
-        let _guards = states
-            .iter()
-            .map(|state| state.mutation_lock.lock().unwrap())
-            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(states.len());
+        for (key, state) in keys.iter().zip(states.iter()) {
+            guards.push(acquire_mutation_lock(state, key)?);
+        }
+        let _guards = guards;
         f()
     }
 
@@ -726,44 +778,8 @@ impl SegmentManager {
         Ok(())
     }
 
-    pub fn write_wal(&self, table_dir: &Path, batch: &RecordBatch) -> Result<()> {
-        let state = self.get_or_create_state_for_table_dir(table_dir)?;
-
-        let wal_data = crate::sql::execution::wal_helper::serialize_batch_for_wal(batch);
-        let txn_id = self.alloc_txn_id();
-
-        let mut wal_guard = state.wal_writer.lock().unwrap();
-        if wal_guard.is_none() {
-            let wal_dir = table_dir.join("wal");
-            let writer = WalWriter::open(&wal_dir, 64 * 1024 * 1024)?;
-            *wal_guard = Some(writer);
-        }
-        let wal_writer = wal_guard.as_mut().unwrap();
-        wal_writer.write_compact(txn_id, &wal_data, false)?;
-        Ok(())
-    }
-
     fn table_states_snapshot(&self) -> Vec<Arc<TableSegmentState>> {
         self.tables.read().unwrap().values().cloned().collect()
-    }
-
-    pub fn sync_all_wals(&self) {
-        let states = self.table_states_snapshot();
-        for state in states {
-            let mut wal_guard = state.wal_writer.lock().unwrap();
-            if let Some(ref mut w) = *wal_guard {
-                let _ = w.sync();
-            }
-        }
-    }
-
-    pub fn clear_wal(&self, table_dir: &Path) -> Result<()> {
-        let state = self.get_or_create_state_for_table_dir(table_dir)?;
-        let mut wal_guard = state.wal_writer.lock().unwrap();
-        if let Some(ref mut w) = *wal_guard {
-            w.clear()?;
-        }
-        Ok(())
     }
 
     pub fn clear_active_segments(&self, db: &str, table: &str) {
@@ -791,24 +807,11 @@ impl SegmentManager {
             .collect()
     }
 
-    pub fn remove_wal(&self, table_dir: &Path) {
-        let Ok(key) = self.table_state_key_from_dir(table_dir) else {
-            return;
-        };
-        let state = self.tables.read().unwrap().get(&key).cloned();
-        if let Some(state) = state {
-            let mut wal_guard = state.wal_writer.lock().unwrap();
-            *wal_guard = None;
-        }
-    }
-
     pub fn remove_table_state(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let state = self.tables.write().unwrap().remove(&key);
         if let Some(state) = state {
             state.retired.store(true, Ordering::Release);
-            let mut wal_guard = state.wal_writer.lock().unwrap();
-            *wal_guard = None;
             state.active_segments.lock().unwrap().clear();
         }
     }
@@ -821,17 +824,7 @@ impl SegmentManager {
         let key = table_key(db, table);
         let state = self.tables.read().unwrap().get(&key).cloned();
         if let Some(state) = state {
-            *state.wal_writer.lock().unwrap() = None;
             state.active_segments.lock().unwrap().clear();
-        }
-    }
-
-    pub fn rename_table_state(&self, db: &str, old_name: &str, new_name: &str) {
-        let old_key = table_key(db, old_name);
-        let new_key = table_key(db, new_name);
-        let mut tables = self.tables.write().unwrap();
-        if let Some(state) = tables.remove(&old_key) {
-            tables.insert(new_key, state);
         }
     }
 
@@ -850,18 +843,50 @@ impl SegmentManager {
         };
         for state in states {
             state.retired.store(true, Ordering::Release);
-            let mut wal_guard = state.wal_writer.lock().unwrap();
-            *wal_guard = None;
             state.active_segments.lock().unwrap().clear();
         }
     }
+}
 
-    pub fn clear_all_wals(&self) {
-        let states = self.table_states_snapshot();
-        for state in states {
-            let mut wal_guard = state.wal_writer.lock().unwrap();
-            if let Some(ref mut w) = *wal_guard {
-                let _ = w.clear();
+/// Acquire a table mutation lock with a bounded wait. A stalled lock holder
+/// (slow fsync, durable-tail rewrite, compaction) must surface as an explicit
+/// timeout error instead of blocking the caller forever, and slow acquisitions
+/// are logged so lock queueing is visible in the server log.
+fn acquire_mutation_lock<'a>(
+    state: &'a TableSegmentState,
+    key: &str,
+) -> Result<std::sync::MutexGuard<'a, ()>> {
+    let timeouts = crate::common::config::storage_timeouts();
+    let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
+    let warn_after = Duration::from_millis(timeouts.mutation_lock_warn_ms.max(1));
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match state.mutation_lock.try_lock() {
+            Ok(guard) => {
+                let waited = start.elapsed();
+                if waited >= warn_after {
+                    tracing::warn!(
+                        table = key,
+                        wait_ms = waited.as_millis() as u64,
+                        "table mutation lock acquisition was slow"
+                    );
+                }
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if start.elapsed() >= timeout {
+                    return Err(TaibaiError::ResourceBusy(format!(
+                        "table mutation lock timeout after {}ms waiting on {}",
+                        timeout.as_millis(),
+                        key
+                    )));
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(16));
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("table mutation lock poisoned: {}", poisoned)
             }
         }
     }

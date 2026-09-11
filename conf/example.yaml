@@ -3,6 +3,8 @@ server:
   port: 5151
   max_connections: 1024
   max_concurrent_requests: 8
+  # 重请求等待执行槽位的最长时间，超时返回 overload 错误而不是静默排队
+  request_queue_timeout_ms: 30000
 
 storage:
   # data_dir: "./data"
@@ -11,9 +13,25 @@ storage:
   min_segment_seal_size_mb: 500
   max_segment_size_mb: 2048
   hot_store_memory_limit_mb: 8192
-  row_group_target_rows: 8192
+  # 未满一个 row group 的已提交数据驻留 memtable/durable tail；该值同时决定
+  # memtable 滚动阈值（max_rows_per_memtable）。大批量导入场景调大可减少
+  # row group 数量、tail 滚动次数与元数据开销（代价是未刷盘驻留内存上限升高，
+  # spill 机制会在内存压力下自动释放冷 memtable）。
+  row_group_target_rows: 65536
   # reader 与 segment 元数据缓存的 segment 数量
   reader_cache_capacity: 1024
+  # 等待表级 mutation lock 的最长时间，超时返回锁超时错误而不是永久阻塞
+  mutation_lock_timeout_ms: 60000
+  # 加锁等待超过该阈值时输出 warn 日志，暴露锁排队
+  mutation_lock_warn_ms: 1000
+  # 等待 durable tail group commit（fsync）确认的最长时间
+  tail_commit_timeout_ms: 120000
+  # fsync 或 commit 确认超过该阈值时输出 warn 日志，暴露慢盘
+  tail_commit_warn_ms: 2000
+  # ACK 分级：false=ACK_ON_FSYNC（默认，fsync 落盘后应答，崩溃零丢失）；
+  # true=ACK_ON_WAL（写入 page cache 即应答，延迟最低，但机器掉电可能丢失
+  # 最近一批已应答数据）。测试/导入环境可用 true 换取吞吐，生产保持 false
+  tail_async_fsync: false
 
 buffer:
   query_memory_limit_mb: 4096
@@ -25,7 +43,7 @@ buffer:
 compression:
   enabled: true
   # bulk segment 写入的 zstd 压缩级别（1..=22，启动时截断）
-  bulk_zstd_level: 1
+  bulk_zstd_level: 3
 
 log:
   level: "info"

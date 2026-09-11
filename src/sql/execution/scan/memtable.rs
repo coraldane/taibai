@@ -124,13 +124,19 @@ pub fn scan_memtables(
                 }
 
                 let filtered = if spec.has_predicates() {
-                    super::row_filter::apply_predicates(
+                    match super::row_filter::apply_predicates(
                         source,
                         &spec.eq_predicates,
                         &spec.range_predicates,
                         &spec.in_predicates,
                         spec.remaining_predicate.as_ref(),
-                    )
+                    ) {
+                        Ok(filtered) => filtered,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "memtable predicate evaluation failed");
+                            return None;
+                        }
+                    }
                 } else {
                     source.clone()
                 };
@@ -228,13 +234,21 @@ pub fn scan_hot_store_by_key(
     };
 
     let filtered = if !direct_filter_lookup && spec.has_predicates() {
-        super::row_filter::apply_predicates(
+        // On evaluation failure, bail out of the fast path entirely so the
+        // caller falls back to the generic memtable scan.
+        match super::row_filter::apply_predicates(
             &batch,
             &spec.eq_predicates,
             &spec.range_predicates,
             &spec.in_predicates,
             spec.remaining_predicate.as_ref(),
-        )
+        ) {
+            Ok(filtered) => filtered,
+            Err(e) => {
+                tracing::warn!(error = %e, "hot-store predicate evaluation failed");
+                return None;
+            }
+        }
     } else {
         batch
     };
@@ -336,13 +350,19 @@ pub fn count_memtable_rows(
                     0
                 }
             } else if spec.has_predicates() {
-                let filtered = super::row_filter::apply_predicates(
-                    &mt_batch,
+                let filtered = match super::row_filter::apply_predicates(
+                    mt_batch,
                     &spec.eq_predicates,
                     &spec.range_predicates,
                     &spec.in_predicates,
                     spec.remaining_predicate.as_ref(),
-                );
+                ) {
+                    Ok(filtered) => filtered,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "memtable count predicate failed");
+                        return 0;
+                    }
+                };
                 filtered.num_rows() as u64
             } else {
                 mt_batch.num_rows() as u64

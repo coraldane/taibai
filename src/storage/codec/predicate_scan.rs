@@ -472,6 +472,13 @@ fn count_eq_adaptive(
         {
             count_eq_varchar_dictionary(payload, row_count, bitmap, value)
         }
+        crate::storage::codec::encoding::EncodingType::DeltaOfDelta => {
+            let values = crate::storage::codec::column_codec::decode_i64_dod_payload(payload)?;
+            count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
+        }
+        crate::storage::codec::encoding::EncodingType::GorillaXor => {
+            count_eq_gorilla(payload, row_count, col_def, bitmap, value)
+        }
         other => Err(TaibaiError::Storage(format!(
             "unsupported adaptive column encoding {:?} for count_eq",
             other
@@ -552,6 +559,42 @@ fn count_eq_numeric_from_i64(
         val_pos += 1;
     }
 
+    Ok(count)
+}
+
+fn count_eq_gorilla(
+    payload: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: &NullBitmap,
+    value: &ScalarValue,
+) -> Result<u64> {
+    let width = match col_def.data_type {
+        DataType::Float32 => 32,
+        DataType::Float64 | DataType::Decimal => 64,
+        _ => return Ok(0),
+    };
+    let target = match (&col_def.data_type, value) {
+        (DataType::Float32, ScalarValue::Float32(Some(v))) => Some(v.to_bits() as u64),
+        (DataType::Float64, ScalarValue::Float64(Some(v))) => Some(v.to_bits()),
+        (DataType::Decimal, ScalarValue::Decimal(Some(v))) => Some(*v as u64),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Ok(0);
+    };
+    let bits = crate::storage::codec::column_codec::decode_gorilla_xor_payload(payload, width)?;
+    let mut count: u64 = 0;
+    let mut val_pos = 0usize;
+    for row in 0..row_count {
+        if bitmap.is_null(row) {
+            continue;
+        }
+        if val_pos < bits.len() && bits[val_pos] == target {
+            count += 1;
+        }
+        val_pos += 1;
+    }
     Ok(count)
 }
 

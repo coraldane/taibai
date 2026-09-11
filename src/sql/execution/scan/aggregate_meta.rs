@@ -22,7 +22,7 @@ use std::path::Path;
 
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
-use crate::sql::execution::operators::aggregate::{aggregate_result_type, format_aggregate_name};
+use crate::sql::execution::operators::aggregate::aggregate_result_column_def;
 use crate::sql::execution::scan::memtable as scan_memtable;
 use crate::sql::execution::scan::partition;
 use crate::sql::execution::scan::row_filter;
@@ -32,13 +32,14 @@ use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::segment::delete_bitmap;
 use crate::storage::segment_manager::SegmentManager;
-use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 /// Compute the result of a simple metadata-only aggregate query.
 ///
 /// `aggregates` are the (already logical-schema-indexed) aggregate expressions
 /// from the SELECT list. Returns a single-row result batch.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_simple_aggregate(
     spec: &ScanSpec,
     aggregates: &[AggregateExpr],
@@ -207,12 +208,7 @@ pub fn compute_simple_aggregate(
         .collect::<Vec<_>>();
     let columns = aggregates
         .iter()
-        .map(|aggregate| {
-            ColumnDef::new(
-                &format_aggregate_name(aggregate, table_schema),
-                aggregate_result_type(aggregate, table_schema),
-            )
-        })
+        .map(|aggregate| aggregate_result_column_def(aggregate, table_schema))
         .collect();
     let schema = Schema::new(columns);
     let mut batch = RecordBatch::new(schema);

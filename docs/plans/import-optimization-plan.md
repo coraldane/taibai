@@ -237,18 +237,11 @@ WAL entry:
 - 预期减少 WAL 大小 10-15%
 - 与方案 A 叠加效果更好
 
-#### 方案 D: bulk mode 下可选禁用 WAL
-
-当前 `BulkImportConfig.disable_wal` 已支持但默认 false。对于可重放的批量导入场景：
-- 设置 `disable_wal: true`
-- WAL 大小直接降为 0
-- 风险: 导入过程中崩溃会丢失未持久化的数据
-
 ### 3.3 推荐组合
 
-**短期**（方案 C + D）: 列式 WAL + 可选禁用 WAL
+**短期**（方案 C）: 列式 WAL
 - 实现简单，风险低
-- 预期 WAL: 2.8GB → 1.2-1.5GB（不禁用 WAL）或 0（禁用 WAL）
+- 预期 WAL: 2.8GB → 1.2-1.5GB
 
 **中期**（方案 A + B + C）: WAL 压缩 + 截断优化 + 列式格式
 - 完整 WAL 优化

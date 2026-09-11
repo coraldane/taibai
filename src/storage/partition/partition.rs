@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-use std::path::{Path, PathBuf};
-
 use crate::common::error::{Result, TaibaiError};
 use crate::types::scalar::ScalarValue;
 
@@ -17,8 +14,10 @@ pub enum PartitionStrategy {
     Month,
 }
 
-impl PartitionStrategy {
-    pub fn from_str(s: &str) -> Result<Self> {
+impl std::str::FromStr for PartitionStrategy {
+    type Err = TaibaiError;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
             "DAY" => Ok(PartitionStrategy::Day),
             "YEAR" => Ok(PartitionStrategy::Year),
@@ -135,51 +134,8 @@ impl PartitionPruner {
             .cloned()
             .collect()
     }
-
-    pub fn discover_partitions(&self, table_dir: &Path) -> Result<Vec<String>> {
-        let mut partitions = Vec::new();
-        if !table_dir.exists() {
-            return Ok(partitions);
-        }
-        for entry in std::fs::read_dir(table_dir)? {
-            let entry = entry?;
-            if let Some(name) = entry.file_name().to_str() {
-                if let Some(key) = parse_partition_key(name) {
-                    if !partitions.contains(&key) {
-                        partitions.push(key);
-                    }
-                }
-            }
-        }
-        partitions.sort();
-        Ok(partitions)
-    }
-
-    pub fn discover_partition_segments(
-        &self,
-        table_dir: &Path,
-        partition_key: &str,
-    ) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-        if !table_dir.exists() {
-            return Ok(files);
-        }
-        for entry in std::fs::read_dir(table_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if let Some(key) = parse_partition_key(name) {
-                    if key == partition_key {
-                        files.push(path);
-                    }
-                }
-            }
-        }
-        files.sort();
-        Ok(files)
-    }
 }
 
 #[cfg(test)]
-#[path = "partition_tests.rs"]
+#[path = "partition_test.rs"]
 mod tests;

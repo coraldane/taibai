@@ -66,10 +66,6 @@ pub fn encode_binary_result_batches(schema: &Schema, batches: &[RecordBatch]) ->
 }
 
 /// Encode column data as fixed-width little-endian values.
-fn encode_column_data(col_idx: usize, batch: &RecordBatch) -> Vec<u8> {
-    encode_column_data_batches(col_idx, std::slice::from_ref(batch))
-}
-
 fn encode_column_data_batches(col_idx: usize, batches: &[RecordBatch]) -> Vec<u8> {
     let mut buf = Vec::new();
     for batch in batches {
@@ -142,5 +138,5 @@ fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
-#[path = "result_tests.rs"]
+#[path = "result_test.rs"]
 mod tests;

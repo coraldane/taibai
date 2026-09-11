@@ -160,9 +160,8 @@ async fn main() {
 
     if drop_table {
         let drop_sql = format!("DROP TABLE {}", HOT_TABLE);
-        match client.execute(&drop_sql).await {
-            Ok(_) => log_msg!("Dropped table {}.", HOT_TABLE),
-            Err(_) => {}
+        if client.execute(&drop_sql).await.is_ok() {
+            log_msg!("Dropped table {}.", HOT_TABLE)
         }
     }
 

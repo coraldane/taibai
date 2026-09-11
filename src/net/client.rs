@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,19 +17,8 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-#[allow(dead_code)]
-pub struct BulkImportConfig {
-    pub disable_wal: bool,
-}
+pub struct BulkImportConfig;
 
-#[allow(dead_code)]
-pub struct PipelineStats {
-    pub sent: i64,
-    pub completed: i64,
-    pub errors: i64,
-}
-
-#[allow(dead_code)]
 pub struct Client {
     framed: Framed<tokio::net::TcpStream, MessageCodec>,
     session_id: Option<String>,
@@ -122,7 +110,6 @@ impl Client {
         write_len_prefixed_string(&mut payload, username);
         write_len_prefixed_string(&mut payload, password);
         write_len_prefixed_string(&mut payload, database);
-        payload.push(1);
         payload.extend_from_slice(&timezone_offset_hours.to_le_bytes());
         payload.push(1);
 
@@ -234,7 +221,6 @@ impl Client {
                     client_timings: None,
                 })
             }
-            MSG_TYPE_RESULT => Ok(parse_text_result(&resp.payload)?),
             MSG_TYPE_BINARY_QUERY_RESULT => Ok(parse_binary_result(&resp.payload)?),
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
@@ -286,21 +272,6 @@ impl Client {
                     if response.msg_type == MSG_TYPE_BINARY_QUERY_RESULT {
                         return Ok(None);
                     }
-                }
-                MSG_TYPE_RESULT => {
-                    let QueryResult::Rows {
-                        schema,
-                        batches,
-                        server_timings,
-                        ..
-                    } = parse_text_result(&response.payload)?
-                    else {
-                        unreachable!()
-                    };
-                    for batch in batches {
-                        on_batch(&schema, batch)?;
-                    }
-                    return Ok(server_timings);
                 }
                 MSG_TYPE_RESULT_END => {
                     return Ok(parse_server_timing_trailer(&response.payload, 0));
@@ -364,12 +335,8 @@ impl Client {
         Ok(())
     }
 
-    pub async fn start_bulk_import(&mut self, config: &BulkImportConfig) -> Result<()> {
-        let config_json = if config.disable_wal {
-            "{\"disable_wal\":true}"
-        } else {
-            "{\"disable_wal\":false}"
-        };
+    pub async fn start_bulk_import(&mut self, _config: &BulkImportConfig) -> Result<()> {
+        let config_json = "{}";
         let sql = format!("START BULK IMPORT {}", config_json);
         self.execute(&sql).await?;
         self.bulk_import_mode = true;
@@ -471,14 +438,6 @@ impl Client {
         self.send(Message::empty(MSG_TYPE_PING)).await?;
         self.recv().await?;
         Ok(())
-    }
-
-    pub fn get_pipeline_stats(&self) -> PipelineStats {
-        PipelineStats {
-            sent: self.pending_count.load(Ordering::Relaxed),
-            completed: self.response_handled.load(Ordering::Relaxed),
-            errors: 0,
-        }
     }
 
     pub async fn drain_pipeline(&mut self) -> Result<()> {
@@ -595,7 +554,6 @@ impl Client {
                     client_timings: None,
                 })
             }
-            MSG_TYPE_RESULT => Ok(parse_text_result(&resp.payload)?),
             MSG_TYPE_BINARY_QUERY_RESULT => Ok(parse_binary_result(&resp.payload)?),
             MSG_TYPE_ERROR => {
                 let msg = String::from_utf8_lossy(&resp.payload).to_string();
@@ -688,97 +646,6 @@ impl Client {
             .map_err(|_| TaibaiError::Network("recv timeout".into()))?
             .ok_or_else(|| TaibaiError::Network("connection closed".into()))?
     }
-}
-
-fn parse_text_result(payload: &[u8]) -> Result<QueryResult> {
-    if payload.len() < 4 {
-        return Err(TaibaiError::Protocol("result payload too short".into()));
-    }
-    let mut offset = 0usize;
-
-    let col_count = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-
-    let mut columns = Vec::with_capacity(col_count);
-    for _ in 0..col_count {
-        let (name, rest) = read_len_prefixed_string(&payload[offset..])?;
-        if rest.len() < 3 {
-            return Err(TaibaiError::Protocol("truncated column metadata".into()));
-        }
-        let dtype_byte = rest[0];
-        let scale = rest[1] as i32;
-        let precision = rest[2] as i32;
-        let data_type = DataType::from_u8(dtype_byte)?;
-        columns.push(ColumnDef {
-            name: name.to_string(),
-            data_type,
-            nullable: true,
-            scale,
-            precision,
-            auto_increment: false,
-            primary_key: false,
-            default_value: None,
-            column_id: 0,
-            previous_names: Vec::new(),
-        });
-        offset += 4 + name.len() + 3;
-    }
-
-    if payload.len() < offset + 4 {
-        return Err(TaibaiError::Protocol("result missing row count".into()));
-    }
-    let row_count = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
-    offset += 4;
-
-    let schema = Schema::new(columns);
-
-    if row_count == 0 {
-        let server_timings = parse_server_timing_trailer(payload, offset);
-        return Ok(QueryResult::Rows {
-            schema: schema.clone(),
-            batches: vec![RecordBatch::new(schema)],
-            server_elapsed: server_timings.as_ref().map(|t| t.total),
-            server_timings,
-            client_timings: None,
-        });
-    }
-
-    let mut arrays: Vec<ColumnArray> = schema
-        .columns
-        .iter()
-        .map(|col| ColumnArray::empty(col.data_type))
-        .collect();
-
-    for _ in 0..row_count {
-        for (col_idx, col) in schema.columns.iter().enumerate() {
-            if offset >= payload.len() {
-                return Err(TaibaiError::Protocol("truncated row data".into()));
-            }
-            let is_null = payload[offset] != 0;
-            offset += 1;
-
-            let dt = col.data_type;
-            let value = if is_null {
-                ScalarValue::null_for_type(dt)
-            } else {
-                let scale = col.scale;
-                let (val, consumed) = read_scalar_value(&payload[offset..], dt, scale)?;
-                offset += consumed;
-                val
-            };
-            arrays[col_idx].push(&value)?;
-        }
-    }
-
-    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    let server_timings = parse_server_timing_trailer(payload, offset);
-    Ok(QueryResult::Rows {
-        schema,
-        batches: vec![batch],
-        server_elapsed: server_timings.as_ref().map(|t| t.total),
-        server_timings,
-        client_timings: None,
-    })
 }
 
 fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
@@ -1193,7 +1060,7 @@ fn parse_scaled_decimal_text(s: &str, scale: i32) -> Result<i64> {
 }
 
 #[cfg(test)]
-#[path = "client_tests.rs"]
+#[path = "client_test.rs"]
 mod tests;
 
 fn encode_scalar_param(buf: &mut Vec<u8>, val: &ScalarValue) {

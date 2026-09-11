@@ -308,5 +308,5 @@ fn skip_value_set_extension(
 }
 
 #[cfg(test)]
-#[path = "footer_tests.rs"]
+#[path = "footer_test.rs"]
 mod tests;

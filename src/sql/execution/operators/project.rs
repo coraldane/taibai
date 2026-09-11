@@ -1,7 +1,8 @@
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
 use crate::sql::execution::helpers::coerce_scalar_for_dtype;
-use crate::sql::execution::operators::filter::{eval_expr_column, remap_expr_for_batch};
+use crate::sql::execution::operators::filter::{eval_expr_column_with, remap_expr_for_batch};
+use crate::sql::execution::subquery_runtime::SubqueryRegistry;
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::LogicalExpr;
 use crate::types::array::ColumnArray;
@@ -14,6 +15,9 @@ pub struct ProjectExec {
     pub aliases: Vec<Option<String>>,
     pub input: Box<dyn ExecutionOp>,
     pub input_schema: Schema,
+    /// Snapshot registry for correlated subqueries, when the query contains
+    /// any.
+    pub subqueries: Option<SubqueryRegistry>,
 }
 
 impl ExecutionOp for ProjectExec {
@@ -35,7 +39,7 @@ impl ExecutionOp for ProjectExec {
 
                 for (i, expr) in self.expressions.iter().enumerate() {
                     let expr = remap_expr_for_batch(expr, &self.input_schema, &batch.schema);
-                    let vals = eval_expr_column(&expr, &batch)?;
+                    let vals = eval_expr_column_with(&expr, &batch, self.subqueries.as_ref())?;
                     let col_def =
                         project_column_def(&expr, &batch.schema, self.aliases[i].as_deref());
                     let mut col = ColumnArray::empty(col_def.data_type);
@@ -121,8 +125,23 @@ pub fn infer_type(expr: &LogicalExpr, schema: &Schema) -> DataType {
             .map(|c| c.data_type)
             .unwrap_or(DataType::Int64),
         LogicalExpr::Literal(v) => v.data_type(),
-        LogicalExpr::BinaryOp { op: BinOp::Div, .. } => DataType::Float64,
-        LogicalExpr::BinaryOp { .. } => DataType::Int64,
+        LogicalExpr::BinaryOp { op, left, right } => match op {
+            BinOp::Eq
+            | BinOp::Neq
+            | BinOp::Lt
+            | BinOp::Gt
+            | BinOp::Lte
+            | BinOp::Gte
+            | BinOp::And
+            | BinOp::Or => DataType::Bool,
+            BinOp::Div => DataType::Float64,
+            BinOp::Like | BinOp::NotLike | BinOp::In | BinOp::NotIn => DataType::Bool,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {
+                let lt = infer_type(left, schema);
+                let rt = infer_type(right, schema);
+                crate::sql::binder::type_resolver::common_type(&lt, &rt)
+            }
+        },
         LogicalExpr::Aggregate(agg) => {
             let agg_prefix = match agg.func {
                 crate::sql::planner::AggFunc::Count => "count",
@@ -232,9 +251,29 @@ pub fn project_column_def(expr: &LogicalExpr, schema: &Schema, alias: Option<&st
         }
     }
 
+    if let LogicalExpr::Aggregate(agg) = expr {
+        let agg_prefix = match agg.func {
+            crate::sql::planner::AggFunc::Count => "count",
+            crate::sql::planner::AggFunc::Sum => "sum",
+            crate::sql::planner::AggFunc::Avg => "avg",
+            crate::sql::planner::AggFunc::Min => "min",
+            crate::sql::planner::AggFunc::Max => "max",
+        };
+        if let Some(column) = schema.columns.iter().find(|c| {
+            let name = c.name.to_ascii_lowercase();
+            name.starts_with(&format!("{}(", agg_prefix)) || name == format!("{}(*)", agg_prefix)
+        }) {
+            let mut col_def = column.clone();
+            if let Some(alias) = alias {
+                col_def.name = alias.to_string();
+            }
+            return col_def;
+        }
+    }
+
     ColumnDef::new(alias.unwrap_or("expr"), infer_type(expr, schema))
 }
 
 #[cfg(test)]
-#[path = "project_tests.rs"]
+#[path = "project_test.rs"]
 mod tests;

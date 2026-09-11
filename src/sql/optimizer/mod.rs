@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 pub mod bloom_filter;
 pub mod column_pruning;
 pub mod cost;
@@ -18,7 +17,6 @@ pub mod zone_map_pruning;
 use crate::sql::planner::{LogicalExpr, LogicalPlan};
 
 pub trait Rule: Send + Sync {
-    fn name(&self) -> &str;
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool);
 }
 
@@ -48,10 +46,6 @@ impl Optimizer {
                 Box::new(subquery::SubqueryRule),
             ],
         }
-    }
-
-    pub fn add_rule(&mut self, rule: Box<dyn Rule>) {
-        self.rules.push(rule);
     }
 
     pub fn optimize(&self, plan: LogicalPlan) -> LogicalPlan {
@@ -196,9 +190,12 @@ fn expr_complexity(expr: &LogicalExpr) -> usize {
         LogicalExpr::InSubquery { expr, subquery, .. } => {
             1 + expr_complexity(expr) + plan_complexity(subquery)
         }
+        LogicalExpr::CorrelatedSubquery(corr) => {
+            1 + corr.lhs.as_ref().map(|e| expr_complexity(e)).unwrap_or(0)
+        }
     }
 }
 
 #[cfg(test)]
-#[path = "mod_tests.rs"]
+#[path = "mod_test.rs"]
 mod tests;

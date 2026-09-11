@@ -1,5 +1,13 @@
 # Taibai 性能测试与验证报告
 
+> **状态注记（2026-09）**：本报告写于经典 WAL 时代，现行持久化已由 durable tail（组提交 + 帧级 CRC + zstd）替代经典 WAL，报告中 WAL 文件大小、WAL fsync、`wal_writers().lock()` 等讨论为历史架构记录。后续进展：
+>
+> - **瓶颈 #2（行式序列化）已解决**：`prepare_batch_for_wal` 现按列编码——定宽列整列 memcpy（`encode_column_raw_into`），压缩后写入 durable tail。
+> - **瓶颈 #1（解析与表达式求值）已解决**：`try_exec_fast_insert_sql`（`src/sql/execution/dml_insert/fast.rs`）实现报告"方案 A"的等价物——字节级快速解析、`FastInsertPlan` 计划缓存、字面量按列类型直推（绕过 `ScalarValue` 中转）、批量预分配；不支持的形态回落完整解析路径。
+> - **恢复正确性修复（2026-09）**：`decode_column_raw` 此前对 NULL 行不消费编码槽位，导致含 NULL 的列崩溃恢复后错位；已修复并新增 round-trip 契约测试（`wal_helper_test.rs`、`durable_tail_test.rs::recovered_tail_preserves_null_values_in_mixed_columns`）。
+> - **重新实测（2026-09，见 §1.1）**：普通 SQL INSERT 已从 ~110k 提升到 **~192k rows/sec**（10000 行/批），实时形态（100 行/批）~14.9k rows/sec，bulk 模式 ~286k rows/sec。复现工具见 [perf_verify](../../examples/perf_verify/README.md)。
+> - **实时小批次组提交修复（2026-09，见 §1.2）**：诊断发现组提交平均组大小仅 ~2，并发小批次吞吐被单语句独占 fsync 串行化；已实现自适应收集窗口与 async 模式惰性刷盘，本机（慢 fsync 环境）8 并发 strict fsync 吞吐 +57%、async 模式 +16%。
+
 ## 1. 当前状态
 
 | 指标 | 当前值 | 目标值 | 状态 |
@@ -9,6 +17,44 @@
 | WAL 文件大小 | 2.8GB (64MB×44文件) | - | ⚠️ 远大于segment |
 | Segment 文件大小 (SQL) | 2GB | - | ⚠️ 大于批量导入 |
 | Segment 文件大小 (批量) | 1.1GB | - | ✅ 合理 |
+
+### 1.1 重新实测（2026-09，durable tail 架构 + fast insert 路径）
+
+环境：Windows，release 构建（`cargo build --release --workspace`），单机服务端与客户端本机回环，8 客户端并发；数据为合成的 34 列行情 tick（100 只股票轮流交替）；服务端/客户端均无调优。命令：`examples\perf_verify\perf_verify.bat 100000`。
+
+| 场景 | 每 INSERT 行数 | 吞吐（客户端观测端到端） |
+|------|--------------|------------------------|
+| realtime（贴近实时写入） | 100 | ~14,900 rows/sec（~149 语句/sec） |
+| import（批量导入形态） | 10,000 | ~192,000 rows/sec |
+| bulk 直写（对照） | 10,000 | ~286,000 rows/sec |
+
+结论：
+
+- 历史值 ~110k 已过时，当前普通 SQL INSERT 在 10000 行/批下达 ~192k rows/sec（+75%）。
+- realtime 与 import 形态约 13 倍差距，主要来自语句数与每语句固定开销（解析入口、tail 组提交次数）——单条 INSERT 的行数对吞吐影响远大于其他因素；实时采集侧若需更高吞吐应聚合小批次（如 5–50ms 窗口）后再提交。
+- bulk 模式（~286k）与普通 INSERT（~192k）之间仍有约 1.5 倍差距，后续优化空间在 tail 提交与批量路径的合并。
+
+### 1.2 实时小批次组提交修复（2026-09）
+
+`tests/realtime_write_scaling_test.rs::realtime_group_commit_scaling_diagnostic`（`--ignored`，需 `--nocapture` 查看 profile 输出）以 100 行/INSERT 的实时形态做进程内测量。
+
+**修复前根因**（insert-profile 证据）：单提交线程上组提交平均组大小仅 ~2.04（8 并发下 max=8 罕见）——固定 500µs 收集窗口抓不住错峰到达的提交请求；每条语句基本独享一次 fsync。叠加本机受安全软件干扰 fsync 高达 30–55ms，串行 fsync 链把 8 并发 strict 模式钉在 83 stmt/s。
+
+**修复**（`src/storage/core/durable_tail.rs`）：
+
+1. **自适应收集窗口**：提交线程记录组大小历史；检测到并发负载（前组 ≥ 2 请求）时窗口从 500µs 放大到 2ms、组上限 8，单客户端串行流维持 500µs 不受影响。
+2. **async 模式惰性刷盘**：`tail_async_fsync` 下 ACK 不再等待每次 fsync——提交线程批量写入页缓存即 ACK；dirty tail 满足以下任一条件才落盘：距上次 fsync ≥ 200ms、未刷字节 ≥ 8MB、持续静默 ≥ `max(5ms, 2×实测 fsync 均价)`（自适应，上限 200ms）、或收到 Flush/Shutdown 命令。acknowledged-but-not-synced 的窗口由这些阈值界定，崩溃时最多丢最近 200ms/8MB。
+3. **自适应静默阈值**：初版固定 5ms 静默即刷在慢盘上得不偿失（为 5ms 空闲付出 30–100ms 停顿，async 相位实测跌至 95 stmt/s）；改为随 fsync 实测成本缩放后，同环境恢复到 257–331 stmt/s。commit 通道断开（未经 `stop()` 的退出）也会兜底 sync 一次，避免嵌入式用法静默丢数据。
+
+**修复后本机实测**（release，同一诊断；本机 fsync 受安全软件干扰且逐次波动 30–100ms，绝对值仅供方向参考）：
+
+| 相位 | 修复前 stmt/s | 修复后 stmt/s（两次运行区间） | 变化 |
+|------|--------------|------------------------------|------|
+| 单客户端 strict fsync | 25 | 20–31 | 不变（串行流无组可攒） |
+| 8 并发 strict fsync | 83 | 94–143 | +13% ~ +72% |
+| 8 并发 async fsync | 187 | **257–331** | **+37% ~ +77%** |
+
+机制证据：并发相位组平均从 ~2 提升到 ~3.8（上限 8）；async 相对 strict 的吞吐比恢复到 ~2.7 倍（惰性刷盘的预期形态）。正确性由 `concurrent_autocommit_inserts_are_visible_and_durable`（strict + async 两变体，均以 `Engine::shutdown()` 有序关停并重启校验）锁定。
 
 ## 2. 性能瓶颈分析
 
@@ -51,7 +97,7 @@ CSV → 二进制列式编码 → Pipeline发送 → 服务端直接解析payloa
 ```
 
 - ✅ 跳过 SQL 解析
-- ✅ 跳过 WAL（`disable_wal: true`）
+- ✅ 使用当前统一的 active segment 持久化路径
 - ✅ Pipeline 模式（8个并发请求）
 - ✅ 生产者-消费者双线程架构
 - ✅ 字符串池化（security_id 零拷贝）

@@ -590,7 +590,7 @@ fn parse_int32(s: &str) -> i32 {
     }
     while idx < bytes.len() {
         let b = bytes[idx];
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             break;
         }
         result = result.wrapping_mul(10).wrapping_add((b - b'0') as i32);
@@ -629,7 +629,7 @@ fn parse_int64(s: &str) -> i64 {
             idx += 1;
             continue;
         }
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             break;
         }
         if !has_dot {
@@ -675,7 +675,7 @@ fn parse_decimal(s: &str, scale: u32) -> i64 {
             idx += 1;
             continue;
         }
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             break;
         }
         if !has_decimal || decimals < scale {
@@ -717,7 +717,7 @@ fn parse_timestamp(s: &str) -> i64 {
     let minute = parse_2digits(bytes, 14) as i32;
     let second = parse_2digits(bytes, 17) as i32;
 
-    if year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 {
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return 0;
     }
 
@@ -732,8 +732,8 @@ fn parse_timestamp(s: &str) -> i64 {
     }
     days += (day - 1) as i64;
 
-    let mut micros = days * 86400_000_000i64;
-    micros += hour as i64 * 3600_000_000i64;
+    let mut micros = days * 86_400_000_000i64;
+    micros += hour as i64 * 3_600_000_000i64;
     micros += minute as i64 * 60_000_000i64;
     micros += second as i64 * 1_000_000i64;
 
@@ -743,7 +743,7 @@ fn parse_timestamp(s: &str) -> i64 {
         let mut pos = 20;
         while pos < bytes.len() && frac_digits < 6 {
             let b = bytes[pos];
-            if b < b'0' || b > b'9' {
+            if !b.is_ascii_digit() {
                 break;
             }
             frac = frac * 10 + (b - b'0') as i64;

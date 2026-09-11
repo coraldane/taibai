@@ -125,7 +125,6 @@ pub(super) struct PartitionedInnerJoin {
     build_left: bool,
     condition: LogicalExpr,
     left_schema: Schema,
-    right_schema: Schema,
     output_schema: Schema,
     memory_limit_bytes: usize,
     batch_rows: usize,
@@ -144,7 +143,6 @@ impl PartitionedInnerJoin {
         build_left: bool,
         condition: LogicalExpr,
         left_schema: Schema,
-        right_schema: Schema,
         output_schema: Schema,
         memory_limit_bytes: usize,
         partition_count: usize,
@@ -185,7 +183,6 @@ impl PartitionedInnerJoin {
             build_left,
             condition,
             left_schema,
-            right_schema,
             output_schema,
             memory_limit_bytes: memory_limit_bytes.max(1),
             batch_rows: batch_rows.max(1),
@@ -329,8 +326,8 @@ fn write_partitioned_batch(
             continue;
         }
         let partition = hash_partition(&key, partition_count);
-        for column in 0..batch.num_columns() {
-            columns[partition][column].push(
+        for (column, target) in columns[partition].iter_mut().enumerate() {
+            target.push(
                 &batch
                     .scalar(row, column)
                     .unwrap_or(ScalarValue::Int64(None)),

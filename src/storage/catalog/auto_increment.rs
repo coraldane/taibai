@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -9,15 +8,13 @@ use crate::common::error::{Result, TaibaiError};
 
 pub struct AutoIncrementCounter {
     current: AtomicU64,
-    table: String,
     column: String,
 }
 
 impl AutoIncrementCounter {
-    pub fn new(table: &str, column: &str, start: u64) -> Self {
+    pub fn new(column: &str, start: u64) -> Self {
         Self {
             current: AtomicU64::new(start),
-            table: table.to_string(),
             column: column.to_string(),
         }
     }
@@ -46,10 +43,6 @@ impl AutoIncrementCounter {
                 Err(observed) => current = observed,
             }
         }
-    }
-
-    pub fn table(&self) -> &str {
-        &self.table
     }
 
     pub fn column(&self) -> &str {
@@ -90,7 +83,7 @@ impl AutoIncrementManager {
             }
         }
 
-        let counter = Arc::new(AutoIncrementCounter::new(table, column, start_value));
+        let counter = Arc::new(AutoIncrementCounter::new(column, start_value));
         {
             let mut counters = self.counters.write().unwrap();
             counters.insert(key, Arc::clone(&counter));
@@ -158,10 +151,6 @@ impl AutoIncrementManager {
         counter.advance_past(value);
         Ok(())
     }
-
-    pub fn counters(&self) -> &RwLock<HashMap<String, Arc<AutoIncrementCounter>>> {
-        &self.counters
-    }
 }
 
 impl Default for AutoIncrementManager {
@@ -171,5 +160,5 @@ impl Default for AutoIncrementManager {
 }
 
 #[cfg(test)]
-#[path = "auto_increment_tests.rs"]
+#[path = "auto_increment_test.rs"]
 mod tests;

@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-
-pub mod aggregate;
 pub mod control;
 pub mod conversion;
 pub mod date;

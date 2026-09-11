@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::common::error::{Result, TaibaiError};
-use crate::storage::codec::column_codec::encode_column;
+use crate::storage::codec::column_codec::choose_stored_column_encoding;
 use crate::storage::codec::io_util::encode_len_prefixed_str;
 use crate::storage::codec::scalar_tag::{encode_scalar_with_tag, null_for_dtype};
 use crate::storage::index::bloomfilter::BloomFilter;
@@ -102,8 +102,7 @@ impl SegmentWriter {
             file,
             schema,
             row_group_size: row_group_size
-                .max(1)
-                .min(crate::storage::segment::constants::MAX_COLUMN_PAGE_ROWS),
+                .clamp(1, crate::storage::segment::constants::MAX_COLUMN_PAGE_ROWS),
             row_groups: Vec::new(),
             current_group: None,
             total_rows: 0,
@@ -144,20 +143,21 @@ impl SegmentWriter {
                     build_column_metadata(col, offset, to_write, self.bloom_columns[col_idx]);
                 merge_column_metadata(group, col_idx, metadata);
 
-                let encoded = encode_column(col, offset, to_write)?;
-                let uncompressed_len = encoded.len() as u64;
+                let single_block = group.columns[col_idx].is_empty() && to_write == can_fit;
 
-                let compressed = zstd::bulk::compress(
-                    &encoded,
+                let stored = choose_stored_column_encoding(
+                    col,
+                    offset,
+                    to_write,
                     crate::storage::segment_manager::bulk_compression_level(),
-                )
-                .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+                    single_block,
+                )?;
 
-                group.uncompressed_sizes[col_idx] += uncompressed_len;
+                group.uncompressed_sizes[col_idx] += stored.uncompressed_size;
                 if group.columns[col_idx].is_empty() {
-                    group.columns[col_idx] = compressed;
+                    group.columns[col_idx] = stored.data;
                 } else {
-                    group.columns[col_idx].extend_from_slice(&compressed);
+                    group.columns[col_idx].extend_from_slice(&stored.data);
                 }
             }
 
@@ -219,21 +219,21 @@ impl SegmentWriter {
                 let metadata =
                     build_column_metadata(col, row_offset, row_count, self.bloom_columns[col_idx]);
 
-                let encoded = encode_column(col, row_offset, row_count)?;
-                let uncompressed_size = encoded.len() as u64;
-                let compressed = zstd::bulk::compress(
-                    &encoded,
+                let stored = choose_stored_column_encoding(
+                    col,
+                    row_offset,
+                    row_count,
                     crate::storage::segment_manager::bulk_compression_level(),
-                )
-                .map_err(|e| TaibaiError::Storage(format!("zstd compress error: {}", e)))?;
+                    true,
+                )?;
                 let value_set = metadata.value_set.map(|mut values| {
                     values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
                     values
                 });
 
                 Ok(EncodedColumn {
-                    compressed,
-                    uncompressed_size,
+                    compressed: stored.data,
+                    uncompressed_size: stored.uncompressed_size,
                     zone_map: ZoneMap {
                         min_value: metadata.min_value.unwrap_or_else(|| null_for_dtype(dtype)),
                         max_value: metadata.max_value.unwrap_or_else(|| null_for_dtype(dtype)),
@@ -566,12 +566,12 @@ fn build_column_metadata(
             let mut null_count = 0u64;
             let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
             let mut values = Some(HashSet::new());
-            for row in offset..offset + count {
+            for (row, &raw) in data.iter().enumerate().skip(offset).take(count) {
                 if bitmap.is_null(row) {
                     null_count += 1;
                     continue;
                 }
-                let value = data[row] != 0;
+                let value = raw != 0;
                 min_value = Some(min_value.map_or(value, |current: bool| current.min(value)));
                 max_value = Some(max_value.map_or(value, |current: bool| current.max(value)));
                 if let Some(filter) = &mut bloom_filter {
@@ -751,12 +751,11 @@ where
     let mut null_count = 0u64;
     let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
     let mut values = Some(HashSet::new());
-    for row in offset..offset + count {
+    for (row, &value) in data.iter().enumerate().skip(offset).take(count) {
         if bitmap.is_null(row) {
             null_count += 1;
             continue;
         }
-        let value = data[row];
         min_value = Some(min_value.map_or(value, |current: T| current.min(value)));
         max_value = Some(max_value.map_or(value, |current: T| current.max(value)));
         if let Some(filter) = &mut bloom_filter {
@@ -785,12 +784,11 @@ fn metadata_float32(
     let mut null_count = 0u64;
     let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
     let mut values = Some(HashSet::new());
-    for row in offset..offset + count {
+    for (row, &value) in data.iter().enumerate().skip(offset).take(count) {
         if bitmap.is_null(row) {
             null_count += 1;
             continue;
         }
-        let value = data[row];
         if min_value.is_none_or(|current| value < current) {
             min_value = Some(value);
         }
@@ -829,12 +827,11 @@ fn metadata_float64(
     let mut null_count = 0u64;
     let mut bloom_filter = bloom_enabled.then(BloomFilter::with_defaults);
     let mut values = Some(HashSet::new());
-    for row in offset..offset + count {
+    for (row, &value) in data.iter().enumerate().skip(offset).take(count) {
         if bitmap.is_null(row) {
             null_count += 1;
             continue;
         }
-        let value = data[row];
         if min_value.is_none_or(|current| value < current) {
             min_value = Some(value);
         }

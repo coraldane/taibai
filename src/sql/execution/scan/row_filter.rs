@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-use crate::storage::codec::fastscan::{apply_filter_mask_fast, FastScanEQ};
+use crate::storage::codec::fastscan::apply_filter_mask_fast;
 use crate::storage::codec::predicate_scan::selected_eq_rows_from_raw;
 use crate::storage::partition::pruning::RangeOp;
 use crate::types::array::ColumnArray;
@@ -22,9 +21,9 @@ pub fn apply_predicates(
     range_predicates: &[crate::storage::partition::pruning::RangeClause],
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
-) -> RecordBatch {
+) -> crate::common::error::Result<RecordBatch> {
     if batch.num_rows() == 0 {
-        return batch.clone();
+        return Ok(batch.clone());
     }
 
     let mut mask: Vec<bool> = vec![true; batch.num_rows()];
@@ -32,37 +31,37 @@ pub fn apply_predicates(
     for (col_idx, value) in eq_predicates {
         apply_eq_mask(batch, *col_idx, value, &mut mask);
         if mask.iter().all(|m| !m) {
-            return empty_like(batch);
+            return Ok(empty_like(batch));
         }
     }
 
     for clause in range_predicates {
         apply_range_mask(batch, clause, &mut mask);
         if mask.iter().all(|m| !m) {
-            return empty_like(batch);
+            return Ok(empty_like(batch));
         }
     }
 
     for pred in in_predicates {
         apply_in_mask(batch, pred, &mut mask);
         if mask.iter().all(|m| !m) {
-            return empty_like(batch);
+            return Ok(empty_like(batch));
         }
     }
 
     if let Some(expr) = remaining_predicate {
-        apply_remaining_mask(batch, expr, &mut mask);
+        apply_remaining_mask(batch, expr, &mut mask)?;
     }
 
     let match_count = mask.iter().filter(|&&m| m).count();
     if match_count == batch.num_rows() {
-        return batch.clone();
+        return Ok(batch.clone());
     }
     if match_count == 0 {
-        return empty_like(batch);
+        return Ok(empty_like(batch));
     }
 
-    apply_filter_mask_fast(batch, &mask)
+    Ok(apply_filter_mask_fast(batch, &mask))
 }
 
 pub fn apply_predicates_with_column_map(
@@ -84,13 +83,13 @@ pub fn apply_predicates_with_column_map(
     let remapped_remaining = remaining_predicate
         .map(|expr| remap_expr(expr, &col_pos_by_original))
         .transpose()?;
-    Ok(apply_predicates(
+    apply_predicates(
         batch,
         &remapped_eq,
         &remapped_range,
         &remapped_in,
         remapped_remaining.as_ref(),
-    ))
+    )
 }
 
 pub fn apply_eq_mask(batch: &RecordBatch, col_idx: usize, value: &ScalarValue, mask: &mut [bool]) {
@@ -148,224 +147,15 @@ fn apply_remaining_mask(
     batch: &RecordBatch,
     expr: &crate::sql::planner::LogicalExpr,
     mask: &mut [bool],
-) {
-    if let Ok(row_mask) = eval_logical_expr_batch(expr, batch) {
-        for (i, m) in row_mask.iter().enumerate() {
-            mask[i] = mask[i] && *m;
-        }
+) -> crate::common::error::Result<()> {
+    let row_mask = crate::sql::execution::operators::filter::eval_filter(expr, batch)?;
+    for (i, m) in row_mask.iter().enumerate() {
+        mask[i] = mask[i] && *m;
     }
+    Ok(())
 }
 
-fn eval_logical_expr_batch(
-    expr: &crate::sql::planner::LogicalExpr,
-    batch: &RecordBatch,
-) -> crate::common::error::Result<Vec<bool>> {
-    use crate::sql::planner::LogicalExpr;
-    let num_rows = batch.num_rows();
-    match expr {
-        LogicalExpr::BinaryOp { left, op, right } => {
-            use crate::sql::parser::ast::BinOp;
-            match op {
-                BinOp::And => {
-                    let lm = eval_logical_expr_batch(left, batch)?;
-                    let rm = eval_logical_expr_batch(right, batch)?;
-                    Ok(lm.iter().zip(rm.iter()).map(|(l, r)| *l && *r).collect())
-                }
-                BinOp::Or => {
-                    let lm = eval_logical_expr_batch(left, batch)?;
-                    let rm = eval_logical_expr_batch(right, batch)?;
-                    Ok(lm.iter().zip(rm.iter()).map(|(l, r)| *l || *r).collect())
-                }
-                BinOp::Eq => {
-                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
-                        return compare_simple_values(left, right, batch, |ord| {
-                            ord == std::cmp::Ordering::Equal
-                        });
-                    }
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
-                        (&**left, &**right)
-                    {
-                        if let Some(col) = batch.column(*idx) {
-                            return Ok(col.eq_vec(val));
-                        }
-                    }
-                    if let (LogicalExpr::Literal(val), LogicalExpr::Column(idx)) =
-                        (&**left, &**right)
-                    {
-                        if let Some(col) = batch.column(*idx) {
-                            return Ok(col.eq_vec(val));
-                        }
-                    }
-                    Ok(vec![true; num_rows])
-                }
-                BinOp::Neq => {
-                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
-                        return compare_simple_values(left, right, batch, |ord| {
-                            ord != std::cmp::Ordering::Equal
-                        });
-                    }
-                    Ok(vec![true; num_rows])
-                }
-                BinOp::Lt => {
-                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
-                        return compare_simple_values(left, right, batch, |ord| {
-                            ord == std::cmp::Ordering::Less
-                        });
-                    }
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
-                        (&**left, &**right)
-                    {
-                        if let Some(col) = batch.column(*idx) {
-                            return Ok(col.lt_vec(val));
-                        }
-                    }
-                    Ok(vec![true; num_rows])
-                }
-                BinOp::Gt => {
-                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
-                        return compare_simple_values(left, right, batch, |ord| {
-                            ord == std::cmp::Ordering::Greater
-                        });
-                    }
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
-                        (&**left, &**right)
-                    {
-                        if let Some(col) = batch.column(*idx) {
-                            return Ok(col.gt_vec(val));
-                        }
-                    }
-                    Ok(vec![true; num_rows])
-                }
-                BinOp::Lte => {
-                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
-                        return compare_simple_values(left, right, batch, |ord| {
-                            matches!(ord, std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
-                        });
-                    }
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
-                        (&**left, &**right)
-                    {
-                        if let Some(col) = batch.column(*idx) {
-                            return Ok(col.le_vec(val));
-                        }
-                    }
-                    Ok(vec![true; num_rows])
-                }
-                BinOp::Gte => {
-                    if is_simple_value_expr(left) && is_simple_value_expr(right) {
-                        return compare_simple_values(left, right, batch, |ord| {
-                            matches!(ord, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
-                        });
-                    }
-                    if let (LogicalExpr::Column(idx), LogicalExpr::Literal(val)) =
-                        (&**left, &**right)
-                    {
-                        if let Some(col) = batch.column(*idx) {
-                            return Ok(col.ge_vec(val));
-                        }
-                    }
-                    Ok(vec![true; num_rows])
-                }
-                _ => Ok(vec![true; num_rows]),
-            }
-        }
-        LogicalExpr::Not(inner) => {
-            let inner_mask = eval_logical_expr_batch(inner, batch)?;
-            Ok(inner_mask.iter().map(|m| !m).collect())
-        }
-        LogicalExpr::Literal(value) => Ok(vec![
-            match value {
-                ScalarValue::Bool(Some(value)) => *value,
-                _ => !value.is_null(),
-            };
-            num_rows
-        ]),
-        LogicalExpr::IsNull(inner) => {
-            if let LogicalExpr::Column(idx) = &**inner {
-                if let Some(col) = batch.column(*idx) {
-                    return Ok(col.is_null_vec());
-                }
-            }
-            Ok(vec![true; num_rows])
-        }
-        LogicalExpr::IsNotNull(inner) => {
-            if let LogicalExpr::Column(idx) = &**inner {
-                if let Some(col) = batch.column(*idx) {
-                    return Ok(col.is_not_null_vec());
-                }
-            }
-            Ok(vec![true; num_rows])
-        }
-        LogicalExpr::In {
-            expr,
-            values,
-            negated,
-        } => {
-            let vals = eval_logical_value_batch(expr, batch)?;
-            Ok(vals
-                .iter()
-                .map(|val| {
-                    let found = values.iter().any(|candidate| scalar_eq(val, candidate));
-                    if *negated {
-                        !found
-                    } else {
-                        found
-                    }
-                })
-                .collect())
-        }
-        _ => Ok(vec![true; num_rows]),
-    }
-}
-
-fn is_simple_value_expr(expr: &crate::sql::planner::LogicalExpr) -> bool {
-    matches!(
-        expr,
-        crate::sql::planner::LogicalExpr::Column(_) | crate::sql::planner::LogicalExpr::Literal(_)
-    )
-}
-
-fn compare_simple_values<F>(
-    left: &crate::sql::planner::LogicalExpr,
-    right: &crate::sql::planner::LogicalExpr,
-    batch: &RecordBatch,
-    keep: F,
-) -> crate::common::error::Result<Vec<bool>>
-where
-    F: Fn(std::cmp::Ordering) -> bool,
-{
-    let left_values = eval_logical_value_batch(left, batch)?;
-    let right_values = eval_logical_value_batch(right, batch)?;
-    Ok(left_values
-        .iter()
-        .zip(right_values.iter())
-        .map(|(left, right)| {
-            if left.is_null() || right.is_null() {
-                false
-            } else {
-                keep(crate::storage::index::sort_key::compare_scalars_for_sort(
-                    left, right,
-                ))
-            }
-        })
-        .collect())
-}
-
-fn eval_logical_value_batch(
-    expr: &crate::sql::planner::LogicalExpr,
-    batch: &RecordBatch,
-) -> crate::common::error::Result<Vec<ScalarValue>> {
-    use crate::sql::planner::LogicalExpr;
-    let num_rows = batch.num_rows();
-    match expr {
-        LogicalExpr::Column(idx) => Ok((0..num_rows)
-            .map(|row| batch.scalar(row, *idx).unwrap_or(ScalarValue::Int64(None)))
-            .collect()),
-        LogicalExpr::Literal(value) => Ok(vec![value.clone(); num_rows]),
-        _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 pub fn predicate_first_read(
     reader: &crate::storage::segment::SegmentReader,
     rg_idx: usize,
@@ -381,7 +171,17 @@ pub fn predicate_first_read(
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
 
-    let mut mask: Vec<bool> = vec![true; pred_batch.num_rows()];
+    let mut mask: Vec<bool> = if reader.delete_bitmap().is_empty() {
+        vec![true; pred_batch.num_rows()]
+    } else {
+        let rg_start_row = reader.row_group_start_row(rg_idx);
+        (0..pred_batch.num_rows() as u64)
+            .map(|i| !reader.is_row_deleted(rg_start_row + i))
+            .collect()
+    };
+    if mask.iter().all(|m| !m) {
+        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+    }
 
     let pred_to_batch_pos: std::collections::HashMap<usize, usize> = predicate_cols
         .iter()
@@ -445,7 +245,7 @@ pub fn predicate_first_read(
 
     if let Some(expr) = remaining_predicate {
         let remapped_expr = remap_expr(expr, &pred_to_batch_pos)?;
-        apply_remaining_mask(&pred_batch, &remapped_expr, &mut mask);
+        apply_remaining_mask(&pred_batch, &remapped_expr, &mut mask)?;
     }
 
     let match_count = mask.iter().filter(|&&m| m).count();
@@ -503,6 +303,7 @@ pub fn predicate_first_read(
         .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cluster_key_range_read(
     reader: &crate::storage::segment::SegmentReader,
     rg_idx: usize,
@@ -637,7 +438,7 @@ pub fn cluster_key_range_read(
         &remapped_range,
         &remapped_in,
         remapped_remaining.as_ref(),
-    );
+    )?;
 
     project_filtered_union(&filtered, &union_cols, projection_cols)
 }
@@ -1124,47 +925,6 @@ fn empty_with_projection(
     RecordBatch::new(proj_schema)
 }
 
-fn scalar_eq(a: &ScalarValue, b: &ScalarValue) -> bool {
-    if a.is_null() || b.is_null() {
-        return false;
-    }
-    crate::storage::index::sort_key::compare_scalars_for_sort(a, b) == std::cmp::Ordering::Equal
-}
-
-pub fn apply_cluster_key_fast_scan(
-    batches: &mut Vec<RecordBatch>,
-    cluster_key: &[String],
-    eq_predicates: &[(usize, ScalarValue)],
-    table_schema: &crate::types::batch::Schema,
-) {
-    if cluster_key.is_empty() || eq_predicates.is_empty() {
-        return;
-    }
-    let key_col = match cluster_key.first() {
-        Some(k) => k,
-        None => return,
-    };
-    let col_idx = match table_schema.index_of(key_col) {
-        Some(idx) => idx,
-        None => return,
-    };
-    let value = match eq_predicates.iter().find(|(idx, _)| *idx == col_idx) {
-        Some((_, v)) => v.clone(),
-        None => return,
-    };
-
-    let fast_scan = FastScanEQ::new(col_idx, value);
-    let mut filtered = Vec::with_capacity(batches.len());
-    for batch in batches.drain(..) {
-        if let Some(result) = fast_scan.scan_batch_sorted(&batch, &[col_idx]) {
-            if result.num_rows() > 0 {
-                filtered.push(result);
-            }
-        }
-    }
-    *batches = filtered;
-}
-
 #[cfg(test)]
-#[path = "row_filter_tests.rs"]
+#[path = "row_filter_test.rs"]
 mod tests;

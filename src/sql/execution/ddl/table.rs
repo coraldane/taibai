@@ -1,3 +1,4 @@
+#[allow(clippy::too_many_arguments)]
 pub fn exec_create_table(
     engine: &Engine,
     db: &str,
@@ -10,6 +11,7 @@ pub fn exec_create_table(
     partition_by: &Option<PartitionDef>,
     ttl: &Option<TtlDef>,
     hot: &Option<HotDef>,
+    durability: &Option<DurabilityLevel>,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
@@ -87,6 +89,12 @@ pub fn exec_create_table(
         if let Some(ttl_def) = ttl {
             meta.set_ttl(&ttl_def.column, ttl_def.duration_secs);
         }
+        if let Some(level) = durability {
+            meta.durability = match level {
+                DurabilityLevel::Strict => TableDurability::Strict,
+                DurabilityLevel::Relaxed => TableDurability::Relaxed,
+            };
+        }
     }
 
     let auto_inc_col = columns.iter().find(|c| c.auto_increment);
@@ -115,6 +123,7 @@ pub fn exec_create_table(
                 &index.columns,
                 Vec::new(),
                 Some(engine.segment_mgr().memtable_flush_epoch(db, name)),
+                None,
             )?;
         }
         let primary_columns = meta
@@ -131,6 +140,7 @@ pub fn exec_create_table(
                 &primary_columns,
                 Vec::new(),
                 Some(engine.segment_mgr().memtable_flush_epoch(db, name)),
+                None,
             )?;
         }
     }
@@ -178,16 +188,15 @@ pub fn exec_drop_index(
         engine
             .index_manager()
             .remove_unique_index_snapshot(db, table, index_name);
-        engine.index_manager().mark_index_stale(db, table);
     } else {
         table_meta.drop_secondary_index(index_name)?;
-        engine.index_manager().mark_index_stale(db, table);
     }
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn exec_create_index(
     engine: &Engine,
     db: &str,
@@ -384,7 +393,7 @@ pub fn exec_rebuild_unique_index(
                     db,
                     table,
                     &indices,
-                    &index.name,
+                    "REBUILD UNIQUE INDEX statement",
                 )?;
                 engine.index_manager().persist_unique_index_entries(
                     db,
@@ -393,19 +402,21 @@ pub fn exec_rebuild_unique_index(
                     &index.columns,
                     entries,
                     Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
+                    None,
                 )?;
                 rebuilt += 1;
             }
             Ok(())
         })?;
 
-    if rebuilt == 0 && index_name.is_some() {
-        return Err(TaibaiError::Sql(format!(
-            "unique index '{}' does not exist",
-            index_name.unwrap()
-        )));
+    if rebuilt == 0 {
+        if let Some(index_name) = index_name {
+            return Err(TaibaiError::Sql(format!(
+                "unique index '{}' does not exist",
+                index_name
+            )));
+        }
     }
-    engine.index_manager().mark_index_stale(db, table);
     Ok(ExecResult::Ok {
         rows_affected: rebuilt,
     })
@@ -464,12 +475,11 @@ pub fn exec_drop_table(
             engine.batch_writer().drain_table_tail(db, name)?;
 
             let step_start = Instant::now();
-            engine.segment_mgr().remove_wal(&table_dir);
             tracing::info!(
                 db,
                 table = name,
                 elapsed_ms = step_start.elapsed().as_millis(),
-                "drop table: removed wal handle"
+                "drop table: drained table tail"
             );
 
             let step_start = Instant::now();
@@ -558,7 +568,7 @@ pub fn exec_drop_table(
             Some(tombstone) => break (tombstone, table_meta),
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table = name,
@@ -575,7 +585,6 @@ pub fn exec_drop_table(
     drop(catalogs);
 
     engine.auto_increment_manager().unregister(db, name);
-    engine.index_manager().remove_index(db, name);
     let unique_index_names = table_meta
         .unique_indexes
         .iter()
@@ -680,8 +689,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             }
             engine.batch_writer().drain_table_tail(db, name)?;
             engine.segment_mgr().flush_table_active(db, name)?;
-            engine.segment_mgr().remove_wal(&old_table_dir);
-            engine.segment_mgr().close_table_state_handles(db, name);
+                engine.segment_mgr().close_table_state_handles(db, name);
             engine
                 .segment_mgr()
                 .invalidate_readers_under(&old_table_dir);
@@ -740,7 +748,7 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
             Some(()) => break catalog_before,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table = name,
@@ -759,7 +767,6 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
     engine
         .auto_increment_manager()
         .rename_table(db, name, new_name);
-    engine.index_manager().rename_index(db, name, new_name);
     let unique_index_names = catalog_before
         .get_table(name)
         .map(|meta| {
@@ -894,7 +901,6 @@ fn exec_partition_change(
                 "partition change cleared resident memtables and flushed active segments"
             );
             engine.hot_store_manager().remove(db, name);
-            engine.index_manager().mark_index_stale(db, name);
             let unique_index_names = before_meta
                 .unique_indexes
                 .iter()
@@ -922,7 +928,7 @@ fn exec_partition_change(
             Some(operation_dir) => break operation_dir,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table = name,
@@ -1012,7 +1018,7 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
             Some(()) => break,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table = name,
@@ -1190,10 +1196,8 @@ pub fn exec_alter_table(
                     engine
                         .index_manager()
                         .remove_unique_index_snapshot(db, name, index_name);
-                    engine.index_manager().mark_index_stale(db, name);
                 } else {
                     table_meta.drop_secondary_index(index_name)?;
-                    engine.index_manager().mark_index_stale(db, name);
                 }
             }
             AlterOperation::RenameColumn { old_name, new_name } => {
@@ -1463,8 +1467,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
 
         let mut op = || {
             engine.batch_writer().drain_table_tail(db, table)?;
-            engine.segment_mgr().remove_wal(&table_dir);
-            engine.segment_mgr().close_table_state_handles(db, table);
+                engine.segment_mgr().close_table_state_handles(db, table);
             engine.segment_mgr().invalidate_readers_under(&table_dir);
 
             write_before_meta(&operation_dir, &before_meta)?;
@@ -1506,7 +1509,6 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             engine.batch_writer().clear_memtables(db, table);
             engine.segment_mgr().remove_table_state(db, table);
             engine.hot_store_manager().remove(db, table);
-            engine.index_manager().clear_index(db, table);
             let unique_index_names = before_meta
                 .unique_indexes
                 .iter()
@@ -1534,7 +1536,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             Some(operation_dir) => break operation_dir,
             None => {
                 lock_attempts += 1;
-                if lock_attempts == 1 || lock_attempts % 200 == 0 {
+                if lock_attempts == 1 || lock_attempts.is_multiple_of(200) {
                     tracing::warn!(
                         db,
                         table,

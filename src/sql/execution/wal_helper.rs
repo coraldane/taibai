@@ -1,99 +1,8 @@
-#![allow(dead_code)]
-use std::path::{Path, PathBuf};
-
 use crate::common::error::Result;
-use crate::storage::catalog::schema::TableMeta;
 
-use super::engine::Engine;
-
-pub fn write_wal(
-    engine: &Engine,
-    table_dir: &Path,
-    batch: &crate::types::batch::RecordBatch,
-) -> Result<()> {
-    if engine.is_bulk_mode() {
-        return Ok(());
-    }
-
-    let mgr = engine.segment_mgr();
-    mgr.write_wal(table_dir, batch)?;
-
-    Ok(())
-}
-
-pub fn determine_write_dir(
-    _engine: &Engine,
-    table_meta: &TableMeta,
-    batch: &crate::types::batch::RecordBatch,
-    default_dir: &Path,
-) -> Result<(PathBuf, String)> {
-    if table_meta.partition_key.is_empty() {
-        return Ok((default_dir.to_path_buf(), String::new()));
-    }
-
-    let part_col_idx = batch
-        .schema
-        .columns
-        .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(&table_meta.partition_key));
-
-    let Some(col_idx) = part_col_idx else {
-        return Ok((default_dir.to_path_buf(), String::new()));
-    };
-
-    let strategy = match table_meta.partition_type {
-        crate::storage::catalog::schema::PartitionType::Day => {
-            crate::storage::partition::PartitionStrategy::Day
-        }
-        crate::storage::catalog::schema::PartitionType::Year => {
-            crate::storage::partition::PartitionStrategy::Year
-        }
-        crate::storage::catalog::schema::PartitionType::Month => {
-            crate::storage::partition::PartitionStrategy::Month
-        }
-        crate::storage::catalog::schema::PartitionType::Value => {
-            let first_val = batch
-                .scalar(0, col_idx)
-                .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-            return Ok((
-                default_dir.to_path_buf(),
-                first_val.to_text().unwrap_or_default(),
-            ));
-        }
-        crate::storage::catalog::schema::PartitionType::Hash => {
-            let first_val = batch
-                .scalar(0, col_idx)
-                .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-            let hash_val = crate::storage::partition::partition_function::hash_partition_value(
-                &first_val,
-                table_meta.partition_param as i64,
-            );
-            return Ok((default_dir.to_path_buf(), format!("hash_{}", hash_val)));
-        }
-        crate::storage::catalog::schema::PartitionType::Mod => {
-            let first_val = batch
-                .scalar(0, col_idx)
-                .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-            let mod_val = crate::storage::partition::partition_function::mod_partition_value(
-                &first_val,
-                table_meta.partition_param as i64,
-            );
-            return Ok((default_dir.to_path_buf(), mod_val.to_string()));
-        }
-        crate::storage::catalog::schema::PartitionType::None => {
-            return Ok((default_dir.to_path_buf(), String::new()))
-        }
-    };
-
-    let first_val = batch
-        .scalar(0, col_idx)
-        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-
-    let partition_key = crate::storage::partition::compute_partition_key(&first_val, strategy)
-        .unwrap_or_else(|_| "default".to_string());
-
-    Ok((default_dir.to_path_buf(), partition_key))
-}
+#[cfg(test)]
+#[path = "wal_helper_test.rs"]
+mod tests;
 
 pub fn serialize_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Vec<u8> {
     compress_prepared_batch_for_wal(prepare_batch_for_wal(batch))
@@ -418,6 +327,10 @@ fn decode_column_raw(
     for row in 0..num_rows {
         let is_null = null_bitmap.is_some_and(|bm| bm.is_null(row));
         if is_null {
+            // The encoder writes a placeholder slot for every row, including
+            // NULLs. Skipping without consuming the slot would misalign every
+            // value after the first NULL in this column.
+            pos = skip_wal_slot(data, pos, dt)?;
             col.push(&ScalarValue::null_for_type(dt))?;
         } else {
             let val = decode_fixed_value(data, &mut pos, dt)?;
@@ -426,6 +339,59 @@ fn decode_column_raw(
     }
 
     Ok(())
+}
+
+/// Byte length of one encoded slot at `pos`, without materializing its value.
+fn skip_wal_slot(data: &[u8], pos: usize, dt: crate::protocol::types::DataType) -> Result<usize> {
+    use crate::common::error::TaibaiError;
+
+    let trunc =
+        || TaibaiError::Internal(format!("WAL data truncated reading NULL slot for {:?}", dt));
+    match dt {
+        crate::protocol::types::DataType::Bool
+        | crate::protocol::types::DataType::Int8
+        | crate::protocol::types::DataType::UInt8 => Ok(pos + 1),
+        crate::protocol::types::DataType::Int16 | crate::protocol::types::DataType::UInt16 => {
+            Ok(pos + 2)
+        }
+        crate::protocol::types::DataType::Int32
+        | crate::protocol::types::DataType::UInt32
+        | crate::protocol::types::DataType::Float32
+        | crate::protocol::types::DataType::Date => Ok(pos + 4),
+        crate::protocol::types::DataType::Int64
+        | crate::protocol::types::DataType::UInt64
+        | crate::protocol::types::DataType::Float64
+        | crate::protocol::types::DataType::Decimal
+        | crate::protocol::types::DataType::Time
+        | crate::protocol::types::DataType::Timestamp
+        | crate::protocol::types::DataType::Interval => Ok(pos + 8),
+        crate::protocol::types::DataType::VarChar | crate::protocol::types::DataType::Blob => {
+            let end = pos.checked_add(4).ok_or_else(&trunc)?;
+            if end > data.len() {
+                return Err(trunc());
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
+            let slot_end = end.checked_add(len).ok_or_else(&trunc)?;
+            if slot_end > data.len() {
+                return Err(trunc());
+            }
+            Ok(slot_end)
+        }
+        crate::protocol::types::DataType::Vector => {
+            let end = pos.checked_add(4).ok_or_else(&trunc)?;
+            if end > data.len() {
+                return Err(trunc());
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
+            let slot_end = end.checked_add(len.saturating_mul(4)).ok_or_else(&trunc)?;
+            if slot_end > data.len() {
+                return Err(trunc());
+            }
+            Ok(slot_end)
+        }
+    }
 }
 
 fn decode_fixed_value(

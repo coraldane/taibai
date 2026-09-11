@@ -3,8 +3,8 @@ use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{
-    AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, GrantObject, HotDef,
-    PartitionDef, PartitionStrategy, Privilege, Statement, TtlDef, UniqueKeyDef,
+    AlterOperation, AlterUserOperation, ColumnDefAst, DefaultValue, DurabilityLevel, GrantObject,
+    HotDef, PartitionDef, PartitionStrategy, Privilege, Statement, TtlDef, UniqueKeyDef,
 };
 use crate::sql::parser::lexer::Token;
 use crate::sql::parser::parser::{parse_data_type, Parser};
@@ -195,6 +195,7 @@ impl Parser {
         let mut partition_by: Option<PartitionDef> = None;
         let mut ttl: Option<TtlDef> = None;
         let mut hot: Option<HotDef> = None;
+        let mut durability: Option<DurabilityLevel> = None;
 
         loop {
             if self.peek() == &Token::Cluster && cluster_by.is_none() {
@@ -271,6 +272,24 @@ impl Parser {
                 ttl = Some(self.parse_ttl_def()?);
             } else if self.peek() == &Token::Hot && hot.is_none() {
                 hot = Some(self.parse_hot_def()?);
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("DURABILITY"))
+                && durability.is_none()
+            {
+                self.advance();
+                if self.peek() == &Token::Eq {
+                    self.advance();
+                }
+                let level = self.expect_ident()?;
+                durability = Some(match level.to_ascii_lowercase().as_str() {
+                    "strict" => DurabilityLevel::Strict,
+                    "relaxed" => DurabilityLevel::Relaxed,
+                    other => {
+                        return Err(TaibaiError::Sql(format!(
+                            "expected DURABILITY = STRICT or RELAXED, got '{}'",
+                            other
+                        )))
+                    }
+                });
             } else {
                 break;
             }
@@ -286,6 +305,7 @@ impl Parser {
             partition_by,
             ttl,
             hot,
+            durability,
         })
     }
 

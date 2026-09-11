@@ -235,7 +235,11 @@ impl Engine {
     }
 
     pub fn begin_bulk_import(&self) -> usize {
-        self.bulk_mode_sessions.fetch_add(1, Ordering::AcqRel) + 1
+        let active = self.bulk_mode_sessions.fetch_add(1, Ordering::AcqRel) + 1;
+        if active == 1 {
+            self.index_manager.pause_unique_index_compaction();
+        }
+        active
     }
 
     pub fn end_bulk_import(&self) -> usize {
@@ -270,6 +274,9 @@ impl Engine {
                 .lock()
                 .unwrap()
                 .remove(&(db, table));
+        }
+        if !self.is_bulk_mode() {
+            self.index_manager.resume_unique_index_compaction();
         }
         Ok(total)
     }
@@ -360,20 +367,6 @@ impl Engine {
         Ok(0)
     }
 
-    /// Close-of-day archival (design 鎼?.2): flush every live memtable, seal all
-    /// active segments (and clear WALs), then evict every resident hot store and
-    /// drop Archived memtables. After this the day's data is fully handed off to
-    /// the history layer; the next trading day starts with empty resident state.
-    /// Intended to be triggered by an external scheduler at market close.
-    pub fn close_of_day_flush(&self) -> Result<()> {
-        tracing::info!("close-of-day: flushing all resident data to history");
-        self.flush_all_buffers()?;
-        self.hot_store_mgr.evict_all();
-        self.batch_writer.memtable_manager().remove_all_archived();
-        tracing::info!("close-of-day: complete, resident state evicted");
-        Ok(())
-    }
-
     pub fn close_of_day_flush_table(&self, db: &str, table: &str) -> Result<()> {
         tracing::info!(
             db,
@@ -440,18 +433,35 @@ impl Engine {
         } else if !dirty_partitions.is_empty() {
             stats = compactor.optimize_table(db, table, &table_meta)?;
         }
-        if stats.segments_written > 0 {
-            self.index_manager.mark_index_stale(db, table);
-            let unique_index_names = table_meta
-                .unique_indexes
-                .iter()
-                .map(|index| index.name.clone())
-                .collect::<Vec<_>>();
-            self.index_manager.invalidate_table_unique_index_snapshots(
-                db,
-                table,
-                &unique_index_names,
-            );
+        if stats.segments_written > 0 || stats.rows_dropped > 0 {
+            let schema = Schema::new(table_meta.columns.clone());
+            let rebuilt = self.segment_mgr.with_table_mutation_lock(db, table, || {
+                super::dml_insert::rebuild_table_location_indexes(
+                    self,
+                    db,
+                    table,
+                    &table_meta,
+                    &schema,
+                )
+            });
+            if let Err(error) = rebuilt {
+                tracing::warn!(
+                    db,
+                    table,
+                    error = %error,
+                    "close-of-day index auto-rebuild failed; falling back to snapshot invalidation"
+                );
+                let unique_index_names = table_meta
+                    .unique_indexes
+                    .iter()
+                    .map(|index| index.name.clone())
+                    .collect::<Vec<_>>();
+                self.index_manager.invalidate_table_unique_index_snapshots(
+                    db,
+                    table,
+                    &unique_index_names,
+                );
+            }
         }
         let today = chrono::Local::now().date_naive().to_string();
         {

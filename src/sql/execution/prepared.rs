@@ -1,11 +1,14 @@
-#![allow(dead_code)]
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::sql::parser::ast::{Expr, FromClause, JoinExpr, Statement, TableRef, WindowFunc};
 use crate::sql::parser::parser::Parser;
 use crate::sql::planner::LogicalPlan;
 use crate::types::scalar::ScalarValue;
+
+/// Upper bound of live prepared statements per session. Statements are never
+/// evicted silently while in use; exceeding the limit fails the new PREPARE.
+pub const DEFAULT_MAX_PREPARED_STATEMENTS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
@@ -23,7 +26,6 @@ pub struct PreparedStatement {
 pub struct PreparedStatementCache {
     next_id: u32,
     statements: HashMap<u32, PreparedStatement>,
-    lru_order: VecDeque<u32>,
     max_size: usize,
 }
 
@@ -35,31 +37,34 @@ impl Default for PreparedStatementCache {
 
 impl PreparedStatementCache {
     pub fn new() -> Self {
-        Self {
-            next_id: 1,
-            statements: HashMap::new(),
-            lru_order: VecDeque::new(),
-            max_size: 128,
-        }
+        Self::with_max_size(DEFAULT_MAX_PREPARED_STATEMENTS)
     }
 
     pub fn with_max_size(max_size: usize) -> Self {
         Self {
             next_id: 1,
             statements: HashMap::new(),
-            lru_order: VecDeque::new(),
-            max_size,
+            max_size: max_size.max(1),
         }
     }
 
     pub fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
+        if self.statements.len() >= self.max_size {
+            return Err(TaibaiError::Sql(format!(
+                "too many prepared statements on session (limit {}); close unused statements before preparing more",
+                self.max_size
+            )));
+        }
         let stmts = Parser::parse(sql)?;
         if stmts.is_empty() {
             return Err(TaibaiError::Sql("empty query".into()));
         }
 
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| TaibaiError::Sql("prepared statement id space exhausted".into()))?;
 
         let param_count = count_placeholders(&stmts[0]);
 
@@ -75,8 +80,6 @@ impl PreparedStatementCache {
         };
 
         self.statements.insert(id, prepared.clone());
-        self.lru_order.push_front(id);
-        self.evict_if_needed();
         Ok(prepared)
     }
 
@@ -85,30 +88,18 @@ impl PreparedStatementCache {
     }
 
     pub fn get_mut(&mut self, id: u32) -> Option<&mut PreparedStatement> {
-        if self.statements.contains_key(&id) {
-            self.lru_order.retain(|&x| x != id);
-            self.lru_order.push_front(id);
-            self.statements.get_mut(&id)
-        } else {
-            None
-        }
+        self.statements.get_mut(&id)
     }
 
     pub fn remove(&mut self, id: u32) -> Option<PreparedStatement> {
-        self.lru_order.retain(|&x| x != id);
         self.statements.remove(&id)
     }
 
     pub fn insert(&mut self, stmt: PreparedStatement) {
-        let id = stmt.id;
-        self.statements.insert(id, stmt);
-        self.lru_order.retain(|&x| x != id);
-        self.lru_order.push_front(id);
-        self.evict_if_needed();
+        self.statements.insert(stmt.id, stmt);
     }
 
     pub fn close(&mut self, id: u32) -> bool {
-        self.lru_order.retain(|&x| x != id);
         self.statements.remove(&id).is_some()
     }
 
@@ -120,19 +111,12 @@ impl PreparedStatementCache {
         self.statements.is_empty()
     }
 
-    pub fn clear(&mut self) {
-        self.statements.clear();
-        self.lru_order.clear();
+    pub fn next_id(&self) -> u32 {
+        self.next_id
     }
 
-    fn evict_if_needed(&mut self) {
-        while self.statements.len() > self.max_size {
-            if let Some(oldest) = self.lru_order.pop_back() {
-                self.statements.remove(&oldest);
-            } else {
-                break;
-            }
-        }
+    pub fn clear(&mut self) {
+        self.statements.clear();
     }
 }
 
@@ -869,5 +853,5 @@ fn check_window_func_for_placeholders(wf: &WindowFunc, found: &mut bool) {
 }
 
 #[cfg(test)]
-#[path = "prepared_tests.rs"]
+#[path = "prepared_test.rs"]
 mod tests;

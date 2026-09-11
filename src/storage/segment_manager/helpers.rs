@@ -71,23 +71,6 @@ pub(super) fn discover_max_partition_seq(
     max_seq
 }
 
-#[allow(dead_code)]
-pub(super) fn placeholder_zone_maps(schema: &Schema, row_count: u64) -> Vec<ZoneMap> {
-    schema
-        .columns
-        .iter()
-        .map(|col| {
-            let null = crate::storage::codec::scalar_tag::null_for_dtype(col.data_type);
-            ZoneMap {
-                min_value: null.clone(),
-                max_value: null,
-                null_count: 0,
-                row_count,
-            }
-        })
-        .collect()
-}
-
 pub(super) fn compute_zone_maps_from_batch(
     batch: &RecordBatch,
     start_row: usize,
@@ -119,11 +102,10 @@ fn compute_zone_map_from_column(
         ($values:expr, $variant:ident) => {{
             let mut min = None;
             let mut max = None;
-            for row in start_row..end_row {
+            for (row, &value) in $values.iter().enumerate().take(end_row).skip(start_row) {
                 if bitmap.is_null(row) {
                     continue;
                 }
-                let value = $values[row];
                 if min.is_none_or(|current| value < current) {
                     min = Some(value);
                 }
@@ -144,11 +126,10 @@ fn compute_zone_map_from_column(
         ($values:expr, $variant:ident) => {{
             let mut min = None;
             let mut max = None;
-            for row in start_row..end_row {
+            for (row, &value) in $values.iter().enumerate().take(end_row).skip(start_row) {
                 if bitmap.is_null(row) {
                     continue;
                 }
-                let value = $values[row];
                 if min.is_none_or(|current| value.partial_cmp(&current).is_some_and(|o| o.is_lt()))
                 {
                     min = Some(value);
@@ -171,15 +152,15 @@ fn compute_zone_map_from_column(
         ColumnArray::Bool { data, .. } => {
             let mut min = None;
             let mut max = None;
-            for row in start_row..end_row {
+            for (row, &raw) in data.iter().enumerate().take(end_row).skip(start_row) {
                 if bitmap.is_null(row) {
                     continue;
                 }
-                let value = data[row] != 0;
-                if min.is_none_or(|current| value < current) {
+                let value = raw != 0;
+                if min.is_none_or(|current: bool| !value & current) {
                     min = Some(value);
                 }
-                if max.is_none_or(|current| value > current) {
+                if max.is_none_or(|current: bool| value & !current) {
                     max = Some(value);
                 }
             }
@@ -256,7 +237,7 @@ pub(crate) fn direct_bulk_request_to_batch(
     RecordBatch::try_new(schema.clone(), columns)
 }
 
-pub(super) fn direct_bulk_column_scalar_at(
+pub(crate) fn direct_bulk_column_scalar_at(
     col: &DirectBulkColumn<'_>,
     row_idx: usize,
 ) -> Result<ScalarValue> {
@@ -346,46 +327,6 @@ fn direct_bulk_variable_range_at(
         "bulk column '{}' row {} not found",
         col.name, target_row
     )))
-}
-
-pub(super) fn sort_batch_by_key_indices(
-    batch: &RecordBatch,
-    key_indices: &[usize],
-) -> Result<RecordBatch> {
-    if batch.num_rows() <= 1 {
-        return Ok(batch.clone());
-    }
-
-    let mut rows: Vec<usize> = (0..batch.num_rows()).collect();
-    rows.sort_by(|left, right| {
-        for &col_idx in key_indices {
-            let left_value = batch.scalar(*left, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
-            });
-            let right_value = batch.scalar(*right, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
-            });
-            let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(
-                &left_value,
-                &right_value,
-            );
-            if cmp != std::cmp::Ordering::Equal {
-                return cmp;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
-
-    let mut sorted = RecordBatch::new(batch.schema.clone());
-    for row_idx in rows {
-        for col_idx in 0..batch.num_columns() {
-            let value = batch.scalar(row_idx, col_idx).unwrap_or_else(|| {
-                ScalarValue::null_for_type(batch.schema.columns[col_idx].data_type)
-            });
-            sorted.column_mut(col_idx).unwrap().push(&value)?;
-        }
-    }
-    Ok(sorted)
 }
 
 pub(super) fn filter_batch_by_mask(
@@ -645,43 +586,5 @@ fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<Scal
 }
 
 #[cfg(test)]
-mod zone_map_tests {
-    use super::*;
-    use crate::types::batch::ColumnDef;
-
-    #[test]
-    fn typed_zone_maps_preserve_ranges_and_null_counts() {
-        let schema = Schema::new(vec![
-            ColumnDef::new("number", DataType::Int32),
-            ColumnDef::new("text", DataType::VarChar),
-        ]);
-        let mut batch = RecordBatch::new(schema);
-        for (number, text) in [
-            (
-                ScalarValue::Int32(Some(9)),
-                ScalarValue::VarChar(Some("z".into())),
-            ),
-            (
-                ScalarValue::Int32(None),
-                ScalarValue::VarChar(Some("b".into())),
-            ),
-            (ScalarValue::Int32(Some(-4)), ScalarValue::VarChar(None)),
-            (
-                ScalarValue::Int32(Some(3)),
-                ScalarValue::VarChar(Some("m".into())),
-            ),
-        ] {
-            batch.column_mut(0).unwrap().push(&number).unwrap();
-            batch.column_mut(1).unwrap().push(&text).unwrap();
-        }
-
-        let maps = compute_zone_maps_from_batch(&batch, 0, 4);
-        assert_eq!(maps[0].min_value, ScalarValue::Int32(Some(-4)));
-        assert_eq!(maps[0].max_value, ScalarValue::Int32(Some(9)));
-        assert_eq!(maps[0].null_count, 1);
-        assert_eq!(maps[1].min_value, ScalarValue::VarChar(Some("b".into())));
-        assert_eq!(maps[1].max_value, ScalarValue::VarChar(Some("z".into())));
-        assert_eq!(maps[1].null_count, 1);
-        assert!(maps.iter().all(|map| map.row_count == 4));
-    }
-}
+#[path = "zone_map_test.rs"]
+mod zone_map_tests;

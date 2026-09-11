@@ -2,7 +2,10 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::common::error::{Result, TaibaiError};
-use crate::protocol::message::{Message, MessageHeader, HEADER_SIZE, MSG_TYPE_QUERY};
+use crate::protocol::message::{
+    Message, MessageHeader, HEADER_SIZE, MSG_TYPE_BATCH_EXECUTE, MSG_TYPE_CLOSE_STMT,
+    MSG_TYPE_EXECUTE, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
+};
 
 pub struct MessageCodec {
     max_message_size: usize,
@@ -52,7 +55,11 @@ impl Decoder for MessageCodec {
         src.advance(HEADER_SIZE);
         let payload = if payload_len > 0 {
             let raw = src.split_to(payload_len);
-            if raw.len() >= 8 && raw[0] == 0x78 {
+            let is_prepared = matches!(
+                header.msg_type,
+                MSG_TYPE_PREPARE | MSG_TYPE_EXECUTE | MSG_TYPE_CLOSE_STMT | MSG_TYPE_BATCH_EXECUTE
+            );
+            if !is_prepared && raw.len() >= 8 && raw[0] == 0x78 {
                 match crate::protocol::compress::zlib_decompress_complete(&raw) {
                     Some(decompressed) => Bytes::from(decompressed),
                     None => raw.freeze(),
@@ -77,7 +84,12 @@ impl Encoder<Message> for MessageCodec {
     fn encode(&mut self, msg: Message, dst: &mut BytesMut) -> Result<()> {
         let is_bulk = msg.msg_type == 0x20 || msg.msg_type == 0x21 || msg.msg_type == 0x23;
         let is_query = msg.msg_type == MSG_TYPE_QUERY;
-        let should_compress = !is_bulk && !is_query && msg.payload.len() > self.compress_threshold;
+        let is_prepared = matches!(
+            msg.msg_type,
+            MSG_TYPE_PREPARE | MSG_TYPE_EXECUTE | MSG_TYPE_CLOSE_STMT | MSG_TYPE_BATCH_EXECUTE
+        );
+        let should_compress =
+            !is_bulk && !is_query && !is_prepared && msg.payload.len() > self.compress_threshold;
 
         let payload = if should_compress {
             match crate::protocol::compress::zlib_compress(&msg.payload) {
@@ -110,5 +122,5 @@ impl Encoder<Message> for MessageCodec {
 }
 
 #[cfg(test)]
-#[path = "codec_tests.rs"]
+#[path = "codec_test.rs"]
 mod tests;

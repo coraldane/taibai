@@ -213,6 +213,7 @@ impl Parser {
             let op = match self.peek() {
                 Token::Star => Some(BinOp::Mul),
                 t if *t == Token::Ident("/".into()) => Some(BinOp::Div),
+                t if *t == Token::Ident("%".into()) => Some(BinOp::Mod),
                 _ => None,
             };
             if let Some(op) = op {

@@ -10,7 +10,7 @@ members = [
 
 [package]
 name = "taibai"
-version = "0.1.9"
+version = "0.2.4"
 edition = "2021"
 autotests = false
 description = "An experimental Rust columnar database server for analytical workloads"
@@ -135,6 +135,14 @@ name = "aggregate_streaming_test"
 path = "tests/aggregate_streaming_test.rs"
 
 [[test]]
+name = "aggregate_regression_test"
+path = "tests/aggregate_regression_test.rs"
+
+[[test]]
+name = "having_clause_test"
+path = "tests/having_clause_test.rs"
+
+[[test]]
 name = "analyze_statistics_test"
 path = "tests/analyze_statistics_test.rs"
 
@@ -145,3 +153,21 @@ path = "tests/join_reorder_statistics_test.rs"
 [[test]]
 name = "performance_baseline_test"
 path = "tests/performance_baseline_test.rs"
+
+[[test]]
+name = "delete_visibility_regression_test"
+path = "tests/delete_visibility_regression_test.rs"
+
+[[test]]
+name = "sql_semantics_regression_test"
+path = "tests/sql_semantics_regression_test.rs"
+
+[[test]]
+name = "subquery_derived_table_test"
+path = "tests/subquery_derived_table_test.rs"
+
+[[test]]
+name = "realtime_write_scaling_test"
+path = "tests/realtime_write_scaling_test.rs"
+
+

@@ -6,6 +6,7 @@ impl Engine {
             SegmentConfig::default(),
             AutoCompactConfig::default(),
             8 * 1024 * 1024 * 1024,
+            false,
         )
     }
     pub fn new_with_storage_config(
@@ -19,6 +20,7 @@ impl Engine {
             segment_config,
             AutoCompactConfig::default(),
             8 * 1024 * 1024 * 1024,
+            false,
         )
     }
 
@@ -28,6 +30,7 @@ impl Engine {
         segment_config: SegmentConfig,
         auto_compact_config: AutoCompactConfig,
         hot_store_memory_limit_bytes: u64,
+        tail_async_fsync: bool,
     ) -> Result<Self> {
         super::ddl::recover_database_drop_tombstones(data_dir)?;
         let mut catalogs = HashMap::new();
@@ -109,6 +112,7 @@ impl Engine {
                 // tails. Use the configured memory budget for asynchronous
                 // checkpoint pressure instead of a fixed 512 MiB estimate.
                 max_total_memory: hot_store_memory_limit_bytes,
+                tail_async_fsync,
                 ..BatchWriterConfig::default()
             },
             Arc::clone(&segment_mgr),
@@ -148,6 +152,7 @@ impl Engine {
             data_dir.to_path_buf(),
             Arc::clone(&catalogs),
             Arc::clone(&index_manager),
+            Arc::clone(batch_writer.memtable_manager()),
             auto_compact_config,
         );
 
@@ -188,7 +193,6 @@ impl Engine {
                 session.bulk_import_mode,
                 &session.username,
             ) {
-                let result = result;
                 if result.is_ok() && session.active_txn_id() > 0 {
                     session.mark_txn_write();
                 }
@@ -237,7 +241,12 @@ impl Engine {
         self.ensure_permissions(session, &stmt)?;
         match &stmt {
             Statement::Select { .. } => {
-                if let Some(plan) = prepared.cached_plan.as_ref() {
+                let plan_matches_database = prepared
+                    .planned_database
+                    .as_deref()
+                    .is_some_and(|db| db == session.database);
+                if let (Some(plan), true) = (prepared.cached_plan.as_ref(), plan_matches_database)
+                {
                     super::query::exec_select_with_plan_and_txn(
                         self,
                         &session.database,
@@ -257,11 +266,24 @@ impl Engine {
                         if !has_placeholders {
                             let table_schemas =
                                 self.gather_table_schemas(&session.database, &stmt)?;
-                            if let Ok(plan) =
-                                crate::sql::planner::plan_select(&stmt, &table_schemas)
-                            {
-                                prepared.cached_plan = Some(crate::sql::optimizer::optimize(plan));
-                                prepared.planned_database = Some(session.database.clone());
+                            // Plan caching is best-effort: statements whose
+                            // subqueries cannot be eagerly resolved (e.g.
+                            // correlated subqueries) simply re-resolve on
+                            // every execution.
+                            if let Ok(planned_stmt) = super::query::resolve_in_subqueries(
+                                self,
+                                &session.database,
+                                &stmt,
+                            ) {
+                                if let Ok(plan) = crate::sql::planner::plan_select(
+                                    &planned_stmt,
+                                    &table_schemas,
+                                ) {
+                                    prepared.cached_plan =
+                                        Some(crate::sql::optimizer::optimize(plan));
+                                    prepared.planned_database =
+                                        Some(session.database.clone());
+                                }
                             }
                         }
                     }
@@ -321,7 +343,11 @@ impl Engine {
                     values: bound_values,
                     ..
                 } => values.extend(bound_values),
-                _ => unreachable!("prepared statement kind was checked above"),
+                _ => {
+                    return Err(TaibaiError::Sql(
+                        "prepared statement changed kind during batch binding".into(),
+                    ));
+                }
             }
         }
 
@@ -381,10 +407,12 @@ impl Engine {
                 partition_by,
                 ttl,
                 hot,
+                durability,
             } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                let result = super::ddl::exec_create_table(
+                
+                super::ddl::exec_create_table(
                     self,
                     &db,
                     &table,
@@ -396,8 +424,8 @@ impl Engine {
                     partition_by,
                     ttl,
                     hot,
-                );
-                result
+                    durability,
+                )
             }
             Statement::CreateIndex {
                 name,
@@ -430,20 +458,20 @@ impl Engine {
             Statement::DropTable { name, if_exists } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                let result = super::ddl::exec_drop_table(self, &db, &table, *if_exists);
-                result
+                
+                super::ddl::exec_drop_table(self, &db, &table, *if_exists)
             }
             Statement::AlterTable { name, operations } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                let result = super::ddl::exec_alter_table(self, &db, &table, operations);
-                result
+                
+                super::ddl::exec_alter_table(self, &db, &table, operations)
             }
             Statement::Truncate { table } => {
                 let db = table.effective_database(&session.database).to_string();
                 let table_name = table.name.clone();
-                let result = super::ddl::exec_truncate_table(self, &db, &table_name);
-                result
+                
+                super::ddl::exec_truncate_table(self, &db, &table_name)
             }
             Statement::CreateDatabase {
                 name,
@@ -707,7 +735,7 @@ impl Engine {
                 let table_name = table.as_ref().map(|t| t.name.clone());
                 super::ddl::exec_flush_table(self, db, &table_name)
             }
-            Statement::Union { .. } => super::query::exec_select_with_txn(
+            Statement::Union { .. } => super::query::exec_union_with_txn(
                 self,
                 &session.database,
                 stmt,

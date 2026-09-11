@@ -163,26 +163,6 @@ fn filter_by_partition_values(
         .collect()
 }
 
-#[allow(dead_code)]
-pub fn extract_partition_key_from_in_predicate(
-    spec: &ScanSpec,
-    pi: &PartitionScanInfo,
-) -> Vec<String> {
-    let Some(pk_idx) = pi.partition_key_col_idx else {
-        return Vec::new();
-    };
-    for pred in &spec.in_predicates {
-        if pred.column_index == pk_idx {
-            return pred
-                .values
-                .iter()
-                .filter_map(ScalarValue::to_text)
-                .collect();
-        }
-    }
-    Vec::new()
-}
-
 #[cfg(test)]
-#[path = "partition_tests.rs"]
+#[path = "partition_test.rs"]
 mod tests;

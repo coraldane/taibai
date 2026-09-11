@@ -541,7 +541,7 @@ fn direct_bulk_keeps_resident_hot_partition_query_off_segments() {
     );
     assert_eq!(
         engine
-            .exec_bulk_insert_payload_with_wal_control("main", &payload, false)
+            .exec_bulk_insert_payload_with_options("main", &payload, false)
             .expect("direct bulk insert"),
         1
     );

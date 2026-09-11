@@ -85,5 +85,5 @@ pub enum TlsMode {
 }
 
 #[cfg(test)]
-#[path = "tls_tests.rs"]
+#[path = "tls_test.rs"]
 mod tests;

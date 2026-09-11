@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -51,6 +50,11 @@ pub struct MemTable {
     created_at: Instant,
     txn_id: AtomicU64,
     visibility: RwLock<TxnVisibility>,
+    /// Bumped whenever the resident batch is wholesale replaced (REPLACE
+    /// conflict filtering, rollback restores). Appends only extend the batch
+    /// tail, so REPLACE conflict key indexes can refresh incrementally on a
+    /// stable version and rebuild on a bump.
+    content_version: AtomicU64,
 }
 
 impl MemTable {
@@ -68,6 +72,7 @@ impl MemTable {
             created_at: Instant::now(),
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
+            content_version: AtomicU64::new(0),
         }
     }
 
@@ -91,6 +96,7 @@ impl MemTable {
             created_at: Instant::now(),
             txn_id: AtomicU64::new(txn_id),
             visibility: RwLock::new(TxnVisibility::Uncommitted(txn_id)),
+            content_version: AtomicU64::new(0),
         }
     }
 
@@ -261,16 +267,6 @@ impl MemTable {
         guard.as_ref().map(|batch| batch.as_ref().clone())
     }
 
-    /// Freeze a zero-copy snapshot for an out-of-lock checkpoint. Once the
-    /// memtable enters `Flushing`, INSERTs switch to a new memtable, so this
-    /// shared batch remains immutable without copying all column buffers.
-    pub fn read_snapshot_shared(&self) -> Option<Arc<RecordBatch>> {
-        if self.ensure_resident().is_err() {
-            return None;
-        }
-        self.batch.read().unwrap().clone()
-    }
-
     pub fn is_spilled(&self) -> bool {
         matches!(
             *self.backing.read().unwrap(),
@@ -374,6 +370,7 @@ impl MemTable {
         *guard = Some(Arc::new(batch));
         *backing_guard = MemTableBacking::Resident;
         self.row_count.store(rows, Ordering::Release);
+        self.content_version.fetch_add(1, Ordering::Release);
     }
 
     pub fn id(&self) -> Uuid {
@@ -401,6 +398,7 @@ impl MemTable {
             created_at: Instant::now(),
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
+            content_version: AtomicU64::new(0),
         }
     }
 
@@ -428,6 +426,7 @@ impl MemTable {
             created_at: Instant::now(),
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
+            content_version: AtomicU64::new(0),
         }
     }
 
@@ -448,7 +447,14 @@ impl MemTable {
         }
         *guard = Some(Arc::new(batch));
         self.row_count.store(rows, Ordering::Release);
+        self.content_version.fetch_add(1, Ordering::Release);
         true
+    }
+
+    /// Monotonic content version. Stable across tail-only appends; bumped when
+    /// the batch is wholesale replaced.
+    pub fn content_version(&self) -> u64 {
+        self.content_version.load(Ordering::Acquire)
     }
 
     pub fn schema(&self) -> Option<Schema> {
@@ -460,13 +466,59 @@ impl MemTable {
     }
 }
 
+/// Lazily built per-memtable key index for REPLACE conflict matching: maps
+/// each constraint key to the resident row positions holding it. Refreshed
+/// incrementally while the memtable only appends; rebuilt when the batch is
+/// wholesale replaced (content version bump); compacted in place when REPLACE
+/// conflict filtering removes rows. Probing with this index replaces the
+/// per-statement full scan of every committed memtable.
+pub struct ReplaceKeyIndex {
+    signature: Vec<Vec<usize>>,
+    content_version: u64,
+    rows_indexed: u64,
+    per_constraint:
+        Vec<std::collections::HashMap<Vec<crate::types::scalar::ScalarValue>, Vec<u32>>>,
+}
+
+fn replace_key_positions_for_rows(
+    batch: &RecordBatch,
+    constraints: &[Vec<usize>],
+    start_row: usize,
+    maps: &mut [std::collections::HashMap<Vec<crate::types::scalar::ScalarValue>, Vec<u32>>],
+) {
+    for row_idx in start_row..batch.num_rows() {
+        for (constraint_idx, indices) in constraints.iter().enumerate() {
+            let mut key = Vec::with_capacity(indices.len());
+            let mut valid = true;
+            for &col_idx in indices {
+                match batch.scalar(row_idx, col_idx) {
+                    Some(value) if !value.is_null() => key.push(value),
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                maps[constraint_idx]
+                    .entry(key)
+                    .or_default()
+                    .push(row_idx as u32);
+            }
+        }
+    }
+}
+
+type WritableTableKey = (String, String, String, u64);
+
 pub struct MemTableManager {
     memtables: RwLock<Vec<Arc<MemTable>>>,
-    writable: RwLock<HashMap<(String, String, String, u64), Weak<MemTable>>>,
+    writable: RwLock<HashMap<WritableTableKey, Weak<MemTable>>>,
     max_rows_per_memtable: u64,
     max_age_secs: u64,
     low_rate_max_rows: u64,
     low_rate_max_age_secs: u64,
+    replace_key_indexes: RwLock<HashMap<Uuid, ReplaceKeyIndex>>,
 }
 
 impl MemTableManager {
@@ -483,6 +535,7 @@ impl MemTableManager {
             max_age_secs,
             low_rate_max_rows,
             low_rate_max_age_secs: low_rate_max_age_secs.max(max_age_secs),
+            replace_key_indexes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -511,6 +564,7 @@ impl MemTableManager {
 
     /// Register a recovered tail without decoding it: the memtable starts
     /// spilled and materializes from `tail_path` on first access.
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_spilled_tail(
         &self,
         id: Uuid,
@@ -636,6 +690,130 @@ impl MemTableManager {
             .collect()
     }
 
+    /// Refresh the per-memtable REPLACE key index against `batch` and return
+    /// the ascending positions of rows conflicting with any key set. Combined
+    /// under one lock so a probe can never observe a partially refreshed
+    /// index. The caller holds the table mutation lock and the batch read
+    /// lock, so appends cannot interleave.
+    pub fn replace_key_conflicts(
+        &self,
+        memtable: &MemTable,
+        key_sets: &[(
+            Vec<usize>,
+            std::collections::HashSet<Vec<crate::types::scalar::ScalarValue>>,
+        )],
+        batch: &RecordBatch,
+    ) -> Vec<u32> {
+        let signature: Vec<Vec<usize>> = key_sets
+            .iter()
+            .map(|(indices, _)| indices.clone())
+            .collect();
+        let version = memtable.content_version();
+        let rows = batch.num_rows() as u64;
+        let mut indexes = self.replace_key_indexes.write().unwrap();
+        let entry = indexes
+            .entry(memtable.id())
+            .or_insert_with(|| ReplaceKeyIndex {
+                signature: signature.clone(),
+                content_version: version,
+                rows_indexed: 0,
+                per_constraint: signature.iter().map(|_| HashMap::new()).collect(),
+            });
+        if entry.signature != signature
+            || entry.content_version != version
+            || entry.rows_indexed > rows
+        {
+            entry.signature = signature.clone();
+            entry.content_version = version;
+            entry.per_constraint = signature.iter().map(|_| HashMap::new()).collect();
+            entry.rows_indexed = 0;
+        }
+        if entry.rows_indexed < rows {
+            replace_key_positions_for_rows(
+                batch,
+                &signature,
+                entry.rows_indexed as usize,
+                &mut entry.per_constraint,
+            );
+            entry.rows_indexed = rows;
+        }
+        let mut matched: Vec<u32> = Vec::new();
+        for (indices, keys) in key_sets {
+            let Some(constraint_idx) = entry.signature.iter().position(|sig| sig == indices) else {
+                continue;
+            };
+            let Some(map) = entry.per_constraint.get(constraint_idx) else {
+                continue;
+            };
+            for key in keys {
+                if let Some(positions) = map.get(key) {
+                    matched.extend_from_slice(positions);
+                }
+            }
+        }
+        matched.sort_unstable();
+        matched.dedup();
+        matched
+    }
+
+    /// Compact index positions after REPLACE conflict filtering removed
+    /// `removed_positions` (ascending) from a batch of `old_row_count` rows.
+    /// Verifies the memtable's post-filter state; drops the cached entry on
+    /// any mismatch so the next probe rebuilds it.
+    pub fn compact_replace_key_index(
+        &self,
+        memtable: &MemTable,
+        removed_positions: &[u32],
+        old_row_count: usize,
+    ) {
+        let mut indexes = self.replace_key_indexes.write().unwrap();
+        let Some(entry) = indexes.get_mut(&memtable.id()) else {
+            return;
+        };
+        let expected_rows = (old_row_count - removed_positions.len()) as u64;
+        if entry.content_version.wrapping_add(1) != memtable.content_version()
+            || memtable.row_count() != expected_rows
+        {
+            indexes.remove(&memtable.id());
+            return;
+        }
+        let mut new_position = vec![u32::MAX; old_row_count];
+        let mut removed_so_far = 0u32;
+        let mut removed_iter = removed_positions.iter().copied();
+        let mut next_removed = removed_iter.next();
+        for (pos, slot) in new_position.iter_mut().enumerate() {
+            if next_removed == Some(pos as u32) {
+                removed_so_far += 1;
+                next_removed = removed_iter.next();
+            } else {
+                *slot = pos as u32 - removed_so_far;
+            }
+        }
+        for map in &mut entry.per_constraint {
+            for positions in map.values_mut() {
+                positions.retain_mut(|pos| {
+                    let shifted = new_position[*pos as usize];
+                    if shifted == u32::MAX {
+                        false
+                    } else {
+                        *pos = shifted;
+                        true
+                    }
+                });
+            }
+            map.retain(|_, positions| !positions.is_empty());
+        }
+        entry.content_version += 1;
+        entry.rows_indexed = expected_rows;
+    }
+
+    /// Drop REPLACE key indexes whose memtables are no longer registered.
+    fn prune_replace_key_indexes(&self) {
+        let memtables = self.memtables.read().unwrap();
+        let mut indexes = self.replace_key_indexes.write().unwrap();
+        indexes.retain(|id, _| memtables.iter().any(|mt| mt.id() == *id));
+    }
+
     pub fn get_readable_by_table(&self, db: &str, table: &str) -> Vec<Arc<MemTable>> {
         let memtables = self.memtables.read().unwrap();
         memtables
@@ -665,21 +843,8 @@ impl MemTableManager {
         memtables.retain(|mt| {
             !(mt.db() == db && mt.table() == table && mt.state() == MemTableState::Archived)
         });
-    }
-
-    /// Drop every `Archived` memtable across all tables (full close-of-day).
-    pub fn remove_all_archived(&self) {
-        let mut memtables = self.memtables.write().unwrap();
-        memtables.retain(|mt| mt.state() != MemTableState::Archived);
-    }
-
-    pub fn get_by_txn(&self, txn_id: u64) -> Vec<Arc<MemTable>> {
-        let memtables = self.memtables.read().unwrap();
-        memtables
-            .iter()
-            .filter(|mt| mt.txn_id() == txn_id && mt.state() == MemTableState::Pending)
-            .cloned()
-            .collect()
+        drop(memtables);
+        self.prune_replace_key_indexes();
     }
 
     pub fn get_visible_to(&self, db: &str, table: &str, reader_txn_id: u64) -> Vec<Arc<MemTable>> {
@@ -731,6 +896,8 @@ impl MemTableManager {
     pub fn remove_flushed(&self) {
         let mut memtables = self.memtables.write().unwrap();
         memtables.retain(|mt| mt.state() != MemTableState::Flushed);
+        drop(memtables);
+        self.prune_replace_key_indexes();
     }
 
     pub fn clear_table(&self, db: &str, table: &str) -> u64 {
@@ -746,6 +913,8 @@ impl MemTableManager {
                 true
             }
         });
+        drop(memtables);
+        self.prune_replace_key_indexes();
         cleared
     }
 
@@ -762,6 +931,8 @@ impl MemTableManager {
                 true
             }
         });
+        drop(memtables);
+        self.prune_replace_key_indexes();
         cleared
     }
 
@@ -810,21 +981,29 @@ impl MemTableManager {
             false
         });
         memtables.extend(replacements);
+        drop(memtables);
+        self.prune_replace_key_indexes();
         renamed_rows
     }
 
     pub fn rollback_txn(&self, txn_id: u64) -> u64 {
         let mut memtables = self.memtables.write().unwrap();
         let mut rolled_back = 0u64;
+        let mut removed_any = false;
         memtables.retain(|mt| {
             if mt.txn_id() == txn_id {
                 mt.mark_aborted();
                 rolled_back += mt.row_count();
+                removed_any = true;
                 false
             } else {
                 true
             }
         });
+        drop(memtables);
+        if removed_any {
+            self.prune_replace_key_indexes();
+        }
         rolled_back
     }
 
@@ -841,15 +1020,6 @@ impl MemTableManager {
         committed
     }
 
-    pub fn total_row_count(&self) -> u64 {
-        let memtables = self.memtables.read().unwrap();
-        memtables
-            .iter()
-            .filter(|mt| mt.state() == MemTableState::Pending)
-            .map(|mt| mt.row_count())
-            .sum()
-    }
-
     /// Approximate resident bytes owned by pending memtables. Spilled
     /// memtables contribute only metadata (counted as zero), since their rows
     /// live in the durable tail.
@@ -861,158 +1031,8 @@ impl MemTableManager {
             .map(|mt| mt.estimated_memory_bytes())
             .sum()
     }
-
-    pub fn txn_row_count(&self, txn_id: u64) -> u64 {
-        let memtables = self.memtables.read().unwrap();
-        memtables
-            .iter()
-            .filter(|mt| mt.txn_id() == txn_id && mt.state() == MemTableState::Pending)
-            .map(|mt| mt.row_count())
-            .sum()
-    }
-
-    pub fn txn_tables(&self, txn_id: u64) -> HashMap<(String, String), u64> {
-        let memtables = self.memtables.read().unwrap();
-        let mut result = HashMap::new();
-        for mt in memtables.iter() {
-            if mt.txn_id() == txn_id && mt.state() == MemTableState::Pending {
-                let key = (mt.db().to_string(), mt.table().to_string());
-                *result.entry(key).or_insert(0) += mt.row_count();
-            }
-        }
-        result
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::types::DataType;
-    use crate::types::batch::ColumnDef;
-    use crate::types::scalar::ScalarValue;
-
-    fn batch(schema: &Schema, values: &[i64]) -> RecordBatch {
-        let mut batch = RecordBatch::new(schema.clone());
-        for value in values {
-            batch
-                .column_mut(0)
-                .unwrap()
-                .push(&ScalarValue::Int64(Some(*value)))
-                .unwrap();
-        }
-        batch
-    }
-
-    #[test]
-    fn low_rate_memtable_uses_extended_age_before_becoming_flushable() {
-        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
-        let manager = MemTableManager::new(10_000, 0, 2, 3600);
-        let memtable = manager.get_or_create("main", "t", "", &schema);
-        memtable.append(&batch(&schema, &[1])).unwrap();
-        assert!(manager.get_flushable().is_empty());
-
-        memtable.append(&batch(&schema, &[2, 3])).unwrap();
-        assert_eq!(manager.get_flushable().len(), 1);
-    }
-
-    #[test]
-    fn spilled_memtable_flushes_at_regular_age() {
-        let temp = tempfile::tempdir().unwrap();
-        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
-        let manager = MemTableManager::new(10_000, 0, 2, 3600);
-        let memtable = manager.get_or_create("main", "t", "2026", &schema);
-        let rows = batch(&schema, &[1]);
-        memtable.append(&rows).unwrap();
-        assert!(manager.get_flushable().is_empty());
-
-        crate::storage::core::durable_tail::persist(temp.path(), memtable.id(), "2026", &rows)
-            .unwrap();
-        let tail_path =
-            crate::storage::core::durable_tail::live_tail_path(temp.path(), memtable.id())
-                .unwrap()
-                .expect("tail should exist");
-        assert!(memtable.spill_to_tail(tail_path));
-
-        // The extended low-rate age exists to batch resident rows; a spilled
-        // memtable holds no memory, so it must flush at the regular age.
-        assert_eq!(manager.get_flushable().len(), 1);
-    }
-
-    #[test]
-    fn pending_memory_uses_column_capacity_and_excludes_flushed_tables() {
-        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
-        let manager = MemTableManager::new(10_000, 60, 2, 3600);
-        let memtable = manager.get_or_create("main", "t", "", &schema);
-        memtable.append(&batch(&schema, &[1, 2, 3])).unwrap();
-
-        assert!(manager.total_estimated_memory_bytes() >= 3 * std::mem::size_of::<i64>() as u64);
-        memtable.set_state(MemTableState::Flushed);
-        assert_eq!(manager.total_estimated_memory_bytes(), 0);
-    }
-
-    #[test]
-    fn writable_index_replaces_full_memtable_without_reusing_history() {
-        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
-        let manager = MemTableManager::new(2, 60, 2, 3600);
-
-        let first = manager.get_or_create("main", "t", "2026", &schema);
-        first.append_owned(batch(&schema, &[1, 2])).unwrap();
-        let second = manager.get_or_create("main", "t", "2026", &schema);
-        assert_ne!(first.id(), second.id());
-        assert_eq!(
-            manager.get_or_create("main", "t", "2026", &schema).id(),
-            second.id()
-        );
-
-        second.append_owned(batch(&schema, &[3, 4])).unwrap();
-        let third = manager.get_or_create("main", "t", "2026", &schema);
-        assert_ne!(second.id(), third.id());
-        assert_eq!(manager.get_by_table("main", "t").len(), 3);
-    }
-
-    #[test]
-    fn spilled_memtable_materializes_lazily() {
-        let temp = tempfile::tempdir().unwrap();
-        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
-        let memtable = MemTable::new("main".into(), "t".into(), "2026".into(), schema.clone());
-        let rows = batch(&schema, &[1, 2, 3]);
-        memtable.append(&rows).unwrap();
-        assert!(memtable.estimated_memory_bytes() > 0);
-
-        crate::storage::core::durable_tail::persist(temp.path(), memtable.id(), "2026", &rows)
-            .unwrap();
-        let tail_path =
-            crate::storage::core::durable_tail::live_tail_path(temp.path(), memtable.id())
-                .unwrap()
-                .expect("tail should exist");
-
-        assert!(memtable.spill_to_tail(tail_path));
-        assert!(memtable.is_spilled());
-        assert_eq!(memtable.estimated_memory_bytes(), 0);
-        assert_eq!(memtable.row_count(), 3);
-        // A second spill is a no-op.
-        assert!(!memtable.spill_to_tail(std::path::PathBuf::from("unused")));
-
-        let snapshot = memtable.read_snapshot().expect("spilled rows materialize");
-        assert_eq!(snapshot.num_rows(), 3);
-        assert_eq!(snapshot.scalar(2, 0), Some(ScalarValue::Int64(Some(3))));
-        assert!(!memtable.is_spilled());
-
-        // Appending after materialization keeps all rows visible.
-        memtable.append(&batch(&schema, &[4])).unwrap();
-        let snapshot = memtable.read_snapshot().unwrap();
-        assert_eq!(snapshot.num_rows(), 4);
-    }
-
-    #[test]
-    fn spill_rejects_empty_or_flushed_memtables() {
-        let temp = tempfile::tempdir().unwrap();
-        let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
-        let memtable = MemTable::new("main".into(), "t".into(), "".into(), schema.clone());
-        assert!(!memtable.spill_to_tail(temp.path().join("none.tail")));
-
-        memtable.append(&batch(&schema, &[1])).unwrap();
-        memtable.set_state(MemTableState::Flushing);
-        assert!(!memtable.spill_to_tail(temp.path().join("none.tail")));
-    }
-}
+#[path = "memtable_test.rs"]
+mod tests;

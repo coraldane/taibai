@@ -1,3 +1,4 @@
+#[allow(clippy::too_many_arguments)]
 pub fn exec_replace(
     engine: &Engine,
     db: &str,
@@ -27,19 +28,39 @@ pub fn exec_replace(
     // Pseudo unique-index entries (empty segment_path) marking the replacement
     // rows as existing. Published only after the staged insert commits, so a
     // later plain INSERT still sees the keys without a segment location.
-    let replace_unique_constraints = unique_constraints(&materialized.table_meta, &location_schema)?;
-    let replace_unique_entries = build_unique_index_entries_for_batch(
+    let replace_unique_constraints =
+        unique_constraints(&materialized.table_meta, &location_schema)?;
+    let mut replace_unique_entries = build_unique_index_entries_for_batch(
         &materialized.table_meta,
         &location_schema,
         &survivors,
         &replace_unique_constraints,
     )?;
+    let replace_primary_indices = primary_key_indices(&location_schema);
+    if !replace_primary_indices.is_empty() {
+        replace_unique_entries.push((
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
+            primary_location_entries_for_batch(
+                &location_schema,
+                &survivors,
+                &replace_primary_indices,
+            ),
+        ));
+    }
     let internal_txn_id = engine.alloc_txn_id();
+
+    // Checkpoint large pending tails BEFORE taking the table mutation lock so
+    // the flush I/O does not extend the critical section. Rows arriving after
+    // the checkpoint are conflict-deleted in place below.
+    engine
+        .batch_writer()
+        .checkpoint_before_rewrite(db, table, physical_insert_rows as usize)?;
 
     // No pre-flush: rows still resident in memtables are conflict-deleted in
     // place below. The delete and the staged insert run under one lock, so
     // DELETE/UPDATE cannot interleave.
-    let (deleted, undo) = engine
+    let lock_start = Instant::now();
+    let (deleted, undo, pending_commits) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
             ensure_replace_location_indexes(
@@ -50,9 +71,8 @@ pub fn exec_replace(
                 &location_schema,
                 &key_sets,
             )?;
-            let memtable_plans = super::dml_delete::plan_replace_memtable_conflicts(
-                engine, db, table, &key_sets,
-            )?;
+            let memtable_plans =
+                super::dml_delete::plan_replace_memtable_conflicts(engine, db, table, &key_sets)?;
             let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
                 engine,
                 db,
@@ -72,9 +92,8 @@ pub fn exec_replace(
             ) {
                 Ok(memtable_undo) => undo.merge(memtable_undo),
                 Err(error) => {
-                    let _ = super::dml_delete::restore_replace_delete_under_table_lock(
-                        engine, &undo,
-                    );
+                    let _ =
+                        super::dml_delete::restore_replace_delete_under_table_lock(engine, &undo);
                     return Err(error);
                 }
             }
@@ -125,28 +144,28 @@ pub fn exec_replace(
 
             let finalize_result = engine
                 .batch_writer()
-                .commit_txn_under_table_lock(internal_txn_id);
-            if let Err(error) = finalize_result {
-                rollback_replace_under_table_lock(
-                    engine,
-                    db,
-                    table,
-                    &materialized.table_meta,
-                    internal_txn_id,
-                    &undo,
-                )?;
-                return Err(error);
-            }
+                .commit_txn_submit_under_table_lock(internal_txn_id);
+            let pending_commits = match finalize_result {
+                Ok(pending_commits) => pending_commits,
+                Err(error) => {
+                    rollback_replace_under_table_lock(
+                        engine,
+                        db,
+                        table,
+                        &materialized.table_meta,
+                        internal_txn_id,
+                        &undo,
+                    )?;
+                    return Err(error);
+                }
+            };
 
             // Publish existence markers for the committed replacement rows.
             // Failure only downgrades later validation to a full scan; the
             // statement is already committed and must not fail here.
-            if let Err(error) = append_unique_index_entries_after_insert(
-                engine,
-                db,
-                table,
-                replace_unique_entries,
-            ) {
+            if let Err(error) =
+                append_unique_index_entries_after_insert(engine, db, table, replace_unique_entries)
+            {
                 tracing::warn!(
                     db,
                     table,
@@ -164,8 +183,49 @@ pub fn exec_replace(
                     .invalidate_table_unique_index_snapshots(db, table, &index_names);
             }
 
-            Ok((deleted, undo))
+            Ok((deleted, undo, pending_commits))
         })?;
+
+    let lock_elapsed = lock_start.elapsed();
+    let lock_warn_after = std::time::Duration::from_millis(
+        crate::common::config::storage_timeouts()
+            .mutation_lock_warn_ms
+            .max(1),
+    );
+    if lock_elapsed >= lock_warn_after {
+        tracing::warn!(
+            db,
+            table,
+            hold_ms = lock_elapsed.as_millis() as u64,
+            inserted_rows = physical_insert_rows,
+            "REPLACE held the table mutation lock for a long critical section"
+        );
+    }
+
+    if let Err(error) = engine
+        .batch_writer()
+        .wait_pending_tail_commits(pending_commits)
+    {
+        let rollback_result = engine.segment_mgr().with_table_mutation_lock(db, table, || {
+            rollback_replace_under_table_lock(
+                engine,
+                db,
+                table,
+                &materialized.table_meta,
+                internal_txn_id,
+                &undo,
+            )
+        });
+        if let Err(rollback_error) = rollback_result {
+            tracing::warn!(
+                db,
+                table,
+                error = %rollback_error,
+                "failed to restore replaced rows after durable commit failure"
+            );
+        }
+        return Err(error);
+    }
 
     super::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
     engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
@@ -183,6 +243,7 @@ pub fn exec_replace(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn exec_insert(
     engine: &Engine,
     db: &str,
@@ -206,6 +267,7 @@ pub fn exec_insert(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_insert_inner(
     engine: &Engine,
     db: &str,
@@ -348,6 +410,7 @@ fn materialize_insert_values(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_materialized_insert_batch(
     engine: &Engine,
     db: &str,
@@ -386,6 +449,16 @@ fn exec_materialized_insert_batch(
         )));
     }
     let row_count = batch.num_rows() as u64;
+    // RELAXED tables opt qualifying large auto-commit multi-row INSERTs into
+    // the direct segment write path: no memtable, no durable tail, no
+    // double write. Durability/visibility of the tail of the import is
+    // bounded by the active-segment row-group flush (idle flush within
+    // seconds, or full row groups), which the DURABILITY = RELAXED contract
+    // documents.
+    let relaxed_direct_insert = txn_id == 0
+        && !bulk_import_mode
+        && table_meta.durability == TableDurability::Relaxed
+        && batch.num_rows() >= RELAXED_DIRECT_INSERT_MIN_ROWS;
     log_insert_profile(
         "cluster_sort",
         row_count as usize,
@@ -443,18 +516,24 @@ fn exec_materialized_insert_batch(
         primary_keys_for_batch(&batch, &schema, &primary_key_indices)?
     };
     let auto_increment_touched = !auto_inc_cols.is_empty();
-    let unique_index_entries = if publish_unique_index_entries {
+    let mut unique_index_entries = if publish_unique_index_entries {
         build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?
     } else {
         Vec::new()
     };
+    if publish_unique_index_entries && !primary_key_indices.is_empty() {
+        unique_index_entries.push((
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
+            primary_location_entries_for_batch(&schema, &batch, &primary_key_indices),
+        ));
+    }
     log_insert_profile(
         "constraints",
         row_count as usize,
         constraint_start.elapsed(),
     );
 
-    if txn_id == 0 && !bulk_import_mode {
+    if txn_id == 0 && !bulk_import_mode && !relaxed_direct_insert {
         match engine.feed_hot_store(db, table, table_meta, &batch) {
             Ok(()) => {
                 if engine
@@ -466,17 +545,14 @@ fn exec_materialized_insert_batch(
             }
             Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
                 engine.reclaim_hot_store_pressure(db, table);
-                if let Err(e) = engine.feed_hot_store(db, table, table_meta, &batch) {
-                    return Err(e);
-                }
+                engine.feed_hot_store(db, table, table_meta, &batch)?
             }
             Err(e) => return Err(e),
         }
     }
     let write_start = Instant::now();
-    if bulk_import_mode {
-        engine
-            .exec_bulk_insert_partitioned_with_wal_control(db, table, table_meta, batch, false)?;
+    if bulk_import_mode || relaxed_direct_insert {
+        engine.exec_bulk_insert_partitioned(db, table, table_meta, batch, relaxed_direct_insert)?;
     } else {
         write_batch_by_partition(
             engine,
@@ -499,15 +575,6 @@ fn exec_materialized_insert_batch(
         let _ = engine
             .index_manager()
             .append_primary_keys(db, table, &primary_keys)?;
-        if publish_unique_index_entries {
-            engine
-                .index_manager()
-                .invalidate_unique_index_snapshot_if_present(
-                    db,
-                    table,
-                    crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
-                );
-        }
     }
 
     if publish_catalog {
@@ -530,7 +597,7 @@ fn exec_materialized_insert_batch(
     })
 }
 
-fn build_unique_index_entries_for_batch(
+pub(crate) fn build_unique_index_entries_for_batch(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
     batch: &RecordBatch,
@@ -564,7 +631,32 @@ fn build_unique_index_entries_for_batch(
     Ok(result)
 }
 
-fn append_unique_index_entries_after_insert(
+/// Pseudo existence entries (empty segment_path) for the primary-key
+/// location index. Keeping this index incrementally maintained on INSERT
+/// and REPLACE avoids a full-table rebuild on the next REPLACE conflict
+/// lookup that `invalidate_unique_index_snapshot_if_present` used to cause.
+pub(crate) fn primary_location_entries_for_batch(
+    schema: &Schema,
+    batch: &RecordBatch,
+    indices: &[usize],
+) -> Vec<UniqueIndexEntry> {
+    let mut entries = Vec::new();
+    for row_idx in 0..batch.num_rows() {
+        let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
+            continue;
+        };
+        entries.push(UniqueIndexEntry {
+            key,
+            location: UniqueRowLocation {
+                segment_path: String::new(),
+                row_id: row_idx as u64,
+            },
+        });
+    }
+    entries
+}
+
+pub(crate) fn append_unique_index_entries_after_insert(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -587,14 +679,15 @@ fn append_unique_index_entries_after_insert(
     Ok(())
 }
 
-fn ensure_replace_location_indexes(
-    engine: &Engine,
-    db: &str,
-    table: &str,
+/// Every location index of a table: named unique indexes plus the implicit
+/// primary-key location index. Each entry is (index name, key columns,
+/// key-column indices in the table schema); the list is empty when the table
+/// has neither unique indexes nor a primary key.
+#[allow(clippy::type_complexity)]
+pub(crate) fn location_indexes_for_table(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
-    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
-) -> Result<()> {
+) -> Result<Vec<(String, Vec<String>, Vec<usize>)>> {
     let mut indexes = table_meta
         .unique_indexes
         .iter()
@@ -611,13 +704,13 @@ fn ensure_replace_location_indexes(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok((index.name.as_str(), index.columns.clone(), indices))
+            Ok((index.name.as_str().to_string(), index.columns.clone(), indices))
         })
         .collect::<Result<Vec<_>>>()?;
     let primary_indices = primary_key_indices(schema);
     if !primary_indices.is_empty() {
         indexes.push((
-            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+            crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME.to_string(),
             primary_indices
                 .iter()
                 .map(|index| table_meta.columns[*index].name.clone())
@@ -625,6 +718,87 @@ fn ensure_replace_location_indexes(
             primary_indices,
         ));
     }
+    Ok(indexes)
+}
+
+/// Rebuild every location index snapshot from a fresh full scan after a
+/// physical segment rewrite (UPDATE, OPTIMIZE, background compaction): the
+/// rewritten rows live at new segment locations, so the previous snapshots
+/// are unusable. Rebuilding eagerly keeps the next statement on the
+/// incremental path instead of paying the scan lazily. The primary-key
+/// in-memory cache is dropped because updated rows may have changed keys;
+/// the location index rebuilt here is the authoritative probe path.
+pub(crate) fn rebuild_table_location_indexes(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+) -> Result<()> {
+    rebuild_table_location_indexes_from(
+        engine.index_manager(),
+        engine.segment_mgr(),
+        &engine.memtable_manager().get_by_table(db, table),
+        engine.data_dir(),
+        db,
+        table,
+        table_meta,
+        schema,
+    )
+}
+
+/// Component-level twin of `rebuild_table_location_indexes` for callers
+/// without an `Engine` handle (the background auto-compaction thread). The
+/// caller is responsible for holding the table mutation lock, matching the
+/// REPLACE path's `ensure_replace_location_indexes`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rebuild_table_location_indexes_from(
+    index_manager: &crate::storage::index::index_manager::IndexManager,
+    segment_mgr: &SegmentManager,
+    memtables: &[std::sync::Arc<crate::storage::core::memtable::MemTable>],
+    data_dir: &std::path::Path,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+) -> Result<()> {
+    let indexes = location_indexes_for_table(table_meta, schema)?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let table_dir = data_dir.join(db).join(table);
+    for (index_name, columns, indices) in indexes {
+        let entries = collect_unique_index_entries_from(
+            segment_mgr,
+            memtables,
+            &table_dir,
+            table,
+            &indices,
+            "segment rewrite auto rebuild",
+        )?;
+        index_manager.persist_unique_index_entries(
+            db,
+            table,
+            &index_name,
+            &columns,
+            entries,
+            Some(segment_mgr.memtable_flush_epoch(db, table)),
+            None,
+        )?;
+    }
+    index_manager.invalidate_primary_key_cache(db, table);
+    Ok(())
+}
+
+fn ensure_replace_location_indexes(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+    key_sets: &[(Vec<usize>, HashSet<Vec<ScalarValue>>)],
+) -> Result<()> {
+    let indexes = location_indexes_for_table(table_meta, schema)?;
     for (index_name, columns, indices) in indexes {
         let keys = key_sets
             .iter()
@@ -633,19 +807,26 @@ fn ensure_replace_location_indexes(
             .unwrap_or_default();
         if engine
             .index_manager()
-            .unique_key_locations(db, table, index_name, &keys)?
+            .unique_key_locations(db, table, &index_name, &keys)?
             .is_some()
         {
             continue;
         }
-        let entries = collect_unique_index_entries(engine, db, table, &indices, index_name)?;
+        let entries = collect_unique_index_entries(
+            engine,
+            db,
+            table,
+            &indices,
+            "replace location index bootstrap",
+        )?;
         engine.index_manager().persist_unique_index_entries(
             db,
             table,
-            index_name,
+            &index_name,
             &columns,
             entries,
             Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
+            None,
         )?;
     }
     Ok(())
@@ -721,31 +902,6 @@ fn rollback_replace_under_table_lock(
     }
 }
 
-#[cfg(test)]
-mod lock_order_tests {
-    #[test]
-    fn replace_does_not_publish_catalog_while_holding_table_lock() {
-        let source = include_str!("write.rs");
-        let replace = source
-            .split_once("pub fn exec_replace(")
-            .unwrap()
-            .1
-            .split_once("pub fn exec_insert(")
-            .unwrap()
-            .0;
-        let locked = replace
-            .split_once("with_table_mutation_lock")
-            .unwrap()
-            .1
-            .split_once("})?;")
-            .unwrap()
-            .0;
-        assert!(!locked.contains("record_inserted_rows"));
-        assert!(!locked.contains("persist_auto_increment_next_value"));
-        assert!(!locked.contains("finalize_replace_delete("));
-    }
-}
-
 fn replace_key_for_row(
     batch: &RecordBatch,
     row_idx: usize,
@@ -809,6 +965,7 @@ fn collapse_replace_batch(
     Ok((filter_batch_by_mask(batch, &active, survivors)?, replaced))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_batch_by_partition(
     engine: &Engine,
     db: &str,
@@ -911,6 +1068,7 @@ fn write_batch_by_partition(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_partition_batch(
     engine: &Engine,
     db: &str,

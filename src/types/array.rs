@@ -1485,7 +1485,7 @@ impl ColumnArray {
 }
 
 #[cfg(test)]
-#[path = "array_tests.rs"]
+#[path = "array_test.rs"]
 mod tests;
 
 include!("array/analytics.rs");

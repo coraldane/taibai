@@ -168,7 +168,11 @@ impl Accumulator {
             Accumulator::Count { count, col } => match *col {
                 CountKind::Star => *count += batch.num_rows() as u64,
                 CountKind::Column(c) => {
-                    if let Some(col_arr) = batch.column(c) {
+                    // `col_idx_opt` carries the batch-remapped column index;
+                    // the stored index is logical and may be stale after
+                    // projection pushdown.
+                    let column = col_idx_opt.unwrap_or(c);
+                    if let Some(col_arr) = batch.column(column) {
                         *count += col_arr.col_count_non_null();
                     }
                 }
@@ -310,6 +314,7 @@ impl Accumulator {
             Accumulator::Count { count, col } => match *col {
                 CountKind::Star => *count += 1,
                 CountKind::Column(column) => {
+                    let column = col_idx_opt.unwrap_or(column);
                     if batch
                         .column(column)
                         .is_some_and(|col| !col.bitmap().is_null(row))
@@ -768,6 +773,7 @@ impl ExecutionOp for HashAggregateExec {
                 output_schema,
                 aggregates,
                 physical_schema,
+                self.input_schema.clone(),
                 self.having.clone(),
                 self.max_groups,
                 spill_rows,
@@ -778,7 +784,13 @@ impl ExecutionOp for HashAggregateExec {
                 .expect("spill merge initialized")
                 .next_batch();
         }
-        let result = self.finalize_grouped(&group_keys, &groups, &aggregates, &physical_schema)?;
+        let result = self.finalize_grouped(
+            &group_by,
+            &group_keys,
+            &groups,
+            &aggregates,
+            &physical_schema,
+        )?;
         Ok(Some(result))
     }
 }
@@ -793,9 +805,7 @@ impl HashAggregateExec {
     ) -> Result<RecordBatch> {
         let mut col_defs = Vec::new();
         for agg in aggregates {
-            let name = format_aggregate_name(agg, physical_schema);
-            let dt = aggregate_result_type(agg, physical_schema);
-            col_defs.push(ColumnDef::new(&name, dt));
+            col_defs.push(aggregate_result_column_def(agg, physical_schema));
         }
         let schema = Schema::new(col_defs);
         let mut result_batch = RecordBatch::new(schema);
@@ -816,27 +826,27 @@ impl HashAggregateExec {
             result_batch = apply_distinct(result_batch);
         }
         if let Some(ref having_pred) = self.having {
-            result_batch = apply_having(result_batch, having_pred)?;
+            result_batch = apply_having(result_batch, having_pred, &self.input_schema)?;
         }
         Ok(result_batch)
     }
 
     fn finalize_grouped(
         &self,
+        group_by: &[LogicalExpr],
         group_keys: &[(Vec<u8>, Vec<ScalarValue>)],
         groups: &HashMap<Vec<u8>, Vec<Accumulator>>,
         aggregates: &[AggregateExpr],
         physical_schema: &Schema,
     ) -> Result<RecordBatch> {
         let mut col_defs = Vec::new();
-        let ngb = self.group_by.len();
+        let ngb = group_by.len();
         // group-by output columns keep their original physical types
-        for (i, _) in self.group_by.iter().enumerate() {
+        for (i, _) in group_by.iter().enumerate() {
             // Recover the type from the first representative scalar instead of
             // relying on physical_schema (the remapped logical indices already
             // match physical_schema here, so both are fine).
-            let dt = self
-                .group_by
+            let dt = group_by
                 .get(i)
                 .and_then(|e| match e {
                     LogicalExpr::Column(idx) => physical_schema.columns.get(*idx),
@@ -844,8 +854,7 @@ impl HashAggregateExec {
                 })
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::VarChar);
-            let name = self
-                .group_by
+            let name = group_by
                 .get(i)
                 .and_then(|e| match e {
                     LogicalExpr::Column(idx) => physical_schema.columns.get(*idx),
@@ -853,12 +862,17 @@ impl HashAggregateExec {
                 })
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| format!("col_{}", i));
-            col_defs.push(ColumnDef::new(&name, dt));
+            let mut def = ColumnDef::new(&name, dt);
+            if let LogicalExpr::Column(idx) = &group_by[i] {
+                if let Some(source) = physical_schema.columns.get(*idx) {
+                    def.scale = source.scale;
+                    def.precision = source.precision;
+                }
+            }
+            col_defs.push(def);
         }
         for agg in aggregates {
-            let name = format_aggregate_name(agg, physical_schema);
-            let dt = aggregate_result_type(agg, physical_schema);
-            col_defs.push(ColumnDef::new(&name, dt));
+            col_defs.push(aggregate_result_column_def(agg, physical_schema));
         }
         let schema = Schema::new(col_defs);
         let mut result_batch = RecordBatch::new(schema);
@@ -887,7 +901,7 @@ impl HashAggregateExec {
             result_batch = apply_distinct(result_batch);
         }
         if let Some(ref having_pred) = self.having {
-            result_batch = apply_having(result_batch, having_pred)?;
+            result_batch = apply_having(result_batch, having_pred, &self.input_schema)?;
         }
         Ok(result_batch)
     }
@@ -936,10 +950,7 @@ fn grouped_output_schema(
         }
     }
     for aggregate in aggregates {
-        columns.push(ColumnDef::new(
-            &format_aggregate_name(aggregate, physical_schema),
-            aggregate_result_type(aggregate, physical_schema),
-        ));
+        columns.push(aggregate_result_column_def(aggregate, physical_schema));
     }
     Schema::new(columns)
 }
@@ -1088,6 +1099,7 @@ struct GroupSpillMerge {
     output_schema: Schema,
     aggregates: Vec<AggregateExpr>,
     physical_schema: Schema,
+    input_schema: Schema,
     having: Option<LogicalExpr>,
     max_groups: usize,
     emitted_groups: usize,
@@ -1100,6 +1112,7 @@ impl GroupSpillMerge {
         output_schema: Schema,
         aggregates: Vec<AggregateExpr>,
         physical_schema: Schema,
+        input_schema: Schema,
         having: Option<LogicalExpr>,
         max_groups: usize,
         batch_rows: usize,
@@ -1123,6 +1136,7 @@ impl GroupSpillMerge {
             output_schema,
             aggregates,
             physical_schema,
+            input_schema,
             having,
             max_groups,
             emitted_groups: 0,
@@ -1226,7 +1240,7 @@ impl GroupSpillMerge {
             }
 
             if let Some(having) = self.having.as_ref() {
-                output = apply_having(output, having)?;
+                output = apply_having(output, having, &self.input_schema)?;
             }
             if output.num_rows() > 0 {
                 return Ok(Some(output));
@@ -1478,20 +1492,6 @@ fn arg_column_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
     }
 }
 
-/// Build a single-row RecordBatch containing only `row` from `batch`.
-fn slice_batch_single_row(batch: &RecordBatch, row: usize) -> Option<RecordBatch> {
-    let ncols = batch.num_columns();
-    let mut cols = Vec::with_capacity(ncols);
-    for c in 0..ncols {
-        let col = batch.column(c)?;
-        let sv = col.scalar(row);
-        let mut new_col = ColumnArray::empty(col.data_type());
-        new_col.push(&sv).ok()?;
-        cols.push(new_col);
-    }
-    Some(RecordBatch::try_new(batch.schema.clone(), cols).ok()?)
-}
-
 pub fn format_aggregate_name(agg: &AggregateExpr, schema: &Schema) -> String {
     let arg_name = match &*agg.arg {
         LogicalExpr::Wildcard => "*".to_string(),
@@ -1535,6 +1535,23 @@ fn null_scalar_of_type(dt: DataType) -> ScalarValue {
         DataType::Vector => ScalarValue::Vector(None),
         _ => ScalarValue::Int64(None),
     }
+}
+
+/// Output column definition for an aggregate expression. Decimal results
+/// inherit the argument column's scale/precision so clients can render the
+/// decimal point correctly.
+pub fn aggregate_result_column_def(agg: &AggregateExpr, schema: &Schema) -> ColumnDef {
+    let dt = aggregate_result_type(agg, schema);
+    let mut def = ColumnDef::new(&format_aggregate_name(agg, schema), dt);
+    if dt == DataType::Decimal {
+        if let LogicalExpr::Column(idx) = &*agg.arg {
+            if let Some(source) = schema.columns.get(*idx) {
+                def.scale = source.scale;
+                def.precision = source.precision;
+            }
+        }
+    }
+    def
 }
 
 pub fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
@@ -1799,157 +1816,18 @@ fn apply_distinct(batch: RecordBatch) -> RecordBatch {
 }
 
 /// Apply HAVING filter to aggregated results.
-fn apply_having(batch: RecordBatch, _predicate: &LogicalExpr) -> Result<RecordBatch> {
+fn apply_having(
+    batch: RecordBatch,
+    predicate: &LogicalExpr,
+    logical_schema: &Schema,
+) -> Result<RecordBatch> {
     // HAVING is evaluated using the same filter logic as WHERE
     // but operates on the aggregated result schema
-    let mask = crate::sql::execution::operators::filter::eval_filter(_predicate, &batch)?;
+    let remapped = remap_expr_for_batch(predicate, logical_schema, &batch.schema);
+    let mask = crate::sql::execution::operators::filter::eval_filter(&remapped, &batch)?;
     Ok(super::apply_filter_mask(&batch, &mask))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct OneBatchExec {
-        batch: Option<RecordBatch>,
-    }
-
-    struct ManyBatchExec {
-        batches: std::vec::IntoIter<RecordBatch>,
-    }
-
-    impl ExecutionOp for OneBatchExec {
-        fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-            Ok(self.batch.take())
-        }
-    }
-
-    impl ExecutionOp for ManyBatchExec {
-        fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-            Ok(self.batches.next())
-        }
-    }
-
-    #[test]
-    fn grouped_aggregate_spills_and_merges_partial_states() {
-        let schema = Schema::new(vec![
-            ColumnDef::new("group_id", DataType::Int64),
-            ColumnDef::new("value", DataType::Int64),
-        ]);
-        let mut groups = ColumnArray::empty(DataType::Int64);
-        let mut values = ColumnArray::empty(DataType::Int64);
-        for (group, value) in [(0, 10), (1, 20), (0, 30), (2, 40), (1, 20), (0, 10)] {
-            groups.push(&ScalarValue::Int64(Some(group))).unwrap();
-            values.push(&ScalarValue::Int64(Some(value))).unwrap();
-        }
-        let batch = RecordBatch::try_new(schema.clone(), vec![groups, values]).unwrap();
-        let aggregates = vec![
-            AggregateExpr {
-                func: AggFunc::Count,
-                arg: Box::new(LogicalExpr::Wildcard),
-                distinct: false,
-            },
-            AggregateExpr {
-                func: AggFunc::Sum,
-                arg: Box::new(LogicalExpr::Column(1)),
-                distinct: false,
-            },
-            AggregateExpr {
-                func: AggFunc::Count,
-                arg: Box::new(LogicalExpr::Column(1)),
-                distinct: true,
-            },
-        ];
-        let mut exec = HashAggregateExec::new(
-            vec![LogicalExpr::Column(0)],
-            aggregates,
-            Box::new(OneBatchExec { batch: Some(batch) }),
-            schema,
-        )
-        .with_memory_limit_bytes(1);
-
-        let mut results = HashMap::new();
-        while let Some(batch) = exec.next_batch().unwrap() {
-            for row in 0..batch.num_rows() {
-                results.insert(
-                    batch.scalar(row, 0).unwrap(),
-                    (
-                        batch.scalar(row, 1).unwrap(),
-                        batch.scalar(row, 2).unwrap(),
-                        batch.scalar(row, 3).unwrap(),
-                    ),
-                );
-            }
-        }
-
-        assert_eq!(
-            results.get(&ScalarValue::Int64(Some(0))),
-            Some(&(
-                ScalarValue::Int64(Some(3)),
-                ScalarValue::Int64(Some(50)),
-                ScalarValue::Int64(Some(2)),
-            ))
-        );
-        assert_eq!(
-            results.get(&ScalarValue::Int64(Some(1))),
-            Some(&(
-                ScalarValue::Int64(Some(2)),
-                ScalarValue::Int64(Some(40)),
-                ScalarValue::Int64(Some(1)),
-            ))
-        );
-        assert_eq!(
-            results.get(&ScalarValue::Int64(Some(2))),
-            Some(&(
-                ScalarValue::Int64(Some(1)),
-                ScalarValue::Int64(Some(40)),
-                ScalarValue::Int64(Some(1)),
-            ))
-        );
-    }
-
-    #[test]
-    fn global_distinct_aggregates_spill_and_deduplicate_across_runs() {
-        let schema = Schema::new(vec![ColumnDef::new("value", DataType::Int64)]);
-        let batches = [[1, 2, 2], [2, 3, 1]]
-            .into_iter()
-            .map(|values| {
-                let mut column = ColumnArray::empty(DataType::Int64);
-                for value in values {
-                    column.push(&ScalarValue::Int64(Some(value))).unwrap();
-                }
-                RecordBatch::try_new(schema.clone(), vec![column]).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let aggregates = [
-            AggFunc::Count,
-            AggFunc::Sum,
-            AggFunc::Avg,
-            AggFunc::Min,
-            AggFunc::Max,
-        ]
-        .into_iter()
-        .map(|func| AggregateExpr {
-            func,
-            arg: Box::new(LogicalExpr::Column(0)),
-            distinct: true,
-        })
-        .collect();
-        let mut exec = HashAggregateExec::new(
-            Vec::new(),
-            aggregates,
-            Box::new(ManyBatchExec {
-                batches: batches.into_iter(),
-            }),
-            schema,
-        )
-        .with_memory_limit_bytes(1);
-
-        let output = exec.next_batch().unwrap().unwrap();
-        assert_eq!(output.scalar(0, 0), Some(ScalarValue::Int64(Some(3))));
-        assert_eq!(output.scalar(0, 1), Some(ScalarValue::Int64(Some(6))));
-        assert_eq!(output.scalar(0, 2), Some(ScalarValue::Float64(Some(2.0))));
-        assert_eq!(output.scalar(0, 3), Some(ScalarValue::Int64(Some(1))));
-        assert_eq!(output.scalar(0, 4), Some(ScalarValue::Int64(Some(3))));
-    }
-}
+#[path = "aggregate_test.rs"]
+mod tests;

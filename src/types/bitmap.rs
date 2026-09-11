@@ -20,19 +20,6 @@ impl NullBitmap {
         }
     }
 
-    pub fn new_all_null(len: usize) -> Self {
-        let u64_count = Self::u64_count(len);
-        let mut data = vec![u64::MAX; u64_count];
-        if len > 0 {
-            let bits_in_last = len - (u64_count - 1) * 64;
-            if bits_in_last < 64 {
-                let last = u64_count - 1;
-                data[last] = (1u64 << bits_in_last) - 1;
-            }
-        }
-        Self { data, len }
-    }
-
     pub fn from_bytes(bitmap_bytes: &[u8], len: usize) -> Self {
         let u64_count = Self::u64_count(len);
         let mut data = vec![0u64; u64_count];
@@ -85,17 +72,6 @@ impl NullBitmap {
     }
 
     #[inline]
-    pub fn set_valid(&mut self, idx: usize) {
-        if idx >= self.len || self.data.is_empty() {
-            return;
-        }
-        let data_idx = idx / 64;
-        if data_idx < self.data.len() {
-            self.data[data_idx] &= !(1u64 << (idx % 64));
-        }
-    }
-
-    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -107,10 +83,6 @@ impl NullBitmap {
 
     pub fn null_count(&self) -> usize {
         self.data.iter().map(|w| w.count_ones() as usize).sum()
-    }
-
-    pub fn valid_count(&self) -> usize {
-        self.len - self.null_count()
     }
 
     pub fn is_all_valid(&self) -> bool {
@@ -143,9 +115,9 @@ impl NullBitmap {
         if self.is_all_valid() {
             return out;
         }
-        for i in 0..self.len {
+        for (i, flag) in out.iter_mut().enumerate() {
             if self.is_null(i) {
-                out[i] = 1;
+                *flag = 1;
             }
         }
         out
@@ -220,5 +192,5 @@ impl NullBitmap {
 }
 
 #[cfg(test)]
-#[path = "bitmap_tests.rs"]
+#[path = "bitmap_test.rs"]
 mod tests;

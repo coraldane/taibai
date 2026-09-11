@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+use crate::protocol::types::DataType;
 use crate::sql::optimizer::partition_pruning::PartitionFilter;
 use crate::sql::parser::ast::*;
 use crate::types::batch::Schema;
@@ -6,6 +6,7 @@ use crate::types::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum LogicalPlan {
     Scan(ScanPlan),
     Filter(FilterPlan),
@@ -196,7 +197,26 @@ pub enum LogicalExpr {
         subquery: Box<LogicalPlan>,
         negated: bool,
     },
+    /// Correlated subquery evaluated per outer row by the execution layer
+    /// (see `execution::subquery_runtime`). The registry that owns the
+    /// inner snapshot is keyed by `id`.
+    CorrelatedSubquery(Box<CorrelatedSubqueryPlan>),
     Wildcard,
+}
+
+/// Plan-level form of `parser::ast::CorrelatedSubquery`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrelatedSubqueryPlan {
+    pub id: u64,
+    pub kind: crate::sql::parser::ast::CorrelatedKind,
+    /// For `In`, the left-hand side expression in the outer scope.
+    pub lhs: Option<Box<LogicalExpr>>,
+    pub stmt: Statement,
+    pub conjuncts: Vec<Expr>,
+    /// `placeholder id -> column index in the enclosing block's logical schema`.
+    pub params: Vec<(usize, usize)>,
+    /// Type of the value this node evaluates to.
+    pub result_type: DataType,
 }
 
 #[derive(Debug, Clone, PartialEq)]

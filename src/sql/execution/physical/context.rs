@@ -6,6 +6,7 @@ use crate::types::batch::Schema;
 use crate::sql::execution::engine::Engine;
 use crate::sql::execution::query::ResolvedTableRef;
 use crate::sql::execution::scan::runtime::ScanRuntime;
+use crate::sql::execution::subquery_runtime::SubqueryRegistry;
 
 pub struct PhysicalContext<'a> {
     pub scan_runtime: ScanRuntime,
@@ -13,6 +14,10 @@ pub struct PhysicalContext<'a> {
     pub table_schemas: &'a HashMap<String, Schema>,
     pub table_metas: &'a HashMap<String, TableMeta>,
     pub is_count_star: bool,
+    /// Snapshot registry for correlated subqueries, used by the profiled
+    /// materialized pipeline (EXPLAIN ANALYZE) to evaluate markers that
+    /// could not be decorrelated.
+    pub subqueries: Option<SubqueryRegistry>,
 }
 
 impl<'a> PhysicalContext<'a> {
@@ -29,7 +34,13 @@ impl<'a> PhysicalContext<'a> {
             table_schemas,
             table_metas,
             is_count_star,
+            subqueries: None,
         }
+    }
+
+    pub fn with_subqueries(mut self, subqueries: Option<SubqueryRegistry>) -> Self {
+        self.subqueries = subqueries;
+        self
     }
 
     pub fn table_ref(&self, table_name: &str) -> Option<&ResolvedTableRef> {

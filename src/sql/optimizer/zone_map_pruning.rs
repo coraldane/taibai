@@ -6,10 +6,6 @@ use super::Rule;
 pub struct ZoneMapPruningRule;
 
 impl Rule for ZoneMapPruningRule {
-    fn name(&self) -> &str {
-        "zone_map_pruning"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         apply_zone_map_pruning(plan)
     }

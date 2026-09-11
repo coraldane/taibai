@@ -7,10 +7,6 @@ use super::Rule;
 pub struct SemiJoinRule;
 
 impl Rule for SemiJoinRule {
-    fn name(&self) -> &str {
-        "semi_join"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         transform_to_semi_join(plan)
     }
@@ -35,8 +31,8 @@ fn transform_to_semi_join(plan: LogicalPlan) -> (LogicalPlan, bool) {
                     let left_plan = *filter.input.clone();
                     if let LogicalPlan::Scan(scan) = &left_plan {
                         let semi = build_semi_join_from_in(scan, values, *negated);
-                        if semi.is_some() {
-                            return (semi.unwrap(), true);
+                        if let Some(semi_join) = semi {
+                            return (semi_join, true);
                         }
                     }
                 }
@@ -109,26 +105,13 @@ fn transform_to_semi_join(plan: LogicalPlan) -> (LogicalPlan, bool) {
     }
 }
 
-fn transform_expr_to_semi_join(expr: &LogicalExpr, input: &LogicalPlan) -> (LogicalExpr, bool) {
+fn transform_expr_to_semi_join(expr: &LogicalExpr, _input: &LogicalPlan) -> (LogicalExpr, bool) {
     match expr {
-        LogicalExpr::ExistsSubquery(subquery) => {
-            if let LogicalPlan::Scan(scan) = input {
-                let _semi = LogicalPlan::SemiJoin(SemiJoinPlan {
-                    left: Box::new(LogicalPlan::Scan(scan.clone())),
-                    right: subquery.clone(),
-                    condition: LogicalExpr::Literal(ScalarValue::Bool(Some(true))),
-                    left_schema: scan.schema.clone(),
-                    right_schema: extract_schema(subquery),
-                    is_anti: false,
-                });
-                return (LogicalExpr::Literal(ScalarValue::Bool(Some(true))), true);
-            }
-            (expr.clone(), false)
-        }
+        LogicalExpr::ExistsSubquery(_) => (expr.clone(), false),
         LogicalExpr::BinaryOp { left, op, right } => match op {
             BinOp::And => {
-                let (new_left, lc) = transform_expr_to_semi_join(left, input);
-                let (new_right, rc) = transform_expr_to_semi_join(right, input);
+                let (new_left, lc) = transform_expr_to_semi_join(left, _input);
+                let (new_right, rc) = transform_expr_to_semi_join(right, _input);
                 (
                     LogicalExpr::BinaryOp {
                         left: Box::new(new_left),
@@ -139,8 +122,8 @@ fn transform_expr_to_semi_join(expr: &LogicalExpr, input: &LogicalPlan) -> (Logi
                 )
             }
             BinOp::Or => {
-                let (new_left, lc) = transform_expr_to_semi_join(left, input);
-                let (new_right, rc) = transform_expr_to_semi_join(right, input);
+                let (new_left, lc) = transform_expr_to_semi_join(left, _input);
+                let (new_right, rc) = transform_expr_to_semi_join(right, _input);
                 (
                     LogicalExpr::BinaryOp {
                         left: Box::new(new_left),
@@ -171,30 +154,9 @@ fn build_semi_join_from_in(
     None
 }
 
-fn extract_schema(plan: &LogicalPlan) -> crate::types::batch::Schema {
-    match plan {
-        LogicalPlan::Scan(scan) => scan.schema.clone(),
-        LogicalPlan::Project(proj) => extract_schema(&proj.input),
-        LogicalPlan::Filter(filter) => extract_schema(&filter.input),
-        LogicalPlan::Aggregate(agg) => extract_schema(&agg.input),
-        LogicalPlan::Join(join) => join.output_schema.clone(),
-        LogicalPlan::SemiJoin(semi) => semi.left_schema.clone(),
-        LogicalPlan::Sort(sort) => extract_schema(&sort.input),
-        LogicalPlan::Limit(limit) => extract_schema(&limit.input),
-        LogicalPlan::TopN(topn) => extract_schema(&topn.input),
-        LogicalPlan::Distinct(distinct) => extract_schema(&distinct.input),
-        LogicalPlan::Window(window) => extract_schema(&window.input),
-        LogicalPlan::Empty => crate::types::batch::Schema::empty(),
-    }
-}
-
 pub struct SemiJoinColumnPruningRule;
 
 impl Rule for SemiJoinColumnPruningRule {
-    fn name(&self) -> &str {
-        "semi_join_column_pruning"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         prune_semi_join_columns(plan)
     }

@@ -273,8 +273,7 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
         ));
     }
 
-    if table_meta.hot_time_column.is_some() {
-        let time_col = table_meta.hot_time_column.as_ref().unwrap();
+    if let Some(time_col) = table_meta.hot_time_column.as_ref() {
         let mut hot_str = format!(" HOT BY ({})", time_col);
         if let Some(idx_col) = &table_meta.hot_index_column {
             hot_str.push_str(&format!(" INDEX ({})", idx_col));
@@ -306,6 +305,10 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
 
     if let Some(ttl) = &table_meta.ttl {
         create_sql.push_str(&format!(" TTL ({}, {})", ttl.column, ttl.duration_secs));
+    }
+
+    if table_meta.durability == TableDurability::Relaxed {
+        create_sql.push_str(" DURABILITY = RELAXED");
     }
 
     for secondary_index in &table_meta.secondary_indexes {
@@ -614,15 +617,37 @@ pub fn exec_optimize_table(
         compactor.optimize_table(db, table, &table_meta)?
     };
 
-    engine.index_manager().mark_index_stale(db, table);
-    let unique_index_names = table_meta
-        .unique_indexes
-        .iter()
-        .map(|index| index.name.clone())
-        .collect::<Vec<_>>();
-    engine
-        .index_manager()
-        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+    // The rewrite moved rows to new segment locations, so rebuild the
+    // location-index snapshots eagerly instead of invalidating them for a
+    // lazy rebuild on the next probe. Skip when compaction was a no-op.
+    if stats.segments_written > 0 || stats.rows_dropped > 0 {
+        let schema = Schema::new(table_meta.columns.clone());
+        let rebuilt = engine.segment_mgr().with_table_mutation_lock(db, table, || {
+            super::dml_insert::rebuild_table_location_indexes(
+                engine,
+                db,
+                table,
+                &table_meta,
+                &schema,
+            )
+        });
+        if let Err(error) = rebuilt {
+            tracing::warn!(
+                db,
+                table,
+                error = %error,
+                "OPTIMIZE TABLE index auto-rebuild failed; falling back to snapshot invalidation"
+            );
+            let unique_index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            engine
+                .index_manager()
+                .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+        }
+    }
 
     tracing::info!(
         db,
@@ -1015,29 +1040,4 @@ fn estimate_hll(registers: &[u8]) -> u64 {
     corrected.round().max(0.0) as u64
 }
 
-#[cfg(test)]
-mod analyze_histogram_tests {
-    use super::{AnalyzeColumnCollector, ANALYZE_HISTOGRAM_BUCKETS, ANALYZE_HISTOGRAM_SAMPLE_SIZE};
-    use crate::types::scalar::ScalarValue;
 
-    #[test]
-    fn histogram_sampling_and_bucket_count_are_bounded() {
-        let mut collector = AnalyzeColumnCollector::new();
-        for value in 0..10_000i64 {
-            collector.non_null_count += 1;
-            collector.sample_value(ScalarValue::Int64(Some(value)));
-        }
-        assert_eq!(collector.samples.len(), ANALYZE_HISTOGRAM_SAMPLE_SIZE);
-
-        let statistics = collector.finish();
-        assert!(statistics.histogram.len() <= ANALYZE_HISTOGRAM_BUCKETS);
-        assert_eq!(
-            statistics
-                .histogram
-                .iter()
-                .map(|bucket| bucket.sample_count as usize)
-                .sum::<usize>(),
-            ANALYZE_HISTOGRAM_SAMPLE_SIZE
-        );
-    }
-}

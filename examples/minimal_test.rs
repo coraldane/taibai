@@ -14,8 +14,7 @@ fn main() {
     let compressed = zstd::bulk::compress(
         &data
             .iter()
-            .map(|v| v.to_le_bytes())
-            .flatten()
+            .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<u8>>(),
         1,
     )

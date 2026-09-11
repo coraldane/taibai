@@ -1,5 +1,5 @@
 impl SegmentManager {
-    pub fn bulk_insert_payload(&self, db: &str, payload: &[u8], _disable_wal: bool) -> Result<u64> {
+    pub fn bulk_insert_payload(&self, db: &str, payload: &[u8]) -> Result<u64> {
         let req = parse_direct_bulk_payload(payload)?;
         if req.row_count == 0 {
             return Ok(0);
@@ -56,6 +56,7 @@ impl SegmentManager {
             }
         }
 
+        self.note_direct_segment_append(db, req.table_name);
         Ok(req.row_count as u64)
     }
 
@@ -63,7 +64,6 @@ impl SegmentManager {
         &self,
         db: &str,
         payload: &[u8],
-        _disable_wal: bool,
         catalogs: &crate::storage::catalog::schema::DatabaseCatalog,
         flush_immediately: bool,
     ) -> Result<u64> {
@@ -202,6 +202,9 @@ impl SegmentManager {
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
             }
             written += group.row_count as u64;
+        }
+        if written > 0 {
+            self.note_direct_segment_append(db, req.table_name);
         }
         Ok(written)
     }

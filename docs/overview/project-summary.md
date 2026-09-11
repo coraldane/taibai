@@ -20,7 +20,7 @@ Taibai 是一个使用 Rust 实现的列式数据库服务器，目标是提供�
 - `src/net/`：异步 TCP/TLS 网络层，负责连接、登录、会话、消息分发和客户端实现。
 - `src/protocol/`：二进制协议层，定义消息类型、帧格式、压缩与查询结果编码。
 - `src/sql/`：SQL 解析、绑定、逻辑计划、优化和执行。
-- `src/storage/`：目录元数据、列式 segment、WAL、MemTable、事务、索引、分区与压缩合并。
+- `src/storage/`：目录元数据、列式 segment、持久化 tail、MemTable、事务、索引、分区与压缩合并。
 - `src/types/`：标量值、列数组、RecordBatch 和 NULL 位图等内部数据表示。
 - `src/common/`：配置、错误类型等公共设施。
 - `src/tools/` 与 `src/bin/`：segment 相关辅助工具。
@@ -111,7 +111,7 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 
 ## 存储引擎
 
-存储层是 Taibai 的核心。它使用自定义列式 segment 文件格式，并围绕写入缓冲、WAL、目录元数据和优化合并构建。
+存储层是 Taibai 的核心。它使用自定义列式 segment 文件格式，并围绕写入缓冲、持久化 tail、目录元数据和优化合并构建。
 
 主要能力包括：
 
@@ -119,7 +119,7 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - 表元数据：列定义、行数、segment 数、创建时间、聚簇键、分区信息、TTL 信息。
 - MemTable 写入缓冲。
 - BatchWriter 批写入队列。
-- WAL 用于写前日志、事务提交和恢复相关记录。
+- 持久化 tail（durable tail）承担写路径持久化与崩溃恢复，经典 WAL 已移除。
 - SegmentManager 管理表数据文件、活跃 segment、flush 与读取。
 - Segment 文件包含 header、压缩列数据、row group 元数据、footer 和 footer offset。
 - Row Group 默认大小为 8192 行。
@@ -177,7 +177,7 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 
 - 协议支持列式批量插入消息。
 - 服务端支持 `START BULK IMPORT` / `STOP BULK IMPORT` 模式。
-- 可在批量导入时关闭 WAL，以换取更高导入速度。
+- `START BULK IMPORT` 启用统一的批量导入模式；当前无独立 WAL 写入。
 - 客户端支持 pipeline，在多个批次请求未完成时继续发送后续批次。
 - `examples/batch_import` 针对股票 tick CSV 数据实现了高性能导入示例，包括块读取、字符串池化、列式编码、批大小控制和进度输出。
 

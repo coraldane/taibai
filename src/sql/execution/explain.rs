@@ -32,6 +32,18 @@ pub fn exec_explain(
         }
     };
 
+    // Resolve subqueries / derived tables so their plans can be rendered;
+    // ANALYZE would need the per-query subquery runtime during execution and
+    // is not wired through here yet.
+    let mut resolved: Option<super::query::ResolvedQuery> = None;
+    let (select_from, derived_tables) = if super::query::stmt_has_subquery_or_derived(select_from) {
+        resolved = Some(super::query::resolve_query(engine, db, select_from)?);
+        let query = resolved.as_ref().expect("just assigned");
+        (&query.stmt as &Statement, Some(&query.derived))
+    } else {
+        (select_from, None)
+    };
+
     let from_clause = match select_from {
         Statement::Select { from, .. } => from.as_ref(),
         _ => None,
@@ -44,6 +56,17 @@ pub fn exec_explain(
     {
         let catalogs = engine.catalogs().read().unwrap();
         for table_ref in &table_refs {
+            if table_ref.database == super::query::DERIVED_DB {
+                let derived = derived_tables.expect("derived tables present");
+                let (schema, _) = derived.get(&table_ref.key).ok_or_else(|| {
+                    TaibaiError::Internal(format!(
+                        "missing materialized derived table '{}'",
+                        table_ref.key
+                    ))
+                })?;
+                table_schemas.insert(table_ref.key.clone(), schema.clone());
+                continue;
+            }
             let catalog = catalogs.get(&table_ref.database).ok_or_else(|| {
                 TaibaiError::Sql(format!("database '{}' does not exist", table_ref.database))
             })?;
@@ -60,6 +83,14 @@ pub fn exec_explain(
 
     let plan = plan_select(select_from, &table_schemas)?;
     let plan = crate::sql::optimizer::optimize(plan);
+    let mut extra_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let plan = if let Some(query) = &resolved {
+        let outcome = super::decorrelate::decorrelate(plan, &query.registry);
+        extra_batches = outcome.extra_batches;
+        outcome.plan
+    } else {
+        plan
+    };
     let plan = reconcile_plan_indexes(plan, &table_metas);
     let query_shape = plan_shape(&plan);
     let fingerprint = stable_fingerprint(&query_shape);
@@ -74,6 +105,12 @@ pub fn exec_explain(
         let mut stats: HashMap<String, ScanStats> = HashMap::new();
         let profile = QueryProfile::default();
         let start = std::time::Instant::now();
+        let pre = resolved
+            .as_ref()
+            .map(|query| super::query::PreResolvedExec {
+                resolved: query,
+                extra_batches: &extra_batches,
+            });
         let result = super::query::exec_select_with_profile(
             engine,
             db,
@@ -81,6 +118,7 @@ pub fn exec_explain(
             &mut stats,
             plan.clone(),
             &profile,
+            pre,
         )?;
         let elapsed = start.elapsed();
         let rows_returned = match &result {
@@ -308,6 +346,7 @@ fn expr_shape(expr: &LogicalExpr) -> String {
         LogicalExpr::Not(expr) => format!("Not({})", expr_shape(expr)),
         LogicalExpr::IsNull(expr) => format!("IsNull({})", expr_shape(expr)),
         LogicalExpr::IsNotNull(expr) => format!("IsNotNull({})", expr_shape(expr)),
+        LogicalExpr::CorrelatedSubquery(_) => "correlated_subquery".to_string(),
         LogicalExpr::In { expr, negated, .. } => {
             format!("In({};negated={negated})", expr_shape(expr))
         }
@@ -691,6 +730,7 @@ fn render_expr(expr: &LogicalExpr, schema: &Schema) -> String {
             .get(*idx)
             .map(|c| c.name.clone())
             .unwrap_or_else(|| format!("col#{}", idx)),
+        LogicalExpr::CorrelatedSubquery(_) => "correlated subquery".to_string(),
         LogicalExpr::Literal(v) => format!("{:?}", v),
         LogicalExpr::BinaryOp { left, op, right } => {
             let opstr = match op {

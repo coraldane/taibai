@@ -128,6 +128,7 @@ fn count_with_single_eq(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn count_with_predicates(
     spec: &ScanSpec,
     segment_files: &[std::path::PathBuf],
@@ -197,7 +198,7 @@ fn count_with_predicates(
                     &spec.range_predicates,
                     &spec.in_predicates,
                     spec.remaining_predicate.as_ref(),
-                )
+                )?
             } else {
                 row_filter::apply_predicates_with_column_map(
                     &batch,

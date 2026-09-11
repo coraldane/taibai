@@ -10,6 +10,7 @@ use super::row_group::{self, RowGroupPruneResult};
 use super::spec::ScanSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum RowGroupReadStrategy {
     PlainRead,
     PredicateFirstRead,
@@ -125,13 +126,12 @@ impl<'a> ScanPlanner<'a> {
         let order_key_pos = cluster_key
             .iter()
             .position(|key| key.eq_ignore_ascii_case(order_col_name))?;
-        if order_key_pos == 0 {
-            return None;
-        }
 
-        for key in cluster_key.iter().take(order_key_pos) {
-            let key_idx = self.table_schema.index_of(key)?;
-            self.spec.eq_value_for_column(key_idx)?;
+        if order_key_pos > 0 {
+            for key in cluster_key.iter().take(order_key_pos) {
+                let key_idx = self.table_schema.index_of(key)?;
+                self.spec.eq_value_for_column(key_idx)?;
+            }
         }
 
         Some(OrderedClusterLimit {
@@ -387,13 +387,13 @@ pub fn read_plain_row_group(
     }
 
     if spec.has_predicates() {
-        Ok(row_filter::apply_predicates(
+        row_filter::apply_predicates(
             &batch,
             &spec.eq_predicates,
             &spec.range_predicates,
             &spec.in_predicates,
             spec.remaining_predicate.as_ref(),
-        ))
+        )
     } else {
         Ok(batch)
     }
@@ -620,5 +620,5 @@ fn set_tighter_upper(
 }
 
 #[cfg(test)]
-#[path = "strategy_tests.rs"]
+#[path = "strategy_test.rs"]
 mod tests;

@@ -28,6 +28,26 @@ fn default_tls_handshake_timeout_secs() -> u64 {
     10
 }
 
+fn default_request_queue_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_mutation_lock_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_mutation_lock_warn_ms() -> u64 {
+    1_000
+}
+
+fn default_tail_commit_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_tail_commit_warn_ms() -> u64 {
+    2_000
+}
+
 /// Process-global runtime limits consulted by query operators (aggregation,
 /// streaming scans, ...). Populated once at startup from `BufferSettings` via
 /// [`set_query_limits`]. Operators read via [`query_limits`]; before startup
@@ -37,7 +57,6 @@ pub struct QueryLimits {
     /// Soft per-query memory ceiling in MB. Query operators and final result
     /// materialization enforce this limit to abort oversized queries before
     /// they can exhaust process memory.
-    #[allow(dead_code)]
     pub query_memory_limit_mb: u64,
     pub max_result_message_bytes: usize,
     pub max_aggregate_groups: usize,
@@ -72,6 +91,40 @@ static PERFORMANCE_BASELINE_CONFIG: OnceLock<PerformanceBaselineConfig> = OnceLo
 static INSERT_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static BULK_ZSTD_LEVEL: OnceLock<i32> = OnceLock::new();
 static READER_CACHE_CAPACITY: OnceLock<usize> = OnceLock::new();
+static STORAGE_TIMEOUTS: OnceLock<StorageTimeouts> = OnceLock::new();
+
+/// Process-wide deadlines for the blocking waits on the write path (table
+/// mutation lock acquisition and durable-tail commit acknowledgement). Every
+/// such wait must be bounded so a stalled lock holder or a slow disk surfaces
+/// as an explicit timeout error instead of an indefinite hang.
+#[derive(Debug, Clone, Copy)]
+pub struct StorageTimeouts {
+    pub mutation_lock_timeout_ms: u64,
+    pub mutation_lock_warn_ms: u64,
+    pub tail_commit_timeout_ms: u64,
+    pub tail_commit_warn_ms: u64,
+}
+
+impl Default for StorageTimeouts {
+    fn default() -> Self {
+        Self {
+            mutation_lock_timeout_ms: default_mutation_lock_timeout_ms(),
+            mutation_lock_warn_ms: default_mutation_lock_warn_ms(),
+            tail_commit_timeout_ms: default_tail_commit_timeout_ms(),
+            tail_commit_warn_ms: default_tail_commit_warn_ms(),
+        }
+    }
+}
+
+/// Install storage wait timeouts sourced from the `storage.*` config section.
+/// Called once during server startup; defaults apply when unset.
+pub fn set_storage_timeouts(timeouts: StorageTimeouts) {
+    let _ = STORAGE_TIMEOUTS.set(timeouts);
+}
+
+pub fn storage_timeouts() -> StorageTimeouts {
+    *STORAGE_TIMEOUTS.get_or_init(StorageTimeouts::default)
+}
 
 /// Enable per-stage INSERT profiling logs. Configured from `log.insert_profile`
 /// in the config file at startup; defaults to off.
@@ -92,7 +145,7 @@ pub fn set_storage_runtime_settings(bulk_zstd_level: i32, reader_cache_capacity:
 }
 
 pub fn bulk_zstd_level() -> i32 {
-    *BULK_ZSTD_LEVEL.get().unwrap_or(&1)
+    *BULK_ZSTD_LEVEL.get().unwrap_or(&3)
 }
 
 pub fn reader_cache_capacity() -> usize {
@@ -157,6 +210,7 @@ impl Default for PerformanceBaselineConfig {
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub fn set_performance_baseline_config(
     config: PerformanceBaselineConfig,
 ) -> Result<(), PerformanceBaselineConfig> {
@@ -313,7 +367,7 @@ fn default_execution_threads() -> usize {
 }
 
 fn default_max_parallel_row_groups() -> usize {
-    default_execution_threads().min(8).max(1)
+    default_execution_threads().clamp(1, 8)
 }
 
 fn default_parallel_scan_min_row_groups() -> usize {
@@ -329,10 +383,10 @@ fn default_join_spill_partitions() -> usize {
 }
 
 fn default_max_parallel_segments() -> usize {
-    default_execution_threads().min(4).max(1)
+    default_execution_threads().clamp(1, 4)
 }
 fn default_global_io_permits() -> usize {
-    default_execution_threads().min(4).max(1)
+    default_execution_threads().clamp(1, 4)
 }
 fn default_global_cpu_permits() -> usize {
     default_execution_threads().max(1)
@@ -347,7 +401,7 @@ fn default_reader_cache_capacity() -> usize {
 }
 
 fn default_bulk_zstd_level() -> i32 {
-    1
+    3
 }
 
 fn default_insert_profile() -> bool {
@@ -446,6 +500,11 @@ pub struct ServerSettings {
     /// Maximum time allowed for an incoming TLS handshake. Set to 0 to disable.
     #[serde(default = "default_tls_handshake_timeout_secs")]
     pub tls_handshake_timeout_secs: u64,
+    /// Maximum time a heavy request may wait for an execution slot before the
+    /// server rejects it with an overload error. Bounds queueing so a
+    /// saturated engine surfaces backpressure instead of silently hanging.
+    #[serde(default = "default_request_queue_timeout_ms")]
+    pub request_queue_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,9 +551,33 @@ pub struct StorageSettings {
     pub hot_store_memory_limit_mb: u64,
     #[serde(default = "default_row_group_target_rows")]
     pub row_group_target_rows: usize,
+    /// Ack durable-tail appends once the bytes reach the page cache. The tail
+    /// committer thread still fsyncs every group in the background, so the
+    /// durability lag stays within one group-commit window (sub-second), but a
+    /// crash in that window can lose already-acknowledged INSERTs. Trades a
+    /// synchronous fsync on the INSERT latency path for throughput on
+    /// fsync-bound disks. Default false keeps fsync-before-ack semantics.
+    #[serde(default)]
+    pub tail_async_fsync: bool,
     /// Number of segments kept in the reader and segment-metadata caches.
     #[serde(default = "default_reader_cache_capacity")]
     pub reader_cache_capacity: usize,
+    /// Maximum time a write may wait for the per-table mutation lock before
+    /// failing with a lock timeout error instead of blocking forever.
+    #[serde(default = "default_mutation_lock_timeout_ms")]
+    pub mutation_lock_timeout_ms: u64,
+    /// Log a warning when acquiring the per-table mutation lock takes longer
+    /// than this threshold, making lock queueing visible in the server log.
+    #[serde(default = "default_mutation_lock_warn_ms")]
+    pub mutation_lock_warn_ms: u64,
+    /// Maximum time a request waits for durable-tail group commit (fsync)
+    /// acknowledgement before failing with a commit timeout error.
+    #[serde(default = "default_tail_commit_timeout_ms")]
+    pub tail_commit_timeout_ms: u64,
+    /// Log a warning when durable-tail commit acknowledgement takes longer
+    /// than this threshold, surfacing slow fsync/disks.
+    #[serde(default = "default_tail_commit_warn_ms")]
+    pub tail_commit_warn_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +727,7 @@ fn default_server_settings() -> ServerSettings {
         max_concurrent_requests: default_max_concurrent_requests(),
         connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
         tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+        request_queue_timeout_ms: default_request_queue_timeout_ms(),
     }
 }
 
@@ -671,6 +755,11 @@ fn default_storage_settings() -> StorageSettings {
         hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
+        tail_async_fsync: false,
+        mutation_lock_timeout_ms: default_mutation_lock_timeout_ms(),
+        mutation_lock_warn_ms: default_mutation_lock_warn_ms(),
+        tail_commit_timeout_ms: default_tail_commit_timeout_ms(),
+        tail_commit_warn_ms: default_tail_commit_warn_ms(),
     }
 }
 
@@ -986,5 +1075,5 @@ impl RunMode {
 }
 
 #[cfg(test)]
-#[path = "config_tests.rs"]
+#[path = "config_test.rs"]
 mod tests;

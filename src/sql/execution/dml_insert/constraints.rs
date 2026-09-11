@@ -1,4 +1,4 @@
-fn unique_constraints(
+pub(crate) fn unique_constraints(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     schema: &Schema,
 ) -> Result<Vec<(String, Vec<usize>)>> {
@@ -79,75 +79,98 @@ pub fn validate_unique_key_uniqueness(
                 .map(|idx| schema.columns[*idx].name.clone())
                 .collect::<Vec<_>>();
             if columns == index_columns {
-                for key in &keys {
-                    if engine
-                        .index_manager()
-                        .unique_key_exists(db, table, index_name, key)?
-                        .unwrap_or(false)
-                    {
-                        return Err(duplicate_unique_key_error(table, index_name, key));
+                let key_vec = keys.iter().cloned().collect::<Vec<_>>();
+                match engine
+                    .index_manager()
+                    .unique_keys_exist(db, table, index_name, &key_vec)?
+                {
+                    Some(false) => return Ok(()),
+                    Some(true) => {
+                        for key in &key_vec {
+                            if engine
+                                .index_manager()
+                                .unique_key_exists(db, table, index_name, key)?
+                                .unwrap_or(false)
+                            {
+                                return Err(duplicate_unique_key_error(table, index_name, key));
+                            }
+                        }
+                        return Ok(());
                     }
+                    None => {}
                 }
-                return Ok(());
             }
         }
     }
-    load_existing_unique_keys(engine, db, table, indices, index_name, &mut keys)
+    load_existing_unique_keys(engine, db, table, indices, index_name, &keys)
 }
 
+/// Collect one entry per live row for the given key columns. Rows sharing a
+/// duplicate key from an unvalidated write is preserved: REPLACE treats every location as a
+/// replaceable conflict, so callers must see each one instead of failing on
+/// pre-existing dirty data.
 pub fn collect_unique_index_entries(
     engine: &Engine,
     db: &str,
     table: &str,
     indices: &[usize],
-    index_name: &str,
+    reason: &str,
 ) -> Result<Vec<UniqueIndexEntry>> {
-    let mut keys = HashSet::new();
+    collect_unique_index_entries_from(
+        engine.segment_mgr(),
+        &engine.memtable_manager().get_by_table(db, table),
+        &engine.data_dir().join(db).join(table),
+        table,
+        indices,
+        reason,
+    )
+}
+
+pub(crate) fn collect_unique_index_entries_from(
+    segment_mgr: &SegmentManager,
+    memtables: &[std::sync::Arc<crate::storage::core::memtable::MemTable>],
+    table_dir: &std::path::Path,
+    table: &str,
+    indices: &[usize],
+    reason: &str,
+) -> Result<Vec<UniqueIndexEntry>> {
+    let started = std::time::Instant::now();
     let mut entries = Vec::new();
-    let table_dir = engine.data_dir().join(db).join(table);
     if table_dir.exists() {
-        for seg_path in SegmentManager::discover_segments(&table_dir)? {
-            let reader = engine.segment_mgr().open_reader_cached(&seg_path)?;
+        for seg_path in SegmentManager::discover_segments(table_dir)? {
+            let reader = segment_mgr.open_reader_cached(&seg_path)?;
             for rg_idx in 0..reader.num_row_groups() {
-                let mut batch = reader.read_row_group_with_projection(rg_idx, indices)?;
+                let batch = reader.read_row_group_with_projection(rg_idx, indices)?;
                 let rg_start = reader.row_group_start_row(rg_idx);
-                if !reader.delete_bitmap().is_empty() {
-                    batch = crate::storage::segment::delete_bitmap::filter_batch(
-                        &batch,
-                        rg_start,
-                        reader.delete_bitmap(),
-                    )?;
-                }
+                let delete_bitmap = reader.delete_bitmap();
                 let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
                 for row_idx in 0..batch.num_rows() {
+                    let row_id = rg_start + row_idx as u64;
+                    if crate::storage::segment::delete_bitmap::is_deleted(delete_bitmap, row_id) {
+                        continue;
+                    }
                     let Some(key) =
                         unique_key_for_row(&batch, row_idx, &projected_indices, &batch.schema)
                     else {
                         continue;
                     };
-                    if !keys.insert(key.clone()) {
-                        return Err(duplicate_unique_key_error(table, index_name, &key));
-                    }
                     entries.push(UniqueIndexEntry {
                         key,
                         location: UniqueRowLocation {
                             segment_path: seg_path.to_string_lossy().to_string(),
-                            row_id: rg_start + row_idx as u64,
+                            row_id,
                         },
                     });
                 }
             }
         }
     }
-    for memtable in engine.memtable_manager().get_by_table(db, table) {
+    for memtable in memtables {
         if let Some(batch) = memtable.read() {
             for row_idx in 0..batch.num_rows() {
                 let Some(key) = unique_key_for_row(&batch, row_idx, indices, &batch.schema) else {
                     continue;
                 };
-                if !keys.insert(key.clone()) {
-                    return Err(duplicate_unique_key_error(table, index_name, &key));
-                }
                 entries.push(UniqueIndexEntry {
                     key,
                     location: UniqueRowLocation {
@@ -158,16 +181,28 @@ pub fn collect_unique_index_entries(
             }
         }
     }
+    tracing::warn!(
+        table,
+        key_columns = indices.len(),
+        entries = entries.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        reason,
+        "unique index snapshot rebuild from full-table scan"
+    );
     Ok(entries)
 }
 
+/// Historical duplicate keys among themselves do not violate the statement
+/// being validated: only a collision with a key the current batch is writing
+/// is an error. This mirrors the snapshot-based path (`unique_key_exists`),
+/// which never fails on unrelated pre-existing duplicates.
 fn load_existing_unique_keys(
     engine: &Engine,
     db: &str,
     table: &str,
     indices: &[usize],
     index_name: &str,
-    inserted_keys: &mut HashSet<Vec<ScalarValue>>,
+    new_keys: &HashSet<Vec<ScalarValue>>,
 ) -> Result<()> {
     let table_dir = engine.data_dir().join(db).join(table);
     if table_dir.exists() {
@@ -182,19 +217,13 @@ fn load_existing_unique_keys(
                         reader.delete_bitmap(),
                     )?;
                 }
-                check_existing_unique_batch(table, index_name, &batch, inserted_keys)?;
+                check_existing_unique_batch(table, index_name, &batch, new_keys)?;
             }
         }
     }
     for memtable in engine.memtable_manager().get_by_table(db, table) {
         if let Some(batch) = memtable.read() {
-            check_existing_unique_batch_with_indices(
-                table,
-                index_name,
-                &batch,
-                indices,
-                inserted_keys,
-            )?;
+            check_existing_unique_batch_with_indices(table, index_name, &batch, indices, new_keys)?;
         }
     }
     Ok(())
@@ -204,16 +233,10 @@ fn check_existing_unique_batch(
     table: &str,
     index_name: &str,
     batch: &RecordBatch,
-    inserted_keys: &mut HashSet<Vec<ScalarValue>>,
+    new_keys: &HashSet<Vec<ScalarValue>>,
 ) -> Result<()> {
     let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
-    check_existing_unique_batch_with_indices(
-        table,
-        index_name,
-        batch,
-        &projected_indices,
-        inserted_keys,
-    )
+    check_existing_unique_batch_with_indices(table, index_name, batch, &projected_indices, new_keys)
 }
 
 fn check_existing_unique_batch_with_indices(
@@ -221,13 +244,13 @@ fn check_existing_unique_batch_with_indices(
     index_name: &str,
     batch: &RecordBatch,
     indices: &[usize],
-    inserted_keys: &mut HashSet<Vec<ScalarValue>>,
+    new_keys: &HashSet<Vec<ScalarValue>>,
 ) -> Result<()> {
     for row_idx in 0..batch.num_rows() {
         let Some(key) = unique_key_for_row(batch, row_idx, indices, &batch.schema) else {
             continue;
         };
-        if !inserted_keys.insert(key.clone()) {
+        if new_keys.contains(&key) {
             return Err(duplicate_unique_key_error(table, index_name, &key));
         }
     }
@@ -295,7 +318,7 @@ fn duplicate_unique_key_error(table: &str, index_name: &str, key: &[ScalarValue]
     ))
 }
 
-fn primary_key_indices(schema: &Schema) -> Vec<usize> {
+pub(crate) fn primary_key_indices(schema: &Schema) -> Vec<usize> {
     schema
         .columns
         .iter()
@@ -325,7 +348,7 @@ fn validate_primary_key_values_present(
     Ok(())
 }
 
-fn primary_keys_for_batch(
+pub(crate) fn primary_keys_for_batch(
     batch: &RecordBatch,
     schema: &Schema,
     primary_key_indices: &[usize],
@@ -335,7 +358,7 @@ fn primary_keys_for_batch(
         .collect()
 }
 
-fn validate_primary_key_uniqueness(
+pub fn validate_primary_key_uniqueness(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -349,6 +372,21 @@ fn validate_primary_key_uniqueness(
         if !unique.insert(key.clone()) {
             return Err(duplicate_primary_key_error(table, key));
         }
+    }
+
+    if let Some(exists) = engine.index_manager().unique_keys_exist(
+        db,
+        table,
+        crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+        &keys,
+    )? {
+        if exists {
+            return Err(TaibaiError::Sql(format!(
+                "duplicate primary key for table '{}'",
+                table
+            )));
+        }
+        return Ok(());
     }
 
     if let Some(exists) = engine
@@ -369,7 +407,7 @@ fn validate_primary_key_uniqueness(
         db,
         table,
         primary_key_indices,
-        "PRIMARY",
+        "primary key uniqueness fallback",
     )?;
     let historical_keys = entries
         .into_iter()

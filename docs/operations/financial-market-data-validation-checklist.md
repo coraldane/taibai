@@ -124,7 +124,7 @@ CREATE TABLE daily_bars (
 | 多连接并发写入 | 多客户端按不同 symbol 或交易所写入 | 无死锁、无重复提交异常 |
 | 高峰写入 | 模拟开盘、收盘、极端行情突发流量 | P99 写入延迟不超过目标 |
 | 批量写入 | 使用批量导入协议写入当日数据 | 吞吐稳定，segment 文件可读 |
-| 小批量写入 | 逐条或小批次写入 | 延迟可控，WAL 不异常膨胀 |
+| 小批量写入 | 逐条或小批次写入 | 延迟可控，tail 不异常膨胀 |
 | 乱序写入 | 部分 tick 延迟到达 | 查询结果按 event_time/sequence 正确排序 |
 | 重复写入 | 重放同一批 tick | 可去重或重复边界明确 |
 | 跨交易日写入 | 交易日切换时持续写入 | 正确进入新分区 |
@@ -198,7 +198,7 @@ resume(last_ack_sequence)
 | 重复导入 | 同一天重复导入 | 可替换、幂等或拒绝策略明确 |
 | 增量补数据 | 补充历史某一天数据 | 元数据、索引、checksum 更新正确 |
 | 修正数据 | 替换某 symbol 某日分钟线 | 旧数据不可见，新数据可查 |
-| 压缩率 | 统计原始数据、WAL、segment、索引大小 | 符合容量规划 |
+| 压缩率 | 统计原始数据、tail、segment、索引大小 | 符合容量规划 |
 
 ### 5.2 核心查询
 
@@ -268,7 +268,7 @@ resume(last_ack_sequence)
 - 并发 INSERT 不丢行。
 - 并发 SELECT 与 INSERT 互不阻塞或阻塞边界明确。
 - 并发 UPDATE/DELETE 与 SELECT 可见性正确。
-- 长事务不会无限阻塞 compaction 或 WAL 清理。
+- 长事务不会无限阻塞 compaction 或 tail 清理。
 - 事务 ID、快照、MVCC 版本回收正确。
 - 死锁或锁等待有超时和日志。
 
@@ -294,18 +294,21 @@ resume(last_ack_sequence)
 - TLS 连接。
 - 错误信息不泄露敏感路径、密码、token。
 
-## 7. 存储、WAL 与恢复验证
+## 7. 存储、持久化 tail 与恢复验证
 
-### 7.1 WAL
+### 7.1 持久化 tail (durable tail)
+
+经典 WAL 已移除，持久化由 `memtable_tail/` 尾部日志与 active segment 自身承担。
 
 | 测试项 | 验证方法 | 验收标准 |
 |--------|----------|----------|
-| WAL 追加 | 写入后检查 WAL 记录 | CRC、长度、事务信息正确 |
-| WAL replay | 停库后重启 | 已提交数据恢复 |
+| tail 追加 | 写入后检查 tail 帧 | CRC、长度、行数索引正确 |
+| tail replay | 停库后重启 | 已提交数据恢复 |
 | 未提交事务 | crash 前未 commit | 重启后不可见 |
-| 截断 WAL | 人为截断最后一条记录 | 可安全忽略损坏尾部 |
-| WAL 膨胀 | 长时间写入 | 清理策略有效或告警明确 |
-| WAL 压缩 | 如启用压缩 | replay 正确，压缩率可观测 |
+| 截断 tail | 人为截断最后一帧 | 可安全忽略损坏尾部 |
+| tail 膨胀 | 长时间写入 | flush/seal 后及时清理，膨胀可告警 |
+| tail 压缩 | zstd 压缩帧 | replay 正确，压缩率可观测 |
+| 重复回放 | crash 于物化后、tail 清理前 | 行数 watermark 防止重复计入 |
 | fsync 策略 | sync/no-sync/bulk 模式 | 数据损失边界明确 |
 
 ### 7.2 Segment
@@ -325,7 +328,7 @@ resume(last_ack_sequence)
 | 场景 | 验证方法 | 验收标准 |
 |------|----------|----------|
 | INSERT 前崩溃 | kill -9 before write | 无半条数据 |
-| WAL 后 segment 前崩溃 | 注入崩溃点 | replay 后数据可见 |
+| tail 落盘后物化前崩溃 | 注入崩溃点 | replay 后数据可见 |
 | segment 写入中崩溃 | 注入崩溃点 | 不读取损坏 segment，可恢复 |
 | commit 前崩溃 | 注入崩溃点 | 事务不可见 |
 | commit 后崩溃 | 注入崩溃点 | 事务可见 |
@@ -339,7 +342,7 @@ resume(last_ack_sequence)
 
 | 测试 | 指标 |
 |------|------|
-| SQL INSERT 单行 | rows/s、P95/P99 latency、WAL size |
+| SQL INSERT 单行 | rows/s、P95/P99 latency、tail size |
 | SQL INSERT 多行 | batch size 与吞吐曲线 |
 | INSERT_BATCH | rows/s、CPU、内存、磁盘写入 |
 | bulk import columnar | rows/s、压缩率、segment size |
@@ -379,7 +382,7 @@ resume(last_ack_sequence)
 - 定时 flush。
 - segment seal。
 - compaction。
-- WAL 清理。
+- tail 清理。
 - 备份。
 - 随机 kill/restart。
 - 定期 checksum 校验。
@@ -388,14 +391,14 @@ resume(last_ack_sequence)
 
 | 故障 | 验证目标 |
 |------|----------|
-| kill -9 服务进程 | WAL/segment 恢复正确 |
+| kill -9 服务进程 | tail/segment 恢复正确 |
 | 机器重启 | 数据目录可恢复 |
 | 网络断开 | 客户端重连、订阅恢复 |
 | 网络延迟 | 写入和订阅延迟可观测 |
 | 磁盘满 | 写入失败明确，不损坏已有数据 |
 | 磁盘慢 | P99 延迟和背压策略可观测 |
 | 文件损坏 | segment checker 能发现并隔离 |
-| WAL 损坏 | replay 可停止在安全位置 |
+| tail 损坏 | replay 可停止在安全位置 |
 | schema 文件损坏 | 有备份或明确恢复方式 |
 | 时钟跳变 | event_time 不受系统时间异常影响 |
 | 内存压力 | 查询失败可控，不 OOM 崩溃 |
@@ -413,7 +416,7 @@ resume(last_ack_sequence)
 - 查询 P50/P95/P99。
 - tick 订阅推送延迟。
 - 订阅 backlog。
-- WAL 文件数量和大小。
+- tail 文件数量和大小。
 - segment 数量、大小、row group 数。
 - compaction 次数、耗时、输入/输出大小。
 - 分区数量和大小。
@@ -428,7 +431,7 @@ resume(last_ack_sequence)
 - 启动配置。
 - 数据目录和版本。
 - schema 加载。
-- WAL replay 进度。
+- tail replay 进度。
 - segment seal。
 - compaction 开始和结束。
 - 查询计划和慢查询。
@@ -482,7 +485,7 @@ resume(last_ack_sequence)
 
 | 层级 | 数据规模 | 触发方式 | 内容 |
 |------|----------|----------|------|
-| Unit | 极小 | 每次提交 | parser、types、codec、WAL、segment、optimizer |
+| Unit | 极小 | 每次提交 | parser、types、codec、tail、segment、optimizer |
 | Integration | Mini | 每次提交 | DDL、DML、查询、事务、权限 |
 | Correctness | Small | 每日 | 与 reference 系统比对 |
 | Performance Smoke | Small | 每日 | 核心查询和写入性能趋势 |

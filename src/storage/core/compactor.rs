@@ -327,6 +327,7 @@ impl Compactor {
         Ok(stats)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compact_segment_group(
         &self,
         db: &str,
@@ -577,6 +578,7 @@ impl Compactor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_compacted_segment(
         &self,
         db: &str,
@@ -660,20 +662,18 @@ impl Compactor {
             sorted_indices.len()
         };
 
-        if sort_key_indices.is_empty() && total_rows > 0 {
-            if rows_written != total_rows {
-                let progress_pct = rows_written as f64 * 100.0 / total_rows as f64;
-                tracing::info!(
-                    db,
-                    table,
-                    table_full_name = %format!("{}.{}", db, table),
-                    partition_key,
-                    rows_written,
-                    total_rows,
-                    progress_pct = format_args!("{:.2}", progress_pct),
-                    "compact write progress"
-                );
-            }
+        if sort_key_indices.is_empty() && total_rows > 0 && rows_written != total_rows {
+            let progress_pct = rows_written as f64 * 100.0 / total_rows as f64;
+            tracing::info!(
+                db,
+                table,
+                table_full_name = %format!("{}.{}", db, table),
+                partition_key,
+                rows_written,
+                total_rows,
+                progress_pct = format_args!("{:.2}", progress_pct),
+                "compact write progress"
+            );
         }
 
         tracing::info!(
@@ -1377,5 +1377,5 @@ pub(crate) fn partition_key_candidates(raw: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[path = "compactor_tests.rs"]
+#[path = "compactor_test.rs"]
 mod tests;

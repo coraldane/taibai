@@ -23,6 +23,7 @@ pub struct ScanExec {
     table_schema: Option<Schema>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ScanSource {
     Batches(VecDeque<RecordBatch>),
     Cursor(ScanCursor),

@@ -18,12 +18,6 @@ impl SelectionVector {
         Self { indices }
     }
 
-    pub fn all(len: usize) -> Self {
-        Self {
-            indices: (0..len as u32).collect(),
-        }
-    }
-
     pub fn indices(&self) -> &[u32] {
         &self.indices
     }
@@ -57,14 +51,5 @@ impl SelectionVector {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::SelectionVector;
-
-    #[test]
-    fn mask_is_converted_to_stable_row_ids() {
-        assert_eq!(
-            SelectionVector::from_mask(&[true, false, true, true]).indices(),
-            &[0, 2, 3]
-        );
-    }
-}
+#[path = "selection_test.rs"]
+mod tests;

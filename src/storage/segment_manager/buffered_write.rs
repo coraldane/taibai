@@ -4,7 +4,6 @@ impl SegmentManager {
         db: &str,
         table: &str,
         batch: RecordBatch,
-        _disable_wal: bool,
     ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true)
     }
@@ -14,19 +13,8 @@ impl SegmentManager {
         db: &str,
         table: &str,
         batch: &RecordBatch,
-        _disable_wal: bool,
     ) -> Result<u64> {
         self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
-    }
-
-    pub fn bulk_insert_batch_deferred(
-        &self,
-        db: &str,
-        table: &str,
-        batch: RecordBatch,
-        _disable_wal: bool,
-    ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, false)
     }
 
     pub fn bulk_insert_batch_with_partition(
@@ -42,32 +30,6 @@ impl SegmentManager {
             partition_key,
             batch,
             true,
-        )
-    }
-
-    pub fn bulk_insert_batch_with_partition_ref(
-        &self,
-        db: &str,
-        table: &str,
-        partition_key: &str,
-        batch: &RecordBatch,
-    ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, partition_key, batch, true)
-    }
-
-    pub fn bulk_insert_batch_with_partition_deferred(
-        &self,
-        db: &str,
-        table: &str,
-        partition_key: &str,
-        batch: RecordBatch,
-    ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_owned_inner(
-            db,
-            table,
-            partition_key,
-            batch,
-            false,
         )
     }
 
@@ -97,6 +59,7 @@ impl SegmentManager {
             batch,
             flush_immediately,
         )?;
+        self.note_direct_segment_append(db, table);
         Ok(row_count)
     }
 
@@ -127,9 +90,15 @@ impl SegmentManager {
             flush_immediately,
         )?;
 
+        self.note_direct_segment_append(db, table);
         Ok(row_count)
     }
 
+    /// Test-only helper: flush one batch through the memtable path when
+    /// `should_write` returns true. Production writes go through the bulk
+    /// insert paths above; DDL tests use this to force deterministic flushes.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn flush_memtable_batch_if(
         &self,
         db: &str,
@@ -217,6 +186,7 @@ impl SegmentManager {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn flush_memtable_batch_if_under_table_lock(
         &self,
         db: &str,
@@ -245,13 +215,14 @@ impl SegmentManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flush_memtable_batch_under_table_lock_inner(
         &self,
         db: &str,
         table: &str,
         partition_key: &str,
         batch: &RecordBatch,
-        txn_id: u64,
+        _txn_id: u64,
         state: &TableSegmentState,
         should_write: impl FnOnce() -> bool,
         on_written: impl FnOnce(),
@@ -262,13 +233,9 @@ impl SegmentManager {
 
         let table_dir = self.data_dir.join(db).join(table);
         std::fs::create_dir_all(&table_dir)?;
-        if txn_id > 0 {
-            self.write_txn_wal(&table_dir, txn_id, batch)?;
-        }
-        self.append_batch_with_partition_locked(&table_dir, &state, partition_key, batch, true)?;
-        if txn_id > 0 {
-            self.sync_table_wal(&table_dir)?;
-        }
+        let _visibility = state.flush_visibility.write().unwrap();
+        self.append_batch_with_partition_locked(&table_dir, state, partition_key, batch, true)?;
+        Self::sleep_flush_transition_delay();
         on_written();
         Ok(true)
     }
@@ -284,14 +251,14 @@ impl SegmentManager {
         {
             let mut active_guard = state.active_segments.lock().unwrap();
             self.get_or_create_active_segment_for_partition_locked(
-                &table_dir,
+                table_dir,
                 &batch.schema,
                 partition_key,
                 &mut active_guard,
             )?;
 
             let seg = active_guard.get_mut(partition_key).unwrap();
-            seg.append_batch(&batch, &|path| self.invalidate_reader(path))?;
+            seg.append_batch(batch, &|path| self.invalidate_reader(path))?;
 
             if seg.current_size >= self.max_segment_size() {
                 seg.seal(&|path| self.invalidate_reader(path))?;

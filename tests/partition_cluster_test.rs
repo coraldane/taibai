@@ -149,7 +149,7 @@ fn bulk_import_honors_year_partition_on_int32_yyyymmdd() {
 
     assert_eq!(
         engine
-            .exec_bulk_insert_payload_with_wal_control("main", &payload, false)
+            .exec_bulk_insert_payload_with_options("main", &payload, false)
             .expect("bulk insert"),
         4
     );
@@ -258,7 +258,7 @@ fn direct_bulk_preserves_nulls_when_partition_groups_reorder_rows() {
     let payload = encode_columnar_bulk_insert("nullable_bulk", &batch).unwrap();
     assert_eq!(
         engine
-            .exec_bulk_insert_payload_with_wal_control("main", &payload, false)
+            .exec_bulk_insert_payload_with_options("main", &payload, false)
             .expect("direct bulk insert with nulls"),
         4
     );
@@ -360,7 +360,7 @@ fn direct_bulk_rejects_null_for_not_null_column() {
     let payload = encode_columnar_bulk_insert("strict_bulk", &batch).unwrap();
 
     let err = engine
-        .exec_bulk_insert_payload_with_wal_control("main", &payload, false)
+        .exec_bulk_insert_payload_with_options("main", &payload, false)
         .unwrap_err();
     assert!(err.to_string().contains("does not allow NULL"));
 }
@@ -494,7 +494,7 @@ fn bulk_import_mode_defers_direct_payload_metadata_flush() {
 
     assert_eq!(
         engine
-            .exec_bulk_insert_payload_with_options("main", &payload, true, true)
+            .exec_bulk_insert_payload_with_options("main", &payload, true)
             .expect("bulk insert"),
         2
     );
@@ -751,7 +751,7 @@ fn bulk_import_append_is_visible_to_count_before_flush() {
             ],
         );
         engine
-            .exec_bulk_insert_payload_with_wal_control("main", &seed, false)
+            .exec_bulk_insert_payload_with_options("main", &seed, false)
             .expect("seed bulk insert");
         engine.flush_all_buffers().expect("flush seed rows");
         engine.segment_mgr().shutdown();
@@ -786,7 +786,7 @@ fn bulk_import_append_is_visible_to_count_before_flush() {
     );
     assert_eq!(
         engine
-            .exec_bulk_insert_payload_with_options("main", &append, true, true)
+            .exec_bulk_insert_payload_with_options("main", &append, true)
             .expect("bulk append"),
         3
     );
@@ -841,7 +841,7 @@ fn deferred_direct_bulk_append_invalidates_cached_reader_for_count() {
     );
     assert_eq!(
         engine
-            .exec_bulk_insert_payload_with_wal_control("main", &first, false)
+            .exec_bulk_insert_payload_with_options("main", &first, false)
             .expect("first bulk insert"),
         2
     );
@@ -876,7 +876,7 @@ fn deferred_direct_bulk_append_invalidates_cached_reader_for_count() {
     );
     assert_eq!(
         engine
-            .exec_bulk_insert_payload_with_options("main", &second, true, true)
+            .exec_bulk_insert_payload_with_options("main", &second, true)
             .expect("deferred bulk append"),
         3
     );
@@ -932,7 +932,7 @@ fn deferred_direct_bulk_first_value_partition_insert_is_countable_by_partition_c
     );
     assert_eq!(
         engine
-            .exec_bulk_insert_payload_with_options("main", &payload, true, true)
+            .exec_bulk_insert_payload_with_options("main", &payload, true)
             .expect("deferred bulk insert"),
         3
     );

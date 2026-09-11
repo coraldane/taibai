@@ -10,10 +10,6 @@ use super::Rule;
 pub struct FilterReorderRule;
 
 impl Rule for FilterReorderRule {
-    fn name(&self) -> &str {
-        "filter_reorder"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         reorder_filters(plan)
     }

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::protocol::types::DataType;
 use crate::types::scalar::ScalarValue;
 
@@ -81,6 +80,7 @@ pub enum GrantObject {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Statement {
     CreateIndex {
         name: String,
@@ -100,6 +100,7 @@ pub enum Statement {
         partition_by: Option<PartitionDef>,
         ttl: Option<TtlDef>,
         hot: Option<HotDef>,
+        durability: Option<DurabilityLevel>,
     },
     DropTable {
         name: ObjectName,
@@ -331,6 +332,12 @@ pub struct TtlDef {
     pub duration_secs: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityLevel {
+    Strict,
+    Relaxed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JoinType {
     Inner,
@@ -386,6 +393,39 @@ pub struct OrderByItem {
     pub desc: bool,
 }
 
+/// The shape of a correlated subquery occurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrelatedKind {
+    /// `EXISTS (SELECT ...)` / `NOT EXISTS (SELECT ...)`
+    Exists { negated: bool },
+    /// `(SELECT ...)` used as a scalar value; must yield at most one row.
+    Scalar,
+    /// `<lhs> IN (SELECT ...)` / `NOT IN`; `lhs` is evaluated in the outer scope.
+    In { negated: bool },
+}
+
+/// A bound correlated subquery. Produced only by the execution layer's
+/// binding pass; the parser never creates this node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrelatedSubquery {
+    /// Registry key for the execution-time snapshot of the inner query.
+    pub id: u64,
+    pub kind: CorrelatedKind,
+    /// For `CorrelatedKind::In`, the left-hand side expression (outer scope).
+    pub lhs: Option<Box<Expr>>,
+    /// The inner statement with correlated WHERE conjuncts removed and outer
+    /// references replaced by `Expr::Placeholder(id)` markers.
+    pub stmt: Box<Statement>,
+    /// The WHERE conjuncts that reference the outer block, still carrying
+    /// placeholder markers. Re-inserted (with markers substituted) before each
+    /// per-row execution.
+    pub conjuncts: Vec<Expr>,
+    /// `placeholder id -> column index in the enclosing block's schema`.
+    pub params: Vec<(usize, usize)>,
+    /// Data type of the value this node evaluates to (captured at bind time).
+    pub result_type: crate::protocol::types::DataType,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(ScalarValue),
@@ -427,6 +467,13 @@ pub enum Expr {
     },
     Exists(Box<Expr>),
     Subquery(Box<Statement>),
+    /// A correlated subquery left in place by the execution layer's binding
+    /// pass (`query::bind_correlated_subquery`). The inner statement's
+    /// references to the enclosing query block were rewritten to
+    /// `Expr::Placeholder(id)` markers; `params` maps each marker id to the
+    /// enclosing block's column index. The execution layer evaluates the node
+    /// once per outer row (see `execution::subquery_runtime`).
+    Correlated(Box<CorrelatedSubquery>),
     Function {
         name: String,
         args: Vec<Expr>,

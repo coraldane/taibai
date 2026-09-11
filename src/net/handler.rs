@@ -43,7 +43,6 @@ impl Handler {
             if session.bulk_import_mode {
                 remaining_bulk_sessions = self.engine.end_bulk_import();
                 session.bulk_import_mode = false;
-                session.disable_wal = false;
                 tracing::info!(
                     remaining_bulk_sessions,
                     session_id = %session.session_id_string(),
@@ -63,11 +62,6 @@ impl Handler {
                 }
             }
         }
-    }
-
-    #[cfg(test)]
-    pub fn handle_message(&mut self, msg: Message) -> Result<Vec<Message>> {
-        self.handle_message_cancellable(msg, Arc::new(AtomicBool::new(false)), None)
     }
 
     pub fn handle_message_cancellable(
@@ -130,14 +124,11 @@ impl Handler {
             database.to_string()
         };
 
-        let binary_results = rest.first().map(|&b| b != 0).unwrap_or(false);
-
-        let timezone_offset_hours = if rest.len() >= 5 {
-            i32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]])
-        } else {
-            0
-        };
-        let streaming_results = rest.get(5).is_some_and(|&b| b != 0);
+        if rest.len() != 5 {
+            return Err(TaibaiError::Protocol("invalid login capabilities".into()));
+        }
+        let timezone_offset_hours = i32::from_le_bytes(rest[0..4].try_into().unwrap());
+        let streaming_results = rest[4] != 0;
 
         let auth_result = self
             .engine
@@ -162,8 +153,17 @@ impl Handler {
             ))]);
         }
 
+        if self.session.is_some() {
+            tracing::warn!(
+                username,
+                "duplicate login on an authenticated connection rejected to preserve existing session state (prepared statements, active transaction)"
+            );
+            return Ok(vec![build_auth_fail(
+                "connection already logged in; reuse the established session or open a new connection",
+            )]);
+        }
+
         let mut session = Session::new(username.to_string(), database);
-        session.binary_results = binary_results;
         session.streaming_results = streaming_results;
         session.timezone_offset_hours = timezone_offset_hours;
         let session_id = session.session_id_string();
@@ -194,7 +194,7 @@ impl Handler {
             .get(..b"INSERT".len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"INSERT"));
         let should_log_query = should_log_query_sql(sql);
-        if !is_insert {
+        if !is_insert && !is_heartbeat_query(sql) {
             tracing::info!(sql, "query received");
         }
 
@@ -228,7 +228,6 @@ impl Handler {
             return result;
         }
 
-        let use_binary = session.binary_results;
         let original_database = session.database.clone();
         let has_query_database = !database.is_empty();
         if has_query_database {
@@ -318,11 +317,7 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
-                let msg = if use_binary {
-                    build_binary_query_result(&schema, &batches)
-                } else {
-                    build_query_result(&schema, &batches)
-                };
+                let msg = build_binary_query_result(&schema, &batches);
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
                     Err(error) => return Ok(vec![build_error(&error.to_string())]),
@@ -372,13 +367,10 @@ impl Handler {
         Ok(msg)
     }
 
-    fn handle_start_bulk_import(&mut self, sql: &str) -> Result<Vec<Message>> {
+    fn handle_start_bulk_import(&mut self, _sql: &str) -> Result<Vec<Message>> {
         let Some(session) = self.session.as_mut() else {
             return Ok(vec![build_error("not logged in")]);
         };
-
-        let disable_wal =
-            sql.contains("\"disable_wal\":true") || sql.contains("\"disable_wal\": true");
 
         let active_sessions = if session.bulk_import_mode {
             self.engine.bulk_mode_session_count()
@@ -387,10 +379,8 @@ impl Handler {
         };
 
         session.bulk_import_mode = true;
-        session.disable_wal = disable_wal;
 
         tracing::info!(
-            disable_wal,
             active_bulk_sessions = active_sessions,
             "bulk import mode started"
         );
@@ -412,7 +402,6 @@ impl Handler {
         // state consistent even if flushing a dirty table reports an error;
         // the dirty-table entry remains queued for a later retry.
         session.bulk_import_mode = false;
-        session.disable_wal = false;
 
         let flushed = if remaining_sessions == 0 {
             self.engine.flush_bulk_dirty_tables()?
@@ -429,8 +418,8 @@ impl Handler {
     }
 
     fn handle_bulk_insert(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
-        let (db, disable_wal) = match &self.session {
-            Some(s) => (s.database.clone(), s.disable_wal),
+        let db = match &self.session {
+            Some(s) => s.database.clone(),
             None => return Ok(vec![build_error("not logged in")]),
         };
 
@@ -441,7 +430,6 @@ impl Handler {
         match self.engine.exec_bulk_insert_payload_with_options(
             &db,
             payload,
-            disable_wal,
             self.session
                 .as_ref()
                 .map(|s| s.bulk_import_mode)
@@ -492,10 +480,67 @@ impl Handler {
                         }
                     }
                 }
+                if let Some((_, param_types)) =
+                    Self::current_insert_param_types(&self.engine, session, &stmt)
+                {
+                    if let Some(cached) = session.prepared_statements.get_mut(stmt.id) {
+                        cached.param_types = param_types;
+                    }
+                }
                 Ok(vec![Message::new(MSG_TYPE_PREPARE, Bytes::from(buf))])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
         }
+    }
+
+    fn current_insert_param_types(
+        engine: &Engine,
+        session: &Session,
+        stmt: &crate::sql::execution::prepared::PreparedStatement,
+    ) -> Option<(String, Vec<crate::protocol::types::DataType>)> {
+        let (table, columns) = match &stmt.stmt {
+            Statement::Insert { table, columns, .. }
+            | Statement::Replace { table, columns, .. } => (table, columns),
+            _ => return None,
+        };
+        let database = table.effective_database(&session.database);
+        let meta = engine.get_table_meta(database, &table.name)?;
+        let mut types = Vec::with_capacity(stmt.param_count);
+        for param_index in 0..stmt.param_count {
+            let column = if columns.is_empty() {
+                meta.columns.get(param_index)
+            } else {
+                columns.get(param_index).and_then(|name| {
+                    meta.columns
+                        .iter()
+                        .find(|column| column.name.eq_ignore_ascii_case(name))
+                })
+            };
+            types.push(column?.data_type);
+        }
+        Some((format!("{}.{}", database, table.name), types))
+    }
+
+    fn reject_stale_prepared_statement(
+        engine: &Engine,
+        session: &mut Session,
+        stmt: crate::sql::execution::prepared::PreparedStatement,
+        stmt_id: u32,
+    ) -> Vec<Message> {
+        let qualified_name = Self::current_insert_param_types(engine, session, &stmt)
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| "unknown table".to_string());
+        session.prepared_statements.insert(stmt);
+        tracing::warn!(
+            stmt_id,
+            table = %qualified_name,
+            "prepared statement rejected: table schema changed after PREPARE"
+        );
+        vec![build_error(&format!(
+            "prepared statement {} no longer matches current schema of {} \
+             (table altered after PREPARE); re-prepare the statement",
+            stmt_id, qualified_name
+        ))]
     }
 
     fn handle_execute(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -564,19 +609,38 @@ impl Handler {
             }
         }
 
-        let use_binary = session.binary_results;
-
         let mut stmt = match session.prepared_statements.remove(stmt_id) {
             Some(s) => s,
             None => {
+                tracing::warn!(
+                    stmt_id,
+                    live_statements = session.prepared_statements.len(),
+                    next_unissued_id = session.prepared_statements.next_id(),
+                    "prepared statement lookup failed on execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
+                );
                 return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found",
-                    stmt_id
-                ))])
+                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
+                    stmt_id,
+                    session.prepared_statements.len(),
+                    session.prepared_statements.next_id()
+                ))]);
             }
         };
 
         stmt.params = params;
+
+        if let Some((_, current_types)) =
+            Self::current_insert_param_types(&self.engine, session, &stmt)
+        {
+            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
+                return Ok(Self::reject_stale_prepared_statement(
+                    &self.engine,
+                    session,
+                    stmt,
+                    stmt_id,
+                ));
+            }
+        }
 
         let execute_start = Instant::now();
         let result = self.engine.execute_prepared(session, &mut stmt);
@@ -595,11 +659,7 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
-                let msg = if use_binary {
-                    build_binary_query_result(&schema, &batches)
-                } else {
-                    build_query_result(&schema, &batches)
-                };
+                let msg = build_binary_query_result(&schema, &batches);
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
                     Err(error) => return Ok(vec![build_error(&error.to_string())]),
@@ -814,14 +874,35 @@ impl Handler {
         let mut stmt = match session.prepared_statements.remove(stmt_id) {
             Some(s) => s,
             None => {
+                tracing::warn!(
+                    stmt_id,
+                    live_statements = session.prepared_statements.len(),
+                    next_unissued_id = session.prepared_statements.next_id(),
+                    "prepared statement lookup failed on batch execute; client may reference an unknown id (protocol/version mismatch or stale connection)"
+                );
                 return Ok(vec![build_error(&format!(
-                    "prepared statement {} not found",
-                    stmt_id
-                ))])
+                    "prepared statement {} not found (session has {} prepared statement(s); ids start at 1, next unissued id is {})",
+                    stmt_id,
+                    session.prepared_statements.len(),
+                    session.prepared_statements.next_id()
+                ))]);
             }
         };
 
         let param_count = stmt.param_count;
+
+        if let Some((_, current_types)) =
+            Self::current_insert_param_types(&self.engine, session, &stmt)
+        {
+            if !stmt.param_types.is_empty() && stmt.param_types != current_types {
+                return Ok(Self::reject_stale_prepared_statement(
+                    &self.engine,
+                    session,
+                    stmt,
+                    stmt_id,
+                ));
+            }
+        }
         let mut parameter_batch = Vec::with_capacity(batch_size);
 
         for row_idx in 0..batch_size {
@@ -1037,6 +1118,16 @@ fn log_query_if_needed(
     }
 }
 
+fn is_heartbeat_query(sql: &str) -> bool {
+    let sql = sql.trim_end();
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+    let mut tokens = sql.split_ascii_whitespace();
+    matches!(
+        (tokens.next(), tokens.next(), tokens.next()),
+        (Some(select), Some("1"), None) if select.eq_ignore_ascii_case("SELECT")
+    )
+}
+
 fn should_log_query_sql(sql: &str) -> bool {
     // INSERT statements can be megabytes long. Do not parse every statement a
     // second time merely to decide whether it produces a result set.
@@ -1129,39 +1220,6 @@ fn append_duration_micros(buf: &mut Vec<u8>, elapsed: Duration) {
     buf.extend_from_slice(&(elapsed.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
 }
 
-fn build_query_result(
-    schema: &crate::types::batch::Schema,
-    batches: &[crate::types::batch::RecordBatch],
-) -> Message {
-    let mut buf = Vec::new();
-
-    buf.extend_from_slice(&(schema.columns.len() as u32).to_le_bytes());
-
-    for col in &schema.columns {
-        write_len_prefixed_string(&mut buf, &col.name);
-        buf.push(col.data_type as u8);
-        buf.push(col.scale as u8);
-        buf.push(col.precision as u8);
-    }
-
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    buf.extend_from_slice(&(total_rows as u32).to_le_bytes());
-
-    for batch in batches {
-        for row in 0..batch.num_rows() {
-            for col_idx in 0..schema.columns.len() {
-                let col_def = &schema.columns[col_idx];
-                match batch.column(col_idx) {
-                    Some(col) => write_column_value_with_scale(&mut buf, col, row, col_def.scale),
-                    None => buf.push(1),
-                }
-            }
-        }
-    }
-
-    Message::new(MSG_TYPE_RESULT, Bytes::from(buf))
-}
-
 fn build_binary_query_result(
     schema: &crate::types::batch::Schema,
     batches: &[crate::types::batch::RecordBatch],
@@ -1170,97 +1228,6 @@ fn build_binary_query_result(
     Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(encoded))
 }
 
-fn write_column_value_with_scale(
-    buf: &mut Vec<u8>,
-    col: &crate::types::array::ColumnArray,
-    row: usize,
-    scale: i32,
-) {
-    if col.bitmap().is_null(row) {
-        buf.push(1);
-        return;
-    }
-
-    buf.push(0);
-    match col {
-        crate::types::array::ColumnArray::Bool { data, .. } => {
-            buf.push(if data[row] != 0 { 1 } else { 0 })
-        }
-        crate::types::array::ColumnArray::Int8 { data, .. } => buf.push(data[row] as u8),
-        crate::types::array::ColumnArray::Int16 { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::Int32 { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::Int64 { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::UInt8 { data, .. } => buf.push(data[row]),
-        crate::types::array::ColumnArray::UInt16 { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::UInt32 { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::UInt64 { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::Float32 { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::Float64 { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::Decimal { data, .. } => {
-            write_decimal_value_with_scale(buf, data[row], scale)
-        }
-        crate::types::array::ColumnArray::Date { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::Time { data, .. }
-        | crate::types::array::ColumnArray::Timestamp { data, .. }
-        | crate::types::array::ColumnArray::Interval { data, .. } => {
-            buf.extend_from_slice(&data[row].to_le_bytes())
-        }
-        crate::types::array::ColumnArray::VarChar { data, .. } => {
-            let bytes = data[row].as_bytes();
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(bytes);
-        }
-        crate::types::array::ColumnArray::Blob { data, .. } => {
-            buf.extend_from_slice(&(data[row].len() as u32).to_le_bytes());
-            buf.extend_from_slice(&data[row]);
-        }
-        crate::types::array::ColumnArray::Vector { data, .. } => {
-            buf.extend_from_slice(&(data[row].len() as u32).to_le_bytes());
-            for f in &data[row] {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-    }
-}
-
-fn write_decimal_value_with_scale(buf: &mut Vec<u8>, value: i64, scale: i32) {
-    if scale > 0 {
-        let divisor = 10_i128.pow(scale as u32);
-        let sign = if value < 0 { "-" } else { "" };
-        let abs = (value as i128).abs();
-        let int_part = abs / divisor;
-        let frac_part = abs % divisor;
-        let s = if frac_part == 0 {
-            format!("{}{}", sign, int_part)
-        } else {
-            let width = scale as usize;
-            format!("{}{}.{:0width$}", sign, int_part, frac_part)
-        };
-        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        buf.extend_from_slice(s.as_bytes());
-    } else {
-        buf.extend_from_slice(&value.to_le_bytes());
-    }
-}
-
 #[cfg(test)]
-#[path = "handler_tests.rs"]
+#[path = "handler_test.rs"]
 mod tests;

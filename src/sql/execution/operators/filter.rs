@@ -1,23 +1,28 @@
 use crate::common::error::Result;
 use crate::sql::execution::functions::registry::FunctionRegistry;
+use crate::sql::execution::helpers::scalar_like_matches;
 use crate::sql::parser::ast::BinOp;
 use crate::sql::planner::{AggregateExpr, LogicalExpr};
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::{ExecutionOp, RuntimeInFilter};
+use crate::sql::execution::subquery_runtime::SubqueryRegistry;
 
 pub struct FilterExec {
     pub predicate: LogicalExpr,
     pub input: Box<dyn ExecutionOp>,
     pub schema: Schema,
+    /// Snapshot registry for correlated subqueries, when the query contains
+    /// any. `None` makes evaluation of such nodes fail loudly.
+    pub subqueries: Option<SubqueryRegistry>,
 }
 
 impl ExecutionOp for FilterExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         while let Some(batch) = self.input.next_batch()? {
             let predicate = remap_expr_for_batch(&self.predicate, &self.schema, &batch.schema);
-            let mask = eval_filter(&predicate, &batch)?;
+            let mask = eval_filter_with(&predicate, &batch, self.subqueries.as_ref())?;
             let filtered = super::apply_filter_mask(&batch, &mask);
             if filtered.num_rows() > 0 {
                 return Ok(Some(filtered));
@@ -137,8 +142,46 @@ pub fn remap_expr_for_batch(
                 .map(|arg| remap_expr_for_batch(arg, logical_schema, batch_schema))
                 .collect(),
         },
+        LogicalExpr::CorrelatedSubquery(corr_box) => {
+            let mut corr = (*corr_box).clone();
+            // Params point at the enclosing block's logical columns; remap
+            // them to the physical batch layout the same way plain columns
+            // are remapped.
+            corr.params = corr
+                .params
+                .iter()
+                .map(|(marker, logical_idx)| {
+                    let batch_idx = logical_schema
+                        .columns
+                        .get(*logical_idx)
+                        .and_then(|col| {
+                            if batch_schema.columns.get(*logical_idx) == Some(col) {
+                                Some(*logical_idx)
+                            } else {
+                                batch_schema.index_of(&col.name)
+                            }
+                        })
+                        .unwrap_or(*logical_idx);
+                    (*marker, batch_idx)
+                })
+                .collect();
+            if let Some(lhs) = &corr.lhs {
+                corr.lhs = Some(Box::new(remap_expr_for_batch(
+                    lhs,
+                    logical_schema,
+                    batch_schema,
+                )));
+            }
+            LogicalExpr::CorrelatedSubquery(corr)
+        }
         _ => expr.clone(),
     }
+}
+
+/// Equality with the same semantics as `eval_comparison(.., Eq, ..)`: NULL
+/// never equals anything.
+pub(crate) fn values_equal(left: &ScalarValue, right: &ScalarValue) -> bool {
+    eval_comparison(left, &BinOp::Eq, right)
 }
 
 fn aggregate_output_name(agg: &AggregateExpr, logical_schema: &Schema) -> Option<String> {
@@ -171,21 +214,29 @@ pub fn remap_aggregate_for_batch(
 }
 
 pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>> {
+    eval_filter_with(expr, batch, None)
+}
+
+pub fn eval_filter_with(
+    expr: &LogicalExpr,
+    batch: &RecordBatch,
+    subqueries: Option<&SubqueryRegistry>,
+) -> Result<Vec<bool>> {
     let num_rows = batch.num_rows();
     let mut mask = vec![true; num_rows];
 
     match expr {
         LogicalExpr::BinaryOp { left, op, right } => match op {
             BinOp::And => {
-                let left_mask = eval_filter(left, batch)?;
-                let right_mask = eval_filter(right, batch)?;
+                let left_mask = eval_filter_with(left, batch, subqueries)?;
+                let right_mask = eval_filter_with(right, batch, subqueries)?;
                 for i in 0..num_rows {
                     mask[i] = left_mask[i] && right_mask[i];
                 }
             }
             BinOp::Or => {
-                let left_mask = eval_filter(left, batch)?;
-                let right_mask = eval_filter(right, batch)?;
+                let left_mask = eval_filter_with(left, batch, subqueries)?;
+                let right_mask = eval_filter_with(right, batch, subqueries)?;
                 for i in 0..num_rows {
                     mask[i] = left_mask[i] || right_mask[i];
                 }
@@ -194,15 +245,15 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                 if let Some(vector_mask) = eval_column_literal_comparison(left, op, right, batch) {
                     return Ok(vector_mask);
                 }
-                let left_vals = eval_expr_column(left, batch)?;
-                let right_vals = eval_expr_column(right, batch)?;
+                let left_vals = eval_expr_column_with(left, batch, subqueries)?;
+                let right_vals = eval_expr_column_with(right, batch, subqueries)?;
                 for i in 0..num_rows {
                     mask[i] = eval_comparison(&left_vals[i], op, &right_vals[i]);
                 }
             }
         },
         LogicalExpr::Not(inner) => {
-            let inner_mask = eval_filter(inner, batch)?;
+            let inner_mask = eval_filter_with(inner, batch, subqueries)?;
             for i in 0..num_rows {
                 mask[i] = !inner_mask[i];
             }
@@ -213,7 +264,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                     return Ok(column.is_null_vec());
                 }
             }
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             for i in 0..num_rows {
                 mask[i] = vals[i].is_null();
             }
@@ -224,7 +275,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
                     return Ok(column.is_not_null_vec());
                 }
             }
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 *m = !vals[i].is_null();
             }
@@ -234,12 +285,28 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
             values,
             negated,
         } => {
-            let vals = eval_expr_column(expr, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 let found = values
                     .iter()
                     .any(|candidate| eval_comparison(&vals[i], &BinOp::Eq, candidate));
                 *m = if *negated { !found } else { found };
+            }
+        }
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
+            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
+                let matched =
+                    crate::sql::execution::helpers::scalar_like_matches(&vals[i], pattern);
+                *m = if *negated && !vals[i].is_null() {
+                    !matched
+                } else {
+                    matched
+                };
             }
         }
         LogicalExpr::Literal(v) => {
@@ -251,7 +318,7 @@ pub fn eval_filter(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<bool>>
             }
         }
         _ => {
-            let vals = eval_expr_column(expr, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
             for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
                 *m = matches!(vals[i], ScalarValue::Bool(Some(true)));
             }
@@ -395,6 +462,14 @@ fn cmp_f64(l: f64, op: &BinOp, r: f64) -> bool {
 }
 
 pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<ScalarValue>> {
+    eval_expr_column_with(expr, batch, None)
+}
+
+pub fn eval_expr_column_with(
+    expr: &LogicalExpr,
+    batch: &RecordBatch,
+    subqueries: Option<&SubqueryRegistry>,
+) -> Result<Vec<ScalarValue>> {
     let num_rows = batch.num_rows();
     match expr {
         LogicalExpr::Column(idx) => Ok((0..num_rows)
@@ -402,8 +477,8 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             .collect()),
         LogicalExpr::Literal(v) => Ok(vec![v.clone(); num_rows]),
         LogicalExpr::BinaryOp { left, op, right } => {
-            let lv = eval_expr_column(left, batch)?;
-            let rv = eval_expr_column(right, batch)?;
+            let lv = eval_expr_column_with(left, batch, subqueries)?;
+            let rv = eval_expr_column_with(right, batch, subqueries)?;
             let mut result = Vec::with_capacity(num_rows);
             for i in 0..num_rows {
                 result.push(eval_binary_scalar(&lv[i], op, &rv[i]));
@@ -446,21 +521,21 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             }
         }
         LogicalExpr::IsNull(inner) => {
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|v| ScalarValue::Bool(Some(v.is_null())))
                 .collect())
         }
         LogicalExpr::IsNotNull(inner) => {
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|v| ScalarValue::Bool(Some(!v.is_null())))
                 .collect())
         }
         LogicalExpr::Not(inner) => {
-            let vals = eval_expr_column(inner, batch)?;
+            let vals = eval_expr_column_with(inner, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|v| match v {
@@ -474,7 +549,7 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             values,
             negated,
         } => {
-            let vals = eval_expr_column(expr, batch)?;
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
             Ok(vals
                 .iter()
                 .map(|val| {
@@ -492,20 +567,20 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
         } => {
             let operand_values = operand
                 .as_deref()
-                .map(|expr| eval_expr_column(expr, batch))
+                .map(|expr| eval_expr_column_with(expr, batch, subqueries))
                 .transpose()?;
             let clause_values = when_clauses
                 .iter()
                 .map(|(when_expr, then_expr)| {
                     Ok((
-                        eval_expr_column(when_expr, batch)?,
-                        eval_expr_column(then_expr, batch)?,
+                        eval_expr_column_with(when_expr, batch, subqueries)?,
+                        eval_expr_column_with(then_expr, batch, subqueries)?,
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let else_values = else_clause
                 .as_deref()
-                .map(|expr| eval_expr_column(expr, batch))
+                .map(|expr| eval_expr_column_with(expr, batch, subqueries))
                 .transpose()?;
             let mut result = Vec::with_capacity(num_rows);
             for row_idx in 0..num_rows {
@@ -534,7 +609,7 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
         LogicalExpr::Function { name, args } => {
             let arg_columns = args
                 .iter()
-                .map(|arg| eval_expr_column(arg, batch))
+                .map(|arg| eval_expr_column_with(arg, batch, subqueries))
                 .collect::<Result<Vec<_>>>()?;
             let registry = FunctionRegistry::default();
             let mut result = Vec::with_capacity(num_rows);
@@ -547,91 +622,186 @@ pub fn eval_expr_column(expr: &LogicalExpr, batch: &RecordBatch) -> Result<Vec<S
             }
             Ok(result)
         }
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
+            let lows = eval_expr_column_with(low, batch, subqueries)?;
+            let highs = eval_expr_column_with(high, batch, subqueries)?;
+            Ok((0..num_rows)
+                .map(|row_idx| {
+                    let inside = eval_comparison(&vals[row_idx], &BinOp::Gte, &lows[row_idx])
+                        && eval_comparison(&vals[row_idx], &BinOp::Lte, &highs[row_idx]);
+                    ScalarValue::Bool(Some(if *negated { !inside } else { inside }))
+                })
+                .collect())
+        }
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let vals = eval_expr_column_with(expr, batch, subqueries)?;
+            Ok(vals
+                .iter()
+                .map(|v| {
+                    if v.is_null() {
+                        return ScalarValue::Bool(None);
+                    }
+                    let matched = scalar_like_matches(v, pattern);
+                    ScalarValue::Bool(Some(matched != *negated))
+                })
+                .collect())
+        }
+        LogicalExpr::CorrelatedSubquery(node) => {
+            crate::sql::execution::subquery_runtime::eval_correlated_column(node, batch, subqueries)
+        }
         _ => Ok(vec![ScalarValue::Int64(None); num_rows]),
     }
 }
 
 fn eval_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> ScalarValue {
+    use BinOp::*;
     if left.is_null() || right.is_null() {
-        return ScalarValue::Int64(None);
-    }
-    if matches!(op, BinOp::Div) {
-        let Some(l) = left.numeric_f64() else {
-            return ScalarValue::Float64(None);
-        };
-        let Some(r) = right.numeric_f64() else {
-            return ScalarValue::Float64(None);
-        };
-        if r == 0.0 {
-            return ScalarValue::Float64(None);
-        }
-        return ScalarValue::Float64(Some(l / r));
-    }
-    if let (Some(l), Some(r)) = (left.integer_i128(), right.integer_i128()) {
         return match op {
-            BinOp::Add => i64::try_from(l + r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Sub => i64::try_from(l - r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Mul => i64::try_from(l * r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Div => unreachable!("division is handled before integer arithmetic"),
-            BinOp::Mod if r != 0 => i64::try_from(l % r)
-                .ok()
-                .map(|v| ScalarValue::Int64(Some(v)))
-                .unwrap_or(ScalarValue::Int64(None)),
-            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
-            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
-            BinOp::Lt => ScalarValue::Bool(Some(l < r)),
-            BinOp::Gt => ScalarValue::Bool(Some(l > r)),
-            BinOp::Lte => ScalarValue::Bool(Some(l <= r)),
-            BinOp::Gte => ScalarValue::Bool(Some(l >= r)),
-            _ => ScalarValue::Bool(None),
+            Eq | Neq | Lt | Gt | Lte | Gte | And | Or => ScalarValue::Bool(None),
+            _ => ScalarValue::Int64(None),
         };
     }
-    match (left, right) {
-        (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => match op {
-            BinOp::And => ScalarValue::Bool(Some(*l && *r)),
-            BinOp::Or => ScalarValue::Bool(Some(*l || *r)),
-            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
-            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
-            _ => ScalarValue::Bool(None),
-        },
-        (ScalarValue::Int64(Some(l)), ScalarValue::Int64(Some(r))) => match op {
-            BinOp::Add => ScalarValue::Int64(Some(l + r)),
-            BinOp::Sub => ScalarValue::Int64(Some(l - r)),
-            BinOp::Mul => ScalarValue::Int64(Some(l * r)),
-            BinOp::Div => unreachable!("division is handled before integer arithmetic"),
-            BinOp::Mod if *r != 0 => ScalarValue::Int64(Some(l % r)),
-            BinOp::Mod => ScalarValue::Int64(None),
-            BinOp::Eq => ScalarValue::Bool(Some(l == r)),
-            BinOp::Neq => ScalarValue::Bool(Some(l != r)),
-            BinOp::Lt => ScalarValue::Bool(Some(l < r)),
-            BinOp::Gt => ScalarValue::Bool(Some(l > r)),
-            BinOp::Lte => ScalarValue::Bool(Some(l <= r)),
-            BinOp::Gte => ScalarValue::Bool(Some(l >= r)),
-            BinOp::And | BinOp::Or => ScalarValue::Bool(None),
-            _ => ScalarValue::Bool(None),
-        },
-        (ScalarValue::Float64(Some(l)), ScalarValue::Float64(Some(r))) => match op {
-            BinOp::Add => ScalarValue::Float64(Some(l + r)),
-            BinOp::Sub => ScalarValue::Float64(Some(l - r)),
-            BinOp::Mul => ScalarValue::Float64(Some(l * r)),
-            BinOp::Div => ScalarValue::Float64(Some(l / r)),
-            BinOp::Mod => ScalarValue::Float64(Some(l % r)),
-            _ => ScalarValue::Bool(None),
-        },
-        (ScalarValue::Int32(Some(l)), ScalarValue::Int32(Some(r))) => match op {
-            BinOp::Add => ScalarValue::Int32(Some(l + r)),
-            BinOp::Sub => ScalarValue::Int32(Some(l - r)),
-            _ => ScalarValue::Bool(None),
-        },
-        _ => ScalarValue::Int64(None),
+    match op {
+        And => {
+            let (l, r) = (as_bool(left), as_bool(right));
+            if l == Some(false) || r == Some(false) {
+                ScalarValue::Bool(Some(false))
+            } else if let (Some(l), Some(r)) = (l, r) {
+                ScalarValue::Bool(Some(l && r))
+            } else {
+                ScalarValue::Bool(None)
+            }
+        }
+        Or => {
+            let (l, r) = (as_bool(left), as_bool(right));
+            if l == Some(true) || r == Some(true) {
+                ScalarValue::Bool(Some(true))
+            } else if let (Some(l), Some(r)) = (l, r) {
+                ScalarValue::Bool(Some(l || r))
+            } else {
+                ScalarValue::Bool(None)
+            }
+        }
+        Eq | Neq | Lt | Gt | Lte | Gte => {
+            let matched = match (left, right) {
+                (ScalarValue::Bool(Some(l)), ScalarValue::Bool(Some(r))) => Some(if l == r {
+                    std::cmp::Ordering::Equal
+                } else if *l {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }),
+                _ => left.numeric_cmp(right).or_else(|| match (left, right) {
+                    (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) => {
+                        Some(l.cmp(r))
+                    }
+                    (ScalarValue::Date(Some(l)), ScalarValue::Date(Some(r))) => Some(l.cmp(r)),
+                    (ScalarValue::Timestamp(Some(l)), ScalarValue::Timestamp(Some(r))) => {
+                        Some(l.cmp(r))
+                    }
+                    _ => None,
+                }),
+            };
+            match matched.map(|ord| match op {
+                Eq => ord == std::cmp::Ordering::Equal,
+                Neq => ord != std::cmp::Ordering::Equal,
+                Lt => ord == std::cmp::Ordering::Less,
+                Gt => ord == std::cmp::Ordering::Greater,
+                Lte => ord != std::cmp::Ordering::Greater,
+                Gte => ord != std::cmp::Ordering::Less,
+                _ => unreachable!(),
+            }) {
+                Some(v) => ScalarValue::Bool(Some(v)),
+                None => ScalarValue::Bool(None),
+            }
+        }
+        Add | Sub | Mul | Mod | Div => {
+            if matches!(op, Div) {
+                let (Some(l), Some(r)) = (left.numeric_f64(), right.numeric_f64()) else {
+                    return ScalarValue::Float64(None);
+                };
+                if r == 0.0 {
+                    return ScalarValue::Float64(None);
+                }
+                return ScalarValue::Float64(Some(l / r));
+            }
+            if let (Some(l), Some(r)) = (left.integer_i128(), right.integer_i128()) {
+                return match op {
+                    Div | Mod if r == 0 => ScalarValue::Int64(None),
+                    Mod => i64::try_from(l % r)
+                        .ok()
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .unwrap_or(ScalarValue::Int64(None)),
+                    Add => i64::try_from(l + r)
+                        .ok()
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .unwrap_or(ScalarValue::Int64(None)),
+                    Sub => i64::try_from(l - r)
+                        .ok()
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .unwrap_or(ScalarValue::Int64(None)),
+                    Mul => l
+                        .checked_mul(r)
+                        .and_then(|v| i64::try_from(v).ok())
+                        .map(|v| ScalarValue::Int64(Some(v)))
+                        .unwrap_or(ScalarValue::Int64(None)),
+                    Div => unreachable!("integer division falls through to floating point"),
+                    _ => unreachable!("non-arithmetic operator in arithmetic evaluation"),
+                };
+            }
+            if matches!(
+                (left, right),
+                (ScalarValue::VarChar(Some(_)), ScalarValue::VarChar(Some(_)))
+            ) {
+                if let (ScalarValue::VarChar(Some(l)), ScalarValue::VarChar(Some(r))) =
+                    (left, right)
+                {
+                    return match op {
+                        Add => ScalarValue::VarChar(Some(format!("{l}{r}"))),
+                        _ => ScalarValue::Bool(None),
+                    };
+                }
+            }
+            let (Some(l), Some(r)) = (left.numeric_f64(), right.numeric_f64()) else {
+                return ScalarValue::Int64(None);
+            };
+            let value = match op {
+                Add => l + r,
+                Sub => l - r,
+                Mul => l * r,
+                Div => {
+                    if r == 0.0 {
+                        return ScalarValue::Float64(None);
+                    }
+                    l / r
+                }
+                Mod => {
+                    if r == 0.0 {
+                        return ScalarValue::Float64(None);
+                    }
+                    l % r
+                }
+                _ => unreachable!(),
+            };
+            ScalarValue::Float64(Some(value))
+        }
+        Like | NotLike | In | NotIn => ScalarValue::Bool(None),
+    }
+}
+
+fn as_bool(value: &ScalarValue) -> Option<bool> {
+    match value {
+        ScalarValue::Bool(Some(b)) => Some(*b),
+        _ => None,
     }
 }

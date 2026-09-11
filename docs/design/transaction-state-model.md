@@ -1,5 +1,12 @@
 # Transaction State Model and Session Management
 
+> **状态注记（2026-09）**：本文描述目标状态模型，部分内容尚未实现，以代码为准。当前实际状态：
+>
+> - **已实现**：`TxnState` 状态机、会话事务绑定、`ReadCommitted`（唯一实现的隔离级别）、memtable 粒度的事务可见性（`TxnVisibility`/`is_visible_to`，见 `src/storage/core/memtable.rs`）、表级写互斥（见 `src/storage/segment_manager/manager_core.rs`）。
+> - **未实现**：`Idle` 会话态、`RepeatableRead`/`Serializable` 隔离级别、`AccessMode` 只读事务、MVCC 版本链、`ConcurrencyControl` 多策略（实际为表级串行 + 约束检查）。
+>
+> 面向使用者的行为说明见 [事务与并发语义](../user-guide/transactions-and-concurrency.md)。
+
 ## Transaction State Model
 
 ### TxnState Enum

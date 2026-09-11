@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +19,22 @@ pub enum PartitionType {
     Month = 4,
     Hash = 5,
     Mod = 6,
+}
+
+/// Durability contract for a table's ordinary INSERT path.
+///
+/// `Strict` (default) keeps the memtable + durable-tail pipeline: every
+/// acknowledged auto-commit INSERT is fsynced to the tail before the ack and
+/// survives a crash. `Relaxed` routes qualifying large multi-row INSERTs
+/// directly into the segment row-group buffer, skipping the durable tail
+/// entirely: acknowledged rows may be lost when the process crashes before
+/// the buffered row group is flushed, which is the documented trade for
+/// halving write amplification on bulk-style data feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TableDurability {
+    #[default]
+    Strict,
+    Relaxed,
 }
 
 /// Partition info for a table.
@@ -167,6 +182,8 @@ pub struct TableMeta {
     pub dropped_columns: Vec<ColumnDef>,
     #[serde(default)]
     pub statistics: Option<TableStatisticsMeta>,
+    #[serde(default)]
+    pub durability: TableDurability,
 }
 
 impl TableMeta {
@@ -201,6 +218,7 @@ impl TableMeta {
             schema_version: 1,
             dropped_columns: Vec::new(),
             statistics: None,
+            durability: TableDurability::Strict,
         };
         meta.ensure_column_ids();
         meta
@@ -311,12 +329,6 @@ impl TableMeta {
             return None;
         }
         Some(self.partition_key_idx as usize)
-    }
-
-    pub fn data_path(&self, base_dir: &str) -> PathBuf {
-        PathBuf::from(base_dir)
-            .join(&self.database)
-            .join(&self.name)
     }
 
     pub fn partition_strategy(
@@ -514,9 +526,6 @@ impl DatabaseCatalog {
                 table.ensure_column_ids();
             }
             Ok(catalog)
-        } else if let Some(catalog) = Self::load_legacy_catalog(meta_dir, db_name)? {
-            catalog.save(meta_dir)?;
-            Ok(catalog)
         } else {
             let catalog = DatabaseCatalog::new(db_name);
             catalog.save(meta_dir)?;
@@ -547,30 +556,6 @@ impl DatabaseCatalog {
 
     pub fn catalog_dir(meta_dir: &Path) -> PathBuf {
         meta_dir.join("catalogs")
-    }
-
-    fn load_legacy_catalog(meta_dir: &Path, db_name: &str) -> Result<Option<Self>> {
-        let legacy_path = meta_dir.join("schema.json");
-        if !legacy_path.exists() {
-            return Ok(None);
-        }
-        let data = fs::read_to_string(&legacy_path).map_err(|e| {
-            TaibaiError::Storage(format!("failed to read legacy schema.json: {}", e))
-        })?;
-        let mut catalog: DatabaseCatalog = serde_json::from_str(&data).map_err(|e| {
-            TaibaiError::Storage(format!("failed to parse legacy schema.json: {}", e))
-        })?;
-        if catalog.name != db_name {
-            return Ok(None);
-        }
-        catalog.name = db_name.to_string();
-        for table in catalog.tables.values_mut() {
-            table.database = db_name.to_string();
-            table.update_partition_key_idx();
-            table.update_ttl_column_idx();
-            table.ensure_column_ids();
-        }
-        Ok(Some(catalog))
     }
 
     pub fn create_table(&mut self, name: &str, columns: Vec<ColumnDef>) -> Result<()> {
@@ -743,5 +728,5 @@ impl DatabaseCatalog {
 }
 
 #[cfg(test)]
-#[path = "schema_tests.rs"]
+#[path = "schema_test.rs"]
 mod tests;

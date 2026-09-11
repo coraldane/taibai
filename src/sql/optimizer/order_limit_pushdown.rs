@@ -6,10 +6,6 @@ use super::Rule;
 pub struct OrderLimitPushdownRule;
 
 impl Rule for OrderLimitPushdownRule {
-    fn name(&self) -> &str {
-        "order_limit_pushdown"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         push_order_limit_to_scan(plan)
     }
@@ -163,10 +159,6 @@ fn is_orderable_type(dt: crate::protocol::types::DataType) -> bool {
 pub struct TopNPushdownRule;
 
 impl Rule for TopNPushdownRule {
-    fn name(&self) -> &str {
-        "topn_pushdown"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         push_topn_to_scan(plan)
     }
@@ -456,6 +448,7 @@ fn expr_contains_conjunct(existing: &LogicalExpr, predicate: &LogicalExpr) -> bo
 
 fn expr_columns_within(expr: &LogicalExpr, upper_bound: usize) -> bool {
     match expr {
+        LogicalExpr::CorrelatedSubquery(_) => false,
         LogicalExpr::Column(idx) => *idx < upper_bound,
         LogicalExpr::Literal(_) | LogicalExpr::Wildcard => true,
         LogicalExpr::BinaryOp { left, right, .. } => {
@@ -534,5 +527,5 @@ fn is_selective_predicate(expr: &LogicalExpr) -> bool {
 }
 
 #[cfg(test)]
-#[path = "order_limit_pushdown_tests.rs"]
+#[path = "order_limit_pushdown_test.rs"]
 mod tests;

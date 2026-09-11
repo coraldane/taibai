@@ -7,10 +7,6 @@ use super::Rule;
 pub struct BloomFilterRule;
 
 impl Rule for BloomFilterRule {
-    fn name(&self) -> &str {
-        "bloom_filter"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         apply_bloom_filter(plan)
     }

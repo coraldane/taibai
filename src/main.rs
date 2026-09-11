@@ -1,10 +1,4 @@
-mod common;
-mod net;
-mod protocol;
-mod sql;
-mod storage;
-mod types;
-mod version;
+use taibai::{common, net, sql, storage, types, version};
 
 use std::sync::Arc;
 
@@ -168,6 +162,7 @@ where
             config.log.query_max_size_mb,
         ) {
             tracing::error!(error = %e, query_file, "failed to initialize query log");
+            eprintln!("taibai: failed to initialize query log: {e}");
             std::process::exit(1);
         }
         tracing::info!(
@@ -179,17 +174,24 @@ where
 
     if let Err(e) = std::fs::create_dir_all(&config.storage.data_dir) {
         tracing::error!(error = %e, "failed to create data directory");
+        eprintln!("taibai: failed to create data directory: {e}");
         std::process::exit(1);
     }
 
-    let _ = crate::common::config::set_performance_baseline_config(
-        crate::common::config::PerformanceBaselineConfig::from(&config.performance),
+    let _ = common::config::set_performance_baseline_config(
+        common::config::PerformanceBaselineConfig::from(&config.performance),
     );
-    crate::common::config::set_insert_profile_enabled(config.log.insert_profile);
-    crate::common::config::set_storage_runtime_settings(
+    common::config::set_insert_profile_enabled(config.log.insert_profile);
+    common::config::set_storage_runtime_settings(
         config.compression.bulk_zstd_level,
         config.storage.reader_cache_capacity,
     );
+    common::config::set_storage_timeouts(common::config::StorageTimeouts {
+        mutation_lock_timeout_ms: config.storage.mutation_lock_timeout_ms,
+        mutation_lock_warn_ms: config.storage.mutation_lock_warn_ms,
+        tail_commit_timeout_ms: config.storage.tail_commit_timeout_ms,
+        tail_commit_warn_ms: config.storage.tail_commit_warn_ms,
+    });
 
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
@@ -200,10 +202,12 @@ where
             .storage
             .hot_store_memory_limit_mb
             .saturating_mul(1024 * 1024),
+        config.storage.tail_async_fsync,
     ) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize engine");
+            eprintln!("taibai: failed to initialize engine: {e}");
             std::process::exit(1);
         }
     };
@@ -211,7 +215,7 @@ where
     let config = Arc::new(config);
     // Publish process-global query runtime limits for operators (aggregation,
     // streaming scans) to consult.
-    let _ = crate::common::config::set_query_limits(crate::common::config::QueryLimits {
+    let _ = common::config::set_query_limits(common::config::QueryLimits {
         query_memory_limit_mb: config.buffer.query_memory_limit_mb,
         max_result_message_bytes: config.server.max_message_size,
         max_aggregate_groups: config.buffer.max_aggregate_groups,
@@ -228,7 +232,7 @@ where
         .num_threads(config.buffer.execution_threads.max(1))
         .thread_name(|idx| format!("taibai-exec-{idx}"))
         .build_global();
-    crate::sql::execution::engine::start_close_of_day_scheduler(engine.clone());
+    sql::execution::engine::start_close_of_day_scheduler(engine.clone());
     tracing::info!("close-of-day scheduler started");
 
     let server = Server::new(config, engine.clone());

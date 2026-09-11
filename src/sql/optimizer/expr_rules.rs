@@ -15,10 +15,6 @@ use crate::sql::planner::LogicalPlan;
 pub struct ExpressionSimplificationRule;
 
 impl Rule for ExpressionSimplificationRule {
-    fn name(&self) -> &str {
-        "expression_simplification"
-    }
-
     fn apply(&self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         simplify_plan(plan)
     }
@@ -164,7 +160,8 @@ fn fold_binary(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Option<Sc
             BinOp::Add => Some(ScalarValue::Int64(Some(l + r))),
             BinOp::Sub => Some(ScalarValue::Int64(Some(l - r))),
             BinOp::Mul => Some(ScalarValue::Int64(Some(l * r))),
-            BinOp::Div if *r != 0 => Some(ScalarValue::Int64(Some(l / r))),
+            BinOp::Div if *r != 0 => Some(ScalarValue::Float64(Some(*l as f64 / *r as f64))),
+            BinOp::Mod if *r != 0 => Some(ScalarValue::Int64(Some(l % r))),
             BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
             BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
             BinOp::Lt => Some(ScalarValue::Bool(Some(l < r))),
@@ -179,6 +176,7 @@ fn fold_binary(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> Option<Sc
             BinOp::Sub => Some(ScalarValue::Float64(Some(l - r))),
             BinOp::Mul => Some(ScalarValue::Float64(Some(l * r))),
             BinOp::Div if *r != 0.0 => Some(ScalarValue::Float64(Some(l / r))),
+            BinOp::Mod if *r != 0.0 => Some(ScalarValue::Float64(Some(l % r))),
             BinOp::Eq => Some(ScalarValue::Bool(Some(l == r))),
             BinOp::Neq => Some(ScalarValue::Bool(Some(l != r))),
             BinOp::Lt => Some(ScalarValue::Bool(Some(l < r))),

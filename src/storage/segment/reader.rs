@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use std::fs;
@@ -20,8 +19,9 @@ use super::footer::{parse_segment_footer, reserved_section_offset, ParsedSegment
 use super::meta::{read_embedded_footer, read_latest_sidecar_footer};
 use super::RowGroupMeta;
 
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 struct SegmentFooter {
-    version: u32,
     row_count: u64,
     row_groups: Vec<RowGroupMeta>,
     schema: Schema,
@@ -33,7 +33,6 @@ struct SegmentFooter {
 impl From<ParsedSegmentFooter> for SegmentFooter {
     fn from(f: ParsedSegmentFooter) -> Self {
         Self {
-            version: f.version,
             row_count: f.row_count,
             row_groups: f.row_groups,
             schema: f.schema,
@@ -250,10 +249,6 @@ impl SegmentReader {
         Ok(())
     }
 
-    fn read_footer_bytes(path: &Path) -> Result<Vec<u8>> {
-        Ok(Self::read_footer_source(path, None)?.footer)
-    }
-
     fn read_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {
         let file_len = match file_len_hint {
             Some(len) => len,
@@ -288,6 +283,18 @@ impl SegmentReader {
         })
     }
 
+    fn decompress_column_block(block: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+        // Adaptive blocks that skip zstd begin with the null bitmap length
+        // (u32 LE); bounded row groups keep it far below the zstd frame magic.
+        if block.starts_with(&ZSTD_FRAME_MAGIC) {
+            let decompressed = zstd::bulk::decompress(block, 64 * 1024 * 1024)
+                .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
+            Ok(std::borrow::Cow::Owned(decompressed))
+        } else {
+            Ok(std::borrow::Cow::Borrowed(block))
+        }
+    }
+
     pub fn read_column(&self, row_group: usize, column_idx: usize) -> Result<ColumnArray> {
         let rg = &self.footer.row_groups[row_group];
         let col_def = &self.footer.schema.columns[column_idx];
@@ -307,8 +314,7 @@ impl SegmentReader {
         let data = self.data.as_slice();
         let compressed = &data[col_offset..col_offset + col_len];
 
-        zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-            .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))
+        Ok(Self::decompress_column_block(compressed)?.into_owned())
     }
 
     pub fn read_row_group_batch(
@@ -350,8 +356,7 @@ impl SegmentReader {
                 let col_offset = col_offsets[col_idx];
                 let col_len = rg.column_compressed_sizes[col_idx] as usize;
                 let compressed = &all_data[col_offset..col_offset + col_len];
-                let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-                    .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
+                let decompressed = Self::decompress_column_block(compressed)?;
                 let col_def = &self.footer.schema.columns[col_idx];
                 let col_array = decode_column(&decompressed, rg.row_count as usize, col_def)?;
                 Ok(Some((col_idx, col_array)))
@@ -401,8 +406,7 @@ impl SegmentReader {
                 let col_offset = col_offsets[col_idx];
                 let col_len = rg.column_compressed_sizes[col_idx] as usize;
                 let compressed = &all_data[col_offset..col_offset + col_len];
-                let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-                    .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
+                let decompressed = Self::decompress_column_block(compressed)?;
 
                 let col_def = &self.footer.schema.columns[col_idx];
                 let col_array = decode_column_selected(
@@ -718,8 +722,7 @@ impl SegmentReader {
         let data = self.data.as_slice();
         let compressed = &data[col_offset..col_offset + col_len];
 
-        let decompressed = zstd::bulk::decompress(compressed, 64 * 1024 * 1024)
-            .map_err(|e| TaibaiError::Storage(format!("zstd decompress error: {}", e)))?;
+        let decompressed = Self::decompress_column_block(compressed)?;
 
         crate::storage::codec::predicate_scan::count_eq_from_raw(
             &decompressed,
