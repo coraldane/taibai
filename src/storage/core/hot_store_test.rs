@@ -400,3 +400,204 @@ fn resolve_key_column_prefers_hot_index_column() {
     let idx = resolve_key_column(&meta).expect("resolvable");
     assert_eq!(idx, 0, "must fall back to cluster_key leading column");
 }
+
+// ---------------------------------------------------------------------------
+// Chunked-store tests: sealed chunk boundaries, prefix reclamation and the
+// backpressure valve.
+// ---------------------------------------------------------------------------
+
+fn kv_schema() -> Schema {
+    Schema::new(vec![
+        ColumnDef::new("id", DataType::Int64),
+        ColumnDef::new("v", DataType::Int64),
+    ])
+}
+
+fn kv_store(chunk_rows: usize, memory_limit: u64) -> HotStore {
+    HotStore::with_chunk_rows(kv_schema(), 0, None, memory_limit, chunk_rows)
+}
+
+fn kv_batch(ids: std::ops::Range<i64>) -> RecordBatch {
+    let mut batch = RecordBatch::new(kv_schema());
+    for id in ids {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(id * 10)))
+            .unwrap();
+    }
+    batch
+}
+
+/// Rows whose key repeats across several sealed chunks: key `i % 3` for
+/// `i in 0..rows`.
+fn keyed_batch(rows: i64) -> RecordBatch {
+    let mut batch = RecordBatch::new(kv_schema());
+    for i in 0..rows {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(i % 3)))
+            .unwrap();
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(i * 10)))
+            .unwrap();
+    }
+    batch
+}
+
+#[test]
+fn chunk_seal_keeps_global_order_across_boundaries() {
+    // chunk_rows = 8: appending 20 rows yields sealed chunks [0,8) and [8,16)
+    // plus an open chunk [16,20).
+    let store = kv_store(8, u64::MAX);
+    store.append(&keyed_batch(20)).unwrap();
+    assert_eq!(store.row_count(), 20);
+
+    // Forward lookup gathers ascending append order across chunk boundaries.
+    let fwd = store
+        .lookup(&ScalarValue::Int64(Some(0)), None, Some(&[1]), 0, false)
+        .unwrap();
+    match fwd.column(0).unwrap() {
+        ColumnArray::Int64 { data, .. } => {
+            assert_eq!(data, &vec![0, 30, 60, 90, 120, 150, 180]);
+        }
+        _ => panic!("expected int64 payload column"),
+    }
+
+    // Reverse lookup starts at the newest row, even when it lives in the open
+    // chunk, and the LIMIT short-circuits without walking older chunks.
+    let rev = store
+        .lookup_filtered(
+            &ScalarValue::Int64(Some(0)),
+            None,
+            Some(&[1]),
+            0,
+            true,
+            Some(2),
+            &[],
+            &[],
+        )
+        .unwrap();
+    match rev.column(0).unwrap() {
+        ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![180, 150]),
+        _ => panic!("expected int64 payload column"),
+    }
+
+    // Watermark above both sealed chunks leaves only the open-chunk row.
+    let live = store
+        .lookup(&ScalarValue::Int64(Some(0)), None, Some(&[1]), 16, false)
+        .unwrap();
+    match live.column(0).unwrap() {
+        ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![180]),
+        _ => panic!("expected int64 payload column"),
+    }
+    assert_eq!(
+        store.count_by_key_partition_from(&ScalarValue::Int64(Some(0)), None, 16),
+        Some(1)
+    );
+    assert_eq!(
+        store.count_by_key_partition_from(&ScalarValue::Int64(Some(0)), None, 0),
+        Some(7)
+    );
+}
+
+#[test]
+fn compact_prefix_drops_whole_chunks_and_trims_boundary() {
+    let store = kv_store(8, u64::MAX);
+    // 12 + 8 rows with unique ids 0..20 -> sealed [0,8), [8,16), open [16,20).
+    store.append(&kv_batch(0..12)).unwrap();
+    store.append(&kv_batch(12..20)).unwrap();
+    assert_eq!(store.row_count(), 20);
+
+    // Cut at 10: chunk [0,8) released whole, chunk [8,16) trimmed to [10,16).
+    let dropped = store.compact_prefix(10);
+    assert_eq!(dropped, 10);
+    assert_eq!(store.row_count(), 10);
+
+    assert!(store
+        .lookup(&ScalarValue::Int64(Some(9)), None, None, 0, false)
+        .is_none());
+    let kept = store
+        .lookup(&ScalarValue::Int64(Some(10)), None, Some(&[1]), 0, false)
+        .unwrap();
+    match kept.column(0).unwrap() {
+        ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![100]),
+        _ => panic!("expected int64 payload column"),
+    }
+    let from_open = store
+        .lookup(&ScalarValue::Int64(Some(19)), None, Some(&[1]), 0, false)
+        .unwrap();
+    match from_open.column(0).unwrap() {
+        ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![190]),
+        _ => panic!("expected int64 payload column"),
+    }
+
+    // Watermarks are relative to the reclaimed front: the surviving `id = 11`
+    // row now sits at relative offset 0.
+    assert_eq!(
+        store.count_filtered(
+            &ScalarValue::Int64(Some(11)),
+            None,
+            0,
+            &[],
+            &[RangeClause {
+                column_index: 1,
+                op: RangeOp::Ge,
+                value: ScalarValue::Int64(Some(0)),
+            }],
+        ),
+        Some(1)
+    );
+    // Watermarks are relative to the reclaimed front: the surviving `id = 11`
+    // row now sits at relative offset 1.
+    assert_eq!(
+        store.count_by_key_partition_from(&ScalarValue::Int64(Some(11)), None, 0),
+        Some(1)
+    );
+    assert_eq!(
+        store.count_by_key_partition_from(&ScalarValue::Int64(Some(11)), None, 1),
+        Some(1)
+    );
+    assert_eq!(
+        store.count_by_key_partition_from(&ScalarValue::Int64(Some(11)), None, 2),
+        Some(0)
+    );
+
+    // Second reclaim of 8 of the 10 surviving rows cuts into the open chunk.
+    let dropped = store.compact_prefix(8);
+    assert_eq!(dropped, 8);
+    assert_eq!(store.row_count(), 2);
+    assert!(store
+        .lookup(&ScalarValue::Int64(Some(17)), None, None, 0, false)
+        .is_none());
+    let tail = store
+        .lookup(&ScalarValue::Int64(Some(18)), None, Some(&[1]), 0, false)
+        .unwrap();
+    match tail.column(0).unwrap() {
+        ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![180]),
+        _ => panic!("expected int64 payload column"),
+    }
+}
+
+#[test]
+fn hard_memory_limit_rejects_before_mutation() {
+    // A 2-column Int64 batch of 4 rows estimates well above a 10-byte limit.
+    let store = kv_store(8, 10);
+    let err = store
+        .append(&kv_batch(0..4))
+        .expect_err("append must be rejected under backpressure");
+    assert!(matches!(err, crate::common::error::TaibaiError::ResourceBusy(_)));
+    assert_eq!(store.row_count(), 0);
+    assert_eq!(
+        store.count_by_key_partition_from(&ScalarValue::Int64(Some(1)), None, 0),
+        None
+    );
+}

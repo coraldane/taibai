@@ -198,4 +198,8 @@ path = "tests/ttl_purge_test.rs"
 name = "window_function_test"
 path = "tests/window_function_test.rs"
 
+[[test]]
+name = "hot_store_bench_test"
+path = "tests/hot_store_bench_test.rs"
+
 

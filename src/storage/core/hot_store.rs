@@ -1,26 +1,43 @@
 //! In-memory hot acceleration store.
 //!
-//! An append-only columnar buffer that indexes the **leading cluster-key
-//! column** of a table with a per-value inverted index, so that point lookups
-//! of the form `WHERE <key> = ?` gather only the matching rows instead of
-//! scanning the whole resident set.
+//! The layout follows the kdb+ HDB/RDB split:
 //!
-//! This is a *generic* mechanism: the index column is whatever the table
-//! declares as its first `CLUSTER BY` column, of any comparable scalar type
-//! (integer, float, boolean, varchar, date/time/...). No business-specific
+//! * The resident set is chopped into fixed-size **chunks** (default 64Ki
+//!   rows). A chunk whose columns and inverted index are complete is *sealed*
+//!   and published as an immutable `Arc`, exactly like an immutable q HDB
+//!   partition: readers gather from sealed chunks with **no data locks at
+//!   all** (only a shared hold on the chunk-list snapshot).
+//! * A single writable **open chunk** is the RDB analogue. Appends are bulk
+//!   `memcpy` into its column vectors plus incremental inverted-index upkeep
+//!   for the new rows only, under one writer mutex. A sealed chunk carries its
+//!   own copy of the `g#`-style group index (per distinct key value -> row
+//!   offsets), so the write path never revisits old data.
+//! * `compact_prefix` releases whole chunks below the reclaimed prefix by
+//!   advancing a `front` cursor, so reclaim cost is O(chunks) rather than
+//!   O(rows) and surviving rows are not re-indexed. Row ids are interpreted
+//!   relative to `front`, which keeps the scan layer's watermark arithmetic
+//!   (`row_count - live memtable rows`) exact.
+//!
+//! The index column is the leading `CLUSTER BY` column (or the explicit
+//! `hot_index_column`), of any comparable scalar type. No business-specific
 //! assumptions are baked in.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::partition::pruning::{RangeClause, RangeOp};
-use crate::types::array::ColumnArray;
+use crate::types::array::{BinaryBuffer, ColumnArray, Utf8Buffer};
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
+
+/// Rows per sealed chunk. Sealed chunks are immutable `Arc`s, so this is the
+/// granularity of lock-free reads and of prefix reclamation.
+const DEFAULT_CHUNK_ROWS: usize = 65_536;
 
 #[derive(Debug, Clone, Default)]
 pub struct ResidentCoverageSnapshot {
@@ -31,6 +48,9 @@ pub struct ResidentCoverageSnapshot {
 /// Interning pool for variable-length key values. A distinct string is stored
 /// once and addressed by a `u32` id, so that building the inverted index never
 /// re-clones a string for every row (only on first sight of a new value).
+///
+/// This mirrors q's enumerated `` `sym$ `` symbols: the index compares interned
+/// ids, never string bytes.
 pub struct StringPool {
     forward: HashMap<String, u32>,
     reverse: Vec<String>,
@@ -213,22 +233,442 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Typed predicate pre-compilation.
+//
+// `ColumnArray::compare_scalar_at` re-matches the (column, scalar) enum pair on
+// every row. The lookup loops run one tight filter pass over each chunk's
+// posting list, so each predicate is resolved once per chunk into a typed
+// comparator and the per-row work is a direct slice index + `Ord::cmp`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmpOp {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl CmpOp {
+    #[inline]
+    fn matches(self, ord: std::cmp::Ordering) -> bool {
+        match self {
+            CmpOp::Eq => ord.is_eq(),
+            CmpOp::Lt => ord.is_lt(),
+            CmpOp::Le => !ord.is_gt(),
+            CmpOp::Gt => ord.is_gt(),
+            CmpOp::Ge => !ord.is_lt(),
+        }
+    }
+}
+
+/// A predicate bound to one chunk's typed column storage.
+enum FastPred<'a> {
+    Bool { data: &'a [u8], v: bool },
+    I8 { data: &'a [i8], v: i8 },
+    I16 { data: &'a [i16], v: i16 },
+    I32 { data: &'a [i32], v: i32 },
+    I64 { data: &'a [i64], v: i64 },
+    U8 { data: &'a [u8], v: u8 },
+    U16 { data: &'a [u16], v: u16 },
+    U32 { data: &'a [u32], v: u32 },
+    U64 { data: &'a [u64], v: u64 },
+    F32 { data: &'a [f32], v: f32 },
+    F64 { data: &'a [f64], v: f64 },
+    Str { data: &'a Utf8Buffer, v: &'a str },
+    Bytes { data: &'a BinaryBuffer, v: &'a [u8] },
+}
+
+impl FastPred<'_> {
+    #[inline]
+    fn compare(&self, row: usize) -> Option<std::cmp::Ordering> {
+        match *self {
+            FastPred::Bool { data, v } => Some((data[row] != 0).cmp(&v)),
+            FastPred::I8 { data, v } => Some(data[row].cmp(&v)),
+            FastPred::I16 { data, v } => Some(data[row].cmp(&v)),
+            FastPred::I32 { data, v } => Some(data[row].cmp(&v)),
+            FastPred::I64 { data, v } => Some(data[row].cmp(&v)),
+            FastPred::U8 { data, v } => Some(data[row].cmp(&v)),
+            FastPred::U16 { data, v } => Some(data[row].cmp(&v)),
+            FastPred::U32 { data, v } => Some(data[row].cmp(&v)),
+            FastPred::U64 { data, v } => Some(data[row].cmp(&v)),
+            FastPred::F32 { data, v } => data[row].partial_cmp(&v),
+            FastPred::F64 { data, v } => data[row].partial_cmp(&v),
+            FastPred::Str { data, v } => Some(data.value(row).cmp(v)),
+            FastPred::Bytes { data, v } => Some(data.value(row).cmp(v)),
+        }
+    }
+}
+
+/// A fully-resolved row predicate: either a typed fast comparator or the
+/// canonical scalar path (cross-type comparisons and any other pair).
+enum RowPred<'c, 'v> {
+    Fast {
+        bitmap: &'c NullBitmap,
+        pred: FastPred<'c>,
+        op: CmpOp,
+    },
+    Generic {
+        column: &'c ColumnArray,
+        value: &'v ScalarValue,
+        op: CmpOp,
+    },
+    AlwaysFalse,
+}
+
+impl RowPred<'_, '_> {
+    #[inline]
+    fn matches(&self, row: usize) -> bool {
+        match self {
+            RowPred::Fast { bitmap, pred, op } => {
+                if bitmap.is_null(row) {
+                    return false;
+                }
+                pred.compare(row).is_some_and(|ord| op.matches(ord))
+            }
+            RowPred::Generic { column, value, op } => column
+                .compare_scalar_at(row, value)
+                .is_some_and(|ord| op.matches(ord)),
+            RowPred::AlwaysFalse => false,
+        }
+    }
+}
+
+fn compile_one<'c, 'v>(
+    column: Option<&'c ColumnArray>,
+    value: &'v ScalarValue,
+    op: CmpOp,
+) -> RowPred<'c, 'v>
+where
+    'v: 'c,
+{
+    use ScalarValue as SV;
+    let Some(col) = column else {
+        return RowPred::AlwaysFalse;
+    };
+    macro_rules! typed {
+        ($variant:ident, $scalar:ident, $field:ident) => {
+            if let (ColumnArray::$variant { data, .. }, SV::$scalar(Some(v))) = (col, value) {
+                return RowPred::Fast {
+                    bitmap: col.bitmap(),
+                    pred: FastPred::$field {
+                        data,
+                        v: v.clone(),
+                    },
+                    op,
+                };
+            }
+        };
+    }
+    typed!(Bool, Bool, Bool);
+    typed!(Int8, Int8, I8);
+    typed!(Int16, Int16, I16);
+    typed!(Int32, Int32, I32);
+    typed!(Int64, Int64, I64);
+    typed!(UInt8, UInt8, U8);
+    typed!(UInt16, UInt16, U16);
+    typed!(UInt32, UInt32, U32);
+    typed!(UInt64, UInt64, U64);
+    typed!(Float32, Float32, F32);
+    typed!(Float64, Float64, F64);
+    typed!(Decimal, Decimal, I64);
+    typed!(Date, Date, I32);
+    typed!(Time, Time, I64);
+    typed!(Timestamp, Timestamp, I64);
+    typed!(Interval, Interval, I64);
+    if let (ColumnArray::VarChar { data, .. }, SV::VarChar(Some(v))) = (col, value) {
+        return RowPred::Fast {
+            bitmap: col.bitmap(),
+            pred: FastPred::Str {
+                data,
+                v: v.as_str(),
+            },
+            op,
+        };
+    }
+    if let (ColumnArray::Blob { data, .. }, SV::Blob(Some(v))) = (col, value) {
+        return RowPred::Fast {
+            bitmap: col.bitmap(),
+            pred: FastPred::Bytes {
+                data,
+                v: v.as_slice(),
+            },
+            op,
+        };
+    }
+    RowPred::Generic {
+        column: col,
+        value,
+        op,
+    }
+}
+
+/// Pre-resolve the pushed-down predicates against one chunk's columns. The
+/// index-covered key column (and the partition column when the composite index
+/// was used) are skipped, mirroring the guarantee that every candidate row
+/// already satisfies them.
+fn compile_predicates<'c, 'v>(
+    columns: &'c [ColumnArray],
+    eq_predicates: &'v [(usize, ScalarValue)],
+    range_predicates: &'v [RangeClause],
+    covered_key_column: usize,
+    covered_partition_column: Option<usize>,
+) -> Vec<RowPred<'c, 'v>>
+where
+    'v: 'c,
+{
+    let mut preds = Vec::new();
+    for (column, value) in eq_predicates {
+        if *column == covered_key_column || Some(*column) == covered_partition_column {
+            continue;
+        }
+        preds.push(compile_one(columns.get(*column), value, CmpOp::Eq));
+    }
+    for clause in range_predicates {
+        let op = match clause.op {
+            RangeOp::Eq => CmpOp::Eq,
+            RangeOp::Lt => CmpOp::Lt,
+            RangeOp::Le => CmpOp::Le,
+            RangeOp::Gt => CmpOp::Gt,
+            RangeOp::Ge => CmpOp::Ge,
+        };
+        preds.push(compile_one(
+            columns.get(clause.column_index),
+            &clause.value,
+            op,
+        ));
+    }
+    preds
+}
+
+// ---------------------------------------------------------------------------
+// Chunks
+// ---------------------------------------------------------------------------
+
+/// Group index of one chunk: per distinct key value -> ascending local row
+/// offsets (the `g#` attribute analogue), plus the composite key/partition
+/// index used when a lookup pins the partition column.
+struct GroupIndex {
+    key: HashMap<ValueKey, Vec<u32>>,
+    key_partition: Option<HashMap<(ValueKey, ValueKey), Vec<u32>>>,
+}
+
+impl GroupIndex {
+    fn empty(partitioned: bool) -> Self {
+        Self {
+            key: HashMap::new(),
+            key_partition: partitioned.then(HashMap::new),
+        }
+    }
+
+    fn estimate_bytes(&self) -> u64 {
+        let key_entry = std::mem::size_of::<ValueKey>() as u64 + 24; // slot + Vec header
+        let mut bytes = self.key.len() as u64 * key_entry;
+        bytes += self
+            .key
+            .values()
+            .map(|v| v.capacity() as u64 * 4)
+            .sum::<u64>();
+        if let Some(kp) = &self.key_partition {
+            let entry = (std::mem::size_of::<ValueKey>() as u64) * 2 + 24;
+            bytes += kp.len() as u64 * entry;
+            bytes += kp.values().map(|v| v.capacity() as u64 * 4).sum::<u64>();
+        }
+        bytes
+    }
+}
+
+/// A sealed (immutable) chunk. `base` is the global row id of local offset 0;
+/// global ids only move relative to the store's `front` cursor.
+struct Chunk {
+    base: u64,
+    rows: u32,
+    columns: Vec<ColumnArray>,
+    index: GroupIndex,
+    memory_bytes: u64,
+}
+
+/// Read-only view shared by sealed chunks and the open chunk, so the lookup
+/// walk can treat both uniformly.
+trait ChunkView {
+    fn base(&self) -> u64;
+    fn num_rows(&self) -> u64;
+    fn columns(&self) -> &[ColumnArray];
+    fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>>;
+    fn key_partition_postings(&self, key: &ValueKey, partition: &ValueKey) -> Option<&Vec<u32>>;
+}
+
+impl ChunkView for Chunk {
+    fn base(&self) -> u64 {
+        self.base
+    }
+    fn num_rows(&self) -> u64 {
+        self.rows as u64
+    }
+    fn columns(&self) -> &[ColumnArray] {
+        &self.columns
+    }
+    fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>> {
+        self.index.key.get(key)
+    }
+    fn key_partition_postings(&self, key: &ValueKey, partition: &ValueKey) -> Option<&Vec<u32>> {
+        self.index.key_partition.as_ref()?.get(&(*key, *partition))
+    }
+}
+
+/// The single writable chunk. Appends bulk-copy columns and maintain the group
+/// index for the new rows only; readers take this chunk's lock briefly, so they
+/// never observe a half-extended batch.
+struct OpenChunk {
+    base: u64,
+    rows: usize,
+    columns: Vec<ColumnArray>,
+    index: GroupIndex,
+}
+
+impl OpenChunk {
+    fn new(schema: &Schema, base: u64, chunk_rows: usize, partitioned: bool) -> Self {
+        Self {
+            base,
+            rows: 0,
+            columns: schema
+                .columns
+                .iter()
+                .map(|c| ColumnArray::with_capacity(c.data_type, chunk_rows))
+                .collect(),
+            index: GroupIndex::empty(partitioned),
+        }
+    }
+
+    /// Freeze a copy of this chunk's current content into an immutable chunk.
+    /// The open chunk keeps its data so readers already holding the lock (or
+    /// about to acquire it) still observe every published row.
+    fn freeze_at(&self, base: u64) -> Chunk {
+        let memory_bytes = self.columns.iter().map(|c| c.estimated_size_bytes() as u64).sum::<u64>()
+            + self.index.estimate_bytes();
+        Chunk {
+            base,
+            rows: self.rows as u32,
+            columns: self.columns.clone(),
+            index: GroupIndex {
+                key: self.index.key.clone(),
+                key_partition: self.index.key_partition.clone(),
+            },
+            memory_bytes,
+        }
+    }
+
+    fn estimated_memory_bytes(&self) -> u64 {
+        self.columns.iter().map(|c| c.estimated_size_bytes() as u64).sum::<u64>()
+            + self.index.estimate_bytes()
+    }
+}
+
+impl ChunkView for OpenChunk {
+    fn base(&self) -> u64 {
+        self.base
+    }
+    fn num_rows(&self) -> u64 {
+        self.rows as u64
+    }
+    fn columns(&self) -> &[ColumnArray] {
+        &self.columns
+    }
+    fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>> {
+        self.index.key.get(key)
+    }
+    fn key_partition_postings(&self, key: &ValueKey, partition: &ValueKey) -> Option<&Vec<u32>> {
+        self.index.key_partition.as_ref()?.get(&(*key, *partition))
+    }
+}
+
+/// Reader-visible snapshot: the `front` cursor, the sealed chunk list and the
+/// open chunk handle. Lookups hold the `RwLock` read guard for their whole
+/// walk (readers never block readers; only seal/compact take the write side),
+/// which keeps a query's view atomic against prefix reclamation.
+///
+/// `summary` aggregates the per-chunk group indexes so a watermark-free COUNT
+/// probes one hash instead of every chunk. It is maintained under the writer
+/// lock at seal/compact time.
+struct StoreState {
+    front: u64,
+    sealed: Vec<Arc<Chunk>>,
+    summary: SealedSummary,
+    open: Arc<RwLock<OpenChunk>>,
+}
+
+/// Seal-time rollup of the sealed chunks' group indexes: rows per key value,
+/// and rows per (key, partition) pair when the table is partitioned.
+#[derive(Default, Clone)]
+struct SealedSummary {
+    key_rows: HashMap<ValueKey, u64>,
+    key_partition_rows: HashMap<(ValueKey, ValueKey), u64>,
+}
+
+impl SealedSummary {
+    fn add_chunk(&mut self, index: &GroupIndex) {
+        for (key, offsets) in &index.key {
+            *self.key_rows.entry(*key).or_insert(0) += offsets.len() as u64;
+        }
+        if let Some(kp) = &index.key_partition {
+            for (key, offsets) in kp {
+                *self.key_partition_rows.entry(*key).or_insert(0) += offsets.len() as u64;
+            }
+        }
+    }
+
+    /// Remove the contribution of `index`: either every row (`None`) or only
+    /// those at local offsets below `cut` (prefix reclaimed from a boundary
+    /// chunk).
+    fn remove_chunk(&mut self, index: &GroupIndex, cut: Option<usize>) {
+        for (key, offsets) in &index.key {
+            let removed = match cut {
+                Some(c) => offsets.partition_point(|&o| (o as usize) < c) as u64,
+                None => offsets.len() as u64,
+            };
+            if removed > 0 {
+                if let Some(slot) = self.key_rows.get_mut(key) {
+                    *slot = slot.saturating_sub(removed);
+                }
+            }
+        }
+        if let Some(kp) = &index.key_partition {
+            for (key, offsets) in kp {
+                let removed = match cut {
+                    Some(c) => offsets.partition_point(|&o| (o as usize) < c) as u64,
+                    None => offsets.len() as u64,
+                };
+                if removed > 0 {
+                    if let Some(slot) = self.key_partition_rows.get_mut(key) {
+                        *slot = slot.saturating_sub(removed);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// An in-memory, append-only acceleration table.
 ///
-/// Columns are stored in their declared (native) types. A per-value inverted
-/// index maps each distinct value of the leading cluster-key column to the row
-/// offsets that carry it, enabling O(matched) gather for point lookups.
+/// Columns are stored in their declared (native) types across contiguous
+/// chunks. A per-chunk group index maps each distinct value of the leading
+/// cluster-key column to the row offsets that carry it, enabling O(matched)
+/// gather for point lookups.
 pub struct HotStore {
     schema: Schema,
     key_column_index: usize,
     partition_column_index: Option<usize>,
-    columns: RwLock<Vec<ColumnArray>>,
+    chunk_rows: usize,
+    state: RwLock<Arc<StoreState>>,
+    /// Serializes append/seal/compact. Readers never take this.
+    writer: Mutex<()>,
+    string_pool: RwLock<StringPool>,
     row_count: AtomicU64,
+    memory_bytes: AtomicU64,
     fully_resident: AtomicBool,
     resident_partitions: RwLock<HashSet<String>>,
-    string_pool: RwLock<StringPool>,
-    value_index: RwLock<HashMap<ValueKey, Vec<u32>>>,
-    value_partition_index: RwLock<HashMap<(ValueKey, ValueKey), Vec<u32>>>,
     memory_soft_limit: u64,
     memory_hard_limit: u64,
 }
@@ -240,20 +680,48 @@ impl HotStore {
         partition_column_index: Option<usize>,
         memory_limit_bytes: u64,
     ) -> Self {
-        let columns = build_initial_columns(&schema);
-        Self {
+        Self::with_chunk_rows(
             schema,
             key_column_index,
             partition_column_index,
-            columns: RwLock::new(columns),
-            row_count: AtomicU64::new(0),
-            fully_resident: AtomicBool::new(false),
-            resident_partitions: RwLock::new(HashSet::new()),
-            string_pool: RwLock::new(StringPool::new()),
-            value_index: RwLock::new(HashMap::new()),
-            value_partition_index: RwLock::new(HashMap::new()),
+            memory_limit_bytes,
+            DEFAULT_CHUNK_ROWS,
+        )
+    }
+
+    fn with_chunk_rows(
+        schema: Schema,
+        key_column_index: usize,
+        partition_column_index: Option<usize>,
+        memory_limit_bytes: u64,
+        chunk_rows: usize,
+    ) -> Self {
+        let chunk_rows = chunk_rows.max(1);
+        let open = Arc::new(RwLock::new(OpenChunk::new(
+            &schema,
+            0,
+            chunk_rows,
+            partition_column_index.is_some(),
+        )));
+        Self {
             memory_soft_limit: memory_limit_bytes,
             memory_hard_limit: memory_limit_bytes,
+            schema,
+            key_column_index,
+            partition_column_index,
+            chunk_rows,
+            state: RwLock::new(Arc::new(StoreState {
+                front: 0,
+                sealed: Vec::new(),
+                summary: SealedSummary::default(),
+                open,
+            })),
+            writer: Mutex::new(()),
+            string_pool: RwLock::new(StringPool::new()),
+            row_count: AtomicU64::new(0),
+            memory_bytes: AtomicU64::new(0),
+            fully_resident: AtomicBool::new(false),
+            resident_partitions: RwLock::new(HashSet::new()),
         }
     }
 
@@ -315,13 +783,23 @@ impl HotStore {
             .contains(partition_key)
     }
 
-    /// Number of distinct key values currently indexed.
+    /// Number of distinct key values currently indexed. Sealed chunks are
+    /// unioned on demand; this is a diagnostic, not a query-path primitive.
     pub fn distinct_key_count(&self) -> usize {
-        self.value_index.read().unwrap().len()
+        let st = self.state.read().unwrap();
+        let mut distinct: HashSet<ValueKey> = HashSet::new();
+        for chunk in &st.sealed {
+            distinct.extend(chunk.index.key.keys().copied());
+        }
+        let open = st.open.read().unwrap();
+        distinct.extend(open.index.key.keys().copied());
+        distinct.len()
     }
 
-    /// Append a batch, incrementally maintaining the inverted index by scanning
-    /// only the newly added rows (O(added) rather than O(total)).
+    /// Append a batch. The columns are bulk-copied into the open chunk and the
+    /// group index is extended for the new rows; a full open chunk is sealed
+    /// into an immutable `Arc` (one copy per chunk, amortized over
+    /// `chunk_rows` rows).
     pub fn append(&self, batch: &RecordBatch) -> Result<()> {
         let added = batch.num_rows();
         if added == 0 {
@@ -340,7 +818,8 @@ impl HotStore {
         // path) reacts by checkpoint-flushing + compacting the persisted prefix,
         // then retrying once.
         let projected = self
-            .estimated_memory_bytes()
+            .memory_bytes
+            .load(Ordering::Relaxed)
             .saturating_add(estimate_batch_memory(batch));
         if projected > self.memory_hard_limit {
             tracing::error!(
@@ -354,25 +833,23 @@ impl HotStore {
             )));
         }
 
-        let base = self.row_count.load(Ordering::Acquire);
-        if base + added as u64 > u32::MAX as u64 {
-            return Err(TaibaiError::Internal(
-                "hot store: row offset overflow (exceeds u32 range)".into(),
-            ));
-        }
-        let base_u32 = base as u32;
+        let _writer = self.writer.lock().unwrap();
 
-        // Derive index keys for the new rows (interning strings without cloning).
-        let key_col = batch.column(self.key_column_index).ok_or_else(|| {
-            TaibaiError::Internal("hot store: missing key column in batch".into())
-        })?;
+        // Derive index keys for the new rows (interning strings without
+        // cloning). Done once per batch; the per-slice copy below slices into
+        // this buffer.
         let (keys, partition_keys) = {
             let mut pool = self.string_pool.write().unwrap();
+            let key_col = batch.column(self.key_column_index).ok_or_else(|| {
+                TaibaiError::Internal("hot store: missing key column in batch".into())
+            })?;
             let keys = collect_keys(key_col, &mut pool)?;
             let partition_keys = match self.partition_column_index {
                 Some(partition_idx) => {
                     let partition_col = batch.column(partition_idx).ok_or_else(|| {
-                        TaibaiError::Internal("hot store: missing partition column in batch".into())
+                        TaibaiError::Internal(
+                            "hot store: missing partition column in batch".into(),
+                        )
                     })?;
                     Some(collect_keys(partition_col, &mut pool)?)
                 }
@@ -381,35 +858,62 @@ impl HotStore {
             (keys, partition_keys)
         };
 
-        // Extend every column in its native type.
-        {
-            let mut cols = self.columns.write().unwrap();
-            for i in 0..self.schema.num_columns() {
-                if let Some(src) = batch.column(i) {
-                    cols[i].extend(src)?;
+        let num_cols = self.schema.num_columns();
+        let mut consumed = 0usize;
+        while consumed < added {
+            let open_arc = self.state.read().unwrap().open.clone();
+            let mut open = open_arc.write().unwrap();
+            let space = self.chunk_rows - open.rows;
+            let take = space.min(added - consumed);
+            let start = consumed;
+            let end = consumed + take;
+            for i in 0..num_cols {
+                let src = batch.column(i).ok_or_else(|| {
+                    TaibaiError::Internal("hot store: missing column in batch".into())
+                })?;
+                if start == 0 && end == added {
+                    open.columns[i].extend(src)?;
+                } else {
+                    let sliced = src.slice_fast(start, end);
+                    open.columns[i].extend(&sliced)?;
                 }
             }
-        }
-
-        // Update the inverted index.
-        {
-            let mut idx = self.value_index.write().unwrap();
-            for (j, key) in keys.iter().enumerate() {
-                idx.entry(*key).or_default().push(base_u32 + j as u32);
-            }
-        }
-        if let Some(partition_keys) = &partition_keys {
-            let mut idx = self.value_partition_index.write().unwrap();
-            for (j, (key, partition_key)) in keys.iter().zip(partition_keys.iter()).enumerate() {
-                idx.entry((*key, *partition_key))
+            let local_base = open.rows as u32;
+            for (j, key) in keys[start..end].iter().enumerate() {
+                open.index
+                    .key
+                    .entry(*key)
                     .or_default()
-                    .push(base_u32 + j as u32);
+                    .push(local_base + j as u32);
+            }
+            if let (Some(kp), Some(pkeys)) =
+                (open.index.key_partition.as_mut(), partition_keys.as_ref())
+            {
+                for (j, (key, pkey)) in keys[start..end]
+                    .iter()
+                    .zip(pkeys[start..end].iter())
+                    .enumerate()
+                {
+                    kp.entry((*key, *pkey))
+                        .or_default()
+                        .push(local_base + j as u32);
+                }
+            }
+            open.rows += take;
+            let full = open.rows == self.chunk_rows;
+            drop(open);
+            consumed = end;
+            if full {
+                self.seal_open();
             }
         }
 
-        self.row_count.store(base + added as u64, Ordering::Release);
+        // Publish the new rows only after their data and index are in place.
+        self.row_count.fetch_add(added as u64, Ordering::AcqRel);
+        self.memory_bytes
+            .fetch_add(estimate_batch_memory(batch), Ordering::Relaxed);
 
-        let used = self.estimated_memory_bytes();
+        let used = self.memory_bytes.load(Ordering::Relaxed);
         if used > self.memory_hard_limit {
             tracing::error!(
                 used_bytes = used,
@@ -425,6 +929,39 @@ impl HotStore {
         }
 
         Ok(())
+    }
+
+    /// Seal the current open chunk: freeze it into the sealed list and install
+    /// a fresh open chunk. Caller must hold the writer mutex.
+    fn seal_open(&self) {
+        let st = self.state.read().unwrap().clone();
+        let frozen = {
+            let open = st.open.read().unwrap();
+            if open.rows == 0 {
+                return;
+            }
+            Arc::new(open.freeze_at(open.base))
+        };
+        let fresh = Arc::new(RwLock::new(OpenChunk::new(
+            &self.schema,
+            frozen.base + frozen.rows as u64,
+            self.chunk_rows,
+            self.partition_column_index.is_some(),
+        )));
+        let mut sealed = Vec::with_capacity(st.sealed.len() + 1);
+        sealed.extend(st.sealed.iter().cloned());
+        sealed.push(Arc::clone(&frozen));
+        let mut summary = st.summary.clone();
+        summary.add_chunk(&frozen.index);
+        // The write guard must not span the recompute below (same-thread
+        // RwLock re-acquisition would self-deadlock).
+        *self.state.write().unwrap() = Arc::new(StoreState {
+            front: st.front,
+            sealed,
+            summary,
+            open: fresh,
+        });
+        self.recompute_memory_bytes();
     }
 
     /// Gather all rows whose index-column value equals `key_value`, optionally
@@ -472,88 +1009,165 @@ impl HotStore {
         eq_predicates: &[(usize, ScalarValue)],
         range_predicates: &[RangeClause],
     ) -> Option<RecordBatch> {
-        let (key, partition_key) = {
-            let pool = self.string_pool.read().unwrap();
-            let key = scalar_to_key(key_value, &pool).ok()??;
-            let partition_key = match partition_value {
-                Some(value) => scalar_to_key(value, &pool).ok()?,
-                None => None,
-            };
-            (key, partition_key)
-        };
-        let partition_index;
-        let value_index;
-        let raw = if let Some(partition_key) = partition_key {
-            partition_index = self.value_partition_index.read().unwrap();
-            partition_index.get(&(key, partition_key))?
+        let (key, partition_key) = self.resolve_query_keys(key_value, partition_value)?;
+        // Hold the snapshot for the whole walk so a query never mixes chunks
+        // from before and after a prefix reclamation.
+        let st = self.state.read().unwrap();
+        let open_guard = st.open.read().unwrap();
+        let front = st.front;
+
+        // Visit chunks in append order (ascending ids), or newest-first for
+        // reverse lookups, so LIMIT can terminate early.
+        let mut visit: Vec<&dyn ChunkView> = Vec::with_capacity(st.sealed.len() + 1);
+        if reverse {
+            visit.push(&*open_guard);
+            visit.extend(st.sealed.iter().rev().map(|c| c.as_ref() as &dyn ChunkView));
         } else {
-            value_index = self.value_index.read().unwrap();
-            value_index.get(&key)?
-        };
+            visit.extend(st.sealed.iter().map(|c| c.as_ref() as &dyn ChunkView));
+            visit.push(&*open_guard);
+        }
 
         let proj: Vec<usize> = match projection {
             Some(p) => p.to_vec(),
             None => (0..self.schema.num_columns()).collect(),
         };
-        let cols = self.columns.read().unwrap();
-        let start = raw.partition_point(|offset| (*offset as u64) < min_offset);
-        let available = &raw[start..];
-        let covered_partition_column = partition_key.and(self.partition_column_index);
         let target = row_limit.unwrap_or(usize::MAX);
-        let mut rows = Vec::with_capacity(available.len().min(target));
-        if target == 0 {
-            // Keep `rows` empty.
-        } else if reverse {
-            for &row in available.iter().rev() {
-                if hot_row_matches(
-                    &cols,
-                    row as usize,
-                    eq_predicates,
-                    range_predicates,
-                    self.key_column_index,
-                    covered_partition_column,
-                ) {
-                    rows.push(row);
-                    if rows.len() >= target {
-                        break;
+        let mut gathered: Option<(Vec<ColumnDef>, Vec<ColumnArray>)> = None;
+        let mut found: usize = 0;
+        let mut seen = false;
+        let mut skipped_by_watermark = false;
+        let mut rows_buf: Vec<u32> = Vec::new();
+
+        for chunk in visit {
+            let base = chunk.base() - front;
+            let chunk_end = base + chunk.num_rows();
+            if chunk_end <= min_offset {
+                // Fully below the watermark. Coverage is an append-order
+                // prefix, so a newest-first (reverse) walk can stop here.
+                skipped_by_watermark = true;
+                if reverse {
+                    break;
+                }
+                continue;
+            }
+            if found >= target {
+                break;
+            }
+            let postings = match partition_key {
+                Some(pk) => chunk.key_partition_postings(&key, &pk),
+                None => chunk.key_postings(&key),
+            };
+            let Some(postings) = postings else {
+                continue;
+            };
+            seen = true;
+            let cut = if min_offset > base {
+                ((min_offset - base).min(u32::MAX as u64)) as u32
+            } else {
+                0
+            };
+            let start = postings.partition_point(|&o| o < cut);
+            let slice = &postings[start..];
+            if slice.is_empty() {
+                continue;
+            }
+            let covered_partition = partition_key.and(self.partition_column_index);
+            let preds = compile_predicates(
+                chunk.columns(),
+                eq_predicates,
+                range_predicates,
+                self.key_column_index,
+                covered_partition,
+            );
+            rows_buf.clear();
+            let remaining = target - found;
+            if reverse {
+                for &row in slice.iter().rev() {
+                    if preds.iter().all(|p| p.matches(row as usize)) {
+                        rows_buf.push(row);
+                        if rows_buf.len() >= remaining {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for &row in slice {
+                    if preds.iter().all(|p| p.matches(row as usize)) {
+                        rows_buf.push(row);
+                        if rows_buf.len() >= remaining {
+                            break;
+                        }
                     }
                 }
             }
-        } else {
-            for &row in available {
-                if hot_row_matches(
-                    &cols,
-                    row as usize,
-                    eq_predicates,
-                    range_predicates,
-                    self.key_column_index,
-                    covered_partition_column,
-                ) {
-                    rows.push(row);
-                    if rows.len() >= target {
-                        break;
+            if rows_buf.is_empty() {
+                continue;
+            }
+            found += rows_buf.len();
+            let columns: Vec<ColumnArray> = proj
+                .iter()
+                .map(|&ci| chunk.columns()[ci].take(&rows_buf))
+                .collect();
+            match &mut gathered {
+                Some((_, acc)) => {
+                    for (dst, src) in acc.iter_mut().zip(columns) {
+                        dst.extend(&src).ok();
                     }
+                }
+                slot @ None => {
+                    let defs = proj
+                        .iter()
+                        .map(|&i| self.schema.columns[i].clone())
+                        .collect();
+                    *slot = Some((defs, columns));
                 }
             }
         }
+        drop(open_guard);
 
-        if rows.is_empty() {
+        if !seen {
+            if skipped_by_watermark {
+                // The key was never probed above the watermark. Keep the
+                // None-vs-empty contract: a key that exists only under the
+                // watermark yields Some(empty), never None.
+                if !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        let Some((defs, columns)) = gathered else {
             let col_defs: Vec<ColumnDef> = proj
                 .iter()
                 .map(|&i| self.schema.columns[i].clone())
                 .collect();
             return Some(RecordBatch::new(Schema::new(col_defs)));
-        }
+        };
+        RecordBatch::try_new(Schema::new(defs), columns).ok()
+    }
 
-        let mut out_cols = Vec::with_capacity(proj.len());
-        let mut out_defs = Vec::with_capacity(proj.len());
-        for &ci in &proj {
-            out_defs.push(self.schema.columns[ci].clone());
-            out_cols.push(cols[ci].take(&rows));
+    /// Existence probe used to distinguish "never seen" (`None`) from "seen
+    /// but everything filtered" (`Some(empty)`) when the watermark skipped
+    /// chunks without probing their postings.
+    fn key_exists_anywhere(
+        &self,
+        st: &StoreState,
+        key: &ValueKey,
+        partition_key: Option<&ValueKey>,
+    ) -> bool {
+        let sealed_hit = st.sealed.iter().any(|c| match partition_key {
+            Some(pk) => c.key_partition_postings(key, pk).is_some(),
+            None => c.key_postings(key).is_some(),
+        });
+        if sealed_hit {
+            return true;
         }
-        drop(cols);
-
-        RecordBatch::try_new(Schema::new(out_defs), out_cols).ok()
+        let open = st.open.read().unwrap();
+        match partition_key {
+            Some(pk) => open.key_partition_postings(key, pk).is_some(),
+            None => open.key_postings(key).is_some(),
+        }
     }
 
     /// Count rows whose index-column value equals `key_value` without
@@ -564,27 +1178,64 @@ impl HotStore {
         partition_value: Option<&ScalarValue>,
         min_offset: u64,
     ) -> Option<u64> {
-        let pool = self.string_pool.read().unwrap();
-        let key = scalar_to_key(key_value, &pool).ok()??;
-        let partition_key = match partition_value {
-            Some(value) => scalar_to_key(value, &pool).ok()?,
-            None => None,
-        };
-        drop(pool);
-        let partition_index;
-        let value_index;
-        let offsets = if let Some(partition_key) = partition_key {
-            partition_index = self.value_partition_index.read().unwrap();
-            partition_index.get(&(key, partition_key))?
-        } else {
-            value_index = self.value_index.read().unwrap();
-            value_index.get(&key)?
-        };
-        Some(if min_offset == 0 {
-            offsets.len() as u64
-        } else {
-            (offsets.len() - offsets.partition_point(|offset| (*offset as u64) < min_offset)) as u64
-        })
+        let (key, partition_key) = self.resolve_query_keys(key_value, partition_value)?;
+        let st = self.state.read().unwrap();
+        let open = st.open.read().unwrap();
+        let front = st.front;
+
+        if min_offset == 0 {
+            // Resident fast path: every sealed row is visible, so the
+            // seal-time summary answers for all chunks in one probe.
+            let sealed_total = match partition_key {
+                None => st.summary.key_rows.get(&key).copied().unwrap_or(0),
+                Some(pk) => st
+                    .summary
+                    .key_partition_rows
+                    .get(&(key, pk))
+                    .copied()
+                    .unwrap_or(0),
+            };
+            let mut total = sealed_total;
+            let mut seen = sealed_total > 0;
+            let open_postings = match partition_key {
+                Some(pk) => open.key_partition_postings(&key, &pk),
+                None => open.key_postings(&key),
+            };
+            if let Some(offsets) = open_postings {
+                seen = true;
+                total += offsets.len() as u64;
+            }
+            return seen.then_some(total);
+        }
+
+        let mut seen = false;
+        let mut skipped = false;
+        let mut total = 0u64;
+        for chunk in sealed_then_open(&st, &open) {
+            let base = chunk.base() - front;
+            if base + chunk.num_rows() <= min_offset {
+                skipped = true;
+                continue;
+            }
+            let postings = match partition_key {
+                Some(pk) => chunk.key_partition_postings(&key, &pk),
+                None => chunk.key_postings(&key),
+            };
+            let Some(postings) = postings else {
+                continue;
+            };
+            seen = true;
+            let cut = if min_offset > base {
+                ((min_offset - base).min(u32::MAX as u64)) as u32
+            } else {
+                0
+            };
+            total += (postings.len() - postings.partition_point(|&o| o < cut)) as u64;
+        }
+        if !seen && skipped && !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
+            return None;
+        }
+        (seen || skipped).then_some(total)
     }
 
     /// Count matching index candidates without gathering a RecordBatch.
@@ -596,120 +1247,230 @@ impl HotStore {
         eq_predicates: &[(usize, ScalarValue)],
         range_predicates: &[RangeClause],
     ) -> Option<u64> {
-        let (key, partition_key) = {
-            let pool = self.string_pool.read().unwrap();
-            let key = scalar_to_key(key_value, &pool).ok()??;
-            let partition_key = match partition_value {
-                Some(value) => scalar_to_key(value, &pool).ok()?,
-                None => None,
+        let (key, partition_key) = self.resolve_query_keys(key_value, partition_value)?;
+        let st = self.state.read().unwrap();
+        let open = st.open.read().unwrap();
+        let front = st.front;
+        let mut seen = false;
+        let mut skipped = false;
+        let mut total = 0u64;
+        for chunk in sealed_then_open(&st, &open) {
+            let base = chunk.base() - front;
+            if base + chunk.num_rows() <= min_offset {
+                skipped = true;
+                continue;
+            }
+            let postings = match partition_key {
+                Some(pk) => chunk.key_partition_postings(&key, &pk),
+                None => chunk.key_postings(&key),
             };
-            (key, partition_key)
-        };
-        let partition_index;
-        let value_index;
-        let offsets = if let Some(partition_key) = partition_key {
-            partition_index = self.value_partition_index.read().unwrap();
-            partition_index.get(&(key, partition_key))?
-        } else {
-            value_index = self.value_index.read().unwrap();
-            value_index.get(&key)?
-        };
-        let start = offsets.partition_point(|offset| (*offset as u64) < min_offset);
-        let covered_partition_column = partition_key.and(self.partition_column_index);
-        let columns = self.columns.read().unwrap();
-        Some(
-            offsets[start..]
+            let Some(postings) = postings else {
+                continue;
+            };
+            seen = true;
+            let cut = if min_offset > base {
+                ((min_offset - base).min(u32::MAX as u64)) as u32
+            } else {
+                0
+            };
+            let start = postings.partition_point(|&o| o < cut);
+            if start >= postings.len() {
+                continue;
+            }
+            let covered_partition = partition_key.and(self.partition_column_index);
+            let preds = compile_predicates(
+                chunk.columns(),
+                eq_predicates,
+                range_predicates,
+                self.key_column_index,
+                covered_partition,
+            );
+            total += postings[start..]
                 .iter()
-                .filter(|&&row| {
-                    hot_row_matches(
-                        &columns,
-                        row as usize,
-                        eq_predicates,
-                        range_predicates,
-                        self.key_column_index,
-                        covered_partition_column,
-                    )
-                })
-                .count() as u64,
-        )
+                .filter(|&&row| preds.iter().all(|p| p.matches(row as usize)))
+                .count() as u64;
+        }
+        if !seen && skipped && !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
+            return None;
+        }
+        (seen || skipped).then_some(total)
     }
 
-    /// Rough resident-memory estimate in bytes.
+    /// Resolve the query key (and optional partition key) through the intern
+    /// pool. `None` means the value has never been appended.
+    fn resolve_query_keys(
+        &self,
+        key_value: &ScalarValue,
+        partition_value: Option<&ScalarValue>,
+    ) -> Option<(ValueKey, Option<ValueKey>)> {
+        let pool = self.string_pool.read().unwrap();
+        let key = scalar_to_key(key_value, &pool).ok()??;
+        let partition_key = match partition_value {
+            Some(value) => scalar_to_key(value, &pool).ok()?,
+            None => None,
+        };
+        Some((key, partition_key))
+    }
+
+    /// Rough resident-memory estimate in bytes (maintained incrementally and
+    /// recomputed at seal/compact boundaries).
     pub fn estimated_memory_bytes(&self) -> u64 {
-        let cols = self.columns.read().unwrap();
-        let mut total: u64 = 0;
-        for (i, col) in cols.iter().enumerate() {
-            total += (col.len() as u64) * approx_type_width(&self.schema.columns[i].data_type);
-        }
-        drop(cols);
-        total += (self.string_pool.read().unwrap().len() as u64) * 24; // interned strings
-        total += self.row_count() * 4; // inverted-index row-offset storage
-        total
+        self.memory_bytes.load(Ordering::Relaxed)
     }
 
     pub fn soft_limit_exceeded(&self) -> bool {
-        self.estimated_memory_bytes() > self.memory_soft_limit
+        self.memory_bytes.load(Ordering::Relaxed) > self.memory_soft_limit
+    }
+
+    fn recompute_memory_bytes(&self) {
+        let st = self.state.read().unwrap().clone();
+        let mut total: u64 = st.sealed.iter().map(|c| c.memory_bytes).sum();
+        total += st.open.read().unwrap().estimated_memory_bytes();
+        total += (self.string_pool.read().unwrap().len() as u64) * 24;
+        self.memory_bytes.store(total, Ordering::Relaxed);
     }
 
     /// Drop the leading `requested` rows (the append-prefix already persisted to
     /// segments) to reclaim resident memory under backpressure. Returns the
-    /// number of rows actually dropped. Remaining rows keep their relative
-    /// order; the inverted index is rewritten with shifted offsets. This is the
-    /// "release the oldest archived interval" safety valve from design 搂3.1.
+    /// number of rows actually dropped.
+    ///
+    /// Whole chunks below the cut are released as-is (their frozen indexes go
+    /// with them); only the chunk straddling the cut is trimmed and re-indexed.
+    /// The `front` cursor advances instead of renumbering survivors, so the
+    /// relative offsets the scan layer uses as watermarks stay exact. This is
+    /// the "release the oldest archived interval" safety valve from design
+    /// 搂3.1.
     pub fn compact_prefix(&self, requested: u64) -> u64 {
-        let total = self.row_count();
-        if requested == 0 || total == 0 {
+        if requested == 0 {
             return 0;
         }
-        let n = (requested.min(total)) as usize;
-        {
-            let mut cols = self.columns.write().unwrap();
-            for i in 0..cols.len() {
-                let len = cols[i].len();
-                if n >= len {
-                    cols[i] = ColumnArray::empty(self.schema.columns[i].data_type);
-                } else {
-                    cols[i] = cols[i].slice_fast(n, len);
-                }
+        let _writer = self.writer.lock().unwrap();
+        let total = self.row_count();
+        if total == 0 {
+            return 0;
+        }
+        let n = requested.min(total);
+        let st = self.state.read().unwrap().clone();
+        let cut = st.front + n;
+        let mut summary = st.summary.clone();
+
+        let mut sealed: Vec<Arc<Chunk>> = Vec::with_capacity(st.sealed.len());
+        for chunk in &st.sealed {
+            let end = chunk.base + chunk.rows as u64;
+            if end <= cut {
+                // Entirely below the cut: the frozen chunk (columns + index)
+                // is released as one allocation group.
+                summary.remove_chunk(&chunk.index, None);
+                continue;
+            }
+            if chunk.base >= cut {
+                sealed.push(Arc::clone(chunk));
+            } else {
+                // Boundary chunk: keep [cut, end) as a fresh frozen chunk.
+                let local_cut = (cut - chunk.base) as usize;
+                let rows = chunk.rows as usize;
+                summary.remove_chunk(&chunk.index, Some(local_cut));
+                let columns: Vec<ColumnArray> = chunk
+                    .columns
+                    .iter()
+                    .map(|c| c.slice_fast(local_cut, rows))
+                    .collect();
+                let index = self.rebuild_index(&columns);
+                let memory_bytes = columns
+                    .iter()
+                    .map(|c| c.estimated_size_bytes() as u64)
+                    .sum::<u64>()
+                    + index.estimate_bytes();
+                sealed.push(Arc::new(Chunk {
+                    base: cut,
+                    rows: (rows - local_cut) as u32,
+                    columns,
+                    index,
+                    memory_bytes,
+                }));
             }
         }
-        {
-            let mut idx = self.value_index.write().unwrap();
-            let n_u32 = n as u32;
-            for offsets in idx.values_mut() {
-                let mut write_pos = 0usize;
-                let len = offsets.len();
-                for read_pos in 0..len {
-                    let o = offsets[read_pos];
-                    if o >= n_u32 {
-                        offsets[write_pos] = o - n_u32;
-                        write_pos += 1;
-                    }
-                }
-                offsets.truncate(write_pos);
+
+        // Open chunk: shared when untouched, trimmed when the cut reaches into
+        // it, replaced when fully reclaimed.
+        let open_arc = {
+            let open = st.open.read().unwrap();
+            let end = open.base + open.rows as u64;
+            if open.rows == 0 || open.base >= cut {
+                Arc::clone(&st.open)
+            } else if end <= cut {
+                Arc::new(RwLock::new(OpenChunk::new(
+                    &self.schema,
+                    end,
+                    self.chunk_rows,
+                    self.partition_column_index.is_some(),
+                )))
+            } else {
+                let local_cut = (cut - open.base) as usize;
+                let columns: Vec<ColumnArray> = open
+                    .columns
+                    .iter()
+                    .map(|c| c.slice_fast(local_cut, open.rows))
+                    .collect();
+                let index = self.rebuild_index(&columns);
+                Arc::new(RwLock::new(OpenChunk {
+                    base: cut,
+                    rows: open.rows - local_cut,
+                    columns,
+                    index,
+                }))
             }
-            idx.retain(|_, v| !v.is_empty());
-        }
-        {
-            let mut idx = self.value_partition_index.write().unwrap();
-            let n_u32 = n as u32;
-            for offsets in idx.values_mut() {
-                let mut write_pos = 0usize;
-                let len = offsets.len();
-                for read_pos in 0..len {
-                    let o = offsets[read_pos];
-                    if o >= n_u32 {
-                        offsets[write_pos] = o - n_u32;
-                        write_pos += 1;
-                    }
-                }
-                offsets.truncate(write_pos);
-            }
-            idx.retain(|_, v| !v.is_empty());
-        }
-        self.row_count.fetch_sub(n as u64, Ordering::Release);
-        n as u64
+        };
+
+        *self.state.write().unwrap() = Arc::new(StoreState {
+            front: cut,
+            sealed,
+            summary,
+            open: open_arc,
+        });
+
+        self.row_count.fetch_sub(n, Ordering::AcqRel);
+        self.recompute_memory_bytes();
+        n
     }
+
+    /// Rebuild the group index of a trimmed chunk directly from its columns
+    /// (string values are already interned, so this is a lookup-only pass).
+    fn rebuild_index(&self, columns: &[ColumnArray]) -> GroupIndex {
+        let mut pool = self.string_pool.write().unwrap();
+        let keys = match columns.get(self.key_column_index) {
+            Some(col) => collect_keys(col, &mut pool).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let partition_keys = match self.partition_column_index.and_then(|i| columns.get(i)) {
+            Some(col) => collect_keys(col, &mut pool).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut index = GroupIndex::empty(self.partition_column_index.is_some());
+        for (row, key) in keys.iter().enumerate() {
+            index.key.entry(*key).or_default().push(row as u32);
+        }
+        if let (Some(kp), Some(pkeys)) = (
+            index.key_partition.as_mut(),
+            (!partition_keys.is_empty()).then_some(&partition_keys),
+        ) {
+            for (row, (key, pkey)) in keys.iter().zip(pkeys.iter()).enumerate() {
+                kp.entry((*key, *pkey)).or_default().push(row as u32);
+            }
+        }
+        index
+    }
+}
+
+/// Iterate the sealed chunks in append order followed by the open chunk.
+fn sealed_then_open<'a>(
+    st: &'a StoreState,
+    open: &'a OpenChunk,
+) -> impl Iterator<Item = &'a dyn ChunkView> {
+    st.sealed
+        .iter()
+        .map(|c| c.as_ref() as &dyn ChunkView)
+        .chain(std::iter::once(open as &dyn ChunkView))
 }
 
 fn estimate_batch_memory(batch: &RecordBatch) -> u64 {
@@ -721,46 +1482,6 @@ fn estimate_batch_memory(batch: &RecordBatch) -> u64 {
     }
     total += (batch.num_rows() as u64) * 4; // inverted-index row offsets
     total
-}
-
-#[inline]
-fn hot_row_matches(
-    columns: &[ColumnArray],
-    row: usize,
-    eq_predicates: &[(usize, ScalarValue)],
-    range_predicates: &[RangeClause],
-    covered_key_column: usize,
-    covered_partition_column: Option<usize>,
-) -> bool {
-    if !eq_predicates
-        .iter()
-        .filter(|(column, _)| {
-            *column != covered_key_column && Some(*column) != covered_partition_column
-        })
-        .all(|(column, value)| {
-            columns
-                .get(*column)
-                .and_then(|array| array.compare_scalar_at(row, value))
-                .is_some_and(|ordering| ordering.is_eq())
-        })
-    {
-        return false;
-    }
-    range_predicates.iter().all(|clause| {
-        let Some(ordering) = columns
-            .get(clause.column_index)
-            .and_then(|array| array.compare_scalar_at(row, &clause.value))
-        else {
-            return false;
-        };
-        match clause.op {
-            RangeOp::Eq => ordering.is_eq(),
-            RangeOp::Lt => ordering.is_lt(),
-            RangeOp::Le => !ordering.is_gt(),
-            RangeOp::Gt => ordering.is_gt(),
-            RangeOp::Ge => !ordering.is_lt(),
-        }
-    })
 }
 
 fn approx_type_width(dt: &DataType) -> u64 {
@@ -779,14 +1500,6 @@ fn approx_type_width(dt: &DataType) -> u64 {
         DataType::Blob => 32,
         DataType::Vector => 64,
     }
-}
-
-fn build_initial_columns(schema: &Schema) -> Vec<ColumnArray> {
-    schema
-        .columns
-        .iter()
-        .map(|c| ColumnArray::empty(c.data_type))
-        .collect()
 }
 
 /// Registry of resident hot stores, keyed by `(db, table)`.
