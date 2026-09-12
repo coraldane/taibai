@@ -170,12 +170,12 @@ fn build_operator_with_limit(
                 profile,
                 depth + 1,
             )?;
-            Ok(Box::new(FilterExec {
-                predicate: filter.predicate,
+            Ok(Box::new(FilterExec::new(
+                filter.predicate,
                 input,
                 schema,
-                subqueries: ctx.subqueries.clone(),
-            }))
+                ctx.subqueries.clone(),
+            )))
         }
         LogicalPlan::Project(project) => {
             let input_schema = get_scan_schema(&project.input);
@@ -377,15 +377,25 @@ fn build_operator_with_limit(
                 crate::sql::execution::operators::DistinctExec::new(input),
             ))
         }
-        LogicalPlan::Window(window) => build_operator_with_limit(
-            *window.input,
-            ctx,
-            None,
-            table_batches,
-            scan_seeds,
-            profile,
-            depth + 1,
-        ),
+        LogicalPlan::Window(window) => {
+            let input_schema = get_scan_schema_from_window(&window);
+            let input = build_operator_with_limit(
+                *window.input,
+                ctx,
+                None,
+                table_batches,
+                scan_seeds,
+                profile,
+                depth + 1,
+            )?;
+            Ok(Box::new(
+                crate::sql::execution::operators::window::WindowExec::new(
+                    input,
+                    window.funcs,
+                    input_schema,
+                ),
+            ))
+        }
         LogicalPlan::Empty => Ok(Box::new(ScanExec::new(vec![], None))),
     };
     let operator = operator?;
@@ -1541,7 +1551,7 @@ fn estimate_plan_profile(plan: &LogicalPlan, ctx: &PhysicalContext<'_>) -> PlanE
                 JoinType::Right => inner_rows.max(right.rows),
                 JoinType::Full => inner_rows.max(left.rows).max(right.rows),
                 JoinType::Cross => left.rows.saturating_mul(right.rows),
-                JoinType::Semi | JoinType::Anti | JoinType::Asof => left.rows,
+                JoinType::Semi | JoinType::Anti | JoinType::Asof | JoinType::LeftAsof => left.rows,
             };
             let merged = merge_join_ndv(
                 rows,
@@ -1895,6 +1905,19 @@ fn annotate_scan(
     }
 }
 
+/// Schema of a Window node: its input's columns plus one result column per
+/// window function.
+fn get_scan_schema_from_window(window: &crate::sql::planner::WindowPlan) -> Schema {
+    let mut schema = get_scan_schema(&window.input);
+    for func in &window.funcs {
+        schema.columns.push(ColumnDef::new(
+            &func.output_name,
+            crate::sql::execution::operators::window::window_result_type(&func.kind, &schema),
+        ));
+    }
+    schema
+}
+
 pub(crate) fn get_scan_schema(plan: &LogicalPlan) -> Schema {
     match plan {
         LogicalPlan::Scan(s) => s.schema.clone(),
@@ -1956,7 +1979,7 @@ pub(crate) fn get_scan_schema(plan: &LogicalPlan) -> Schema {
         LogicalPlan::SemiJoin(s) => s.left_schema.clone(),
         LogicalPlan::TopN(t) => get_scan_schema(&t.input),
         LogicalPlan::Distinct(d) => get_scan_schema(&d.input),
-        LogicalPlan::Window(w) => get_scan_schema(&w.input),
+        LogicalPlan::Window(w) => get_scan_schema_from_window(w),
         LogicalPlan::Empty => Schema::new(vec![ColumnDef::new("count(*)", DataType::Int64)]),
     }
 }

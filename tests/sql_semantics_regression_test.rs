@@ -997,19 +997,31 @@ fn scalar_functions_in_projection_and_where() {
 }
 
 #[test]
-fn window_function_fails_loudly() {
+fn window_functions_fail_loudly_with_group_by() {
     let (_temp_dir, engine, mut session) = create_engine();
     seed_quote_tables(&engine, &mut session);
+
+    // Window functions over aggregated inputs are not supported yet; they
+    // must fail loudly instead of silently returning wrong data.
+    let message = query_err(
+        &engine,
+        &mut session,
+        "SELECT security_id, COUNT(*), ROW_NUMBER() OVER (PARTITION BY security_id) rn
+         FROM t_quote GROUP BY security_id",
+    );
+    assert!(
+        !message.is_empty(),
+        "window functions combined with GROUP BY must fail loudly"
+    );
 
     let message = query_err(
         &engine,
         &mut session,
-        "SELECT security_id, ROW_NUMBER() OVER (PARTITION BY security_id ORDER BY deal_time) rn
-         FROM t_quote",
+        "SELECT security_id + ROW_NUMBER() OVER (ORDER BY deal_time) FROM t_quote",
     );
     assert!(
         !message.is_empty(),
-        "window functions must not silently return wrong data"
+        "nested window expressions must fail loudly"
     );
 }
 

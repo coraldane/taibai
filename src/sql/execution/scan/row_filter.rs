@@ -8,11 +8,44 @@ use crate::types::scalar::ScalarValue;
 
 use super::spec::InPredicate;
 
+/// Cluster-key search bounds for one scan: a leading equality prefix plus
+/// range bounds on the next cluster column. The binary-search key tuple is
+/// the prefix values followed by the range bound value; because the segment
+/// is sorted by the full cluster key lexicographically, tuple search on any
+/// leading subset of the key is always valid.
 #[derive(Debug, Clone)]
 pub struct ClusterKeyBounds {
-    pub column_index: usize,
+    /// `(column_index, value)` equality pairs in cluster-key order.
+    pub prefix_eq: Vec<(usize, ScalarValue)>,
+    /// The cluster column the range bounds apply to.
+    pub range_column_index: usize,
     pub lower: Option<(ScalarValue, bool)>,
     pub upper: Option<(ScalarValue, bool)>,
+}
+
+impl ClusterKeyBounds {
+    /// Single-column bounds on the first cluster column (no prefix).
+    pub fn single(
+        column_index: usize,
+        lower: Option<(ScalarValue, bool)>,
+        upper: Option<(ScalarValue, bool)>,
+    ) -> Self {
+        Self {
+            prefix_eq: Vec::new(),
+            range_column_index: column_index,
+            lower,
+            upper,
+        }
+    }
+
+    /// The columns forming the search key tuple, in order.
+    pub fn key_column_indices(&self) -> Vec<usize> {
+        let mut cols: Vec<usize> = self.prefix_eq.iter().map(|(idx, _)| *idx).collect();
+        if !cols.contains(&self.range_column_index) {
+            cols.push(self.range_column_index);
+        }
+        cols
+    }
 }
 
 pub fn apply_predicates(
@@ -315,27 +348,37 @@ pub fn cluster_key_range_read(
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> crate::common::error::Result<RecordBatch> {
-    let key_col_idx = bounds.column_index;
-    if let Some(eq_value) = simple_cluster_eq_value(
-        key_col_idx,
-        bounds,
-        eq_predicates,
-        range_predicates,
-        in_predicates,
-        remaining_predicate,
-    ) {
-        return cluster_key_eq_read(reader, rg_idx, key_col_idx, eq_value, projection_cols);
+    let key_col_idx = bounds.range_column_index;
+    if bounds.prefix_eq.is_empty() {
+        if let Some(eq_value) = simple_cluster_eq_value(
+            key_col_idx,
+            bounds,
+            eq_predicates,
+            range_predicates,
+            in_predicates,
+            remaining_predicate,
+        ) {
+            return cluster_key_eq_read(reader, rg_idx, key_col_idx, eq_value, projection_cols);
+        }
     }
 
-    let key_batch = reader.read_columns_fast(rg_idx, &[key_col_idx])?;
+    let key_cols_idx = bounds.key_column_indices();
+    let key_batch = reader.read_columns_fast(rg_idx, &key_cols_idx)?;
     if key_batch.num_rows() == 0 {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
 
-    let Some(key_col) = key_batch.column(0) else {
-        return Ok(empty_with_projection(reader, rg_idx, projection_cols));
-    };
-    if !is_sorted_ascending(key_col) {
+    let key_cols: Vec<&ColumnArray> = key_cols_idx
+        .iter()
+        .enumerate()
+        .map(|(pos, _)| key_batch.column(pos))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            crate::common::error::TaibaiError::Internal(
+                "cluster key columns missing from key batch".into(),
+            )
+        })?;
+    if !key_tuple_is_sorted(&key_cols) {
         return predicate_first_read(
             reader,
             rg_idx,
@@ -350,25 +393,27 @@ pub fn cluster_key_range_read(
 
     let start = match &bounds.lower {
         Some((value, inclusive)) => {
+            let tuple = search_tuple(&bounds.prefix_eq, Some(value));
             if *inclusive {
-                lower_bound(key_col, value)
+                lower_bound_tuple(&key_cols, &tuple)
             } else {
-                upper_bound(key_col, value)
+                upper_bound_tuple(&key_cols, &tuple)
             }
         }
         None => 0,
     };
     let end = match &bounds.upper {
         Some((value, inclusive)) => {
+            let tuple = search_tuple(&bounds.prefix_eq, Some(value));
             if *inclusive {
-                upper_bound(key_col, value)
+                upper_bound_tuple(&key_cols, &tuple)
             } else {
-                lower_bound(key_col, value)
+                lower_bound_tuple(&key_cols, &tuple)
             }
         }
-        None => key_col.len(),
+        None => key_batch.num_rows(),
     };
-    if start == end {
+    if start >= end {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
 
@@ -382,18 +427,22 @@ pub fn cluster_key_range_read(
         std::collections::HashMap::with_capacity(union_cols.len());
     let mut cols_to_read = Vec::with_capacity(union_cols.len());
 
-    if union_cols.contains(&key_col_idx) {
+    for (pos, &col_idx) in key_cols_idx.iter().enumerate() {
+        if !union_cols.contains(&col_idx) || cols_to_read.contains(&col_idx) {
+            continue;
+        }
+        let key_col = key_cols[pos];
         let key_values = if reader.delete_bitmap().is_empty() {
             key_col.slice_fast(start, end)
         } else {
             let key_mask = selected_rows_mask(key_batch.num_rows(), &selected_rows);
             key_col.filter_by_mask_fast(&key_mask, selected_rows.len())
         };
-        columns_by_idx.insert(key_col_idx, key_values);
+        columns_by_idx.insert(col_idx, key_values);
     }
 
     for &col_idx in &union_cols {
-        if col_idx != key_col_idx && !cols_to_read.contains(&col_idx) {
+        if !key_cols_idx.contains(&col_idx) && !cols_to_read.contains(&col_idx) {
             cols_to_read.push(col_idx);
         }
     }
@@ -622,12 +671,43 @@ fn repeated_scalar_column(
     Ok(col)
 }
 
-fn lower_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
+/// Compare one row against the search tuple lexicographically over the key
+/// columns. A NULL row value sorts after any non-NULL bound (mirroring the
+/// `compare_at` convention); the surviving slice is re-filtered by the
+/// regular predicates, so a slightly wide slice stays correct.
+fn compare_row_to_tuple(
+    cols: &[&ColumnArray],
+    tuple: &[ScalarValue],
+    row: usize,
+) -> std::cmp::Ordering {
+    for (col, value) in cols.iter().zip(tuple.iter()) {
+        match col.compare_scalar_at(row, value) {
+            Some(std::cmp::Ordering::Equal) => {}
+            Some(ord) => return ord,
+            None => return std::cmp::Ordering::Greater,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Prefix equality values plus an optional range bound value.
+fn search_tuple(
+    prefix_eq: &[(usize, ScalarValue)],
+    bound: Option<&ScalarValue>,
+) -> Vec<ScalarValue> {
+    let mut tuple: Vec<ScalarValue> = prefix_eq.iter().map(|(_, value)| value.clone()).collect();
+    if let Some(value) = bound {
+        tuple.push(value.clone());
+    }
+    tuple
+}
+
+fn lower_bound_tuple(cols: &[&ColumnArray], tuple: &[ScalarValue]) -> usize {
     let mut lo = 0usize;
-    let mut hi = col.len();
+    let mut hi = cols.first().map_or(0, |col| col.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if col.compare_scalar_at(mid, value) == Some(std::cmp::Ordering::Less) {
+        if compare_row_to_tuple(cols, tuple, mid) == std::cmp::Ordering::Less {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -636,12 +716,12 @@ fn lower_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
     lo
 }
 
-fn upper_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
+fn upper_bound_tuple(cols: &[&ColumnArray], tuple: &[ScalarValue]) -> usize {
     let mut lo = 0usize;
-    let mut hi = col.len();
+    let mut hi = cols.first().map_or(0, |col| col.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if col.compare_scalar_at(mid, value) == Some(std::cmp::Ordering::Greater) {
+        if compare_row_to_tuple(cols, tuple, mid) == std::cmp::Ordering::Greater {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -650,12 +730,19 @@ fn upper_bound(col: &ColumnArray, value: &ScalarValue) -> usize {
     lo
 }
 
-fn is_sorted_ascending(col: &ColumnArray) -> bool {
-    if col.len() <= 1 {
-        return true;
-    }
-    for row_idx in 1..col.len() {
-        if col.compare_at(row_idx, row_idx - 1) == std::cmp::Ordering::Less {
+/// The leading cluster-key subset is non-decreasing. Lexicographic sort over
+/// the full cluster key implies this for every prefix of it.
+fn key_tuple_is_sorted(cols: &[&ColumnArray]) -> bool {
+    let len = cols.first().map_or(0, |col| col.len());
+    for row_idx in 1..len {
+        let mut ord = std::cmp::Ordering::Equal;
+        for col in cols {
+            ord = col.compare_at(row_idx, row_idx - 1);
+            if ord != std::cmp::Ordering::Equal {
+                break;
+            }
+        }
+        if ord == std::cmp::Ordering::Less {
             return false;
         }
     }

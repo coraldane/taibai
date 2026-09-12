@@ -68,7 +68,7 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - 分区策略：`VALUE`、`DAY`、`MONTH`、`YEAR`、`HASH`、`MOD`。
 - DML：`INSERT`、多行插入、`UPDATE`、`DELETE`。
 - 查询：`SELECT`、`WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT/OFFSET`、`DISTINCT`。
-- Join：Inner、Left、Right、Full、Cross、Semi、Anti、Asof 等 AST/计划层类型。
+- Join：Inner、Left、Right、Full、Cross、Semi、Anti,以及 ASOF JOIN / LEFT ASOF JOIN（按等值键分区、时间键二分的行情最近匹配连接）。
 - 子查询：`IN`、`EXISTS`、标量子查询等。
 - 集合查询：`UNION` / `UNION ALL`。
 - 窗口函数：`ROW_NUMBER`、`RANK`、`DENSE_RANK`、`LEAD`、`LAG`，以及窗口聚合。

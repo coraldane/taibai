@@ -230,6 +230,14 @@ impl Engine {
         catalogs.get(db).and_then(|c| c.get_table(table).cloned())
     }
 
+    /// Run one pass of partition-level TTL purge across all candidate
+    /// tables (temporal partitions whose TTL column is the partition
+    /// column). Invoked periodically by the close-of-day scheduler; see
+    /// `ttl_purge`.
+    pub fn run_ttl_partition_purge(&self) -> Result<u64> {
+        crate::sql::execution::ttl_purge::purge_expired_partitions(self)
+    }
+
     pub fn database_exists(&self, db: &str) -> bool {
         self.catalogs.read().unwrap().contains_key(db)
     }

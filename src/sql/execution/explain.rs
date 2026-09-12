@@ -316,7 +316,7 @@ fn plan_shape(plan: &LogicalPlan) -> String {
         LogicalPlan::Distinct(distinct) => format!("Distinct({})", plan_shape(&distinct.input)),
         LogicalPlan::Window(window) => format!(
             "Window({};{})",
-            window.window_funcs.len(),
+            window.funcs.len(),
             plan_shape(&window.input)
         ),
         LogicalPlan::Join(join) => format!(
@@ -555,11 +555,9 @@ fn render_plan(plan: &LogicalPlan, depth: usize, out: &mut String, ctx: &Physica
         }
         LogicalPlan::Window(w) => {
             out.push_str(&format!(
-                "{}Window: funcs={}, partition_by={}, order_by={}, estimated_rows={}\n",
+                "{}Window: funcs={}, estimated_rows={}\n",
                 pad,
-                w.window_funcs.len(),
-                w.partition_by.len(),
-                w.order_by.len(),
+                w.funcs.len(),
                 estimated_rows
             ));
             render_plan(&w.input, depth + 1, out, ctx);

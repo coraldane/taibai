@@ -262,8 +262,91 @@ pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Resul
         }
     }
 
-    let (mut proj_exprs, mut proj_aliases) =
-        expr::resolve_projection_with_alias(select_list, &schema, &alias_map)?;
+    // Projection resolution, window-aware: top-level `WindowFunction` select
+    // items become references to window-computed columns appended after the
+    // input schema. Anything else containing a window call (nested or in
+    // aggregated queries) fails loudly.
+    let window_base = schema.columns.len();
+    let mut proj_exprs: Vec<LogicalExpr> = Vec::new();
+    let mut proj_aliases: Vec<Option<String>> = Vec::new();
+    let mut item_proj_pos: HashMap<usize, usize> = HashMap::new();
+    let mut window_funcs: Vec<WindowFuncPlan> = Vec::new();
+    let mut has_window = false;
+
+    for (item_idx, item) in select_list.iter().enumerate() {
+        match item {
+            SelectItem::Star => {
+                for i in 0..schema.columns.len() {
+                    proj_exprs.push(LogicalExpr::Column(i));
+                    proj_aliases.push(None);
+                }
+                item_proj_pos.insert(item_idx, proj_exprs.len().saturating_sub(1));
+            }
+            SelectItem::Expr(expr, alias) if matches!(expr, Expr::WindowFunction { .. }) => {
+                has_window = true;
+                if has_aggregate {
+                    return Err(TaibaiError::Sql(
+                        "window functions cannot be combined with GROUP BY or aggregate functions yet"
+                            .to_string(),
+                    ));
+                }
+                let Expr::WindowFunction {
+                    func,
+                    partition_by,
+                    order_by,
+                    frame,
+                } = expr
+                else {
+                    unreachable!("matched WindowFunction");
+                };
+                let plan_fn = expr::window_function_to_plan(
+                    func,
+                    partition_by,
+                    order_by,
+                    frame.as_ref(),
+                    &schema,
+                    &alias_map,
+                    ctx,
+                )?;
+                let idx = match window_funcs
+                    .iter()
+                    .position(|existing| existing == &plan_fn)
+                {
+                    Some(existing) => existing,
+                    None => {
+                        window_funcs.push(plan_fn);
+                        window_funcs.len() - 1
+                    }
+                };
+                proj_exprs.push(LogicalExpr::Column(window_base + idx));
+                proj_aliases.push(
+                    alias
+                        .clone()
+                        .or_else(|| Some(window_funcs[idx].output_name.clone())),
+                );
+                item_proj_pos.insert(item_idx, proj_exprs.len() - 1);
+            }
+            SelectItem::Expr(expr, alias) => {
+                if expr::contains_window_function(expr) {
+                    return Err(TaibaiError::Sql(
+                        "window functions are only supported as top-level SELECT expressions"
+                            .to_string(),
+                    ));
+                }
+                let logical = expr::ast_expr_to_logical(expr, &schema, &alias_map)?;
+                proj_exprs.push(logical);
+                proj_aliases.push(alias.clone().or_else(|| Some(expr::expr_to_name(expr))));
+                item_proj_pos.insert(item_idx, proj_exprs.len() - 1);
+            }
+        }
+    }
+
+    if has_window {
+        plan = LogicalPlan::Window(WindowPlan {
+            funcs: window_funcs.clone(),
+            input: Box::new(plan),
+        });
+    }
 
     if has_aggregate {
         for e in proj_exprs.iter_mut() {
@@ -275,10 +358,28 @@ pub fn plan_select_with_context(stmt: &Statement, ctx: &PlannerContext) -> Resul
 
     let mut logical_keys: Vec<(LogicalExpr, bool)> = Vec::new();
     for (e, desc) in &order_ast {
-        let mut key = expr::ast_expr_to_logical_with_context(e, &schema, &alias_map, ctx)?;
-        if has_aggregate {
-            key = expr::rewrite_agg_refs(key, &original_group, &original_aggs);
-        }
+        let key = if matches!(e, Expr::WindowFunction { .. }) {
+            // ORDER BY <window expr>: must reference a SELECT-list window
+            // item; the sort key becomes that item's projected column.
+            let proj_pos = select_list
+                .iter()
+                .position(|item| matches!(item, SelectItem::Expr(se, _) if se == e))
+                .and_then(|idx| item_proj_pos.get(&idx).copied())
+                .ok_or_else(|| {
+                    TaibaiError::Sql(
+                        "ORDER BY window functions must appear in the SELECT list".to_string(),
+                    )
+                })?;
+            // Use the resolved projection expression so the force-above
+            // position lookup finds it.
+            proj_exprs[proj_pos].clone()
+        } else {
+            let mut key = expr::ast_expr_to_logical_with_context(e, &schema, &alias_map, ctx)?;
+            if has_aggregate {
+                key = expr::rewrite_agg_refs(key, &original_group, &original_aggs);
+            }
+            key
+        };
         logical_keys.push((key, *desc));
     }
 

@@ -350,7 +350,7 @@ fn expr_side(expr: &LogicalExpr, left_ncols: usize, total_cols: usize) -> ExprSi
 fn can_push_join_side(join_type: JoinType, is_left: bool) -> bool {
     match join_type {
         JoinType::Inner | JoinType::Cross | JoinType::Semi | JoinType::Anti => true,
-        JoinType::Left => !is_left,
+        JoinType::Left | JoinType::LeftAsof => !is_left,
         JoinType::Right => is_left,
         JoinType::Full => false,
         JoinType::Asof => !is_left,
@@ -360,7 +360,7 @@ fn can_push_join_side(join_type: JoinType, is_left: bool) -> bool {
 fn can_push_filter_through_join(join_type: JoinType, is_left: bool) -> bool {
     match join_type {
         JoinType::Inner | JoinType::Cross | JoinType::Semi | JoinType::Anti => true,
-        JoinType::Left => is_left,
+        JoinType::Left | JoinType::LeftAsof => is_left,
         JoinType::Right => !is_left,
         JoinType::Full => false,
         JoinType::Asof => is_left,

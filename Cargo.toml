@@ -170,4 +170,32 @@ path = "tests/subquery_derived_table_test.rs"
 name = "realtime_write_scaling_test"
 path = "tests/realtime_write_scaling_test.rs"
 
+[[test]]
+name = "vectorized_expr_bench_test"
+path = "tests/vectorized_expr_bench_test.rs"
+
+[[test]]
+name = "aggregate_group_bench_test"
+path = "tests/aggregate_group_bench_test.rs"
+
+[[test]]
+name = "join_probe_bench_test"
+path = "tests/join_probe_bench_test.rs"
+
+[[test]]
+name = "asof_join_test"
+path = "tests/asof_join_test.rs"
+
+[[test]]
+name = "cluster_composite_test"
+path = "tests/cluster_composite_test.rs"
+
+[[test]]
+name = "ttl_purge_test"
+path = "tests/ttl_purge_test.rs"
+
+[[test]]
+name = "window_function_test"
+path = "tests/window_function_test.rs"
+
 

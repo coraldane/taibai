@@ -110,33 +110,58 @@ impl<'a> ScanPlanner<'a> {
             || self.spec.has_group_by
             || self.spec.has_join
             || self.spec.remaining_predicate.is_some()
-            || self.spec.order_by.len() != 1
+            || self.spec.order_by.is_empty()
         {
             return None;
         }
 
         let cluster_key = self.spec.cluster_key.as_ref()?;
-        let order = self.spec.order_by.first()?;
-        let order_col_name = self
+        let first = self.spec.order_by.first()?;
+        let first_name = self
             .table_schema
             .columns
-            .get(order.column_index)?
+            .get(first.column_index)?
             .name
             .as_str();
-        let order_key_pos = cluster_key
+        let first_pos = cluster_key
             .iter()
-            .position(|key| key.eq_ignore_ascii_case(order_col_name))?;
+            .position(|key| key.eq_ignore_ascii_case(first_name))?;
 
-        if order_key_pos > 0 {
-            for key in cluster_key.iter().take(order_key_pos) {
-                let key_idx = self.table_schema.index_of(key)?;
-                self.spec.eq_value_for_column(key_idx)?;
+        // Order keys before the matched cluster position must be pinned by
+        // equality predicates, otherwise the surviving rows are not globally
+        // ordered by the ORDER BY suffix.
+        for key in cluster_key.iter().take(first_pos) {
+            let key_idx = self.table_schema.index_of(key)?;
+            self.spec.eq_value_for_column(key_idx)?;
+        }
+
+        // The ORDER BY list must occupy consecutive cluster-key positions,
+        // all in the same direction; segment/RG reversal then yields a
+        // globally ordered stream whichever direction it is.
+        for (offset, order) in self.spec.order_by.iter().enumerate() {
+            let name = self
+                .table_schema
+                .columns
+                .get(order.column_index)?
+                .name
+                .as_str();
+            let pos = cluster_key
+                .iter()
+                .position(|key| key.eq_ignore_ascii_case(name))?;
+            if pos != first_pos + offset {
+                return None;
             }
+            if order.desc != first.desc {
+                return None;
+            }
+        }
+        if first_pos + self.spec.order_by.len() > cluster_key.len() {
+            return None;
         }
 
         Some(OrderedClusterLimit {
-            order_column_index: order.column_index,
-            desc: order.desc,
+            order_column_index: first.column_index,
+            desc: first.desc,
         })
     }
 
@@ -164,57 +189,74 @@ impl<'a> ScanPlanner<'a> {
         self.spec.projection.is_some()
     }
 
+    /// Walk the cluster key in order: equality-pinned columns extend the
+    /// prefix; the first column with range predicates becomes the range
+    /// column. A prefix without any range still yields bounds (equality run
+    /// on the prefix), so `symbol = ?` on `CLUSTER BY (symbol, ts)` keeps
+    /// using the sorted-key binary search.
     fn cluster_key_bounds(&self) -> Option<ClusterKeyBounds> {
         let cluster_key = self.spec.cluster_key.as_ref()?;
-        let key_col = cluster_key.first()?;
-        let key_col_idx = self.table_schema.index_of(key_col)?;
+        let mut prefix: Vec<(usize, ScalarValue)> = Vec::new();
 
-        if let Some(value) = self.spec.eq_value_for_column(key_col_idx) {
-            return Some(ClusterKeyBounds {
-                column_index: key_col_idx,
-                lower: Some((value.clone(), true)),
-                upper: Some((value.clone(), true)),
+        for key_col in cluster_key {
+            let col_idx = self.table_schema.index_of(key_col)?;
+
+            let eq_value = self.spec.eq_value_for_column(col_idx).cloned().or_else(|| {
+                self.spec
+                    .range_predicates
+                    .iter()
+                    .find(|clause| {
+                        clause.column_index == col_idx
+                            && clause.op == crate::storage::partition::pruning::RangeOp::Eq
+                    })
+                    .map(|clause| clause.value.clone())
             });
-        }
-
-        let mut lower: Option<(crate::types::scalar::ScalarValue, bool)> = None;
-        let mut upper: Option<(crate::types::scalar::ScalarValue, bool)> = None;
-        for clause in &self.spec.range_predicates {
-            if clause.column_index != key_col_idx {
+            if let Some(value) = eq_value {
+                prefix.push((col_idx, value));
                 continue;
             }
-            match clause.op {
-                crate::storage::partition::pruning::RangeOp::Eq => {
-                    return Some(ClusterKeyBounds {
-                        column_index: key_col_idx,
-                        lower: Some((clause.value.clone(), true)),
-                        upper: Some((clause.value.clone(), true)),
-                    });
+
+            let mut lower: Option<(ScalarValue, bool)> = None;
+            let mut upper: Option<(ScalarValue, bool)> = None;
+            for clause in &self.spec.range_predicates {
+                if clause.column_index != col_idx {
+                    continue;
                 }
-                crate::storage::partition::pruning::RangeOp::Gt => {
-                    set_tighter_lower(&mut lower, clause.value.clone(), false);
-                }
-                crate::storage::partition::pruning::RangeOp::Ge => {
-                    set_tighter_lower(&mut lower, clause.value.clone(), true);
-                }
-                crate::storage::partition::pruning::RangeOp::Lt => {
-                    set_tighter_upper(&mut upper, clause.value.clone(), false);
-                }
-                crate::storage::partition::pruning::RangeOp::Le => {
-                    set_tighter_upper(&mut upper, clause.value.clone(), true);
+                match clause.op {
+                    crate::storage::partition::pruning::RangeOp::Eq => {}
+                    crate::storage::partition::pruning::RangeOp::Gt => {
+                        set_tighter_lower(&mut lower, clause.value.clone(), false);
+                    }
+                    crate::storage::partition::pruning::RangeOp::Ge => {
+                        set_tighter_lower(&mut lower, clause.value.clone(), true);
+                    }
+                    crate::storage::partition::pruning::RangeOp::Lt => {
+                        set_tighter_upper(&mut upper, clause.value.clone(), false);
+                    }
+                    crate::storage::partition::pruning::RangeOp::Le => {
+                        set_tighter_upper(&mut upper, clause.value.clone(), true);
+                    }
                 }
             }
+
+            if lower.is_some() || upper.is_some() {
+                return Some(ClusterKeyBounds {
+                    prefix_eq: prefix,
+                    range_column_index: col_idx,
+                    lower,
+                    upper,
+                });
+            }
+            break;
         }
 
-        if lower.is_some() || upper.is_some() {
-            Some(ClusterKeyBounds {
-                column_index: key_col_idx,
-                lower,
-                upper,
-            })
-        } else {
-            None
-        }
+        let (last_col, last_value) = prefix.last().cloned()?;
+        Some(ClusterKeyBounds {
+            prefix_eq: prefix[..prefix.len() - 1].to_vec(),
+            range_column_index: last_col,
+            lower: Some((last_value.clone(), true)),
+            upper: Some((last_value, true)),
+        })
     }
 }
 

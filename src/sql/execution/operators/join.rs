@@ -1,9 +1,10 @@
 /// Hash Join Execution Operator - DuckDB-inspired Sink/Probe two-phase design.
 /// Supports: Inner, Left, Right, Full, Cross, Semi, Anti, and Asof joins.
 /// Uses columnar data processing through RecordBatch for cache efficiency.
-use crate::common::error::Result;
+use crate::common::error::{Result, TaibaiError};
+use crate::protocol::types::DataType;
 use crate::sql::execution::functions::registry::FunctionRegistry;
-use crate::sql::execution::join_hashtable::{AsofJoinIndex, JoinHashTable, RowPointer};
+use crate::sql::execution::join_hashtable::{AsofJoinIndex, AsofOp, JoinHashTable, RowPointer};
 use crate::sql::execution::spill::{MemoryManager, MemoryReservation};
 use crate::sql::parser::ast::BinOp;
 use crate::sql::parser::ast::JoinType;
@@ -14,6 +15,17 @@ use crate::types::scalar::ScalarValue;
 
 use super::join_spill::PartitionedInnerJoin;
 use super::{ExecutionOp, RuntimeInFilter};
+
+/// Decomposed ASOF join condition: equality keys plus exactly one time-key
+/// inequality (`l.ts <op> r.ts`).
+#[derive(Debug, Clone)]
+struct AsofPlan {
+    eq_left_cols: Vec<usize>,
+    eq_right_cols: Vec<usize>,
+    left_time_col: usize,
+    right_time_col: usize,
+    op: AsofOp,
+}
 
 /// Columnar Hash Join Executor
 pub struct HashJoinExec {
@@ -36,6 +48,7 @@ pub struct HashJoinExec {
     hash_table: Option<JoinHashTable>,
     memory_reservation: Option<MemoryReservation>,
     asof_index: Option<AsofJoinIndex>,
+    asof_plan: Option<AsofPlan>,
     // Probe phase state
     probe_state: ProbeState,
 }
@@ -53,6 +66,29 @@ struct ProbeState {
     buffer_pos: usize,
     build_done: bool,
     finalize_done: bool,
+    // --- fast probe path (pure-equality conditions) ---
+    /// Enabled when the condition is a pure conjunction of column = column
+    /// pairs and no spill path was taken; see `condition_is_pure_eq`.
+    fast_enabled: bool,
+    /// (probe row, build row pointer) matches for the active probe batch.
+    fast_pairs: Vec<(u32, RowPointer)>,
+    fast_pairs_pos: usize,
+    /// Index of the active probe batch within `right_batches`/`left_batches`.
+    fast_probe_batch_idx: usize,
+    /// Scratch buffers reused across batches to keep the hot loop
+    /// allocation-free apart from the match list growth.
+    pair_scratch: Vec<RowPointer>,
+    probe_rows_scratch: Vec<u32>,
+    build_rows_scratch: Vec<u32>,
+}
+
+/// Which input feeds the hash-table build side in the fast probe path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FastJoinPlan {
+    /// Build = left input, probe = right input.
+    BuildLeftProbeRight,
+    /// Build = right input, probe = left input.
+    BuildRightProbeLeft,
 }
 
 /// Represents one output row as (left_row_values, right_row_values or None)
@@ -90,6 +126,7 @@ impl HashJoinExec {
             hash_table: None,
             memory_reservation: None,
             asof_index: None,
+            asof_plan: None,
             probe_state: ProbeState::default(),
         }
     }
@@ -123,17 +160,20 @@ impl HashJoinExec {
                     ht.insert_batch(batch);
                 }
                 ht.finalize();
+                self.probe_state.fast_enabled = self.condition_is_pure_eq();
                 self.hash_table = Some(ht);
             }
-            JoinType::Asof => {
-                // Asof join: build sorted index from right side
-                let ts_col = self.right_key_cols.first().copied().unwrap_or(0);
+            JoinType::Asof | JoinType::LeftAsof => {
+                // Asof join: build the partitioned sorted index from the
+                // right side; matched rows are fetched from the same batches.
+                let plan = self.asof_join_plan()?;
                 let mut batches = Vec::new();
                 while let Some(batch) = self.right.next_batch()? {
                     batches.push(batch);
                 }
                 let mut asof_idx = AsofJoinIndex::new();
-                asof_idx.build(batches, ts_col);
+                asof_idx.build(batches, &plan.eq_right_cols, plan.right_time_col);
+                self.asof_plan = Some(plan);
                 self.asof_index = Some(asof_idx);
             }
             _ => {
@@ -147,6 +187,7 @@ impl HashJoinExec {
                 }
                 ht.finalize();
                 self.inject_right_runtime_filter(&ht);
+                self.probe_state.fast_enabled = self.condition_is_pure_eq();
                 self.hash_table = Some(ht);
             }
         }
@@ -228,6 +269,7 @@ impl HashJoinExec {
         }
         self.hash_table = Some(table);
         self.memory_reservation = Some(memory);
+        self.probe_state.fast_enabled = self.condition_is_pure_eq();
         self.probe_state.build_done = true;
         Ok(())
     }
@@ -287,6 +329,24 @@ impl ExecutionOp for HashJoinExec {
         }
 
         match self.join_type {
+            JoinType::Inner if self.probe_state.fast_enabled => {
+                let plan = if self.build_left {
+                    FastJoinPlan::BuildLeftProbeRight
+                } else {
+                    FastJoinPlan::BuildRightProbeLeft
+                };
+                self.probe_fast(plan, false)
+            }
+            JoinType::Left if self.probe_state.fast_enabled => {
+                self.probe_fast(FastJoinPlan::BuildLeftProbeRight, false)
+            }
+            JoinType::Right if self.probe_state.fast_enabled => {
+                self.probe_fast(FastJoinPlan::BuildRightProbeLeft, false)
+            }
+            JoinType::Semi if self.probe_state.fast_enabled => {
+                self.probe_fast(FastJoinPlan::BuildLeftProbeRight, true)
+            }
+            JoinType::Asof | JoinType::LeftAsof => self.probe_asof(),
             JoinType::Inner => self.probe_inner(),
             JoinType::Left => self.probe_left(),
             JoinType::Right => self.probe_right(),
@@ -294,7 +354,6 @@ impl ExecutionOp for HashJoinExec {
             JoinType::Cross => self.probe_cross(),
             JoinType::Semi => self.probe_semi(),
             JoinType::Anti => self.probe_anti(),
-            JoinType::Asof => self.probe_asof(),
         }
     }
 }
@@ -651,35 +710,435 @@ impl HashJoinExec {
         self.drain_buffer()
     }
 
-    /// Asof join: for each left row, find closest right row by timestamp.
+    /// Asof join: for each left row, binary-search the equality-key
+    /// partition for the right row selected by the time-key direction.
+    /// `ASOF JOIN` drops unmatched left rows; `LEFT ASOF JOIN` emits them
+    /// with a NULL right side. NULL equality/time keys never match.
     fn probe_asof(&mut self) -> Result<Option<RecordBatch>> {
         if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
             return self.drain_buffer();
         }
-        let left_row = match self.get_next_left_row() {
-            Some(row) => row,
-            None => return Ok(None),
-        };
-        let ts_col = self.left_key_cols.first().copied().unwrap_or(0);
-        let probe_ts = left_row[ts_col].clone();
-        let found = {
-            let asof = self.asof_index.as_ref().unwrap();
-            asof.find_asof(&probe_ts)
-        };
-        if let Some(_ptr) = found {
-            let right_row: Vec<ScalarValue> = (0..self.right_schema.columns.len())
-                .map(|_| ScalarValue::Int64(None))
-                .collect();
-            self.probe_state
-                .output_buffer
-                .push((left_row, Some(right_row)));
-        } else {
-            let null_right = self.make_null_right_row();
-            self.probe_state
-                .output_buffer
-                .push((left_row, Some(null_right)));
+        let left_preserving = self.join_type == JoinType::LeftAsof;
+        loop {
+            if self.probe_state.output_buffer.len() >= Self::BATCH_SIZE {
+                return self.drain_buffer();
+            }
+            let left_row = match self.get_next_left_row() {
+                Some(row) => row,
+                None => {
+                    if self.probe_state.output_buffer.is_empty() {
+                        return Ok(None);
+                    }
+                    return self.drain_buffer();
+                }
+            };
+
+            let matched = {
+                let asof = self.asof_index.as_ref().unwrap();
+                let plan = self.asof_plan.as_ref().expect("asof plan built");
+                asof.partition_for_scalars(&left_row, &plan.eq_left_cols)
+                    .and_then(|entries| {
+                        let probe_ts = &left_row[plan.left_time_col];
+                        if probe_ts.is_null() {
+                            None
+                        } else {
+                            asof.find_asof(entries, probe_ts, plan.op)
+                        }
+                    })
+            };
+
+            match matched {
+                Some(ptr) => {
+                    let right_row: Vec<ScalarValue> = (0..self.right_schema.columns.len())
+                        .map(|c| self.asof_index.as_ref().unwrap().get_scalar(&ptr, c))
+                        .collect();
+                    self.probe_state
+                        .output_buffer
+                        .push((left_row, Some(right_row)));
+                }
+                None => {
+                    if left_preserving {
+                        let null_right = self.make_null_right_row();
+                        self.probe_state
+                            .output_buffer
+                            .push((left_row, Some(null_right)));
+                    }
+                }
+            }
         }
-        self.drain_buffer()
+    }
+
+    /// Decompose the ON clause into equality keys plus exactly one time-key
+    /// inequality. Fails loudly on shapes ASOF cannot execute.
+    fn asof_join_plan(&self) -> Result<AsofPlan> {
+        let left_ncols = self.left_schema.columns.len();
+        let mut plan = AsofPlan {
+            eq_left_cols: Vec::new(),
+            eq_right_cols: Vec::new(),
+            left_time_col: 0,
+            right_time_col: 0,
+            op: AsofOp::AtOrBefore,
+        };
+        let mut has_time = false;
+
+        fn walk(
+            expr: &LogicalExpr,
+            left_ncols: usize,
+            plan: &mut AsofPlan,
+            has_time: &mut bool,
+        ) -> Result<()> {
+            match expr {
+                LogicalExpr::BinaryOp {
+                    left,
+                    op: BinOp::And,
+                    right,
+                } => {
+                    walk(left, left_ncols, plan, has_time)?;
+                    walk(right, left_ncols, plan, has_time)
+                }
+                LogicalExpr::BinaryOp { left, op, right } => {
+                    let (LogicalExpr::Column(l), LogicalExpr::Column(r)) =
+                        (left.as_ref(), right.as_ref())
+                    else {
+                        return Err(TaibaiError::Sql(
+                            "ASOF JOIN ON conditions must compare plain columns".into(),
+                        ));
+                    };
+                    let (left_col, right_col) = if *l < left_ncols && *r >= left_ncols {
+                        (*l, *r - left_ncols)
+                    } else if (*r < left_ncols) && (*l >= left_ncols) {
+                        (*r, *l - left_ncols)
+                    } else {
+                        return Err(TaibaiError::Sql(
+                            "ASOF JOIN ON conditions must span both join inputs".into(),
+                        ));
+                    };
+                    match op {
+                        BinOp::Eq => {
+                            plan.eq_left_cols.push(left_col);
+                            plan.eq_right_cols.push(right_col);
+                            Ok(())
+                        }
+                        BinOp::Gte | BinOp::Gt | BinOp::Lte | BinOp::Lt => {
+                            if *has_time {
+                                return Err(TaibaiError::Sql(
+                                    "ASOF JOIN accepts exactly one time-key inequality".into(),
+                                ));
+                            }
+                            *has_time = true;
+                            plan.left_time_col = left_col;
+                            plan.right_time_col = right_col;
+                            plan.op = match op {
+                                BinOp::Gte => AsofOp::AtOrBefore,
+                                BinOp::Gt => AsofOp::Before,
+                                BinOp::Lte => AsofOp::AtOrAfter,
+                                _ => AsofOp::After,
+                            };
+                            Ok(())
+                        }
+                        _ => Err(TaibaiError::Sql(
+                            "ASOF JOIN ON supports equality keys and one time-key inequality"
+                                .into(),
+                        )),
+                    }
+                }
+                _ => Err(TaibaiError::Sql(
+                    "ASOF JOIN ON supports equality keys and one time-key inequality".into(),
+                )),
+            }
+        }
+
+        walk(&self.condition, left_ncols, &mut plan, &mut has_time)?;
+        if !has_time {
+            return Err(TaibaiError::Sql(
+                "ASOF JOIN requires one time-key inequality in ON, e.g. l.ts >= r.ts".into(),
+            ));
+        }
+        if plan.eq_left_cols.is_empty() {
+            return Err(TaibaiError::Sql(
+                "ASOF JOIN requires at least one equality key besides the time key".into(),
+            ));
+        }
+        let time_type_ok = |schema: &Schema, col: usize| {
+            matches!(
+                schema.columns.get(col).map(|c| c.data_type),
+                Some(DataType::Timestamp) | Some(DataType::Int64) | Some(DataType::Float64)
+            )
+        };
+        if !time_type_ok(&self.left_schema, plan.left_time_col)
+            || !time_type_ok(&self.right_schema, plan.right_time_col)
+        {
+            return Err(TaibaiError::Sql(
+                "ASOF JOIN time key must be TIMESTAMP, INT64 or DOUBLE".into(),
+            ));
+        }
+        Ok(plan)
+    }
+
+    // --- Fast probe path (pure-equality conditions) ---
+
+    /// True when the join condition is exactly a conjunction of
+    /// `column = column` equality pairs that the hash table fully covers. For
+    /// such conditions a hash match implies the condition holds (keys of the
+    /// same variant compare equal), so the per-pair residual evaluation can
+    /// be skipped. Float/Blob/Vector keys keep the scalar path: their hash
+    /// equality (bit patterns / NULL-ish mapping) is broader than the scalar
+    /// equality the residual check applies.
+    fn condition_is_pure_eq(&self) -> bool {
+        let left_ncols = self.left_schema.columns.len();
+        fn walk(expr: &LogicalExpr, left_ncols: usize, leaves: &mut usize) -> bool {
+            match expr {
+                LogicalExpr::BinaryOp {
+                    left,
+                    op: BinOp::And,
+                    right,
+                } => walk(left, left_ncols, leaves) && walk(right, left_ncols, leaves),
+                LogicalExpr::BinaryOp {
+                    left,
+                    op: BinOp::Eq,
+                    right,
+                } => {
+                    *leaves += 1;
+                    matches!(
+                        (left.as_ref(), right.as_ref()),
+                        (LogicalExpr::Column(l), LogicalExpr::Column(r))
+                            if (*l < left_ncols) != (*r < left_ncols)
+                    )
+                }
+                _ => false,
+            }
+        }
+        let mut leaves = 0usize;
+        if !walk(&self.condition, left_ncols, &mut leaves) {
+            return false;
+        }
+        if leaves == 0 || leaves != self.left_key_cols.len() || leaves != self.right_key_cols.len()
+        {
+            return false;
+        }
+        let risky_key = |schema: &Schema, cols: &[usize]| {
+            cols.iter().any(|&i| {
+                matches!(
+                    schema.columns.get(i).map(|c| c.data_type),
+                    Some(DataType::Float32)
+                        | Some(DataType::Float64)
+                        | Some(DataType::Blob)
+                        | Some(DataType::Vector)
+                )
+            })
+        };
+        !risky_key(&self.left_schema, &self.left_key_cols)
+            && !risky_key(&self.right_schema, &self.right_key_cols)
+    }
+
+    /// Advance to the next probe batch on the right input; returns its index
+    /// in `right_batches`, or `None` when the probe side is exhausted.
+    fn next_right_probe_batch(&mut self) -> Option<usize> {
+        if !self.probe_state.right_collected {
+            while let Ok(Some(batch)) = self.right.next_batch() {
+                if batch.num_rows() > 0 {
+                    self.probe_state.right_batches.push(batch);
+                }
+            }
+            self.probe_state.right_collected = true;
+        }
+        let idx = self.probe_state.right_batch_idx;
+        if idx < self.probe_state.right_batches.len() {
+            self.probe_state.right_batch_idx += 1;
+            return Some(idx);
+        }
+        None
+    }
+
+    /// Advance to the next probe batch on the left input (lazily collected).
+    fn next_left_probe_batch(&mut self) -> Option<usize> {
+        loop {
+            let idx = self.probe_state.left_batch_idx;
+            if idx < self.probe_state.left_batches.len() {
+                self.probe_state.left_batch_idx += 1;
+                return Some(idx);
+            }
+            match self.left.next_batch() {
+                Ok(Some(batch)) => {
+                    if batch.num_rows() > 0 {
+                        self.probe_state.left_batches.push(batch);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Fast probe driver: emit buffered match pairs, scan the next probe
+    /// batch when the buffer drains, and run the unmatched-build-side
+    /// finalize for LEFT/RIGHT joins once the probe side is exhausted.
+    fn probe_fast(&mut self, plan: FastJoinPlan, null_right: bool) -> Result<Option<RecordBatch>> {
+        let probe_left = plan == FastJoinPlan::BuildRightProbeLeft;
+        loop {
+            if self.probe_state.fast_pairs_pos < self.probe_state.fast_pairs.len() {
+                return self.emit_fast_chunk(plan, null_right);
+            }
+            if !self.scan_next_fast_batch(probe_left)? {
+                match self.join_type {
+                    JoinType::Left => {
+                        if self.probe_state.finalize_done {
+                            return Ok(None);
+                        }
+                        self.emit_unmatched_left()?;
+                        self.probe_state.finalize_done = true;
+                        if self.probe_state.output_buffer.is_empty() {
+                            return Ok(None);
+                        }
+                        return self.drain_buffer();
+                    }
+                    JoinType::Right => {
+                        if self.probe_state.finalize_done {
+                            return Ok(None);
+                        }
+                        self.emit_unmatched_right()?;
+                        self.probe_state.finalize_done = true;
+                        if self.probe_state.output_buffer.is_empty() {
+                            return Ok(None);
+                        }
+                        return self.drain_buffer();
+                    }
+                    _ => return Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Fill `fast_pairs` from the next probe batch. Returns `false` when the
+    /// probe side is exhausted.
+    fn scan_next_fast_batch(&mut self, probe_left: bool) -> Result<bool> {
+        let batch_idx = if probe_left {
+            self.next_left_probe_batch()
+        } else {
+            self.next_right_probe_batch()
+        };
+        let Some(batch_idx) = batch_idx else {
+            return Ok(false);
+        };
+        self.probe_state.fast_probe_batch_idx = batch_idx;
+        let key_cols: &[usize] = if probe_left {
+            &self.left_key_cols
+        } else {
+            &self.right_key_cols
+        };
+        let mark = matches!(self.join_type, JoinType::Left | JoinType::Right);
+        let table = self.hash_table.as_mut().unwrap();
+        let state = &mut self.probe_state;
+        if probe_left {
+            let probe_batch = &state.left_batches[batch_idx];
+            scan_probe_batch(
+                probe_batch,
+                key_cols,
+                table,
+                mark,
+                &mut state.fast_pairs,
+                &mut state.pair_scratch,
+            );
+        } else {
+            let probe_batch = &state.right_batches[batch_idx];
+            scan_probe_batch(
+                probe_batch,
+                key_cols,
+                table,
+                mark,
+                &mut state.fast_pairs,
+                &mut state.pair_scratch,
+            );
+        }
+        Ok(true)
+    }
+
+    /// Emit up to BATCH_SIZE match pairs as a columnar batch: probe and build
+    /// columns are gathered with a single `take` per column instead of
+    /// materializing and re-pushing scalar rows.
+    fn emit_fast_chunk(
+        &mut self,
+        plan: FastJoinPlan,
+        null_right: bool,
+    ) -> Result<Option<RecordBatch>> {
+        let build_is_left = plan == FastJoinPlan::BuildLeftProbeRight;
+        let probe_left = !build_is_left;
+        let state = &mut self.probe_state;
+        let pos = state.fast_pairs_pos;
+        if pos >= state.fast_pairs.len() {
+            return Ok(None);
+        }
+        let mut end = (pos + Self::BATCH_SIZE).min(state.fast_pairs.len());
+        // Keep the chunk inside one build batch so a single take per column
+        // suffices; the remaining pairs stay buffered for the next call.
+        let build_batch_idx = state.fast_pairs[pos].1.batch_idx;
+        while end < state.fast_pairs.len() && state.fast_pairs[end].1.batch_idx == build_batch_idx {
+            end += 1;
+        }
+
+        let probe_rows = &mut state.probe_rows_scratch;
+        probe_rows.clear();
+        let build_rows = &mut state.build_rows_scratch;
+        build_rows.clear();
+        for (row, ptr) in &state.fast_pairs[pos..end] {
+            probe_rows.push(*row);
+            build_rows.push(ptr.row_idx as u32);
+        }
+
+        let table = self.hash_table.as_ref().unwrap();
+        let build_batch = &table.build_data[build_batch_idx];
+        let probe_batch_idx = state.fast_probe_batch_idx;
+        let probe_batch = if probe_left {
+            &state.left_batches[probe_batch_idx]
+        } else {
+            &state.right_batches[probe_batch_idx]
+        };
+        let rows_in_chunk = end - pos;
+
+        let left_ncols = self.left_schema.columns.len();
+        let right_ncols = self.right_schema.columns.len();
+        let mut columns: Vec<ColumnArray> = Vec::with_capacity(left_ncols + right_ncols);
+        for c in 0..left_ncols {
+            let (source, indices) = if build_is_left {
+                (build_batch.column(c), &build_rows[..])
+            } else {
+                (probe_batch.column(c), &probe_rows[..])
+            };
+            let source = source.expect("output column missing from join input");
+            columns.push(source.take(indices));
+        }
+        for c in 0..right_ncols {
+            if null_right {
+                columns.push(Self::null_column(
+                    self.right_schema.columns[c].data_type,
+                    rows_in_chunk,
+                )?);
+                continue;
+            }
+            let (source, indices) = if build_is_left {
+                (probe_batch.column(c), &probe_rows[..])
+            } else {
+                (build_batch.column(c), &build_rows[..])
+            };
+            let source = source.expect("output column missing from join input");
+            columns.push(source.take(indices));
+        }
+
+        state.fast_pairs_pos = end;
+        if state.fast_pairs_pos >= state.fast_pairs.len() {
+            state.fast_pairs.clear();
+            state.fast_pairs_pos = 0;
+        }
+        let schema = self.output_schema.clone();
+        Ok(Some(RecordBatch::try_new(schema, columns)?))
+    }
+
+    fn null_column(data_type: DataType, rows: usize) -> Result<ColumnArray> {
+        let mut column = ColumnArray::empty(data_type);
+        let null = ScalarValue::null_for_type(data_type);
+        for _ in 0..rows {
+            column.push(&null)?;
+        }
+        Ok(column)
     }
 
     // --- Helper methods ---
@@ -877,6 +1336,34 @@ impl HashJoinExec {
         // Build appropriate output schema
         let schema = self.output_schema.clone();
         Ok(Some(RecordBatch::try_new(schema, columns)?))
+    }
+}
+
+/// Collect (probe row, build pointer) matches for every row of one probe
+/// batch, probing typed keys straight from column storage. Rows with NULL
+/// join keys are skipped (they never match), mirroring the build side.
+fn scan_probe_batch(
+    probe_batch: &RecordBatch,
+    key_columns: &[usize],
+    table: &mut JoinHashTable,
+    mark: bool,
+    pairs: &mut Vec<(u32, RowPointer)>,
+    scratch: &mut Vec<RowPointer>,
+) {
+    pairs.clear();
+    for row in 0..probe_batch.num_rows() {
+        let matches = table.probe_batch_row(probe_batch, row, key_columns);
+        let Some(matches) = matches else {
+            continue;
+        };
+        scratch.clear();
+        scratch.extend_from_slice(matches);
+        for ptr in &scratch[..] {
+            if mark {
+                table.mark_matched(ptr);
+            }
+            pairs.push((row as u32, *ptr));
+        }
     }
 }
 

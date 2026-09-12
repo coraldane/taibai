@@ -1,0 +1,206 @@
+//! End-to-end tests for window functions (roadmap step 3, P3.5): ranking,
+//! offsets, running/whole-partition/frame aggregates, and ORDER BY over a
+//! window alias.
+
+use tempfile::TempDir;
+
+use taibai::net::session::Session;
+use taibai::sql::execution::engine::{Engine, ExecResult};
+use taibai::types::scalar::ScalarValue;
+
+fn setup_engine() -> (TempDir, Engine, Session) {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ticks (symbol VARCHAR, ts INT64, price DOUBLE)",
+        )
+        .expect("create ticks");
+    // AAPL has a price tie at ts 1 and 2 (RANK/DENSE_RANK peers).
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO ticks VALUES
+                ('AAPL', 1, 10.0),
+                ('AAPL', 2, 10.0),
+                ('AAPL', 3, 12.0),
+                ('MSFT', 1, 20.0),
+                ('MSFT', 2, 21.0)",
+        )
+        .expect("insert");
+
+    (temp_dir, engine, session)
+}
+
+fn query_rows(engine: &Engine, session: &mut Session, sql: &str) -> Vec<Vec<ScalarValue>> {
+    let ExecResult::Query { batches, .. } = engine.execute(session, sql).expect("query ok") else {
+        panic!("expected query result for: {sql}");
+    };
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            rows.push(
+                (0..batch.num_columns())
+                    .map(|c| batch.scalar(row, c).expect("column value"))
+                    .collect(),
+            );
+        }
+    }
+    rows
+}
+
+fn i64(v: i64) -> ScalarValue {
+    ScalarValue::Int64(Some(v))
+}
+
+fn f64(v: f64) -> ScalarValue {
+    ScalarValue::Float64(Some(v))
+}
+
+#[test]
+fn row_number_partitions_and_orders() {
+    let (_dir, engine, mut session) = setup_engine();
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT symbol, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts) rn
+         FROM ticks ORDER BY symbol, ts",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![ScalarValue::VarChar(Some("AAPL".into())), i64(1)],
+            vec![ScalarValue::VarChar(Some("AAPL".into())), i64(2)],
+            vec![ScalarValue::VarChar(Some("AAPL".into())), i64(3)],
+            vec![ScalarValue::VarChar(Some("MSFT".into())), i64(1)],
+            vec![ScalarValue::VarChar(Some("MSFT".into())), i64(2)],
+        ]
+    );
+}
+
+#[test]
+fn rank_and_dense_rank_handle_ties() {
+    let (_dir, engine, mut session) = setup_engine();
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT ts, RANK() OVER (PARTITION BY symbol ORDER BY price) r,
+                DENSE_RANK() OVER (PARTITION BY symbol ORDER BY price) dr
+         FROM ticks WHERE symbol = 'AAPL' ORDER BY ts",
+    );
+    // Prices 10.0, 10.0, 12.0: RANK has gaps, DENSE_RANK does not.
+    assert_eq!(rows[0], vec![i64(1), i64(1), i64(1)]);
+    assert_eq!(rows[1], vec![i64(2), i64(1), i64(1)]);
+    assert_eq!(rows[2], vec![i64(3), i64(3), i64(2)]);
+}
+
+#[test]
+fn lag_and_lead_offset_within_partition() {
+    let (_dir, engine, mut session) = setup_engine();
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT ts,
+                LAG(price) OVER (PARTITION BY symbol ORDER BY ts) prev,
+                LEAD(price) OVER (PARTITION BY symbol ORDER BY ts) next,
+                LEAD(price, 1, -1.0) OVER (PARTITION BY symbol ORDER BY ts) next_default
+         FROM ticks WHERE symbol = 'MSFT' ORDER BY ts",
+    );
+    // MSFT: 20.0 then 21.0. First LAG is NULL; last LEAD is NULL unless a
+    // default is given (here -1.0).
+    assert_eq!(
+        rows[0],
+        vec![i64(1), ScalarValue::Float64(None), f64(21.0), f64(21.0)]
+    );
+    assert_eq!(
+        rows[1],
+        vec![i64(2), f64(20.0), ScalarValue::Float64(None), f64(-1.0)]
+    );
+}
+
+#[test]
+fn running_aggregate_uses_default_range_frame() {
+    let (_dir, engine, mut session) = setup_engine();
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT ts, SUM(price) OVER (PARTITION BY symbol ORDER BY ts) running
+         FROM ticks WHERE symbol = 'AAPL' ORDER BY ts",
+    );
+    // Default frame (unbounded preceding -> current row, peers included):
+    // 10.0, 20.0 (both 10.0 rows are peers), 32.0.
+    assert_eq!(rows[0][1], f64(10.0));
+    assert_eq!(rows[1][1], f64(20.0));
+    assert_eq!(rows[2][1], f64(32.0));
+}
+
+#[test]
+fn whole_partition_aggregate_without_order_by() {
+    let (_dir, engine, mut session) = setup_engine();
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT ts, SUM(price) OVER (PARTITION BY symbol) total
+         FROM ticks WHERE symbol = 'MSFT' ORDER BY ts",
+    );
+    assert_eq!(rows[0][1], f64(41.0));
+    assert_eq!(rows[1][1], f64(41.0));
+}
+
+#[test]
+fn rows_frame_moves_window() {
+    let (_dir, engine, mut session) = setup_engine();
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT ts, AVG(price) OVER (
+             PARTITION BY symbol ORDER BY ts
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+         ) ma
+         FROM ticks WHERE symbol = 'AAPL' ORDER BY ts",
+    );
+    // Moving average over the previous row and the current row.
+    assert_eq!(rows[0][1], f64(10.0));
+    assert_eq!(rows[1][1], f64(10.0));
+    assert_eq!(rows[2][1], f64(11.0));
+}
+
+#[test]
+fn order_by_window_alias_sorts_on_computed_column() {
+    let (_dir, engine, mut session) = setup_engine();
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT symbol, ts, ROW_NUMBER() OVER (ORDER BY ts DESC) rn
+         FROM ticks ORDER BY rn DESC LIMIT 2",
+    );
+    // The two earliest rows (ts=1 of each symbol) carry the largest
+    // descending row numbers; ordering by rn itself is what is asserted.
+    let rn_values: Vec<i64> = rows
+        .iter()
+        .map(|row| match &row[2] {
+            ScalarValue::Int64(Some(v)) => *v,
+            other => panic!("unexpected rn {other:?}"),
+        })
+        .collect();
+    // ORDER BY rn DESC: output must be in descending rn order.
+    assert_eq!(rn_values, vec![5, 4], "rows: {rows:?}");
+    let mut sorted = rn_values.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec![4, 5]);
+}
+
+#[test]
+fn count_star_over_partition_counts_rows() {
+    let (_dir, engine, mut session) = setup_engine();
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT DISTINCT COUNT(*) OVER (PARTITION BY symbol) c
+         FROM ticks ORDER BY c",
+    );
+    assert_eq!(rows, vec![vec![i64(2)], vec![i64(3)]]);
+}

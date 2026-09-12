@@ -9,6 +9,7 @@ pub mod scan;
 pub mod semi_join;
 pub mod sort;
 pub mod topn;
+pub mod window;
 
 use std::collections::HashMap;
 
@@ -135,12 +136,12 @@ pub fn build_pipeline_with_subqueries(
         LogicalPlan::Filter(filter) => {
             let schema = get_scan_schema(&filter.input);
             let input = build_pipeline_with_subqueries(*filter.input, table_batches, subqueries)?;
-            Ok(Box::new(FilterExec {
-                predicate: filter.predicate,
+            Ok(Box::new(FilterExec::new(
+                filter.predicate,
                 input,
-                schema: schema.clone(),
-                subqueries: subqueries.cloned(),
-            }))
+                schema.clone(),
+                subqueries.cloned(),
+            )))
         }
         LogicalPlan::Project(proj) => {
             let input_schema = get_scan_schema(&proj.input);

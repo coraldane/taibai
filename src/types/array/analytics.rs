@@ -1,3 +1,82 @@
+/// Generates a same-variant `Column op Literal` comparison kernel
+/// (`eq_vec`/`lt_vec`/…). `$ord_op`/`$ord_val` describe the cross-variant
+/// fallback: it routes through `compare_scalar_at` and keeps the same
+/// ordering predicate (e.g. `<=` means `ord != Ordering::Greater`).
+macro_rules! cmp_vec_fn {
+    ($fn_name:ident, $op:tt, $ord_op:tt, $ord_val:ident) => {
+        pub fn $fn_name(&self, value: &ScalarValue) -> Vec<bool> {
+            let num_rows = self.len();
+            let bitmap = self.bitmap();
+            match (self, value) {
+                (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && (data[i] != 0) == *v)
+                    .collect(),
+                (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Int16 { data, .. }, ScalarValue::Int16(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Int8 { data, .. }, ScalarValue::Int8(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::UInt64 { data, .. }, ScalarValue::UInt64(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::UInt32 { data, .. }, ScalarValue::UInt32(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::UInt16 { data, .. }, ScalarValue::UInt16(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::UInt8 { data, .. }, ScalarValue::UInt8(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Float64 { data, .. }, ScalarValue::Float64(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Float32 { data, .. }, ScalarValue::Float32(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Decimal { data, .. }, ScalarValue::Decimal(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Date { data, .. }, ScalarValue::Date(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Time { data, .. }, ScalarValue::Time(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                    .collect(),
+                (ColumnArray::Timestamp { data, .. }, ScalarValue::Timestamp(Some(v))) => {
+                    (0..num_rows)
+                        .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                        .collect()
+                }
+                (ColumnArray::Interval { data, .. }, ScalarValue::Interval(Some(v))) => {
+                    (0..num_rows)
+                        .map(|i| !bitmap.is_null(i) && data[i] $op *v)
+                        .collect()
+                }
+                (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
+                    .map(|i| !bitmap.is_null(i) && data.value(i) $op v.as_str())
+                    .collect(),
+                _ if value.numeric_f64().is_some() => (0..num_rows)
+                    .map(|i| {
+                        !bitmap.is_null(i)
+                            && self
+                                .compare_scalar_at(i, value)
+                                .is_some_and(|ord| ord $ord_op std::cmp::Ordering::$ord_val)
+                    })
+                    .collect(),
+                _ => vec![false; num_rows],
+            }
+        }
+    };
+}
+
 impl ColumnArray {
     pub fn count_eq(&self, value: &ScalarValue) -> u64 {
         let num_rows = self.len();
@@ -411,127 +490,11 @@ impl ColumnArray {
         }
     }
 
-    pub fn eq_vec(&self, value: &ScalarValue) -> Vec<bool> {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        match (self, value) {
-            (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && (data[i] != 0) == *v)
-                .collect(),
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] == *v)
-                .collect(),
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] == *v)
-                .collect(),
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && &data[i] == v)
-                .collect(),
-            _ if value.numeric_f64().is_some() => (0..num_rows)
-                .map(|i| {
-                    !bitmap.is_null(i)
-                        && self.compare_scalar_at(i, value) == Some(std::cmp::Ordering::Equal)
-                })
-                .collect(),
-            _ => vec![false; num_rows],
-        }
-    }
-
-    pub fn lt_vec(&self, value: &ScalarValue) -> Vec<bool> {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        match (self, value) {
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] < *v)
-                .collect(),
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] < *v)
-                .collect(),
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data.value(i) < v.as_str())
-                .collect(),
-            _ if value.numeric_f64().is_some() => (0..num_rows)
-                .map(|i| {
-                    !bitmap.is_null(i)
-                        && self.compare_scalar_at(i, value) == Some(std::cmp::Ordering::Less)
-                })
-                .collect(),
-            _ => vec![false; num_rows],
-        }
-    }
-
-    pub fn le_vec(&self, value: &ScalarValue) -> Vec<bool> {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        match (self, value) {
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] <= *v)
-                .collect(),
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] <= *v)
-                .collect(),
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data.value(i) <= v.as_str())
-                .collect(),
-            _ if value.numeric_f64().is_some() => (0..num_rows)
-                .map(|i| {
-                    !bitmap.is_null(i)
-                        && self
-                            .compare_scalar_at(i, value)
-                            .is_some_and(|ord| ord != std::cmp::Ordering::Greater)
-                })
-                .collect(),
-            _ => vec![false; num_rows],
-        }
-    }
-
-    pub fn gt_vec(&self, value: &ScalarValue) -> Vec<bool> {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        match (self, value) {
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] > *v)
-                .collect(),
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] > *v)
-                .collect(),
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data.value(i) > v.as_str())
-                .collect(),
-            _ if value.numeric_f64().is_some() => (0..num_rows)
-                .map(|i| {
-                    !bitmap.is_null(i)
-                        && self.compare_scalar_at(i, value) == Some(std::cmp::Ordering::Greater)
-                })
-                .collect(),
-            _ => vec![false; num_rows],
-        }
-    }
-
-    pub fn ge_vec(&self, value: &ScalarValue) -> Vec<bool> {
-        let num_rows = self.len();
-        let bitmap = self.bitmap();
-        match (self, value) {
-            (ColumnArray::Int64 { data, .. }, ScalarValue::Int64(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] >= *v)
-                .collect(),
-            (ColumnArray::Int32 { data, .. }, ScalarValue::Int32(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data[i] >= *v)
-                .collect(),
-            (ColumnArray::VarChar { data, .. }, ScalarValue::VarChar(Some(v))) => (0..num_rows)
-                .map(|i| !bitmap.is_null(i) && data.value(i) >= v.as_str())
-                .collect(),
-            _ if value.numeric_f64().is_some() => (0..num_rows)
-                .map(|i| {
-                    !bitmap.is_null(i)
-                        && self
-                            .compare_scalar_at(i, value)
-                            .is_some_and(|ord| ord != std::cmp::Ordering::Less)
-                })
-                .collect(),
-            _ => vec![false; num_rows],
-        }
-    }
+    cmp_vec_fn!(eq_vec, ==, ==, Equal);
+    cmp_vec_fn!(lt_vec, <, ==, Less);
+    cmp_vec_fn!(le_vec, <=, !=, Greater);
+    cmp_vec_fn!(gt_vec, >, ==, Greater);
+    cmp_vec_fn!(ge_vec, >=, !=, Less);
 
     pub fn is_null_vec(&self) -> Vec<bool> {
         let num_rows = self.len();
@@ -762,6 +725,409 @@ impl ColumnArray {
                     bitmap: new_bitmap,
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vectorized column-vs-column comparison and arithmetic kernels.
+//
+// Semantics contract: these kernels must produce byte-identical results to the
+// per-row scalar paths (`eval_comparison` / `eval_binary_scalar` in
+// `src/sql/execution/operators/filter.rs`). Any node shape not covered here
+// falls back to the scalar path, so coverage can grow incrementally without
+// behavior risk.
+// ---------------------------------------------------------------------------
+
+/// Comparison operator for the typed column kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+/// Arithmetic operator for the typed column kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+#[inline]
+fn compare_op_matches(ord: Option<std::cmp::Ordering>, op: CompareOp) -> bool {
+    use std::cmp::Ordering;
+    match op {
+        CompareOp::Eq => ord == Some(Ordering::Equal),
+        // Incomparable values (NaN) still count as "not equal".
+        CompareOp::Neq => ord != Some(Ordering::Equal),
+        CompareOp::Lt => ord == Some(Ordering::Less),
+        CompareOp::Lte => ord != Some(Ordering::Greater),
+        CompareOp::Gt => ord == Some(Ordering::Greater),
+        CompareOp::Gte => ord != Some(Ordering::Less),
+    }
+}
+
+/// Three-valued result of a typed column-vs-column comparison: the two-valued
+/// match mask plus the NULL bitmap marking rows where the result is NULL
+/// (either operand NULL, or NaN for float columns — mirroring the scalar
+/// path, where an incomparable NaN comparison yields Bool(None)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnCompare {
+    pub mask: Vec<bool>,
+    pub nulls: NullBitmap,
+}
+
+fn cmp_mask_ord<T: Ord>(
+    l: &[T],
+    lb: &NullBitmap,
+    r: &[T],
+    rb: &NullBitmap,
+    op: CompareOp,
+) -> ColumnCompare {
+    let mut nulls = NullBitmap::with_capacity(l.len());
+    let mask = (0..l.len())
+        .map(|i| {
+            if lb.is_null(i) || rb.is_null(i) {
+                nulls.push_null();
+                return false;
+            }
+            nulls.push_valid();
+            compare_op_matches(Some(l[i].cmp(&r[i])), op)
+        })
+        .collect();
+    ColumnCompare { mask, nulls }
+}
+
+fn cmp_mask_f32(
+    l: &[f32],
+    lb: &NullBitmap,
+    r: &[f32],
+    rb: &NullBitmap,
+    op: CompareOp,
+) -> ColumnCompare {
+    let mut nulls = NullBitmap::with_capacity(l.len());
+    let mask = (0..l.len())
+        .map(|i| {
+            if lb.is_null(i) || rb.is_null(i) || l[i].is_nan() || r[i].is_nan() {
+                nulls.push_null();
+                return false;
+            }
+            nulls.push_valid();
+            compare_op_matches(l[i].partial_cmp(&r[i]), op)
+        })
+        .collect();
+    ColumnCompare { mask, nulls }
+}
+
+fn cmp_mask_f64(
+    l: &[f64],
+    lb: &NullBitmap,
+    r: &[f64],
+    rb: &NullBitmap,
+    op: CompareOp,
+) -> ColumnCompare {
+    let mut nulls = NullBitmap::with_capacity(l.len());
+    let mask = (0..l.len())
+        .map(|i| {
+            if lb.is_null(i) || rb.is_null(i) || l[i].is_nan() || r[i].is_nan() {
+                nulls.push_null();
+                return false;
+            }
+            nulls.push_valid();
+            compare_op_matches(l[i].partial_cmp(&r[i]), op)
+        })
+        .collect();
+    ColumnCompare { mask, nulls }
+}
+
+fn cmp_mask_str(
+    l: &Utf8Buffer,
+    lb: &NullBitmap,
+    r: &Utf8Buffer,
+    rb: &NullBitmap,
+    op: CompareOp,
+) -> ColumnCompare {
+    let mut nulls = NullBitmap::with_capacity(l.len());
+    let mask = (0..l.len())
+        .map(|i| {
+            if lb.is_null(i) || rb.is_null(i) {
+                nulls.push_null();
+                return false;
+            }
+            nulls.push_valid();
+            compare_op_matches(Some(l.value(i).cmp(r.value(i))), op)
+        })
+        .collect();
+    ColumnCompare { mask, nulls }
+}
+
+impl ColumnArray {
+    /// Element-wise three-valued comparison of two same-variant columns.
+    /// Returns `None` when the variants differ or the element type has no
+    /// typed kernel (Blob, Vector, Bool); callers fall back to the scalar
+    /// path.
+    pub fn compare_column(&self, op: CompareOp, other: &ColumnArray) -> Option<ColumnCompare> {
+        use ColumnArray as C;
+        if self.len() != other.len() {
+            return None;
+        }
+        let out = match (self, other) {
+            (C::Int8 { data: l, bitmap: lb }, C::Int8 { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Int16 { data: l, bitmap: lb }, C::Int16 { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Int32 { data: l, bitmap: lb }, C::Int32 { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Int64 { data: l, bitmap: lb }, C::Int64 { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::UInt8 { data: l, bitmap: lb }, C::UInt8 { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::UInt16 { data: l, bitmap: lb }, C::UInt16 { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::UInt32 { data: l, bitmap: lb }, C::UInt32 { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::UInt64 { data: l, bitmap: lb }, C::UInt64 { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Decimal { data: l, bitmap: lb }, C::Decimal { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Date { data: l, bitmap: lb }, C::Date { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Time { data: l, bitmap: lb }, C::Time { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Timestamp { data: l, bitmap: lb }, C::Timestamp { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Interval { data: l, bitmap: lb }, C::Interval { data: r, bitmap: rb }) => {
+                cmp_mask_ord(l, lb, r, rb, op)
+            }
+            (C::Float32 { data: l, bitmap: lb }, C::Float32 { data: r, bitmap: rb }) => {
+                cmp_mask_f32(l, lb, r, rb, op)
+            }
+            (C::Float64 { data: l, bitmap: lb }, C::Float64 { data: r, bitmap: rb }) => {
+                cmp_mask_f64(l, lb, r, rb, op)
+            }
+            (C::VarChar { data: l, bitmap: lb }, C::VarChar { data: r, bitmap: rb }) => {
+                cmp_mask_str(l, lb, r, rb, op)
+            }
+            _ => return None,
+        };
+        Some(out)
+    }
+
+    /// True for variants whose values participate in `integer_i128`
+    /// arithmetic (all signed/unsigned integers plus unscaled Decimal).
+    fn is_integer_class(&self) -> bool {
+        matches!(
+            self,
+            ColumnArray::Int8 { .. }
+                | ColumnArray::Int16 { .. }
+                | ColumnArray::Int32 { .. }
+                | ColumnArray::Int64 { .. }
+                | ColumnArray::UInt8 { .. }
+                | ColumnArray::UInt16 { .. }
+                | ColumnArray::UInt32 { .. }
+                | ColumnArray::UInt64 { .. }
+                | ColumnArray::Decimal { .. }
+        )
+    }
+
+    fn is_float_class(&self) -> bool {
+        matches!(
+            self,
+            ColumnArray::Float32 { .. } | ColumnArray::Float64 { .. }
+        )
+    }
+
+    /// Per-row `integer_i128` equivalent over the column's physical data.
+    fn integer_i128_at(&self, i: usize) -> Option<i128> {
+        if self.bitmap().is_null(i) {
+            return None;
+        }
+        let value = match self {
+            ColumnArray::Int8 { data, .. } => data[i] as i128,
+            ColumnArray::Int16 { data, .. } => data[i] as i128,
+            ColumnArray::Int32 { data, .. } => data[i] as i128,
+            ColumnArray::Int64 { data, .. } => data[i] as i128,
+            ColumnArray::UInt8 { data, .. } => data[i] as i128,
+            ColumnArray::UInt16 { data, .. } => data[i] as i128,
+            ColumnArray::UInt32 { data, .. } => data[i] as i128,
+            ColumnArray::UInt64 { data, .. } => data[i] as i128,
+            ColumnArray::Decimal { data, .. } => data[i] as i128,
+            _ => return None,
+        };
+        Some(value)
+    }
+
+    /// Element-wise arithmetic on two columns. Mirrors `eval_binary_scalar`:
+    /// integer-class pairs widen to i128 and produce Int64 (overflow and
+    /// zero-divisor become NULL), division always produces Float64, and any
+    /// NULL operand produces a NULL row. Returns `None` for unsupported
+    /// variant combinations.
+    pub fn arith_column(&self, op: ArithOp, other: &ColumnArray) -> Option<ColumnArray> {
+        if self.len() != other.len() {
+            return None;
+        }
+        if op == ArithOp::Div {
+            return self.arith_numeric_f64(op, |i| other.numeric_f64_at(i));
+        }
+        if self.is_integer_class() && other.is_integer_class() {
+            return Some(self.arith_integer(op, |i| other.integer_i128_at(i)));
+        }
+        if self.is_float_class() && other.is_float_class() {
+            return self.arith_numeric_f64(op, |i| other.numeric_f64_at(i));
+        }
+        // Mixed float x integer (and anything else) stays on the scalar path.
+        None
+    }
+
+    /// Element-wise arithmetic between a column and a scalar literal.
+    /// A NULL literal yields an all-NULL Int64 column, exactly like the
+    /// scalar path's early return.
+    pub fn arith_scalar(&self, op: ArithOp, literal: &ScalarValue) -> Option<ColumnArray> {
+        if literal.is_null() {
+            return Some(ColumnArray::Int64 {
+                data: vec![0; self.len()],
+                bitmap: NullBitmap::from_bools(&vec![true; self.len()]),
+            });
+        }
+        if op == ArithOp::Div {
+            let value = literal.numeric_f64()?;
+            return self.arith_numeric_f64(op, |_| Some(value));
+        }
+        if self.is_integer_class() && literal.integer_i128().is_some() {
+            let value = literal.integer_i128()?;
+            return Some(self.arith_integer(op, |_| Some(value)));
+        }
+        if literal.numeric_f64().is_some() {
+            let value = literal.numeric_f64()?;
+            return self.arith_numeric_f64(op, |_| Some(value));
+        }
+        None
+    }
+
+    /// Integer-class arithmetic: i128 intermediates, Int64 output, checked
+    /// overflow/zero-divisor → NULL. `rhs_at` covers both column and scalar
+    /// right-hand sides.
+    fn arith_integer(&self, op: ArithOp, rhs_at: impl Fn(usize) -> Option<i128>) -> ColumnArray {
+        let len = self.len();
+        let mut data = vec![0i64; len];
+        let mut bitmap = NullBitmap::with_capacity(len);
+        for (i, slot) in data.iter_mut().enumerate() {
+            let value = match (self.integer_i128_at(i), rhs_at(i)) {
+                (Some(l), Some(r)) => {
+                    let raw = match op {
+                        ArithOp::Add => l.checked_add(r),
+                        ArithOp::Sub => l.checked_sub(r),
+                        ArithOp::Mul => l.checked_mul(r),
+                        ArithOp::Mod => {
+                            if r == 0 {
+                                None
+                            } else {
+                                Some(l % r)
+                            }
+                        }
+                        ArithOp::Div => None,
+                    };
+                    raw.and_then(|v| i64::try_from(v).ok())
+                }
+                _ => None,
+            };
+            match value {
+                Some(v) => {
+                    *slot = v;
+                    bitmap.push_valid();
+                }
+                None => bitmap.push_null(),
+            }
+        }
+        ColumnArray::Int64 { data, bitmap }
+    }
+
+    /// f64 arithmetic (division and float-class ops): Float64 output, NULL on
+    /// missing operands; zero divisor → NULL to match `eval_binary_scalar`.
+    fn arith_numeric_f64(
+        &self,
+        op: ArithOp,
+        rhs_at: impl Fn(usize) -> Option<f64>,
+    ) -> Option<ColumnArray> {
+        let len = self.len();
+        let mut data = vec![0f64; len];
+        let mut bitmap = NullBitmap::with_capacity(len);
+        for (i, slot) in data.iter_mut().enumerate() {
+            let value = match (self.numeric_f64_at(i), rhs_at(i)) {
+                (Some(l), Some(r)) => match op {
+                    ArithOp::Div => {
+                        if r == 0.0 {
+                            None
+                        } else {
+                            Some(l / r)
+                        }
+                    }
+                    ArithOp::Add => Some(l + r),
+                    ArithOp::Sub => Some(l - r),
+                    ArithOp::Mul => Some(l * r),
+                    ArithOp::Mod => {
+                        if r == 0.0 {
+                            None
+                        } else {
+                            Some(l % r)
+                        }
+                    }
+                },
+                _ => None,
+            };
+            match value {
+                Some(v) => {
+                    *slot = v;
+                    bitmap.push_valid();
+                }
+                None => bitmap.push_null(),
+            }
+        }
+        Some(ColumnArray::Float64 { data, bitmap })
+    }
+
+    /// Element-wise logical NOT on a Bool column; NULL rows stay NULL (their
+    /// payload bytes are left at 0).
+    pub fn bool_not(&self) -> Option<ColumnArray> {
+        if let ColumnArray::Bool { data, bitmap } = self {
+            Some(ColumnArray::Bool {
+                data: data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| if bitmap.is_null(i) { 0 } else { v ^ 1 })
+                    .collect(),
+                bitmap: bitmap.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Build a Bool column from a row mask (all rows valid).
+    pub fn bool_column_from_mask(mask: Vec<bool>) -> ColumnArray {
+        let bitmap = NullBitmap::new_valid(mask.len());
+        ColumnArray::Bool {
+            data: mask.into_iter().map(u8::from).collect(),
+            bitmap,
         }
     }
 }

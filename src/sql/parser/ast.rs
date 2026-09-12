@@ -348,6 +348,9 @@ pub enum JoinType {
     Semi,
     Anti,
     Asof,
+    /// `LEFT ASOF JOIN`: asof matching that preserves unmatched left rows
+    /// with NULL right-side columns (the kdb `aj` convention).
+    LeftAsof,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -493,10 +496,12 @@ pub enum WindowFunc {
     Rank,
     DenseRank,
     Lead {
+        arg: Box<Expr>,
         offset: usize,
         default: Option<Box<Expr>>,
     },
     Lag {
+        arg: Box<Expr>,
         offset: usize,
         default: Option<Box<Expr>>,
     },

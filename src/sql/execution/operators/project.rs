@@ -39,15 +39,10 @@ impl ExecutionOp for ProjectExec {
 
                 for (i, expr) in self.expressions.iter().enumerate() {
                     let expr = remap_expr_for_batch(expr, &self.input_schema, &batch.schema);
-                    let vals = eval_expr_column_with(&expr, &batch, self.subqueries.as_ref())?;
                     let col_def =
                         project_column_def(&expr, &batch.schema, self.aliases[i].as_deref());
-                    let mut col = ColumnArray::empty(col_def.data_type);
-                    for v in &vals {
-                        let coerced = coerce_project_value(v, &col_def)?;
-                        col.push(&coerced)?;
-                    }
-                    columns.push(col);
+                    let column = self.project_column(&expr, &batch, &col_def)?;
+                    columns.push(column);
                     col_defs.push(col_def);
                 }
 
@@ -56,6 +51,32 @@ impl ExecutionOp for ProjectExec {
             }
             None => Ok(None),
         }
+    }
+}
+
+impl ProjectExec {
+    /// Evaluate one projection expression. Prefers the typed kernels and only
+    /// falls back to the per-value scalar path when the expression shape or
+    /// the target coercion is not covered, so both paths stay semantically
+    /// identical.
+    fn project_column(
+        &self,
+        expr: &LogicalExpr,
+        batch: &RecordBatch,
+        col_def: &ColumnDef,
+    ) -> Result<ColumnArray> {
+        if let Some(column) = crate::sql::execution::expr_vec::eval_expr_to_column(expr, batch)? {
+            if column.data_type() == col_def.data_type {
+                return Ok(column);
+            }
+        }
+        let vals = eval_expr_column_with(expr, batch, self.subqueries.as_ref())?;
+        let mut col = ColumnArray::empty(col_def.data_type);
+        for v in &vals {
+            let coerced = coerce_project_value(v, col_def)?;
+            col.push(&coerced)?;
+        }
+        Ok(col)
     }
 }
 

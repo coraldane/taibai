@@ -69,6 +69,7 @@ pub enum Token {
     To,
     // Join keywords
     Join,
+    Asof,
     Inner,
     Left,
     Right,
@@ -208,6 +209,7 @@ impl std::fmt::Display for Token {
             Token::Modify => write!(f, "MODIFY"),
             Token::To => write!(f, "TO"),
             Token::Join => write!(f, "JOIN"),
+            Token::Asof => write!(f, "ASOF"),
             Token::Inner => write!(f, "INNER"),
             Token::Left => write!(f, "LEFT"),
             Token::Right => write!(f, "RIGHT"),
@@ -586,6 +588,7 @@ impl<'a> Lexer<'a> {
             "TO" => Token::To,
             // Join keywords
             "JOIN" => Token::Join,
+            "ASOF" => Token::Asof,
             "INNER" => Token::Inner,
             "LEFT" => Token::Left,
             "RIGHT" => Token::Right,

@@ -249,6 +249,7 @@ impl Parser {
                     | Token::Right
                     | Token::Full
                     | Token::Cross
+                    | Token::Asof
             );
             if !is_join {
                 break;
@@ -328,8 +329,26 @@ impl Parser {
             if self.peek() == &Token::Outer {
                 self.advance();
             }
-            self.expect(&Token::Join)?;
-            JoinType::Left
+            // `LEFT ASOF JOIN` — asof matching that preserves left rows.
+            if self.peek() == &Token::Asof {
+                self.advance();
+                self.expect(&Token::Join)?;
+                JoinType::LeftAsof
+            } else {
+                self.expect(&Token::Join)?;
+                JoinType::Left
+            }
+        } else if self.peek() == &Token::Asof {
+            self.advance();
+            // `ASOF [LEFT] JOIN` — both keyword orders are accepted.
+            if self.peek() == &Token::Left {
+                self.advance();
+                self.expect(&Token::Join)?;
+                JoinType::LeftAsof
+            } else {
+                self.expect(&Token::Join)?;
+                JoinType::Asof
+            }
         } else if self.peek() == &Token::Right {
             self.advance();
             if self.peek() == &Token::Outer {

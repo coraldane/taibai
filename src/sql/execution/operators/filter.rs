@@ -9,6 +9,13 @@ use crate::types::scalar::ScalarValue;
 use super::{ExecutionOp, RuntimeInFilter};
 use crate::sql::execution::subquery_runtime::SubqueryRegistry;
 
+thread_local! {
+    /// Shared per-thread fallback registry. Scalar function execution is only
+    /// reached for shapes without typed kernels, but rebuilding the registry
+    /// for every batch showed up in profiles.
+    static FALLBACK_FUNCTION_REGISTRY: FunctionRegistry = FunctionRegistry::default();
+}
+
 pub struct FilterExec {
     pub predicate: LogicalExpr,
     pub input: Box<dyn ExecutionOp>,
@@ -16,13 +23,50 @@ pub struct FilterExec {
     /// Snapshot registry for correlated subqueries, when the query contains
     /// any. `None` makes evaluation of such nodes fail loudly.
     pub subqueries: Option<SubqueryRegistry>,
+    /// Remapped predicate cache: `remap_expr_for_batch` is only needed when
+    /// the physical batch layout differs from the logical schema, and is
+    /// deterministic per batch schema, so cache it instead of re-cloning the
+    /// expression tree for every batch.
+    remapped: Option<(Schema, LogicalExpr)>,
+}
+
+impl FilterExec {
+    pub fn new(
+        predicate: LogicalExpr,
+        input: Box<dyn ExecutionOp>,
+        schema: Schema,
+        subqueries: Option<SubqueryRegistry>,
+    ) -> Self {
+        Self {
+            predicate,
+            input,
+            schema,
+            subqueries,
+            remapped: None,
+        }
+    }
 }
 
 impl ExecutionOp for FilterExec {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         while let Some(batch) = self.input.next_batch()? {
-            let predicate = remap_expr_for_batch(&self.predicate, &self.schema, &batch.schema);
-            let mask = eval_filter_with(&predicate, &batch, self.subqueries.as_ref())?;
+            let predicate = if batch.schema == self.schema {
+                &self.predicate
+            } else {
+                if !self
+                    .remapped
+                    .as_ref()
+                    .is_some_and(|(schema, _)| *schema == batch.schema)
+                {
+                    let expr = remap_expr_for_batch(&self.predicate, &self.schema, &batch.schema);
+                    self.remapped = Some((batch.schema.clone(), expr));
+                }
+                self.remapped
+                    .as_ref()
+                    .map(|(_, expr)| expr)
+                    .unwrap_or(&self.predicate)
+            };
+            let mask = eval_filter_with(predicate, &batch, self.subqueries.as_ref())?;
             let filtered = super::apply_filter_mask(&batch, &mask);
             if filtered.num_rows() > 0 {
                 return Ok(Some(filtered));
@@ -244,6 +288,11 @@ pub fn eval_filter_with(
             _ => {
                 if let Some(vector_mask) = eval_column_literal_comparison(left, op, right, batch) {
                     return Ok(vector_mask);
+                }
+                if let Some(typed_mask) =
+                    crate::sql::execution::expr_vec::eval_comparison_mask(left, *op, right, batch)?
+                {
+                    return Ok(typed_mask);
                 }
                 let left_vals = eval_expr_column_with(left, batch, subqueries)?;
                 let right_vals = eval_expr_column_with(right, batch, subqueries)?;
@@ -611,14 +660,16 @@ pub fn eval_expr_column_with(
                 .iter()
                 .map(|arg| eval_expr_column_with(arg, batch, subqueries))
                 .collect::<Result<Vec<_>>>()?;
-            let registry = FunctionRegistry::default();
             let mut result = Vec::with_capacity(num_rows);
             for row_idx in 0..num_rows {
                 let row_args = arg_columns
                     .iter()
                     .map(|values| values[row_idx].clone())
                     .collect::<Vec<_>>();
-                result.push(registry.execute(name, &row_args)?);
+                result.push(
+                    FALLBACK_FUNCTION_REGISTRY
+                        .with(|registry| registry.execute(name, &row_args))?,
+                );
             }
             Ok(result)
         }

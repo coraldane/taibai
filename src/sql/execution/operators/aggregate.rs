@@ -98,10 +98,13 @@ enum Accumulator {
         any: bool,
     },
     /// DISTINCT sets need to remember seen values. Only used for
-    /// COUNT/SUM/AVG DISTINCT over a single column.
+    /// COUNT/SUM/AVG DISTINCT over a single column. Values are stored as the
+    /// self-describing `encode_key_at` bytes (type tag + null flag + typed
+    /// payload) so the hot path avoids JSON/string work and the summary can
+    /// decode them back for SUM/AVG/MIN/MAX.
     Distinct {
         func: AggFunc,
-        seen: std::collections::HashSet<String>,
+        seen: std::collections::HashSet<Vec<u8>>,
         is_count_star: bool,
     },
 }
@@ -112,16 +115,6 @@ enum CountKind {
     Star,
     /// COUNT(col) — only non-null values of this column count.
     Column(usize),
-}
-
-fn hex_key(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 impl Accumulator {
@@ -258,12 +251,10 @@ impl Accumulator {
                     }
                 }
             }
-            Accumulator::Distinct {
-                func: _,
-                seen,
-                is_count_star,
-            } => {
-                // For DISTINCT we must inspect per-row values.
+            Accumulator::Distinct { seen, .. } => {
+                // For DISTINCT we must inspect per-row values; the encoded
+                // key bytes double as the decodable value representation.
+                let mut key = Vec::new();
                 match col_idx_opt {
                     Some(c) => {
                         if let Some(col_arr) = batch.column(c) {
@@ -271,34 +262,23 @@ impl Accumulator {
                                 if col_arr.bitmap().is_null(i) {
                                     continue;
                                 }
-                                let s =
-                                    serde_json::to_string(&col_arr.scalar(i)).map_err(|error| {
-                                        TaibaiError::Internal(format!(
-                                            "failed to encode DISTINCT value: {error}"
-                                        ))
-                                    })?;
-                                seen.insert(s);
+                                key.clear();
+                                col_arr.encode_key_at(i, &mut key);
+                                seen.insert(key.clone());
                             }
                         }
                     }
                     None => {
                         // COUNT(DISTINCT *) — count distinct full rows.
                         for row in 0..batch.num_rows() {
-                            let values = (0..batch.num_columns())
-                                .map(|col| {
-                                    batch.scalar(row, col).unwrap_or(ScalarValue::Int64(None))
-                                })
-                                .collect::<Vec<_>>();
-                            let s = serde_json::to_string(&values).map_err(|error| {
-                                TaibaiError::Internal(format!(
-                                    "failed to encode DISTINCT row: {error}"
-                                ))
-                            })?;
-                            seen.insert(s);
+                            key.clear();
+                            for column in &batch.columns {
+                                column.encode_key_at(row, &mut key);
+                            }
+                            seen.insert(key.clone());
                         }
                     }
                 }
-                let _ = is_count_star;
             }
         }
         Ok(())
@@ -361,7 +341,7 @@ impl Accumulator {
                     }
                 }
                 if !key.is_empty() {
-                    seen.insert(hex_key(&key));
+                    seen.insert(key);
                 }
             }
             // MIN/MAX keep an owned value per group, but avoid constructing a
@@ -424,9 +404,9 @@ impl Accumulator {
                 func,
                 seen,
                 is_count_star,
-            } => finalize_distinct_encoded(
+            } => finalize_distinct_values(
                 *func,
-                seen.iter().map(String::as_str),
+                seen.iter().map(|bytes| decode_key_scalar(bytes)),
                 col_type,
                 *is_count_star,
             ),
@@ -437,7 +417,7 @@ impl Accumulator {
         let dynamic = match self {
             Accumulator::Distinct { seen, .. } => seen
                 .iter()
-                .map(|value| value.capacity() + std::mem::size_of::<String>())
+                .map(|value| value.capacity() + std::mem::size_of::<Vec<u8>>())
                 .sum(),
             Accumulator::Min(Some(value)) | Accumulator::Max(Some(value)) => {
                 scalar_dynamic_size(value)
@@ -519,7 +499,7 @@ impl Accumulator {
 
     fn take_distinct_values(
         &mut self,
-    ) -> Option<(AggFunc, bool, std::collections::HashSet<String>)> {
+    ) -> Option<(AggFunc, bool, std::collections::HashSet<Vec<u8>>)> {
         match self {
             Accumulator::Distinct {
                 func,
@@ -641,6 +621,7 @@ impl ExecutionOp for HashAggregateExec {
         let mut estimated_group_bytes = 0usize;
         let mut spills = Vec::new();
         let mut memory = MemoryManager::reservation();
+        let mut key_buf: Vec<u8> = Vec::new();
         let spill_rows = crate::common::config::query_limits()
             .spill_batch_rows
             .max(1);
@@ -670,95 +651,111 @@ impl ExecutionOp for HashAggregateExec {
                     _ => 0,
                 })
                 .collect();
+            // Aggregate argument column indices are stable once the physical
+            // schema is known; resolve them once per batch instead of per row.
+            let agg_col_indices: Vec<Option<usize>> = aggregates
+                .iter()
+                .map(|agg| match &*agg.arg {
+                    LogicalExpr::Column(idx) => Some(*idx),
+                    _ => None,
+                })
+                .collect();
 
             for row in 0..batch.num_rows() {
-                let mut key = Vec::with_capacity(gb_indices.len() * 12);
+                // The key buffer is reused across rows: the previous code
+                // allocated a fresh Vec per row, which dominated grouped-query
+                // profiles.
+                key_buf.clear();
                 for &column in &gb_indices {
                     if let Some(array) = batch.column(column) {
-                        array.encode_key_at(row, &mut key);
+                        array.encode_key_at(row, &mut key_buf);
                     }
                 }
 
-                if !groups.contains_key(&key) {
-                    let key_scalars: Vec<ScalarValue> = gb_indices
-                        .iter()
-                        .map(|&column| {
-                            batch
-                                .column(column)
-                                .map(|array| array.scalar(row))
-                                .unwrap_or(ScalarValue::Int64(None))
-                        })
-                        .collect();
-                    if groups.len() >= self.max_groups {
-                        return Err(TaibaiError::Sql(format!(
-                            "aggregate group count exceeds limit {}; \
-                             consider refining GROUP BY to reduce cardinality",
-                            self.max_groups
-                        )));
+                // Single hash lookup for the hot (existing group) path; the
+                // double-hash contains_key + get_mut pattern is gone.
+                let accums = match groups.get_mut(&key_buf) {
+                    Some(accums) => accums,
+                    None => {
+                        let key_scalars: Vec<ScalarValue> = gb_indices
+                            .iter()
+                            .map(|&column| {
+                                batch
+                                    .column(column)
+                                    .map(|array| array.scalar(row))
+                                    .unwrap_or(ScalarValue::Int64(None))
+                            })
+                            .collect();
+                        if groups.len() >= self.max_groups {
+                            return Err(TaibaiError::Sql(format!(
+                                "aggregate group count exceeds limit {}; \
+                                 consider refining GROUP BY to reduce cardinality",
+                                self.max_groups
+                            )));
+                        }
+                        let accums: Result<Vec<Accumulator>> = self
+                            .aggregates
+                            .iter()
+                            .map(|agg| {
+                                let col_type = match &*agg.arg {
+                                    LogicalExpr::Column(idx) => self
+                                        .input_schema
+                                        .columns
+                                        .get(*idx)
+                                        .map(|c| c.data_type)
+                                        .unwrap_or(DataType::Int64),
+                                    _ => DataType::Int64,
+                                };
+                                Accumulator::new_for(agg, col_type)
+                            })
+                            .collect();
+                        let accums = accums?;
+                        estimated_group_bytes = estimated_group_bytes.saturating_add(
+                            key_buf.len()
+                                + accums
+                                    .iter()
+                                    .map(Accumulator::estimated_size_bytes)
+                                    .sum::<usize>()
+                                + key_scalars.len() * std::mem::size_of::<ScalarValue>(),
+                        );
+                        group_keys.push((key_buf.clone(), key_scalars));
+                        groups.insert(key_buf.clone(), accums);
+                        groups.get_mut(&key_buf).expect("group inserted above")
                     }
-                    let accums: Result<Vec<Accumulator>> = self
-                        .aggregates
-                        .iter()
-                        .map(|agg| {
-                            let col_type = match &*agg.arg {
-                                LogicalExpr::Column(idx) => self
-                                    .input_schema
-                                    .columns
-                                    .get(*idx)
-                                    .map(|c| c.data_type)
-                                    .unwrap_or(DataType::Int64),
-                                _ => DataType::Int64,
-                            };
-                            Accumulator::new_for(agg, col_type)
-                        })
-                        .collect();
-                    estimated_group_bytes = estimated_group_bytes.saturating_add(
-                        key.len()
-                            + accums
-                                .as_ref()
-                                .map(|values| {
-                                    values
-                                        .iter()
-                                        .map(Accumulator::estimated_size_bytes)
-                                        .sum::<usize>()
-                                })
-                                .unwrap_or(0)
-                            + key_scalars.len() * std::mem::size_of::<ScalarValue>(),
-                    );
-                    group_keys.push((key.clone(), key_scalars));
-                    groups.insert(key.clone(), accums?);
-                }
+                };
 
-                let accums = groups.get_mut(&key).unwrap();
-                let before_update = accums
-                    .iter()
-                    .map(Accumulator::estimated_size_bytes)
-                    .sum::<usize>();
-                for (acc, agg) in accums.iter_mut().zip(aggregates.iter()) {
-                    let col_idx = match &*agg.arg {
-                        LogicalExpr::Column(idx) => Some(*idx),
-                        _ => None,
-                    };
-                    acc.update_row(&batch, col_idx, row)?;
+                for (acc, col_idx) in accums.iter_mut().zip(agg_col_indices.iter()) {
+                    acc.update_row(&batch, *col_idx, row)?;
                 }
-                let after_update = accums
-                    .iter()
-                    .map(Accumulator::estimated_size_bytes)
-                    .sum::<usize>();
-                estimated_group_bytes = estimated_group_bytes
-                    .saturating_sub(before_update)
-                    .saturating_add(after_update);
-                super::profile::record_current_peak_memory(estimated_group_bytes);
+            }
 
-                if estimated_group_bytes >= self.memory_limit_bytes
-                    || !memory.try_resize(estimated_group_bytes)
-                {
-                    spills.push(spill_group_run(&groups, &group_keys, spill_rows)?);
-                    groups.clear();
-                    group_keys.clear();
-                    estimated_group_bytes = 0;
-                    memory.release();
-                }
+            // Deep memory refresh once per batch (matching the no-GROUP-BY
+            // path): DISTINCT sets and MIN/MAX values grow per row, but
+            // re-estimating on every row dominated grouped-query profiles.
+            estimated_group_bytes = group_keys
+                .iter()
+                .map(|(key, scalars)| {
+                    key.len() + scalars.len() * std::mem::size_of::<ScalarValue>()
+                })
+                .sum::<usize>()
+                + groups
+                    .values()
+                    .map(|accums| {
+                        accums
+                            .iter()
+                            .map(Accumulator::estimated_size_bytes)
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>();
+            super::profile::record_current_peak_memory(estimated_group_bytes);
+            if estimated_group_bytes >= self.memory_limit_bytes
+                || !memory.try_resize(estimated_group_bytes)
+            {
+                spills.push(spill_group_run(&groups, &group_keys, spill_rows)?);
+                groups.clear();
+                group_keys.clear();
+                estimated_group_bytes = 0;
+                memory.release();
             }
         }
 
@@ -1258,15 +1255,100 @@ fn scalar_dynamic_size(value: &ScalarValue) -> usize {
     }
 }
 
-fn finalize_distinct_encoded<'a>(
+/// Decode one `encode_key_at`-encoded key back into its scalar value. The
+/// format is `[type_tag: u8][null_flag: u8][payload]` with `u32`
+/// length/dimension prefixes for variable-width payloads; see
+/// `ColumnArray::encode_key_at`. Returns `None` for malformed input (or a
+/// NULL key, which never enters a DISTINCT set in the first place).
+fn decode_key_scalar(bytes: &[u8]) -> Option<ScalarValue> {
+    let (&tag, rest) = bytes.split_first()?;
+    let (&flag, payload) = rest.split_first()?;
+    if flag == 0 {
+        return None;
+    }
+    fn take(payload: &[u8], width: usize) -> Option<&[u8]> {
+        (payload.len() >= width).then(|| &payload[..width])
+    }
+    match tag {
+        tag if tag == DataType::Bool as u8 => {
+            Some(ScalarValue::Bool(Some(take(payload, 1)?[0] != 0)))
+        }
+        tag if tag == DataType::Int8 as u8 => Some(ScalarValue::Int8(Some(i8::from_le_bytes(
+            take(payload, 1)?.try_into().ok()?,
+        )))),
+        tag if tag == DataType::Int16 as u8 => Some(ScalarValue::Int16(Some(i16::from_le_bytes(
+            take(payload, 2)?.try_into().ok()?,
+        )))),
+        tag if tag == DataType::Int32 as u8 => Some(ScalarValue::Int32(Some(i32::from_le_bytes(
+            take(payload, 4)?.try_into().ok()?,
+        )))),
+        tag if tag == DataType::Int64 as u8 => Some(ScalarValue::Int64(Some(i64::from_le_bytes(
+            take(payload, 8)?.try_into().ok()?,
+        )))),
+        tag if tag == DataType::UInt8 as u8 => Some(ScalarValue::UInt8(Some(take(payload, 1)?[0]))),
+        tag if tag == DataType::UInt16 as u8 => Some(ScalarValue::UInt16(Some(
+            u16::from_le_bytes(take(payload, 2)?.try_into().ok()?),
+        ))),
+        tag if tag == DataType::UInt32 as u8 => Some(ScalarValue::UInt32(Some(
+            u32::from_le_bytes(take(payload, 4)?.try_into().ok()?),
+        ))),
+        tag if tag == DataType::UInt64 as u8 => Some(ScalarValue::UInt64(Some(
+            u64::from_le_bytes(take(payload, 8)?.try_into().ok()?),
+        ))),
+        tag if tag == DataType::Float32 as u8 => Some(ScalarValue::Float32(Some(
+            f32::from_le_bytes(take(payload, 4)?.try_into().ok()?),
+        ))),
+        tag if tag == DataType::Float64 as u8 => Some(ScalarValue::Float64(Some(
+            f64::from_le_bytes(take(payload, 8)?.try_into().ok()?),
+        ))),
+        tag if tag == DataType::Decimal as u8 => Some(ScalarValue::Decimal(Some(
+            i64::from_le_bytes(take(payload, 8)?.try_into().ok()?),
+        ))),
+        tag if tag == DataType::Date as u8 => Some(ScalarValue::Date(Some(i32::from_le_bytes(
+            take(payload, 4)?.try_into().ok()?,
+        )))),
+        tag if tag == DataType::Time as u8 => Some(ScalarValue::Time(Some(i64::from_le_bytes(
+            take(payload, 8)?.try_into().ok()?,
+        )))),
+        tag if tag == DataType::Timestamp as u8 => Some(ScalarValue::Timestamp(Some(
+            i64::from_le_bytes(take(payload, 8)?.try_into().ok()?),
+        ))),
+        tag if tag == DataType::Interval as u8 => Some(ScalarValue::Interval(Some(
+            i64::from_le_bytes(take(payload, 8)?.try_into().ok()?),
+        ))),
+        tag if tag == DataType::VarChar as u8 => {
+            let len = u32::from_le_bytes(take(payload, 4)?.try_into().ok()?) as usize;
+            let raw = take(&payload[4..], len)?;
+            Some(ScalarValue::VarChar(Some(
+                String::from_utf8(raw.to_vec()).ok()?,
+            )))
+        }
+        tag if tag == DataType::Blob as u8 => {
+            let len = u32::from_le_bytes(take(payload, 4)?.try_into().ok()?) as usize;
+            Some(ScalarValue::Blob(Some(take(&payload[4..], len)?.to_vec())))
+        }
+        tag if tag == DataType::Vector as u8 => {
+            let dim = u32::from_le_bytes(take(payload, 4)?.try_into().ok()?) as usize;
+            let raw = take(&payload[4..], dim * 4)?;
+            let mut values = Vec::with_capacity(dim);
+            for chunk in raw.chunks_exact(4) {
+                values.push(f32::from_le_bytes(chunk.try_into().ok()?));
+            }
+            Some(ScalarValue::Vector(Some(values)))
+        }
+        _ => None,
+    }
+}
+
+fn finalize_distinct_values(
     func: AggFunc,
-    values: impl Iterator<Item = &'a str>,
+    values: impl Iterator<Item = Option<ScalarValue>>,
     col_type: DataType,
     is_count_star: bool,
 ) -> ScalarValue {
     let mut summary = DistinctSummary::default();
     for value in values {
-        summary.add_encoded(value, is_count_star);
+        summary.add_value(value, is_count_star);
     }
     summary.finalize(func, col_type)
 }
@@ -1281,12 +1363,14 @@ struct DistinctSummary {
 }
 
 impl DistinctSummary {
-    fn add_encoded(&mut self, encoded: &str, is_count_star: bool) {
+    /// `value` is `None` when the encoded key could not be decoded (the
+    /// pre-P1.2 behavior silently dropped such values from SUM/AVG/MIN/MAX).
+    fn add_value(&mut self, value: Option<ScalarValue>, is_count_star: bool) {
         self.count = self.count.saturating_add(1);
         if is_count_star {
             return;
         }
-        let Ok(value) = serde_json::from_str::<ScalarValue>(encoded) else {
+        let Some(value) = value else {
             return;
         };
         if let Some(value) = value.integer_i128() {
@@ -1347,18 +1431,18 @@ impl DistinctSpillAccumulator {
         }
     }
 
-    fn spill_values(&mut self, values: std::collections::HashSet<String>) -> Result<()> {
+    fn spill_values(&mut self, values: std::collections::HashSet<Vec<u8>>) -> Result<()> {
         if values.is_empty() {
             return Ok(());
         }
         let mut values = values.into_iter().collect::<Vec<_>>();
         values.sort_unstable();
-        let schema = Schema::new(vec![ColumnDef::new("distinct_value", DataType::VarChar)]);
+        let schema = Schema::new(vec![ColumnDef::new("distinct_value", DataType::Blob)]);
         let batch_schema = schema.clone();
         let batches = values.chunks(self.batch_rows).map(move |chunk| {
-            let mut column = ColumnArray::empty(DataType::VarChar);
+            let mut column = ColumnArray::empty(DataType::Blob);
             for value in chunk {
-                column.push(&ScalarValue::VarChar(Some(value.clone())))?;
+                column.push(&ScalarValue::Blob(Some(value.clone())))?;
             }
             RecordBatch::try_new(batch_schema.clone(), vec![column])
         });
@@ -1388,7 +1472,7 @@ impl DistinctSpillAccumulator {
         let mut previous = None;
         while let Some(item) = heap.pop() {
             if previous.as_ref() != Some(&item.value) {
-                summary.add_encoded(&item.value, self.is_count_star);
+                summary.add_value(decode_key_scalar(&item.value), self.is_count_star);
                 previous = Some(item.value.clone());
             }
             let cursor = &mut cursors[item.cursor];
@@ -1440,9 +1524,9 @@ impl DistinctSpillCursor {
         Ok(())
     }
 
-    fn current(&self) -> Option<String> {
+    fn current(&self) -> Option<Vec<u8>> {
         match self.batch.as_ref()?.scalar(self.row, 0) {
-            Some(ScalarValue::VarChar(Some(value))) => Some(value),
+            Some(ScalarValue::Blob(Some(value))) => Some(value),
             _ => None,
         }
     }
@@ -1462,7 +1546,7 @@ impl DistinctSpillCursor {
 
 #[derive(Eq, PartialEq)]
 struct DistinctHeapItem {
-    value: String,
+    value: Vec<u8>,
     cursor: usize,
 }
 

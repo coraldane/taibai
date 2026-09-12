@@ -1488,4 +1488,8 @@ impl ColumnArray {
 #[path = "array_test.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "array/vec_kernel_test.rs"]
+mod vec_kernel_tests;
+
 include!("array/analytics.rs");

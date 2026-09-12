@@ -526,7 +526,12 @@ impl Parser {
             {
                 self.advance();
                 let start = self.parse_frame_bound()?;
-                self.expect(&Token::Ident("AND".into()))?;
+                // AND is tokenized as the logical keyword, not an identifier.
+                if self.peek() == &Token::And {
+                    self.advance();
+                } else {
+                    self.expect(&Token::Ident("AND".into()))?;
+                }
                 let end = self.parse_frame_bound()?;
                 (start, end)
             } else {
@@ -549,38 +554,51 @@ impl Parser {
             "RANK" => WindowFunc::Rank,
             "DENSE_RANK" => WindowFunc::DenseRank,
             "LEAD" => {
-                let offset = if args.is_empty() {
-                    1
-                } else {
-                    match &args[0] {
-                        Expr::Literal(ScalarValue::Int64(Some(v))) => *v as usize,
-                        Expr::Literal(ScalarValue::Int32(Some(v))) => *v as usize,
-                        _ => 1,
+                // Standard form: LEAD(value[, offset[, default]]).
+                let Some(arg) = args.first() else {
+                    return Err(TaibaiError::Sql(
+                        "LEAD requires a value argument".to_string(),
+                    ));
+                };
+                let offset = match args.get(1) {
+                    Some(Expr::Literal(ScalarValue::Int64(Some(v)))) => *v as usize,
+                    Some(Expr::Literal(ScalarValue::Int32(Some(v)))) => *v as usize,
+                    None => 1,
+                    _ => {
+                        return Err(TaibaiError::Sql(
+                            "LEAD offset must be an integer literal".to_string(),
+                        ))
                     }
                 };
-                let default = if args.len() > 1 {
-                    Some(Box::new(args[1].clone()))
-                } else {
-                    None
-                };
-                WindowFunc::Lead { offset, default }
+                let default = args.get(2).map(|d| Box::new(d.clone()));
+                WindowFunc::Lead {
+                    arg: Box::new(arg.clone()),
+                    offset,
+                    default,
+                }
             }
             "LAG" => {
-                let offset = if args.is_empty() {
-                    1
-                } else {
-                    match &args[0] {
-                        Expr::Literal(ScalarValue::Int64(Some(v))) => *v as usize,
-                        Expr::Literal(ScalarValue::Int32(Some(v))) => *v as usize,
-                        _ => 1,
+                let Some(arg) = args.first() else {
+                    return Err(TaibaiError::Sql(
+                        "LAG requires a value argument".to_string(),
+                    ));
+                };
+                let offset = match args.get(1) {
+                    Some(Expr::Literal(ScalarValue::Int64(Some(v)))) => *v as usize,
+                    Some(Expr::Literal(ScalarValue::Int32(Some(v)))) => *v as usize,
+                    None => 1,
+                    _ => {
+                        return Err(TaibaiError::Sql(
+                            "LAG offset must be an integer literal".to_string(),
+                        ))
                     }
                 };
-                let default = if args.len() > 1 {
-                    Some(Box::new(args[1].clone()))
-                } else {
-                    None
-                };
-                WindowFunc::Lag { offset, default }
+                let default = args.get(2).map(|d| Box::new(d.clone()));
+                WindowFunc::Lag {
+                    arg: Box::new(arg.clone()),
+                    offset,
+                    default,
+                }
             }
             _ => WindowFunc::Aggregate {
                 func: name,
@@ -611,9 +629,17 @@ impl Parser {
                     "expected PRECEDING or FOLLOWING after UNBOUNDED".into(),
                 ))
             }
-        } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "CURRENT") {
+        } else if self.peek() == &Token::Current
+            || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "CURRENT")
+        {
             self.advance();
-            self.expect(&Token::Ident("ROW".into()))?;
+            // ROW may arrive as the plural keyword token (shared with
+            // ROWS) or a plain identifier.
+            if self.peek() == &Token::Rows {
+                self.advance();
+            } else {
+                self.expect(&Token::Ident("ROW".into()))?;
+            }
             Ok(FrameBound::CurrentRow)
         } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING") {
             self.advance();
@@ -627,10 +653,14 @@ impl Parser {
                 _ => unreachable!(),
             };
             self.advance();
-            if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING") {
+            let is_preceding = self.peek() == &Token::Preceding
+                || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING");
+            let is_following = self.peek() == &Token::Following
+                || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "FOLLOWING");
+            if is_preceding {
                 self.advance();
                 Ok(FrameBound::Preceding(n))
-            } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "FOLLOWING") {
+            } else if is_following {
                 self.advance();
                 Ok(FrameBound::Following(n))
             } else {

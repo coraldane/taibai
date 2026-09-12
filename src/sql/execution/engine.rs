@@ -445,6 +445,7 @@ pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHan
         .name("taibai-close-of-day".into())
         .spawn(move || {
             let mut last_fired: HashSet<(String, String, chrono::NaiveDate)> = HashSet::new();
+            let mut last_ttl_purge = std::time::Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(30));
                 let now = Local::now();
@@ -470,6 +471,16 @@ pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHan
                     }
                     tables
                 };
+                // Partition-level TTL purge, at most once per minute: drop
+                // fully-expired temporal partitions instead of leaving them
+                // to the read-time row filter forever.
+                if last_ttl_purge.elapsed() >= Duration::from_secs(60) {
+                    last_ttl_purge = std::time::Instant::now();
+                    if let Err(error) = engine.run_ttl_partition_purge() {
+                        tracing::warn!(error = %error, "ttl purge: run failed");
+                    }
+                }
+
                 for (db, table, close_time, last_close_date) in hot_tables {
                     let Some((target_h, target_m)) = parse_hh_mm(&close_time).or(Some((15, 30))) else {
                         continue;

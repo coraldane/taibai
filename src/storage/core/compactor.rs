@@ -101,6 +101,10 @@ impl Compactor {
 
         let schema = Schema::new(table_meta.columns.clone());
         let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
+        let ttl = table_meta.ttl.as_ref().and_then(|info| {
+            let idx = table_meta.get_ttl_column_index_cached()?;
+            Some((idx, info.duration_secs))
+        });
         let sort_key_indices = if sort_by_cluster_key {
             cluster_key_indices.as_slice()
         } else {
@@ -179,6 +183,7 @@ impl Compactor {
                         sort_key_indices,
                         &cluster_key_indices,
                         output_row_group_rows,
+                        ttl,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -244,6 +249,10 @@ impl Compactor {
 
         let schema = Schema::new(table_meta.columns.clone());
         let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
+        let ttl = table_meta.ttl.as_ref().and_then(|info| {
+            let idx = table_meta.get_ttl_column_index_cached()?;
+            Some((idx, info.duration_secs))
+        });
         let output_row_group_rows = self.segment_mgr.row_group_target_rows();
         let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
             for candidate in &candidates {
@@ -308,6 +317,7 @@ impl Compactor {
                 &cluster_key_indices,
                 &cluster_key_indices,
                 output_row_group_rows,
+                ttl,
             )
         })?;
 
@@ -339,6 +349,7 @@ impl Compactor {
         sort_key_indices: &[usize],
         bloom_column_indices: &[usize],
         output_row_group_rows: usize,
+        ttl: Option<(usize, i64)>,
     ) -> Result<CompactStats> {
         // The clustered path follows the original Go implementation's
         // index-only sort design: concatenate each decoded column into one
@@ -364,17 +375,36 @@ impl Compactor {
         );
 
         if sort_key_indices.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as i64;
             for seg_path in segment_files {
                 let reader = self.segment_mgr.open_reader(seg_path)?;
                 let mut segment_row_base = 0u64;
                 for rg_idx in 0..reader.num_row_groups() {
                     let batch_idx = source_row_groups.len();
                     let row_count = reader.row_group_rows(rg_idx) as usize;
+                    // TTL purge for the unsorted path: read just the TTL
+                    // column and drop rows the read-time filter would hide.
+                    let ttl_col = ttl.and_then(|(idx, _)| reader.read_column(rg_idx, idx).ok());
+                    let duration = ttl.map(|(_, secs)| secs.saturating_mul(1_000_000));
                     for row_idx in 0..row_count {
                         let row_id = segment_row_base + row_idx as u64;
                         if reader.is_row_deleted(row_id) {
                             deleted_rows += 1;
                             continue;
+                        }
+                        if let (Some(col), Some(duration)) = (&ttl_col, duration) {
+                            let visible = matches!(
+                                col.scalar(row_idx),
+                                crate::types::scalar::ScalarValue::Timestamp(Some(ts))
+                                    if ts.saturating_add(duration) > now
+                            );
+                            if !visible {
+                                deleted_rows += 1;
+                                continue;
+                            }
                         }
                         row_refs.push(RowRef { batch_idx, row_idx });
                     }
@@ -456,6 +486,30 @@ impl Compactor {
                 })
                 .collect::<Result<Vec<_>>>()?;
             preloaded_batch = Some(RecordBatch::try_new(schema.clone(), columns)?);
+
+            // TTL purge: physically drop rows the read-time TTL filter would
+            // hide anyway (ts + duration <= now, or a non-timestamp TTL
+            // value), keeping compaction output and query visibility in sync.
+            if let (Some((ttl_col_idx, duration_secs)), Some(batch)) =
+                (ttl, preloaded_batch.as_ref())
+            {
+                if let Some(ttl_col) = batch.column(ttl_col_idx) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
+                    let duration = duration_secs.saturating_mul(1_000_000);
+                    let before = sorted_indices.len();
+                    sorted_indices.retain(|&global_row| {
+                        matches!(
+                            ttl_col.scalar(global_row as usize),
+                            crate::types::scalar::ScalarValue::Timestamp(Some(ts))
+                                if ts.saturating_add(duration) > now
+                        )
+                    });
+                    deleted_rows += (before - sorted_indices.len()) as u64;
+                }
+            }
 
             tracing::info!(
                 db,
