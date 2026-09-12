@@ -23,6 +23,7 @@
 //! assumptions are baked in.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -39,47 +40,193 @@ use crate::types::scalar::ScalarValue;
 /// granularity of lock-free reads and of prefix reclamation.
 const DEFAULT_CHUNK_ROWS: usize = 65_536;
 
+// ---------------------------------------------------------------------------
+// Hashing.
+//
+// The append path hashes the key value of every row twice (string intern +
+// group-index update) and the read path probes once per query. SipHash costs
+// more than the surrounding work for these short keys, so every hot map uses
+// the multiply-xor hasher below (FxHash family).
+// ---------------------------------------------------------------------------
+
+type FastBuild = BuildHasherDefault<FastHasher>;
+
+#[derive(Default)]
+struct FastHasher {
+    hash: u64,
+}
+
+impl FastHasher {
+    const SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(Self::SEED);
+    }
+
+    /// Standalone string hash for the intern cache (nonzero by construction).
+    #[inline]
+    fn hash_str(s: &str) -> u64 {
+        let mut h = FastHasher::default();
+        h.write(s.as_bytes());
+        h.write_u8(0xff);
+        h.finish() | 1
+    }
+}
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(buf));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rem.len()].copy_from_slice(rem);
+            self.add(u64::from_le_bytes(buf));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    #[inline]
+    fn write_i8(&mut self, i: i8) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_i16(&mut self, i: i16) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_i32(&mut self, i: i32) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_isize(&mut self, i: isize) {
+        self.add(i as u64);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ResidentCoverageSnapshot {
     fully_resident: bool,
     resident_partitions: HashSet<String>,
 }
 
+/// Direct-mapped cache slot for the intern pool: `(hash, id)` with `hash == 0`
+/// meaning empty. Hashes are forced nonzero, so a slot match is either the
+/// interned value or a (verified) 64-bit collision.
+#[derive(Clone, Copy)]
+struct PoolCacheSlot {
+    hash: u64,
+    id: u32,
+    _pad: u32,
+}
+
+const POOL_CACHE_SLOTS: usize = 1024;
+
 /// Interning pool for variable-length key values. A distinct string is stored
 /// once and addressed by a `u32` id, so that building the inverted index never
 /// re-clones a string for every row (only on first sight of a new value).
 ///
 /// This mirrors q's enumerated `` `sym$ `` symbols: the index compares interned
-/// ids, never string bytes.
+/// ids, never string bytes. A direct-mapped hash cache sits in front of the
+/// map so repeated symbols within a batch skip the full lookup entirely.
 pub struct StringPool {
-    forward: HashMap<String, u32>,
+    forward: HashMap<String, u32, FastBuild>,
     reverse: Vec<String>,
+    cache: Vec<PoolCacheSlot>,
 }
 
 impl StringPool {
     pub fn new() -> Self {
         Self {
-            forward: HashMap::new(),
+            forward: HashMap::with_hasher(FastBuild::default()),
             reverse: Vec::new(),
+            cache: vec![PoolCacheSlot { hash: 0, id: 0, _pad: 0 }; POOL_CACHE_SLOTS],
+        }
+    }
+
+    #[inline]
+    fn cached(&self, s: &str) -> Option<(usize, PoolCacheSlot)> {
+        let hash = FastHasher::hash_str(s);
+        let idx = (hash as usize) & (POOL_CACHE_SLOTS - 1);
+        let slot = self.cache[idx];
+        if slot.hash == hash && self.reverse[slot.id as usize] == s {
+            Some((idx, slot))
+        } else {
+            None
         }
     }
 
     /// Insert-or-return for a string value. Borrows `s` (no allocation on a
     /// cache hit).
     pub fn intern(&mut self, s: &str) -> u32 {
-        if let Some(&id) = self.forward.get(s) {
-            return id;
+        if let Some((_idx, slot)) = self.cached(s) {
+            return slot.id;
         }
-        let id = self.reverse.len() as u32;
-        self.reverse.push(s.to_string());
-        self.forward.insert(s.to_string(), id);
+        let id = match self.forward.get(s) {
+            Some(&id) => id,
+            None => {
+                let id = self.reverse.len() as u32;
+                self.reverse.push(s.to_string());
+                self.forward.insert(s.to_string(), id);
+                id
+            }
+        };
+        let hash = FastHasher::hash_str(s);
+        let idx = (hash as usize) & (POOL_CACHE_SLOTS - 1);
+        self.cache[idx] = PoolCacheSlot { hash, id, _pad: 0 };
         id
     }
 
     /// Immutable lookup used on the read/query path. `None` means the value has
     /// never been appended, hence there can be no matching rows.
     pub fn lookup(&self, s: &str) -> Option<u32> {
-        self.forward.get(s).copied()
+        match self.cached(s) {
+            Some((_idx, slot)) => Some(slot.id),
+            None => self.forward.get(s).copied(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -215,15 +362,23 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
         ColumnArray::Timestamp { data, .. } => num_keys!(data, |v: i64| ValueKey::Int(v)),
         ColumnArray::Interval { data, .. } => num_keys!(data, |v: i64| ValueKey::Int(v)),
         ColumnArray::VarChar { data, .. } => {
+            // Symbol-grouped ingestion repeats each key on consecutive rows;
+            // a byte compare against the previous row skips the whole intern
+            // for those runs.
+            let mut prev_valid = false;
             for i in 0..n {
                 if bm.is_null(i) {
                     out.push(ValueKey::Null);
+                    prev_valid = false;
+                } else if prev_valid && data[i] == data[i - 1] {
+                    out.push(*out.last().expect("previous row pushed a key"));
                 } else {
                     out.push(ValueKey::Str(pool.intern(&data[i])));
+                    prev_valid = true;
                 }
             }
         }
-        ColumnArray::Blob { .. } | ColumnArray::Vector { .. } => {
+        ColumnArray::Selected { .. } | ColumnArray::Blob { .. } | ColumnArray::Vector { .. } => {
             return Err(TaibaiError::Internal(format!(
                 "hot store: column type {} is not supported as a cluster-key column",
                 col.data_type().display_name()
@@ -410,7 +565,7 @@ where
 /// was used) are skipped, mirroring the guarantee that every candidate row
 /// already satisfies them.
 fn compile_predicates<'c, 'v>(
-    columns: &'c [ColumnArray],
+    columns: &'c [std::sync::Arc<ColumnArray>],
     eq_predicates: &'v [(usize, ScalarValue)],
     range_predicates: &'v [RangeClause],
     covered_key_column: usize,
@@ -424,7 +579,11 @@ where
         if *column == covered_key_column || Some(*column) == covered_partition_column {
             continue;
         }
-        preds.push(compile_one(columns.get(*column), value, CmpOp::Eq));
+        preds.push(compile_one(
+            columns.get(*column).map(std::sync::Arc::as_ref),
+            value,
+            CmpOp::Eq,
+        ));
     }
     for clause in range_predicates {
         let op = match clause.op {
@@ -435,7 +594,7 @@ where
             RangeOp::Ge => CmpOp::Ge,
         };
         preds.push(compile_one(
-            columns.get(clause.column_index),
+            columns.get(clause.column_index).map(std::sync::Arc::as_ref),
             &clause.value,
             op,
         ));
@@ -451,15 +610,15 @@ where
 /// offsets (the `g#` attribute analogue), plus the composite key/partition
 /// index used when a lookup pins the partition column.
 struct GroupIndex {
-    key: HashMap<ValueKey, Vec<u32>>,
-    key_partition: Option<HashMap<(ValueKey, ValueKey), Vec<u32>>>,
+    key: HashMap<ValueKey, Vec<u32>, FastBuild>,
+    key_partition: Option<HashMap<(ValueKey, ValueKey), Vec<u32>, FastBuild>>,
 }
 
 impl GroupIndex {
     fn empty(partitioned: bool) -> Self {
         Self {
-            key: HashMap::new(),
-            key_partition: partitioned.then(HashMap::new),
+            key: HashMap::with_hasher(FastBuild::default()),
+            key_partition: partitioned.then(|| HashMap::with_hasher(FastBuild::default())),
         }
     }
 
@@ -485,17 +644,18 @@ impl GroupIndex {
 struct Chunk {
     base: u64,
     rows: u32,
-    columns: Vec<ColumnArray>,
+    columns: Vec<std::sync::Arc<ColumnArray>>,
     index: GroupIndex,
     memory_bytes: u64,
 }
 
 /// Read-only view shared by sealed chunks and the open chunk, so the lookup
-/// walk can treat both uniformly.
-trait ChunkView {
+/// walk can treat both uniformly. `Send + Sync` lets the parallel gather walk
+/// chunks on the rayon pool.
+trait ChunkView: Sync {
     fn base(&self) -> u64;
     fn num_rows(&self) -> u64;
-    fn columns(&self) -> &[ColumnArray];
+    fn columns(&self) -> &[std::sync::Arc<ColumnArray>];
     fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>>;
     fn key_partition_postings(&self, key: &ValueKey, partition: &ValueKey) -> Option<&Vec<u32>>;
 }
@@ -507,7 +667,7 @@ impl ChunkView for Chunk {
     fn num_rows(&self) -> u64 {
         self.rows as u64
     }
-    fn columns(&self) -> &[ColumnArray] {
+    fn columns(&self) -> &[std::sync::Arc<ColumnArray>] {
         &self.columns
     }
     fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>> {
@@ -524,7 +684,7 @@ impl ChunkView for Chunk {
 struct OpenChunk {
     base: u64,
     rows: usize,
-    columns: Vec<ColumnArray>,
+    columns: Vec<std::sync::Arc<ColumnArray>>,
     index: GroupIndex,
 }
 
@@ -536,7 +696,7 @@ impl OpenChunk {
             columns: schema
                 .columns
                 .iter()
-                .map(|c| ColumnArray::with_capacity(c.data_type, chunk_rows))
+                .map(|c| std::sync::Arc::new(ColumnArray::with_capacity(c.data_type, chunk_rows)))
                 .collect(),
             index: GroupIndex::empty(partitioned),
         }
@@ -551,7 +711,11 @@ impl OpenChunk {
         Chunk {
             base,
             rows: self.rows as u32,
-            columns: self.columns.clone(),
+            columns: self
+                .columns
+                .iter()
+                .map(|c| std::sync::Arc::new((**c).clone()))
+                .collect(),
             index: GroupIndex {
                 key: self.index.key.clone(),
                 key_partition: self.index.key_partition.clone(),
@@ -573,7 +737,7 @@ impl ChunkView for OpenChunk {
     fn num_rows(&self) -> u64 {
         self.rows as u64
     }
-    fn columns(&self) -> &[ColumnArray] {
+    fn columns(&self) -> &[std::sync::Arc<ColumnArray>] {
         &self.columns
     }
     fn key_postings(&self, key: &ValueKey) -> Option<&Vec<u32>> {
@@ -603,8 +767,8 @@ struct StoreState {
 /// and rows per (key, partition) pair when the table is partitioned.
 #[derive(Default, Clone)]
 struct SealedSummary {
-    key_rows: HashMap<ValueKey, u64>,
-    key_partition_rows: HashMap<(ValueKey, ValueKey), u64>,
+    key_rows: HashMap<ValueKey, u64, FastBuild>,
+    key_partition_rows: HashMap<(ValueKey, ValueKey), u64, FastBuild>,
 }
 
 impl SealedSummary {
@@ -787,7 +951,7 @@ impl HotStore {
     /// unioned on demand; this is a diagnostic, not a query-path primitive.
     pub fn distinct_key_count(&self) -> usize {
         let st = self.state.read().unwrap();
-        let mut distinct: HashSet<ValueKey> = HashSet::new();
+        let mut distinct: HashSet<ValueKey, FastBuild> = HashSet::with_hasher(FastBuild::default());
         for chunk in &st.sealed {
             distinct.extend(chunk.index.key.keys().copied());
         }
@@ -871,11 +1035,13 @@ impl HotStore {
                 let src = batch.column(i).ok_or_else(|| {
                     TaibaiError::Internal("hot store: missing column in batch".into())
                 })?;
+                let dst = std::sync::Arc::get_mut(&mut open.columns[i])
+                    .expect("open chunk columns are exclusively owned");
                 if start == 0 && end == added {
-                    open.columns[i].extend(src)?;
+                    dst.extend(src)?;
                 } else {
                     let sliced = src.slice_fast(start, end);
-                    open.columns[i].extend(&sliced)?;
+                    dst.extend(&sliced)?;
                 }
             }
             let local_base = open.rows as u32;
@@ -1019,26 +1185,137 @@ impl HotStore {
         // Visit chunks in append order (ascending ids), or newest-first for
         // reverse lookups, so LIMIT can terminate early.
         let mut visit: Vec<&dyn ChunkView> = Vec::with_capacity(st.sealed.len() + 1);
-        if reverse {
+        let open_visit_pos = if reverse {
             visit.push(&*open_guard);
             visit.extend(st.sealed.iter().rev().map(|c| c.as_ref() as &dyn ChunkView));
+            0usize
         } else {
             visit.extend(st.sealed.iter().map(|c| c.as_ref() as &dyn ChunkView));
+            let pos = visit.len();
             visit.push(&*open_guard);
-        }
+            pos
+        };
 
         let proj: Vec<usize> = match projection {
             Some(p) => p.to_vec(),
             None => (0..self.schema.num_columns()).collect(),
         };
         let target = row_limit.unwrap_or(usize::MAX);
-        let mut gathered: Option<(Vec<ColumnDef>, Vec<ColumnArray>)> = None;
+
+        // Large gathers (analytics over one key's full history) parallelize
+        // across chunks on the rayon pool; point lookups and limited reads
+        // stay on the serial walk with its early exit.
+        if row_limit.is_none()
+            && visit.len() > 1
+            && estimate_candidates(
+                &visit,
+                &key,
+                partition_key.as_ref(),
+                min_offset,
+                front,
+            ) >= PARALLEL_GATHER_MIN_ROWS
+        {
+            use rayon::prelude::*;
+            // (probed, skipped below watermark, gathered part)
+            type Part = (bool, bool, Option<(Vec<ColumnDef>, Vec<ColumnArray>)>);
+            let parts: Vec<Part> = visit
+                .par_iter()
+                .map(|&chunk| {
+                    let base = chunk.base() - front;
+                    if base + chunk.num_rows() <= min_offset {
+                        return (false, true, None);
+                    }
+                    let postings = match partition_key {
+                        Some(pk) => chunk.key_partition_postings(&key, &pk),
+                        None => chunk.key_postings(&key),
+                    };
+                    let Some(postings) = postings else {
+                        return (false, false, None);
+                    };
+                    let cut = if min_offset > base {
+                        ((min_offset - base).min(u32::MAX as u64)) as u32
+                    } else {
+                        0
+                    };
+                    let slice = &postings[postings.partition_point(|&o| o < cut)..];
+                    if slice.is_empty() {
+                        return (true, false, None);
+                    }
+                    let covered_partition = partition_key.and(self.partition_column_index);
+                    let preds = compile_predicates(
+                        chunk.columns(),
+                        eq_predicates,
+                        range_predicates,
+                        self.key_column_index,
+                        covered_partition,
+                    );
+                    let mut rows = Vec::with_capacity(slice.len());
+                    if reverse {
+                        for &row in slice.iter().rev() {
+                            if preds.iter().all(|p| p.matches(row as usize)) {
+                                rows.push(row);
+                            }
+                        }
+                    } else {
+                        for &row in slice {
+                            if preds.iter().all(|p| p.matches(row as usize)) {
+                                rows.push(row);
+                            }
+                        }
+                    }
+                    if rows.is_empty() {
+                        return (true, false, None);
+                    }
+                    let columns: Vec<ColumnArray> = proj
+                        .iter()
+                        .map(|&ci| chunk.columns()[ci].take(&rows))
+                        .collect();
+                    let defs = proj
+                        .iter()
+                        .map(|&i| self.schema.columns[i].clone())
+                        .collect();
+                    (true, false, Some((defs, columns)))
+                })
+                .collect();
+            let mut gathered: Option<(Vec<ColumnDef>, Vec<ColumnArray>)> = None;
+            let mut seen = false;
+            let mut skipped_by_watermark = false;
+            for (probed, was_skipped, part) in parts {
+                seen |= probed;
+                skipped_by_watermark |= was_skipped;
+                if let Some((defs, columns)) = part {
+                    accumulate_part(&mut gathered, defs, columns);
+                }
+            }
+            if !seen && skipped_by_watermark {
+                if !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
+                    return None;
+                }
+            } else if !seen {
+                return None;
+            }
+            let Some((defs, columns)) = gathered else {
+                let col_defs: Vec<ColumnDef> = proj
+                    .iter()
+                    .map(|&i| self.schema.columns[i].clone())
+                    .collect();
+                return Some(RecordBatch::new(Schema::new(col_defs)));
+            };
+            return RecordBatch::try_new(Schema::new(defs), columns).ok();
+        }
+
         let mut found: usize = 0;
         let mut seen = false;
         let mut skipped_by_watermark = false;
         let mut rows_buf: Vec<u32> = Vec::new();
+        // Per contributing chunk: the row selection plus, for each projected
+        // column, either the shared sealed source (`View`) or an already
+        // gathered owned column for the open chunk (`Owned`).
+        let mut chunk_selections: Vec<(Vec<u32>, Vec<SelectionSource>)> = Vec::new();
 
-        for chunk in visit {
+        for (visit_idx, chunk) in visit.iter().enumerate() {
+            let chunk: &dyn ChunkView = *chunk;
+            let is_open = visit_idx == open_visit_pos;
             let base = chunk.base() - front;
             let chunk_end = base + chunk.num_rows();
             if chunk_end <= min_offset {
@@ -1104,26 +1381,116 @@ impl HotStore {
                 continue;
             }
             found += rows_buf.len();
+            let rows = std::mem::take(&mut rows_buf);
+            let sources: Vec<SelectionSource> = proj
+                .iter()
+                .map(|&ci| {
+                    if is_open {
+                        // Open-chunk columns mutate in place; views cannot
+                        // share them, so take only the selected rows.
+                        SelectionSource::Owned(chunk.columns()[ci].take(&rows))
+                    } else {
+                        SelectionSource::Shared(chunk.columns()[ci].clone())
+                    }
+                })
+                .collect();
+            chunk_selections.push((rows, sources));
+        }
+        drop(open_guard);
+
+        // Small results containing sealed-chunk rows become zero-copy views;
+        // everything else keeps the fused memcpy gather, which beats
+        // indirection for consumers.
+        let has_shared_part = chunk_selections.iter().any(|(_, sources)| {
+            sources
+                .iter()
+                .any(|s| matches!(s, SelectionSource::Shared(_)))
+        });
+        if seen && has_shared_part && found <= SELECTED_MAX_ROWS {
+            let defs: Vec<ColumnDef> = proj
+                .iter()
+                .map(|&i| self.schema.columns[i].clone())
+                .collect();
             let columns: Vec<ColumnArray> = proj
                 .iter()
-                .map(|&ci| chunk.columns()[ci].take(&rows_buf))
+                .enumerate()
+                .map(|(col_pos, &ci)| {
+                    let data_type = self.schema.columns[ci].data_type;
+                    let parts: Vec<(std::sync::Arc<ColumnArray>, std::sync::Arc<[u32]>)> =
+                        chunk_selections
+                            .iter()
+                            .map(|(rows, sources)| match &sources[col_pos] {
+                                SelectionSource::Shared(source) => {
+                                    (source.clone(), std::sync::Arc::from(rows.clone()))
+                                }
+                                SelectionSource::Owned(owned) => {
+                                    let identity: Vec<u32> =
+                                        (0..owned.len() as u32).collect();
+                                    (
+                                        std::sync::Arc::new(owned.clone()),
+                                        std::sync::Arc::from(identity),
+                                    )
+                                }
+                            })
+                            .collect();
+                    ColumnArray::selected(std::sync::Arc::from(parts), data_type, found)
+                })
                 .collect();
-            match &mut gathered {
-                Some((_, acc)) => {
-                    for (dst, src) in acc.iter_mut().zip(columns) {
-                        dst.extend(&src).ok();
+            return RecordBatch::try_new(Schema::new(defs), columns).ok();
+        }
+        if seen
+            && !has_shared_part
+            && found <= SELECTED_MAX_ROWS
+            && chunk_selections.len() == 1
+        {
+            // Single open-chunk hit: the taken columns ARE the result; move
+            // them without a copy.
+            let (_, sources) = chunk_selections.remove(0);
+            let defs: Vec<ColumnDef> = proj
+                .iter()
+                .map(|&i| self.schema.columns[i].clone())
+                .collect();
+            let columns: Vec<ColumnArray> = sources
+                .into_iter()
+                .map(|s| match s {
+                    SelectionSource::Owned(col) => col,
+                    SelectionSource::Shared(_) => unreachable!("checked above"),
+                })
+                .collect();
+            return RecordBatch::try_new(Schema::new(defs), columns).ok();
+        }
+        let mut gathered: Option<(Vec<ColumnDef>, Vec<ColumnArray>)> = None;
+        for (rows, sources) in chunk_selections {
+            if gathered.is_none() {
+                let defs = proj
+                    .iter()
+                    .map(|&i| self.schema.columns[i].clone())
+                    .collect();
+                let columns = proj
+                    .iter()
+                    .map(|&i| ColumnArray::empty(self.schema.columns[i].data_type))
+                    .collect();
+                gathered = Some((defs, columns));
+            }
+            let mut sources = sources.into_iter();
+            if let Some((_, acc)) = gathered.as_mut() {
+                for col in acc.iter_mut() {
+                    match sources.next() {
+                        Some(SelectionSource::Shared(source)) => {
+                            if source.gather_into(&rows, col).is_err() {
+                                return None;
+                            }
+                        }
+                        Some(SelectionSource::Owned(owned)) => {
+                            // Rows were already gathered from the open chunk;
+                            // append them (buffer move for variable-width).
+                            col.append_owned(owned).ok();
+                        }
+                        None => {}
                     }
-                }
-                slot @ None => {
-                    let defs = proj
-                        .iter()
-                        .map(|&i| self.schema.columns[i].clone())
-                        .collect();
-                    *slot = Some((defs, columns));
                 }
             }
         }
-        drop(open_guard);
 
         if !seen {
             if skipped_by_watermark {
@@ -1370,10 +1737,10 @@ impl HotStore {
                 let local_cut = (cut - chunk.base) as usize;
                 let rows = chunk.rows as usize;
                 summary.remove_chunk(&chunk.index, Some(local_cut));
-                let columns: Vec<ColumnArray> = chunk
+                let columns: Vec<std::sync::Arc<ColumnArray>> = chunk
                     .columns
                     .iter()
-                    .map(|c| c.slice_fast(local_cut, rows))
+                    .map(|c| std::sync::Arc::new(c.slice_fast(local_cut, rows)))
                     .collect();
                 let index = self.rebuild_index(&columns);
                 let memory_bytes = columns
@@ -1407,10 +1774,10 @@ impl HotStore {
                 )))
             } else {
                 let local_cut = (cut - open.base) as usize;
-                let columns: Vec<ColumnArray> = open
+                let columns: Vec<std::sync::Arc<ColumnArray>> = open
                     .columns
                     .iter()
-                    .map(|c| c.slice_fast(local_cut, open.rows))
+                    .map(|c| std::sync::Arc::new(c.slice_fast(local_cut, open.rows)))
                     .collect();
                 let index = self.rebuild_index(&columns);
                 Arc::new(RwLock::new(OpenChunk {
@@ -1436,7 +1803,7 @@ impl HotStore {
 
     /// Rebuild the group index of a trimmed chunk directly from its columns
     /// (string values are already interned, so this is a lookup-only pass).
-    fn rebuild_index(&self, columns: &[ColumnArray]) -> GroupIndex {
+    fn rebuild_index(&self, columns: &[std::sync::Arc<ColumnArray>]) -> GroupIndex {
         let mut pool = self.string_pool.write().unwrap();
         let keys = match columns.get(self.key_column_index) {
             Some(col) => collect_keys(col, &mut pool).unwrap_or_default(),
@@ -1471,6 +1838,77 @@ fn sealed_then_open<'a>(
         .iter()
         .map(|c| c.as_ref() as &dyn ChunkView)
         .chain(std::iter::once(open as &dyn ChunkView))
+}
+
+/// One chunk's contribution to a lookup result, per projected column: either
+/// the sealed chunk's shared column (rows selected by index) or an owned
+/// gather of the open chunk's selected rows.
+enum SelectionSource {
+    Shared(std::sync::Arc<ColumnArray>),
+    Owned(ColumnArray),
+}
+
+/// Result rows at or below this count are returned as zero-copy `Selected`
+/// views; larger results use the fused memcpy gather.
+const SELECTED_MAX_ROWS: usize = 512;
+
+/// Minimum visible candidate rows before a gather is worth spreading across
+/// the rayon pool. Below this the serial walk wins (no task-spawn overhead).
+const PARALLEL_GATHER_MIN_ROWS: u64 = 32_768;
+
+/// Visible posting entries across all chunks, used to size up a gather before
+/// deciding between the serial and parallel walks. Early-outs at the parallel
+/// threshold so point lookups pay for at most one extra chunk probe.
+fn estimate_candidates(
+    visit: &[&dyn ChunkView],
+    key: &ValueKey,
+    partition_key: Option<&ValueKey>,
+    min_offset: u64,
+    front: u64,
+) -> u64 {
+    let mut total = 0u64;
+    for &chunk in visit {
+        let base = chunk.base() - front;
+        if base + chunk.num_rows() <= min_offset {
+            continue;
+        }
+        let postings = match partition_key {
+            Some(pk) => chunk.key_partition_postings(key, pk),
+            None => chunk.key_postings(key),
+        };
+        if let Some(postings) = postings {
+            let cut = if min_offset > base {
+                ((min_offset - base).min(u32::MAX as u64)) as u32
+            } else {
+                0
+            };
+            total += (postings.len() - postings.partition_point(|&o| o < cut)) as u64;
+            if total >= PARALLEL_GATHER_MIN_ROWS {
+                break;
+            }
+        }
+    }
+    total
+}
+
+/// Fold one chunk's gathered columns into the output accumulator, preserving
+/// visit order. `append_owned` moves variable-width buffers instead of
+/// re-copying them row by row.
+fn accumulate_part(
+    gathered: &mut Option<(Vec<ColumnDef>, Vec<ColumnArray>)>,
+    defs: Vec<ColumnDef>,
+    columns: Vec<ColumnArray>,
+) {
+    match gathered {
+        Some((_, acc)) => {
+            for (dst, src) in acc.iter_mut().zip(columns) {
+                dst.append_owned(src).ok();
+            }
+        }
+        slot @ None => {
+            *slot = Some((defs, columns));
+        }
+    }
 }
 
 fn estimate_batch_memory(batch: &RecordBatch) -> u64 {

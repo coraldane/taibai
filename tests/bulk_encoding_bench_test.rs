@@ -207,9 +207,17 @@ fn run_phase(engine: &Engine, _session: &mut Session, label: &str, binary_v2: bo
 
 #[test]
 #[ignore = "diagnostic benchmark: run with --ignored --nocapture"]
-fn bulk_payload_v1_vs_v2_throughput() {
+fn bulk_payload_throughput() {
     let dir = TempDir::new().expect("tempdir");
-    let engine = Engine::new(dir.path(), "main").expect("engine");
+    let engine = Engine::new_with_storage_config_and_auto_compact(
+        dir.path(),
+        "main",
+        taibai::storage::segment_manager::SegmentConfig::default(),
+        taibai::sql::execution::AutoCompactConfig::default(),
+        64 * 1024 * 1024,
+        true, // async fsync: exposes the CPU-side decode cost
+    )
+    .expect("engine");
     let mut session = Session::new("root".to_string(), "main".to_string());
     engine
         .execute(
@@ -222,9 +230,8 @@ fn bulk_payload_v1_vs_v2_throughput() {
         )
         .expect("create table");
 
-    // Warm up both paths so page caches, hot store, and segment state are hot.
-    run_phase(&engine, &mut session, "warmup_v1", false);
-    run_phase(&engine, &mut session, "warmup_v2", true);
-    run_phase(&engine, &mut session, "v1_text_layout", false);
-    run_phase(&engine, &mut session, "v2_binary_layout", true);
+    // Warm up so page caches, hot store, and segment state are hot.
+    run_phase(&engine, &mut session, "warmup", false);
+    run_phase(&engine, &mut session, "v1_length_prefixed", false);
+    run_phase(&engine, &mut session, "v1_repeat", false);
 }

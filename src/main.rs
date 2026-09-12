@@ -549,6 +549,9 @@ fn append_column_cell(line: &mut String, col: &types::array::ColumnArray, row: u
     }
 
     match col {
+        types::array::ColumnArray::Selected { .. } => {
+            return append_column_cell(line, col.flattened(), row, scale);
+        }
         types::array::ColumnArray::Bool { data, .. } => {
             line.push_str(if data[row] != 0 { "true" } else { "false" });
         }

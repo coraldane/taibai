@@ -11,6 +11,7 @@ use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
 use crate::storage::segment_manager::state::TableSegmentState;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
+use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
 pub fn table_key(db: &str, table: &str) -> String {
@@ -227,14 +228,115 @@ pub(crate) fn direct_bulk_request_to_batch(
 ) -> Result<RecordBatch> {
     let mut columns = Vec::with_capacity(req.columns.len());
     for col in &req.columns {
-        let mut array = ColumnArray::empty(col.data_type);
-        for row_idx in 0..req.row_count {
-            let scalar = direct_bulk_column_scalar_at(col, row_idx)?;
-            array.push(&scalar)?;
-        }
-        columns.push(array);
+        columns.push(direct_bulk_column_to_array(col, req.row_count)?);
     }
     RecordBatch::try_new(schema.clone(), columns)
+}
+
+/// Decode one columnar payload straight into its typed column. The wire
+/// format is already column-major, so fixed-width payloads are converted
+/// element-wise without `ScalarValue` boxing, VarChar bytes are pushed
+/// straight into the UTF-8 buffer (no per-row `String` allocation), and only
+/// columns that actually carry NULLs pay for per-row bitmap work.
+fn direct_bulk_column_to_array(
+    col: &DirectBulkColumn<'_>,
+    rows: usize,
+) -> Result<ColumnArray> {
+    let has_nulls = !col.nulls.is_empty() && (0..rows).any(|r| null_bit_is_set(col.nulls, r));
+    if has_nulls {
+        // Rare path: per-row decode honouring the NULL bitmap.
+        let mut array = ColumnArray::with_capacity(col.data_type, rows);
+        for row_idx in 0..rows {
+            if null_bit_is_set(col.nulls, row_idx) {
+                array.push_null_value();
+            } else {
+                array.push(&direct_bulk_column_scalar_at(col, row_idx)?)?;
+            }
+        }
+        return Ok(array);
+    }
+
+    macro_rules! bulk_fixed {
+        ($variant:ident, $ty:ty, $width:expr) => {{
+            if col.data.len() == rows * $width {
+                let mut vals = Vec::with_capacity(rows);
+                for chunk in col.data.chunks_exact($width) {
+                    vals.push(<$ty>::from_le_bytes(chunk.try_into().expect("width match")));
+                }
+                return Ok(ColumnArray::$variant {
+                    data: vals,
+                    bitmap: NullBitmap::new_valid(rows),
+                });
+            }
+        }};
+    }
+
+    match col.data_type {
+        DataType::Bool => {
+            if col.data.len() == rows {
+                return Ok(ColumnArray::Bool {
+                    data: col.data.to_vec(),
+                    bitmap: NullBitmap::new_valid(rows),
+                });
+            }
+        }
+        DataType::Int8 => {
+            if col.data.len() == rows {
+                return Ok(ColumnArray::Int8 {
+                    data: col.data.iter().map(|&b| b as i8).collect(),
+                    bitmap: NullBitmap::new_valid(rows),
+                });
+            }
+        }
+        DataType::UInt8 => {
+            if col.data.len() == rows {
+                return Ok(ColumnArray::UInt8 {
+                    data: col.data.to_vec(),
+                    bitmap: NullBitmap::new_valid(rows),
+                });
+            }
+        }
+        DataType::Int16 => bulk_fixed!(Int16, i16, 2),
+        DataType::UInt16 => bulk_fixed!(UInt16, u16, 2),
+        DataType::Int32 => bulk_fixed!(Int32, i32, 4),
+        DataType::UInt32 => bulk_fixed!(UInt32, u32, 4),
+        DataType::Float32 => bulk_fixed!(Float32, f32, 4),
+        DataType::Date => bulk_fixed!(Date, i32, 4),
+        DataType::Int64 => bulk_fixed!(Int64, i64, 8),
+        DataType::UInt64 => bulk_fixed!(UInt64, u64, 8),
+        DataType::Float64 => bulk_fixed!(Float64, f64, 8),
+        DataType::Decimal => bulk_fixed!(Decimal, i64, 8),
+        DataType::Time => bulk_fixed!(Time, i64, 8),
+        DataType::Timestamp => bulk_fixed!(Timestamp, i64, 8),
+        DataType::Interval => bulk_fixed!(Interval, i64, 8),
+        DataType::VarChar => {
+            if let Some(ranges) = &col.variable_ranges {
+                if ranges.len() == rows {
+                    let total_bytes: usize = ranges.iter().map(|&(_, len)| len).sum();
+                    let mut buf = crate::types::array::Utf8Buffer::with_capacity(rows);
+                    buf.reserve_values(rows, total_bytes);
+                    for &(offset, len) in ranges {
+                        let value = std::str::from_utf8(&col.data[offset..offset + len])
+                            .map_err(|_| TaibaiError::Protocol("invalid utf8 in bulk varchar".into()))?;
+                        buf.push_str(value);
+                    }
+                    return Ok(ColumnArray::VarChar {
+                        data: buf,
+                        bitmap: NullBitmap::new_valid(rows),
+                    });
+                }
+            }
+        }
+        DataType::Blob | DataType::Vector => {}
+    }
+
+    // Fallback for unexpected payload sizes and variable-width types without
+    // prebuilt ranges: per-row decode (still NULL-free).
+    let mut array = ColumnArray::with_capacity(col.data_type, rows);
+    for row_idx in 0..rows {
+        array.push(&direct_bulk_column_scalar_at(col, row_idx)?)?;
+    }
+    Ok(array)
 }
 
 pub(crate) fn direct_bulk_column_scalar_at(
@@ -588,3 +690,88 @@ fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<Scal
 #[cfg(test)]
 #[path = "zone_map_test.rs"]
 mod zone_map_tests;
+
+#[cfg(test)]
+mod bulk_decode_bench {
+    //! Diagnostic comparison of the per-row ScalarValue decode (legacy
+    //! algorithm) against the direct typed decode, on a synthetic tick
+    //! payload. Run with:
+    //! `cargo test --lib direct_bulk -- --ignored --nocapture`
+    use super::*;
+    use crate::protocol::types::DataType;
+    use crate::storage::bulk_payload::DirectBulkColumn;
+    use std::time::Instant;
+
+    fn tick_request(rows: usize) -> (DirectBulkRequest<'static>, Vec<Vec<u8>>) {
+        // Leak payloads to keep 'static references for DirectBulkRequest.
+        let mut symbol_bytes: Vec<u8> = Vec::new();
+        let mut symbol_ranges: Vec<(usize, usize)> = Vec::with_capacity(rows);
+        let mut fixed: [Vec<u8>; 4] = [const { Vec::new() }; 4];
+        for seq in 0..rows {
+            let symbol = format!("SH{:06}", seq % 5000);
+            symbol_ranges.push((symbol_bytes.len(), symbol.len()));
+            symbol_bytes.extend_from_slice(symbol.as_bytes());
+            fixed[0].extend_from_slice(&20260911i32.to_le_bytes());
+            fixed[1].extend_from_slice(&(1_000 + (seq % 90_000) as i64).to_le_bytes());
+            fixed[2].extend_from_slice(&100i64.to_le_bytes());
+            fixed[3].extend_from_slice(&(1_783_700_000_000_000u64 as i64).to_le_bytes());
+        }
+        let symbol_bytes: &'static [u8] = Box::leak(symbol_bytes.into_boxed_slice());
+        let symbol_ranges: &'static [(usize, usize)] = Box::leak(symbol_ranges.into_boxed_slice());
+        let fixed_static: Vec<&'static [u8]> = fixed
+            .into_iter()
+            .map(|v| Box::leak(v.into_boxed_slice()) as &'static [u8])
+            .collect();
+        let mk = |name: &'static str, dtype: DataType, data: &'static [u8], ranges: Option<&'static [(usize, usize)]>| DirectBulkColumn {
+            name,
+            data_type: dtype,
+            scale: 0,
+            precision: 0,
+            data,
+            nulls: &[],
+            variable_ranges: ranges.map(|r| r.to_vec()),
+        };
+        let columns = vec![
+            mk("security_id", DataType::VarChar, symbol_bytes, Some(symbol_ranges)),
+            mk("deal_date", DataType::Int32, fixed_static[0], None),
+            mk("price", DataType::Decimal, fixed_static[1], None),
+            mk("trans_volume", DataType::Int64, fixed_static[2], None),
+            mk("local_time", DataType::Timestamp, fixed_static[3], None),
+        ];
+        (DirectBulkRequest { table_name: "t", row_count: rows, columns }, Vec::new())
+    }
+
+    #[test]
+    #[ignore = "diagnostic benchmark: run with --ignored --nocapture"]
+    fn direct_decode_vs_per_row_scalar() {
+        let rows = 100_000;
+        let (req, _) = tick_request(rows);
+
+        let start = Instant::now();
+        let mut legacy_rows = 0usize;
+        for col in &req.columns {
+            let mut array = ColumnArray::empty(col.data_type);
+            for row_idx in 0..req.row_count {
+                let scalar = direct_bulk_column_scalar_at(col, row_idx).unwrap();
+                array.push(&scalar).unwrap();
+                legacy_rows += 1;
+            }
+        }
+        let legacy = start.elapsed();
+
+        let start = Instant::now();
+        let mut direct_rows = 0usize;
+        for col in &req.columns {
+            let array = direct_bulk_column_to_array(col, req.row_count).unwrap();
+            direct_rows += array.len();
+        }
+        let direct = start.elapsed();
+
+        assert_eq!(legacy_rows, direct_rows);
+        println!(
+            "decode {rows} rows x {} cols: legacy per-row Scalar = {legacy:?}, direct typed = {direct:?} ({:.1}x faster)",
+            req.columns.len(),
+            legacy.as_secs_f64() / direct.as_secs_f64()
+        );
+    }
+}

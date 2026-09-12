@@ -22,6 +22,14 @@ use taibai::types::scalar::ScalarValue;
 const BATCH_ROWS: usize = 4_096;
 const APPEND_ROUNDS: usize = 245; // ~1M rows in whole batches
 const TOTAL_ROWS: usize = APPEND_ROUNDS * BATCH_ROWS;
+
+/// Multiplier for profiling runs (`HOT_BENCH_SCALE=20 cargo test ...`).
+fn bench_scale() -> usize {
+    std::env::var("HOT_BENCH_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
 const SYMBOLS: usize = 1_000;
 const LOOKUPS: usize = 20_000;
 const LOOKUP_LIMIT: usize = 10;
@@ -78,24 +86,31 @@ fn bench_hot_store_append_and_point_lookup() {
     let mgr = HotStoreManager::new();
     let meta = tick_meta();
 
+    // Phase 0: build the batches outside the timed region so the append
+    // number isolates the store's own cost.
+    let scale = bench_scale();
+    let rounds = APPEND_ROUNDS * scale;
+    let batches: Vec<RecordBatch> = (0..rounds)
+        .map(|r| tick_batch((r * BATCH_ROWS) as i64, BATCH_ROWS))
+        .collect();
+
     let start = Instant::now();
-    let mut base = 0i64;
-    for _ in 0..APPEND_ROUNDS {
-        let batch = tick_batch(base, BATCH_ROWS);
-        mgr.try_append("main", "ticks", &meta, &batch).unwrap();
-        base += BATCH_ROWS as i64;
+    for batch in &batches {
+        mgr.try_append("main", "ticks", &meta, batch).unwrap();
     }
     let append_elapsed = start.elapsed();
-    let rows_per_sec = TOTAL_ROWS as f64 / append_elapsed.as_secs_f64();
+    let append_rows = rounds * BATCH_ROWS;
+    let rows_per_sec = append_rows as f64 / append_elapsed.as_secs_f64();
 
     let store = mgr.get("main", "ticks").unwrap();
-    assert_eq!(store.row_count(), TOTAL_ROWS as u64);
+    assert_eq!(store.row_count(), append_rows as u64);
 
     // "Latest N ticks for symbol X" - the resident fast-path gather the scan
     // layer issues (reverse posting walk + row limit, full projection).
+    let lookups = LOOKUPS * scale;
     let mut hits = 0u64;
     let lookup_start = Instant::now();
-    for i in 0..LOOKUPS {
+    for i in 0..lookups {
         let symbol = format!("S{:04}", i % SYMBOLS);
         if let Some(batch) = store.lookup_filtered(
             &ScalarValue::VarChar(Some(symbol)),
@@ -112,7 +127,31 @@ fn bench_hot_store_append_and_point_lookup() {
     }
     let lookup_elapsed = lookup_start.elapsed();
     assert!(hits > 0);
-    let us_per_lookup = lookup_elapsed.as_secs_f64() * 1e6 / LOOKUPS as f64;
+    let us_per_lookup = lookup_elapsed.as_secs_f64() * 1e6 / lookups as f64;
+
+    // Full-key gather: every row of one symbol, ascending. This is the
+    // per-symbol analytics scan (large candidates, no row limit).
+    let gathers = SYMBOLS * scale; // every symbol exactly `scale` times
+    let gather_start = Instant::now();
+    let mut gathered = 0u64;
+    for i in 0..gathers {
+        let symbol = format!("S{:04}", i % SYMBOLS);
+        if let Some(batch) = store.lookup_filtered(
+            &ScalarValue::VarChar(Some(symbol)),
+            None,
+            None,
+            0,
+            false,
+            None,
+            &[],
+            &[],
+        ) {
+            gathered += batch.num_rows() as u64;
+        }
+    }
+    let gather_elapsed = gather_start.elapsed();
+    assert_eq!(gathered, append_rows as u64 * scale as u64);
+    let gather_rows_per_sec = gathered as f64 / gather_elapsed.as_secs_f64();
 
     // Posting-list-only count (composite index not used: no partition column).
     let count_start = Instant::now();
@@ -124,12 +163,19 @@ fn bench_hot_store_append_and_point_lookup() {
             .unwrap_or(0);
     }
     let count_elapsed = count_start.elapsed();
-    assert_eq!(total as usize, TOTAL_ROWS);
+    assert_eq!(total as usize, append_rows);
 
-    println!("append:  {TOTAL_ROWS} rows in {:.2?} -> {:.0} rows/s", append_elapsed, rows_per_sec);
     println!(
-        "lookup:  {LOOKUPS} latest-{} gathers in {:.2?} -> {:.2} us/op ({} rows hit)",
+        "append:  {append_rows} rows in {:.2?} -> {:.0} rows/s",
+        append_elapsed, rows_per_sec
+    );
+    println!(
+        "lookup:  {lookups} latest-{} gathers in {:.2?} -> {:.2} us/op ({} rows hit)",
         LOOKUP_LIMIT, lookup_elapsed, us_per_lookup, hits
+    );
+    println!(
+        "gather:  {gathers} full-key scans, {gathered} rows in {:.2?} -> {:.0} rows/s",
+        gather_elapsed, gather_rows_per_sec
     );
     println!(
         "count:   {SYMBOLS} key counts in {:.2?} -> total {total}",

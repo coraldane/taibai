@@ -1329,7 +1329,9 @@ fn push_literal_fast(
             Ok(())
         }
         (ColumnArray::VarChar { data, bitmap }, ScalarValue::VarChar(Some(v))) => {
-            data.push(v.clone());
+            // Copy the bytes straight into the buffer; cloning into a fresh
+            // String would add a heap allocation per row.
+            data.push_str(v);
             bitmap.push_valid();
             Ok(())
         }

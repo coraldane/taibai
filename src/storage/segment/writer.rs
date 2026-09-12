@@ -559,7 +559,9 @@ fn build_column_metadata(
     count: usize,
     bloom_enabled: bool,
 ) -> ColumnMetadata {
+    let col = col.flattened();
     match col {
+        ColumnArray::Selected { .. } => unreachable!("materialized above"),
         ColumnArray::Bool { data, bitmap } => {
             let mut min_value = None;
             let mut max_value = None;

@@ -519,6 +519,7 @@ fn encode_varchar_dictionary_adaptive(
 
 pub fn encode_value(buf: &mut Vec<u8>, col: &ColumnArray, idx: usize) {
     match col {
+        ColumnArray::Selected { .. } => encode_value(buf, col.flattened(), idx),
         ColumnArray::Bool { data, .. } => buf.push(data[idx]),
         ColumnArray::Int8 { data, .. } => buf.push(data[idx] as u8),
         ColumnArray::Int16 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),

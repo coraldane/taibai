@@ -902,11 +902,10 @@ fn combine_conjuncts(conjuncts: Vec<LogicalExpr>) -> Option<LogicalExpr> {
 fn single_scalar_marker(expr: &LogicalExpr) -> Option<&CorrelatedSubqueryPlan> {
     fn walk<'a>(expr: &'a LogicalExpr, found: &mut Vec<&'a CorrelatedSubqueryPlan>) {
         match expr {
-            LogicalExpr::CorrelatedSubquery(node) => {
-                if node.kind == CorrelatedKind::Scalar {
+            LogicalExpr::CorrelatedSubquery(node)
+                if node.kind == CorrelatedKind::Scalar => {
                     found.push(node);
                 }
-            }
             LogicalExpr::BinaryOp { left, right, .. } => {
                 walk(left, found);
                 walk(right, found);

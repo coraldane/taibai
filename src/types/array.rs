@@ -2,6 +2,7 @@ use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
+use std::sync::OnceLock;
 
 /// Arrow-compatible variable-width UTF-8 storage. `offsets` always contains
 /// one more entry than there are values and `data` owns all string bytes in a
@@ -66,6 +67,14 @@ impl Utf8Buffer {
     pub fn push_str(&mut self, value: &str) {
         self.data.extend_from_slice(value.as_bytes());
         self.offsets.push(self.data.len() as u32);
+    }
+
+    /// Reserve room for `values` more entries totalling `bytes` payload bytes.
+    /// Gathers that know their output size up front use this to keep the
+    /// append loop allocation-free.
+    pub fn reserve_values(&mut self, values: usize, bytes: usize) {
+        self.offsets.reserve(values.saturating_add(1));
+        self.data.reserve(bytes);
     }
 
     pub fn append(&mut self, other: &mut Self) {
@@ -206,6 +215,12 @@ impl BinaryBuffer {
         self.data.extend_from_slice(value);
         self.offsets.push(self.data.len() as u32);
     }
+
+    /// See [`Utf8Buffer::reserve_values`].
+    pub fn reserve_values(&mut self, values: usize, bytes: usize) {
+        self.offsets.reserve(values.saturating_add(1));
+        self.data.reserve(bytes);
+    }
     pub fn append(&mut self, other: &mut Self) {
         let base = self.data.len() as u32;
         self.data.append(&mut other.data);
@@ -284,8 +299,26 @@ impl<'a> IntoIterator for &'a BinaryBuffer {
 /// Data is stored in typed vectors for cache efficiency; null values are
 /// marked in the bitmap but still occupy space in the data vector (simpler
 /// than taibai's "skip nulls" approach for in-memory representation).
+///
+/// The `Selected` variant is a zero-copy view: row indices into one or more
+/// shared immutable source columns. Reads (`scalar`, `compare_scalar_at`,
+/// `len`, ...) resolve through the indices directly; anything that needs
+/// owned buffers (bitmap slices, mutation) materializes the gathered column
+/// once into `flat` and then operates on it.
+/// (source column, ascending selected indices) for one zero-copy part.
+pub type SelectedPart = (std::sync::Arc<ColumnArray>, std::sync::Arc<[u32]>);
+pub type SelectedParts = std::sync::Arc<[SelectedPart]>;
+
 #[derive(Debug, Clone)]
 pub enum ColumnArray {
+    /// Zero-copy gather view. `parts` are (source column, ascending indices).
+    Selected {
+        parts: SelectedParts,
+        data_type: DataType,
+        len: usize,
+        /// Lazily materialized identical owned column (never `Selected`).
+        flat: OnceLock<Box<ColumnArray>>,
+    },
     Bool {
         data: Vec<u8>,
         bitmap: NullBitmap,
@@ -390,6 +423,7 @@ impl ColumnArray {
             };
         }
         match self {
+            ColumnArray::Selected { .. } => self.flattened().compare_at(left, right),
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => cmp_ord!(data),
             ColumnArray::Int8 { data, .. } => cmp_ord!(data),
             ColumnArray::Int16 { data, .. } => cmp_ord!(data),
@@ -475,6 +509,7 @@ impl ColumnArray {
             };
         }
         match self {
+            ColumnArray::Selected { .. } => self.flattened().encode_key_at(row, out),
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => out.push(data[row]),
             ColumnArray::Int8 { data, .. } => out.push(data[row] as u8),
             ColumnArray::Int16 { data, .. } => bytes!(data),
@@ -544,6 +579,48 @@ impl ColumnArray {
             ColumnArray::Float64 { data, .. } => Some(data[row]),
             _ => self.numeric_i64_at(row).map(|value| value as f64),
         }
+    }
+
+    /// Build a zero-copy view over gathered rows of shared source columns.
+    /// `parts` are (source, ascending indices); `len` is the total selected
+    /// row count.
+    pub fn selected(parts: SelectedParts, data_type: DataType, len: usize) -> Self {
+        ColumnArray::Selected {
+            parts,
+            data_type,
+            len,
+            flat: OnceLock::new(),
+        }
+    }
+
+    /// The owned materialization of this column. `Selected` columns gather
+    /// their parts on first call and cache the result; other variants return
+    /// themselves.
+    pub fn flattened(&self) -> &ColumnArray {
+        match self {
+            ColumnArray::Selected { parts, data_type, flat, .. } => flat.get_or_init(|| {
+                let mut out = ColumnArray::empty(*data_type);
+                for (source, indices) in parts.iter() {
+                    source
+                        .gather_into(indices, &mut out)
+                        .expect("selected parts share the column data type");
+                }
+                Box::new(out)
+            }),
+            other => other,
+        }
+    }
+
+    /// Materialize in place so `&mut` operations can proceed on owned data.
+    pub fn flatten_in_place(&mut self) {
+        if let ColumnArray::Selected { .. } = self {
+            *self = self.flattened().clone();
+        }
+    }
+
+    /// True for the zero-copy view variant.
+    pub fn is_selected(&self) -> bool {
+        matches!(self, ColumnArray::Selected { .. })
     }
 
     /// Create an empty ColumnArray for the given DataType.
@@ -713,6 +790,7 @@ impl ColumnArray {
     /// Returns the DataType of this column.
     pub fn data_type(&self) -> DataType {
         match self {
+            ColumnArray::Selected { data_type, .. } => *data_type,
             ColumnArray::Bool { .. } => DataType::Bool,
             ColumnArray::Int8 { .. } => DataType::Int8,
             ColumnArray::Int16 { .. } => DataType::Int16,
@@ -738,6 +816,7 @@ impl ColumnArray {
     /// Returns the number of rows in this column.
     pub fn len(&self) -> usize {
         match self {
+            ColumnArray::Selected { len, .. } => *len,
             ColumnArray::Bool { data, .. } => data.len(),
             ColumnArray::Int8 { data, .. } => data.len(),
             ColumnArray::Int16 { data, .. } => data.len(),
@@ -769,8 +848,18 @@ impl ColumnArray {
     /// This deliberately favours a cheap, deterministic estimate over an
     /// allocator-specific exact value and is used for query spill decisions.
     pub fn estimated_size_bytes(&self) -> usize {
+        if let ColumnArray::Selected { parts, .. } = self {
+            return parts
+                .iter()
+                .map(|(source, indices)| {
+                    let width = source.data_type().fixed_size().unwrap_or(24);
+                    indices.len() * width + indices.len().div_ceil(8)
+                })
+                .sum();
+        }
         let bitmap = self.bitmap().estimated_size_bytes();
         match self {
+            ColumnArray::Selected { .. } => unreachable!("handled above"),
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => {
                 bitmap + data.capacity()
             }
@@ -820,9 +909,11 @@ impl ColumnArray {
         }
     }
 
-    /// Returns a reference to the null bitmap.
+    /// Returns a reference to the null bitmap. Materializes a `Selected`
+    /// view on first call (the bitmap is cached with the flattened column).
     pub fn bitmap(&self) -> &NullBitmap {
         match self {
+            ColumnArray::Selected { .. } => self.flattened().bitmap(),
             ColumnArray::Bool { bitmap, .. } => bitmap,
             ColumnArray::Int8 { bitmap, .. } => bitmap,
             ColumnArray::Int16 { bitmap, .. } => bitmap,
@@ -847,7 +938,9 @@ impl ColumnArray {
 
     /// Returns a mutable reference to the null bitmap.
     pub fn bitmap_mut(&mut self) -> &mut NullBitmap {
+        self.flatten_in_place();
         match self {
+            ColumnArray::Selected { .. } => unreachable!("flattened above"),
             ColumnArray::Bool { bitmap, .. } => bitmap,
             ColumnArray::Int8 { bitmap, .. } => bitmap,
             ColumnArray::Int16 { bitmap, .. } => bitmap,
@@ -872,7 +965,18 @@ impl ColumnArray {
 
     /// Get the scalar value at the given index.
     pub fn scalar(&self, idx: usize) -> ScalarValue {
+        if let ColumnArray::Selected { parts, .. } = self {
+            let mut offset = 0usize;
+            for (source, indices) in parts.iter() {
+                if idx < offset + indices.len() {
+                    return source.scalar(indices[idx - offset] as usize);
+                }
+                offset += indices.len();
+            }
+            panic!("ColumnArray::scalar: index {idx} out of bounds");
+        }
         match self {
+            ColumnArray::Selected { .. } => unreachable!("handled above"),
             ColumnArray::Bool { data, bitmap } => {
                 if bitmap.is_null(idx) {
                     ScalarValue::Bool(None)
@@ -1011,6 +1115,7 @@ impl ColumnArray {
 
     /// Push a scalar value into this column array.
     pub fn push(&mut self, value: &ScalarValue) -> Result<()> {
+        self.flatten_in_place();
         let is_null = value.is_null();
         match (self, value) {
             (ColumnArray::Bool { data, bitmap }, ScalarValue::Bool(v)) => {
@@ -1177,7 +1282,9 @@ impl ColumnArray {
     }
 
     pub fn push_null_value(&mut self) {
+        self.flatten_in_place();
         match self {
+            ColumnArray::Selected { .. } => unreachable!("flattened above"),
             ColumnArray::Bool { data, bitmap } => {
                 data.push(0);
                 bitmap.push_null();
@@ -1269,6 +1376,17 @@ impl ColumnArray {
 
     /// Append another ColumnArray of the same type.
     pub fn extend(&mut self, other: &ColumnArray) -> Result<()> {
+        self.flatten_in_place();
+        // A view argument is materialized on extend: its rows are consumed
+        // exactly like an owned column's.
+        let owned_other;
+        let other = match other {
+            ColumnArray::Selected { .. } => {
+                owned_other = other.flattened().clone();
+                &owned_other
+            }
+            other => other,
+        };
         if self.data_type() != other.data_type() {
             return Err(TaibaiError::Internal(format!(
                 "cannot extend {} with {}",
@@ -1439,6 +1557,7 @@ impl ColumnArray {
     /// cloned, which is important when compaction concatenates many decoded
     /// row groups into one global column.
     pub fn append_owned(&mut self, other: ColumnArray) -> Result<()> {
+        self.flatten_in_place();
         match other {
             ColumnArray::VarChar {
                 mut data,

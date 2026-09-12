@@ -5,7 +5,9 @@ pub fn encode_column_direct_range(col: &ColumnArray, start: usize, len: usize) -
     data.extend_from_slice(&0u32.to_le_bytes());
     let end = start + len;
 
+    let col = col.flattened();
     match col {
+        ColumnArray::Selected { .. } => unreachable!("materialized above"),
         ColumnArray::Int32 { data: vals, .. } => {
             let slice = &vals[start..end];
             let bytes =

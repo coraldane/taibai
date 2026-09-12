@@ -222,6 +222,7 @@ impl ColumnArray {
             }};
         }
         match self {
+            ColumnArray::Selected { .. } => self.flattened().col_min(),
             ColumnArray::Int64 { data, .. } => numeric_min!(data, Int64),
             ColumnArray::Int32 { data, .. } => numeric_min!(data, Int32),
             ColumnArray::Int16 { data, .. } => numeric_min!(data, Int16),
@@ -314,6 +315,7 @@ impl ColumnArray {
             }};
         }
         match self {
+            ColumnArray::Selected { .. } => self.flattened().col_max(),
             ColumnArray::Int64 { data, .. } => numeric_max!(data, Int64),
             ColumnArray::Int32 { data, .. } => numeric_max!(data, Int32),
             ColumnArray::Int16 { data, .. } => numeric_max!(data, Int16),
@@ -637,94 +639,265 @@ impl ColumnArray {
     /// gather path: instead of scanning the whole column it copies only the
     /// requested rows, turning a full-scan into an O(matched) operation.
     pub fn take(&self, indices: &[u32]) -> ColumnArray {
-        macro_rules! take_copy_column {
-            ($variant:ident, $data:expr, $bitmap:expr) => {{
-                let mut new_data = Vec::with_capacity(indices.len());
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
-                for &idx in indices {
-                    let i = idx as usize;
-                    new_data.push($data[i]);
-                    if $bitmap.is_null(i) {
-                        new_bitmap.push_null();
-                    } else {
-                        new_bitmap.push_valid();
+        let mut out = ColumnArray::empty(self.data_type());
+        self.gather_into(indices, &mut out)
+            .expect("take: gather_into cannot fail for a fresh column of the same type");
+        out
+    }
+
+    /// Gather `indices` from `self` and append them to `dst`, which must hold
+    /// the same data type. Fuses what `take` + `extend` used to do (two copies
+    /// plus a temporary column) into a single pass that writes straight into
+    /// the destination.
+    ///
+    /// Ascending index runs (posting lists are sorted, so full-chunk gathers
+    /// are one run) are copied with `extend_from_slice`/bulk-valid bitmaps.
+    pub fn gather_into(&self, indices: &[u32], dst: &mut ColumnArray) -> Result<()> {
+        if self.data_type() != dst.data_type() {
+            return Err(TaibaiError::Internal(format!(
+                "gather_into: destination holds {} but source is {}",
+                dst.data_type().display_name(),
+                self.data_type().display_name()
+            )));
+        }
+        if indices.is_empty() {
+            return Ok(());
+        }
+        // A source column without nulls lets the gather extend the output
+        // bitmap in bulk instead of a branch per row, which is the common case
+        // for ingested hot data. Detecting "no nulls" scans the whole source
+        // bitmap, so only take the fast path when the gather is dense enough
+        // to amortize that scan; sparse gathers (e.g. ten rows out of a 64Ki
+        // chunk) keep the per-row loop.
+        let all_valid = indices.len() * 128 >= self.len() && self.bitmap().is_all_valid();
+
+        // Ascending runs of indices are copied with memcpy; everything else
+        // falls back to per-row pushes.
+        macro_rules! gather_fixed {
+            ($src_data:expr, $src_bitmap:expr, $dst_data:expr, $dst_bitmap:expr) => {{
+                $dst_data.reserve($dst_data.len() + indices.len());
+                if all_valid {
+                    let mut i = 0usize;
+                    while i < indices.len() {
+                        let first = indices[i] as usize;
+                        let mut run = 1usize;
+                        while i + run < indices.len() && indices[i + run] == indices[i + run - 1] + 1
+                        {
+                            run += 1;
+                        }
+                        if run >= 4 {
+                            $dst_data.extend_from_slice(&$src_data[first..first + run]);
+                        } else {
+                            for &idx in &indices[i..i + run] {
+                                $dst_data.push($src_data[idx as usize]);
+                            }
+                        }
+                        $dst_bitmap.extend_valid(run);
+                        i += run;
+                    }
+                } else {
+                    for &idx in indices {
+                        let i = idx as usize;
+                        $dst_data.push($src_data[i]);
+                        if $src_bitmap.is_null(i) {
+                            $dst_bitmap.push_null();
+                        } else {
+                            $dst_bitmap.push_valid();
+                        }
                     }
                 }
-                ColumnArray::$variant {
-                    data: new_data,
-                    bitmap: new_bitmap,
-                }
+                Ok(())
             }};
         }
 
-        match self {
-            ColumnArray::Bool { data, bitmap } => take_copy_column!(Bool, data, bitmap),
-            ColumnArray::Int8 { data, bitmap } => take_copy_column!(Int8, data, bitmap),
-            ColumnArray::Int16 { data, bitmap } => take_copy_column!(Int16, data, bitmap),
-            ColumnArray::Int32 { data, bitmap } => take_copy_column!(Int32, data, bitmap),
-            ColumnArray::Int64 { data, bitmap } => take_copy_column!(Int64, data, bitmap),
-            ColumnArray::UInt8 { data, bitmap } => take_copy_column!(UInt8, data, bitmap),
-            ColumnArray::UInt16 { data, bitmap } => take_copy_column!(UInt16, data, bitmap),
-            ColumnArray::UInt32 { data, bitmap } => take_copy_column!(UInt32, data, bitmap),
-            ColumnArray::UInt64 { data, bitmap } => take_copy_column!(UInt64, data, bitmap),
-            ColumnArray::Float32 { data, bitmap } => take_copy_column!(Float32, data, bitmap),
-            ColumnArray::Float64 { data, bitmap } => take_copy_column!(Float64, data, bitmap),
-            ColumnArray::Decimal { data, bitmap } => take_copy_column!(Decimal, data, bitmap),
-            ColumnArray::Date { data, bitmap } => take_copy_column!(Date, data, bitmap),
-            ColumnArray::Time { data, bitmap } => take_copy_column!(Time, data, bitmap),
-            ColumnArray::Timestamp { data, bitmap } => take_copy_column!(Timestamp, data, bitmap),
-            ColumnArray::Interval { data, bitmap } => take_copy_column!(Interval, data, bitmap),
-            ColumnArray::VarChar { data, bitmap } => {
-                let mut new_data = Utf8Buffer::with_capacity(indices.len());
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
-                for &idx in indices {
-                    let i = idx as usize;
-                    new_data.push_str(data.value(i));
-                    if bitmap.is_null(i) {
-                        new_bitmap.push_null();
-                    } else {
-                        new_bitmap.push_valid();
+        // Variable-width payload: per-row copy is unavoidable (offsets differ),
+        // but the destination is reserved up front so the loop is
+        // allocation-free, and the bitmap still uses the bulk path.
+        macro_rules! gather_var {
+            ($src:expr, $src_bitmap:expr, $dst:expr, $dst_bitmap:expr, $push:ident) => {{
+                let total_bytes: usize = indices
+                    .iter()
+                    .map(|&idx| {
+                        let i = idx as usize;
+                        ($src.offsets[i + 1] - $src.offsets[i]) as usize
+                    })
+                    .sum();
+                $dst.reserve_values(indices.len(), total_bytes);
+                if all_valid {
+                    $dst_bitmap.extend_valid(indices.len());
+                    for &idx in indices {
+                        let i = idx as usize;
+                        $dst.$push($src.value(i));
+                    }
+                } else {
+                    for &idx in indices {
+                        let i = idx as usize;
+                        $dst.$push($src.value(i));
+                        if $src_bitmap.is_null(i) {
+                            $dst_bitmap.push_null();
+                        } else {
+                            $dst_bitmap.push_valid();
+                        }
                     }
                 }
+                Ok(())
+            }};
+        }
+
+        match (self, dst) {
+            (
+                ColumnArray::Bool { data, bitmap },
+                ColumnArray::Bool {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Int8 { data, bitmap },
+                ColumnArray::Int8 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Int16 { data, bitmap },
+                ColumnArray::Int16 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Int32 { data, bitmap },
+                ColumnArray::Int32 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Int64 { data, bitmap },
+                ColumnArray::Int64 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::UInt8 { data, bitmap },
+                ColumnArray::UInt8 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::UInt16 { data, bitmap },
+                ColumnArray::UInt16 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::UInt32 { data, bitmap },
+                ColumnArray::UInt32 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::UInt64 { data, bitmap },
+                ColumnArray::UInt64 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Float32 { data, bitmap },
+                ColumnArray::Float32 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Float64 { data, bitmap },
+                ColumnArray::Float64 {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Decimal { data, bitmap },
+                ColumnArray::Decimal {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Date { data, bitmap },
+                ColumnArray::Date {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Time { data, bitmap },
+                ColumnArray::Time {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Timestamp { data, bitmap },
+                ColumnArray::Timestamp {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::Interval { data, bitmap },
+                ColumnArray::Interval {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_fixed!(data, bitmap, dst_data, dst_bitmap),
+            (
+                ColumnArray::VarChar { data, bitmap },
                 ColumnArray::VarChar {
-                    data: new_data,
-                    bitmap: new_bitmap,
-                }
-            }
-            ColumnArray::Blob { data, bitmap } => {
-                let mut new_data = BinaryBuffer::with_capacity(indices.len());
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
-                for &idx in indices {
-                    let i = idx as usize;
-                    new_data.push_slice(data.value(i));
-                    if bitmap.is_null(i) {
-                        new_bitmap.push_null();
-                    } else {
-                        new_bitmap.push_valid();
-                    }
-                }
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_var!(data, bitmap, dst_data, dst_bitmap, push_str),
+            (
+                ColumnArray::Blob { data, bitmap },
                 ColumnArray::Blob {
-                    data: new_data,
-                    bitmap: new_bitmap,
-                }
-            }
-            ColumnArray::Vector { data, bitmap } => {
-                let mut new_data = Vec::with_capacity(indices.len());
-                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => gather_var!(data, bitmap, dst_data, dst_bitmap, push_slice),
+            (
+                ColumnArray::Vector { data, bitmap },
+                ColumnArray::Vector {
+                    data: dst_data,
+                    bitmap: dst_bitmap,
+                },
+            ) => {
+                dst_data.reserve(dst_data.len() + indices.len());
                 for &idx in indices {
-                    let i = idx as usize;
-                    new_data.push(data[i].clone());
-                    if bitmap.is_null(i) {
-                        new_bitmap.push_null();
-                    } else {
-                        new_bitmap.push_valid();
+                    dst_data.push(data[idx as usize].clone());
+                }
+                if all_valid {
+                    dst_bitmap.extend_valid(indices.len());
+                } else {
+                    for &idx in indices {
+                        if bitmap.is_null(idx as usize) {
+                            dst_bitmap.push_null();
+                        } else {
+                            dst_bitmap.push_valid();
+                        }
                     }
                 }
-                ColumnArray::Vector {
-                    data: new_data,
-                    bitmap: new_bitmap,
-                }
+                Ok(())
             }
+            _ => Err(TaibaiError::Internal(
+                "gather_into: column type mismatch".to_string(),
+            )),
         }
     }
 }

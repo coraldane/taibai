@@ -167,6 +167,20 @@ impl NullBitmap {
         }
     }
 
+    /// Append `n` valid rows in one step. Gathers from null-free source
+    /// columns use this to keep the bitmap work O(n/64) instead of a branch
+    /// per row.
+    pub fn extend_valid(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.len += n;
+        let needed = Self::u64_count(self.len);
+        if self.data.len() < needed {
+            self.data.resize(needed, 0);
+        }
+    }
+
     pub fn push_valid(&mut self) {
         self.len += 1;
         let needed = Self::u64_count(self.len);
