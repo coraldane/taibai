@@ -747,9 +747,9 @@ impl SegmentManager {
         path: &Path,
         schema: Schema,
         row_group_size: usize,
-        batches: &[RecordBatch],
+        batches: &[std::sync::Arc<RecordBatch>],
     ) -> Result<()> {
-        let total_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         let mut combined = RecordBatch::with_capacity(schema.clone(), total_rows);
         for batch in batches {
             if batch.num_columns() != combined.num_columns() {

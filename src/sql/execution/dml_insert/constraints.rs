@@ -41,9 +41,12 @@ fn validate_unique_constraints_in_batch(
             let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
                 continue;
             };
-            if !keys.insert(key.clone()) {
+            // Probe first and move on success: hashing twice is cheaper than
+            // cloning every key cell (a String copy for VarChar) per row.
+            if keys.contains(&key) {
                 return Err(duplicate_unique_key_error(table, name, &key));
             }
+            keys.insert(key);
         }
     }
     Ok(())
@@ -64,9 +67,10 @@ pub fn validate_unique_key_uniqueness(
             let Some(key) = unique_key_for_row(batch, row_idx, indices, schema) else {
                 continue;
             };
-            if !keys.insert(key.clone()) {
+            if keys.contains(&key) {
                 return Err(duplicate_unique_key_error(table, index_name, &key));
             }
+            keys.insert(key);
         }
     }
     if new_batch.is_some() {
@@ -282,7 +286,7 @@ pub fn validate_unique_indexes_in_batches(
     table: &str,
     schema: &Schema,
     unique_indexes: &[crate::storage::catalog::schema::UniqueIndexMeta],
-    batches: &[RecordBatch],
+    batches: &[std::sync::Arc<RecordBatch>],
 ) -> Result<()> {
     for index in unique_indexes {
         let mut indices = Vec::with_capacity(index.columns.len());
@@ -297,9 +301,10 @@ pub fn validate_unique_indexes_in_batches(
                 let Some(key) = unique_key_for_row(batch, row_idx, &indices, schema) else {
                     continue;
                 };
-                if !keys.insert(key.clone()) {
+                if keys.contains(&key) {
                     return Err(duplicate_unique_key_error(table, &index.name, &key));
                 }
+                keys.insert(key);
             }
         }
     }
@@ -434,9 +439,10 @@ fn validate_primary_key_uniqueness_in_batch(
     let mut keys = HashSet::new();
     for row_idx in 0..batch.num_rows() {
         let key = primary_key_for_row(batch, row_idx, primary_key_indices, schema)?;
-        if !keys.insert(key.clone()) {
+        if keys.contains(&key) {
             return Err(duplicate_primary_key_error(table, &key));
         }
+        keys.insert(key);
     }
     Ok(())
 }

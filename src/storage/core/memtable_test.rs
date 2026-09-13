@@ -2,6 +2,7 @@ use super::*;
 use crate::protocol::types::DataType;
 use crate::types::batch::ColumnDef;
 use crate::types::scalar::ScalarValue;
+use std::sync::Arc;
 
 fn batch(schema: &Schema, values: &[i64]) -> RecordBatch {
     let mut batch = RecordBatch::new(schema.clone());
@@ -59,7 +60,7 @@ fn replace_key_conflicts_rebuilds_after_batch_replacement() {
     memtable.append(&batch(&schema, &[1, 2, 3])).unwrap();
     let version_before = memtable.content_version();
 
-    assert!(memtable.replace_pending_batch(batch(&schema, &[7, 8])));
+    assert!(memtable.replace_pending_batch(Arc::new(batch(&schema, &[7, 8]))));
     assert!(memtable.content_version() > version_before);
     assert_eq!(
         manager.replace_key_conflicts(
@@ -104,7 +105,7 @@ fn compact_replace_key_index_shifts_and_verifies() {
     );
 
     // Remove rows 0 and 3 (keys 1 and 4): filtered batch is [2, 3, 5].
-    assert!(memtable.replace_pending_batch(batch(&schema, &[2, 3, 5])));
+    assert!(memtable.replace_pending_batch(Arc::new(batch(&schema, &[2, 3, 5]))));
     manager.compact_replace_key_index(&memtable, &[0, 3], 5);
 
     let filtered = memtable.read().unwrap();
@@ -127,8 +128,8 @@ fn compact_replace_key_index_drops_entry_on_state_mismatch() {
 
     // A second replacement (rollback restore) bumps the version again, so
     // the compaction guard must refuse to shift positions.
-    assert!(memtable.replace_pending_batch(batch(&schema, &[1, 2, 9])));
-    assert!(memtable.replace_pending_batch(batch(&schema, &[1, 2])));
+    assert!(memtable.replace_pending_batch(Arc::new(batch(&schema, &[1, 2, 9]))));
+    assert!(memtable.replace_pending_batch(Arc::new(batch(&schema, &[1, 2]))));
     manager.compact_replace_key_index(&memtable, &[0], 3);
 
     assert_eq!(

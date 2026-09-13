@@ -256,6 +256,15 @@ impl MemTable {
             .map(|batch| Arc::try_unwrap(batch).unwrap_or_else(|shared| shared.as_ref().clone()))
     }
 
+    /// Empty the memtable without materializing the batch. Unlike
+    /// `take_batch()`, this drops the shared `Arc` instead of deep-copying
+    /// the data when another holder (e.g. an in-flight pubsub event) still
+    /// references it. Use at every discard-only call site.
+    pub fn clear_batch(&self) {
+        let mut guard = self.batch.write().unwrap();
+        guard.take();
+    }
+
     /// Copy the current batch without moving it out. Used by the checkpoint
     /// flush path so the data stays resident (then the memtable is marked
     /// `Archived`), in contrast to `take_batch()` which empties the memtable.
@@ -443,7 +452,7 @@ impl MemTable {
     /// Replace a live memtable while the caller holds the table mutation lock.
     /// Returns `false` if a concurrent flush has already moved the memtable out
     /// of the pending state.
-    pub fn replace_pending_batch(&self, batch: RecordBatch) -> bool {
+    pub fn replace_pending_batch(&self, batch: Arc<RecordBatch>) -> bool {
         if self.state() != MemTableState::Pending {
             return false;
         }
@@ -455,7 +464,9 @@ impl MemTable {
         if self.state() != MemTableState::Pending {
             return false;
         }
-        *guard = Some(Arc::new(batch));
+        // Store the caller's Arc directly: undo backups and updated batches
+        // arrive pre-shared, so the swap costs no deep copy.
+        *guard = Some(batch);
         self.row_count.store(rows, Ordering::Release);
         self.content_version.fetch_add(1, Ordering::Release);
         true
@@ -917,7 +928,7 @@ impl MemTableManager {
             if mt.db() == db && mt.table() == table {
                 cleared += mt.row_count();
                 mt.set_state(MemTableState::Flushed);
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 false
             } else {
                 true
@@ -935,7 +946,7 @@ impl MemTableManager {
             if mt.db() == db && mt.table() == table && mt.partition_key() == partition_key {
                 cleared += mt.row_count();
                 mt.set_state(MemTableState::Flushed);
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 false
             } else {
                 true

@@ -1,8 +1,10 @@
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::segment_manager::SegmentManager;
+use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::engine::{Engine, ExecResult};
@@ -60,19 +62,22 @@ pub fn exec_update(
 
     let updated_count = mgr.with_table_mutation_lock(db, table, || {
         let mut updated_count = 0u64;
-        let mut memtable_updates = Vec::new();
+        let mut memtable_updates: Vec<(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Arc<RecordBatch>,
+        )> = Vec::new();
         for memtable in engine
             .memtable_manager()
             .get_visible_to(db, table, reader_txn_id)
         {
-            let Some(batch) = memtable.read_snapshot() else {
+            let Some(batch) = memtable.read_snapshot_arc() else {
                 continue;
             };
             let (new_batch, affected) =
                 update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
-            if affected > 0 {
+            if let Some(new_batch) = new_batch {
                 updated_count += affected;
-                memtable_updates.push((memtable, new_batch));
+                memtable_updates.push((memtable, Arc::new(new_batch)));
             }
         }
 
@@ -95,7 +100,7 @@ pub fn exec_update(
         } else {
             Vec::new()
         };
-        let mut rewritten_segments = Vec::new();
+        let mut rewritten_segments: Vec<(std::path::PathBuf, Vec<Arc<RecordBatch>>)> = Vec::new();
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
@@ -128,37 +133,43 @@ pub fn exec_update(
 
                 segment_updated = true;
                 let batch = reader.read_row_group(rg_idx)?;
-                let mut new_batch = RecordBatch::new(batch.schema.clone());
-                for (row_idx, matches) in mask.into_iter().enumerate() {
-                    let absolute_row = reader.row_group_start_row(rg_idx) + row_idx as u64;
+                // Surviving rows keep their order; matched survivors receive
+                // the assigned value in their assigned columns only.
+                let start_row = reader.row_group_start_row(rg_idx);
+                let delete_bitmap = reader.delete_bitmap();
+                let mut kept: Vec<u32> = Vec::new();
+                let mut kept_matched: Vec<bool> = Vec::with_capacity(mask.len());
+                for (row_idx, matches) in mask.iter().enumerate() {
+                    let absolute_row = start_row + row_idx as u64;
                     if crate::storage::segment::delete_bitmap::is_deleted(
-                        reader.delete_bitmap(),
+                        delete_bitmap,
                         absolute_row,
                     ) {
                         continue;
                     }
-                    for col_idx in 0..batch.num_columns() {
-                        let val = if matches {
-                            updated_value_for_column(
-                                assignments,
-                                &batch,
-                                row_idx,
-                                col_idx,
-                                &table_schema,
-                            )?
-                        } else {
-                            batch
-                                .scalar(row_idx, col_idx)
-                                .unwrap_or(ScalarValue::null_for_type(
-                                    table_schema.columns[col_idx].data_type,
-                                ))
-                        };
-                        new_batch.column_mut(col_idx).unwrap().push(&val)?;
-                    }
-                    if matches {
-                        updated_count += 1;
+                    kept.push(row_idx as u32);
+                    kept_matched.push(*matches);
+                }
+                let assigned = precompute_assigned_values(assignments, &table_schema);
+                let mut new_columns = Vec::with_capacity(batch.num_columns());
+                for (col_idx, column) in batch.columns.iter().enumerate() {
+                    match assigned.get(&col_idx) {
+                        None => new_columns.push(column.take(&kept)),
+                        Some(value) => {
+                            let mut out = ColumnArray::empty(column.data_type());
+                            for (kept_idx, &src_row) in kept.iter().enumerate() {
+                                if kept_matched[kept_idx] {
+                                    out.push(value)?;
+                                } else {
+                                    out.push(&column.scalar(src_row as usize))?;
+                                }
+                            }
+                            new_columns.push(out);
+                        }
                     }
                 }
+                let new_batch = RecordBatch::try_new(batch.schema.clone(), new_columns)?;
+                updated_count += kept_matched.iter().filter(|m| **m).count() as u64;
                 row_group_updates.push((rg_idx, Some(new_batch)));
             }
 
@@ -166,7 +177,7 @@ pub fn exec_update(
                 let mut new_batches = Vec::new();
                 for (rg_idx, batch) in row_group_updates {
                     match batch {
-                        Some(batch) => new_batches.push(batch),
+                        Some(batch) => new_batches.push(Arc::new(batch)),
                         None => {
                             let mut batch = reader.read_row_group(rg_idx)?;
                             if !reader.delete_bitmap().is_empty() {
@@ -177,7 +188,7 @@ pub fn exec_update(
                                 )?;
                             }
                             if batch.num_rows() > 0 {
-                                new_batches.push(batch);
+                                new_batches.push(Arc::new(batch));
                             }
                         }
                     }
@@ -191,7 +202,7 @@ pub fn exec_update(
         }
 
         if !table_meta.unique_indexes.is_empty() {
-            let mut validation_batches = Vec::new();
+            let mut validation_batches: Vec<Arc<RecordBatch>> = Vec::new();
             for seg_path in SegmentManager::discover_segments(&table_dir)? {
                 if rewritten_segments
                     .iter()
@@ -210,7 +221,7 @@ pub fn exec_update(
                         )?;
                     }
                     if batch.num_rows() > 0 {
-                        validation_batches.push(batch);
+                        validation_batches.push(Arc::new(batch));
                     }
                 }
             }
@@ -221,8 +232,8 @@ pub fn exec_update(
                 let batch = memtable_updates
                     .iter()
                     .find(|(updated, _)| Arc::ptr_eq(updated, &memtable))
-                    .map(|(_, batch)| batch.clone())
-                    .or_else(|| memtable.read_snapshot());
+                    .map(|(_, batch)| Arc::clone(batch))
+                    .or_else(|| memtable.read_snapshot_arc());
                 if let Some(batch) = batch {
                     if batch.num_rows() > 0 {
                         validation_batches.push(batch);
@@ -350,36 +361,69 @@ fn update_memtable_batch(
     where_clause: &Option<Expr>,
     table_schema: &Schema,
     batch: &RecordBatch,
-) -> Result<(RecordBatch, u64)> {
+) -> Result<(Option<RecordBatch>, u64)> {
     let mask = if let Some(where_expr) = where_clause.as_ref() {
         eval_where_clause_batch(where_expr, batch, table_schema)?
     } else {
         vec![true; batch.num_rows()]
     };
+    // `None` means no row matched, so the caller skips the memtable without
+    // paying for any copy.
     if !mask.iter().any(|matches| *matches) {
-        return Ok((batch.clone(), 0));
+        return Ok((None, 0));
     }
 
-    let mut affected = 0u64;
-    let mut new_batch = RecordBatch::new(batch.schema.clone());
-    for (row_idx, matches) in mask.into_iter().enumerate() {
-        for col_idx in 0..batch.num_columns() {
-            let value = if matches {
-                updated_value_for_column(assignments, batch, row_idx, col_idx, table_schema)?
-            } else {
-                batch
-                    .scalar(row_idx, col_idx)
+    let assigned = precompute_assigned_values(assignments, table_schema);
+    let all_rows: Vec<u32> = (0..batch.num_rows() as u32).collect();
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+    for (col_idx, column) in batch.columns.iter().enumerate() {
+        match assigned.get(&col_idx) {
+            // Untouched columns: one bulk gather instead of a per-cell
+            // ScalarValue round-trip.
+            None => new_columns.push(column.take(&all_rows)),
+            Some(value) => {
+                let mut out = ColumnArray::empty(column.data_type());
+                for (row_idx, matches) in mask.iter().enumerate() {
+                    if *matches {
+                        out.push(value)?;
+                    } else {
+                        out.push(&column.scalar(row_idx))?;
+                    }
+                }
+                new_columns.push(out);
+            }
+        }
+    }
+    let affected = mask.iter().filter(|matches| **matches).count() as u64;
+    Ok((
+        Some(RecordBatch::try_new(batch.schema.clone(), new_columns)?),
+        affected,
+    ))
+}
+
+/// Assignment expressions are constant per statement (they are evaluated
+/// without row context), so resolve every assigned column index and value
+/// once instead of per row.
+fn precompute_assigned_values(
+    assignments: &[Assignment],
+    table_schema: &Schema,
+) -> HashMap<usize, ScalarValue> {
+    let mut assigned = HashMap::new();
+    for assign in assignments {
+        if let Some(col_idx) = table_schema
+            .columns
+            .iter()
+            .position(|column| column.name == assign.column)
+        {
+            assigned.entry(col_idx).or_insert_with(|| {
+                eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type)
                     .unwrap_or(ScalarValue::null_for_type(
                         table_schema.columns[col_idx].data_type,
                     ))
-            };
-            new_batch.column_mut(col_idx).unwrap().push(&value)?;
-        }
-        if matches {
-            affected += 1;
+            });
         }
     }
-    Ok((new_batch, affected))
+    assigned
 }
 
 fn build_update_mask(
@@ -426,22 +470,4 @@ fn segment_may_match(
         return predicate.matches_row_group(segment_zone_maps);
     }
     (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
-}
-
-fn updated_value_for_column(
-    assignments: &[Assignment],
-    batch: &RecordBatch,
-    row_idx: usize,
-    col_idx: usize,
-    table_schema: &Schema,
-) -> Result<ScalarValue> {
-    let col_name = &table_schema.columns[col_idx].name;
-    if let Some(assign) = assignments.iter().find(|a| &a.column == col_name) {
-        return eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type);
-    }
-    Ok(batch
-        .scalar(row_idx, col_idx)
-        .unwrap_or(ScalarValue::null_for_type(
-            table_schema.columns[col_idx].data_type,
-        )))
 }

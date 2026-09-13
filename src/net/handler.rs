@@ -339,7 +339,12 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
-                let msg = build_binary_query_result(&schema, &batches);
+                let timings = ServerTimings {
+                    total: server_start.elapsed(),
+                    execute: execute_elapsed,
+                    encode: encode_start.elapsed(),
+                };
+                let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
                 let msg = match self.validate_query_response(msg) {
                     Ok(msg) => msg,
                     Err(error) => return Ok(vec![build_error(&error.to_string())]),
@@ -352,12 +357,7 @@ impl Handler {
                     "ok",
                     server_start.elapsed(),
                 );
-                let timings = ServerTimings {
-                    total: server_start.elapsed(),
-                    execute: execute_elapsed,
-                    encode: encode_start.elapsed(),
-                };
-                Ok(vec![append_server_timings(msg, timings)])
+                Ok(vec![msg])
             }
             Err(e) => {
                 if !is_insert {
@@ -681,17 +681,17 @@ impl Handler {
             }
             Ok(ExecResult::Query { schema, batches }) => {
                 let encode_start = Instant::now();
-                let msg = build_binary_query_result(&schema, &batches);
-                let msg = match self.validate_query_response(msg) {
-                    Ok(msg) => msg,
-                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
-                };
                 let timings = ServerTimings {
                     total: server_start.elapsed(),
                     execute: execute_elapsed,
                     encode: encode_start.elapsed(),
                 };
-                Ok(vec![append_server_timings(msg, timings)])
+                let msg = build_binary_query_result_with_timings(&schema, &batches, timings);
+                let msg = match self.validate_query_response(msg) {
+                    Ok(msg) => msg,
+                    Err(error) => return Ok(vec![build_error(&error.to_string())]),
+                };
+                Ok(vec![msg])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
         }
@@ -1383,11 +1383,16 @@ fn append_duration_micros(buf: &mut Vec<u8>, elapsed: Duration) {
     buf.extend_from_slice(&(elapsed.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
 }
 
-fn build_binary_query_result(
+/// Build the binary result message with the server-timing trailer
+/// appended before the payload is frozen, avoiding a second copy of the
+/// whole result payload.
+fn build_binary_query_result_with_timings(
     schema: &crate::types::batch::Schema,
     batches: &[crate::types::batch::RecordBatch],
+    timings: ServerTimings,
 ) -> Message {
-    let encoded = crate::protocol::result::encode_binary_result_batches(schema, batches);
+    let mut encoded = crate::protocol::result::encode_binary_result_batches(schema, batches);
+    append_server_timing_trailer(&mut encoded, timings);
     Message::new(MSG_TYPE_BINARY_QUERY_RESULT, Bytes::from(encoded))
 }
 

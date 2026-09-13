@@ -1864,38 +1864,29 @@ pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
 
 /// Apply DISTINCT to a RecordBatch, removing duplicate rows.
 fn apply_distinct(batch: RecordBatch) -> RecordBatch {
-    let mut seen: Vec<String> = Vec::new();
-    let mut mask = Vec::new();
-
+    // Typed byte keys from column storage (no per-cell ScalarValue or String
+    // keys) and a hash set instead of the former O(n^2) linear scan.
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut key_buf = Vec::new();
+    let mut mask = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        let key: String = (0..batch.num_columns())
-            .map(|c| {
-                batch
-                    .scalar(row, c)
-                    .unwrap_or(ScalarValue::Int64(None))
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("|");
-        if !seen.contains(&key) {
-            seen.push(key);
-            mask.push(true);
-        } else {
-            mask.push(false);
+        key_buf.clear();
+        for column in &batch.columns {
+            column.encode_key_at(row, &mut key_buf);
         }
+        mask.push(seen.insert(key_buf.clone()));
     }
 
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for col_idx in 0..batch.num_columns() {
-        let col = batch.column(col_idx).unwrap();
-        let mut new_col = ColumnArray::empty(col.data_type());
-        for (i, &keep) in mask.iter().enumerate() {
-            if keep {
-                new_col.push(&col.scalar(i)).unwrap();
-            }
-        }
-        columns.push(new_col);
-    }
+    let kept_rows: Vec<u32> = mask
+        .iter()
+        .enumerate()
+        .filter_map(|(row, &keep)| keep.then_some(row as u32))
+        .collect();
+    let columns = batch
+        .columns
+        .iter()
+        .map(|column| column.take(&kept_rows))
+        .collect();
     RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
 }
 

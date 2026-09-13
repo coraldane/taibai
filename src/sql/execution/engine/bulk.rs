@@ -87,7 +87,7 @@ fn prepare_direct_bulk_constraint_entries(
 
     let mut entries_by_index = Vec::with_capacity(unique_constraints.len());
     for (index_name, indices) in unique_constraints {
-        let mut keys = Vec::with_capacity(req.row_count);
+
         let mut seen = HashSet::with_capacity(req.row_count);
         let mut entries = Vec::with_capacity(req.row_count);
         for row_idx in 0..req.row_count {
@@ -107,13 +107,15 @@ fn prepare_direct_bulk_constraint_entries(
             if has_null {
                 continue;
             }
-            if !seen.insert(key.clone()) {
+            // Probe first and move on success so each row pays one key
+            // clone instead of two.
+            if seen.contains(&key) {
                 return Err(TaibaiError::Sql(format!(
                     "duplicate unique key '{}' for table '{}'",
                     index_name, table
                 )));
             }
-            keys.push(key.clone());
+            seen.insert(key.clone());
             entries.push(UniqueIndexEntry {
                 key,
                 location: UniqueRowLocation {
@@ -122,6 +124,9 @@ fn prepare_direct_bulk_constraint_entries(
                 },
             });
         }
+        // `seen` holds exactly the deduplicated keys; move them out instead
+        // of re-cloning per row.
+        let keys: Vec<Vec<crate::types::scalar::ScalarValue>> = seen.into_iter().collect();
         match engine
             .index_manager()
             .unique_keys_exist(db, table, &index_name, &keys)?

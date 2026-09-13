@@ -31,7 +31,7 @@ pub(crate) struct ReplaceDeleteUndo {
     deleted_locations: Vec<UniqueRowLocation>,
     /// Original batches of memtables whose conflicting rows were filtered out,
     /// restored verbatim on rollback.
-    memtable_backups: Vec<(Arc<MemTable>, RecordBatch)>,
+    memtable_backups: Vec<(Arc<MemTable>, Arc<RecordBatch>)>,
 }
 
 impl ReplaceDeleteUndo {
@@ -54,8 +54,8 @@ impl ReplaceDeleteUndo {
 /// of invalidating it.
 pub(crate) struct ReplaceMemtableConflictPlan {
     memtable: Arc<MemTable>,
-    original: RecordBatch,
-    filtered: RecordBatch,
+    original: Arc<RecordBatch>,
+    filtered: Arc<RecordBatch>,
     removed_positions: Vec<u32>,
 }
 
@@ -88,26 +88,27 @@ pub(crate) fn plan_replace_memtable_conflicts(
         if memtable.is_transactional() || memtable.visibility() != TxnVisibility::Committed {
             continue;
         }
-        let planned = memtable
-            .read_with(|batch| {
-                if batch.num_rows() == 0 {
-                    return None;
-                }
-                let positions = engine
-                    .memtable_manager()
-                    .replace_key_conflicts(&memtable, key_sets, batch);
-                if positions.is_empty() {
-                    return None;
-                }
-                let removed = positions.len();
-                let mut keep = vec![true; batch.num_rows()];
-                for &row_idx in &positions {
-                    keep[row_idx as usize] = false;
-                }
-                let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
-                Some((batch.clone(), filtered, positions))
-            })
-            .flatten();
+        // Share the memtable's own Arc as the undo backup instead of
+        // deep-copying the batch; the table mutation lock is held, so the
+        // resident batch cannot change between the read and the swap.
+        let planned = memtable.read_snapshot_arc().and_then(|batch| {
+            if batch.num_rows() == 0 {
+                return None;
+            }
+            let positions = engine
+                .memtable_manager()
+                .replace_key_conflicts(&memtable, key_sets, &batch);
+            if positions.is_empty() {
+                return None;
+            }
+            let removed = positions.len();
+            let mut keep = vec![true; batch.num_rows()];
+            for &row_idx in &positions {
+                keep[row_idx as usize] = false;
+            }
+            let filtered = filter_batch_keep(&batch, &keep, batch.num_rows() - removed).ok()?;
+            Some((batch, Arc::new(filtered), positions))
+        });
         if let Some((original, filtered, removed_positions)) = planned {
             plans.push(ReplaceMemtableConflictPlan {
                 memtable,
@@ -142,29 +143,27 @@ fn plan_delete_memtable_rows(
                 continue;
             }
         }
-        let planned = memtable
-            .read_with(|batch| {
-                if batch.num_rows() == 0 {
-                    return None;
-                }
-                let mask = match where_clause.as_ref() {
-                    Some(expr) => eval_where_clause_batch(expr, batch, table_schema).ok()?,
-                    None => vec![true; batch.num_rows()],
-                };
-                let removed = mask.iter().filter(|matches| **matches).count();
-                if removed == 0 {
-                    return None;
-                }
-                let keep = mask.iter().map(|matches| !matches).collect::<Vec<_>>();
-                let filtered = filter_batch_keep(batch, &keep, batch.num_rows() - removed).ok()?;
-                let removed_positions = mask
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
-                    .collect::<Vec<_>>();
-                Some((batch.clone(), filtered, removed_positions))
-            })
-            .flatten();
+        let planned = memtable.read_snapshot_arc().and_then(|batch| {
+            if batch.num_rows() == 0 {
+                return None;
+            }
+            let mask = match where_clause.as_ref() {
+                Some(expr) => eval_where_clause_batch(expr, &batch, table_schema).ok()?,
+                None => vec![true; batch.num_rows()],
+            };
+            let removed = mask.iter().filter(|matches| **matches).count();
+            if removed == 0 {
+                return None;
+            }
+            let keep = mask.iter().map(|matches| !matches).collect::<Vec<_>>();
+            let filtered = filter_batch_keep(&batch, &keep, batch.num_rows() - removed).ok()?;
+            let removed_positions = mask
+                .iter()
+                .enumerate()
+                .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
+                .collect::<Vec<_>>();
+            Some((batch, Arc::new(filtered), removed_positions))
+        });
         if let Some((original, filtered, removed_positions)) = planned {
             plans.push(ReplaceMemtableConflictPlan {
                 memtable,

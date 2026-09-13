@@ -493,7 +493,9 @@ impl BatchWriter {
         {
             return Ok(None);
         }
-        let Some(batch) = memtable.read_snapshot() else {
+        // Share the memtable's batch instead of deep-copying it; the tail
+        // append only reads through the Arc and drops it after submit.
+        let Some(batch) = memtable.read_snapshot_arc() else {
             return Ok(None);
         };
         let prepared = PreparedTailAppend::new(&batch);
@@ -703,7 +705,8 @@ impl BatchWriter {
             return Ok(());
         }
         let table_dir = self.segment_mgr.table_dir(memtable.db(), memtable.table());
-        let Some(batch) = memtable.read_snapshot() else {
+        // Arc-share instead of copying; persist only reads the batch.
+        let Some(batch) = memtable.read_snapshot_arc() else {
             return Ok(());
         };
         crate::storage::core::durable_tail::persist(
@@ -1081,7 +1084,9 @@ impl BatchWriter {
             return Ok(());
         }
         mt.set_state(MemTableState::Flushing);
-        let batch = match mt.read_snapshot() {
+        // The table mutation lock is held, so nothing can append while we
+        // flush; share the resident batch instead of copying it.
+        let batch = match mt.read_snapshot_arc() {
             Some(b) if b.num_rows() > 0 => b,
             _ => {
                 mt.set_state(MemTableState::Flushed);
@@ -1094,7 +1099,7 @@ impl BatchWriter {
         let txn_id = mt.txn_id();
         let table_dir = segment_mgr.table_dir(&db, &table);
         if !table_dir.is_dir() {
-            let _ = mt.take_batch();
+            mt.clear_batch();
             mt.set_state(MemTableState::Flushed);
             return Ok(());
         }
@@ -1117,7 +1122,7 @@ impl BatchWriter {
             txn_id,
             || mt.state() == MemTableState::Flushing,
             || {
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 mt.set_state(MemTableState::Flushed);
             },
         );
@@ -1131,7 +1136,7 @@ impl BatchWriter {
             }
         };
         if !wrote {
-            let _ = mt.take_batch();
+            mt.clear_batch();
             mt.set_state(MemTableState::Flushed);
             return Ok(());
         }
@@ -1239,11 +1244,15 @@ impl BatchWriter {
         }
 
         // Lock the group in Flushing state and snapshot every batch.
-        let mut locked: Vec<(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)> =
-            Vec::with_capacity(pending.len());
+        let mut locked: Vec<(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Arc<RecordBatch>,
+        )> = Vec::with_capacity(pending.len());
         for mt in pending {
             mt.set_state(MemTableState::Flushing);
-            match mt.read_snapshot() {
+            // The table mutation lock is held for the whole group flush, so
+            // the resident batches cannot change under us; share them.
+            match mt.read_snapshot_arc() {
                 Some(b) if b.num_rows() > 0 => locked.push((mt.clone(), b)),
                 _ => mt.set_state(MemTableState::Flushed),
             }
@@ -1254,7 +1263,7 @@ impl BatchWriter {
         if !table_dir.is_dir() {
             // Table was dropped while the group waited on the table lock.
             for (mt, _) in &locked {
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 mt.set_state(MemTableState::Flushed);
             }
             return Ok(());
@@ -1287,7 +1296,7 @@ impl BatchWriter {
             },
             || {
                 for (mt, _) in &locked {
-                    let _ = mt.take_batch();
+                    mt.clear_batch();
                     mt.set_state(MemTableState::Flushed);
                 }
             },
@@ -1306,7 +1315,7 @@ impl BatchWriter {
         if !wrote {
             // A concurrent winner already carried these rows; drop the copies.
             for (mt, _) in &locked {
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 mt.set_state(MemTableState::Flushed);
             }
             return Ok(());
@@ -1325,13 +1334,21 @@ impl BatchWriter {
     }
 
     fn concat_flush_group_batches(
-        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
-    ) -> Result<RecordBatch> {
+        locked: &[(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Arc<RecordBatch>,
+        )],
+    ) -> Result<Arc<RecordBatch>> {
         let mut iter = locked.iter();
         let (_, first) = iter
             .next()
             .ok_or_else(|| TaibaiError::Storage("flush group is empty".into()))?;
-        let mut merged = first.clone();
+        // Single memtable in the group: flush its shared batch as-is instead
+        // of copying it into a merged buffer.
+        if iter.len() == 0 {
+            return Ok(Arc::clone(first));
+        }
+        let mut merged = (**first).clone();
         for (_, batch) in iter {
             for col_idx in 0..batch.num_columns() {
                 let source = batch.column(col_idx).ok_or_else(|| {
@@ -1343,7 +1360,7 @@ impl BatchWriter {
                 destination.extend(source)?;
             }
         }
-        Ok(merged)
+        Ok(Arc::new(merged))
     }
 
     /// Durable (tailed) group flush: one flush intent per tail with cumulative
@@ -1354,7 +1371,10 @@ impl BatchWriter {
     #[allow(clippy::too_many_arguments)]
     fn flush_durable_memtable_group_under_table_lock(
         segment_mgr: &Arc<SegmentManager>,
-        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
+        locked: &[(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Arc<RecordBatch>,
+        )],
         merged: &RecordBatch,
         db: &str,
         table: &str,
@@ -1419,7 +1439,7 @@ impl BatchWriter {
             },
             || {
                 for (mt, _) in locked {
-                    let _ = mt.take_batch();
+                    mt.clear_batch();
                     mt.set_state(MemTableState::Flushed);
                 }
             },
@@ -1440,7 +1460,7 @@ impl BatchWriter {
         };
         if !wrote {
             for (mt, _) in locked {
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 mt.set_state(MemTableState::Flushed);
             }
             for intent in intents {
@@ -1476,7 +1496,10 @@ impl BatchWriter {
     #[allow(clippy::too_many_arguments)]
     fn flush_durable_memtable_group_as_new_segment(
         segment_mgr: &Arc<SegmentManager>,
-        locked: &[(Arc<crate::storage::core::memtable::MemTable>, RecordBatch)],
+        locked: &[(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Arc<RecordBatch>,
+        )],
         merged: &RecordBatch,
         db: &str,
         table: &str,
@@ -1549,7 +1572,7 @@ impl BatchWriter {
             segment_mgr.open_reader(&final_path)?;
             crate::storage::segment_manager::SegmentManager::sleep_flush_transition_delay();
             for (mt, _) in locked {
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 mt.set_state(MemTableState::Flushed);
             }
             Ok::<(), TaibaiError>(())
@@ -1636,7 +1659,7 @@ impl BatchWriter {
             0,
             || mt.state() == MemTableState::Flushing,
             || {
-                let _ = mt.take_batch();
+                mt.clear_batch();
                 mt.set_state(MemTableState::Flushed);
             },
         );
@@ -1651,7 +1674,7 @@ impl BatchWriter {
             }
         };
         if !wrote {
-            let _ = mt.take_batch();
+            mt.clear_batch();
             mt.set_state(MemTableState::Flushed);
             let _ = crate::storage::core::durable_tail::cancel_flush(intent);
             return Ok(());
@@ -1737,7 +1760,7 @@ impl BatchWriter {
             let _ = remove_sidecar_meta(&tmp_path);
             segment_mgr.open_reader(&final_path)?;
             crate::storage::segment_manager::SegmentManager::sleep_flush_transition_delay();
-            let _ = mt.take_batch();
+            mt.clear_batch();
             mt.set_state(MemTableState::Flushed);
             Ok::<(), TaibaiError>(())
         });

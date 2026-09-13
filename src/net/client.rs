@@ -844,12 +844,101 @@ fn attach_client_timings(result: &mut QueryResult, timings: ClientTimings) {
     }
 }
 
+/// Decode a fixed-width column in one pass: build the typed vector directly
+/// from the wire bytes instead of materializing a `ScalarValue` per row and
+/// pushing it (which copied every value twice).
+fn decode_fixed_width_column(
+    data_type: DataType,
+    data: &[u8],
+    nulls: &[u8],
+    row_count: usize,
+    width: usize,
+) -> Result<ColumnArray> {
+    if data.len() < row_count * width {
+        return Err(TaibaiError::Protocol(
+            "binary result column data truncated".into(),
+        ));
+    }
+    let mut bitmap = crate::types::bitmap::NullBitmap::new_valid(row_count);
+    for row in 0..row_count {
+        if nulls.get(row).copied().unwrap_or(0) != 0 {
+            bitmap.set_null(row);
+        }
+    }
+    macro_rules! decode_le {
+        ($variant:ident, $t:ty) => {{
+            let mut new_data = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                let off = row * width;
+                let mut bytes = [0u8; std::mem::size_of::<$t>()];
+                bytes.copy_from_slice(&data[off..off + width]);
+                new_data.push(<$t>::from_le_bytes(bytes));
+            }
+            return Ok(ColumnArray::$variant {
+                data: new_data,
+                bitmap,
+            });
+        }};
+    }
+    match data_type {
+        DataType::Bool => {
+            let mut new_data = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                new_data.push(u8::from(data[row * width] != 0));
+            }
+            Ok(ColumnArray::Bool {
+                data: new_data,
+                bitmap,
+            })
+        }
+        DataType::Int8 => {
+            let mut new_data = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                new_data.push(data[row * width] as i8);
+            }
+            Ok(ColumnArray::Int8 {
+                data: new_data,
+                bitmap,
+            })
+        }
+        DataType::UInt8 => {
+            let mut new_data = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                new_data.push(data[row * width]);
+            }
+            Ok(ColumnArray::UInt8 {
+                data: new_data,
+                bitmap,
+            })
+        }
+        DataType::Int16 => decode_le!(Int16, i16),
+        DataType::Int32 => decode_le!(Int32, i32),
+        DataType::Int64 => decode_le!(Int64, i64),
+        DataType::UInt16 => decode_le!(UInt16, u16),
+        DataType::UInt32 => decode_le!(UInt32, u32),
+        DataType::UInt64 => decode_le!(UInt64, u64),
+        DataType::Float32 => decode_le!(Float32, f32),
+        DataType::Float64 => decode_le!(Float64, f64),
+        DataType::Decimal => decode_le!(Decimal, i64),
+        DataType::Date => decode_le!(Date, i32),
+        DataType::Time => decode_le!(Time, i64),
+        DataType::Timestamp => decode_le!(Timestamp, i64),
+        DataType::Interval => decode_le!(Interval, i64),
+        _ => unreachable!("variable-width types are handled by the caller"),
+    }
+}
+
 fn decode_binary_column(
     data_type: DataType,
     data: &[u8],
     nulls: &[u8],
     row_count: usize,
 ) -> Result<ColumnArray> {
+    // Fixed-width columns decode in one bulk pass; only variable-width
+    // columns keep the per-row ScalarValue round-trip.
+    if let Some(width) = data_type.fixed_size() {
+        return decode_fixed_width_column(data_type, data, nulls, row_count, width);
+    }
     let mut col = ColumnArray::empty(data_type);
     let mut offset = 0usize;
     for row in 0..row_count {
