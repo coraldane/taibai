@@ -550,6 +550,20 @@ fn exec_materialized_insert_batch(
             Err(e) => return Err(e),
         }
     }
+    // Capture the change-notification payload before the batch moves into
+    // the writer. Only immediately visible writes are published here:
+    // transactional deltas are published at COMMIT by the batch writer, and
+    // deferred bulk/relaxed writes become visible at flush time. The clone is
+    // skipped entirely while no client is subscribed.
+    let pubsub_batch = if txn_id == 0
+        && !bulk_import_mode
+        && !relaxed_direct_insert
+        && engine.pubsub().has_subscribers()
+    {
+        Some(batch.clone())
+    } else {
+        None
+    };
     let write_start = Instant::now();
     if bulk_import_mode || relaxed_direct_insert {
         engine.exec_bulk_insert_partitioned(db, table, table_meta, batch, relaxed_direct_insert)?;
@@ -564,6 +578,9 @@ fn exec_materialized_insert_batch(
             txn_id,
             table_lock_held,
         )?;
+    }
+    if let Some(batch) = pubsub_batch {
+        engine.pubsub().publish(db, table, batch);
     }
     log_insert_profile("write", row_count as usize, write_start.elapsed());
 

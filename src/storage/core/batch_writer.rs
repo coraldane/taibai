@@ -79,6 +79,9 @@ pub struct BatchWriter {
     flush_handle: Option<std::thread::JoinHandle<()>>,
     tail_committer: Arc<TailCommitter>,
     write_epoch: Arc<AtomicU64>,
+    /// Change-notification hub; `None` when pubsub is disabled. Publishing
+    /// from commit is a lock-free `try_send` guarded by an atomic count.
+    pubsub: Option<Arc<crate::pubsub::PubSubHub>>,
 }
 
 type LockedWriteOutcome = (
@@ -99,7 +102,11 @@ pub(crate) struct PendingTailCommit {
 }
 
 impl BatchWriter {
-    pub fn new(config: BatchWriterConfig, segment_mgr: Arc<SegmentManager>) -> Self {
+    pub fn new(
+        config: BatchWriterConfig,
+        segment_mgr: Arc<SegmentManager>,
+        pubsub: Option<Arc<crate::pubsub::PubSubHub>>,
+    ) -> Self {
         let memtable_mgr = Arc::new(MemTableManager::new(
             config.max_rows_per_memtable,
             config.flush_interval_secs,
@@ -229,6 +236,7 @@ impl BatchWriter {
             flush_handle: Some(flush_handle),
             tail_committer,
             write_epoch,
+            pubsub,
         }
     }
 
@@ -436,6 +444,21 @@ impl BatchWriter {
         table_lock_held: bool,
     ) -> Result<Vec<PendingTailCommit>> {
         let committed_mts = self.memtable_mgr.commit_txn(txn_id);
+        // Publish committed transactional deltas after the visibility flip in
+        // `commit_txn`. Sharing the memtable's batch via `Arc` keeps this off
+        // the copy path; the fan-out thread does the encoding work.
+        if let Some(pubsub) = &self.pubsub {
+            if pubsub.has_subscribers() {
+                for memtable in &committed_mts {
+                    if memtable.row_count() == 0 {
+                        continue;
+                    }
+                    if let Some(snapshot) = memtable.read_snapshot_arc() {
+                        pubsub.publish_shared(memtable.db(), memtable.table(), snapshot);
+                    }
+                }
+            }
+        }
         let mut pending = Vec::new();
         for memtable in &committed_mts {
             if table_lock_held {

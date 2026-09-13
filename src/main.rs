@@ -193,6 +193,10 @@ where
         tail_commit_warn_ms: config.storage.tail_commit_warn_ms,
     });
 
+    let mut pubsub_settings = config.pubsub.clone();
+    if !config.compression.enabled {
+        pubsub_settings.compress_threshold = usize::MAX;
+    }
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
@@ -203,6 +207,7 @@ where
             .hot_store_memory_limit_mb
             .saturating_mul(1024 * 1024),
         config.storage.tail_async_fsync,
+        pubsub_settings,
     ) {
         Ok(e) => e,
         Err(e) => {

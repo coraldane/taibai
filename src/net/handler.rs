@@ -8,9 +8,11 @@ use crate::common::error::{Result, TaibaiError};
 use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;
+use crate::pubsub::ConnHandle;
 use crate::sql::execution::{Engine, ExecResult};
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
+use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
 use crate::types::scalar::ScalarValue;
 
 pub struct Handler {
@@ -18,6 +20,11 @@ pub struct Handler {
     config: Arc<ServerConfig>,
     engine: Arc<Engine>,
     stream_sender: Option<tokio::sync::mpsc::Sender<Message>>,
+    /// Connection push queue used by the pubsub fan-out thread. Set once by
+    /// the connection task after the handler is created.
+    push_channel: Option<tokio::sync::mpsc::Sender<Message>>,
+    /// Delivery handle grouping every subscription made on this connection.
+    pubsub_conn: Option<Arc<ConnHandle>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,10 +41,22 @@ impl Handler {
             config,
             engine,
             stream_sender: None,
+            push_channel: None,
+            pubsub_conn: None,
         }
     }
 
+    /// Install the per-connection push queue. The server creates it before
+    /// the first request is processed; subscriptions made later deliver
+    /// through it.
+    pub fn set_push_channel(&mut self, push_tx: tokio::sync::mpsc::Sender<Message>) {
+        self.push_channel = Some(push_tx);
+    }
+
     pub fn flush_on_disconnect(&mut self) {
+        if let Some(conn) = self.pubsub_conn.take() {
+            self.engine.pubsub().drop_connection(&conn);
+        }
         if let Some(ref mut session) = self.session {
             let mut remaining_bulk_sessions = self.engine.bulk_mode_session_count();
             if session.bulk_import_mode {
@@ -97,6 +116,9 @@ impl Handler {
             MSG_TYPE_CURSOR => self.handle_cursor_open(&msg.payload),
             MSG_TYPE_CURSOR_FETCH => self.handle_cursor_fetch(&msg.payload),
             MSG_TYPE_CURSOR_CLOSE => self.handle_cursor_close(&msg.payload),
+
+            MSG_TYPE_SUBSCRIBE => self.handle_subscribe(&msg.payload),
+            MSG_TYPE_UNSUBSCRIBE => self.handle_unsubscribe(&msg.payload),
 
             MSG_TYPE_BINARY_QUERY_RESULT => {
                 Ok(vec![build_error("unexpected binary result message")])
@@ -1101,6 +1123,147 @@ impl Handler {
                 Ok(vec![build_ok(rows_flushed)])
             }
             Err(e) => Ok(vec![build_error(&e.to_string())]),
+        }
+    }
+
+    /// MSG_TYPE_SUBSCRIBE: payload is one length-prefixed topic string, either
+    /// `table` (session database), `database.table`, `database.*` or `>`.
+    /// Replies MSG_TYPE_OK carrying the subscription id, or an error.
+    fn handle_subscribe(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let (topic, _) = match read_len_prefixed_string(payload) {
+            Ok(v) => v,
+            Err(_) => return Ok(vec![build_error("invalid subscribe message")]),
+        };
+        let session = match &mut self.session {
+            Some(s) => s,
+            None => return Ok(vec![build_error("not logged in")]),
+        };
+        session.touch();
+
+        let Some(push_tx) = self.push_channel.clone() else {
+            return Ok(vec![build_error(
+                "subscriptions are not available on this connection",
+            )]);
+        };
+
+        // Resolve the topic against the session database, validate that the
+        // referenced objects exist, and require SUBSCRIBE (or admin) rights.
+        // `>` subscribes to every database; `db`-scoped wildcards require a
+        // database-level grant, exact tables a table-level grant.
+        let permission_object = if topic == ">" {
+            (PermissionObjectType::Global, "*".to_string())
+        } else if topic == "*" || topic.is_empty() {
+            return Ok(vec![build_error(&format!(
+                "invalid subscription topic '{topic}': expected 'table', 'database.table', 'database.*' or '>'"
+            ))]);
+        } else {
+            match topic.split_once('.') {
+                Some((db, rest)) if rest.contains('*') || rest == ">" => {
+                    (PermissionObjectType::Database, db.to_string())
+                }
+                Some((db, table)) => (PermissionObjectType::Table, format!("{db}.{table}")),
+                None => (
+                    PermissionObjectType::Table,
+                    format!("{}.{}", session.database, topic),
+                ),
+            }
+        };
+        let (topic_db, topic_table) = if topic == ">" {
+            (None, None)
+        } else {
+            match topic.split_once('.') {
+                Some((db, table)) => (Some(db), Some(table)),
+                None => (Some(session.database.as_str()), Some(topic)),
+            }
+        };
+        if let Some(db) = topic_db {
+            if !self.engine.database_exists(db) {
+                return Ok(vec![build_error(&format!(
+                    "database '{db}' does not exist"
+                ))]);
+            }
+        }
+        if let (Some(db), Some(table)) = (topic_db, topic_table) {
+            if !table.contains('*')
+                && table != ">"
+                && self.engine.get_table_meta(db, table).is_none()
+            {
+                return Ok(vec![build_error(&format!(
+                    "table '{db}.{table}' does not exist"
+                ))]);
+            }
+        }
+        if !self.engine.auth_manager().check_permission(
+            &session.username,
+            PermissionType::Subscribe,
+            permission_object.0.clone(),
+            &permission_object.1,
+        ) {
+            tracing::warn!(
+                username = %session.username,
+                topic,
+                "subscribe rejected: missing SUBSCRIBE permission"
+            );
+            return Ok(vec![build_error(&format!(
+                "access denied for user '{}' to SUBSCRIBE on '{}'",
+                session.username, topic
+            ))]);
+        }
+
+        let conn = match &self.pubsub_conn {
+            Some(conn) => Arc::clone(conn),
+            None => {
+                let conn = self.engine.pubsub().create_conn(push_tx);
+                self.pubsub_conn = Some(Arc::clone(&conn));
+                conn
+            }
+        };
+        // Register the fully qualified pattern: hub subjects are always
+        // `database.table`, so a bare table name must be expanded before
+        // matching.
+        let registered_topic = if topic.contains('.') || topic == ">" {
+            topic.to_string()
+        } else {
+            format!("{}.{}", session.database, topic)
+        };
+        match self.engine.pubsub().subscribe(&conn, &registered_topic) {
+            Ok(sub_id) => {
+                tracing::info!(
+                    username = %session.username,
+                    topic = %registered_topic,
+                    sub_id,
+                    conn_id = conn.conn_id(),
+                    "subscription registered"
+                );
+                Ok(vec![build_ok(sub_id)])
+            }
+            Err(reason) => Ok(vec![build_error(&reason)]),
+        }
+    }
+
+    /// MSG_TYPE_UNSUBSCRIBE: payload is a u64 subscription id.
+    fn handle_unsubscribe(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        if payload.len() < 8 {
+            return Ok(vec![build_error("invalid unsubscribe message")]);
+        }
+        let session = match &mut self.session {
+            Some(s) => s,
+            None => return Ok(vec![build_error("not logged in")]),
+        };
+        session.touch();
+        let sub_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+        let Some(conn) = &self.pubsub_conn else {
+            return Ok(vec![build_error(&format!(
+                "subscription {sub_id} not found"
+            ))]);
+        };
+        if self.engine.pubsub().unsubscribe(conn, sub_id) {
+            tracing::info!(username = %session.username, sub_id, "subscription removed");
+            Ok(vec![build_ok(0)])
+        } else {
+            Ok(vec![build_error(&format!(
+                "subscription {sub_id} not found"
+            ))])
         }
     }
 }

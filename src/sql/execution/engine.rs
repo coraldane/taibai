@@ -79,6 +79,7 @@ pub struct Engine {
     catalog_save_state: Mutex<CatalogSaveState>,
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
+    pubsub: Arc<crate::pubsub::PubSubHub>,
     bulk_mode_sessions: AtomicUsize,
     bulk_dirty_tables: Mutex<HashSet<(String, String)>>,
     in_flight_operations: AtomicUsize,

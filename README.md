@@ -193,6 +193,7 @@ log:
 | `examples/multi_insert` | 多行插入示例 |
 | `examples/prepare_test` | 预处理语句示例 |
 | `examples/hot_insert` | 热数据持续写入示例 |
+| `examples/pubsub_demo` | 变更订阅示例：订阅表插入变更并接收服务端推送 |
 
 运行示例前，请先启动 Taibai 服务端，并根据示例源码调整连接参数。
 
@@ -200,6 +201,7 @@ log:
 
 - `docs/getting-started/quick-start.md`：五分钟快速开始。
 - `docs/overview/project-summary.md`：工程功能总览。
+- `docs/user-guide/pubsub.md`：变更订阅（pub/sub）协议、权限与配置。
 - `docs/user-guide/limitations.md`：项目状态、兼容性和使用限制。
 - `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。
 - `docs/operations/data-import-flow.md`：数据导入流程。

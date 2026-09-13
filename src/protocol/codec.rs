@@ -4,7 +4,7 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::message::{
     Message, MessageHeader, HEADER_SIZE, MSG_TYPE_BATCH_EXECUTE, MSG_TYPE_CLOSE_STMT,
-    MSG_TYPE_EXECUTE, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
+    MSG_TYPE_EXECUTE, MSG_TYPE_NOTIFICATION, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
 };
 
 pub struct MessageCodec {
@@ -88,8 +88,15 @@ impl Encoder<Message> for MessageCodec {
             msg.msg_type,
             MSG_TYPE_PREPARE | MSG_TYPE_EXECUTE | MSG_TYPE_CLOSE_STMT | MSG_TYPE_BATCH_EXECUTE
         );
-        let should_compress =
-            !is_bulk && !is_query && !is_prepared && msg.payload.len() > self.compress_threshold;
+        // Notification payloads were compressed once by the pubsub fan-out
+        // thread; compressing here again would force clients to decompress
+        // twice and pay double CPU per subscriber.
+        let is_pubsub_push = msg.msg_type == MSG_TYPE_NOTIFICATION;
+        let should_compress = !is_bulk
+            && !is_query
+            && !is_prepared
+            && !is_pubsub_push
+            && msg.payload.len() > self.compress_threshold;
 
         let payload = if should_compress {
             match crate::protocol::compress::zlib_compress(&msg.payload) {

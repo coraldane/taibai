@@ -6,6 +6,7 @@ members = [
     "examples/prepare_test",
     "examples/hot_insert",
     "examples/query_bench",
+    "examples/pubsub_demo",
 ]
 
 [package]
@@ -207,3 +208,7 @@ name = "bulk_encoding_bench_test"
 path = "tests/bulk_encoding_bench_test.rs"
 
 
+
+[[test]]
+name = "pubsub_test"
+path = "tests/pubsub_test.rs"

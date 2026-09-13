@@ -29,6 +29,9 @@ pub struct Client {
     pending_count: Arc<AtomicI64>,
     response_handled: Arc<AtomicI64>,
     bulk_import_mode: bool,
+    /// Server-pushed change notifications diverted from the response stream
+    /// while awaiting request replies. Drained via `recv_notification`.
+    pending_notifications: std::collections::VecDeque<Message>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +90,7 @@ impl Client {
             pending_count: Arc::new(AtomicI64::new(0)),
             response_handled: Arc::new(AtomicI64::new(0)),
             bulk_import_mode: false,
+            pending_notifications: std::collections::VecDeque::new(),
         })
     }
 
@@ -641,10 +645,103 @@ impl Client {
     }
 
     async fn recv(&mut self) -> Result<Message> {
+        loop {
+            let msg = self.next_frame().await?;
+            // Interleaved server pushes are never valid request replies:
+            // buffer them so every request/response flow stays intact.
+            if msg.msg_type == MSG_TYPE_NOTIFICATION {
+                self.pending_notifications.push_back(msg);
+                continue;
+            }
+            return Ok(msg);
+        }
+    }
+
+    async fn next_frame(&mut self) -> Result<Message> {
         timeout(self.default_timeout, self.framed.next())
             .await
             .map_err(|_| TaibaiError::Network("recv timeout".into()))?
             .ok_or_else(|| TaibaiError::Network("connection closed".into()))?
+    }
+
+    /// Register a change subscription. `topic` is a table in the current
+    /// database (`"ticks"`), a qualified subject (`"main.ticks"`), a database
+    /// wildcard (`"main.*"`), or `>` for every table. Returns the
+    /// subscription id used to correlate pushed notifications and to
+    /// unsubscribe.
+    pub async fn subscribe(&mut self, topic: &str) -> Result<u64> {
+        let mut payload = Vec::with_capacity(4 + topic.len());
+        write_len_prefixed_string(&mut payload, topic);
+        self.send(Message::new(MSG_TYPE_SUBSCRIBE, Bytes::from(payload)))
+            .await?;
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_OK => {
+                if resp.payload.len() < 8 {
+                    return Err(TaibaiError::Protocol("subscribe reply too short".into()));
+                }
+                Ok(u64::from_le_bytes(resp.payload[..8].try_into().unwrap()))
+            }
+            MSG_TYPE_ERROR => Err(TaibaiError::Sql(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            )),
+            other => Err(TaibaiError::Protocol(format!(
+                "unexpected subscribe reply type: {other:#04X}"
+            ))),
+        }
+    }
+
+    /// Remove a previously registered subscription.
+    pub async fn unsubscribe(&mut self, sub_id: u64) -> Result<()> {
+        self.send(Message::new(
+            MSG_TYPE_UNSUBSCRIBE,
+            Bytes::copy_from_slice(&sub_id.to_le_bytes()),
+        ))
+        .await?;
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_OK => Ok(()),
+            MSG_TYPE_ERROR => Err(TaibaiError::Sql(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            )),
+            other => Err(TaibaiError::Protocol(format!(
+                "unexpected unsubscribe reply type: {other:#04X}"
+            ))),
+        }
+    }
+
+    /// Wait for the next change notification pushed by the server. buffered
+    /// notifications that arrived while awaiting request replies are returned
+    /// first.
+    pub async fn recv_notification(&mut self) -> Result<Notification> {
+        if let Some(notification) = self.pop_buffered_notification() {
+            return notification;
+        }
+        let msg = self.next_frame().await?;
+        if msg.msg_type == MSG_TYPE_NOTIFICATION {
+            return parse_notification(&msg.payload);
+        }
+        Err(TaibaiError::Protocol(format!(
+            "expected a change notification, received message type {:#04X}",
+            msg.msg_type
+        )))
+    }
+
+    /// [`recv_notification`](Self::recv_notification) bounded by a timeout;
+    /// `None` means no notification arrived in time.
+    pub async fn recv_notification_timeout(
+        &mut self,
+        dur: Duration,
+    ) -> Result<Option<Notification>> {
+        match timeout(dur, self.recv_notification()).await {
+            Ok(result) => result.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn pop_buffered_notification(&mut self) -> Option<Result<Notification>> {
+        let msg = self.pending_notifications.pop_front()?;
+        Some(parse_notification(&msg.payload))
     }
 }
 
@@ -1185,4 +1282,52 @@ fn encode_scalar_param(buf: &mut Vec<u8>, val: &ScalarValue) {
         }
         ScalarValue::Vector(None) => buf.push(0u8),
     }
+}
+
+/// A server-pushed change notification for one committed insert batch.
+///
+/// `seq` is a per-topic monotonic counter: a gap against the previous
+/// notification means the server dropped events for this subscription
+/// (slow consumer), and the client should re-read the table to catch up.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub sub_id: u64,
+    pub seq: u64,
+    pub topic: String,
+    pub schema: Schema,
+    pub batches: Vec<RecordBatch>,
+}
+
+impl Notification {
+    pub fn num_rows(&self) -> usize {
+        self.batches.iter().map(|batch| batch.num_rows()).sum()
+    }
+}
+
+/// Payload layout (MSG_TYPE_NOTIFICATION):
+/// `[u64 sub_id][u64 seq][string topic][binary result batches]`
+fn parse_notification(payload: &[u8]) -> Result<Notification> {
+    if payload.len() < 16 {
+        return Err(TaibaiError::Protocol(
+            "notification payload too short".into(),
+        ));
+    }
+    let sub_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
+    let seq = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let (topic, rest) = read_len_prefixed_string(&payload[16..])?;
+    let QueryResult::Rows {
+        schema, batches, ..
+    } = parse_binary_result(rest)?
+    else {
+        return Err(TaibaiError::Protocol(
+            "notification body did not decode to rows".into(),
+        ));
+    };
+    Ok(Notification {
+        sub_id,
+        seq,
+        topic: topic.to_string(),
+        schema,
+        batches,
+    })
 }

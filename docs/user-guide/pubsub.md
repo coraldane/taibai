@@ -1,0 +1,68 @@
+# 变更订阅（Pub/Sub）
+
+Taibai 支持客户端订阅表的插入变更：数据提交后，服务端把变更批次异步推送给所有匹配的订阅者，无需轮询。设计借鉴了 kdb+ tickerplant（表级订阅、每主题单调序号、每订阅者独立队列）和 NATS（主题通配符、at-most-once 投递、慢消费者限额丢弃）。
+
+## 能力范围
+
+- **发布内容**：INSERT 提交的行批次（autocommit 单条/批量 INSERT、预处理语句批量执行）以及显式事务 `COMMIT` 的全部写入。通知体复用二进制查询结果编码，列式、零拷贝共享。
+- **投递语义**：at-most-once。每个主题维护单调递增序号（`seq`）；客户端发现 `seq` 跳号即说明有事件被丢弃（见下面的慢消费者策略），应重新查询表数据补齐。
+- **已知限制**：
+  - `UPDATE` / `DELETE` 目前不产生通知（与 kdb tickerplant 的 insert-only 模型一致）。
+  - `DURABILITY = RELAXED` 直写路径与 `START BULK IMPORT` 延迟批量导入不发布通知（数据延迟到 flush 才可见）。
+
+## 协议消息
+
+| 消息类型 | 值 | 方向 | 载荷 |
+| --- | --- | --- | --- |
+| `SUBSCRIBE` | `0x60` | 客户端 → 服务端 | 长度前缀字符串：主题 |
+| `UNSUBSCRIBE` | `0x61` | 客户端 → 服务端 | u64：订阅 id |
+| `NOTIFICATION` | `0x62` | 服务端 → 客户端（推送） | `[u64 sub_id][u64 seq][string topic][binary result batches]` |
+
+- `SUBSCRIBE` 成功后服务端返回 `OK`，载荷为 u64 订阅 id；失败返回 `ERROR`。
+- 主题支持 `table`（等价 `当前库.table`）、`database.table`、`database.*`、`>`（全库所有表）。
+- `NOTIFICATION` 由服务端扇出线程预压缩一次（超过压缩阈值时），所有订阅者共享同一份字节，编解码器对该消息类型不再二次压缩。
+
+## 权限
+
+订阅要求 `SUBSCRIBE` 权限（或 root/admin 管理员）：
+
+```sql
+GRANT SUBSCRIBE ON TABLE main.ticks TO alice;   -- 表级
+GRANT SUBSCRIBE ON DATABASE main TO alice;      -- 覆盖 main.* 与 main.>
+-- 全库订阅（>）需要管理员身份
+```
+
+## 客户端 API（Rust）
+
+```rust
+let mut client = Client::connect("127.0.0.1:5151").await?;
+client.login("root", "taibai", "main").await?;
+
+let sub_id = client.subscribe("main.ticks").await?;
+
+// 通知可能在任何请求响应之间到达；客户端库会自动缓冲，不会干扰请求/响应流。
+if let Some(n) = client.recv_notification_timeout(Duration::from_secs(5)).await? {
+    println!("seq={} topic={} rows={}", n.seq, n.topic, n.num_rows());
+}
+
+client.unsubscribe(sub_id).await?;
+```
+
+完整示例见 `examples/pubsub_demo`。订阅连接若长时间不发送任何协议帧，仍受 `server.connection_idle_timeout_secs` 空闲超时约束——纯订阅客户端应定期 `PING`（推送活动本身也会重置空闲窗口）。
+
+## 实现与资源约束
+
+- **写入路径零阻塞**：发布只做一次 relaxed 原子读（无订阅者时直接返回）加一次无锁 `try_send`；行数据以 `Arc` 共享，提交路径不做列拷贝。没有订阅者时开销接近零。
+- **扇出线程**：单独的 `taibai-pubsub` 线程负责序号分配、一次性编码/压缩、按主题匹配和分发；编码结果以共享字节推给各订阅者，避免 N 份重复编码。
+- **内存可控**：写入事件通道（`event_channel_capacity`）与每连接通知队列（`notification_channel_capacity`）全部有界。慢消费者的超额通知被丢弃并按订阅计数（`dropped`），绝不会拖垮写入或其他订阅者——这正是 NATS 的慢消费者隔离策略。
+- **断线自愈**：连接断开时，连接任务显式注销全部订阅；即使清理被跳过，扇出线程向已关闭队列投递失败后也会自动回收订阅。
+
+## 配置
+
+```yaml
+pubsub:
+  enabled: true                        # 总开关；关闭时 SUBSCRIBE 被拒绝
+  event_channel_capacity: 65536        # 写入 -> 扇出线程事件通道容量
+  max_subscriptions: 1024              # 全局最大订阅数
+  notification_channel_capacity: 1024  # 每连接通知队列容量
+```

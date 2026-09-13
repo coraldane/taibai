@@ -216,6 +216,7 @@ fn bulk_payload_throughput() {
         taibai::sql::execution::AutoCompactConfig::default(),
         64 * 1024 * 1024,
         true, // async fsync: exposes the CPU-side decode cost
+        taibai::common::config::PubSubSettings::default(),
     )
     .expect("engine");
     let mut session = Session::new("root".to_string(), "main".to_string());

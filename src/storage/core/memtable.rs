@@ -267,6 +267,16 @@ impl MemTable {
         guard.as_ref().map(|batch| batch.as_ref().clone())
     }
 
+    /// Share the current batch without copying it. The pubsub commit hook
+    /// uses this so change notifications cost an `Arc` clone instead of a
+    /// full column copy on the transaction-commit path.
+    pub fn read_snapshot_arc(&self) -> Option<Arc<RecordBatch>> {
+        if self.ensure_resident().is_err() {
+            return None;
+        }
+        self.batch.read().unwrap().clone()
+    }
+
     pub fn is_spilled(&self) -> bool {
         matches!(
             *self.backing.read().unwrap(),

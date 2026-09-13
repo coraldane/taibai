@@ -70,7 +70,7 @@ fn full_memtables_flush_while_write_queue_stays_active() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr), None);
 
     for batch_idx in 0..64 {
         writer.write_columns(
@@ -105,7 +105,7 @@ fn tail_file_pressure_forces_table_flush() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
 
     for partition in 0..4 {
         writer.write_columns(
@@ -148,7 +148,7 @@ fn durable_flushes_share_one_active_segment() -> Result<()> {
 
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(4), Arc::clone(&segment_mgr), None);
 
     for batch_idx in 0..3 {
         let batch = make_batch(&schema, batch_idx * 4, 4)?;
@@ -183,7 +183,7 @@ fn crash_before_flush_replays_tail_exactly_once() -> Result<()> {
 
     {
         let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+        let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
         let batch = make_batch(&schema, 100, 5)?;
         writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
         // No flush: stop only halts the background threads, leaving the
@@ -194,7 +194,7 @@ fn crash_before_flush_replays_tail_exactly_once() -> Result<()> {
     assert_eq!(total_segment_rows(&table_dir), 0);
 
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
     let recovered = crate::storage::core::durable_tail::recover(&table_dir, &schema)?;
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].batch.num_rows(), 5);
@@ -228,7 +228,7 @@ fn crash_after_segment_append_suppresses_tail_replay() -> Result<()> {
     let schema = test_schema();
 
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
     let batch = make_batch(&schema, 200, 6)?;
     writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
     writer.flush_table(TEST_DB, TEST_TABLE)?;
@@ -271,7 +271,7 @@ fn crash_mid_append_replays_tail() -> Result<()> {
     let schema = test_schema();
 
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
     let batch = make_batch(&schema, 300, 3)?;
     writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
     writer.flush_table(TEST_DB, TEST_TABLE)?;
@@ -308,7 +308,7 @@ fn memory_pressure_spills_memtable_then_flush_materializes() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
 
     let batch = make_batch(&schema, 0, 5)?;
     writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
@@ -351,7 +351,7 @@ fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
     std::fs::create_dir_all(&table_dir)?;
     let schema = test_schema();
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
-    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr));
+    let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
 
     writer.write_columns(
         TEST_DB,

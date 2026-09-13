@@ -7,6 +7,7 @@ impl Engine {
             AutoCompactConfig::default(),
             8 * 1024 * 1024 * 1024,
             false,
+            crate::common::config::PubSubSettings::default(),
         )
     }
     pub fn new_with_storage_config(
@@ -21,9 +22,11 @@ impl Engine {
             AutoCompactConfig::default(),
             8 * 1024 * 1024 * 1024,
             false,
+            crate::common::config::PubSubSettings::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_storage_config_and_auto_compact(
         data_dir: &Path,
         default_database: &str,
@@ -31,6 +34,7 @@ impl Engine {
         auto_compact_config: AutoCompactConfig,
         hot_store_memory_limit_bytes: u64,
         tail_async_fsync: bool,
+        pubsub_settings: crate::common::config::PubSubSettings,
     ) -> Result<Self> {
         super::ddl::recover_database_drop_tombstones(data_dir)?;
         let mut catalogs = HashMap::new();
@@ -98,6 +102,8 @@ impl Engine {
         let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
+        let pubsub = crate::pubsub::PubSubHub::new(pubsub_settings);
+
         let batch_writer = BatchWriter::new(
             BatchWriterConfig {
                 // A partial row group remains a durable memtable tail. Once a
@@ -116,6 +122,7 @@ impl Engine {
                 ..BatchWriterConfig::default()
             },
             Arc::clone(&segment_mgr),
+            Some(Arc::clone(&pubsub)),
         );
         let recovered_tail_tables =
             recover_durable_memtable_tails(data_dir, &catalogs, &batch_writer)?;
@@ -165,6 +172,7 @@ impl Engine {
             }),
             segment_mgr,
             batch_writer,
+            pubsub,
             bulk_mode_sessions: AtomicUsize::new(0),
             bulk_dirty_tables: Mutex::new(HashSet::new()),
             in_flight_operations: AtomicUsize::new(0),

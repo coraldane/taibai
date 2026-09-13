@@ -17,6 +17,14 @@ impl Engine {
         &self.batch_writer
     }
 
+    /// Change-notification hub backing the SUBSCRIBE protocol messages. The
+    /// write path reaches it through `BatchWriter` (transaction commits) and
+    /// the insert executor (autocommit inserts); connections reach it through
+    /// the request handler.
+    pub fn pubsub(&self) -> &Arc<crate::pubsub::PubSubHub> {
+        &self.pubsub
+    }
+
     pub fn memtable_manager(&self) -> &Arc<MemTableManager> {
         self.batch_writer.memtable_manager()
     }

@@ -476,6 +476,8 @@ pub struct ServerConfig {
     pub log: LogSettings,
     #[serde(default)]
     pub performance: PerformanceBaselineSettings,
+    #[serde(default)]
+    pub pubsub: PubSubSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -629,6 +631,67 @@ pub struct TlsConfigYaml {
     pub enabled: bool,
     pub cert_path: String,
     pub key_path: String,
+}
+
+/// Change-subscription (pubsub) settings. The feature is enabled by default
+/// but costs nothing while no client subscribes: the write path only does a
+/// relaxed atomic load, and every queue is bounded so memory use stays
+/// proportional to the configured capacities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubSubSettings {
+    /// Master switch. When false, SUBSCRIBE requests are rejected and the
+    /// write path short-circuits before touching the event channel.
+    #[serde(default = "default_pubsub_enabled")]
+    pub enabled: bool,
+    /// Capacity of the write-path -> fan-out event channel. Overflow drops
+    /// events (counted) instead of blocking writers.
+    #[serde(default = "default_pubsub_event_channel_capacity")]
+    pub event_channel_capacity: usize,
+    /// Maximum concurrent subscriptions server-wide.
+    #[serde(default = "default_pubsub_max_subscriptions")]
+    pub max_subscriptions: usize,
+    /// Per-connection notification queue capacity. A client that cannot keep
+    /// up has excess notifications dropped (counted per subscription) instead
+    /// of growing memory unboundedly.
+    #[serde(default = "default_pubsub_notification_channel_capacity")]
+    pub notification_channel_capacity: usize,
+    /// Payloads above this size are compressed once by the fan-out thread and
+    /// shared by all subscribers of the change. `usize::MAX` disables
+    /// notification compression. Follows `compression.enabled` at startup.
+    #[serde(default = "default_pubsub_compress_threshold")]
+    pub compress_threshold: usize,
+}
+
+impl Default for PubSubSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_pubsub_enabled(),
+            event_channel_capacity: default_pubsub_event_channel_capacity(),
+            max_subscriptions: default_pubsub_max_subscriptions(),
+            notification_channel_capacity: default_pubsub_notification_channel_capacity(),
+            compress_threshold: default_pubsub_compress_threshold(),
+        }
+    }
+}
+
+fn default_pubsub_enabled() -> bool {
+    true
+}
+
+fn default_pubsub_event_channel_capacity() -> usize {
+    65_536
+}
+
+fn default_pubsub_max_subscriptions() -> usize {
+    1024
+}
+
+fn default_pubsub_notification_channel_capacity() -> usize {
+    1024
+}
+
+fn default_pubsub_compress_threshold() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -806,6 +869,7 @@ impl Default for ServerConfig {
             tls: TlsConfigYaml::default(),
             log: default_log_settings(),
             performance: PerformanceBaselineSettings::default(),
+            pubsub: PubSubSettings::default(),
         }
     }
 }

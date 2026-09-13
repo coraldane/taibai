@@ -157,26 +157,54 @@ where
     };
     let idle_timeout_secs = config.server.connection_idle_timeout_secs;
     let request_queue_timeout_ms = config.server.request_queue_timeout_ms;
+    let notification_capacity = config.pubsub.notification_channel_capacity.max(1);
     let mut framed = Framed::new(
         stream,
         MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),
     );
     let mut handler = Handler::new(config, engine.clone());
     let mut pending_messages = VecDeque::new();
+    // Per-connection push queue for pubsub notifications. The pubsub fan-out
+    // thread only ever `try_send`s, so a stalled client drops notifications
+    // (counted) instead of blocking writers or growing memory unboundedly.
+    // `keep_push_tx` anchors the receiver for the connection lifetime even
+    // while the handler (holding the other clone) is moved into a worker.
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Message>(notification_capacity);
+    let keep_push_tx = push_tx.clone();
+    handler.set_push_channel(push_tx);
 
     let outcome = 'connection: loop {
         let next = if let Some(msg) = pending_messages.pop_front() {
-            Some(Ok(msg))
-        } else if idle_timeout_secs == 0 {
-            framed.next().await
+            Incoming::Frame(Some(Ok(msg)))
         } else {
-            match timeout(Duration::from_secs(idle_timeout_secs), framed.next()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    tracing::warn!(idle_timeout_secs, "closing idle connection");
-                    break Ok(());
+            // Delivering a queued notification counts as connection activity
+            // and restarts the idle window, so a pure subscriber that pushes
+            // data but sends no frames is not disconnected mid-stream.
+            loop {
+                let wait = next_frame_or_push(&mut framed, &mut push_rx);
+                let result = if idle_timeout_secs == 0 {
+                    wait.await
+                } else {
+                    match timeout(Duration::from_secs(idle_timeout_secs), wait).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!(idle_timeout_secs, "closing idle connection");
+                            break 'connection Ok(());
+                        }
+                    }
+                };
+                match result {
+                    Incoming::Pushed => continue,
+                    other => break other,
                 }
             }
+        };
+        let next = match next {
+            Incoming::Closed => break Ok(()),
+            // The inner wait loop consumes `Pushed` itself; reaching this arm
+            // would mean it escaped, which is impossible today.
+            Incoming::Pushed => break Ok(()),
+            Incoming::Frame(frame) => frame,
         };
         let Some(result) = next else {
             break Ok(());
@@ -219,6 +247,21 @@ where
                         }
                     }
                 }
+                push = push_rx.recv() => {
+                    match push {
+                        Some(push) => {
+                            if let Err(error) = framed.send(push).await {
+                                tracing::error!(%error, "pubsub push send error");
+                                cancelled.store(true, Ordering::Release);
+                                return Ok(());
+                            }
+                        }
+                        None => {
+                            cancelled.store(true, Ordering::Release);
+                            return Ok(());
+                        }
+                    }
+                }
             }
         };
         let mut disconnected = false;
@@ -233,6 +276,23 @@ where
                     if let Some(chunk) = chunk {
                         if let Err(error) = framed.send(chunk).await {
                             tracing::error!(%error, "query stream send error");
+                            cancelled.store(true, Ordering::Release);
+                            worker.abort();
+                            return Ok(());
+                        }
+                    }
+                }
+                push = push_rx.recv() => {
+                    match push {
+                        Some(push) => {
+                            if let Err(error) = framed.send(push).await {
+                                tracing::error!(%error, "pubsub push send error");
+                                cancelled.store(true, Ordering::Release);
+                                worker.abort();
+                                return Ok(());
+                            }
+                        }
+                        None => {
                             cancelled.store(true, Ordering::Release);
                             worker.abort();
                             return Ok(());
@@ -306,7 +366,47 @@ where
 
     cleanup_handler_blocking(handler, request_limiter).await;
     tracing::info!("connection closed");
+    drop(keep_push_tx);
     outcome
+}
+
+enum Incoming {
+    /// A decoded protocol frame; `None` means the client closed the stream.
+    Frame(Option<std::result::Result<Message, TaibaiError>>),
+    /// One queued notification was delivered; the caller should resume
+    /// waiting with a fresh (idle) timeout window.
+    Pushed,
+    /// The push channel vanished or a queued notification could not be
+    /// delivered; the connection must close.
+    Closed,
+}
+
+/// Wait for the next client frame, forwarding any queued pubsub notifications
+/// to the socket along the way. Used where the loop would otherwise block on
+/// `framed.next()` alone, so subscribers receive pushes between requests.
+async fn next_frame_or_push<S>(
+    framed: &mut Framed<S, MessageCodec>,
+    push_rx: &mut tokio::sync::mpsc::Receiver<Message>,
+) -> Incoming
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::select! {
+        next = framed.next() => Incoming::Frame(next),
+        push = push_rx.recv() => {
+            match push {
+                Some(push) => {
+                    if let Err(error) = framed.send(push).await {
+                        tracing::error!(%error, "pubsub push send error");
+                        Incoming::Closed
+                    } else {
+                        Incoming::Pushed
+                    }
+                }
+                None => Incoming::Closed,
+            }
+        }
+    }
 }
 
 const DISCONNECT_WORKER_WAIT: Duration = Duration::from_secs(5);

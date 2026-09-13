@@ -45,6 +45,18 @@ compression:
   # bulk segment 写入的 zstd 压缩级别（1..=22，启动时截断）
   bulk_zstd_level: 3
 
+# 变更订阅（pubsub）：客户端通过 SUBSCRIBE 协议消息订阅表的插入变更，
+# 服务端异步推送带序号的通知。默认开启，但没有订阅者时写入路径只做一次
+# 原子读，几乎零开销。所有队列都有界，慢消费者只丢通知（有计数）不阻塞写入。
+pubsub:
+  enabled: true
+  # 写入线程 -> 扇出线程的事件通道容量；打满时丢弃事件并计数
+  event_channel_capacity: 65536
+  # 全局最大订阅数
+  max_subscriptions: 1024
+  # 每个连接的通知队列容量；客户端消费不过时超额通知被丢弃并计数
+  notification_channel_capacity: 1024
+
 log:
   level: "info"
   # 输出 [insert-profile] 逐阶段 INSERT 诊断日志

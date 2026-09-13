@@ -1,0 +1,13 @@
+[package]
+name = "pubsub_demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+taibai = { path = "../.." }
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
+
+[[bin]]
+name = "pubsub_demo"
+path = "src/main.rs"

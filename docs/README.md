@@ -10,6 +10,7 @@
 ## 使用与运维
 
 - [事务与并发语义](user-guide/transactions-and-concurrency.md)
+- [变更订阅（Pub/Sub）](user-guide/pubsub.md)
 - [示例工具使用指南](operations/examples-guide.md)
 - [数据导入流程说明](operations/data-import-flow.md)
 - [Windows 安装说明](operations/windows-installation.md)

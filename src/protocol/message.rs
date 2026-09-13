@@ -34,6 +34,13 @@ pub const MSG_TYPE_EXECUTE: u8 = 0x51;
 pub const MSG_TYPE_CLOSE_STMT: u8 = 0x52;
 pub const MSG_TYPE_BATCH_EXECUTE: u8 = 0x53;
 
+pub const MSG_TYPE_SUBSCRIBE: u8 = 0x60;
+pub const MSG_TYPE_UNSUBSCRIBE: u8 = 0x61;
+/// Server push. Payloads are already compressed once by the pubsub fan-out
+/// thread (when above the compression threshold), so the codec must not
+/// compress them again.
+pub const MSG_TYPE_NOTIFICATION: u8 = 0x62;
+
 #[derive(Debug, Clone)]
 pub struct MessageHeader {
     pub msg_type: u8,
