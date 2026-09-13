@@ -674,19 +674,37 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
         DataType::Timestamp => read_fixed!(i64, 8, Timestamp),
         DataType::Interval => read_fixed!(i64, 8, Interval),
         DataType::VarChar => {
-            let mut vals = Vec::with_capacity(row_count);
+            // Decode straight into the column's UTF-8 arena: one contiguous
+            // buffer + offsets, zero per-row String allocations.
+            let mut buffer = Utf8Buffer::with_capacity(row_count);
+            let mut pos = dc.position() as usize;
             for i in 0..row_count {
                 if bitmap.is_null(i) {
-                    vals.push(String::new());
-                } else {
-                    let len = read_u32_le(&mut dc).unwrap_or(0) as usize;
-                    let mut s = vec![0u8; len];
-                    dc.read_exact(&mut s).unwrap_or(());
-                    vals.push(String::from_utf8_lossy(&s).into_owned());
+                    buffer.push_str("");
+                    continue;
                 }
+                if pos + 4 > remaining_data.len() {
+                    return Err(TaibaiError::Storage("varchar decode: truncated length".into()));
+                }
+                let len =
+                    u32::from_le_bytes(remaining_data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if pos + len > remaining_data.len() {
+                    return Err(TaibaiError::Storage("varchar decode: truncated value".into()));
+                }
+                let raw = &remaining_data[pos..pos + len];
+                match std::str::from_utf8(raw) {
+                    Ok(value) => buffer.push_str(value),
+                    Err(_) => {
+                        let owned = String::from_utf8_lossy(raw).into_owned();
+                        buffer.push_str(&owned);
+                    }
+                }
+                pos += len;
             }
+            dc.set_position(pos as u64);
             ColumnArray::VarChar {
-                data: vals.into(),
+                data: buffer,
                 bitmap: bitmap.clone(),
             }
         }
@@ -775,8 +793,7 @@ pub(crate) fn decode_adaptive_column(
             build_column_from_bits(bits, row_count, col_def, bitmap)
         }
         EncodingType::Dictionary if col_def.data_type == DataType::VarChar => {
-            let values = decode_varchar_dictionary_payload(payload)?;
-            build_varchar_column(values, row_count, bitmap)
+            expand_varchar_dictionary(payload, row_count, &bitmap)
         }
         other => Err(TaibaiError::Storage(format!(
             "unsupported adaptive column encoding {:?} for {}",
@@ -823,26 +840,73 @@ pub(crate) fn decode_i64_delta_payload(payload: &[u8]) -> Result<Vec<i64>> {
     Ok(values)
 }
 
-fn decode_varchar_dictionary_payload(payload: &[u8]) -> Result<Vec<String>> {
+/// Expand a dictionary-encoded varchar column directly into the column's
+/// UTF-8 arena: dictionary entries borrow from the payload and each row is a
+/// single memcpy — no per-row String allocation or clone.
+fn expand_varchar_dictionary(
+    payload: &[u8],
+    row_count: usize,
+    bitmap: &NullBitmap,
+) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(payload);
     let dict_count = read_u32_le(&mut cursor)? as usize;
-    let mut dict = Vec::with_capacity(dict_count);
+    let mut dict: Vec<&str> = Vec::with_capacity(dict_count);
+    let mut owned_fallbacks: Vec<String> = Vec::new();
     for _ in 0..dict_count {
         let len = read_u32_le(&mut cursor)? as usize;
-        let mut bytes = vec![0u8; len];
-        cursor.read_exact(&mut bytes)?;
-        dict.push(String::from_utf8_lossy(&bytes).into_owned());
+        let start = cursor.position() as usize;
+        if start + len > payload.len() {
+            return Err(TaibaiError::Storage(
+                "dictionary varchar decode: truncated entry".into(),
+            ));
+        }
+        let bytes = &payload[start..start + len];
+        let value = match std::str::from_utf8(bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                // Corrupt-data fallback (should not happen: writers validate
+                // UTF-8). Leak one boxed string rather than complicate the
+                // borrow structure for an unreachable path.
+                let leaked: &'static str =
+                    Box::leak(String::from_utf8_lossy(bytes).into_owned().into_boxed_str());
+                owned_fallbacks.push(leaked.to_owned());
+                leaked
+            }
+        };
+        dict.push(value);
+        cursor.set_position((start + len) as u64);
     }
     let index_count = read_u32_le(&mut cursor)? as usize;
-    let mut values = Vec::with_capacity(index_count);
-    for _ in 0..index_count {
-        let idx = read_u32_le(&mut cursor)? as usize;
+    if index_count != row_count.saturating_sub(bitmap.null_count()) {
+        return Err(TaibaiError::Storage(format!(
+            "adaptive varchar value count mismatch: got {}, expected {}",
+            index_count,
+            row_count.saturating_sub(bitmap.null_count())
+        )));
+    }
+    let mut buffer = Utf8Buffer::with_capacity(row_count);
+    let mut pos = cursor.position() as usize;
+    for row in 0..row_count {
+        if bitmap.is_null(row) {
+            buffer.push_str("");
+            continue;
+        }
+        if pos + 4 > payload.len() {
+            return Err(TaibaiError::Storage(
+                "dictionary varchar decode: truncated index".into(),
+            ));
+        }
+        let idx = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
         let value = dict.get(idx).ok_or_else(|| {
             TaibaiError::Storage(format!("dictionary index {} out of bounds", idx))
         })?;
-        values.push(value.clone());
+        buffer.push_str(value);
     }
-    Ok(values)
+    Ok(ColumnArray::VarChar {
+        data: buffer,
+        bitmap: bitmap.clone(),
+    })
 }
 
 fn build_numeric_column_from_i64(
@@ -975,37 +1039,6 @@ fn build_column_from_bits(
     };
     Ok(column)
 }
-
-fn build_varchar_column(
-    values: Vec<String>,
-    row_count: usize,
-    bitmap: NullBitmap,
-) -> Result<ColumnArray> {
-    let expected = row_count.saturating_sub(bitmap.null_count());
-    if values.len() != expected {
-        return Err(TaibaiError::Storage(format!(
-            "adaptive varchar value count mismatch: got {}, expected {}",
-            values.len(),
-            expected
-        )));
-    }
-
-    let mut data = Vec::with_capacity(row_count);
-    let mut value_pos = 0usize;
-    for row in 0..row_count {
-        if bitmap.is_null(row) {
-            data.push(String::new());
-        } else {
-            data.push(values[value_pos].clone());
-            value_pos += 1;
-        }
-    }
-    Ok(ColumnArray::VarChar {
-        data: data.into(),
-        bitmap,
-    })
-}
-
 fn project_column(col: &ColumnArray, selected_rows: &[usize]) -> Result<ColumnArray> {
     let mut out = ColumnArray::empty(col.data_type());
     for &row in selected_rows {
