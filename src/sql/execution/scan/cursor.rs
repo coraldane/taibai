@@ -342,7 +342,7 @@ impl ScanCursor {
                     // Decode in parallel chunks (bounded by the global
                     // cpu/io permits); send in candidate order so the
                     // consumer sees the same sequence as the inline walk.
-                    for chunk in candidates.chunks(16) {
+                    for chunk in candidates.chunks(32) {
                         let decoded: Vec<_> = chunk
                             .par_iter()
                             .filter_map(|row_group| {
