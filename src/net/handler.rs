@@ -1294,6 +1294,14 @@ fn is_heartbeat_query(sql: &str) -> bool {
 fn should_log_query_sql(sql: &str) -> bool {
     // INSERT statements can be megabytes long. Do not parse every statement a
     // second time merely to decide whether it produces a result set.
+    //
+    // The parse here is only needed to classify the statement for the query
+    // log, so skip it entirely when the query log is disabled: otherwise
+    // every SELECT/SHOW/EXPLAIN would be parsed twice per request even with
+    // logging off.
+    if !crate::common::query_log::enabled() {
+        return false;
+    }
     if !starts_like_query(sql) {
         return false;
     }

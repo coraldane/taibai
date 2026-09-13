@@ -50,15 +50,21 @@ impl SegmentManager {
             }
         };
         let partition_strategy = table_meta.partition_strategy();
-        let first_val = batch.scalar(0, pk_idx).unwrap_or(ScalarValue::Int64(None));
-        let first_key = compute_partition_key_from_scalar(&partition_strategy, &first_val);
+        let partition_column = batch.column(pk_idx);
+        let mut keys = partition_column
+            .map(|column| {
+                crate::storage::partition::partition_function::PartitionKeysAt::new(
+                    crate::storage::partition::partition_function::PartitionKeyKind::Strategy(
+                        partition_strategy,
+                    ),
+                    column,
+                )
+            })
+            .expect("partitioned table must expose its partition column");
+        let first_key = keys.key_at(0).to_string();
         let mut single_partition = true;
         for row_idx in 1..batch.num_rows() {
-            let val = batch
-                .scalar(row_idx, pk_idx)
-                .unwrap_or(ScalarValue::Int64(None));
-            let key = compute_partition_key_from_scalar(&partition_strategy, &val);
-            if key != first_key {
+            if keys.key_at(row_idx) != first_key {
                 single_partition = false;
                 break;
             }
@@ -80,18 +86,15 @@ impl SegmentManager {
         let mut seen_keys = HashSet::new();
         seen_keys.insert(first_key.clone());
         for row_idx in 1..batch.num_rows() {
-            let val = batch
-                .scalar(row_idx, pk_idx)
-                .unwrap_or(ScalarValue::Int64(None));
-            let key = compute_partition_key_from_scalar(&partition_strategy, &val);
+            let key = keys.key_at(row_idx);
             if key != current_key {
-                if seen_keys.contains(&key) {
+                if seen_keys.contains(key) {
                     contiguous = false;
                     break;
                 }
                 ranges.push((current_key, current_start, row_idx - current_start));
-                seen_keys.insert(key.clone());
-                current_key = key;
+                seen_keys.insert(key.to_string());
+                current_key = key.to_string();
                 current_start = row_idx;
             }
         }
@@ -114,15 +117,12 @@ impl SegmentManager {
         let mut key_order = Vec::new();
         let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
         for row_idx in 0..batch.num_rows() {
-            let val = batch
-                .scalar(row_idx, pk_idx)
-                .unwrap_or(ScalarValue::Int64(None));
-            let key = compute_partition_key_from_scalar(&table_meta.partition_strategy(), &val);
-            if !groups.contains_key(&key) {
-                key_order.push(key.clone());
-                groups.insert(key.clone(), vec![false; batch.num_rows()]);
+            let key = keys.key_at(row_idx);
+            if !groups.contains_key(key) {
+                key_order.push(key.to_string());
+                groups.insert(key.to_string(), vec![false; batch.num_rows()]);
             }
-            if let Some(mask) = groups.get_mut(&key) {
+            if let Some(mask) = groups.get_mut(key) {
                 mask[row_idx] = true;
             }
         }

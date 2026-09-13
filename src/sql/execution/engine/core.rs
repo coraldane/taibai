@@ -131,6 +131,7 @@ impl Engine {
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
         for (db_name, catalog) in &mut catalogs {
             for table_meta in catalog.tables.values_mut() {
+                let table_meta = std::sync::Arc::make_mut(table_meta);
                 table_meta.ensure_auto_increment_next_value();
                 if let Some(col) = table_meta.auto_increment_column() {
                     auto_increment_mgr.register(
@@ -181,6 +182,7 @@ impl Engine {
             index_manager,
             hot_store_mgr,
             performance_baselines,
+            hot_partition_segments: Mutex::new(HashMap::new()),
         };
         engine.warmup_hot_stores();
         for (db, table) in recovered_tail_tables {

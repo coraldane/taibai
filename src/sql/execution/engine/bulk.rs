@@ -362,7 +362,7 @@ impl Engine {
         let mut explicit_auto_increment_max = None;
         let mut unique_index_entries = Vec::new();
         let mut primary_keys = Vec::new();
-        let table_meta_for_hot = catalog.get_table(&table_name).cloned();
+        let table_meta_for_hot = catalog.get_table_shared(&table_name).cloned();
         let hot_payload_should_feed = !bulk_import_mode
             && table_meta_for_hot.as_ref().is_some_and(|meta| {
                 crate::storage::core::hot_store::resolve_key_column(meta).is_some()

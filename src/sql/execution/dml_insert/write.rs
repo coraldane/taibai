@@ -313,8 +313,10 @@ fn materialize_insert_values(
         .get(db)
         .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
 
+    // Shared snapshot: escapes the catalog lock as an Arc clone instead of a
+    // full TableMeta copy (all column defs, indexes and keys re-allocated).
     let table_meta = catalog
-        .get_table(table)
+        .get_table_shared(table)
         .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
         .clone();
 
@@ -817,16 +819,19 @@ fn ensure_replace_location_indexes(
 ) -> Result<()> {
     let indexes = location_indexes_for_table(table_meta, schema)?;
     for (index_name, columns, indices) in indexes {
-        let keys = key_sets
+        let key_set = key_sets
             .iter()
             .find(|(key_indices, _)| *key_indices == indices)
-            .map(|(_, keys)| keys.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        if engine
-            .index_manager()
-            .unique_key_locations(db, table, &index_name, &keys)?
-            .is_some()
-        {
+            .map(|(_, keys)| keys);
+        let locations = match key_set {
+            Some(keys) => engine
+                .index_manager()
+                .unique_key_locations(db, table, &index_name, keys)?,
+            None => engine
+                .index_manager()
+                .unique_key_locations(db, table, &index_name, std::iter::empty::<&Vec<ScalarValue>>())?,
+        };
+        if locations.is_some() {
             continue;
         }
         let entries = collect_unique_index_entries(
@@ -1145,21 +1150,38 @@ fn sort_batch_for_cluster_key(
     sort_batch_by_key(&batch, &inserter)
 }
 
+
+/// Build the typed, memoized partition-key computer for `table_meta` over
+/// `batch`. `None` when the table has no partition column, mirroring
+/// `get_partition_column_index_cached`.
+fn partition_keys_computer<'a>(
+    table_meta: &crate::storage::catalog::schema::TableMeta,
+    batch: &'a RecordBatch,
+) -> Option<crate::storage::partition::partition_function::PartitionKeysAt<'a>> {
+    use crate::storage::partition::partition_function::{
+        PartitionKeyKind, PartitionKeysAt,
+    };
+    if table_meta.partition_key.is_empty() {
+        return None;
+    }
+    let column = batch.column(table_meta.get_partition_column_index_cached()?)?;
+    let kind = match table_meta.partition_type {
+        crate::storage::catalog::schema::PartitionType::Value => PartitionKeyKind::ValueText,
+        crate::storage::catalog::schema::PartitionType::None => return None,
+        _ => PartitionKeyKind::Strategy(table_meta.partition_strategy()),
+    };
+    Some(PartitionKeysAt::new(kind, column))
+}
+
 fn single_partition_key(
     table_meta: &crate::storage::catalog::schema::TableMeta,
     batch: &RecordBatch,
 ) -> Option<String> {
-    let col_idx = table_meta.get_partition_column_index_cached()?;
-    let first = batch
-        .scalar(0, col_idx)
-        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-    let first_key = compute_partition_key_for_value(table_meta, &first);
+    let mut keys = partition_keys_computer(table_meta, batch)?;
+    let first_key = keys.key_at(0).to_string();
 
     for row_idx in 1..batch.num_rows() {
-        let val = batch
-            .scalar(row_idx, col_idx)
-            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-        if compute_partition_key_for_value(table_meta, &val) != first_key {
+        if keys.key_at(row_idx) != first_key {
             return None;
         }
     }
@@ -1174,29 +1196,23 @@ fn partition_ranges_if_contiguous(
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
         return Some(vec![(String::new(), 0, batch.num_rows())]);
     }
-    let col_idx = table_meta.get_partition_column_index_cached()?;
-    let first = batch
-        .scalar(0, col_idx)
-        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-    let mut current_key = compute_partition_key_for_value(table_meta, &first);
+    let mut keys = partition_keys_computer(table_meta, batch)?;
+    let mut current_key = keys.key_at(0).to_string();
     let mut current_start = 0usize;
     let mut closed = HashSet::new();
     let mut ranges = Vec::new();
 
     for row_idx in 1..batch.num_rows() {
-        let val = batch
-            .scalar(row_idx, col_idx)
-            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-        let key = compute_partition_key_for_value(table_meta, &val);
+        let key = keys.key_at(row_idx);
         if key != current_key {
             if !closed.insert(current_key.clone()) {
                 return None;
             }
             ranges.push((current_key, current_start, row_idx));
-            if closed.contains(&key) {
+            if closed.contains(key) {
                 return None;
             }
-            current_key = key;
+            current_key = key.to_string();
             current_start = row_idx;
         }
     }
@@ -1223,21 +1239,19 @@ fn partition_row_indices(
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
         return vec![(String::new(), (0..batch.num_rows() as u32).collect())];
     }
-    let col_idx = match table_meta.get_partition_column_index_cached() {
-        Some(idx) => idx,
+    let mut keys = match partition_keys_computer(table_meta, batch) {
+        Some(computer) => computer,
         None => return vec![(String::new(), (0..batch.num_rows() as u32).collect())],
     };
     let mut key_order = Vec::new();
     let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
     for row_idx in 0..batch.num_rows() {
-        let val = batch
-            .scalar(row_idx, col_idx)
-            .unwrap_or(crate::types::scalar::ScalarValue::Int64(None));
-        let key = compute_partition_key_for_value(table_meta, &val);
-        if !groups.contains_key(&key) {
-            key_order.push(key.clone());
+        let key = keys.key_at(row_idx);
+        if !groups.contains_key(key) {
+            key_order.push(key.to_string());
+            groups.insert(key.to_string(), Vec::new());
         }
-        groups.entry(key).or_default().push(row_idx as u32);
+        groups.get_mut(key).unwrap().push(row_idx as u32);
     }
     key_order
         .into_iter()

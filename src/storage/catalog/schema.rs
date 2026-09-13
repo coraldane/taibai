@@ -493,7 +493,7 @@ impl TableMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseCatalog {
     pub name: String,
-    pub tables: HashMap<String, TableMeta>,
+    pub tables: HashMap<String, std::sync::Arc<TableMeta>>,
     pub created_at: i64,
 }
 
@@ -519,6 +519,9 @@ impl DatabaseCatalog {
                 .map_err(|e| TaibaiError::Storage(format!("failed to parse catalog: {}", e)))?;
             catalog.name = db_name.to_string();
             for table in catalog.tables.values_mut() {
+                // Freshly loaded maps hold unique Arcs, so make_mut is a
+                // no-copy unwrap here.
+                let table = std::sync::Arc::make_mut(table);
                 table.database = db_name.to_string();
                 table.update_partition_key_idx();
                 table.update_ttl_column_idx();
@@ -563,7 +566,8 @@ impl DatabaseCatalog {
             return Err(TaibaiError::Sql(format!("table '{}' already exists", name)));
         }
         let meta = TableMeta::new(&self.name, name, columns);
-        self.tables.insert(name.to_string(), meta);
+        self.tables
+            .insert(name.to_string(), std::sync::Arc::new(meta));
         Ok(())
     }
 
@@ -575,11 +579,20 @@ impl DatabaseCatalog {
     }
 
     pub fn get_table(&self, name: &str) -> Option<&TableMeta> {
+        self.tables.get(name).map(|table| table.as_ref())
+    }
+
+    /// Shared handle for hot paths that only read metadata: cloning the Arc
+    /// escapes the catalog lock without copying the table definition.
+    pub fn get_table_shared(&self, name: &str) -> Option<&std::sync::Arc<TableMeta>> {
         self.tables.get(name)
     }
 
     pub fn get_table_mut(&mut self, name: &str) -> Option<&mut TableMeta> {
-        self.tables.get_mut(name)
+        // Copy-on-write: DDL under the catalog write lock pays a TableMeta
+        // copy only when an in-flight reader still shares the old snapshot.
+        let table = self.tables.get_mut(name)?;
+        Some(std::sync::Arc::make_mut(table))
     }
 
     pub fn table_names(&self) -> Vec<&str> {
@@ -600,15 +613,16 @@ impl DatabaseCatalog {
             )));
         }
         let mut meta = self.tables.remove(old_name).unwrap();
+        let meta = std::sync::Arc::make_mut(&mut meta);
         meta.name = new_name.to_string();
-        self.tables.insert(new_name.to_string(), meta);
+        self.tables
+            .insert(new_name.to_string(), std::sync::Arc::new(meta.clone()));
         Ok(())
     }
 
     pub fn add_column(&mut self, table_name: &str, mut column: ColumnDef) -> Result<()> {
         let table = self
-            .tables
-            .get_mut(table_name)
+            .get_table_mut(table_name)
             .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         if table.columns.iter().any(|c| c.name == column.name) {
             return Err(TaibaiError::Sql(format!(
@@ -624,8 +638,7 @@ impl DatabaseCatalog {
 
     pub fn drop_column(&mut self, table_name: &str, column_name: &str) -> Result<()> {
         let table = self
-            .tables
-            .get_mut(table_name)
+            .get_table_mut(table_name)
             .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         let idx = table
             .columns
@@ -665,8 +678,7 @@ impl DatabaseCatalog {
         new_name: &str,
     ) -> Result<()> {
         let table = self
-            .tables
-            .get_mut(table_name)
+            .get_table_mut(table_name)
             .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         if table.columns.iter().any(|c| c.name == new_name) {
             return Err(TaibaiError::Sql(format!(
@@ -706,8 +718,7 @@ impl DatabaseCatalog {
         precision: i32,
     ) -> Result<()> {
         let table = self
-            .tables
-            .get_mut(table_name)
+            .get_table_mut(table_name)
             .ok_or_else(|| TaibaiError::Sql(format!("table '{}' does not exist", table_name)))?;
         let col = table
             .columns

@@ -81,23 +81,78 @@ impl Engine {
         };
 
         let mut partitions = std::collections::HashSet::new();
+        // Typed, memoized key derivation straight from column storage; the
+        // scalar-based `hot_partition_key_for_value` is the semantic
+        // reference. NULL rows and unsupported partition types are skipped,
+        // exactly as before.
+        use crate::storage::partition::partition_function::{
+            PartitionKeyKind, PartitionKeysAt,
+        };
+        use crate::storage::catalog::schema::PartitionType;
+        let partition_column = batch.column(partition_col_idx);
+        let kind = match table_meta.partition_type {
+            PartitionType::Value => Some(PartitionKeyKind::ValueText),
+            PartitionType::Day => Some(PartitionKeyKind::Strategy(
+                crate::storage::partition::partition_function::PartitionFunction::Day,
+            )),
+            PartitionType::Month => Some(PartitionKeyKind::Strategy(
+                crate::storage::partition::partition_function::PartitionFunction::Month,
+            )),
+            PartitionType::Year => Some(PartitionKeyKind::Strategy(
+                crate::storage::partition::partition_function::PartitionFunction::Year,
+            )),
+            _ => None,
+        };
+        let Some((kind, partition_column)) = kind.zip(partition_column) else {
+            return HotResidentMark::None;
+        };
+        let mut keys = PartitionKeysAt::new(kind, partition_column);
         for row_idx in 0..batch.num_rows() {
-            let Some(value) = batch.scalar(row_idx, partition_col_idx) else {
+            if partition_column.bitmap().is_null(row_idx) {
                 continue;
-            };
-            let Some(key) = Self::hot_partition_key_for_value(table_meta, &value) else {
+            }
+            let key = keys.key_at(row_idx);
+            if matches!(
+                kind,
+                PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Day,
+                ) | PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Month,
+                ) | PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Year,
+                )
+            ) && key.is_empty()
+            {
+                // Temporal derivation failed for this value; the scalar path
+                // returned None here.
                 continue;
-            };
-            partitions.insert(key);
+            }
+            partitions.insert(key.to_string());
         }
         if partitions.is_empty() {
             return HotResidentMark::None;
         }
 
-        let markable = partitions
-            .into_iter()
-            .filter(|partition| !Self::partition_has_segment(&table_dir, partition))
-            .collect::<Vec<_>>();
+        // Consult the positive segment cache before hitting the filesystem:
+        // once a partition is known to own a segment, it never needs marking
+        // resident again, and skip-list decisions must stay conservative.
+        let markable = {
+            let mut cache = self.hot_partition_segments.lock().unwrap();
+            let known = cache.entry(table_dir.clone()).or_default();
+            partitions
+                .into_iter()
+                .filter(|partition| {
+                    if known.contains(partition.as_str()) {
+                        return false;
+                    }
+                    if Self::partition_has_segment(&table_dir, partition) {
+                        known.insert(partition.clone());
+                        return false;
+                    }
+                    true
+                })
+                .collect::<Vec<_>>()
+        };
         if markable.is_empty() {
             HotResidentMark::None
         } else {
@@ -120,25 +175,12 @@ impl Engine {
         }
     }
 
-    fn hot_partition_key_for_value(
-        table_meta: &crate::storage::catalog::schema::TableMeta,
-        value: &crate::types::scalar::ScalarValue,
-    ) -> Option<String> {
-        match table_meta.partition_type {
-            crate::storage::catalog::schema::PartitionType::Value => value.to_text(),
-            crate::storage::catalog::schema::PartitionType::Day => {
-                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Day).ok()
-            }
-            crate::storage::catalog::schema::PartitionType::Month => {
-                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Month)
-                    .ok()
-            }
-            crate::storage::catalog::schema::PartitionType::Year => {
-                crate::storage::partition::compute_partition_key(value, PartitionStrategy::Year)
-                    .ok()
-            }
-            _ => None,
-        }
+    /// Drop the cached partition-segment knowledge for one table directory.
+    pub fn clear_hot_partition_segments(&self, table_dir: &std::path::Path) {
+        self.hot_partition_segments
+            .lock()
+            .unwrap()
+            .remove(table_dir);
     }
 
     fn table_has_any_segment(table_dir: &std::path::Path) -> bool {
@@ -233,9 +275,11 @@ impl Engine {
         &self,
         db: &str,
         table: &str,
-    ) -> Option<crate::storage::catalog::schema::TableMeta> {
+    ) -> Option<std::sync::Arc<crate::storage::catalog::schema::TableMeta>> {
         let catalogs = self.catalogs.read().unwrap();
-        catalogs.get(db).and_then(|c| c.get_table(table).cloned())
+        catalogs
+            .get(db)
+            .and_then(|c| c.get_table_shared(table).cloned())
     }
 
     /// Run one pass of partition-level TTL purge across all candidate

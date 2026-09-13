@@ -13,7 +13,7 @@ use crate::storage::core::batch_writer::{BatchWriter, BatchWriterConfig};
 use crate::storage::core::compactor::Compactor;
 use crate::storage::core::memtable::MemTableManager;
 use crate::storage::index::index_manager::IndexManager;
-use crate::storage::partition::{parse_partition_key, PartitionStrategy};
+use crate::storage::partition::parse_partition_key;
 use crate::storage::segment_manager::{SegmentConfig, SegmentManager};
 
 use crate::sql::parser::ast::Statement;
@@ -88,6 +88,11 @@ pub struct Engine {
     index_manager: Arc<IndexManager>,
     hot_store_mgr: Arc<crate::storage::core::hot_store::HotStoreManager>,
     performance_baselines: Arc<crate::common::performance_baseline::PerformanceBaselineStore>,
+    /// Per-table directories: partitions already known to have at least one
+    /// segment. Feeds the hot-store resident decision so a busy partitioned
+    /// INSERT path does not re-run `read_dir` per statement. Positive-only
+    /// entries (never invalidated by time) keep the filter conservative.
+    hot_partition_segments: Mutex<HashMap<std::path::PathBuf, HashSet<String>>>,
 }
 
 enum HotResidentMark {

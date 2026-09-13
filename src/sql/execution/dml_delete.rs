@@ -313,12 +313,11 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
             .enumerate()
             .find(|(_, (indices, _))| *indices == primary_key_indices)
         {
-            let keys = keys.iter().cloned().collect::<Vec<_>>();
             match engine.index_manager().unique_key_locations(
                 db,
                 table,
                 crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
-                &keys,
+                keys,
             )? {
                 Some(locations) => direct_locations.extend(locations),
                 None => fallback[key_set_offset] = true,
@@ -342,10 +341,9 @@ pub(crate) fn delete_replace_conflicts_under_table_lock(
         else {
             continue;
         };
-        let keys = keys.iter().cloned().collect::<Vec<_>>();
         match engine
             .index_manager()
-            .unique_key_locations(db, table, &index.name, &keys)?
+            .unique_key_locations(db, table, &index.name, keys)?
         {
             Some(locations) => direct_locations.extend(locations),
             None => fallback[key_set_offset] = true,

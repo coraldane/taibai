@@ -431,6 +431,9 @@ pub fn exec_drop_table(
     let total_start = Instant::now();
     tracing::info!(db, table = name, "drop table: start");
     let table_dir = engine.data_dir().join(db).join(name);
+    // The dropped directory invalidates any cached "partition has segment"
+    // entries; a same-name recreate must re-probe the filesystem.
+    engine.clear_hot_partition_segments(&table_dir);
     let mut catalogs = engine.catalogs().write().unwrap();
     tracing::info!(db, table = name, path = %table_dir.display(), "drop table: waiting for table mutation lock");
     let mut lock_attempts = 0u32;
@@ -511,7 +514,7 @@ pub fn exec_drop_table(
             catalog.drop_table(name)?;
             let meta_dir = engine.data_dir().join("meta");
             if let Err(save_error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), table_meta.clone());
+                catalog.tables.insert(name.to_string(), std::sync::Arc::new(table_meta.clone()));
                 if let Some(tombstone) = tombstone.as_deref() {
                     if let Err(restore_error) =
                         restore_staged_table_directory(tombstone, &table_dir)
@@ -881,7 +884,7 @@ fn exec_partition_change(
 
             let meta_dir = engine.data_dir().join("meta");
             if let Err(error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), before_meta.clone());
+                catalog.tables.insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
                 restore_partition_files(&operation_dir, &table_dir)?;
                 return Err(error);
             }
@@ -994,7 +997,7 @@ fn exec_set_hot(engine: &Engine, db: &str, name: &str, hot: &HotDef) -> Result<E
 
             let meta_dir = engine.data_dir().join("meta");
             if let Err(error) = catalog.save(&meta_dir) {
-                catalog.tables.insert(name.to_string(), before_meta.clone());
+                catalog.tables.insert(name.to_string(), std::sync::Arc::new(before_meta.clone()));
                 return Err(error);
             }
 
@@ -1490,7 +1493,7 @@ pub fn exec_truncate_table(engine: &Engine, db: &str, table: &str) -> Result<Exe
             if let Err(error) = catalog.save(&meta_dir) {
                 catalog
                     .tables
-                    .insert(table.to_string(), before_meta.clone());
+                    .insert(table.to_string(), std::sync::Arc::new(before_meta.clone()));
                 rollback_staged_table_data(&operation_dir, &table_dir)?;
                 return Err(error);
             }

@@ -26,7 +26,6 @@ use crate::storage::segment::{
     encode_segment_header, store, SegmentReader, SegmentWriter, SEGMENT_HEADER_SIZE,
 };
 use crate::types::batch::{RecordBatch, Schema};
-use crate::types::scalar::ScalarValue;
 
 pub(crate) use config::bulk_compression_level;
 pub use config::SegmentConfig;

@@ -103,10 +103,11 @@ impl UserInfo {
 }
 
 fn is_admin_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "root" | "admin" | "administrator"
-    )
+    // Case-insensitive compare without allocating a lowercased copy; this
+    // runs on every permission check of every statement.
+    name.eq_ignore_ascii_case("root")
+        || name.eq_ignore_ascii_case("admin")
+        || name.eq_ignore_ascii_case("administrator")
 }
 
 fn permission_type_matches(granted: &PermissionType, requested: &PermissionType) -> bool {

@@ -26,6 +26,12 @@ fn heartbeat_query_classifier_only_matches_select_one() {
 
 #[test]
 fn query_log_classifier_only_tracks_result_set_queries() {
+    // The classifier short-circuits when the query log is disabled; enable a
+    // throwaway log so the classification logic is exercised.
+    let log_dir = tempfile::TempDir::new().expect("temp dir");
+    crate::common::query_log::init(&log_dir.path().join("queries.log"), 16)
+        .expect("init query log");
+
     for sql in [
         "SELECT * FROM metrics",
         "select * from metrics",

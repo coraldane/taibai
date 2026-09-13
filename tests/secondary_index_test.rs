@@ -52,7 +52,7 @@ fn seed_two_row_group_segment(engine: &Engine, db: &str, table: &str) {
     let table_meta = engine
         .get_table_meta(db, table)
         .expect("table metadata should exist");
-    let schema = Schema::new(table_meta.columns);
+    let schema = Schema::new(table_meta.columns.clone());
     let mut batch = RecordBatch::with_capacity(schema.clone(), 8300);
     for id in 0..8192 {
         let symbol = if id % 2 == 0 { "a" } else { "z" };

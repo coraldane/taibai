@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -506,13 +507,19 @@ impl IndexManager {
         Ok(())
     }
 
-    pub fn unique_key_locations(
+    /// `keys` is generic so callers can pass a slice, a `HashSet` of keys, or
+    /// an empty iterator without cloning the key set into a `Vec` first.
+    pub fn unique_key_locations<I>(
         &self,
         db: &str,
         table: &str,
         index_name: &str,
-        keys: &[Vec<ScalarValue>],
-    ) -> Result<Option<Vec<UniqueRowLocation>>> {
+        keys: I,
+    ) -> Result<Option<Vec<UniqueRowLocation>>>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
+    {
         let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
@@ -530,8 +537,8 @@ impl IndexManager {
             state = refreshed;
         }
         let encoded_keys = keys
-            .iter()
-            .map(|key| encode_unique_key(key))
+            .into_iter()
+            .map(|key| encode_unique_key(key.borrow()))
             .collect::<Result<Vec<_>>>()?;
         let mut locations = {
             let delta = state.delta.read().unwrap();
@@ -605,13 +612,18 @@ impl IndexManager {
         Ok(Some(locations))
     }
 
-    pub fn unique_keys_exist(
+    /// Generic for the same reason as [`unique_key_locations`].
+    pub fn unique_keys_exist<I>(
         &self,
         db: &str,
         table: &str,
         index_name: &str,
-        keys: &[Vec<ScalarValue>],
-    ) -> Result<Option<bool>> {
+        keys: I,
+    ) -> Result<Option<bool>>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
+    {
         let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
@@ -627,8 +639,8 @@ impl IndexManager {
             state = refreshed;
         }
         let mut encoded_keys = keys
-            .iter()
-            .map(|key| encode_unique_key(key))
+            .into_iter()
+            .map(|key| encode_unique_key(key.borrow()))
             .collect::<Result<Vec<_>>>()?;
         encoded_keys.sort();
         encoded_keys.dedup();

@@ -83,14 +83,13 @@ pub fn validate_unique_key_uniqueness(
                 .map(|idx| schema.columns[*idx].name.clone())
                 .collect::<Vec<_>>();
             if columns == index_columns {
-                let key_vec = keys.iter().cloned().collect::<Vec<_>>();
-                match engine
-                    .index_manager()
-                    .unique_keys_exist(db, table, index_name, &key_vec)?
-                {
+                // Pass the set directly: the lookup is generic over the key
+                // iteration, so the whole key set need not be re-cloned per
+                // INSERT.
+                match engine.index_manager().unique_keys_exist(db, table, index_name, &keys)? {
                     Some(false) => return Ok(()),
                     Some(true) => {
-                        for key in &key_vec {
+                        for key in &keys {
                             if engine
                                 .index_manager()
                                 .unique_key_exists(db, table, index_name, key)?
@@ -517,28 +516,4 @@ fn duplicate_primary_key_error(table: &str, key: &[ScalarValue]) -> TaibaiError 
         "duplicate primary key for table '{}': ({})",
         table, key_text
     ))
-}
-
-fn compute_partition_key_for_value(
-    table_meta: &crate::storage::catalog::schema::TableMeta,
-    val: &ScalarValue,
-) -> String {
-    if table_meta.partition_key.is_empty() {
-        return String::new();
-    }
-    use crate::storage::catalog::schema::PartitionType;
-    match table_meta.partition_type {
-        PartitionType::Day
-        | PartitionType::Year
-        | PartitionType::Month
-        | PartitionType::Hash
-        | PartitionType::Mod => {
-            crate::storage::partition::partition_function::compute_partition_key_from_scalar(
-                &table_meta.partition_strategy(),
-                val,
-            )
-        }
-        PartitionType::Value => val.to_text().unwrap_or_default(),
-        PartitionType::None => String::new(),
-    }
 }
