@@ -26,7 +26,7 @@
 - **批量导入**:DuckDB 337 万行/s,taibai 165 万行/s(差 2 倍);taibai 压缩率更高(400MB vs 667MB / 千万行)。
 - **实时写入(持久化)**:调优后 taibai **25.6 万行/s**(fsync ACK 语义),已超过 DuckDB appender 的 23.1 万行/s;高并发下组提交把 fsync 成本摊薄到接近免费(strict ≈ async)。
 - **点查(taibai 的主场)**:盘中热存路径 **~1ms**(2000 行结果,刷盘前后一致);收盘归档后 1.5~4ms;DuckDB 无二级索引、未聚类,同查询 55ms。
-- **扫描聚合(DuckDB 的主场)**:v3+v4 后差距持续收敛(全表聚合 0.97ms vs ~45ms;千万行 GROUP BY 11ms vs 229ms);剩余差距在字典直通解码与流水线重叠(见 §10)。
+- **扫描聚合(DuckDB 的主场)**:v3→v5 后差距大幅收敛(全表聚合 0.97ms vs ~38ms;千万行 GROUP BY 11ms vs 111ms——从 76× 收敛到 10×);剩余差距在字典直通解码与流水线重叠(见 §10)。
 - **hotstore 进程内微基准**:append 1600万~1709万行/s,symbol 最新 N 条点查 1.2~2.0µs,整键 gather 1900万~2615万行/s。
 - **本轮修复**(§7):修掉 3 个热存快路径上的真实正确性 bug(事务行丢失、reclaim 后丢行、REPLACE 残留),并澄清 v1 报告的"352ms 缺口"真因是收盘归档调度。
 
@@ -84,15 +84,15 @@ insert-profile 阶段拆解(100 行/条,服务端):
 
 ## 4. 查询性能(10M 行 × 34 列冷表)
 
-| 查询 | taibai 原始导入后 | taibai OPTIMIZE 后 | taibai OPTIMIZE + 扫描优化(v3) | taibai + 分组快路径(v4) | DuckDB |
-|---|---|---|---|---|---|
-| Q1 点查:单 symbol 单日 → 2000 行×34 列 | 363 ms | **3.0 ms**(wall 5.1 ms) | ~5 ms | **~3.9 ms wall** | 55.0 ms |
-| Q2 单 symbol 最新 10 条 | 616 ms | **6.5 ms** | 不变 | **~6.0 ms** | 7.0 ms |
-| Q3 单 symbol 全期聚合 | 308 ms | **1.9 ms** | ~2.0 ms | **~1.9 ms** | 2.5 ms |
-| Q4 单日 2M 行 GROUP BY | 219 ms | 181 ms | 79 ms | **47 ms**(3.8×) | **7.2 ms** |
-| Q5 全表 10M 行 GROUP BY | 1.07 s | 836 ms | 388 ms | **229 ms**(3.7×) | **11.0 ms** |
-| Q6 单日 2M 行过滤聚合 | 49 ms | 28 ms | 12.7 ms | **~10 ms**(2.8×) | **0.72 ms** |
-| Q7 全表 10M 行 count+sum | 224 ms | 110 ms | 38 ms | ~45 ms(噪声区间) | **0.97 ms** |
+| 查询 | taibai 原始导入后 | taibai OPTIMIZE 后 | taibai OPTIMIZE + 扫描优化(v3) | taibai + 分组快路径(v4) | taibai + 并行分组(v5) | DuckDB |
+|---|---|---|---|---|---|---|
+| Q1 点查:单 symbol 单日 → 2000 行×34 列 | 363 ms | **3.0 ms**(wall 5.1 ms) | ~5 ms | ~3.9 ms | **~3.9 ms** | 55.0 ms |
+| Q2 单 symbol 最新 10 条 | 616 ms | **6.5 ms** | 不变 | ~6.0 ms | **~6.0 ms** | 7.0 ms |
+| Q3 单 symbol 全期聚合 | 308 ms | **1.9 ms** | ~2.0 ms | ~1.9 ms | **~1.9 ms** | 2.5 ms |
+| Q4 单日 2M 行 GROUP BY | 219 ms | 181 ms | 79 ms | 47 ms | **26 ms**(8.4×) | **7.2 ms** |
+| Q5 全表 10M 行 GROUP BY | 1.07 s | 836 ms | 388 ms | 229 ms | **111 ms**(9.6×) | **11.0 ms** |
+| Q6 单日 2M 行过滤聚合 | 49 ms | 28 ms | 12.7 ms | ~10 ms | **~10 ms**(4.9×) | **0.72 ms** |
+| Q7 全表 10M 行 count+sum | 224 ms | 110 ms | 38 ms | ~45 ms | **~38 ms**(2.9×) | **0.97 ms** |
 
 (`OPTIMIZE TABLE` 一次性成本 2.43 s/10M 行。公平性:DuckDB 嵌入式无网络;taibai wall 含 localhost TCP,server_elapsed 不含。)
 
@@ -189,6 +189,18 @@ v1 报告把"写入结束后热表点查 352ms"归因于"刷盘使热存失去 r
 2. **字典解码零分配**:字典编码 VARCHAR 解码改为字典项借用 payload + 行展开单次 memcpy 直写列 UTF-8 arena(移除每行两次 String 克隆);plain VARCHAR 同样直写 Utf8Buffer。
 
 **结果**:Q5 388→**229ms**(累计 3.7×)、Q4 79→**47ms**(累计 3.8×)、Q6 28→**~10ms**;组数/每组计数/avg 最值校验精确(1000 组 × 10000 行)。
+
+### 10.2 并行分组聚合(v5,同日追加)
+
+分组行循环是单线程的(10M 行 × ~11ns ≈ 110ms 串行)。参照 DuckDB 的并行哈希聚合:
+
+- 输入 batch 按行切成 N 个连续区间(N = `max_parallel_row_groups`,≥8192 行才并行),每个槽位维护独立的 `FastGroups` 表,rayon 并行累加;
+- 槽位表只增不缩(lanes 变小时保留既有状态,曾因 resize 收缩丢表导致少 7/8 行,已修复并加正确性校验);
+- 收尾把 N 张表按"槽位序 + 各自插入序"合并(`merge_accumulator`:Count 相加、Sum 相加、Avg 累 sum/count),再走原有 spill/输出结构。
+
+**结果**:Q5 229→**111ms**(vs 最初 836ms = **7.5×**)、Q4 47→**26ms**(7×)、Q7 38ms 持平;正确性校验精确(1000 组/200 万行/sum 10M)。全量 40 个测试目标通过。
+
+**与 DuckDB 剩余差距**:Q5 111 vs 11ms(~10×)——集中在字典直通解码(VARCHAR 仍解码成字符串再 intern,存储字典未直通执行层)与解码/消费流水线重叠。
 
 ## 附:复现命令
 

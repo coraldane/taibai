@@ -13,7 +13,7 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use self::aggregate_fast::{fast_group_supported, fast_group_update, FastGroups};
+use self::aggregate_fast::{fast_group_supported, fast_group_update, merge_slot_tables, FastGroups};
 use super::ExecutionOp;
 
 mod aggregate_fast;
@@ -628,7 +628,8 @@ impl ExecutionOp for HashAggregateExec {
         let spill_rows = crate::common::config::query_limits()
             .spill_batch_rows
             .max(1);
-        let mut fast: Option<FastGroups> = None;
+        let mut fast_tables: Vec<Option<FastGroups>> = Vec::new();
+        let mut fast_unsupported = false;
 
         while let Some(batch) = self.input.next_batch()? {
             if physical_schema.is_none() {
@@ -667,20 +668,21 @@ impl ExecutionOp for HashAggregateExec {
 
             // Single-column GROUP BY fast path: intern the group key into a
             // dense u32 id (FxHash family, no SipHash, no per-row key buffer)
-            // and accumulate through pre-resolved typed column views. Falls
-            // back to the generic per-row loop for any unsupported shape.
-            if fast.is_none()
-                && fast_group_supported(&group_by, &gb_indices, &aggregates, &agg_col_indices, &batch)
-            {
-                fast = Some(FastGroups::new());
+            // and accumulate through pre-resolved typed column views across
+            // per-lane tables merged at the end. Falls back to the generic
+            // per-row loop for any unsupported shape.
+            if !fast_unsupported && fast_tables.is_empty() {
+                if !fast_group_supported(&group_by, &gb_indices, &aggregates, &agg_col_indices, &batch)
+                {
+                    fast_unsupported = true;
+                }
             }
-            if let Some(f) = fast.as_mut() {
+            if !fast_unsupported {
                 let phys = physical_schema.as_ref().unwrap_or(&self.input_schema);
                 fast_group_update(
-                    f,
+                    &mut fast_tables,
                     &batch,
                     gb_indices[0],
-                    &group_by,
                     &aggregates,
                     &agg_col_indices,
                     phys,
@@ -793,9 +795,10 @@ impl ExecutionOp for HashAggregateExec {
         }
 
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
-        let (groups, group_keys) = match fast {
-            Some(f) => f.into_maps(),
-            None => (groups, group_keys),
+        let (groups, group_keys) = if !fast_unsupported {
+            merge_slot_tables(&mut fast_tables).into_maps()
+        } else {
+            (groups, group_keys)
         };
         if !spills.is_empty() {
             if !groups.is_empty() {
