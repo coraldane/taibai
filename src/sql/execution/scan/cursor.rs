@@ -2,7 +2,10 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::common::error::Result;
+use crossbeam_channel::Receiver;
+use rayon::prelude::*;
+
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::catalog::schema::TableMeta;
 use crate::storage::segment::SegmentReader;
 use crate::storage::segment_manager::SegmentManager;
@@ -36,7 +39,19 @@ pub struct ScanCursor {
     /// (streaming reads, aggregates feeding HashAggregateExec) are not bound
     /// to one serial fetch/decode lane.
     prefetch: VecDeque<RecordBatch>,
+    /// Background decoder: streams the segment work list through a bounded
+    /// channel so row-group decode overlaps with downstream consumption
+    /// (aggregate/limit/encode) instead of alternating in window barriers.
+    decode_rx: Option<Receiver<Result<RecordBatch>>>,
 }
+
+/// Minimum decoded row groups before the background decoder is worth a
+/// thread; smaller scans decode inline.
+const BACKGROUND_DECODE_MIN_GROUPS: usize = 4;
+/// Bounded channel capacity: caps decoded-batch memory held ahead of the
+/// consumer (batches are ~10^4 rows, so 64 is a few hundred MB worst case
+/// for wide projections and far less for typical scans).
+const DECODE_CHANNEL_CAPACITY: usize = 64;
 
 impl ScanCursor {
     pub fn try_new(
@@ -70,6 +85,7 @@ impl ScanCursor {
             memtable_batches: Vec::new(),
             memtable_pos: 0,
             prefetch: VecDeque::new(),
+            decode_rx: None,
         }))
     }
 
@@ -98,6 +114,45 @@ impl ScanCursor {
 
         if matches!(self.remaining_limit, Some(0)) {
             return Ok(None);
+        }
+
+        // Background decoder mode: batches arrive through the bounded
+        // channel in work-list order; when the channel closes the memtable
+        // leg follows.
+        if self.decode_rx.is_some() {
+            loop {
+                if let Some(batch) = self.prefetch.pop_front() {
+                    if let Some(batch) = self.limit_batch(batch) {
+                        return Ok(Some(batch));
+                    }
+                    continue;
+                }
+                let received = match self
+                    .decode_rx
+                    .as_ref()
+                    .and_then(|rx| rx.recv().ok())
+                {
+                    Some(batch) => batch,
+                    None => {
+                        self.decode_rx = None;
+                        if self.prefetch.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let batch = strategy::apply_ttl_filter_and_projection(
+                    received?,
+                    &self.table_meta,
+                    &self.plan.projection_cols,
+                    self.plan.strip_ttl_column,
+                )?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                self.prefetch.push_back(batch);
+            }
+            return self.drain_memtable_leg();
         }
 
         while self.segment_pos < self.segments.len() {
@@ -204,6 +259,136 @@ impl ScanCursor {
         }
     }
 
+    /// Build the segment work list; when it is large enough, hand it to a
+    /// background decode thread fed through a bounded channel and report
+    /// that the channel serves the scan. Returns false when the scan should
+    /// stay on the inline sequential walk.
+    fn try_spawn_background_decoder(&mut self) -> Result<bool> {
+        let total_candidates: usize = self
+            .segments
+            .iter()
+            .filter_map(|segment| {
+                let meta = self
+                    .runtime
+                    .segment_mgr()
+                    .segment_meta(segment)
+                    .ok()
+                    .flatten()?;
+                let pred = self.spec.to_row_group_predicate();
+                if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
+                    return Some(0usize);
+                }
+                Some(
+                    super::row_group::prune_row_group_meta(
+                        &meta.row_groups,
+                        &pred,
+                        &super::row_group::build_bloom_check_list(&self.spec),
+                        &super::row_group::build_in_check_list(&self.spec),
+                        &super::row_group::build_set_check_list(&self.spec),
+                        &super::row_group::build_set_in_check_list(&self.spec),
+                    )
+                    .candidate_indices
+                    .len(),
+                )
+            })
+            .sum();
+        if total_candidates < BACKGROUND_DECODE_MIN_GROUPS {
+            return Ok(false);
+        }
+
+        let (tx, rx) = crossbeam_channel::bounded(DECODE_CHANNEL_CAPACITY);
+        let spec = self.spec.clone();
+        let plan = self.plan.clone();
+        let table_schema = self.table_schema.clone();
+        let _table_meta = self.table_meta.clone();
+        let runtime = self.runtime.clone();
+        let db = self.db.clone();
+        let segments = self.segments.clone();
+        let _ = db;
+        std::thread::Builder::new()
+            .name("taibai-cursor-decode".into())
+            .spawn(move || {
+                for segment in &segments {
+                    let reader =
+                        match runtime.segment_mgr().open_reader_cached(segment) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                    let candidates = if let Ok(Some(meta)) =
+                        runtime.segment_mgr().segment_meta(segment)
+                    {
+                        let pred = spec.to_row_group_predicate();
+                        if !super::row_group::prune_segment_by_zone_map(
+                            &pred,
+                            &meta.segment_zone_maps,
+                        ) {
+                            continue;
+                        }
+                        super::row_group::prune_row_group_meta(
+                            &meta.row_groups,
+                            &pred,
+                            &super::row_group::build_bloom_check_list(&spec),
+                            &super::row_group::build_in_check_list(&spec),
+                            &super::row_group::build_set_check_list(&spec),
+                            &super::row_group::build_set_in_check_list(&spec),
+                        )
+                        .candidate_indices
+                    } else {
+                        match strategy::prune_segment(&spec, &reader) {
+                            Some(pruned) => pruned.candidate_indices,
+                            None => continue,
+                        }
+                    };
+                    // Decode in parallel chunks (bounded by the global
+                    // cpu/io permits); send in candidate order so the
+                    // consumer sees the same sequence as the inline walk.
+                    for chunk in candidates.chunks(16) {
+                        let decoded: Vec<_> = chunk
+                            .par_iter()
+                            .filter_map(|row_group| {
+                                let _cpu = crate::common::work_limiter::acquire_cpu();
+                                let _io = crate::common::work_limiter::acquire_io();
+                                strategy::read_row_group_with_strategy(
+                                    &spec,
+                                    &plan,
+                                    &table_schema,
+                                    &reader,
+                                    *row_group,
+                                )
+                                .ok()
+                            })
+                            .collect();
+                        for batch in decoded {
+                            if tx.send(Ok(batch)).is_err() {
+                                // Consumer went away (LIMIT early exit / drop).
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| TaibaiError::Internal(format!("spawn cursor decoder failed: {e}")))?;
+        self.decode_rx = Some(rx);
+        Ok(true)
+    }
+
+    fn drain_memtable_leg(&mut self) -> Result<Option<RecordBatch>> {
+        while self.memtable_pos < self.memtable_batches.len() {
+            let batch = self.memtable_batches[self.memtable_pos].clone();
+            self.memtable_pos += 1;
+            let batch = strategy::apply_ttl_filter_and_projection(
+                batch,
+                &self.table_meta,
+                &self.plan.projection_cols,
+                self.plan.strip_ttl_column,
+            )?;
+            if let Some(batch) = self.limit_batch(batch) {
+                return Ok(Some(batch));
+            }
+        }
+        Ok(None)
+    }
+
     fn open_current_segment(&mut self) {
         let segment = &self.segments[self.segment_pos];
         let meta_candidates = self
@@ -278,6 +463,11 @@ impl ScanCursor {
         } else {
             Vec::new()
         };
+
+        if self.try_spawn_background_decoder()? {
+            self.initialized = true;
+            return Ok(());
+        }
 
         let mut memtable_spec = self.spec.clone();
         memtable_spec.projection = Some(self.plan.projection_cols.clone());
