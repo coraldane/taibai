@@ -60,6 +60,22 @@ FastGroupCol::Dict { ids, dict_len, bitmap } => {
 **更优**:槽位表共享同一 batch 的 dict(同批内必然相同),跨 batch 用
 `dict_values → gid` 的全局 intern(每 batch 仅 dict_len 次,而非行数次)。
 
+## 4.1 适配点侦察(编译器枚举,2026-09-13)
+
+加入变体后编译器枚举出 22 处非穷尽匹配,即第一步的完整工作清单:
+
+**array.rs 核心(8 处,原生实现)**:data_type(:820)、len(:846)、estimated_size_bytes(:850)、bitmap(:889/:943)、scalar(:970)、encode_key_at(:519)、push(:1006)、numeric 分派(:1314)。
+
+**外部消费点(14 处,第一步全部走 materialize 兜底)**:
+- row_filter.rs(扫描过滤)
+- result.rs:100(结果协议编码)
+- hot_store.rs:337(热存 feed)
+- column_codec.rs:521(段写入,理论不可达,防御)
+- column_encoding.rs:9、partition_function.rs:467、compactor.rs、writer.rs:563、wal_helper.rs:83、bulk_importer.rs:59、helpers.rs、join_hashtable.rs:63、dml_insert/fast.rs:498、analytics.rs:224/317(表达式向量内核)
+
+兜底范式(每个 match 臂):
+`ColumnArray::Dictionary { .. } => return self.materialize_varchar().<原调用>,`
+
 ## 5. 渐进策略(降低手术风险)
 
 1. **第一步只做"产生 + 聚合消费"**:解码产 Dictionary;聚合快路径/通用循环适配;
