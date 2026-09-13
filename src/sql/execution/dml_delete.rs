@@ -1125,7 +1125,7 @@ pub fn exec_delete(
         }
 
         if total_deleted > 0 {
-            engine.hot_store_manager().invalidate(db, table);
+            engine.invalidate_hot_store(db, table);
         }
 
         Ok(index_maintenance.apply(engine, db, table))

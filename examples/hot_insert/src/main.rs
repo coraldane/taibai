@@ -8,9 +8,12 @@ use taibai::net::client::Client;
 use tick::{append_insert_prefix, append_tick_csv_values};
 
 const HOT_TABLE: &str = "hot_tick";
-const DEFAULT_BATCH_SIZE: usize = 5000;
+// Steady-state durable-ingest sweet spot on NVMe (group-commit fsync
+// amortization): bigger batches and more concurrent clients feed each fsync
+// group with more rows. Measured 3.3x over the old 5000x4 defaults.
+const DEFAULT_BATCH_SIZE: usize = 20_000;
 const PIPELINE_DEPTH: usize = 8;
-const DEFAULT_CLIENTS: usize = 4;
+const DEFAULT_CLIENTS: usize = 8;
 const DEFAULT_CLOSE_AT: &str = "15:30";
 const HOT_CREATE_TABLE_SQL: &str = "CREATE TABLE {table} ( \
     security_id VARCHAR, \

@@ -79,6 +79,7 @@ fn full_memtables_flush_while_write_queue_stays_active() -> Result<()> {
             "20251231",
             make_batch(&schema, batch_idx * 4, 4)?,
             schema.clone(),
+            true,
         )?;
     }
 
@@ -114,6 +115,7 @@ fn tail_file_pressure_forces_table_flush() -> Result<()> {
             &partition.to_string(),
             make_batch(&schema, partition, 1)?,
             schema.clone(),
+            true,
         )?;
     }
     assert_eq!(
@@ -152,12 +154,12 @@ fn durable_flushes_share_one_active_segment() -> Result<()> {
 
     for batch_idx in 0..3 {
         let batch = make_batch(&schema, batch_idx * 4, 4)?;
-        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
         writer.flush_table(TEST_DB, TEST_TABLE)?;
     }
     // A final partial memtable also lands in the same active segment.
     let batch = make_batch(&schema, 12, 2)?;
-    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
     writer.flush_table(TEST_DB, TEST_TABLE)?;
     writer.stop();
 
@@ -185,7 +187,7 @@ fn crash_before_flush_replays_tail_exactly_once() -> Result<()> {
         let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
         let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
         let batch = make_batch(&schema, 100, 5)?;
-        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+        writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
         // No flush: stop only halts the background threads, leaving the
         // group-committed tail behind like a crash would.
         writer.stop();
@@ -230,7 +232,7 @@ fn crash_after_segment_append_suppresses_tail_replay() -> Result<()> {
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
     let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
     let batch = make_batch(&schema, 200, 6)?;
-    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
     writer.flush_table(TEST_DB, TEST_TABLE)?;
     writer.stop();
     assert_eq!(total_segment_rows(&table_dir), 6);
@@ -273,7 +275,7 @@ fn crash_mid_append_replays_tail() -> Result<()> {
     let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
     let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
     let batch = make_batch(&schema, 300, 3)?;
-    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
     writer.flush_table(TEST_DB, TEST_TABLE)?;
     writer.stop();
     assert_eq!(total_segment_rows(&table_dir), 3);
@@ -311,7 +313,7 @@ fn memory_pressure_spills_memtable_then_flush_materializes() -> Result<()> {
     let mut writer = BatchWriter::new(test_config(1024), Arc::clone(&segment_mgr), None);
 
     let batch = make_batch(&schema, 0, 5)?;
-    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone())?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", batch, schema.clone(), true)?;
     assert!(writer.memtable_manager().total_estimated_memory_bytes() > 0);
 
     // A 1-byte high-water mark forces the pass to spill everything.
@@ -359,6 +361,7 @@ fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
         "",
         make_batch(&schema, 0, 3)?,
         schema.clone(),
+        true,
     )?;
     let spilled = BatchWriter::spill_pressure_pass(
         &segment_mgr,
@@ -377,7 +380,7 @@ fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
         .expect("spilled rows materialize");
     assert_eq!(snapshot.num_rows(), 3);
 
-    writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 3, 2)?, schema)?;
+    writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 3, 2)?, schema, true)?;
     let snapshot = writer.memtable_manager().get_by_table(TEST_DB, TEST_TABLE)[0]
         .read_snapshot()
         .unwrap();

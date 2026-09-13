@@ -1055,3 +1055,137 @@ fn drop_table_removes_resident_hot_store_before_same_name_recreate() {
 
     engine.segment_mgr().shutdown();
 }
+
+/// The realtime gap this pins down: a hot-fed partition stays served by the
+/// hot store even after its memtable has been flushed into segments. The
+/// flushed rows are mirrored (every auto-commit append feeds the store), so
+/// the segment's existence must not retire the fast path — previously the
+/// point lookup fell back to an unclustered full segment scan once the flush
+/// landed.
+#[test]
+fn flushed_partition_still_served_by_resident_hot_store() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ticks (
+                sym VARCHAR NOT NULL,
+                deal_date INT32 NOT NULL,
+                trade_time TIMESTAMP NOT NULL,
+                ts INT32 NOT NULL
+            ) PARTITION BY deal_date CLUSTER BY (sym, deal_date) HOT BY (trade_time) INDEX (sym)",
+        )
+        .expect("create ticks");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO ticks VALUES ('A', 20260108, 1782718238000000, 1), ('A', 20260108, 1782718238000001, 2), ('B', 20260108, 1782718238000002, 7)",
+        )
+        .expect("insert rows");
+
+    // Persist the memtable into a segment. The partition keeps its resident
+    // mark and no write has bypassed the mirror, so the fast path must keep
+    // answering from the hot store alone.
+    engine
+        .execute(&mut session, "FLUSH TABLE ticks")
+        .expect("flush rows");
+
+    let store = engine
+        .hot_store_manager()
+        .get("main", "ticks")
+        .expect("hot store present");
+    assert!(
+        store.is_resident_for_partition(Some("20260108")),
+        "flushed partition must stay resident"
+    );
+    assert_eq!(
+        engine
+            .batch_writer()
+            .memtable_manager()
+            .hot_unfed_rows("main", "ticks", "20260108"),
+        0,
+        "auto-commit appends are fully mirrored"
+    );
+
+    let rows = collect_ts_values(
+        engine
+            .execute(&mut session, "SELECT ts FROM ticks WHERE sym = 'A' AND deal_date = 20260108")
+            .expect("post-flush point lookup"),
+    );
+    assert_eq!(rows, vec![1, 2], "hot store must serve the flushed partition");
+
+    // Row counts stay consistent after the flush too.
+    assert_eq!(
+        collect_count(
+            engine
+                .execute(&mut session, "SELECT count(*) FROM ticks WHERE deal_date = 20260108")
+                .expect("post-flush count")
+        ),
+        3
+    );
+
+    engine.segment_mgr().shutdown();
+}
+
+/// A committed transaction never mirrors into the hot store, so once one
+/// lands in a partition the resident fast path must stand down for it while
+/// results stay correct.
+#[test]
+fn committed_transaction_disables_resident_fast_path_for_partition() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE ticks (
+                sym VARCHAR NOT NULL,
+                deal_date INT32 NOT NULL,
+                trade_time TIMESTAMP NOT NULL,
+                ts INT32 NOT NULL
+            ) PARTITION BY deal_date CLUSTER BY (sym, deal_date) HOT BY (trade_time) INDEX (sym)",
+        )
+        .expect("create ticks");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO ticks VALUES ('A', 20260108, 1782718238000000, 1)",
+        )
+        .expect("auto-commit row");
+
+    engine
+        .execute(&mut session, "BEGIN")
+        .expect("begin txn");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO ticks VALUES ('A', 20260108, 1782718238000001, 2)",
+        )
+        .expect("txn row");
+    engine
+        .execute(&mut session, "COMMIT")
+        .expect("commit txn");
+
+    assert!(
+        engine
+            .batch_writer()
+            .memtable_manager()
+            .hot_unfed_rows("main", "ticks", "20260108")
+            > 0,
+        "committed txn rows must be accounted as unmirrored"
+    );
+
+    // Correctness first: the point lookup still sees both rows.
+    let rows = collect_ts_values(
+        engine
+            .execute(&mut session, "SELECT ts FROM ticks WHERE sym = 'A' AND deal_date = 20260108")
+            .expect("post-txn point lookup"),
+    );
+    assert_eq!(rows, vec![1, 2]);
+
+    engine.segment_mgr().shutdown();
+}

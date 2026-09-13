@@ -202,6 +202,7 @@ impl ScanCursor {
         hot_spec.projection = Some(self.plan.projection_cols.clone());
         if let Some(batch) = memtable::scan_resident_hot_store(
             self.runtime.hot_store_manager(),
+            self.runtime.memtable_manager(),
             &self.db,
             &self.table_meta,
             &hot_spec,

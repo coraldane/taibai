@@ -263,8 +263,9 @@ impl BatchWriter {
         partition_key: &str,
         batch: RecordBatch,
         schema: Schema,
+        hot_fed: bool,
     ) -> Result<u64> {
-        self.write_columns_with_txn(db, table, partition_key, batch, schema, 0)
+        self.write_columns_with_txn(db, table, partition_key, batch, schema, 0, hot_fed)
     }
 
     pub fn write_columns_with_txn(
@@ -275,6 +276,7 @@ impl BatchWriter {
         batch: RecordBatch,
         schema: Schema,
         txn_id: u64,
+        hot_fed: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
@@ -293,6 +295,7 @@ impl BatchWriter {
                 schema,
                 txn_id,
                 prepared,
+                hot_fed,
             )
         })?;
         if let Some((ticket, memtable)) = pending {
@@ -319,6 +322,7 @@ impl BatchWriter {
         schema: Schema,
         txn_id: u64,
         prepared: Option<PreparedTailAppend>,
+        hot_fed: bool,
     ) -> Result<LockedWriteOutcome> {
         let row_count = batch.num_rows() as u64;
         if !self.segment_mgr.table_dir(db, table).is_dir() {
@@ -357,6 +361,13 @@ impl BatchWriter {
             row_count as usize,
             append_start.elapsed(),
         );
+        // Mirror accounting: auto-commit rows appended without a hot-store
+        // feed make the partition unprovable for the resident fast path.
+        // Transaction deltas are accounted at COMMIT instead.
+        if txn_id == 0 && !hot_fed {
+            self.memtable_mgr
+                .note_hot_unfed_rows(db, table, partition_key, row_count);
+        }
         if txn_id == 0 && mt.row_count() >= self.config.max_rows_per_memtable {
             let _ = self.sender.try_send(WriteCommand::Flush {
                 db: db.to_string(),
@@ -374,6 +385,7 @@ impl BatchWriter {
         batch: RecordBatch,
         schema: Schema,
         txn_id: u64,
+        hot_fed: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
@@ -416,6 +428,11 @@ impl BatchWriter {
             row_count as usize,
             append_start.elapsed(),
         );
+        // Mirror accounting, same contract as write_columns_grouped_under_table_lock.
+        if txn_id == 0 && !hot_fed {
+            self.memtable_mgr
+                .note_hot_unfed_rows(db, table, partition_key, row_count);
+        }
 
         if txn_id == 0 && mt.row_count() >= self.config.max_rows_per_memtable {
             let _ = self.sender.try_send(WriteCommand::Flush {

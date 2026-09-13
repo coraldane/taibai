@@ -468,6 +468,16 @@ impl Engine {
             }
         } else if result > 0 {
             self.hot_store_mgr.clear_resident_coverage(db, &table_name);
+            // Bulk-mode writes skip the hot-store feed entirely and their
+            // partitions are not derived here; retire the fast path for the
+            // table until the store is rebuilt (restart warmup / invalidate).
+            if table_meta_for_hot.as_ref().is_some_and(|meta| {
+                crate::storage::core::hot_store::resolve_key_column(meta).is_some()
+            }) {
+                self.batch_writer
+                    .memtable_manager()
+                    .note_hot_unfed_table(db, &table_name, result);
+            }
         }
 
         if result > 0 {
@@ -551,6 +561,7 @@ impl Engine {
             }
             Err(e) => {
                 self.hot_store_mgr.clear_resident_coverage(db, table);
+                self.note_mirror_batch(db, table, table_meta, batch, false);
                 tracing::warn!(
                     db,
                     table,
@@ -571,20 +582,35 @@ impl Engine {
             crate::storage::core::hot_store::ResidentCoverageSnapshot,
         >,
     ) {
-        let feed_result = (|| -> Result<()> {
-            let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
-            let schema = Schema::new(table_meta.columns.clone());
-            let batch =
-                crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)?;
-            match self.feed_hot_store(db, table, table_meta, &batch) {
-                Ok(()) => Ok(()),
-                Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
-                    self.reclaim_hot_store_pressure(db, table);
-                    self.feed_hot_store(db, table, table_meta, &batch)
+        let parse_result = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)
+            .and_then(|req| {
+                let schema = Schema::new(table_meta.columns.clone());
+                crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)
+            });
+        let mut feed_batch: Option<RecordBatch> = None;
+        let feed_result = match parse_result {
+            Ok(batch) => {
+                let fed = match self.feed_hot_store(db, table, table_meta, &batch) {
+                    Ok(()) => Ok(()),
+                    Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
+                        self.reclaim_hot_store_pressure(db, table);
+                        self.feed_hot_store(db, table, table_meta, &batch)
+                    }
+                    Err(e) => Err(e),
+                };
+                match fed {
+                    Ok(()) => {
+                        feed_batch = Some(batch);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        feed_batch = Some(batch);
+                        Err(e)
+                    }
                 }
-                Err(e) => Err(e),
             }
-        })();
+            Err(e) => Err(e),
+        };
 
         match feed_result {
             Ok(()) => {
@@ -595,6 +621,15 @@ impl Engine {
             }
             Err(e) => {
                 self.hot_store_mgr.clear_resident_coverage(db, table);
+                // The payload rows are already persisted but not mirrored;
+                // mark what we can so the resident fast path stands down.
+                match feed_batch.as_ref() {
+                    Some(batch) => self.note_mirror_batch(db, table, table_meta, batch, false),
+                    None => self
+                        .batch_writer
+                        .memtable_manager()
+                        .note_hot_unfed_table(db, table, 1),
+                }
                 tracing::warn!(
                     db,
                     table,

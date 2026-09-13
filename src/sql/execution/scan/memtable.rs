@@ -24,6 +24,7 @@ fn live_memtables_and_watermark(
 
 pub fn scan_resident_hot_store(
     hot_mgr: &HotStoreManager,
+    memtable_mgr: &MemTableManager,
     db: &str,
     table_meta: &TableMeta,
     spec: &ScanSpec,
@@ -35,7 +36,7 @@ pub fn scan_resident_hot_store(
     if store.row_count() == 0 {
         return None;
     }
-    if !resident_hot_covers(&store, table_meta, spec) {
+    if !resident_hot_covers(&store, memtable_mgr, db, table_meta, spec) {
         return None;
     }
     scan_hot_store_by_key(&store, spec, 0)
@@ -43,6 +44,7 @@ pub fn scan_resident_hot_store(
 
 pub fn count_resident_hot_store(
     hot_mgr: &HotStoreManager,
+    memtable_mgr: &MemTableManager,
     db: &str,
     table_meta: &TableMeta,
     spec: &ScanSpec,
@@ -54,13 +56,26 @@ pub fn count_resident_hot_store(
     if store.row_count() == 0 {
         return None;
     }
-    if !resident_hot_covers(&store, table_meta, spec) {
+    if !resident_hot_covers(&store, memtable_mgr, db, table_meta, spec) {
         return None;
     }
     count_hot_store_by_key(&store, spec, 0)
 }
 
-fn resident_hot_covers(store: &HotStore, table_meta: &TableMeta, spec: &ScanSpec) -> bool {
+/// The hot store may answer a partition scan alone only when it holds the
+/// partition's full row set: the store must mark the partition resident AND
+/// no write may have bypassed the hot-store mirror for it. The second check
+/// is what keeps the fast path correct after memtables have been flushed to
+/// segments — the flush itself does not invalidate residency because the
+/// flushed rows are mirrored, but a transaction delta / relaxed or bulk
+/// bypass write does (recorded by the writer as hot-unfed rows).
+fn resident_hot_covers(
+    store: &HotStore,
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> bool {
     let target_partition = if table_meta.is_partitioned() {
         let Some(pi) = spec.partition_info.as_ref() else {
             return false;
@@ -74,7 +89,14 @@ fn resident_hot_covers(store: &HotStore, table_meta: &TableMeta, spec: &ScanSpec
     } else {
         None
     };
-    store.is_resident_for_partition(target_partition.as_deref())
+    if !store.is_resident_for_partition(target_partition.as_deref()) {
+        return false;
+    }
+    memtable_mgr.hot_partition_mirrored(
+        db,
+        &spec.table_name,
+        target_partition.as_deref().unwrap_or(""),
+    )
 }
 
 pub fn scan_memtables(
@@ -99,7 +121,15 @@ pub fn scan_memtables(
     // segment scan, so the gather here skips them. This prefix invariant holds
     // for the single-active-partition ingestion pattern (e.g. today's ticks).
     let has_live_memtable_data = memtables.iter().any(|mt| mt.row_count() > 0);
-    if has_live_memtable_data && spec.reader_txn_id == 0 {
+    // The shortcut below replaces the memtable scan with hot-store rows above
+    // the watermark, which is only equivalent while every live memtable row is
+    // hot-fed. A committed transaction delta (or any other bypass write) lives
+    // in a memtable the store never mirrored; with one present, fall through
+    // to the plain memtable scan so those rows stay visible.
+    if has_live_memtable_data
+        && spec.reader_txn_id == 0
+        && memtable_mgr.hot_table_fully_mirrored(db, table_name)
+    {
         if let Some(store) = hot_mgr.get(db, table_name) {
             let (_, watermark) = live_memtables_and_watermark(
                 memtable_mgr,

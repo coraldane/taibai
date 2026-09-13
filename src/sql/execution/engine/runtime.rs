@@ -69,66 +69,7 @@ impl Engine {
             };
         }
 
-        let Some(partition_col_idx) =
-            table_meta.get_partition_column_index_cached().or_else(|| {
-                table_meta
-                    .columns
-                    .iter()
-                    .position(|col| col.name.eq_ignore_ascii_case(&table_meta.partition_key))
-            })
-        else {
-            return HotResidentMark::None;
-        };
-
-        let mut partitions = std::collections::HashSet::new();
-        // Typed, memoized key derivation straight from column storage; the
-        // scalar-based `hot_partition_key_for_value` is the semantic
-        // reference. NULL rows and unsupported partition types are skipped,
-        // exactly as before.
-        use crate::storage::partition::partition_function::{
-            PartitionKeyKind, PartitionKeysAt,
-        };
-        use crate::storage::catalog::schema::PartitionType;
-        let partition_column = batch.column(partition_col_idx);
-        let kind = match table_meta.partition_type {
-            PartitionType::Value => Some(PartitionKeyKind::ValueText),
-            PartitionType::Day => Some(PartitionKeyKind::Strategy(
-                crate::storage::partition::partition_function::PartitionFunction::Day,
-            )),
-            PartitionType::Month => Some(PartitionKeyKind::Strategy(
-                crate::storage::partition::partition_function::PartitionFunction::Month,
-            )),
-            PartitionType::Year => Some(PartitionKeyKind::Strategy(
-                crate::storage::partition::partition_function::PartitionFunction::Year,
-            )),
-            _ => None,
-        };
-        let Some((kind, partition_column)) = kind.zip(partition_column) else {
-            return HotResidentMark::None;
-        };
-        let mut keys = PartitionKeysAt::new(kind, partition_column);
-        for row_idx in 0..batch.num_rows() {
-            if partition_column.bitmap().is_null(row_idx) {
-                continue;
-            }
-            let key = keys.key_at(row_idx);
-            if matches!(
-                kind,
-                PartitionKeyKind::Strategy(
-                    crate::storage::partition::partition_function::PartitionFunction::Day,
-                ) | PartitionKeyKind::Strategy(
-                    crate::storage::partition::partition_function::PartitionFunction::Month,
-                ) | PartitionKeyKind::Strategy(
-                    crate::storage::partition::partition_function::PartitionFunction::Year,
-                )
-            ) && key.is_empty()
-            {
-                // Temporal derivation failed for this value; the scalar path
-                // returned None here.
-                continue;
-            }
-            partitions.insert(key.to_string());
-        }
+        let partitions = Self::batch_partition_keys(table_meta, batch);
         if partitions.is_empty() {
             return HotResidentMark::None;
         }
@@ -157,6 +98,105 @@ impl Engine {
             HotResidentMark::None
         } else {
             HotResidentMark::Partitions(markable)
+        }
+    }
+
+
+    /// Distinct partition keys of a batch (empty for non-partitioned tables
+    /// or when no key can be derived). Typed, memoized key derivation
+    /// straight from column storage; the scalar-based
+    /// `hot_partition_key_for_value` is the semantic reference. NULL rows and
+    /// unsupported partition types are skipped.
+    pub fn batch_partition_keys(
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: &crate::types::batch::RecordBatch,
+    ) -> Vec<String> {
+        if !table_meta.is_partitioned() {
+            return Vec::new();
+        }
+        let Some(partition_col_idx) =
+            table_meta.get_partition_column_index_cached().or_else(|| {
+                table_meta
+                    .columns
+                    .iter()
+                    .position(|col| col.name.eq_ignore_ascii_case(&table_meta.partition_key))
+            })
+        else {
+            return Vec::new();
+        };
+        use crate::storage::catalog::schema::PartitionType;
+        use crate::storage::partition::partition_function::{
+            PartitionKeyKind, PartitionKeysAt,
+        };
+        let partition_column = batch.column(partition_col_idx);
+        let kind = match table_meta.partition_type {
+            PartitionType::Value => Some(PartitionKeyKind::ValueText),
+            PartitionType::Day => Some(PartitionKeyKind::Strategy(
+                crate::storage::partition::partition_function::PartitionFunction::Day,
+            )),
+            PartitionType::Month => Some(PartitionKeyKind::Strategy(
+                crate::storage::partition::partition_function::PartitionFunction::Month,
+            )),
+            PartitionType::Year => Some(PartitionKeyKind::Strategy(
+                crate::storage::partition::partition_function::PartitionFunction::Year,
+            )),
+            _ => None,
+        };
+        let Some((kind, partition_column)) = kind.zip(partition_column) else {
+            return Vec::new();
+        };
+        let mut keys = PartitionKeysAt::new(kind, partition_column);
+        let mut partitions = std::collections::HashSet::new();
+        for row_idx in 0..batch.num_rows() {
+            if partition_column.bitmap().is_null(row_idx) {
+                continue;
+            }
+            let key = keys.key_at(row_idx);
+            if matches!(
+                kind,
+                PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Day,
+                ) | PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Month,
+                ) | PartitionKeyKind::Strategy(
+                    crate::storage::partition::partition_function::PartitionFunction::Year,
+                )
+            ) && key.is_empty()
+            {
+                // Temporal derivation failed for this value; the scalar path
+                // returned None here.
+                continue;
+            }
+            partitions.insert(key.to_string());
+        }
+        partitions.into_iter().collect()
+    }
+
+    /// Mirror accounting for a batch written outside the regular auto-commit
+    /// INSERT path (bulk / relaxed direct writes). `hot_fed` must reflect
+    /// whether the batch was actually mirrored into the hot store.
+    pub fn note_mirror_batch(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: &crate::types::batch::RecordBatch,
+        hot_fed: bool,
+    ) {
+        if hot_fed || batch.num_rows() == 0 {
+            return;
+        }
+        if crate::storage::core::hot_store::resolve_key_column(table_meta).is_none() {
+            // Table has no hot store; nothing to account for.
+            return;
+        }
+        let mt_mgr = self.batch_writer.memtable_manager();
+        if table_meta.is_partitioned() {
+            for partition in Self::batch_partition_keys(table_meta, batch) {
+                mt_mgr.note_hot_unfed_rows(db, table, &partition, batch.num_rows() as u64);
+            }
+        } else {
+            mt_mgr.note_hot_unfed_rows(db, table, "", batch.num_rows() as u64);
         }
     }
 
@@ -227,6 +267,13 @@ impl Engine {
         let prefix = store_rows.saturating_sub(live);
         if prefix > 0 {
             let dropped = self.hot_store_mgr.compact_prefix(db, table, prefix);
+            // Rows below the new front are gone from the store: retract
+            // residency and flip the mirror accounting so resident-partition
+            // scans fall back to the segment scan instead of under-counting.
+            self.hot_store_mgr.clear_resident_coverage(db, table);
+            self.batch_writer
+                .memtable_manager()
+                .mark_hot_unfed_all_partitions(db, table);
             tracing::warn!(
                 db,
                 table,
@@ -242,6 +289,17 @@ impl Engine {
 
     pub fn auth_manager(&self) -> &Arc<AuthManager> {
         &self.auth_manager
+    }
+
+    /// Drop the hot store of a table together with its mirror accounting.
+    /// Every row-mutation path that invalidates the store (UPDATE/DELETE,
+    /// tail recovery) must go through here so the resident fast path and the
+    /// mirror bookkeeping stay consistent.
+    pub fn invalidate_hot_store(&self, db: &str, table: &str) {
+        self.hot_store_mgr.invalidate(db, table);
+        self.batch_writer
+            .memtable_manager()
+            .clear_hot_unfed(db, table);
     }
 
     pub fn auto_increment_manager(&self) -> &Arc<AutoIncrementManager> {

@@ -301,7 +301,7 @@ pub fn exec_update(
         // HotStore is append-only. Once rows are updated in place it is no
         // longer authoritative, and must not be lazily recreated from only
         // later INSERTs while older memtable rows are still live.
-        engine.hot_store_manager().invalidate(db, table);
+        engine.invalidate_hot_store(db, table);
 
         // UPDATE rewrites rows into new segments, so old index locations die.
         // Rebuild the location-index snapshots from a fresh scan while still

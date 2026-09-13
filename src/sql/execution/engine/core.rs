@@ -186,7 +186,7 @@ impl Engine {
         };
         engine.warmup_hot_stores();
         for (db, table) in recovered_tail_tables {
-            engine.hot_store_mgr.invalidate(&db, &table);
+            engine.invalidate_hot_store(&db, &table);
         }
         Ok(engine)
     }

@@ -481,6 +481,7 @@ impl<'a> ScanExecutor<'a> {
         hot_spec.projection = Some(plan.projection_cols.clone());
         let Some(batch) = memtable::scan_resident_hot_store(
             self.runtime.hot_store_manager(),
+            self.runtime.memtable_manager(),
             self.db,
             &self.table_meta,
             &hot_spec,
@@ -578,6 +579,7 @@ impl<'a> ScanExecutor<'a> {
     fn try_resident_hot_count(&self) -> Result<Option<u64>> {
         Ok(memtable::count_resident_hot_store(
             self.runtime.hot_store_manager(),
+            self.runtime.memtable_manager(),
             self.db,
             &self.table_meta,
             self.spec,

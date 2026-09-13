@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -540,6 +540,13 @@ pub struct MemTableManager {
     low_rate_max_rows: u64,
     low_rate_max_age_secs: u64,
     replace_key_indexes: RwLock<HashMap<Uuid, ReplaceKeyIndex>>,
+    /// Rows per `(db, table, partition)` that reached segments (or will)
+    /// without being mirrored into the hot store: non-fed auto-commit
+    /// appends, committed transaction deltas, bulk/relaxed bypass writes.
+    /// Zero/absent means every segment row of the partition is provably
+    /// mirrored, which is what lets a resident-partition scan answer from
+    /// the hot store alone even after the memtable has been flushed.
+    hot_unfed_rows: Mutex<HashMap<(String, String, String), u64>>,
 }
 
 impl MemTableManager {
@@ -557,7 +564,90 @@ impl MemTableManager {
             low_rate_max_rows,
             low_rate_max_age_secs: low_rate_max_age_secs.max(max_age_secs),
             replace_key_indexes: RwLock::new(HashMap::new()),
+            hot_unfed_rows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record rows appended through a path that skipped the hot-store mirror.
+    pub fn note_hot_unfed_rows(&self, db: &str, table: &str, partition: &str, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let mut unfed = self.hot_unfed_rows.lock().unwrap();
+        *unfed
+            .entry((db.to_string(), table.to_string(), partition.to_string()))
+            .or_insert(0) += rows;
+    }
+
+    /// Zero means every segment row of the partition is provably mirrored in
+    /// the hot store, so a resident-partition scan may answer from the store
+    /// alone. The table-level sentinel key marks bypasses whose partitions
+    /// could not be derived (e.g. raw bulk payloads), disabling the fast path
+    /// for the whole table.
+    pub fn hot_unfed_rows(&self, db: &str, table: &str, partition: &str) -> u64 {
+        let unfed = self.hot_unfed_rows.lock().unwrap();
+        unfed
+            .get(&(db.to_string(), table.to_string(), partition.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Table-level bypass marker: partitions cannot be derived for the rows
+    /// (e.g. raw bulk payloads), so the whole table loses the resident fast
+    /// path. Sticky until the table's hot store is invalidated.
+    pub fn note_hot_unfed_table(&self, db: &str, table: &str, rows: u64) {
+        self.note_hot_unfed_rows(db, table, " table", rows);
+    }
+
+    /// True when a resident-partition scan may answer from the hot store
+    /// alone: neither the table-level sentinel nor the partition carries
+    /// unmirrored rows.
+    pub fn hot_partition_mirrored(&self, db: &str, table: &str, partition: &str) -> bool {
+        let unfed = self.hot_unfed_rows.lock().unwrap();
+        let table_key = (db.to_string(), table.to_string());
+        if unfed
+            .get(&(
+                table_key.0.clone(),
+                table_key.1.clone(),
+                " table".to_string(),
+            ))
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            return false;
+        }
+        unfed
+            .get(&(table_key.0, table_key.1, partition.to_string()))
+            .copied()
+            .unwrap_or(0)
+            == 0
+    }
+
+    /// True when no write of the table has ever bypassed the hot-store
+    /// mirror, so the hot-store watermark shortcut over live memtables is
+    /// exact (every live row is also a hot row above the watermark).
+    pub fn hot_table_fully_mirrored(&self, db: &str, table: &str) -> bool {
+        let unfed = self.hot_unfed_rows.lock().unwrap();
+        !unfed
+            .keys()
+            .any(|(k_db, k_table, _)| k_db == db && k_table == table)
+    }
+
+    /// Flip every accounted partition of the table to unmirrored (hot-store
+    /// prefix reclamation: rows below the new front are gone from the store).
+    pub fn mark_hot_unfed_all_partitions(&self, db: &str, table: &str) {
+        let mut unfed = self.hot_unfed_rows.lock().unwrap();
+        for (key, value) in unfed.iter_mut() {
+            if key.0 == db && key.1 == table && *value == 0 {
+                *value = 1;
+            }
+        }
+    }
+
+    pub fn clear_hot_unfed(&self, db: &str, table: &str) {
+        let mut unfed = self.hot_unfed_rows.lock().unwrap();
+        unfed.retain(|(k_db, k_table, _), _| k_db != db || k_table != table);
     }
 
     pub fn restore_committed_tail(
@@ -1035,6 +1125,12 @@ impl MemTableManager {
             .filter(|mt| mt.txn_id() == txn_id && mt.state() == MemTableState::Pending)
             .cloned()
             .collect();
+        // Transaction deltas never pass through the hot store, so committing
+        // them makes the touched partitions unprovable for the resident fast
+        // path until the store is rebuilt (invalidate / warmup).
+        for mt in &committed {
+            self.note_hot_unfed_rows(mt.db(), mt.table(), mt.partition_key(), mt.row_count());
+        }
         for mt in &committed {
             mt.mark_committed();
         }

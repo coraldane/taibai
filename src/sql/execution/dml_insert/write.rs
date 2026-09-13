@@ -237,6 +237,10 @@ pub fn exec_replace(
     {
         engine.persist_auto_increment_next_value(db, table, false)?;
     }
+    // REPLACE deletes and re-inserts through its own internal transaction and
+    // never mirrors into the hot store; retire the resident fast path rather
+    // than risk stale rows surviving in the mirror.
+    engine.invalidate_hot_store(db, table);
 
     Ok(ExecResult::Ok {
         rows_affected: deleted + affected_insert_rows + replaced_inside_batch,
@@ -570,6 +574,9 @@ fn exec_materialized_insert_batch(
     if bulk_import_mode || relaxed_direct_insert {
         engine.exec_bulk_insert_partitioned(db, table, table_meta, batch, relaxed_direct_insert)?;
     } else {
+        // Same condition as the hot-store feed above: when it holds, every
+        // row of the batch is mirrored into the hot store.
+        let hot_fed = txn_id == 0;
         write_batch_by_partition(
             engine,
             db,
@@ -579,6 +586,7 @@ fn exec_materialized_insert_batch(
             schema,
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
     }
     if let Some(batch) = pubsub_batch {
@@ -997,6 +1005,7 @@ fn write_batch_by_partition(
     schema: Schema,
     txn_id: u64,
     table_lock_held: bool,
+    hot_fed: bool,
 ) -> Result<()> {
     if table_meta.partition_key.is_empty() || batch.num_rows() == 0 {
         write_partition_batch(
@@ -1009,6 +1018,7 @@ fn write_batch_by_partition(
             schema,
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
         return Ok(());
     }
@@ -1031,6 +1041,7 @@ fn write_batch_by_partition(
             schema,
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
         return Ok(());
     }
@@ -1048,6 +1059,7 @@ fn write_batch_by_partition(
                 schema.clone(),
                 txn_id,
                 table_lock_held,
+                hot_fed,
             )?;
         }
         return Ok(());
@@ -1069,6 +1081,7 @@ fn write_batch_by_partition(
             schema,
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
         return Ok(());
     }
@@ -1085,6 +1098,7 @@ fn write_batch_by_partition(
             schema.clone(),
             txn_id,
             table_lock_held,
+            hot_fed,
         )?;
     }
     Ok(())
@@ -1101,6 +1115,7 @@ fn write_partition_batch(
     schema: Schema,
     txn_id: u64,
     table_lock_held: bool,
+    hot_fed: bool,
 ) -> Result<()> {
     let batch = sort_batch_for_cluster_key(table_meta, batch)?;
     if table_lock_held {
@@ -1113,6 +1128,7 @@ fn write_partition_batch(
                 batch,
                 schema,
                 txn_id,
+                hot_fed,
             )?;
     } else {
         engine.batch_writer().write_columns_with_txn(
@@ -1122,6 +1138,7 @@ fn write_partition_batch(
             batch,
             schema,
             txn_id,
+            hot_fed,
         )?;
     }
     Ok(())
