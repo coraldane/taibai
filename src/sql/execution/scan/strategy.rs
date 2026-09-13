@@ -17,6 +17,7 @@ pub enum RowGroupReadStrategy {
     ClusterKeyRangeRead,
 }
 
+#[derive(Clone)]
 pub struct ScanPlan {
     pub predicate_cols: Vec<usize>,
     pub projection_cols: Vec<usize>,

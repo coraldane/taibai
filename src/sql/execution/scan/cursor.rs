@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,6 +31,11 @@ pub struct ScanCursor {
     remaining_limit: Option<usize>,
     memtable_batches: Vec<RecordBatch>,
     memtable_pos: usize,
+    /// Decoded row groups awaiting emission, in candidate order. Filled a
+    /// window at a time by a parallel decode fan-out so cursor-served scans
+    /// (streaming reads, aggregates feeding HashAggregateExec) are not bound
+    /// to one serial fetch/decode lane.
+    prefetch: VecDeque<RecordBatch>,
 }
 
 impl ScanCursor {
@@ -63,6 +69,7 @@ impl ScanCursor {
             remaining_limit,
             memtable_batches: Vec::new(),
             memtable_pos: 0,
+            prefetch: VecDeque::new(),
         }))
     }
 
@@ -103,25 +110,15 @@ impl ScanCursor {
             }
 
             let reader = self.current_reader.as_ref().unwrap().clone();
-            while self.candidate_pos < self.current_candidates.len() {
-                let rg_idx = self.current_candidates[self.candidate_pos];
-                self.candidate_pos += 1;
-                let batch = match strategy::read_row_group_with_strategy(
-                    &self.spec,
-                    &self.plan,
-                    &self.table_schema,
-                    &reader,
-                    rg_idx,
-                ) {
-                    Ok(b) => b,
-                    Err(_) => continue,
+            while self.candidate_pos < self.current_candidates.len()
+                || !self.prefetch.is_empty()
+            {
+                if self.prefetch.is_empty() {
+                    self.fill_prefetch(&reader);
+                }
+                let Some(batch) = self.prefetch.pop_front() else {
+                    continue;
                 };
-                let batch = strategy::apply_ttl_filter_and_projection(
-                    batch,
-                    &self.table_meta,
-                    &self.plan.projection_cols,
-                    self.plan.strip_ttl_column,
-                )?;
                 if let Some(batch) = self.limit_batch(batch) {
                     return Ok(Some(batch));
                 }
@@ -148,6 +145,63 @@ impl ScanCursor {
         }
 
         Ok(None)
+    }
+
+    /// Decode the next `window` candidate row groups of the current segment
+    /// in parallel. `rayon` collect keeps candidate order, so ordered scans
+    /// and LIMIT trimming behave exactly like the serial walk. Decode
+    /// concurrency is bounded by the global cpu/io work permits.
+    fn fill_prefetch(&mut self, reader: &Arc<SegmentReader>) {
+        use rayon::prelude::*;
+        let start = self.candidate_pos;
+        let window = self.prefetch_window();
+        let end = (start + window).min(self.current_candidates.len());
+        self.candidate_pos = end;
+        let rgs = self.current_candidates[start..end].to_vec();
+        let spec = self.spec.clone();
+        let plan = self.plan.clone();
+        let table_schema = self.table_schema.clone();
+        let reader = Arc::clone(reader);
+        let batches: Vec<_> = rgs
+            .into_par_iter()
+            .filter_map(|rg_idx| {
+                let _cpu = crate::common::work_limiter::acquire_cpu();
+                let _io = crate::common::work_limiter::acquire_io();
+                strategy::read_row_group_with_strategy(
+                    &spec,
+                    &plan,
+                    &table_schema,
+                    &reader,
+                    rg_idx,
+                )
+                .ok()
+            })
+            .collect();
+        for batch in batches {
+            let filtered = strategy::apply_ttl_filter_and_projection(
+                batch,
+                &self.table_meta,
+                &self.plan.projection_cols,
+                self.plan.strip_ttl_column,
+            );
+            match filtered {
+                Ok(batch) if batch.num_rows() > 0 => self.prefetch.push_back(batch),
+                _ => {}
+            }
+        }
+    }
+
+    fn prefetch_window(&self) -> usize {
+        let base = crate::common::config::query_limits()
+            .max_parallel_row_groups
+            .clamp(4, 16);
+        // Bounded overshoot for LIMIT queries: decoding a small window keeps
+        // early termination cheap.
+        if self.remaining_limit.is_some() {
+            base.min(4)
+        } else {
+            base
+        }
     }
 
     fn open_current_segment(&mut self) {

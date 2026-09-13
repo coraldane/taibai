@@ -569,20 +569,41 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
 
     macro_rules! read_fixed {
         ($ty:ty, $size:expr, $variant:ident) => {{
-            let mut vals = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                if bitmap.is_null(i) {
-                    vals.push(<$ty>::default());
-                } else {
-                    let mut b = [0u8; $size];
-                    dc.read_exact(&mut b)
-                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
-                    vals.push(<$ty>::from_le_bytes(b));
+            // Null-free fast path: the payload is exactly row_count * $size
+            // little-endian values, so decode degrades to one bulk conversion
+            // (a per-word load on little-endian hosts) instead of a
+            // per-value Cursor::read_exact with bounds checks.
+            if bitmap.null_count() == 0
+                && remaining_data.len() - dc.position() as usize >= row_count * $size
+            {
+                let start = dc.position() as usize;
+                let raw = &remaining_data[start..start + row_count * $size];
+                let mut vals = Vec::with_capacity(row_count);
+                vals.extend(
+                    raw.chunks_exact($size)
+                        .map(|b| <$ty>::from_le_bytes(b.try_into().unwrap())),
+                );
+                dc.set_position((start + row_count * $size) as u64);
+                ColumnArray::$variant {
+                    data: vals.into(),
+                    bitmap: bitmap.clone(),
                 }
-            }
-            ColumnArray::$variant {
-                data: vals.into(),
-                bitmap: bitmap.clone(),
+            } else {
+                let mut vals = Vec::with_capacity(row_count);
+                for i in 0..row_count {
+                    if bitmap.is_null(i) {
+                        vals.push(<$ty>::default());
+                    } else {
+                        let mut b = [0u8; $size];
+                        dc.read_exact(&mut b)
+                            .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
+                        vals.push(<$ty>::from_le_bytes(b));
+                    }
+                }
+                ColumnArray::$variant {
+                    data: vals.into(),
+                    bitmap: bitmap.clone(),
+                }
             }
         }};
     }

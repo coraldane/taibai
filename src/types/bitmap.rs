@@ -85,6 +85,14 @@ impl NullBitmap {
         self.data.iter().map(|w| w.count_ones() as usize).sum()
     }
 
+    /// Raw bitmap words (bit=1 means NULL) for word-at-a-time processing.
+    /// Only the first `len` bits are meaningful; trailing bits of the last
+    /// word are zero.
+    #[inline]
+    pub fn words(&self) -> &[u64] {
+        &self.data
+    }
+
     pub fn is_all_valid(&self) -> bool {
         for &word in &self.data {
             if word != 0 {

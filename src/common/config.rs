@@ -383,10 +383,10 @@ fn default_join_spill_partitions() -> usize {
 }
 
 fn default_max_parallel_segments() -> usize {
-    default_execution_threads().clamp(1, 4)
+    default_execution_threads().clamp(1, 8)
 }
 fn default_global_io_permits() -> usize {
-    default_execution_threads().clamp(1, 4)
+    default_execution_threads().clamp(1, 16)
 }
 fn default_global_cpu_permits() -> usize {
     default_execution_threads().max(1)

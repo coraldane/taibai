@@ -391,36 +391,26 @@ impl ColumnArray {
 
     /// Count of non-null values in this column (vectorized).
     pub fn col_count_non_null(&self) -> u64 {
-        let n = self.len();
-        let bitmap = self.bitmap();
-        let mut count: u64 = 0;
-        for i in 0..n {
-            if !bitmap.is_null(i) {
-                count += 1;
-            }
-        }
-        count
+        (self.len() as u64).saturating_sub(self.bitmap().null_count() as u64)
     }
 
     /// Column-wide sum as i64 for integer columns (vectorized). Returns None if
     /// all values are null or the column type is not integer.
     pub fn col_sum_i64(&self) -> Option<i64> {
-        let n = self.len();
         let bitmap = self.bitmap();
         macro_rules! int_sum {
             ($data:expr, $cast:ty) => {{
-                let mut sum: i64 = 0;
-                let mut any = false;
-                for (i, v) in $data.iter().enumerate().take(n) {
-                    if !bitmap.is_null(i) {
-                        sum = sum.wrapping_add(*v as $cast as i64);
-                        any = true;
+                let data = $data.as_slice();
+                if bitmap.null_count() == 0 {
+                    // Null-free fast path: a branch-free wrapping-add fold the
+                    // compiler can auto-vectorize.
+                    let mut sum: i64 = 0;
+                    for &v in data {
+                        sum = sum.wrapping_add(v as $cast as i64);
                     }
-                }
-                if any {
-                    Some(sum)
+                    (!data.is_empty()).then_some(sum)
                 } else {
-                    None
+                    sum_valid_words(data, bitmap, |v| v as $cast as i64)
                 }
             }};
         }
@@ -430,18 +420,15 @@ impl ColumnArray {
             ColumnArray::Int16 { data, .. } => int_sum!(data, i64),
             ColumnArray::Int8 { data, .. } => int_sum!(data, i64),
             ColumnArray::UInt64 { data, .. } => {
-                let mut sum: i64 = 0;
-                let mut any = false;
-                for (i, v) in data.iter().enumerate().take(n) {
-                    if !bitmap.is_null(i) {
-                        sum = sum.wrapping_add(i64::try_from(*v).unwrap_or(i64::MAX));
-                        any = true;
+                let data: &[u64] = data;
+                if bitmap.null_count() == 0 {
+                    let mut sum: i64 = 0;
+                    for &v in data {
+                        sum = sum.wrapping_add(i64::try_from(v).unwrap_or(i64::MAX));
                     }
-                }
-                if any {
-                    Some(sum)
+                    (!data.is_empty()).then_some(sum)
                 } else {
-                    None
+                    sum_valid_words(data, bitmap, |v| i64::try_from(v).unwrap_or(i64::MAX))
                 }
             }
             ColumnArray::UInt32 { data, .. } => int_sum!(data, i64),
@@ -455,37 +442,20 @@ impl ColumnArray {
     /// Column-wide sum as f64 for float columns (vectorized). Returns None if
     /// all values are null or the column type is not float.
     pub fn col_sum_f64(&self) -> Option<f64> {
-        let n = self.len();
         let bitmap = self.bitmap();
         match self {
             ColumnArray::Float64 { data, .. } => {
-                let mut sum = 0.0f64;
-                let mut any = false;
-                for (i, v) in data.iter().enumerate().take(n) {
-                    if !bitmap.is_null(i) {
-                        sum += *v;
-                        any = true;
-                    }
-                }
-                if any {
-                    Some(sum)
+                if bitmap.null_count() == 0 {
+                    (!data.is_empty()).then(|| data.iter().sum::<f64>())
                 } else {
-                    None
+                    sum_valid_words_f64(data, bitmap, |v| *v)
                 }
             }
             ColumnArray::Float32 { data, .. } => {
-                let mut sum = 0.0f64;
-                let mut any = false;
-                for (i, v) in data.iter().enumerate().take(n) {
-                    if !bitmap.is_null(i) {
-                        sum += *v as f64;
-                        any = true;
-                    }
-                }
-                if any {
-                    Some(sum)
+                if bitmap.null_count() == 0 {
+                    (!data.is_empty()).then(|| data.iter().map(|&v| v as f64).sum())
                 } else {
-                    None
+                    sum_valid_words_f64(data, bitmap, |v| *v as f64)
                 }
             }
             _ => None,
@@ -1303,4 +1273,69 @@ impl ColumnArray {
             bitmap,
         }
     }
+}
+
+
+/// Word-at-a-time valid-row sum for integer-like data: skips all-null words
+/// outright and bulk-adds all-valid words, so dense columns pay no per-row
+/// bitmap test.
+fn sum_valid_words<T: Copy>(
+    data: &[T],
+    bitmap: &crate::types::bitmap::NullBitmap,
+    cvt: impl Fn(T) -> i64,
+) -> Option<i64> {
+    let mut sum: i64 = 0;
+    let mut any = false;
+    for (word_idx, &word) in bitmap.words().iter().enumerate() {
+        let start = word_idx * 64;
+        if start >= data.len() {
+            break;
+        }
+        let end = (start + 64).min(data.len());
+        if word == 0 {
+            for &v in &data[start..end] {
+                sum = sum.wrapping_add(cvt(v));
+            }
+            any = true;
+        } else if word != u64::MAX {
+            for (bit, &v) in data[start..end].iter().enumerate() {
+                if word & (1u64 << bit) == 0 {
+                    sum = sum.wrapping_add(cvt(v));
+                    any = true;
+                }
+            }
+        }
+    }
+    any.then_some(sum)
+}
+
+/// Word-at-a-time valid-row sum for float data.
+fn sum_valid_words_f64<T: Copy>(
+    data: &[T],
+    bitmap: &crate::types::bitmap::NullBitmap,
+    cvt: impl Fn(&T) -> f64,
+) -> Option<f64> {
+    let mut sum = 0.0f64;
+    let mut any = false;
+    for (word_idx, &word) in bitmap.words().iter().enumerate() {
+        let start = word_idx * 64;
+        if start >= data.len() {
+            break;
+        }
+        let end = (start + 64).min(data.len());
+        if word == 0 {
+            for v in &data[start..end] {
+                sum += cvt(v);
+            }
+            any = true;
+        } else if word != u64::MAX {
+            for (bit, v) in data[start..end].iter().enumerate() {
+                if word & (1u64 << bit) == 0 {
+                    sum += cvt(v);
+                    any = true;
+                }
+            }
+        }
+    }
+    any.then_some(sum)
 }

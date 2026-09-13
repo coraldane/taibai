@@ -538,33 +538,34 @@ impl<'a> ScanExecutor<'a> {
                     } else {
                         super::strategy::prune_segment(self.spec, &reader)?.candidate_indices
                     };
-                    let mut batches = Vec::with_capacity(candidates.len());
-                    for row_group in candidates {
-                        let batch_result = {
-                            let _cpu = crate::common::work_limiter::acquire_cpu();
-                            let _io = crate::common::work_limiter::acquire_io();
-                            super::strategy::read_row_group_with_strategy(
-                                self.spec,
-                                plan,
-                                &self.table_schema,
-                                &reader,
-                                row_group,
+                    // Row groups inside a segment decode in parallel as
+                    // well; actual concurrency is bounded by the global
+                    // cpu/io permits, not by rayon lane count.
+                    let batches: Vec<_> = candidates
+                        .into_par_iter()
+                        .filter_map(|row_group| {
+                            let batch_result = {
+                                let _cpu = crate::common::work_limiter::acquire_cpu();
+                                let _io = crate::common::work_limiter::acquire_io();
+                                super::strategy::read_row_group_with_strategy(
+                                    self.spec,
+                                    plan,
+                                    &self.table_schema,
+                                    &reader,
+                                    row_group,
+                                )
+                            };
+                            let batch = batch_result.ok()?;
+                            let batch = super::strategy::apply_ttl_filter_and_projection(
+                                batch,
+                                &self.table_meta,
+                                &plan.projection_cols,
+                                plan.strip_ttl_column,
                             )
-                        };
-                        let Ok(batch) = batch_result else {
-                            continue;
-                        };
-                        let batch = super::strategy::apply_ttl_filter_and_projection(
-                            batch,
-                            &self.table_meta,
-                            &plan.projection_cols,
-                            plan.strip_ttl_column,
-                        )
-                        .ok()?;
-                        if batch.num_rows() > 0 {
-                            batches.push(batch);
-                        }
-                    }
+                            .ok()?;
+                            (batch.num_rows() > 0).then_some(batch)
+                        })
+                        .collect();
                     Some((base + position, batches))
                 })
                 .collect::<Vec<_>>();
