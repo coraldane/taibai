@@ -2,6 +2,33 @@ use crate::storage::codec::fastscan::apply_filter_mask_fast;
 use crate::storage::codec::predicate_scan::selected_eq_rows_from_raw;
 use crate::storage::partition::pruning::RangeOp;
 use crate::types::array::ColumnArray;
+
+/// Expand dictionary columns into plain varchars before typed predicate
+/// evaluation. Recursion terminates: the materialized batch has no
+/// dictionary columns.
+fn materialize_dictionary_columns(
+    batch: &RecordBatch,
+) -> crate::common::error::Result<RecordBatch> {
+    if batch
+        .columns
+        .iter()
+        .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
+    {
+        let columns: crate::common::error::Result<Vec<ColumnArray>> = batch
+            .columns
+            .iter()
+            .map(|c| {
+                if matches!(c, ColumnArray::Dictionary { .. }) {
+                    Ok(c.materialize_varchar())
+                } else {
+                    Ok(c.clone())
+                }
+            })
+            .collect();
+        return RecordBatch::try_new(batch.schema.clone(), columns?);
+    }
+    Ok(batch.clone())
+}
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
@@ -58,6 +85,19 @@ pub fn apply_predicates(
     if batch.num_rows() == 0 {
         return Ok(batch.clone());
     }
+    if batch
+        .columns
+        .iter()
+        .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
+    {
+        return apply_predicates(
+            &materialize_dictionary_columns(batch)?,
+            eq_predicates,
+            range_predicates,
+            in_predicates,
+            remaining_predicate,
+        );
+    }
 
     let mut mask: Vec<bool> = vec![true; batch.num_rows()];
 
@@ -105,6 +145,20 @@ pub fn apply_predicates_with_column_map(
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> crate::common::error::Result<RecordBatch> {
+    if batch
+        .columns
+        .iter()
+        .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
+    {
+        return apply_predicates_with_column_map(
+            &materialize_dictionary_columns(batch)?,
+            source_columns,
+            eq_predicates,
+            range_predicates,
+            in_predicates,
+            remaining_predicate,
+        );
+    }
     let col_pos_by_original: std::collections::HashMap<usize, usize> = source_columns
         .iter()
         .enumerate()

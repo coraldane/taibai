@@ -222,7 +222,9 @@ impl ColumnArray {
             }};
         }
         match self {
-            ColumnArray::Selected { .. } => self.flattened().col_min(),
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+                self.flattened().col_min()
+            }
             ColumnArray::Int64 { data, .. } => numeric_min!(data, Int64),
             ColumnArray::Int32 { data, .. } => numeric_min!(data, Int32),
             ColumnArray::Int16 { data, .. } => numeric_min!(data, Int16),
@@ -315,7 +317,9 @@ impl ColumnArray {
             }};
         }
         match self {
-            ColumnArray::Selected { .. } => self.flattened().col_max(),
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+                self.flattened().col_max()
+            }
             ColumnArray::Int64 { data, .. } => numeric_max!(data, Int64),
             ColumnArray::Int32 { data, .. } => numeric_max!(data, Int32),
             ColumnArray::Int16 { data, .. } => numeric_max!(data, Int16),

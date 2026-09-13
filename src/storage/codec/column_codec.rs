@@ -520,6 +520,7 @@ fn encode_varchar_dictionary_adaptive(
 pub fn encode_value(buf: &mut Vec<u8>, col: &ColumnArray, idx: usize) {
     match col {
         ColumnArray::Selected { .. } => encode_value(buf, col.flattened(), idx),
+        ColumnArray::Dictionary { .. } => encode_value(buf, &col.materialize_varchar(), idx),
         ColumnArray::Bool { data, .. } => buf.push(data[idx]),
         ColumnArray::Int8 { data, .. } => buf.push(data[idx] as u8),
         ColumnArray::Int16 { data, .. } => buf.extend_from_slice(&data[idx].to_le_bytes()),
@@ -554,7 +555,12 @@ pub fn encode_value(buf: &mut Vec<u8>, col: &ColumnArray, idx: usize) {
     }
 }
 
-pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Result<ColumnArray> {
+pub fn decode_column(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    allow_dictionary: bool,
+) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(data);
     let bitmap_len = read_u32_le(&mut cursor)? as usize;
     let mut bitmap_data = vec![0u8; bitmap_len];
@@ -563,7 +569,7 @@ pub fn decode_column(data: &[u8], row_count: usize, col_def: &ColumnDef) -> Resu
 
     let remaining_data = &data[4 + bitmap_len..];
     if remaining_data.starts_with(COLUMN_ENCODING_MAGIC) {
-        return decode_adaptive_column(remaining_data, row_count, col_def, bitmap);
+        return decode_adaptive_column(remaining_data, row_count, col_def, bitmap, allow_dictionary);
     }
     let mut dc = Cursor::new(remaining_data);
 
@@ -756,6 +762,7 @@ pub(crate) fn decode_adaptive_column(
     row_count: usize,
     col_def: &ColumnDef,
     bitmap: NullBitmap,
+    allow_dictionary: bool,
 ) -> Result<ColumnArray> {
     if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
         return Err(TaibaiError::Storage(
@@ -793,7 +800,7 @@ pub(crate) fn decode_adaptive_column(
             build_column_from_bits(bits, row_count, col_def, bitmap)
         }
         EncodingType::Dictionary if col_def.data_type == DataType::VarChar => {
-            expand_varchar_dictionary(payload, row_count, &bitmap)
+            expand_varchar_dictionary(payload, row_count, &bitmap, allow_dictionary)
         }
         other => Err(TaibaiError::Storage(format!(
             "unsupported adaptive column encoding {:?} for {}",
@@ -847,6 +854,7 @@ fn expand_varchar_dictionary(
     payload: &[u8],
     row_count: usize,
     bitmap: &NullBitmap,
+    allow_dictionary: bool,
 ) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(payload);
     let dict_count = read_u32_le(&mut cursor)? as usize;
@@ -884,28 +892,63 @@ fn expand_varchar_dictionary(
             row_count.saturating_sub(bitmap.null_count())
         )));
     }
-    let mut buffer = Utf8Buffer::with_capacity(row_count);
-    let mut pos = cursor.position() as usize;
-    for row in 0..row_count {
+    // Dictionary passthrough: keep (ids, dict) unexpanded so aggregation can
+    // group on u32 ids without any per-row string work. Gated: the
+    // ClusterKeyRangeRead strategy's binary search does not understand the
+    // dictionary variant yet, so this is opt-in until that path is adapted.
+    if !allow_dictionary {
+        let mut buffer = Utf8Buffer::with_capacity(row_count);
+        let mut pos = cursor.position() as usize;
+        for row in 0..row_count {
+            if bitmap.is_null(row) {
+                buffer.push_str("");
+                continue;
+            }
+            if pos + 4 > payload.len() {
+                return Err(TaibaiError::Storage(
+                    "dictionary varchar decode: truncated index".into(),
+                ));
+            }
+            let idx = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let value = dict.get(idx).ok_or_else(|| {
+                TaibaiError::Storage(format!("dictionary index {} out of bounds", idx))
+            })?;
+            buffer.push_str(value);
+        }
+        return Ok(ColumnArray::VarChar {
+            data: buffer,
+            bitmap: bitmap.clone(),
+        });
+    }
+    let start = cursor.position() as usize;
+    if start + index_count * 4 > payload.len() {
+        return Err(TaibaiError::Storage(
+            "dictionary varchar decode: truncated index".into(),
+        ));
+    }
+    let ids: Vec<u32> = payload[start..start + index_count * 4]
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let mut ids_full = vec![0u32; row_count];
+    let mut value_pos = 0usize;
+    for (row, slot) in ids_full.iter_mut().enumerate() {
         if bitmap.is_null(row) {
-            buffer.push_str("");
             continue;
         }
-        if pos + 4 > payload.len() {
-            return Err(TaibaiError::Storage(
-                "dictionary varchar decode: truncated index".into(),
-            ));
-        }
-        let idx = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        let value = dict.get(idx).ok_or_else(|| {
-            TaibaiError::Storage(format!("dictionary index {} out of bounds", idx))
-        })?;
-        buffer.push_str(value);
+        *slot = ids[value_pos];
+        value_pos += 1;
     }
-    Ok(ColumnArray::VarChar {
-        data: buffer,
+    let mut dict_buf = Utf8Buffer::with_capacity(dict.len());
+    for value in &dict {
+        dict_buf.push_str(value);
+    }
+    Ok(ColumnArray::Dictionary {
+        ids: ids_full,
+        dict: dict_buf,
         bitmap: bitmap.clone(),
+        flat: std::sync::OnceLock::new(),
     })
 }
 
@@ -1068,7 +1111,7 @@ pub fn decode_column_selected(
     let values = &data[4 + bitmap_len..];
 
     if values.starts_with(COLUMN_ENCODING_MAGIC) {
-        let decoded = decode_adaptive_column(values, row_count, col_def, bitmap)?;
+        let decoded = decode_adaptive_column(values, row_count, col_def, bitmap, false)?;
         return project_column(&decoded, selected_rows);
     }
 

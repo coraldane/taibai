@@ -62,6 +62,9 @@ impl ScalarValueHashable {
     fn from_column(column: &ColumnArray, row: usize) -> Self {
         match column {
             ColumnArray::Selected { .. } => Self::from_column(column.flattened(), row),
+            ColumnArray::Dictionary { .. } => {
+                Self::from_column(&column.materialize_varchar(), row)
+            }
             ColumnArray::Bool { data, .. } => Self::Bool(Some(data[row] != 0)),
             ColumnArray::Int8 { data, .. } => Self::Int8(Some(data[row])),
             ColumnArray::Int16 { data, .. } => Self::Int16(Some(data[row])),

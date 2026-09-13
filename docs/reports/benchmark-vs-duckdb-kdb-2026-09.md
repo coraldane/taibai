@@ -24,8 +24,7 @@
 ## 2. 结论速览(TL;DR)
 
 - **批量导入**:DuckDB 337 万行/s,taibai 165 万行/s(差 2 倍);taibai 压缩率更高(400MB vs 667MB / 千万行)。
-- **实时写入(持久化)**:taibai **26.3 万行/s**(fsync ACK,20000×8)> DuckDB appender 23.1 万行/s;组提交把 fsync 成本摊薄到接近免费(strict ≈ async)。
-- **批量导入**:taibai 1.30-1.65M rows/s vs DuckDB 3.37M rows/s(差 2~2.6×),taibai 压缩率优 40%。
+- **实时写入(持久化)**:调优后 taibai **25.6 万行/s**(fsync ACK 语义),已超过 DuckDB appender 的 23.1 万行/s;高并发下组提交把 fsync 成本摊薄到接近免费(strict ≈ async)。
 - **点查(taibai 的主场)**:盘中热存路径 **~1ms**(2000 行结果,刷盘前后一致);收盘归档后 1.5~4ms;DuckDB 无二级索引、未聚类,同查询 55ms。
 - **扫描聚合(DuckDB 的主场)**:v3→v5 后差距大幅收敛(全表聚合 0.97ms vs ~38ms;千万行 GROUP BY 11ms vs 111ms——从 76× 收敛到 10×);剩余差距在字典直通解码与流水线重叠(见 §10)。
 - **hotstore 进程内微基准**:append 1600万~1709万行/s,symbol 最新 N 条点查 1.2~2.0µs,整键 gather 1900万~2615万行/s。

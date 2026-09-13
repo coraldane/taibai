@@ -466,6 +466,13 @@ pub fn value_text_at(column: &ColumnArray, row: usize) -> String {
     }
     match column {
         ColumnArray::Selected { .. } => value_text_at(column.flattened(), row),
+        ColumnArray::Dictionary { ids, dict, bitmap, .. } => {
+            if bitmap.is_null(row) {
+                String::new()
+            } else {
+                dict.get(ids[row] as usize).unwrap_or("").to_string()
+            }
+        }
         ColumnArray::Bool { data, .. } => {
             if data[row] != 0 {
                 "true".to_string()

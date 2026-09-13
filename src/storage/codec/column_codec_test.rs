@@ -68,7 +68,7 @@ fn gorilla_xor_roundtrip_float64() {
         values.len() * 8
     );
 
-    let decoded = decode_column(&encoded, n, &col_def(DataType::Float64)).unwrap();
+    let decoded = decode_column(&encoded, n, &col_def(DataType::Float64), false).unwrap();
     match decoded {
         ColumnArray::Float64 { data, .. } => assert_eq!(data, values),
         other => panic!("unexpected variant: {:?}", other.data_type()),
@@ -85,7 +85,7 @@ fn gorilla_xor_roundtrip_float32() {
     };
     let (encoded, skip_zstd) = encode_column_ex(&col, 0, n).unwrap();
     assert!(skip_zstd);
-    let decoded = decode_column(&encoded, n, &col_def(DataType::Float32)).unwrap();
+    let decoded = decode_column(&encoded, n, &col_def(DataType::Float32), false).unwrap();
     match decoded {
         ColumnArray::Float32 { data, .. } => assert_eq!(data, values),
         other => panic!("unexpected variant: {:?}", other.data_type()),
@@ -102,7 +102,7 @@ fn gorilla_xor_roundtrip_decimal() {
     };
     let (encoded, skip_zstd) = encode_column_ex(&col, 0, n).unwrap();
     assert!(skip_zstd, "smooth decimal column should skip zstd");
-    let decoded = decode_column(&encoded, n, &col_def(DataType::Decimal)).unwrap();
+    let decoded = decode_column(&encoded, n, &col_def(DataType::Decimal), false).unwrap();
     match decoded {
         ColumnArray::Decimal { data, .. } => assert_eq!(data, values),
         other => panic!("unexpected variant: {:?}", other.data_type()),
@@ -119,7 +119,7 @@ fn gorilla_xor_roundtrip_with_nulls() {
         bitmap: NullBitmap::from_bools(&flags),
     };
     let (encoded, _) = encode_column_ex(&col, 0, n).unwrap();
-    let decoded = decode_column(&encoded, n, &col_def(DataType::Float64)).unwrap();
+    let decoded = decode_column(&encoded, n, &col_def(DataType::Float64), false).unwrap();
     match decoded {
         ColumnArray::Float64 { data, bitmap } => {
             for i in 0..n {
@@ -206,7 +206,7 @@ fn stored_encoding_choice_is_empirical_and_roundtrips() {
 
     let decompressed_noisy = zstd::bulk::decompress(stored_data, plain_bytes_cap(n)).unwrap();
     assert_eq!(stored.uncompressed_size, decompressed_noisy.len() as u64);
-    let decoded_noisy = decode_column(&decompressed_noisy, n, &def).unwrap();
+    let decoded_noisy = decode_column(&decompressed_noisy, n, &def, false).unwrap();
     match decoded_noisy {
         ColumnArray::Float64 { data, .. } => assert_eq!(data, noisy),
         other => panic!("unexpected variant: {:?}", other.data_type()),
@@ -234,7 +234,7 @@ fn fixed_interval_timestamps_prefer_delta_of_delta() {
         n
     );
 
-    let decoded = decode_column(&encoded, n, &col_def(DataType::Timestamp)).unwrap();
+    let decoded = decode_column(&encoded, n, &col_def(DataType::Timestamp), false).unwrap();
     match decoded {
         ColumnArray::Timestamp { data, .. } => assert_eq!(data, values),
         other => panic!("unexpected variant: {:?}", other.data_type()),
@@ -260,8 +260,8 @@ fn gorilla_blocks_are_independent() {
     let (enc_a, _) = encode_column_ex(&col_a, 0, n).unwrap();
     let (enc_b, _) = encode_column_ex(&col_b, 0, n).unwrap();
     let def = col_def(DataType::Float64);
-    let dec_a = decode_column(&enc_a, n, &def).unwrap();
-    let dec_b = decode_column(&enc_b, n, &def).unwrap();
+    let dec_a = decode_column(&enc_a, n, &def, false).unwrap();
+    let dec_b = decode_column(&enc_b, n, &def, false).unwrap();
     match (dec_a, dec_b) {
         (ColumnArray::Float64 { data: da, .. }, ColumnArray::Float64 { data: db, .. }) => {
             assert_eq!(da, values_a);
@@ -352,7 +352,7 @@ fn adaptive_encoding_compression_bench() {
 
         let def = col_def(dtype);
         let t1 = Instant::now();
-        let decoded = decode_column(&adaptive, n, &def).unwrap();
+        let decoded = decode_column(&adaptive, n, &def, false).unwrap();
         let decode_us = t1.elapsed().as_micros();
         assert_eq!(decoded.len(), n);
 

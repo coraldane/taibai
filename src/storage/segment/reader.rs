@@ -300,7 +300,7 @@ impl SegmentReader {
         let col_def = &self.footer.schema.columns[column_idx];
 
         let decompressed = self.read_column_raw(row_group, column_idx)?;
-        decode_column(&decompressed, rg.row_count as usize, col_def)
+        decode_column(&decompressed, rg.row_count as usize, col_def, false)
     }
 
     pub fn read_column_raw(&self, row_group: usize, column_idx: usize) -> Result<Vec<u8>> {
@@ -358,7 +358,7 @@ impl SegmentReader {
                 let compressed = &all_data[col_offset..col_offset + col_len];
                 let decompressed = Self::decompress_column_block(compressed)?;
                 let col_def = &self.footer.schema.columns[col_idx];
-                let col_array = decode_column(&decompressed, rg.row_count as usize, col_def)?;
+                let col_array = decode_column(&decompressed, rg.row_count as usize, col_def, false)?;
                 Ok(Some((col_idx, col_array)))
             })
             .collect::<Result<Vec<_>>>()?;

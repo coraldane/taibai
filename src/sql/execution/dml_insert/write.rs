@@ -60,6 +60,7 @@ pub fn exec_replace(
     // place below. The delete and the staged insert run under one lock, so
     // DELETE/UPDATE cannot interleave.
     let lock_start = Instant::now();
+    eprintln!("DBGREPL S1 lock enter");
     let (deleted, undo, pending_commits) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {
@@ -73,6 +74,7 @@ pub fn exec_replace(
             )?;
             let memtable_plans =
                 super::dml_delete::plan_replace_memtable_conflicts(engine, db, table, &key_sets)?;
+            eprintln!("DBGREPL C1 conflict delete start");
             let mut undo = super::dml_delete::delete_replace_conflicts_under_table_lock(
                 engine,
                 db,
@@ -114,6 +116,7 @@ pub fn exec_replace(
                 ));
             }
 
+            eprintln!("DBGREPL I1 staged insert start");
             let insert_result = exec_materialized_insert_batch(
                 engine,
                 db,
@@ -202,10 +205,12 @@ pub fn exec_replace(
         );
     }
 
+        eprintln!("DBGREPL T1 wait tail commits");
     if let Err(error) = engine
         .batch_writer()
         .wait_pending_tail_commits(pending_commits)
     {
+        eprintln!("DBGREPL T2 tail wait done");
         let rollback_result = engine.segment_mgr().with_table_mutation_lock(db, table, || {
             rollback_replace_under_table_lock(
                 engine,
@@ -227,7 +232,11 @@ pub fn exec_replace(
         return Err(error);
     }
 
+        eprintln!("DBGREPL 1 finalize start");
+        eprintln!("DBGREPL 1 finalize start");
     super::dml_delete::finalize_replace_delete(engine, db, table, &materialized.table_meta, &undo)?;
+        eprintln!("DBGREPL 2 finalize done");
+        eprintln!("DBGREPL 2 finalize done");
     engine.record_inserted_rows(db, table, physical_insert_rows as i64, false, true)?;
     if materialized
         .table_meta
@@ -240,7 +249,9 @@ pub fn exec_replace(
     // REPLACE deletes and re-inserts through its own internal transaction and
     // never mirrors into the hot store; retire the resident fast path rather
     // than risk stale rows surviving in the mirror.
+        eprintln!("DBGREPL 3 before invalidate");
     engine.invalidate_hot_store(db, table);
+        eprintln!("DBGREPL 4 after invalidate");
 
     Ok(ExecResult::Ok {
         rows_affected: deleted + affected_insert_rows + replaced_inside_batch,

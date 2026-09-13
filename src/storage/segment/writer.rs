@@ -561,7 +561,9 @@ fn build_column_metadata(
 ) -> ColumnMetadata {
     let col = col.flattened();
     match col {
-        ColumnArray::Selected { .. } => unreachable!("materialized above"),
+        ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+            unreachable!("materialized above")
+        }
         ColumnArray::Bool { data, bitmap } => {
             let mut min_value = None;
             let mut max_value = None;

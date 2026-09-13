@@ -543,7 +543,9 @@ fn tail_commit_loop(
                     }
                 }
                 last_group_size = group.len();
+
                 let written = write_append_group(&mut files, &mut compressor, group);
+
                 if async_fsync {
                     // Frames are in the page cache: release the
                     // acknowledgements now and keep the storage barrier off

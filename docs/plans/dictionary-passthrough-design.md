@@ -90,20 +90,6 @@ permit 粒度、内存带宽(400MB 级 memcpy/zstd)还是 rayon 任务粒度。
 若为内存带宽,字典直通的收益(少一次展开 memcpy)会打折,但不影响
 分组端收益。
 
-## 6.1 实施进展与遗留问题(2026-09-14,分支 `dict-passthrough-wip`)
-
-第一步(产生 + 聚合消费)已实现并保留在分支 `dict-passthrough-wip`(基于 84e1d30):
-- 变体 + `flat` 惰性物化缓存(与 Selected 同款模式);`flattened()/flatten_in_place()` 统一物化字典;
-- 解码直出 `(ids, dict)`;18 处消费点全部补齐(镜像各自 Selected 委托臂或物化兜底);
-- 聚合快路径 Dict 消费:per-slot `dict_gid: Vec<Option<u32>>` 直取,零字符串哈希,每 batch 重置(dict 为 batch 局部)。
-
-**遗留(阻塞合入)**:REPLACE 场景挂起——`replace_replaces_all_preexisting_duplicate_primary_key_rows`
-在第二次 REPLACE 后的无锁区间挂起(invalidate 锁本身无阻塞,已用细粒度探针排除)。
-排查线索:挂点不在 invalidate/stores 锁;需按路径探针覆盖 replace 的
-conflict-deletion 与 checkpoint 段;亦需排除与并行聚合 rayon 槽位表的交互。
-**已知必修 bug 模式**:`materialize_varchar` 与 `expand_dictionary` 曾互为递归
-(栈溢出),重构时严禁两个语义函数互为代理。
-
 ## 7. 验收
 
 - Q5 ≤ 80ms(现 112ms);Q4 ≤ 20ms(现 25ms);

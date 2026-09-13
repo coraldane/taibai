@@ -103,6 +103,9 @@ enum FastGroupCol<'a> {
     Str(&'a Utf8Buffer, &'a NullBitmap),
     I64(&'a [i64], &'a NullBitmap),
     I32(&'a [i32], &'a NullBitmap),
+    /// Dictionary passthrough: rows map to dict entries by u32 index; the
+    /// per-slot `dict_gid` table maps entries to group ids with zero hashing.
+    Dict(&'a [u32], usize, &'a NullBitmap),
 }
 
 /// Where a merged entry lands: an existing group (merge accumulators) or a
@@ -120,6 +123,9 @@ enum FastMergeTarget {
 pub(super) struct FastGroups {
     str_map: FastGroupMap<String>,
     i64_map: FastGroupMap<i64>,
+    /// Dictionary fast path: entry (per current batch's dict) -> group id.
+    /// Reset per batch because each batch carries its own dict.
+    dict_gid: Vec<Option<u32>>,
     null_id: Option<u32>,
     keys: Vec<Vec<u8>>,
     scalars: Vec<ScalarValue>,
@@ -131,6 +137,7 @@ impl FastGroups {
         Self {
             str_map: FastGroupMap::default(),
             i64_map: FastGroupMap::default(),
+            dict_gid: Vec::new(),
             null_id: None,
             keys: Vec::new(),
             scalars: Vec::new(),
@@ -160,6 +167,7 @@ impl FastGroups {
         let FastGroups {
             str_map: _,
             i64_map: _,
+            dict_gid: _,
             null_id: _,
             keys,
             scalars,
@@ -259,6 +267,24 @@ impl FastGroups {
     ) -> Result<()> {
         for row in start..end {
             let group_id: u32 = match group_col {
+                FastGroupCol::Dict(ids, dict_len, bitmap) => {
+                    if bitmap.is_null(row) {
+                        self.get_or_create_null_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?
+                    } else {
+                        let entry = ids[row] as usize;
+                        if entry >= self.dict_gid.len() {
+                            self.dict_gid.resize((*dict_len).max(entry + 1), None);
+                        }
+                        match self.dict_gid[entry] {
+                            Some(id) => id,
+                            None => {
+                                let id = self.new_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?;
+                                self.dict_gid[entry] = Some(id);
+                                id
+                            }
+                        }
+                    }
+                }
                 FastGroupCol::Str(data, bitmap) => {
                     if bitmap.is_null(row) {
                         self.get_or_create_null_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?
@@ -489,6 +515,7 @@ pub(super) fn fast_group_supported(
     let group_ok = matches!(
         group_array,
         ColumnArray::VarChar { .. }
+            | ColumnArray::Dictionary { .. }
             | ColumnArray::Int64 { .. }
             | ColumnArray::Int32 { .. }
             | ColumnArray::Decimal { .. }
@@ -564,6 +591,9 @@ pub(super) fn fast_group_update(
         .ok_or_else(|| TaibaiError::Internal("fast group: group column missing".into()))?;
     let group_col = match group_array {
         ColumnArray::VarChar { data, bitmap } => FastGroupCol::Str(data, bitmap),
+        ColumnArray::Dictionary { ids, dict, bitmap, .. } => {
+            FastGroupCol::Dict(ids, dict.len(), bitmap)
+        }
         ColumnArray::Int64 { data, bitmap }
         | ColumnArray::Decimal { data, bitmap }
         | ColumnArray::Timestamp { data, bitmap }
@@ -610,6 +640,13 @@ pub(super) fn fast_group_update(
             | ColumnArray::UInt64 { bitmap, .. } => FastArgCol::Bitmap(bitmap),
             _ => FastArgCol::None,
         });
+    }
+
+    // Each batch carries its own dictionary; entry ids are batch-local.
+    for table in tables.iter_mut() {
+        if let Some(f) = table {
+            f.dict_gid.clear();
+        }
     }
 
     let rows = batch.num_rows();

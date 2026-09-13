@@ -127,7 +127,7 @@ fn selected_eq_rows_adaptive(
             selected_eq_rows_varchar_dictionary(payload, row_count, bitmap, target)
         }
         _ => {
-            let decoded = decode_adaptive_column(data, row_count, col_def, bitmap.clone())?;
+            let decoded = decode_adaptive_column(data, row_count, col_def, bitmap.clone(), false)?;
             Ok((0..decoded.len())
                 .filter(|&row| scalar_values_equal(&decoded.scalar(row), value))
                 .collect())

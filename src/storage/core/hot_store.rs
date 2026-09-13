@@ -335,6 +335,10 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
     }
 
     match col {
+        ColumnArray::Dictionary { .. } => {
+            let materialized = col.materialize_varchar();
+            return collect_keys(&materialized, pool);
+        }
         ColumnArray::Bool { data, .. } => {
             for (i, &raw) in data.iter().enumerate().take(n) {
                 out.push(if bm.is_null(i) {
@@ -2044,8 +2048,11 @@ impl HotStoreManager {
     /// would hide older live memtable rows behind an incomplete fast path.
     pub fn invalidate(&self, db: &str, table: &str) {
         let table_key = (db.to_string(), table.to_string());
+        eprintln!("DBGHOT A stores.write wait");
         self.stores.write().unwrap().remove(&table_key);
+        eprintln!("DBGHOT B stores.write got");
         self.invalidated.write().unwrap().insert(table_key);
+        eprintln!("DBGHOT C invalidated done");
     }
 
     pub fn clear_resident_coverage(&self, db: &str, table: &str) {

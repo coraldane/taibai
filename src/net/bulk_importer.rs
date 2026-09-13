@@ -58,6 +58,7 @@ fn encode_column_data(col: &ColumnArray) -> Result<(Vec<u8>, Vec<u8>)> {
 
     match col {
         ColumnArray::Selected { .. } => return encode_column_data(col.flattened()),
+        ColumnArray::Dictionary { .. } => return encode_column_data(&col.materialize_varchar()),
         ColumnArray::Bool { data: vals, .. } => {
             for v in vals {
                 data.push(*v);

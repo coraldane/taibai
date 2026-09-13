@@ -387,6 +387,16 @@ pub enum ColumnArray {
         data: Utf8Buffer,
         bitmap: NullBitmap,
     },
+    /// Dictionary-encoded varchar: dense u32 ids into a shared value arena.
+    /// Produced by decoding dictionary-encoded segments; consumers that do
+    /// not understand it expand via [`ColumnArray::materialize_varchar`].
+    Dictionary {
+        ids: Vec<u32>,
+        dict: Utf8Buffer,
+        bitmap: NullBitmap,
+        /// Lazily materialized identical owned column (never `Dictionary`).
+        flat: OnceLock<Box<ColumnArray>>,
+    },
     Blob {
         data: BinaryBuffer,
         bitmap: NullBitmap,
@@ -423,7 +433,9 @@ impl ColumnArray {
             };
         }
         match self {
-            ColumnArray::Selected { .. } => self.flattened().compare_at(left, right),
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+                self.flattened().compare_at(left, right)
+            }
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => cmp_ord!(data),
             ColumnArray::Int8 { data, .. } => cmp_ord!(data),
             ColumnArray::Int16 { data, .. } => cmp_ord!(data),
@@ -510,6 +522,17 @@ impl ColumnArray {
         }
         match self {
             ColumnArray::Selected { .. } => self.flattened().encode_key_at(row, out),
+            ColumnArray::Dictionary { ids, dict, bitmap, .. } => {
+                out.push(DataType::VarChar as u8);
+                if bitmap.is_null(row) {
+                    out.push(0);
+                    return;
+                }
+                let value = dict.get(ids[row] as usize).unwrap_or("");
+                out.push(1);
+                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                out.extend_from_slice(value.as_bytes());
+            }
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => out.push(data[row]),
             ColumnArray::Int8 { data, .. } => out.push(data[row] as u8),
             ColumnArray::Int16 { data, .. } => bytes!(data),
@@ -607,13 +630,39 @@ impl ColumnArray {
                 }
                 Box::new(out)
             }),
+            ColumnArray::Dictionary { flat, .. } => {
+                flat.get_or_init(|| Box::new(Self::expand_dictionary(self)))
+            }
             other => other,
         }
     }
 
+    /// Expand dictionary ids into plain per-row varchar values. Identity
+    /// (clone) for every other variant.
+    fn expand_dictionary(&self) -> ColumnArray {
+        if let ColumnArray::Dictionary { ids, dict, bitmap, .. } = self {
+            let mut buffer = Utf8Buffer::with_capacity(ids.len());
+            for (row, id) in ids.iter().enumerate() {
+                if bitmap.is_null(row) {
+                    buffer.push_str("");
+                } else {
+                    buffer.push_str(dict.get(*id as usize).unwrap_or(""));
+                }
+            }
+            return ColumnArray::VarChar {
+                data: buffer,
+                bitmap: bitmap.clone(),
+            };
+        }
+        self.clone()
+    }
+
     /// Materialize in place so `&mut` operations can proceed on owned data.
     pub fn flatten_in_place(&mut self) {
-        if let ColumnArray::Selected { .. } = self {
+        if matches!(
+            self,
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. }
+        ) {
             *self = self.flattened().clone();
         }
     }
@@ -788,6 +837,13 @@ impl ColumnArray {
     }
 
     /// Returns the DataType of this column.
+    /// Expand a dictionary column into a plain VarChar column (identity for
+    /// every other variant). Fallback for consumers that do not understand
+    /// the dictionary representation.
+    pub fn materialize_varchar(&self) -> ColumnArray {
+        self.expand_dictionary()
+    }
+
     pub fn data_type(&self) -> DataType {
         match self {
             ColumnArray::Selected { data_type, .. } => *data_type,
@@ -807,7 +863,7 @@ impl ColumnArray {
             ColumnArray::Time { .. } => DataType::Time,
             ColumnArray::Timestamp { .. } => DataType::Timestamp,
             ColumnArray::Interval { .. } => DataType::Interval,
-            ColumnArray::VarChar { .. } => DataType::VarChar,
+            ColumnArray::VarChar { .. } | ColumnArray::Dictionary { .. } => DataType::VarChar,
             ColumnArray::Blob { .. } => DataType::Blob,
             ColumnArray::Vector { .. } => DataType::Vector,
         }
@@ -817,6 +873,7 @@ impl ColumnArray {
     pub fn len(&self) -> usize {
         match self {
             ColumnArray::Selected { len, .. } => *len,
+            ColumnArray::Dictionary { ids, .. } => ids.len(),
             ColumnArray::Bool { data, .. } => data.len(),
             ColumnArray::Int8 { data, .. } => data.len(),
             ColumnArray::Int16 { data, .. } => data.len(),
@@ -857,9 +914,21 @@ impl ColumnArray {
                 })
                 .sum();
         }
+        if let ColumnArray::Dictionary { ids, dict, bitmap, .. } = self {
+            return ids.capacity() * 4
+                + dict.data_capacity()
+                + dict.offsets().len() * 4
+                + bitmap.estimated_size_bytes();
+        }
         let bitmap = self.bitmap().estimated_size_bytes();
         match self {
             ColumnArray::Selected { .. } => unreachable!("handled above"),
+            ColumnArray::Dictionary { ids, dict, .. } => {
+                ids.capacity() * 4
+                    + dict.data_capacity()
+                    + dict.offsets().len() * 4
+                    + bitmap
+            }
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => {
                 bitmap + data.capacity()
             }
@@ -913,6 +982,7 @@ impl ColumnArray {
     /// view on first call (the bitmap is cached with the flattened column).
     pub fn bitmap(&self) -> &NullBitmap {
         match self {
+            ColumnArray::Dictionary { bitmap, .. } => bitmap,
             ColumnArray::Selected { .. } => self.flattened().bitmap(),
             ColumnArray::Bool { bitmap, .. } => bitmap,
             ColumnArray::Int8 { bitmap, .. } => bitmap,
@@ -940,7 +1010,9 @@ impl ColumnArray {
     pub fn bitmap_mut(&mut self) -> &mut NullBitmap {
         self.flatten_in_place();
         match self {
-            ColumnArray::Selected { .. } => unreachable!("flattened above"),
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+                unreachable!("flattened above")
+            }
             ColumnArray::Bool { bitmap, .. } => bitmap,
             ColumnArray::Int8 { bitmap, .. } => bitmap,
             ColumnArray::Int16 { bitmap, .. } => bitmap,
@@ -977,6 +1049,17 @@ impl ColumnArray {
         }
         match self {
             ColumnArray::Selected { .. } => unreachable!("handled above"),
+            ColumnArray::Dictionary { ids, dict, bitmap, .. } => {
+                if bitmap.is_null(idx) {
+                    ScalarValue::VarChar(None)
+                } else {
+                    ScalarValue::VarChar(Some(
+                        dict.get(ids[idx] as usize)
+                            .unwrap_or("")
+                            .to_string(),
+                    ))
+                }
+            }
             ColumnArray::Bool { data, bitmap } => {
                 if bitmap.is_null(idx) {
                     ScalarValue::Bool(None)
@@ -1284,7 +1367,9 @@ impl ColumnArray {
     pub fn push_null_value(&mut self) {
         self.flatten_in_place();
         match self {
-            ColumnArray::Selected { .. } => unreachable!("flattened above"),
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+                unreachable!("flattened above")
+            }
             ColumnArray::Bool { data, bitmap } => {
                 data.push(0);
                 bitmap.push_null();
