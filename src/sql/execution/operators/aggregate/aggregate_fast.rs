@@ -621,7 +621,9 @@ impl FastGroups {
 fn merge_accumulator(dst: &mut Accumulator, src: Accumulator) {
     match (dst, src) {
         (Accumulator::Count { count: d, .. }, Accumulator::Count { count: s, .. }) => {
-            *d = d.wrapping_add(s);
+            // Saturate like the generic `Accumulator::merge`: a count is a
+            // row cardinality and must never wrap to a small value.
+            *d = d.saturating_add(s);
         }
         (Accumulator::SumI(d), Accumulator::SumI(s)) => {
             *d = match (d.take(), s) {
