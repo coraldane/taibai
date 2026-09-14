@@ -297,3 +297,54 @@ fn window_functions_on_interleaved_unsorted_input() {
 fn vs(s: &str) -> ScalarValue {
     ScalarValue::VarChar(Some(s.to_string()))
 }
+
+#[test]
+fn range_offset_frames_use_value_semantics() {
+    let (_dir, engine, mut session) = setup_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE r (ts INT64, v DOUBLE)")
+        .expect("create r");
+    // Gaps in the order key distinguish value-based RANGE bounds from row
+    // counts: a ROWS frame at ts=100 would include ts=3, the RANGE frame
+    // must not.
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO r VALUES (1, 1.0),(2, 2.0),(3, 3.0),(100, 100.0),(101, 101.0)",
+        )
+        .expect("insert r");
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT ts, SUM(v) OVER (ORDER BY ts RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) s
+         FROM r ORDER BY ts",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![i64(1), f64(1.0)],
+            vec![i64(2), f64(3.0)],
+            vec![i64(3), f64(5.0)],
+            vec![i64(100), f64(100.0)],
+            vec![i64(101), f64(201.0)],
+        ]
+    );
+
+    // DESC order: "preceding" means larger values.
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT ts, SUM(v) OVER (ORDER BY ts DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) s
+         FROM r ORDER BY ts",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![i64(1), f64(3.0)],
+            vec![i64(2), f64(5.0)],
+            vec![i64(3), f64(3.0)],
+            vec![i64(100), f64(201.0)],
+            vec![i64(101), f64(101.0)],
+        ]
+    );
+}

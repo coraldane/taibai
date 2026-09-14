@@ -1948,7 +1948,19 @@ fn approx_type_width(dt: &DataType) -> u64 {
 pub struct HotStoreManager {
     stores: RwLock<HashMap<(String, String), Arc<HotStore>>>,
     invalidated: RwLock<HashSet<(String, String)>>,
+    /// Per-table feed accounting for the backpressure reclaim: `in_flight`
+    /// counts rows appended to the store whose memtable staging has not
+    /// completed yet (they must never be treated as persisted prefix), and
+    /// `epoch` is bumped whenever a reclaim/invalidation shortens the store
+    /// so stale residency marks are not applied afterwards.
+    feed_accounting: Mutex<HashMap<(String, String), FeedAccounting>>,
     memory_limit_bytes: u64,
+}
+
+#[derive(Default)]
+struct FeedAccounting {
+    in_flight: u64,
+    epoch: u64,
 }
 
 impl HotStoreManager {
@@ -1960,8 +1972,57 @@ impl HotStoreManager {
         Self {
             stores: RwLock::new(HashMap::new()),
             invalidated: RwLock::new(HashSet::new()),
+            feed_accounting: Mutex::new(HashMap::new()),
             memory_limit_bytes,
         }
+    }
+
+    /// Open a hot-store feed: accounts the batch as in flight until the
+    /// caller's memtable staging completes (see [`HotFeedGuard`]) and returns
+    /// the current feed epoch for stale-mark detection.
+    pub fn begin_feed(&self, db: &str, table: &str) -> u64 {
+        let mut accounting = self.feed_accounting.lock().unwrap();
+        let state = accounting
+            .entry((db.to_string(), table.to_string()))
+            .or_default();
+        state.in_flight = state.in_flight.saturating_add(1);
+        state.epoch
+    }
+
+    /// Close a hot-store feed opened by [`Self::begin_feed`].
+    pub fn end_feed(&self, db: &str, table: &str) {
+        let mut accounting = self.feed_accounting.lock().unwrap();
+        if let Some(state) = accounting.get_mut(&(db.to_string(), table.to_string())) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+
+    /// Rows currently between hot-store append and memtable staging.
+    pub fn in_flight(&self, db: &str, table: &str) -> u64 {
+        self.feed_accounting
+            .lock()
+            .unwrap()
+            .get(&(db.to_string(), table.to_string()))
+            .map(|state| state.in_flight)
+            .unwrap_or(0)
+    }
+
+    /// Current feed epoch; bumped by every reclaim/invalidation below.
+    pub fn feed_epoch(&self, db: &str, table: &str) -> u64 {
+        self.feed_accounting
+            .lock()
+            .unwrap()
+            .get(&(db.to_string(), table.to_string()))
+            .map(|state| state.epoch)
+            .unwrap_or(0)
+    }
+
+    fn bump_feed_epoch(&self, db: &str, table: &str) {
+        let mut accounting = self.feed_accounting.lock().unwrap();
+        accounting
+            .entry((db.to_string(), table.to_string()))
+            .or_default()
+            .epoch += 1;
     }
 
     pub fn get(&self, db: &str, table: &str) -> Option<Arc<HotStore>> {
@@ -2021,6 +2082,7 @@ impl HotStoreManager {
 
     /// Reclaim the persisted prefix of one table's resident store (backpressure).
     pub fn compact_prefix(&self, db: &str, table: &str, n: u64) -> u64 {
+        self.bump_feed_epoch(db, table);
         let stores = self.stores.read().unwrap();
         stores
             .get(&(db.to_string(), table.to_string()))
@@ -2048,11 +2110,13 @@ impl HotStoreManager {
     /// would hide older live memtable rows behind an incomplete fast path.
     pub fn invalidate(&self, db: &str, table: &str) {
         let table_key = (db.to_string(), table.to_string());
+        self.bump_feed_epoch(db, table);
         self.stores.write().unwrap().remove(&table_key);
         self.invalidated.write().unwrap().insert(table_key);
     }
 
     pub fn clear_resident_coverage(&self, db: &str, table: &str) {
+        self.bump_feed_epoch(db, table);
         if let Some(store) = self.get(db, table) {
             store.clear_resident_coverage();
         }

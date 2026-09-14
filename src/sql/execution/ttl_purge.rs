@@ -147,6 +147,13 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
         Ok(())
     })?;
 
+    // Purged rows may still be mirrored in the hot store, and the purged
+    // partitions may be cached as resident: drop the residency marks and the
+    // cached partition→segment knowledge so scans fall back to the (now
+    // smaller) segment set. The read-time TTL filter stays as the safety net.
+    engine.hot_store_manager().clear_resident_coverage(db, table);
+    engine.clear_hot_partition_segments(&table_dir);
+
     // Phase B — retire catalog entries while holding only catalogs().write().
     // Re-check the directory first: a concurrent writer may have recreated
     // files for an expired key after phase A released the lock (e.g. a

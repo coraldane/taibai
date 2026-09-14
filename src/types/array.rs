@@ -850,8 +850,15 @@ impl ColumnArray {
     /// Expand a dictionary column into a plain VarChar column (identity for
     /// every other variant). Fallback for consumers that do not understand
     /// the dictionary representation.
+    /// The owned, plain-varchar form of this column. Dictionary expansion is
+    /// cached by [`Self::flattened`], so repeated calls (e.g. per-row key
+    /// encoding against the same column) expand the dictionary once instead
+    /// of once per call.
     pub fn materialize_varchar(&self) -> ColumnArray {
-        self.expand_dictionary()
+        match self {
+            ColumnArray::Dictionary { .. } => self.flattened().clone(),
+            other => other.clone(),
+        }
     }
 
     pub fn data_type(&self) -> DataType {

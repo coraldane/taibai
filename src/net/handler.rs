@@ -1163,6 +1163,15 @@ impl Handler {
             )]);
         };
 
+        // Validate the pattern before the permission check so malformed
+        // topics (e.g. `db.t*cks`) are rejected as such instead of being
+        // permission-checked as a database-level wildcard.
+        if let Err(reason) = crate::pubsub::TopicPattern::parse(topic) {
+            return Ok(vec![build_error(&format!(
+                "invalid subscription topic '{topic}': {reason}"
+            ))]);
+        }
+
         // Resolve the topic against the session database, validate that the
         // referenced objects exist, and require SUBSCRIBE (or admin) rights.
         // `>` subscribes to every database; `db`-scoped wildcards require a

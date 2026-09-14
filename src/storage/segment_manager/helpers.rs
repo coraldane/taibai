@@ -312,6 +312,19 @@ fn direct_bulk_column_to_array(
         DataType::VarChar => {
             if let Some(ranges) = &col.variable_ranges {
                 if ranges.len() == rows {
+                    // Protocol-supplied offsets: validate before slicing so a
+                    // malformed payload reports an error instead of panicking
+                    // the decode task (parity with the scalar fallback).
+                    let max_end: usize = ranges
+                        .iter()
+                        .map(|&(offset, len)| offset.saturating_add(len))
+                        .max()
+                        .unwrap_or(0);
+                    if max_end > col.data.len() {
+                        return Err(TaibaiError::Protocol(
+                            "bulk varchar ranges exceed column payload".into(),
+                        ));
+                    }
                     let total_bytes: usize = ranges.iter().map(|&(_, len)| len).sum();
                     let mut buf = crate::types::array::Utf8Buffer::with_capacity(rows);
                     buf.reserve_values(rows, total_bytes);

@@ -330,7 +330,9 @@ fn order_key_peer(
 
 /// Effective frame row span `[lo, hi)` for one row inside its partition.
 /// Without an explicit frame: the whole partition when there is no ORDER BY,
-/// otherwise `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
+/// otherwise `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. RANGE
+/// offset bounds work in the order-key *value* domain (SQL semantics); ROWS
+/// bounds count positions.
 fn frame_bounds(
     plan: &WindowFuncPlan,
     order: &[u32],
@@ -342,28 +344,42 @@ fn frame_bounds(
     let group_len = group_end - group_start;
     let pos_in_group = pos - group_start;
 
-    let (start_spec, end_spec) = match &plan.frame {
-        Some(WindowFrame { start, end, .. }) => (start, end),
+    let (start_spec, end_spec, frame_type) = match &plan.frame {
+        Some(frame) => (&frame.start, &frame.end, frame.frame_type),
         None if !plan.order_by.is_empty() => {
             static DEFAULT: WindowFrame = WindowFrame {
                 frame_type: FrameType::Range,
                 start: FrameBound::UnboundedPreceding,
                 end: FrameBound::CurrentRow,
             };
-            (&DEFAULT.start, &DEFAULT.end)
+            (&DEFAULT.start, &DEFAULT.end, FrameType::Range)
         }
         None => return (group_start, group_end),
     };
+    let is_range = frame_type == FrameType::Range;
 
     let lo = match start_spec {
         FrameBound::UnboundedPreceding => group_start,
+        FrameBound::Preceding(n) if is_range => range_bound_pos(
+            order, order_cols, group_start, group_end, pos, *n, true, true,
+        )
+        .unwrap_or_else(|| peer_start(order, order_cols, group_start, pos)),
         FrameBound::Preceding(n) => group_start + pos_in_group.saturating_sub(*n),
+        FrameBound::CurrentRow if is_range => peer_start(order, order_cols, group_start, pos),
         FrameBound::CurrentRow => pos,
+        FrameBound::Following(n) if is_range => range_bound_pos(
+            order, order_cols, group_start, group_end, pos, *n, true, false,
+        )
+        .unwrap_or_else(|| peer_start(order, order_cols, group_start, pos)),
         FrameBound::Following(n) => group_start + (pos_in_group + n).min(group_len),
         FrameBound::UnboundedFollowing => group_end,
     };
     let hi = match end_spec {
         FrameBound::UnboundedFollowing => group_end,
+        FrameBound::Following(n) if is_range => range_bound_pos(
+            order, order_cols, group_start, group_end, pos, *n, false, false,
+        )
+        .unwrap_or_else(|| peer_end(order, order_cols, group_start, group_end, pos)),
         FrameBound::Following(n) => group_start + (pos_in_group + n + 1).min(group_len),
         FrameBound::CurrentRow => {
             match &plan.frame {
@@ -376,10 +392,85 @@ fn frame_bounds(
                 _ => peer_end(order, order_cols, group_start, group_end, pos),
             }
         }
+        FrameBound::Preceding(n) if is_range => range_bound_pos(
+            order, order_cols, group_start, group_end, pos, *n, false, true,
+        )
+        .unwrap_or_else(|| peer_end(order, order_cols, group_start, group_end, pos)),
         FrameBound::Preceding(n) => group_start + (pos_in_group + 1).saturating_sub(*n),
         FrameBound::UnboundedPreceding => group_start,
     };
     (lo, hi.clamp(lo, group_end))
+}
+
+/// Numeric value of the first (single) ORDER BY key at sorted position `pos`.
+fn range_key_at(
+    order_cols: &[(Vec<ScalarValue>, bool)],
+    order: &[u32],
+    pos: usize,
+) -> Option<f64> {
+    let (col, _) = order_cols.first()?;
+    col.get(*order.get(pos)? as usize)?.numeric_f64()
+}
+
+/// First sorted position in `[group_start, group_end)` of a RANGE offset
+/// bound. `start_bound` selects the frame's lower edge (returns the first
+/// in-frame row) or upper edge (returns the first row *past* the frame);
+/// `preceding` selects the direction of `offset` in the value domain. NULL
+/// and non-numeric order keys return None: those rows compare only to their
+/// own peers, so callers fall back to the peer run.
+#[allow(clippy::too_many_arguments)]
+fn range_bound_pos(
+    order: &[u32],
+    order_cols: &[(Vec<ScalarValue>, bool)],
+    group_start: usize,
+    group_end: usize,
+    pos: usize,
+    offset: usize,
+    start_bound: bool,
+    preceding: bool,
+) -> Option<usize> {
+    let (_, desc) = order_cols.first()?;
+    let desc = *desc;
+    let cur = range_key_at(order_cols, order, pos)?;
+    let n = offset as f64;
+    let keep: Box<dyn Fn(Option<f64>) -> bool> = match (desc, start_bound, preceding) {
+        // ASC, start: frame begins at `cur - n` / `cur + n` (inclusive).
+        (false, true, true) => Box::new(move |v| v.is_some_and(|v| v >= cur - n)),
+        (false, true, false) => Box::new(move |v| v.is_some_and(|v| v >= cur + n)),
+        // DESC, start: earlier sort positions carry larger values.
+        (true, true, true) => Box::new(move |v| v.is_some_and(|v| v <= cur + n)),
+        (true, true, false) => Box::new(move |v| v.is_some_and(|v| v <= cur - n)),
+        // ASC, end: frame ends at `cur + n` (inclusive) / `cur - n` (the
+        // PRECEDING end bound is exclusive in SQL).
+        (false, false, false) => Box::new(move |v| v.is_some_and(|v| v <= cur + n)),
+        (false, false, true) => Box::new(move |v| v.is_some_and(|v| v < cur - n)),
+        // DESC, end.
+        (true, false, false) => Box::new(move |v| v.is_some_and(|v| v >= cur - n)),
+        (true, false, true) => Box::new(move |v| v.is_some_and(|v| v > cur + n)),
+    };
+    if start_bound {
+        (group_start..group_end).find(|&p| keep(range_key_at(order_cols, order, p)))
+    } else {
+        Some(
+            (group_start..group_end)
+                .find(|&p| !keep(range_key_at(order_cols, order, p)))
+                .unwrap_or(group_end),
+        )
+    }
+}
+
+/// First position of the peer run containing `pos`.
+fn peer_start(
+    order: &[u32],
+    order_cols: &[(Vec<ScalarValue>, bool)],
+    group_start: usize,
+    pos: usize,
+) -> usize {
+    let mut start = pos;
+    while start > group_start && order_key_peer(order, start - 1, start, order_cols) {
+        start -= 1;
+    }
+    start
 }
 
 /// Last position (exclusive) of the peer run containing `pos`.

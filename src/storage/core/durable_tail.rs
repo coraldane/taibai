@@ -1065,9 +1065,24 @@ pub fn recover_index(table_dir: &Path, _schema: &Schema) -> Result<Vec<Recovered
         if bytes.len() < TAIL_LOG_HEADER_LEN as usize {
             continue;
         }
-        let rows = scan_tail_log_rows(&bytes).ok_or_else(|| {
-            TaibaiError::Storage("unsupported or corrupt durable tail version".into())
-        })?;
+        let rows = match scan_tail_log_rows(&bytes) {
+            Some(rows) => rows,
+            None => {
+                // A crash can tear the file inside the variable-length
+                // header (magic + key-length present, key bytes missing).
+                // Like a sub-header file, nothing was fsynced into it, so
+                // treat it as absent instead of failing the whole table's
+                // recovery.
+                let partition_len =
+                    u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+                if bytes.len() < 8usize.saturating_add(partition_len) {
+                    continue;
+                }
+                return Err(TaibaiError::Storage(
+                    "unsupported or corrupt durable tail version".into(),
+                ));
+            }
+        };
         let partition_key = read_tail_log_partition_key(&path)?.ok_or_else(|| {
             TaibaiError::Storage("durable tail is missing its partition key".into())
         })?;
@@ -1389,12 +1404,27 @@ fn next_sequence() -> u64 {
 
 /// A tail file shorter than the V2 log header cannot hold even one committed
 /// frame: nothing was fsynced into it, so recovery must treat it as absent
-/// instead of failing the whole table's recovery.
+/// instead of failing the whole table's recovery. The header is
+/// variable-length (magic + partition-key bytes), so both the magic and the
+/// full header extent are validated against the file size.
 const TAIL_LOG_HEADER_LEN: u64 = 8;
 
 fn tail_file_has_header(path: &Path) -> bool {
+    use std::io::Read;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut header = [0u8; TAIL_LOG_HEADER_LEN as usize];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
+        return false;
+    }
+    let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
     fs::metadata(path)
-        .map(|meta| meta.len() >= TAIL_LOG_HEADER_LEN)
+        .map(|meta| meta.len() >= TAIL_LOG_HEADER_LEN.saturating_add(partition_len))
         .unwrap_or(false)
 }
 

@@ -1,3 +1,26 @@
+/// Held for the duration of one hot-store feed: from the append until the
+/// batch's memtable staging completes. Dropping it releases the in-flight
+/// accounting; the captured epoch lets `feed_hot_store` detect that a
+/// concurrent reclaim invalidated the residency mark it computed.
+pub struct HotFeedGuard<'a> {
+    mgr: &'a crate::storage::core::hot_store::HotStoreManager,
+    db: String,
+    table: String,
+    epoch: u64,
+}
+
+impl HotFeedGuard<'_> {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl Drop for HotFeedGuard<'_> {
+    fn drop(&mut self) {
+        self.mgr.end_feed(&self.db, &self.table);
+    }
+}
+
 impl Engine {
     pub(crate) fn performance_baselines(
         &self,
@@ -39,12 +62,33 @@ impl Engine {
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: &crate::types::batch::RecordBatch,
+        feed: &HotFeedGuard<'_>,
     ) -> crate::common::error::Result<()> {
         let resident_mark = self.hot_resident_mark_for_append(db, table, table_meta, batch);
         self.hot_store_mgr
             .try_append(db, table, table_meta, batch)?;
-        self.apply_hot_resident_mark(db, table, resident_mark);
+        // A concurrent backpressure reclaim may have compacted the store
+        // between the mark computation and the append (feed epoch bump):
+        // applying the now-stale positive residency mark would let the
+        // resident fast path answer from the shortened store.
+        if self.hot_store_mgr.feed_epoch(db, table) == feed.epoch() {
+            self.apply_hot_resident_mark(db, table, resident_mark);
+        }
         Ok(())
+    }
+
+    /// Account a hot-store feed for the whole write: the guard must be held
+    /// from the append until the batch's memtable staging completes, so a
+    /// concurrent [`Self::reclaim_hot_store_pressure`] never mistakes the
+    /// in-flight rows for persisted prefix.
+    pub fn begin_hot_feed(&self, db: &str, table: &str) -> HotFeedGuard<'_> {
+        let epoch = self.hot_store_mgr.begin_feed(db, table);
+        HotFeedGuard {
+            mgr: &self.hot_store_mgr,
+            db: db.to_string(),
+            table: table.to_string(),
+            epoch,
+        }
     }
 
     fn hot_resident_mark_for_append(
@@ -129,18 +173,13 @@ impl Engine {
             PartitionKeyKind, PartitionKeysAt,
         };
         let partition_column = batch.column(partition_col_idx);
+        // Derive the kind through `partition_strategy()` so every scheme
+        // (Hash/Mod included) gets per-partition mirror accounting, matching
+        // the write path's `partition_keys_computer`.
         let kind = match table_meta.partition_type {
             PartitionType::Value => Some(PartitionKeyKind::ValueText),
-            PartitionType::Day => Some(PartitionKeyKind::Strategy(
-                crate::storage::partition::partition_function::PartitionFunction::Day,
-            )),
-            PartitionType::Month => Some(PartitionKeyKind::Strategy(
-                crate::storage::partition::partition_function::PartitionFunction::Month,
-            )),
-            PartitionType::Year => Some(PartitionKeyKind::Strategy(
-                crate::storage::partition::partition_function::PartitionFunction::Year,
-            )),
-            _ => None,
+            PartitionType::None => None,
+            _ => Some(PartitionKeyKind::Strategy(table_meta.partition_strategy())),
         };
         let Some((kind, partition_column)) = kind.zip(partition_column) else {
             return Vec::new();
@@ -264,7 +303,13 @@ impl Engine {
             .iter()
             .map(|mt| mt.row_count())
             .sum::<u64>();
-        let prefix = store_rows.saturating_sub(live);
+        let prefix = store_rows
+            .saturating_sub(live)
+            // Rows appended to the store but not staged into the memtables
+            // yet are neither persisted nor counted in `live`: subtracting
+            // them keeps the persisted-prefix estimate stable while their
+            // write is in progress.
+            .saturating_sub(self.hot_store_mgr.in_flight(db, table));
         if prefix > 0 {
             let dropped = self.hot_store_mgr.compact_prefix(db, table, prefix);
             // Rows below the new front are gone from the store: retract

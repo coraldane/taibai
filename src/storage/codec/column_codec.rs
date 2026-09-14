@@ -1365,6 +1365,14 @@ fn expand_varchar_dictionary(
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect();
+    // The passthrough keeps raw ids: an out-of-range id would silently
+    // decode to "" downstream (scalar/encode_key_at fall back to ""), so
+    // validate against the dictionary here instead.
+    if ids.iter().any(|&idx| idx as usize >= dict.len()) {
+        return Err(TaibaiError::Storage(
+            "dictionary index out of bounds".into(),
+        ));
+    }
     let mut ids_full = vec![0u32; row_count];
     let mut value_pos = 0usize;
     for (row, slot) in ids_full.iter_mut().enumerate() {
@@ -1417,26 +1425,9 @@ fn build_numeric_column_from_i64(
             _ => {}
         }
     }
-    macro_rules! build_signed {
-        ($variant:ident, $ty:ty) => {{
-            let out: Vec<$ty> = if bitmap.null_count() == 0 {
-                values.iter().map(|&v| v as $ty).collect()
-            } else {
-                let mut out = Vec::with_capacity(row_count);
-                for row in 0..row_count {
-                    if bitmap.is_null(row) {
-                        out.push(<$ty>::default());
-                    } else {
-                        out.push(values[value_pos] as $ty);
-                        value_pos += 1;
-                    }
-                }
-                out
-            };
-            ColumnArray::$variant { data: out, bitmap }
-        }};
-    }
-    macro_rules! build_unsigned {
+    // One macro serves signed and unsigned (and Date/Time/…) fixed-width
+    // targets alike: `as` casts handle both.
+    macro_rules! build_fixed {
         ($variant:ident, $ty:ty) => {{
             let out: Vec<$ty> = if bitmap.null_count() == 0 {
                 values.iter().map(|&v| v as $ty).collect()
@@ -1457,19 +1448,19 @@ fn build_numeric_column_from_i64(
     }
 
     Ok(match col_def.data_type {
-        DataType::Int8 => build_signed!(Int8, i8),
-        DataType::Int16 => build_signed!(Int16, i16),
-        DataType::Int32 => build_signed!(Int32, i32),
-        DataType::Int64 => build_signed!(Int64, i64),
-        DataType::Decimal => build_signed!(Decimal, i64),
-        DataType::Date => build_signed!(Date, i32),
-        DataType::Time => build_signed!(Time, i64),
-        DataType::Timestamp => build_signed!(Timestamp, i64),
-        DataType::Interval => build_signed!(Interval, i64),
-        DataType::UInt8 => build_unsigned!(UInt8, u8),
-        DataType::UInt16 => build_unsigned!(UInt16, u16),
-        DataType::UInt32 => build_unsigned!(UInt32, u32),
-        DataType::UInt64 => build_unsigned!(UInt64, u64),
+        DataType::Int8 => build_fixed!(Int8, i8),
+        DataType::Int16 => build_fixed!(Int16, i16),
+        DataType::Int32 => build_fixed!(Int32, i32),
+        DataType::Int64 => build_fixed!(Int64, i64),
+        DataType::Decimal => build_fixed!(Decimal, i64),
+        DataType::Date => build_fixed!(Date, i32),
+        DataType::Time => build_fixed!(Time, i64),
+        DataType::Timestamp => build_fixed!(Timestamp, i64),
+        DataType::Interval => build_fixed!(Interval, i64),
+        DataType::UInt8 => build_fixed!(UInt8, u8),
+        DataType::UInt16 => build_fixed!(UInt16, u16),
+        DataType::UInt32 => build_fixed!(UInt32, u32),
+        DataType::UInt64 => build_fixed!(UInt64, u64),
         other => {
             return Err(TaibaiError::Storage(format!(
                 "adaptive numeric encoding cannot decode {}",

@@ -539,8 +539,16 @@ fn exec_materialized_insert_batch(
         constraint_start.elapsed(),
     );
 
-    if txn_id == 0 && !bulk_import_mode && !relaxed_direct_insert {
-        match engine.feed_hot_store(db, table, table_meta, &batch) {
+    // Hold the feed guard at function scope so the in-flight accounting
+    // spans the hot append and the memtable staging below: a concurrent
+    // backpressure reclaim must not mistake these rows for persisted prefix.
+    let hot_feed_guard = if txn_id == 0 && !bulk_import_mode && !relaxed_direct_insert {
+        Some(engine.begin_hot_feed(db, table))
+    } else {
+        None
+    };
+    if let Some(feed) = hot_feed_guard.as_ref() {
+        match engine.feed_hot_store(db, table, table_meta, &batch, feed) {
             Ok(()) => {
                 if engine
                     .hot_store_manager()
@@ -551,7 +559,7 @@ fn exec_materialized_insert_batch(
             }
             Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
                 engine.reclaim_hot_store_pressure(db, table);
-                engine.feed_hot_store(db, table, table_meta, &batch)?
+                engine.feed_hot_store(db, table, table_meta, &batch, feed)?
             }
             Err(e) => return Err(e),
         }

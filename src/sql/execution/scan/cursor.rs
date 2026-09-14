@@ -321,11 +321,8 @@ impl ScanCursor {
         let spec = self.spec.clone();
         let plan = self.plan.clone();
         let table_schema = self.table_schema.clone();
-        let _table_meta = self.table_meta.clone();
         let runtime = self.runtime.clone();
-        let db = self.db.clone();
         let segments = self.segments.clone();
-        let _ = db;
         std::thread::Builder::new()
             .name("taibai-cursor-decode".into())
             .spawn(move || {

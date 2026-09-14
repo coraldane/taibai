@@ -543,11 +543,12 @@ impl Engine {
             crate::storage::core::hot_store::ResidentCoverageSnapshot,
         >,
     ) {
-        let feed_result = match self.feed_hot_store(db, table, table_meta, batch) {
+        let feed = self.begin_hot_feed(db, table);
+        let feed_result = match self.feed_hot_store(db, table, table_meta, batch, &feed) {
             Ok(()) => Ok(()),
             Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
                 self.reclaim_hot_store_pressure(db, table);
-                self.feed_hot_store(db, table, table_meta, batch)
+                self.feed_hot_store(db, table, table_meta, batch, &feed)
             }
             Err(e) => Err(e),
         };
@@ -588,13 +589,14 @@ impl Engine {
                 crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)
             });
         let mut feed_batch: Option<RecordBatch> = None;
+        let feed = self.begin_hot_feed(db, table);
         let feed_result = match parse_result {
             Ok(batch) => {
-                let fed = match self.feed_hot_store(db, table, table_meta, &batch) {
+                let fed = match self.feed_hot_store(db, table, table_meta, &batch, &feed) {
                     Ok(()) => Ok(()),
                     Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
                         self.reclaim_hot_store_pressure(db, table);
-                        self.feed_hot_store(db, table, table_meta, &batch)
+                        self.feed_hot_store(db, table, table_meta, &batch, &feed)
                     }
                     Err(e) => Err(e),
                 };

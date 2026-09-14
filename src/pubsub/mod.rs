@@ -155,6 +155,9 @@ enum PubEvent {
         db: String,
         table: String,
         batch: Arc<RecordBatch>,
+        /// Assigned at publish time so events dropped by a full channel
+        /// still consume their sequence: subscribers observe the gap.
+        seq: u64,
     },
     Shutdown,
 }
@@ -183,6 +186,9 @@ pub struct PubSubHub {
     next_sub_id: AtomicU64,
     next_conn_id: AtomicU64,
     dropped_events: AtomicU64,
+    /// Per-topic notification sequence, assigned at publish time (not in the
+    /// fan-out thread) so dropped events consume a seq and stay detectable.
+    topic_seqs: Mutex<HashMap<String, u64>>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -204,6 +210,7 @@ impl PubSubHub {
             next_sub_id: AtomicU64::new(1),
             next_conn_id: AtomicU64::new(1),
             dropped_events: AtomicU64::new(0),
+            topic_seqs: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
         });
         hub.start_worker();
@@ -254,10 +261,22 @@ impl PubSubHub {
         if !self.has_subscribers() || batch.num_rows() == 0 {
             return;
         }
+        // Assign the sequence here, before the channel accepts the event: an
+        // event dropped by a full channel still consumes its seq, so the
+        // sequence gap subscribers observe covers hub-level drops too.
+        let seq = {
+            let mut seqs = self.topic_seqs.lock().unwrap();
+            let seq = seqs
+                .entry(format!("{db}.{table}"))
+                .or_insert(0);
+            *seq = seq.wrapping_add(1);
+            *seq
+        };
         let event = PubEvent::Change {
             db: db.to_string(),
             table: table.to_string(),
             batch,
+            seq,
         };
         if self.event_tx.try_send(event).is_err() {
             self.record_dropped_event();
@@ -368,11 +387,15 @@ impl PubSubHub {
     }
 
     fn fanout_loop(rx: &crossbeam_channel::Receiver<PubEvent>, state: &FanoutState) {
-        let mut topic_seqs: HashMap<String, u64> = HashMap::new();
         loop {
             match rx.recv_timeout(FANOUT_POLL_INTERVAL) {
-                Ok(PubEvent::Change { db, table, batch }) => {
-                    Self::fanout_change(state, &mut topic_seqs, &db, &table, batch);
+                Ok(PubEvent::Change {
+                    db,
+                    table,
+                    batch,
+                    seq,
+                }) => {
+                    Self::fanout_change(state, &db, &table, batch, seq);
                 }
                 Ok(PubEvent::Shutdown) => break,
                 Err(RecvTimeoutError::Timeout) => {
@@ -387,17 +410,12 @@ impl PubSubHub {
 
     fn fanout_change(
         state: &FanoutState,
-        topic_seqs: &mut HashMap<String, u64>,
         db: &str,
         table: &str,
         batch: Arc<RecordBatch>,
+        seq: u64,
     ) {
         let topic = format!("{db}.{table}");
-        let seq = {
-            let seq = topic_seqs.entry(topic.clone()).or_insert(0);
-            *seq = seq.wrapping_add(1);
-            *seq
-        };
         // Encode and compress once; every subscriber shares the same buffer.
         let mut encoded = encode_binary_result(&batch);
         if encoded.len() > state.compress_threshold {

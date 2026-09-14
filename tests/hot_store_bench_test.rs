@@ -21,7 +21,6 @@ use taibai::types::scalar::ScalarValue;
 
 const BATCH_ROWS: usize = 4_096;
 const APPEND_ROUNDS: usize = 245; // ~1M rows in whole batches
-const TOTAL_ROWS: usize = APPEND_ROUNDS * BATCH_ROWS;
 
 /// Multiplier for profiling runs (`HOT_BENCH_SCALE=20 cargo test ...`).
 fn bench_scale() -> usize {
