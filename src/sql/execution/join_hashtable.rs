@@ -382,17 +382,6 @@ impl AsofJoinIndex {
         }
     }
 
-    /// Look up the partition for one probe row's equality key. `None` when
-    /// the key is unknown (NULL keys are never inserted).
-    pub fn partition_for_batch(
-        &self,
-        batch: &RecordBatch,
-        row: usize,
-        eq_key_cols: &[usize],
-    ) -> Option<&[(ScalarValue, RowPointer)]> {
-        let key = JoinKey::from_batch(batch, row, eq_key_cols)?;
-        self.partitions.get(&key).map(Vec::as_slice)
-    }
 
     /// Look up the partition from already-materialized probe row values,
     /// indexed by the same equality-key columns used at build time. A NULL
@@ -420,10 +409,6 @@ impl AsofJoinIndex {
             .unwrap_or(ScalarValue::Int64(None))
     }
 
-    /// Number of rows seen on the build side.
-    pub fn row_count(&self) -> usize {
-        self.total_rows
-    }
 }
 
 fn compare_timestamps(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {

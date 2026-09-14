@@ -1032,60 +1032,12 @@ pub fn decode_column(
     }
 
     let col = match col_def.data_type {
-        DataType::Bool => {
-            let mut vals = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                vals.push(if bitmap.is_null(i) {
-                    0u8
-                } else {
-                    let mut b = [0u8; 1];
-                    dc.read_exact(&mut b)
-                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
-                    b[0]
-                });
-            }
-            ColumnArray::Bool {
-                data: vals,
-                bitmap: bitmap.clone(),
-            }
-        }
-        DataType::Int8 => {
-            let mut vals = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                vals.push(if bitmap.is_null(i) {
-                    0i8
-                } else {
-                    let mut b = [0u8; 1];
-                    dc.read_exact(&mut b)
-                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
-                    b[0] as i8
-                });
-            }
-            ColumnArray::Int8 {
-                data: vals,
-                bitmap: bitmap.clone(),
-            }
-        }
+        DataType::Bool => read_fixed!(u8, 1, Bool),
+        DataType::Int8 => read_fixed!(i8, 1, Int8),
         DataType::Int16 => read_fixed!(i16, 2, Int16),
         DataType::Int32 => read_fixed!(i32, 4, Int32),
         DataType::Int64 => read_fixed!(i64, 8, Int64),
-        DataType::UInt8 => {
-            let mut vals = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                vals.push(if bitmap.is_null(i) {
-                    0u8
-                } else {
-                    let mut b = [0u8; 1];
-                    dc.read_exact(&mut b)
-                        .map_err(|e| TaibaiError::Storage(format!("read error: {}", e)))?;
-                    b[0]
-                });
-            }
-            ColumnArray::UInt8 {
-                data: vals,
-                bitmap: bitmap.clone(),
-            }
-        }
+        DataType::UInt8 => read_fixed!(u8, 1, UInt8),
         DataType::UInt16 => read_fixed!(u16, 2, UInt16),
         DataType::UInt32 => read_fixed!(u32, 4, UInt32),
         DataType::UInt64 => read_fixed!(u64, 8, UInt64),
@@ -1293,7 +1245,6 @@ fn expand_varchar_dictionary(
     let mut cursor = Cursor::new(payload);
     let dict_count = read_u32_le(&mut cursor)? as usize;
     let mut dict: Vec<&str> = Vec::with_capacity(dict_count);
-    let mut owned_fallbacks: Vec<String> = Vec::new();
     for _ in 0..dict_count {
         let len = read_u32_le(&mut cursor)? as usize;
         let start = cursor.position() as usize;
@@ -1311,7 +1262,6 @@ fn expand_varchar_dictionary(
                 // borrow structure for an unreachable path.
                 let leaked: &'static str =
                     Box::leak(String::from_utf8_lossy(bytes).into_owned().into_boxed_str());
-                owned_fallbacks.push(leaked.to_owned());
                 leaked
             }
         };

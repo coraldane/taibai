@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::common::error::Result;
 use crate::sql::execution::operators::filter::{eval_expr_column, remap_expr_for_batch};
-use crate::sql::execution::operators::sort::compare_scalars;
+use crate::sql::execution::operators::sort::compare_scalars_null_last;
 use crate::sql::planner::{LogicalExpr, SortKey};
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
@@ -102,7 +102,7 @@ struct HeapEntry {
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         for (index, descending) in self.descending.iter().enumerate() {
-            let ordering = compare_scalars(&self.keys[index], &other.keys[index]);
+            let ordering = compare_scalars_null_last(&self.keys[index], &other.keys[index]);
             let ordering = if *descending {
                 ordering.reverse()
             } else {

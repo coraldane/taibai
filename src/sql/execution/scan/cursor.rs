@@ -326,68 +326,96 @@ impl ScanCursor {
         std::thread::Builder::new()
             .name("taibai-cursor-decode".into())
             .spawn(move || {
-                for segment in &segments {
-                    let reader =
-                        match runtime.segment_mgr().open_reader_cached(segment) {
-                            Ok(r) => r,
-                            Err(_) => continue,
+                // A panic in this thread would close the channel and look like
+                // a normal end-of-stream: catch it and fail the query instead.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for segment in &segments {
+                        let reader =
+                            match runtime.segment_mgr().open_reader_cached(segment) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    if segment.exists() {
+                                        // The file is still there but cannot be
+                                        // opened: a real error, not a compaction
+                                        // race — fail the query like the inline
+                                        // walk would.
+                                        let _ = tx.send(Err(e));
+                                        return;
+                                    }
+                                    // Segment removed under us by a concurrent
+                                    // compaction: skip it the way the inline
+                                    // pruning would.
+                                    tracing::warn!(
+                                        segment = %segment.display(),
+                                        "cursor background decode: segment vanished mid-scan; skipping"
+                                    );
+                                    continue;
+                                }
+                            };
+                        let candidates = if let Ok(Some(meta)) =
+                            runtime.segment_mgr().segment_meta(segment)
+                        {
+                            let pred = spec.to_row_group_predicate();
+                            if !super::row_group::prune_segment_by_zone_map(
+                                &pred,
+                                &meta.segment_zone_maps,
+                            ) {
+                                continue;
+                            }
+                            super::row_group::prune_row_group_meta(
+                                &meta.row_groups,
+                                &pred,
+                                &super::row_group::build_bloom_check_list(&spec),
+                                &super::row_group::build_in_check_list(&spec),
+                                &super::row_group::build_set_check_list(&spec),
+                                &super::row_group::build_set_in_check_list(&spec),
+                            )
+                            .candidate_indices
+                        } else {
+                            match strategy::prune_segment(&spec, &reader) {
+                                Some(pruned) => pruned.candidate_indices,
+                                None => continue,
+                            }
                         };
-                    let candidates = if let Ok(Some(meta)) =
-                        runtime.segment_mgr().segment_meta(segment)
-                    {
-                        let pred = spec.to_row_group_predicate();
-                        if !super::row_group::prune_segment_by_zone_map(
-                            &pred,
-                            &meta.segment_zone_maps,
-                        ) {
-                            continue;
-                        }
-                        super::row_group::prune_row_group_meta(
-                            &meta.row_groups,
-                            &pred,
-                            &super::row_group::build_bloom_check_list(&spec),
-                            &super::row_group::build_in_check_list(&spec),
-                            &super::row_group::build_set_check_list(&spec),
-                            &super::row_group::build_set_in_check_list(&spec),
-                        )
-                        .candidate_indices
-                    } else {
-                        match strategy::prune_segment(&spec, &reader) {
-                            Some(pruned) => pruned.candidate_indices,
-                            None => continue,
-                        }
-                    };
-                    // Decode in parallel chunks (bounded by the global
-                    // cpu/io permits); send in candidate order so the
-                    // consumer sees the same sequence as the inline walk.
-                    // The dedicated pool keeps these chunk tasks from
-                    // queueing the consumer's per-batch lane work behind
-                    // multi-millisecond decode tasks on the global pool.
-                    for chunk in candidates.chunks(32) {
-                        let decoded: Vec<_> = background_decode_pool().install(|| {
-                            chunk
-                                .par_iter()
-                                .filter_map(|row_group| {
-                                    let _cpu = crate::common::work_limiter::acquire_cpu();
-                                    let _io = crate::common::work_limiter::acquire_io();
-                                    strategy::read_row_group_with_strategy(
-                                        &spec,
-                                        &plan,
-                                        &table_schema,
-                                        &reader,
-                                        *row_group,
-                                    )
-                                    .ok()
-                                })
-                                .collect()
-                        });
-                        for batch in decoded {
-                            if tx.send(Ok(batch)).is_err() {
-                                // Consumer went away (LIMIT early exit / drop).
-                                return;
+                        // Decode in parallel chunks (bounded by the global
+                        // cpu/io permits); send in candidate order so the
+                        // consumer sees the same sequence as the inline walk.
+                        // The dedicated pool keeps these chunk tasks from
+                        // queueing the consumer's per-batch lane work behind
+                        // multi-millisecond decode tasks on the global pool.
+                        for chunk in candidates.chunks(32) {
+                            let decoded: Vec<_> = background_decode_pool().install(|| {
+                                chunk
+                                    .par_iter()
+                                    .map(|row_group| {
+                                        let _cpu = crate::common::work_limiter::acquire_cpu();
+                                        let _io = crate::common::work_limiter::acquire_io();
+                                        strategy::read_row_group_with_strategy(
+                                            &spec,
+                                            &plan,
+                                            &table_schema,
+                                            &reader,
+                                            *row_group,
+                                        )
+                                    })
+                                    .collect()
+                            });
+                            for batch in decoded {
+                                // Decode failures propagate: a silently dropped
+                                // row group would make the query return partial
+                                // results.
+                                if tx.send(batch).is_err() {
+                                    // Consumer went away (LIMIT early exit / drop).
+                                    return;
+                                }
                             }
                         }
                     }
+                }));
+                if result.is_err() {
+                    let _ = tx.send(Err(TaibaiError::Internal(
+                        "cursor background decoder panicked".into(),
+                    )));
                 }
             })
             .map_err(|e| TaibaiError::Internal(format!("spawn cursor decoder failed: {e}")))?;

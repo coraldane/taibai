@@ -796,7 +796,18 @@ impl ExecutionOp for HashAggregateExec {
 
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
         let (groups, group_keys) = if !fast_unsupported {
-            merge_slot_tables(&mut fast_tables).into_maps()
+            let (groups, group_keys) = merge_slot_tables(&mut fast_tables).into_maps();
+            // The per-slot budget only bounds each lane's table; the merged
+            // total is what the configured limit means (the generic path
+            // errors at the same total).
+            if groups.len() > self.max_groups {
+                return Err(TaibaiError::Sql(format!(
+                    "aggregate group count exceeds limit {}; \
+                     consider refining GROUP BY to reduce cardinality",
+                    self.max_groups
+                )));
+            }
+            (groups, group_keys)
         } else {
             (groups, group_keys)
         };

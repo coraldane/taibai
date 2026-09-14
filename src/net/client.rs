@@ -19,6 +19,10 @@ use crate::types::scalar::ScalarValue;
 
 pub struct BulkImportConfig;
 
+/// Upper bound on server notifications buffered while request replies are
+/// being consumed (mirrors the server's bounded per-connection push queue).
+const MAX_BUFFERED_NOTIFICATIONS: usize = 8_192;
+
 pub struct Client {
     framed: Framed<tokio::net::TcpStream, MessageCodec>,
     session_id: Option<String>,
@@ -31,7 +35,12 @@ pub struct Client {
     bulk_import_mode: bool,
     /// Server-pushed change notifications diverted from the response stream
     /// while awaiting request replies. Drained via `recv_notification`.
+    /// Bounded: a subscriber that never drains them must not grow memory
+    /// without limit (mirrors the server's bounded push queue).
     pending_notifications: std::collections::VecDeque<Message>,
+    /// A response frame that was read while waiting for a notification and
+    /// could not be consumed yet; replayed by `next_frame`.
+    pending_response: Option<Message>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +100,7 @@ impl Client {
             response_handled: Arc::new(AtomicI64::new(0)),
             bulk_import_mode: false,
             pending_notifications: std::collections::VecDeque::new(),
+            pending_response: None,
         })
     }
 
@@ -489,10 +499,6 @@ impl Client {
         self.pipeline_depth
     }
 
-    pub async fn recv_response(&mut self) -> Result<Message> {
-        self.recv().await
-    }
-
     pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement> {
         let sql_bytes = sql.as_bytes();
         let mut payload = Vec::with_capacity(4 + sql_bytes.len());
@@ -648,8 +654,14 @@ impl Client {
         loop {
             let msg = self.next_frame().await?;
             // Interleaved server pushes are never valid request replies:
-            // buffer them so every request/response flow stays intact.
+            // buffer them so every request/response flow stays intact. At the
+            // cap the OLDEST buffered notification is dropped: like the
+            // server's bounded push queue this is at-most-once, and the seq
+            // gap still tells the subscriber what happened.
             if msg.msg_type == MSG_TYPE_NOTIFICATION {
+                if self.pending_notifications.len() >= MAX_BUFFERED_NOTIFICATIONS {
+                    self.pending_notifications.pop_front();
+                }
                 self.pending_notifications.push_back(msg);
                 continue;
             }
@@ -658,6 +670,9 @@ impl Client {
     }
 
     async fn next_frame(&mut self) -> Result<Message> {
+        if let Some(msg) = self.pending_response.take() {
+            return Ok(msg);
+        }
         timeout(self.default_timeout, self.framed.next())
             .await
             .map_err(|_| TaibaiError::Network("recv timeout".into()))?
@@ -721,10 +736,12 @@ impl Client {
         if msg.msg_type == MSG_TYPE_NOTIFICATION {
             return parse_notification(&msg.payload);
         }
-        Err(TaibaiError::Protocol(format!(
-            "expected a change notification, received message type {:#04X}",
-            msg.msg_type
-        )))
+        // Not a notification: park it so the following `recv` gets the
+        // response intact instead of losing the frame.
+        self.pending_response = Some(msg);
+        Err(TaibaiError::Protocol(
+            "no change notification pending; a response frame arrived first".into(),
+        ))
     }
 
     /// [`recv_notification`](Self::recv_notification) bounded by a timeout;

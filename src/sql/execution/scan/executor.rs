@@ -20,6 +20,11 @@ pub struct ScanExecutor<'a> {
     table_meta: crate::storage::catalog::schema::TableMeta,
     db: &'a str,
     stats: Option<&'a mut HashMap<String, ScanStats>>,
+    /// True when the metadata aggregate path produced the final result row.
+    /// When the route engaged but the path declined, the caller must run the
+    /// regular aggregate pipeline over the raw scan batches instead of
+    /// treating them as the answer.
+    metadata_answered: bool,
 }
 
 impl<'a> ScanExecutor<'a> {
@@ -37,6 +42,7 @@ impl<'a> ScanExecutor<'a> {
             table_meta,
             db,
             stats: None,
+            metadata_answered: false,
         }
     }
 
@@ -54,7 +60,15 @@ impl<'a> ScanExecutor<'a> {
             table_meta,
             db,
             stats: None,
+            metadata_answered: false,
         }
+    }
+
+    /// Whether [`Self::execute`] produced the final aggregate row through the
+    /// metadata fast path (as opposed to falling back to a raw scan because
+    /// the path declined).
+    pub fn metadata_answered(&self) -> bool {
+        self.metadata_answered
     }
 
     pub fn with_stats(mut self, stats: &'a mut HashMap<String, ScanStats>) -> Self {
@@ -196,10 +210,12 @@ impl<'a> ScanExecutor<'a> {
             )?
         };
         let Some(batch) = batch else {
-            // Sum over a column the metadata path cannot answer: fall back to
-            // the regular scan+aggregate pipeline.
+            // Sum over a column the metadata path cannot answer: return the
+            // raw scan batches and let the caller run the regular aggregate
+            // pipeline over them (`metadata_answered()` stays false).
             return self.execute_scan();
         };
+        self.metadata_answered = true;
         Ok(vec![batch])
     }
 

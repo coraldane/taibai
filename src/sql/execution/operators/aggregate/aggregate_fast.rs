@@ -14,7 +14,6 @@
 //! loop in the parent module.
 
 use std::collections::HashMap;
-use std::hash::Hasher;
 
 use rayon::prelude::*;
 
@@ -57,44 +56,7 @@ pub(crate) static AGG_ACCOUNT_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static AGG_SETUP_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// FxHash-family hasher (same construction as the hot store's string pool)
-/// so group interning does not pay SipHash per row.
-#[derive(Default)]
-struct FastGroupHasher {
-    hash: u64,
-}
-
-const FAST_GROUP_SEED: u64 = 0x517c_c1b7_2722_0a95;
-
-impl FastGroupHasher {
-    #[inline]
-    fn add(&mut self, word: u64) {
-        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FAST_GROUP_SEED);
-    }
-}
-
-impl Hasher for FastGroupHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            self.add(u64::from_le_bytes(chunk.try_into().unwrap()));
-        }
-        let rem = chunks.remainder();
-        if !rem.is_empty() {
-            let mut buf = [0u8; 8];
-            buf[..rem.len()].copy_from_slice(rem);
-            self.add(u64::from_le_bytes(buf) ^ ((rem.len() as u64) << 56));
-        }
-    }
-}
-
-type FastGroupMap<K> = HashMap<K, u32, std::hash::BuildHasherDefault<FastGroupHasher>>;
+type FastGroupMap<K> = HashMap<K, u32, std::hash::BuildHasherDefault<crate::common::fast_hash::FastHasher>>;
 
 /// Typed view of one aggregate argument column, resolved once per batch so
 /// the row loop indexes plain slices instead of dispatching per row.
@@ -716,14 +678,14 @@ pub(super) fn fast_group_supported(
                 let Some(array) = batch.column(*idx) else {
                     return false;
                 };
+                // Temporal types stay on the generic path: the generic
+                // accumulator does not sum them (SUM yields NULL), and the
+                // fast path's raw-integer fold would diverge from that.
                 let supported = matches!(
                     array,
                     ColumnArray::Int64 { .. }
                         | ColumnArray::Int32 { .. }
                         | ColumnArray::Decimal { .. }
-                        | ColumnArray::Timestamp { .. }
-                        | ColumnArray::Time { .. }
-                        | ColumnArray::Date { .. }
                         | ColumnArray::Float64 { .. }
                         | ColumnArray::Float32 { .. }
                 );

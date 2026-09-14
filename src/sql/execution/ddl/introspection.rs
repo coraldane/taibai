@@ -918,12 +918,12 @@ impl AnalyzeColumnCollector {
             }
             self.non_null_count = self.non_null_count.saturating_add(1);
             if self.min_value.as_ref().is_none_or(|current| {
-                crate::sql::execution::operators::sort::compare_scalars(&value, current).is_lt()
+                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current).is_lt()
             }) {
                 self.min_value = Some(value.clone());
             }
             if self.max_value.as_ref().is_none_or(|current| {
-                crate::sql::execution::operators::sort::compare_scalars(&value, current).is_gt()
+                crate::sql::execution::operators::sort::compare_scalars_null_last(&value, current).is_gt()
             }) {
                 self.max_value = Some(value.clone());
             }
@@ -995,7 +995,7 @@ fn build_histogram(
         .into_iter()
         .map(|sample| sample.value)
         .collect::<Vec<_>>();
-    values.sort_by(crate::sql::execution::operators::sort::compare_scalars);
+    values.sort_by(crate::sql::execution::operators::sort::compare_scalars_null_last);
     if values.is_empty() {
         return Vec::new();
     }
@@ -1005,7 +1005,7 @@ fn build_histogram(
     while start < values.len() {
         let mut end = (start + target).min(values.len());
         while end < values.len()
-            && crate::sql::execution::operators::sort::compare_scalars(
+            && crate::sql::execution::operators::sort::compare_scalars_null_last(
                 &values[end - 1],
                 &values[end],
             )

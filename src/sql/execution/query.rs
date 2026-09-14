@@ -620,6 +620,7 @@ fn exec_table_select_materialized(
 
         let scan_start = std::time::Instant::now();
         let batches = executor.execute()?;
+        let metadata_answered = executor.metadata_answered();
         scan_seeds.insert(
             table_name.clone(),
             ScanProfileSeed {
@@ -643,9 +644,12 @@ fn exec_table_select_materialized(
                 batches,
             });
         }
-        if spec.simple_metadata_aggregates.is_some() {
-            // The scan executor already produced the single aggregate result row
-            // via the metadata fast path; do not feed it through the pipeline.
+        if spec.simple_metadata_aggregates.is_some() && metadata_answered {
+            // The scan executor produced the single aggregate result row via
+            // the metadata fast path; do not feed it through the pipeline.
+            // When the path declined (metadata_answered == false), the
+            // batches are raw scanned rows and the pipeline below must apply
+            // the aggregate operator as usual.
             let result_schema = if let Some(b) = batches.first() {
                 b.schema.clone()
             } else {
