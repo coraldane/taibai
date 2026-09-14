@@ -60,7 +60,6 @@ pub fn exec_replace(
     // place below. The delete and the staged insert run under one lock, so
     // DELETE/UPDATE cannot interleave.
     let lock_start = Instant::now();
-    eprintln!("DBGREPL S1 lock enter");
     let (deleted, undo, pending_commits) = engine
         .segment_mgr()
         .with_table_mutation_lock(db, table, || {

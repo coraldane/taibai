@@ -1050,3 +1050,40 @@ fn two_sums_on_different_columns() {
         "two SUM aggregates"
     );
 }
+
+#[test]
+fn sum_returns_null_for_empty_input_via_metadata_path() {
+    let (_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE t (v INT64)")
+        .expect("create t");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1),(2),(3)")
+        .expect("insert t");
+
+    // SQL semantics: SUM over an empty set is NULL, not 0. The metadata
+    // aggregate fast path must match the generic accumulator here.
+    assert_eq!(
+        query(&engine, &mut session, "SELECT SUM(v) FROM t WHERE v > 1000"),
+        vec![vec![ScalarValue::Int64(None)]]
+    );
+
+    engine
+        .execute(&mut session, "CREATE TABLE n (v INT64)")
+        .expect("create n");
+    engine
+        .execute(&mut session, "INSERT INTO n VALUES (NULL),(NULL)")
+        .expect("insert n");
+    assert_eq!(
+        query(&engine, &mut session, "SELECT SUM(v) FROM n"),
+        vec![vec![ScalarValue::Int64(None)]]
+    );
+
+    engine
+        .execute(&mut session, "CREATE TABLE e (v INT64)")
+        .expect("create e");
+    assert_eq!(
+        query(&engine, &mut session, "SELECT SUM(v) FROM e"),
+        vec![vec![ScalarValue::Int64(None)]]
+    );
+}

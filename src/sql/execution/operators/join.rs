@@ -872,6 +872,23 @@ impl HashJoinExec {
                 "ASOF JOIN time key must be TIMESTAMP, INT64 or DOUBLE".into(),
             ));
         }
+        // Mixed key types cannot be compared (units differ, and the typed
+        // comparator would degrade every pair to Equal), so require one type.
+        let left_time_type = self
+            .left_schema
+            .columns
+            .get(plan.left_time_col)
+            .map(|c| c.data_type);
+        let right_time_type = self
+            .right_schema
+            .columns
+            .get(plan.right_time_col)
+            .map(|c| c.data_type);
+        if left_time_type != right_time_type {
+            return Err(TaibaiError::Sql(format!(
+                "ASOF JOIN time keys must have the same type (left {left_time_type:?}, right {right_time_type:?})"
+            )));
+        }
         Ok(plan)
     }
 
@@ -1069,10 +1086,12 @@ impl HashJoinExec {
         }
         let mut end = (pos + Self::BATCH_SIZE).min(state.fast_pairs.len());
         // Keep the chunk inside one build batch so a single take per column
-        // suffices; the remaining pairs stay buffered for the next call.
+        // suffices: matches for one probe row can span several build batches,
+        // so drop trailing pairs from other batches; they stay buffered for
+        // the next call.
         let build_batch_idx = state.fast_pairs[pos].1.batch_idx;
-        while end < state.fast_pairs.len() && state.fast_pairs[end].1.batch_idx == build_batch_idx {
-            end += 1;
+        while end > pos && state.fast_pairs[end - 1].1.batch_idx != build_batch_idx {
+            end -= 1;
         }
 
         let probe_rows = &mut state.probe_rows_scratch;

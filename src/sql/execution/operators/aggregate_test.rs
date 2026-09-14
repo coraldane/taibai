@@ -308,3 +308,39 @@ fn decode_key_scalar_round_trips_encode_key_at() {
         }
     }
 }
+
+#[test]
+fn decode_key_scalar_round_trips_dictionary_varchar_like_plain() {
+    let mut dict = crate::types::array::Utf8Buffer::new();
+    dict.push_str("AAPL");
+    dict.push_str("MSFT");
+    let dict_col = ColumnArray::Dictionary {
+        ids: vec![0, 1, 0],
+        dict,
+        bitmap: crate::types::bitmap::NullBitmap::new_valid(3),
+        flat: std::sync::OnceLock::new(),
+    };
+    let mut plain = ColumnArray::empty(DataType::VarChar);
+    for value in ["AAPL", "MSFT", "AAPL"] {
+        plain
+            .push(&ScalarValue::VarChar(Some(value.to_string())))
+            .unwrap();
+    }
+    for row in 0..3 {
+        let mut dict_key = Vec::new();
+        dict_col.encode_key_at(row, &mut dict_key);
+        let mut plain_key = Vec::new();
+        plain.encode_key_at(row, &mut plain_key);
+        // Dictionary and plain VarChar must produce byte-identical keys so
+        // DISTINCT aggregation and GROUP BY treat both forms as one value.
+        assert_eq!(
+            dict_key, plain_key,
+            "dictionary key differs from plain key at row {row}"
+        );
+        assert_eq!(
+            decode_key_scalar(&dict_key),
+            Some(plain.scalar(row)),
+            "dictionary round trip failed at row {row}"
+        );
+    }
+}

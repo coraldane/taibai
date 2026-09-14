@@ -101,6 +101,9 @@ pub fn exec_update(
             Vec::new()
         };
         let mut rewritten_segments: Vec<(std::path::PathBuf, Vec<Arc<RecordBatch>>)> = Vec::new();
+        // Assignments are constant per statement; resolve them once for every
+        // segment/row group below.
+        let assigned = precompute_assigned_values(assignments, &table_schema)?;
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
@@ -150,7 +153,6 @@ pub fn exec_update(
                     kept.push(row_idx as u32);
                     kept_matched.push(*matches);
                 }
-                let assigned = precompute_assigned_values(assignments, &table_schema);
                 let mut new_columns = Vec::with_capacity(batch.num_columns());
                 for (col_idx, column) in batch.columns.iter().enumerate() {
                     match assigned.get(&col_idx) {
@@ -373,7 +375,7 @@ fn update_memtable_batch(
         return Ok((None, 0));
     }
 
-    let assigned = precompute_assigned_values(assignments, table_schema);
+    let assigned = precompute_assigned_values(assignments, table_schema)?;
     let all_rows: Vec<u32> = (0..batch.num_rows() as u32).collect();
     let mut new_columns = Vec::with_capacity(batch.num_columns());
     for (col_idx, column) in batch.columns.iter().enumerate() {
@@ -403,11 +405,12 @@ fn update_memtable_batch(
 
 /// Assignment expressions are constant per statement (they are evaluated
 /// without row context), so resolve every assigned column index and value
-/// once instead of per row.
+/// once instead of per row. Evaluation errors abort the statement (matching
+/// the pre-optimization behavior) instead of silently writing NULL.
 fn precompute_assigned_values(
     assignments: &[Assignment],
     table_schema: &Schema,
-) -> HashMap<usize, ScalarValue> {
+) -> Result<HashMap<usize, ScalarValue>> {
     let mut assigned = HashMap::new();
     for assign in assignments {
         if let Some(col_idx) = table_schema
@@ -415,15 +418,14 @@ fn precompute_assigned_values(
             .iter()
             .position(|column| column.name == assign.column)
         {
-            assigned.entry(col_idx).or_insert_with(|| {
-                eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type)
-                    .unwrap_or(ScalarValue::null_for_type(
-                        table_schema.columns[col_idx].data_type,
-                    ))
-            });
+            if !assigned.contains_key(&col_idx) {
+                let value =
+                    eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type)?;
+                assigned.insert(col_idx, value);
+            }
         }
     }
-    assigned
+    Ok(assigned)
 }
 
 fn build_update_mask(

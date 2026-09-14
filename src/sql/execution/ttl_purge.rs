@@ -115,16 +115,25 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
     engine.segment_mgr().flush_table_active(db, table)?;
 
     let mgr = engine.segment_mgr();
-    mgr.with_table_mutation_lock(db, table, || {
-        let mut file_rows: i64 = 0;
+    // Phase A — delete the expired segment files under the mutation lock so
+    // no concurrent flush recreates them mid-delete. The catalog is NOT
+    // touched here: DDL takes catalogs().write() first and then waits for
+    // this lock, so acquiring the catalog lock while holding the mutation
+    // lock would deadlock against it (the order dml_insert/lock_order_test
+    // pins).
+    let mut file_rows: i64 = 0;
+    mgr.with_table_mutation_lock(db, table, || -> Result<()> {
         for key in &expired {
             for path in &files_by_key[key] {
                 mgr.invalidate_readers_under(path);
-                // Count rows from the segment itself: the catalog's
+                // Count live rows from the segment itself: the catalog's
                 // partition list is not always maintained by the write
                 // path, so the file is the source of truth here.
                 if let Ok(reader) = mgr.open_reader(path) {
-                    file_rows += reader.row_count() as i64;
+                    file_rows += reader
+                        .row_count()
+                        .saturating_sub(reader.deleted_row_count())
+                        as i64;
                 }
                 let sidecar = crate::storage::segment::meta::sidecar_meta_path(path);
                 if let Err(error) = std::fs::remove_file(path) {
@@ -135,48 +144,65 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
                 }
             }
         }
+        Ok(())
+    })?;
 
-        let mut catalogs = engine.catalogs().write().unwrap();
-        let Some(catalog) = catalogs.get_mut(db) else {
-            return Ok(0);
-        };
-        let (previous_meta, retired_rows, retired_partitions) = {
-            let Some(table_meta) = catalog.get_table_mut(table) else {
-                return Ok(0);
-            };
-            let previous_meta = table_meta.clone();
-            let mut retired_partitions = 0usize;
-            table_meta.partitions.retain(|info| {
-                let gone = expired.contains(&info.key) || stale.contains(&info.key);
-                if gone {
-                    retired_partitions += 1;
-                }
-                !gone
-            });
-            table_meta.row_count = table_meta
-                .row_count
-                .saturating_sub(file_rows);
-            (previous_meta, file_rows, retired_partitions)
-        };
-        let meta_dir = engine.data_dir().join("meta");
-        if let Err(save_error) = catalog.save(&meta_dir) {
-            if let Some(table_meta) = catalog.get_table_mut(table) {
-                *table_meta = previous_meta;
-            }
-            return Err(TaibaiError::Storage(format!(
-                "ttl purge: failed to save catalog for '{db}.{table}': {save_error}"
-            )));
+    // Phase B — retire catalog entries while holding only catalogs().write().
+    // Re-check the directory first: a concurrent writer may have recreated
+    // files for an expired key after phase A released the lock (e.g. a
+    // backdated insert). Keeping such an entry lets the next round converge
+    // instead of hiding live files behind a pruned partition.
+    let mut catalogs = engine.catalogs().write().unwrap();
+    let Some(catalog) = catalogs.get_mut(db) else {
+        return Ok(0);
+    };
+    let Some(table_meta) = catalog.get_table_mut(table) else {
+        return Ok(0);
+    };
+    let previous_meta = table_meta.clone();
+    let mut retired_partitions = 0usize;
+    table_meta.partitions.retain(|info| {
+        let gone = (expired.contains(&info.key) || stale.contains(&info.key))
+            && !partition_files_exist(&table_dir, &info.key);
+        if gone {
+            retired_partitions += 1;
         }
-        drop(catalogs);
+        !gone
+    });
+    table_meta.row_count = table_meta.row_count.saturating_sub(file_rows);
+    let meta_dir = engine.data_dir().join("meta");
+    if let Err(save_error) = catalog.save(&meta_dir) {
+        if let Some(table_meta) = catalog.get_table_mut(table) {
+            *table_meta = previous_meta;
+        }
+        return Err(TaibaiError::Storage(format!(
+            "ttl purge: failed to save catalog for '{db}.{table}': {save_error}"
+        )));
+    }
+    drop(catalogs);
 
-        tracing::info!(
-            db,
-            table,
-            partitions = retired_partitions,
-            rows = retired_rows,
-            "ttl purge: dropped expired partitions"
-        );
-        Ok(retired_rows.max(0) as u64)
+    tracing::info!(
+        db,
+        table,
+        partitions = retired_partitions,
+        rows = file_rows,
+        "ttl purge: dropped expired partitions"
+    );
+    Ok(file_rows.max(0) as u64)
+}
+
+/// True when at least one segment file for `key` currently exists under
+/// `table_dir`.
+fn partition_files_exist(table_dir: &std::path::Path, key: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(table_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .and_then(parse_partition_key)
+            .is_some_and(|k| k == key)
     })
 }
 

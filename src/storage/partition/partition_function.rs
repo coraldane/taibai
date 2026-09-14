@@ -519,6 +519,9 @@ pub struct PartitionKeysAt<'a> {
     primed: bool,
     cache_raw: Option<i64>,
     cache_key: String,
+    /// Holds keys for rows that cannot refresh the memo (NULL rows), so the
+    /// memo-hit `cache_key` never gets overwritten with a foreign row's key.
+    scratch_key: String,
 }
 
 impl<'a> PartitionKeysAt<'a> {
@@ -539,6 +542,7 @@ impl<'a> PartitionKeysAt<'a> {
             primed: false,
             cache_raw: None,
             cache_key: String::new(),
+            scratch_key: String::new(),
         }
     }
 
@@ -552,13 +556,24 @@ impl<'a> PartitionKeysAt<'a> {
             if raw.is_some() {
                 self.cache_raw = raw;
                 self.primed = true;
+                self.cache_key = self.compute_key(row);
+                return &self.cache_key;
             }
+            // NULL row: the memo stays primed for the previous raw value, so
+            // the key must not land in `cache_key` (a later memo hit would
+            // return this NULL row's key).
+            self.scratch_key = self.compute_key(row);
+            return &self.scratch_key;
         }
-        self.cache_key = match self.kind {
+        self.cache_key = self.compute_key(row);
+        &self.cache_key
+    }
+
+    fn compute_key(&self, row: usize) -> String {
+        match self.kind {
             PartitionKeyKind::Strategy(func) => compute_partition_key_at(&func, self.column, row),
             PartitionKeyKind::ValueText => value_text_at(self.column, row),
-        };
-        &self.cache_key
+        }
     }
 }
 

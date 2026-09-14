@@ -236,3 +236,49 @@ fn bool_column_from_mask_round_trips() {
         _ => panic!("expected Bool result"),
     }
 }
+
+#[test]
+fn selected_and_dictionary_columns_compare_through_flat_form() {
+    use std::sync::Arc;
+
+    // Zero-copy Selected view over rows [5, NULL, 7] picking rows 0 and 2.
+    let source = i64_col(vec![Some(5), None, Some(7)]);
+    let indices: Arc<[u32]> = vec![0u32, 2].into();
+    let parts: SelectedParts = vec![(Arc::new(source), indices)].into();
+    let selected =
+        ColumnArray::selected(parts, crate::protocol::types::DataType::Int64, 2);
+
+    assert_eq!(
+        selected.compare_scalar_at(0, &ScalarValue::Int64(Some(5))),
+        Some(std::cmp::Ordering::Equal)
+    );
+    assert_eq!(
+        selected.compare_scalar_at(1, &ScalarValue::Int64(Some(9))),
+        Some(std::cmp::Ordering::Less)
+    );
+    assert_eq!(selected.numeric_i64_at(1), Some(7));
+    assert_eq!(
+        selected.eq_vec(&ScalarValue::Int64(Some(7))),
+        vec![false, true]
+    );
+
+    // Dictionary varchar compares through its expanded form instead of
+    // returning NULL / all-false.
+    let mut dict = crate::types::array::Utf8Buffer::new();
+    dict.push_str("AAPL");
+    dict.push_str("MSFT");
+    let dict_col = ColumnArray::Dictionary {
+        ids: vec![0, 1, 0],
+        dict,
+        bitmap: NullBitmap::new_valid(3),
+        flat: std::sync::OnceLock::new(),
+    };
+    assert_eq!(
+        dict_col.eq_vec(&ScalarValue::VarChar(Some("AAPL".into()))),
+        vec![true, false, true]
+    );
+    assert_eq!(
+        dict_col.compare_scalar_at(1, &ScalarValue::VarChar(Some("ZZZ".into()))),
+        Some(std::cmp::Ordering::Less)
+    );
+}

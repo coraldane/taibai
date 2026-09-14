@@ -630,11 +630,6 @@ impl ExecutionOp for HashAggregateExec {
             .max(1);
         let mut fast_tables: Vec<Option<FastGroups>> = Vec::new();
         let mut fast_unsupported = false;
-        let mut wait_ns = 0u64;
-        let mut agg_ns = 0u64;
-        let mut batches_n = 0u64;
-        let mut wait_t0 = std::time::Instant::now();
-        let typed0 = aggregate_fast::typed_range_calls();
 
         while let Some(batch) = self.input.next_batch()? {
             if physical_schema.is_none() {
@@ -682,9 +677,6 @@ impl ExecutionOp for HashAggregateExec {
                     fast_unsupported = true;
                 }
             }
-            wait_ns += wait_t0.elapsed().as_nanos() as u64;
-            let agg_t0 = std::time::Instant::now();
-            batches_n += 1;
             if !fast_unsupported {
                 let phys = physical_schema.as_ref().unwrap_or(&self.input_schema);
                 fast_group_update(
@@ -701,8 +693,6 @@ impl ExecutionOp for HashAggregateExec {
                     &mut spills,
                     spill_rows,
                 )?;
-                agg_ns += agg_t0.elapsed().as_nanos() as u64;
-                wait_t0 = std::time::Instant::now();
                 continue;
             }
 
@@ -805,20 +795,6 @@ impl ExecutionOp for HashAggregateExec {
         }
 
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
-        eprintln!(
-            "DBGAGGP bolts={} wait_ms={} agg_ms={} fast={} typed={} miss(g,n,k)={},{},{} join_ms={} acct_ms={} setup_ms={}",
-            batches_n,
-            wait_ns / 1_000_000,
-            agg_ns / 1_000_000,
-            !fast_unsupported,
-            aggregate_fast::typed_range_calls() - typed0,
-            aggregate_fast::TYPED_MISS_GROUP.load(std::sync::atomic::Ordering::Relaxed),
-            aggregate_fast::TYPED_MISS_NULLS.load(std::sync::atomic::Ordering::Relaxed),
-            aggregate_fast::TYPED_MISS_KINDS.load(std::sync::atomic::Ordering::Relaxed),
-            aggregate_fast::AGG_JOIN_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
-            aggregate_fast::AGG_ACCOUNT_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
-            aggregate_fast::AGG_SETUP_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
-        );
         let (groups, group_keys) = if !fast_unsupported {
             merge_slot_tables(&mut fast_tables).into_maps()
         } else {

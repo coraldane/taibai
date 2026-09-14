@@ -34,6 +34,23 @@ struct ServerTimings {
     encode: Duration,
 }
 
+impl Drop for Handler {
+    fn drop(&mut self) {
+        // Safety net for every path that abandons a handler without the
+        // normal `flush_on_disconnect` cleanup (decode errors, push send
+        // failures, aborted request workers): release the connection's
+        // pubsub subscriptions so they cannot outlive the socket. The normal
+        // path already `take()`s the handle first, making this a no-op there.
+        if let Some(conn) = self.pubsub_conn.take() {
+            self.engine.pubsub().drop_connection(&conn);
+            tracing::debug!(
+                conn_id = conn.conn_id(),
+                "pubsub subscriptions released on handler drop"
+            );
+        }
+    }
+}
+
 impl Handler {
     pub fn new(config: Arc<ServerConfig>, engine: Arc<Engine>) -> Self {
         Self {

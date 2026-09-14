@@ -460,6 +460,11 @@ impl ColumnArray {
 
     /// Typed comparison against a literal, used by filter/range kernels.
     pub fn compare_scalar_at(&self, row: usize, value: &ScalarValue) -> Option<std::cmp::Ordering> {
+        // Zero-copy views / dictionary encodings compare through their
+        // materialized form; row indexes are preserved by `flattened`.
+        if matches!(self, ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. }) {
+            return self.flattened().compare_scalar_at(row, value);
+        }
         if self.bitmap().is_null(row) || value.is_null() {
             return None;
         }
@@ -522,14 +527,11 @@ impl ColumnArray {
         }
         match self {
             ColumnArray::Selected { .. } => self.flattened().encode_key_at(row, out),
-            ColumnArray::Dictionary { ids, dict, bitmap, .. } => {
-                out.push(DataType::VarChar as u8);
-                if bitmap.is_null(row) {
-                    out.push(0);
-                    return;
-                }
+            // Dictionary values must encode byte-identically to plain
+            // VarChar: `data_type()` already pushed the VarChar tag above,
+            // and decoders / GROUP BY keys rely on the two forms agreeing.
+            ColumnArray::Dictionary { ids, dict, .. } => {
                 let value = dict.get(ids[row] as usize).unwrap_or("");
-                out.push(1);
                 out.extend_from_slice(&(value.len() as u32).to_le_bytes());
                 out.extend_from_slice(value.as_bytes());
             }
@@ -571,6 +573,10 @@ impl ColumnArray {
     }
 
     pub fn numeric_i64_at(&self, row: usize) -> Option<i64> {
+        // Zero-copy views read through their materialized form.
+        if let ColumnArray::Selected { .. } = self {
+            return self.flattened().numeric_i64_at(row);
+        }
         if self.bitmap().is_null(row) {
             return None;
         }
@@ -594,6 +600,10 @@ impl ColumnArray {
     }
 
     pub fn numeric_f64_at(&self, row: usize) -> Option<f64> {
+        // Zero-copy views read through their materialized form.
+        if let ColumnArray::Selected { .. } = self {
+            return self.flattened().numeric_f64_at(row);
+        }
         if self.bitmap().is_null(row) {
             return None;
         }

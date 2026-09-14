@@ -5,6 +5,14 @@
 macro_rules! cmp_vec_fn {
     ($fn_name:ident, $op:tt, $ord_op:tt, $ord_val:ident) => {
         pub fn $fn_name(&self, value: &ScalarValue) -> Vec<bool> {
+            // Zero-copy views / dictionary encodings compare through their
+            // materialized form; row indexes are preserved by `flattened`.
+            if matches!(
+                self,
+                ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. }
+            ) {
+                return self.flattened().$fn_name(value);
+            }
             let num_rows = self.len();
             let bitmap = self.bitmap();
             match (self, value) {
@@ -1133,6 +1141,11 @@ impl ColumnArray {
             return None;
         }
         if op == ArithOp::Div {
+            // Division mirrors the scalar path, which cannot evaluate
+            // date/time operands: keep those off the vectorized kernel.
+            if !(self.is_integer_class() || self.is_float_class()) {
+                return None;
+            }
             return self.arith_numeric_f64(op, |i| other.numeric_f64_at(i));
         }
         if self.is_integer_class() && other.is_integer_class() {
@@ -1156,6 +1169,11 @@ impl ColumnArray {
             });
         }
         if op == ArithOp::Div {
+            // The scalar path cannot evaluate date/time operands; keep this
+            // kernel byte-identical with it by refusing those columns.
+            if !(self.is_integer_class() || self.is_float_class()) {
+                return None;
+            }
             let value = literal.numeric_f64()?;
             return self.arith_numeric_f64(op, |_| Some(value));
         }
@@ -1163,7 +1181,9 @@ impl ColumnArray {
             let value = literal.integer_i128()?;
             return Some(self.arith_integer(op, |_| Some(value)));
         }
-        if literal.numeric_f64().is_some() {
+        if (self.is_integer_class() || self.is_float_class())
+            && literal.numeric_f64().is_some()
+        {
             let value = literal.numeric_f64()?;
             return self.arith_numeric_f64(op, |_| Some(value));
         }

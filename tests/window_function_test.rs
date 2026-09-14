@@ -204,3 +204,96 @@ fn count_star_over_partition_counts_rows() {
     );
     assert_eq!(rows, vec![vec![i64(2)], vec![i64(3)]]);
 }
+
+#[test]
+fn window_functions_on_interleaved_unsorted_input() {
+    let (_dir, engine, mut session) = setup_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE mixed (symbol VARCHAR, ts INT64, price DOUBLE)",
+        )
+        .expect("create mixed");
+    // Physical insertion order interleaves the partitions and scrambles the
+    // order key inside each partition: the executor must sort row indices by
+    // (partition, order) keys itself, not trust input adjacency.
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO mixed VALUES
+                ('MSFT', 3, 23.0),
+                ('AAPL', 2, 10.0),
+                ('MSFT', 1, 21.0),
+                ('AAPL', 3, 12.0),
+                ('AAPL', 1, 10.0),
+                ('MSFT', 2, 22.0)",
+        )
+        .expect("insert");
+    let rows = query_rows(
+        &engine,
+        &mut session,
+        "SELECT symbol, ts,
+                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts) rn,
+                RANK() OVER (PARTITION BY symbol ORDER BY price) rk,
+                DENSE_RANK() OVER (PARTITION BY symbol ORDER BY price) drk,
+                LEAD(price) OVER (PARTITION BY symbol ORDER BY ts) nxt
+         FROM mixed ORDER BY symbol, ts",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                vs("AAPL"),
+                i64(1),
+                i64(1),
+                i64(1),
+                i64(1),
+                f64(10.0)
+            ],
+            vec![
+                vs("AAPL"),
+                i64(2),
+                i64(2),
+                i64(1),
+                i64(1),
+                f64(12.0)
+            ],
+            vec![
+                vs("AAPL"),
+                i64(3),
+                i64(3),
+                i64(3),
+                i64(2),
+                ScalarValue::Float64(None)
+            ],
+            vec![
+                vs("MSFT"),
+                i64(1),
+                i64(1),
+                i64(1),
+                i64(1),
+                f64(22.0)
+            ],
+            vec![
+                vs("MSFT"),
+                i64(2),
+                i64(2),
+                i64(2),
+                i64(2),
+                f64(23.0)
+            ],
+            vec![
+                vs("MSFT"),
+                i64(3),
+                i64(3),
+                i64(3),
+                i64(3),
+                ScalarValue::Float64(None)
+            ],
+        ]
+    );
+}
+
+fn vs(s: &str) -> ScalarValue {
+    ScalarValue::VarChar(Some(s.to_string()))
+}

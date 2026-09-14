@@ -124,6 +124,7 @@ pub fn compute_simple_aggregate(
             segment_sum_cache_lookup(
                 segment_path.to_string_lossy().as_ref(),
                 meta_rows,
+                meta_deleted,
                 &sum_needed_columns(aggregates, &aggregate_columns, table_schema),
             )
         } else {
@@ -287,7 +288,7 @@ pub fn compute_simple_aggregate(
                     Ok(batch)
                 })
                 .collect();
-            for (fold, batch) in chunk.iter().zip(batches) {
+            for (_fold, batch) in chunk.iter().zip(batches) {
                 fold_batch(&mut accumulators, &aggregate_positions, &batch?)?;
             }
         }
@@ -318,6 +319,7 @@ pub fn compute_simple_aggregate(
             segment_sum_cache_store(
                 segment_path.to_string_lossy().as_ref(),
                 meta_rows,
+                reader.deleted_row_count(),
                 &needed,
                 &deltas,
             );
@@ -433,15 +435,10 @@ impl AggAccum {
             .unwrap_or(DataType::Int64);
         let (sum_i, sum_f, sum_unsupported) = if func == AggFunc::Sum {
             match col_type {
-                DataType::Float32 | DataType::Float64 => (None, Some(0.0), false),
-                DataType::Int64
-                | DataType::Int32
-                | DataType::Int16
-                | DataType::Int8
-                | DataType::Decimal
-                | DataType::Date
-                | DataType::Time
-                | DataType::Timestamp => (Some(0), None, false),
+                DataType::Float32 | DataType::Float64 => (None, None, false),
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+                    (None, None, false)
+                }
                 _ => (None, None, true),
             }
         } else {
@@ -509,16 +506,15 @@ impl AggAccum {
                     self.merge_max(value);
                 }
             }
-            AggFunc::Sum => match self.sum_i {
-                Some(_) => {
-                    if let Some(part) = values.col_sum_i64() {
-                        self.sum_i =
-                            Some(self.sum_i.unwrap_or(0).wrapping_add(part));
+            AggFunc::Sum => match self.col_type {
+                DataType::Float32 | DataType::Float64 => {
+                    if let Some(part) = values.col_sum_f64() {
+                        self.sum_f = Some(self.sum_f.unwrap_or(0.0) + part);
                     }
                 }
                 _ => {
-                    if let Some(part) = values.col_sum_f64() {
-                        self.sum_f = Some(self.sum_f.unwrap_or(0.0) + part);
+                    if let Some(part) = values.col_sum_i64() {
+                        self.sum_i = Some(self.sum_i.unwrap_or(0).wrapping_add(part));
                     }
                 }
             },
@@ -527,18 +523,20 @@ impl AggAccum {
         Ok(())
     }
 
-    /// Fold a cached per-segment partial sum into this accumulator.
+    /// Fold a cached per-segment partial sum into this accumulator. A `None`
+    /// delta means the segment contributed nothing (e.g. all-NULL rows) and
+    /// must not materialize a zero from an empty accumulator.
     fn fold_cached_sum(&mut self, cached: &SumCacheValue) {
         match self.col_type {
             DataType::Float32 | DataType::Float64 => {
-                self.sum_f = Some(self.sum_f.unwrap_or(0.0) + cached.f.unwrap_or(0.0));
+                if let Some(v) = cached.f {
+                    self.sum_f = Some(self.sum_f.unwrap_or(0.0) + v);
+                }
             }
             _ => {
-                self.sum_i = Some(
-                    self.sum_i
-                        .unwrap_or(0)
-                        .wrapping_add(cached.i.unwrap_or(0)),
-                );
+                if let Some(v) = cached.i {
+                    self.sum_i = Some(self.sum_i.unwrap_or(0).wrapping_add(v));
+                }
             }
         }
     }
@@ -612,8 +610,8 @@ fn null_scalar_of_type(dt: DataType) -> ScalarValue {
 
 
 /// Per-segment partial sums for the metadata aggregate fast path. Keyed by
-/// (segment path, row count, column, float?) so appends, compaction, and
-/// deletes naturally invalidate entries. In-process only.
+/// (segment path, column, row count, deleted row count, float?) so appends,
+/// compaction, and deletes naturally invalidate entries. In-process only.
 fn segment_sum_cache() -> &'static std::sync::Mutex<
     std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>,
 > {
@@ -634,6 +632,7 @@ struct SumCacheValue {
 fn segment_sum_cache_lookup(
     segment: &str,
     row_count: u64,
+    deleted_row_count: u64,
     columns: &[(String, bool)],
 ) -> Option<Vec<SumCacheValue>> {
     let cache = segment_sum_cache().lock().unwrap();
@@ -646,7 +645,7 @@ fn segment_sum_cache_lookup(
                         segment.to_string(),
                         name.clone(),
                         row_count,
-                        0,
+                        deleted_row_count,
                         *is_float,
                     ),
                 )
@@ -658,13 +657,14 @@ fn segment_sum_cache_lookup(
 fn segment_sum_cache_store(
     segment: &str,
     row_count: u64,
+    deleted_row_count: u64,
     columns: &[(String, bool)],
     values: &[SumCacheValue],
 ) {
     let mut cache = segment_sum_cache().lock().unwrap();
     for ((name, is_float), value) in columns.iter().zip(values.iter()) {
         cache.insert(
-            (segment.to_string(), name.clone(), row_count, 0u64, *is_float),
+            (segment.to_string(), name.clone(), row_count, deleted_row_count, *is_float),
             *value,
         );
     }

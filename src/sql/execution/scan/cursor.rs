@@ -490,11 +490,9 @@ impl ScanCursor {
             Vec::new()
         };
 
-        if self.try_spawn_background_decoder()? {
-            self.initialized = true;
-            return Ok(());
-        }
-
+        // Memtable rows are never covered by the background segment decoder,
+        // so scan them up front and let both the inline and background modes
+        // drain the same leg.
         let mut memtable_spec = self.spec.clone();
         memtable_spec.projection = Some(self.plan.projection_cols.clone());
         self.memtable_batches = memtable::scan_memtables(
@@ -504,6 +502,12 @@ impl ScanCursor {
             &self.spec.table_name,
             &memtable_spec,
         );
+
+        if self.try_spawn_background_decoder()? {
+            self.initialized = true;
+            return Ok(());
+        }
+
         self.initialized = true;
         Ok(())
     }

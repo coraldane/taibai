@@ -198,3 +198,31 @@ fn partition_keys_at_memo_matches_scalar() {
         assert_eq!(typed, scalar, "memoized key mismatch at row {row}");
     }
 }
+
+#[test]
+fn partition_keys_at_null_rows_do_not_poison_memo() {
+    // [7, NULL, 7, 7]: the NULL row must not overwrite the memoized key for
+    // raw value 7, or the following rows would inherit the NULL row's key
+    // and be routed into the wrong partition.
+    let column = ColumnArray::Int64 {
+        data: vec![7, 0, 7, 7],
+        bitmap: {
+            let mut bitmap = NullBitmap::new_valid(4);
+            bitmap.set_null(1);
+            bitmap
+        },
+    };
+    let mut computer = PartitionKeysAt::new(PartitionKeyKind::ValueText, &column);
+    let keyed = computer.key_at(0).to_string();
+    let null_key = computer.key_at(1).to_string();
+    assert_ne!(
+        keyed, null_key,
+        "the NULL row must compute its own key, not reuse the memo"
+    );
+    assert_eq!(
+        computer.key_at(2),
+        keyed,
+        "a memo hit after a NULL row must return the primed key"
+    );
+    assert_eq!(computer.key_at(3), keyed);
+}

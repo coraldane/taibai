@@ -212,3 +212,7 @@ path = "tests/bulk_encoding_bench_test.rs"
 [[test]]
 name = "pubsub_test"
 path = "tests/pubsub_test.rs"
+
+[[test]]
+name = "join_fast_path_test"
+path = "tests/join_fast_path_test.rs"

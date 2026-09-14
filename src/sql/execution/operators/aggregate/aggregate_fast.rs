@@ -36,13 +36,9 @@ const PARALLEL_MIN_ROWS: usize = 8_192;
 const TYPED_INLINE_MAX_ROWS: usize = 65_536;
 
 /// Diagnostic counter: how many row ranges ran the tight dictionary-key
-/// loop (read with `typed_range_calls`, printed by the aggregate probe).
+/// loop (read by tests/external probes).
 pub(crate) static TYPED_RANGE_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn typed_range_calls() -> u64 {
-    TYPED_RANGE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Temporary diagnostics: why the tight loop did not run.
 pub(crate) static TYPED_MISS_GROUP: std::sync::atomic::AtomicU64 =

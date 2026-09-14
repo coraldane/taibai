@@ -300,9 +300,6 @@ impl Engine {
         self.batch_writer
             .memtable_manager()
             .clear_hot_unfed(db, table);
-        self.batch_writer
-            .memtable_manager()
-            .clear_hot_unfed(db, table);
     }
 
     pub fn auto_increment_manager(&self) -> &Arc<AutoIncrementManager> {

@@ -143,9 +143,30 @@ fn compute_func(
         .map(|key| Ok((eval_expr_column(&key.expr, batch)?, key.desc)))
         .collect::<Result<Vec<_>>>()?;
 
-    // Row indices sorted by (partition keys, order keys). Input order breaks
-    // ties so results stay deterministic.
-    let order: Vec<u32> = (0..num_rows as u32).collect();
+    // Row indices sorted by (partition keys, order keys). The sort is stable
+    // so input order breaks ties and results stay deterministic.
+    let order: Vec<u32> = {
+        let mut order: Vec<u32> = (0..num_rows as u32).collect();
+        order.sort_by(|&a, &b| {
+            for col in &partition_cols {
+                let cmp = compare(&col[a as usize], &col[b as usize]);
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+            for (col, desc) in &order_cols {
+                let mut cmp = compare(&col[a as usize], &col[b as usize]);
+                if *desc {
+                    cmp = cmp.reverse();
+                }
+                if cmp != Ordering::Equal {
+                    return cmp;
+                }
+            }
+            Ordering::Equal
+        });
+        order
+    };
     let mut values = vec![null_value(); num_rows];
     match &plan.kind {
         WindowFuncKind::RowNumber => {
@@ -160,11 +181,12 @@ fn compute_func(
         }
         WindowFuncKind::Rank | WindowFuncKind::DenseRank => {
             let dense = matches!(plan.kind, WindowFuncKind::DenseRank);
-            let mut rank = 0i64;
-            let mut dense_rank = 0i64;
             let mut group_start = 0usize;
             while group_start < order.len() {
                 let group_end = partition_end(&order, group_start, &partition_cols);
+                // Both counters restart from scratch in every partition.
+                let mut rank = 0i64;
+                let mut dense_rank = 0i64;
                 for pos_in_group in 0..(group_end - group_start) {
                     if pos_in_group == 0
                         || !order_key_peer(
@@ -273,13 +295,16 @@ fn compare(a: &ScalarValue, b: &ScalarValue) -> Ordering {
     crate::sql::execution::operators::aggregate::compare_scalars(a, b)
 }
 
-/// End (exclusive) of the partition that `start` belongs to.
+/// End (exclusive) of the partition that `start` belongs to. Compares through
+/// `compare` so NULL/NaN partition keys group together like the sort above.
 fn partition_end(order: &[u32], start: usize, partition_cols: &[Vec<ScalarValue>]) -> usize {
     let mut end = start + 1;
     while end < order.len() {
         let a = order[end - 1] as usize;
         let b = order[end] as usize;
-        let same = partition_cols.iter().all(|col| col[a] == col[b]);
+        let same = partition_cols
+            .iter()
+            .all(|col| compare(&col[a], &col[b]) == Ordering::Equal);
         if !same {
             break;
         }
@@ -288,7 +313,8 @@ fn partition_end(order: &[u32], start: usize, partition_cols: &[Vec<ScalarValue>
     end
 }
 
-/// True when two sorted positions carry the same ORDER BY key (peers).
+/// True when two sorted positions carry the same ORDER BY key (peers). Uses
+/// `compare` so NULL/NaN keys are peers of themselves.
 fn order_key_peer(
     order: &[u32],
     pos_a: usize,
@@ -297,7 +323,9 @@ fn order_key_peer(
 ) -> bool {
     let a = order[pos_a] as usize;
     let b = order[pos_b] as usize;
-    order_cols.iter().all(|(col, _)| col[a] == col[b])
+    order_cols
+        .iter()
+        .all(|(col, _)| compare(&col[a], &col[b]) == Ordering::Equal)
 }
 
 /// Effective frame row span `[lo, hi)` for one row inside its partition.
