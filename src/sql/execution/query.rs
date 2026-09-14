@@ -1067,7 +1067,8 @@ fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) ->
         ) => {
             let ok_func = name.eq_ignore_ascii_case("count")
                 || name.eq_ignore_ascii_case("min")
-                || name.eq_ignore_ascii_case("max");
+                || name.eq_ignore_ascii_case("max")
+                || name.eq_ignore_ascii_case("min");
             ok_func
                 && args.len() == 1
                 && match &args[0] {

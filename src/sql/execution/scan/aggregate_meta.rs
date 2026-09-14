@@ -111,9 +111,41 @@ pub fn compute_simple_aggregate(
         // Sum accumulators need the column data (zone maps carry no sums);
         // serve them from the per-segment partial-sum cache when possible.
         if has_sum && !spec.has_predicates() && meta_deleted == 0 {
-            // COUNT/MIN/MAX fold from the segment zone maps.
+            // COUNT/MIN/MAX fold from the segment zone maps ONLY when the
+            // partial-sum cache answers; on a miss the whole segment is
+            // streamed below and fold_batch accumulates every function, so
+            // folding here as well would double-count.
             if let Some(m) = &meta {
-                fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count)?;
+                let all_cached = {
+                    let needed: Vec<(String, bool)> = aggregates
+                        .iter()
+                        .zip(&aggregate_columns)
+                        .filter(|(agg, _)| agg.func == crate::sql::planner::AggFunc::Sum)
+                        .map(|(_agg, col)| {
+                            let name = col
+                                .and_then(|i| table_schema.columns.get(i))
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            let is_float = col
+                                .and_then(|i| table_schema.columns.get(i))
+                                .map(|c| matches!(
+                                    c.data_type,
+                                    DataType::Float32 | DataType::Float64
+                                ))
+                                .unwrap_or(false);
+                            (name, is_float)
+                        })
+                        .collect();
+                    segment_sum_cache_lookup(
+                        segment_path.to_string_lossy().as_ref(),
+                        m.row_count,
+                        &needed,
+                    )
+                    .is_some()
+                };
+                if all_cached {
+                    fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count)?;
+                }
             }
             // SUM folds from the per-segment partial-sum cache; a miss falls
             // through to the reader scan below, which populates the cache.
@@ -139,6 +171,10 @@ pub fn compute_simple_aggregate(
                 &needed,
             );
             if let Some(cached) = &cached {
+                // COUNT/MIN/MAX from zone maps; SUM from the cache.
+                if let Some(m) = &meta {
+                    fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count)?;
+                }
                 let mut sum_idx = 0usize;
                 for accumulator in accumulators.iter_mut() {
                     if accumulator.func != crate::sql::planner::AggFunc::Sum {
