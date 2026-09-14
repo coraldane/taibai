@@ -630,6 +630,10 @@ impl ExecutionOp for HashAggregateExec {
             .max(1);
         let mut fast_tables: Vec<Option<FastGroups>> = Vec::new();
         let mut fast_unsupported = false;
+        let mut wait_ns = 0u64;
+        let mut agg_ns = 0u64;
+        let mut batches_n = 0u64;
+        let mut wait_t0 = std::time::Instant::now();
 
         while let Some(batch) = self.input.next_batch()? {
             if physical_schema.is_none() {
@@ -677,6 +681,9 @@ impl ExecutionOp for HashAggregateExec {
                     fast_unsupported = true;
                 }
             }
+            wait_ns += wait_t0.elapsed().as_nanos() as u64;
+            let agg_t0 = std::time::Instant::now();
+            batches_n += 1;
             if !fast_unsupported {
                 let phys = physical_schema.as_ref().unwrap_or(&self.input_schema);
                 fast_group_update(
@@ -693,6 +700,8 @@ impl ExecutionOp for HashAggregateExec {
                     &mut spills,
                     spill_rows,
                 )?;
+                agg_ns += agg_t0.elapsed().as_nanos() as u64;
+                wait_t0 = std::time::Instant::now();
                 continue;
             }
 
@@ -795,6 +804,13 @@ impl ExecutionOp for HashAggregateExec {
         }
 
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
+        eprintln!(
+            "DBGAGGP bolts={} wait_ms={} agg_ms={} fast={}",
+            batches_n,
+            wait_ns / 1_000_000,
+            agg_ns / 1_000_000,
+            !fast_unsupported
+        );
         let (groups, group_keys) = if !fast_unsupported {
             merge_slot_tables(&mut fast_tables).into_maps()
         } else {

@@ -771,6 +771,15 @@ pub(crate) fn decode_adaptive_column(
     }
     let encoding = EncodingType::from_u8(data[COLUMN_ENCODING_MAGIC.len()])?;
     let payload = &data[COLUMN_ENCODING_MAGIC.len() + 1..];
+    if std::env::var("TAIBAI_ENC_TRACE").as_deref() == Ok("1") {
+        eprintln!(
+            "DBGENC col={} enc={:?} rows={} payload_len={}",
+            col_def.name,
+            encoding,
+            row_count,
+            payload.len()
+        );
+    }
 
     match encoding {
         EncodingType::Rle => {
