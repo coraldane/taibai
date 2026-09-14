@@ -20,6 +20,8 @@
 
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::common::error::Result;
 use crate::protocol::types::DataType;
 use crate::sql::execution::operators::aggregate::aggregate_result_column_def;
@@ -108,88 +110,49 @@ pub fn compute_simple_aggregate(
             continue;
         }
 
-        // Sum accumulators need the column data (zone maps carry no sums);
-        // serve them from the per-segment partial-sum cache when possible.
-        if has_sum && !spec.has_predicates() && meta_deleted == 0 {
-            // COUNT/MIN/MAX fold from the segment zone maps ONLY when the
-            // partial-sum cache answers; on a miss the whole segment is
-            // streamed below and fold_batch accumulates every function, so
-            // folding here as well would double-count.
-            if let Some(m) = &meta {
-                let all_cached = {
-                    let needed: Vec<(String, bool)> = aggregates
-                        .iter()
-                        .zip(&aggregate_columns)
-                        .filter(|(agg, _)| agg.func == crate::sql::planner::AggFunc::Sum)
-                        .map(|(_agg, col)| {
-                            let name = col
-                                .and_then(|i| table_schema.columns.get(i))
-                                .map(|c| c.name.clone())
-                                .unwrap_or_default();
-                            let is_float = col
-                                .and_then(|i| table_schema.columns.get(i))
-                                .map(|c| matches!(
-                                    c.data_type,
-                                    DataType::Float32 | DataType::Float64
-                                ))
-                                .unwrap_or(false);
-                            (name, is_float)
-                        })
-                        .collect();
-                    segment_sum_cache_lookup(
-                        segment_path.to_string_lossy().as_ref(),
-                        m.row_count,
-                        &needed,
-                    )
-                    .is_some()
-                };
-                if all_cached {
-                    fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count)?;
-                }
-            }
-            // SUM folds from the per-segment partial-sum cache; a miss falls
-            // through to the reader scan below, which populates the cache.
-            let needed: Vec<(String, bool)> = aggregates
-                .iter()
-                .zip(&aggregate_columns)
-                .filter(|(agg, _)| agg.func == crate::sql::planner::AggFunc::Sum)
-                .map(|(_agg, col)| {
-                    let name = col
-                        .and_then(|i| table_schema.columns.get(i))
-                        .map(|c| c.name.clone())
-                        .unwrap_or_default();
-                    let is_float = col
-                        .and_then(|i| table_schema.columns.get(i))
-                        .map(|c| matches!(c.data_type, DataType::Float32 | DataType::Float64))
-                        .unwrap_or(false);
-                    (name, is_float)
-                })
-                .collect();
-            let cached = segment_sum_cache_lookup(
+        // SUM has no zone-map representation: either the per-segment
+        // partial-sum cache answers (COUNT/MIN/MAX fold from the zone maps
+        // and SUM from the cache — no column reads at all), or the segment
+        // streams below with sums folded from data. Folding metadata for a
+        // streaming segment would skip SUM and then cache a zero delta, so
+        // the two paths are mutually exclusive.
+        let sum_cache = if has_sum
+            && !spec.has_predicates()
+            && meta_deleted == 0
+            && meta.is_some()
+        {
+            segment_sum_cache_lookup(
                 segment_path.to_string_lossy().as_ref(),
                 meta_rows,
-                &needed,
-            );
-            if let Some(cached) = &cached {
-                // COUNT/MIN/MAX from zone maps; SUM from the cache.
-                if let Some(m) = &meta {
-                    fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count)?;
-                }
-                let mut sum_idx = 0usize;
-                for accumulator in accumulators.iter_mut() {
-                    if accumulator.func != crate::sql::planner::AggFunc::Sum {
-                        continue;
-                    }
-                    if let Some(v) = cached.get(sum_idx) {
-                        accumulator.fold_cached_sum(v);
-                    }
-                    sum_idx += 1;
-                }
-                continue;
+                &sum_needed_columns(aggregates, &aggregate_columns, table_schema),
+            )
+        } else {
+            None
+        };
+        if let Some(cached) = &sum_cache {
+            if let Some(m) = &meta {
+                fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count)?;
             }
+            let mut sum_idx = 0usize;
+            for accumulator in accumulators.iter_mut() {
+                if accumulator.func != crate::sql::planner::AggFunc::Sum {
+                    continue;
+                }
+                if let Some(v) = cached.get(sum_idx) {
+                    accumulator.fold_cached_sum(v);
+                }
+                sum_idx += 1;
+            }
+            continue;
         }
 
         let reader = segment_mgr.open_reader_cached(segment_path)?;
+        // Cache miss: stream candidate row groups and fold every function
+        // from data, so the stored partial sums are real values.
+        // Any SUM needs data (zone maps carry no sums), predicates or not.
+        // All-match row groups skip the predicate mask — every row matches —
+        // so folding the raw batch there is still exact.
+        let streaming_sum = has_sum && sum_cache.is_none() && reader.deleted_row_count() == 0;
         if !spec.has_predicates() && reader.deleted_row_count() == 0 && !has_sum {
             fold_metadata(
                 &mut accumulators,
@@ -239,6 +202,20 @@ pub fn compute_simple_aggregate(
         }
         let mut row_start = 0u64;
 
+        // Build the per-row-group work list first: metadata-only folds run
+        // inline; data folds read their batches in parallel chunks (reads
+        // dominate the cold path — 600+ row groups), then fold sequentially
+        // in candidate order. Count/Sum/Min/Max are all commutative, so the
+        // fold order only needs to be deterministic, which the ordered
+        // collect below guarantees.
+        struct DataFold {
+            row_group_index: usize,
+            row_start: u64,
+            apply_mask: bool,
+        }
+        let mut meta_folds: Vec<(&[crate::storage::partition::pruning::ZoneMap], u64)> = Vec::new();
+        let mut data_folds: Vec<DataFold> = Vec::new();
+
         for (row_group_index, row_group_meta) in row_groups.iter().enumerate() {
             if !candidates[row_group_index] {
                 row_start += row_group_meta.row_count;
@@ -255,57 +232,76 @@ pub fn compute_simple_aggregate(
                 row_start += row_group_meta.row_count;
                 continue;
             }
+            // The metadata-only fold cannot produce SUM: a streaming_sum
+            // segment folds every function from data instead.
             if predicate_match == crate::storage::partition::pruning::PredicateMatch::All
                 && reader.delete_bitmap().is_empty()
+                && !streaming_sum
             {
-                fold_metadata(
-                    &mut accumulators,
+                meta_folds.push((
                     &row_group_meta.zone_maps,
                     row_group_meta.row_count,
-                )?;
+                ));
                 row_start += row_group_meta.row_count;
                 continue;
             }
 
-            let mut batch =
-                reader.read_row_group_with_projection(row_group_index, &source_columns)?;
-            if !reader.delete_bitmap().is_empty() {
-                batch = delete_bitmap::filter_batch(&batch, row_start, reader.delete_bitmap())?;
-            }
-            if spec.has_predicates() {
-                batch = row_filter::apply_predicates_with_column_map(
-                    &batch,
-                    &source_columns,
-                    &spec.eq_predicates,
-                    &spec.range_predicates,
-                    &spec.in_predicates,
-                    spec.remaining_predicate.as_ref(),
-                )?;
-            }
-            fold_batch(&mut accumulators, &aggregate_positions, &batch)?;
+            data_folds.push(DataFold {
+                row_group_index,
+                row_start,
+                apply_mask: spec.has_predicates(),
+            });
             row_start += row_group_meta.row_count;
         }
 
-        if has_sum && !spec.has_predicates() && reader.deleted_row_count() == 0 {
-            let needed: Vec<(String, bool)> = aggregates
-                .iter()
-                .zip(&aggregate_columns)
-                .filter(|(agg, _)| agg.func == crate::sql::planner::AggFunc::Sum)
-                .map(|(_agg, col)| {
-                    let name = col
-                        .and_then(|i| table_schema.columns.get(i))
-                        .map(|c| c.name.clone())
-                        .unwrap_or_default();
-                    let is_float = col
-                        .and_then(|i| table_schema.columns.get(i))
-                        .map(|c| matches!(c.data_type, DataType::Float32 | DataType::Float64))
-                        .unwrap_or(false);
-                    (name, is_float)
+        for (zone_maps, row_count) in meta_folds {
+            fold_metadata(&mut accumulators, zone_maps, row_count)?;
+        }
+
+        let delete_bitmap_is_empty = reader.delete_bitmap().is_empty();
+        for chunk in data_folds.chunks(32) {
+            let batches: Vec<Result<RecordBatch>> = chunk
+                .par_iter()
+                .map(|fold| {
+                    let mut batch = reader.read_row_group_with_projection(
+                        fold.row_group_index,
+                        &source_columns,
+                    )?;
+                    if !delete_bitmap_is_empty {
+                        batch = delete_bitmap::filter_batch(
+                            &batch,
+                            fold.row_start,
+                            reader.delete_bitmap(),
+                        )?;
+                    }
+                    if fold.apply_mask {
+                        batch = row_filter::apply_predicates_with_column_map(
+                            &batch,
+                            &source_columns,
+                            &spec.eq_predicates,
+                            &spec.range_predicates,
+                            &spec.in_predicates,
+                            spec.remaining_predicate.as_ref(),
+                        )?;
+                    }
+                    Ok(batch)
                 })
                 .collect();
+            for (fold, batch) in chunk.iter().zip(batches) {
+                fold_batch(&mut accumulators, &aggregate_positions, &batch?)?;
+            }
+        }
+
+        if has_sum && !spec.has_predicates() && reader.deleted_row_count() == 0 {
+            let needed = sum_needed_columns(aggregates, &aggregate_columns, table_schema);
+            // Only SUM accumulators: `needed` (and the cache key order)
+            // covers SUM aggregates exclusively, so zipping all accumulators
+            // would pair the cache entry with COUNT's empty delta and store
+            // a zero sum.
             let deltas: Vec<SumCacheValue> = accumulators
                 .iter()
                 .zip(sum_before.iter())
+                .filter(|(a, _)| a.func == crate::sql::planner::AggFunc::Sum)
                 .map(|(a, (i0, f0))| SumCacheValue {
                     i: match (a.sum_i, *i0) {
                         (Some(v), Some(base)) => Some(v.wrapping_sub(base)),
@@ -359,6 +355,28 @@ pub fn compute_simple_aggregate(
             .push(&value)?;
     }
     Ok(Some(batch))
+}
+
+/// Columns the partial-sum cache needs: (column name, is-float) per SUM
+/// aggregate, in aggregate order.
+fn sum_needed_columns(
+    aggregates: &[AggregateExpr],
+    aggregate_columns: &[Option<usize>],
+    table_schema: &Schema,
+) -> Vec<(String, bool)> {
+    aggregates
+        .iter()
+        .zip(aggregate_columns)
+        .filter(|(agg, _)| agg.func == crate::sql::planner::AggFunc::Sum)
+        .map(|(_agg, col)| {
+            let def = col.and_then(|i| table_schema.columns.get(i));
+            let name = def.map(|c| c.name.clone()).unwrap_or_default();
+            let is_float = def
+                .map(|c| matches!(c.data_type, DataType::Float32 | DataType::Float64))
+                .unwrap_or(false);
+            (name, is_float)
+        })
+        .collect()
 }
 
 fn aggregate_source_columns(spec: &ScanSpec, aggregate_columns: &[Option<usize>]) -> Vec<usize> {
@@ -673,10 +691,6 @@ fn sum_aggregates_supported(
                             | crate::protocol::types::DataType::Int32
                             | crate::protocol::types::DataType::Int16
                             | crate::protocol::types::DataType::Int8
-                            | crate::protocol::types::DataType::Decimal
-                            | crate::protocol::types::DataType::Date
-                            | crate::protocol::types::DataType::Time
-                            | crate::protocol::types::DataType::Timestamp
                             | crate::protocol::types::DataType::Float64
                             | crate::protocol::types::DataType::Float32
                     )

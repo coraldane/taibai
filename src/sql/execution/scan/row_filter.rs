@@ -340,7 +340,9 @@ pub fn predicate_first_read(
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
     if match_count == pred_batch.num_rows() {
-        return reader.read_columns_fast(rg_idx, projection_cols);
+        // Whole row group matched: keep dictionary-encoded projections as
+        // (ids, dict) so downstream grouped aggregation consumes u32 ids.
+        return reader.read_columns_fast_allow_dictionary(rg_idx, projection_cols, true);
     }
 
     let selected_rows: Vec<usize> = mask

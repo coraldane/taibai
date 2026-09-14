@@ -296,11 +296,20 @@ impl SegmentReader {
     }
 
     pub fn read_column(&self, row_group: usize, column_idx: usize) -> Result<ColumnArray> {
+        self.read_column_allow_dictionary(row_group, column_idx, false)
+    }
+
+    pub fn read_column_allow_dictionary(
+        &self,
+        row_group: usize,
+        column_idx: usize,
+        allow_dictionary: bool,
+    ) -> Result<ColumnArray> {
         let rg = &self.footer.row_groups[row_group];
         let col_def = &self.footer.schema.columns[column_idx];
 
         let decompressed = self.read_column_raw(row_group, column_idx)?;
-        decode_column(&decompressed, rg.row_count as usize, col_def, false)
+        decode_column(&decompressed, rg.row_count as usize, col_def, allow_dictionary)
     }
 
     pub fn read_column_raw(&self, row_group: usize, column_idx: usize) -> Result<Vec<u8>> {
@@ -321,6 +330,15 @@ impl SegmentReader {
         &self,
         row_group: usize,
         column_indices: &[usize],
+    ) -> Result<Vec<(usize, ColumnArray)>> {
+        self.read_row_group_batch_allow_dictionary(row_group, column_indices, false)
+    }
+
+    pub fn read_row_group_batch_allow_dictionary(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        allow_dictionary: bool,
     ) -> Result<Vec<(usize, ColumnArray)>> {
         if column_indices.is_empty() {
             return Ok(Vec::new());
@@ -358,7 +376,12 @@ impl SegmentReader {
                 let compressed = &all_data[col_offset..col_offset + col_len];
                 let decompressed = Self::decompress_column_block(compressed)?;
                 let col_def = &self.footer.schema.columns[col_idx];
-                let col_array = decode_column(&decompressed, rg.row_count as usize, col_def, false)?;
+                let col_array = decode_column(
+                    &decompressed,
+                    rg.row_count as usize,
+                    col_def,
+                    allow_dictionary,
+                )?;
                 Ok(Some((col_idx, col_array)))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -427,7 +450,17 @@ impl SegmentReader {
         row_group: usize,
         column_indices: &[usize],
     ) -> Result<crate::types::batch::RecordBatch> {
-        let columns_data = self.read_row_group_batch(row_group, column_indices)?;
+        self.read_columns_fast_allow_dictionary(row_group, column_indices, false)
+    }
+
+    pub fn read_columns_fast_allow_dictionary(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        allow_dictionary: bool,
+    ) -> Result<crate::types::batch::RecordBatch> {
+        let columns_data =
+            self.read_row_group_batch_allow_dictionary(row_group, column_indices, allow_dictionary)?;
 
         let mut columns = Vec::with_capacity(column_indices.len());
         let mut col_defs = Vec::with_capacity(column_indices.len());
@@ -527,10 +560,19 @@ impl SegmentReader {
         row_group: usize,
         projection: &[usize],
     ) -> Result<crate::types::batch::RecordBatch> {
+        self.read_row_group_with_projection_and_dictionary(row_group, projection, false)
+    }
+
+    pub fn read_row_group_with_projection_and_dictionary(
+        &self,
+        row_group: usize,
+        projection: &[usize],
+        allow_dictionary: bool,
+    ) -> Result<crate::types::batch::RecordBatch> {
         let mut columns = Vec::with_capacity(projection.len());
         let mut col_defs = Vec::with_capacity(projection.len());
         for &col_idx in projection {
-            columns.push(self.read_column(row_group, col_idx)?);
+            columns.push(self.read_column_allow_dictionary(row_group, col_idx, allow_dictionary)?);
             col_defs.push(self.footer.schema.columns[col_idx].clone());
         }
         let schema = crate::types::batch::Schema::new(col_defs);

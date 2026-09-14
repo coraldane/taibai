@@ -67,6 +67,12 @@ DuckDB(Vector + Value)、DataFusion(ArrayRef + ScalarValue)、Polars 同款答�
 
 剩余差距是 DuckDB 十余年 SIMD/编码调优的护城河,属于健康追赶区间。
 
+> **实际达成(2026-09-14,v10,见 reports/benchmark-vs-duckdb-kdb-2026-09.md §4/§10.5~§10.8)**:
+> Q5 836→**44ms**(~4× vs DuckDB)、Q7 224ms→**0.3ms**(元数据直答,**反超** DuckDB 0.97ms)、
+> Q4 219→12ms(1.7×)、Q6 49→7ms(~10×)、Q1/Q2/Q3 反超。
+> 轨迹与预期表量级一致;第 1 层(字典分组+直通)、第 4 层(BitPacked/DeltaRle 编码、段级部分和元数据直答)已落地,
+> 第 3 层的流式聚合消费与 Q6 谓词下推仍为下一步空间。
+
 ## 4. 原则
 
 - **每层独立可测**:每层落地后跑 Q1~Q7 + 全量回归,收益不达预期即回滚;

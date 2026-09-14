@@ -169,11 +169,6 @@ impl<'a> ScanExecutor<'a> {
             .data_dir()
             .join(self.db)
             .join(&self.spec.table_name);
-        eprintln!(
-            "DBGMETA route aggs={} dir_exists={}",
-            aggs.len(),
-            table_dir.exists()
-        );
         let batch = if table_dir.exists() {
             super::aggregate_meta::compute_simple_aggregate(
                 self.spec,

@@ -31,6 +31,36 @@ use super::{spill_group_run, Accumulator, CountKind};
 /// Minimum rows in a batch before splitting it across group-table slots.
 const PARALLEL_MIN_ROWS: usize = 8_192;
 
+/// Typed-loop shapes run inline on one lane below this batch size: at
+/// ~2ns/row the split's scheduling overhead exceeds the parallelism gain.
+const TYPED_INLINE_MAX_ROWS: usize = 65_536;
+
+/// Diagnostic counter: how many row ranges ran the tight dictionary-key
+/// loop (read with `typed_range_calls`, printed by the aggregate probe).
+pub(crate) static TYPED_RANGE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn typed_range_calls() -> u64 {
+    TYPED_RANGE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Temporary diagnostics: why the tight loop did not run.
+pub(crate) static TYPED_MISS_GROUP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static TYPED_MISS_NULLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static TYPED_MISS_KINDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-batch fixed-cost breakdown (nanoseconds, summed): lane par-join vs
+/// post-join memory accounting.
+pub(crate) static AGG_JOIN_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AGG_ACCOUNT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AGG_SETUP_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// FxHash-family hasher (same construction as the hot store's string pool)
 /// so group interning does not pay SipHash per row.
 #[derive(Default)]
@@ -108,6 +138,37 @@ enum FastGroupCol<'a> {
     Dict(&'a [u32], usize, &'a NullBitmap),
 }
 
+/// Accumulator shape resolved once per range for the tight dictionary-key
+/// loop: null-free Count/Sum/Avg over an i64-view argument. Every other
+/// shape keeps the generic per-row dispatch.
+enum TypedAcc<'a> {
+    CountStar,
+    SumI64(&'a [i64]),
+    AvgI64(&'a [i64]),
+}
+
+impl<'a> TypedAcc<'a> {
+    fn classify(agg: &AggregateExpr, view: &FastArgCol<'a>) -> Option<Self> {
+        if agg.distinct {
+            return None;
+        }
+        match (&agg.func, view) {
+            // A null-free COUNT(col) counts rows — identical to COUNT(*).
+            (AggFunc::Count, FastArgCol::None) => Some(TypedAcc::CountStar),
+            (AggFunc::Count, FastArgCol::I64(_, bm)) if bm.null_count() == 0 => {
+                Some(TypedAcc::CountStar)
+            }
+            (AggFunc::Sum, FastArgCol::I64(data, bm)) if bm.null_count() == 0 => {
+                Some(TypedAcc::SumI64(data))
+            }
+            (AggFunc::Avg, FastArgCol::I64(data, bm)) if bm.null_count() == 0 => {
+                Some(TypedAcc::AvgI64(data))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Where a merged entry lands: an existing group (merge accumulators) or a
 /// fresh append into this table's arrays.
 enum FastMergeTarget {
@@ -130,6 +191,9 @@ pub(super) struct FastGroups {
     keys: Vec<Vec<u8>>,
     scalars: Vec<ScalarValue>,
     accs: Vec<Vec<Accumulator>>,
+    /// Running `estimated_bytes` — maintained on group creation / merge so
+    /// the per-batch memory reservation is O(1) instead of O(groups).
+    cached_bytes: usize,
 }
 
 impl FastGroups {
@@ -142,22 +206,26 @@ impl FastGroups {
             keys: Vec::new(),
             scalars: Vec::new(),
             accs: Vec::new(),
+            cached_bytes: 0,
         }
     }
 
-    fn estimated_bytes(&self) -> usize {
-        self.keys.iter().map(|k| k.len()).sum::<usize>()
-            + self.scalars.len() * std::mem::size_of::<ScalarValue>()
-            + self
-                .accs
+    /// Size estimate of one freshly created group (key bytes, scalar, and
+    /// its accumulator row).
+    fn group_bytes(key: &[u8], accs: &[Accumulator]) -> usize {
+        key.len()
+            + std::mem::size_of::<ScalarValue>()
+            + accs
                 .iter()
-                .map(|accums| {
-                    accums
-                        .iter()
-                        .map(Accumulator::estimated_size_bytes)
-                        .sum::<usize>()
-                })
+                .map(Accumulator::estimated_size_bytes)
                 .sum::<usize>()
+    }
+
+    /// O(1): maintained incrementally on group creation and merge. Merging
+    /// accumulators of the fast-path shapes (Count/Sum/Avg) does not change
+    /// their size, so only appended groups adjust the cache.
+    fn estimated_bytes(&self) -> usize {
+        self.cached_bytes
     }
 
     /// Merge another slot's table into this one. Group discovery order of
@@ -172,6 +240,7 @@ impl FastGroups {
             keys,
             scalars,
             accs,
+            cached_bytes: other_bytes,
         } = other;
         for (key, scalar, mut accumulators) in
             keys.into_iter().zip(scalars.into_iter()).zip(accs.into_iter()).map(|((k, s), a)| (k, s, a))
@@ -235,6 +304,7 @@ impl FastGroups {
                 }
             }
         }
+        self.cached_bytes += other_bytes;
     }
 
     /// Convert into the generic grouping structures (merge order kept).
@@ -265,6 +335,34 @@ impl FastGroups {
         start: usize,
         end: usize,
     ) -> Result<()> {
+        // Tight loop for the dominant scan-aggregate shape: dictionary group
+        // keys with null-free typed Count/Sum/Avg accumulators. Everything a
+        // row needs is resolved once per range (data slices, accumulator
+        // kinds), so the per-row work is an id lookup, an accumulator-slot
+        // deref and typed adds — no bitmap probes, no per-row enum dispatch.
+        // Any other shape (nulls, other types, DISTINCT) uses the generic
+        // interpreter below.
+        if let FastGroupCol::Dict(ids, dict_len, gbm) = group_col {
+            if gbm.null_count() == 0 {
+                let kinds = aggregates
+                    .iter()
+                    .zip(arg_views.iter())
+                    .map(|(agg, view)| TypedAcc::classify(agg, view))
+                    .collect::<Option<Vec<_>>>();
+                if let Some(kinds) = kinds {
+                    return self.update_row_range_dict_typed(
+                        ids, *dict_len, start, end, &kinds, batch, gb_col, aggregates,
+                        physical_schema, max_groups,
+                    );
+                }
+                TYPED_MISS_KINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                TYPED_MISS_NULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            TYPED_MISS_GROUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         for row in start..end {
             let group_id: u32 = match group_col {
                 FastGroupCol::Dict(ids, dict_len, bitmap) => {
@@ -406,6 +504,80 @@ impl FastGroups {
         Ok(())
     }
 
+    /// Monomorphic row loop for dictionary group keys over null-free
+    /// Count/Sum/Avg(i64-view) accumulators. `kinds` is classified once per
+    /// range; unseen dict entries fall through to `new_group` at most
+    /// `dict_len` times per batch.
+    #[allow(clippy::too_many_arguments)]
+    fn update_row_range_dict_typed(
+        &mut self,
+        ids: &[u32],
+        dict_len: usize,
+        start: usize,
+        end: usize,
+        kinds: &[TypedAcc],
+        batch: &RecordBatch,
+        gb_col: usize,
+        aggregates: &[AggregateExpr],
+        physical_schema: &Schema,
+        max_groups: usize,
+    ) -> Result<()> {
+        TYPED_RANGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.dict_gid.len() < dict_len {
+            self.dict_gid.resize(dict_len, None);
+        }
+        for row in start..end {
+            let entry = ids[row] as usize;
+            let group_id = match self.dict_gid[entry] {
+                Some(id) => id,
+                None => {
+                    let id =
+                        self.new_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?;
+                    self.dict_gid[entry] = Some(id);
+                    id
+                }
+            };
+            let accs = &mut self.accs[group_id as usize];
+            for (k, kind) in kinds.iter().enumerate() {
+                match *kind {
+                    TypedAcc::CountStar => match &mut accs[k] {
+                        Accumulator::Count { count, .. } => {
+                            *count = count.wrapping_add(1);
+                        }
+                        _ => {
+                            return Err(TaibaiError::Internal(
+                                "fast group: accumulator shape mismatch".into(),
+                            ))
+                        }
+                    },
+                    TypedAcc::SumI64(data) => match &mut accs[k] {
+                        Accumulator::SumI(value) => {
+                            *value = Some(value.unwrap_or(0).wrapping_add(data[row]));
+                        }
+                        _ => {
+                            return Err(TaibaiError::Internal(
+                                "fast group: accumulator shape mismatch".into(),
+                            ))
+                        }
+                    },
+                    TypedAcc::AvgI64(data) => match &mut accs[k] {
+                        Accumulator::Avg { sum, count, any } => {
+                            *sum += data[row] as f64;
+                            *count += 1;
+                            *any = true;
+                        }
+                        _ => {
+                            return Err(TaibaiError::Internal(
+                                "fast group: accumulator shape mismatch".into(),
+                            ))
+                        }
+                    },
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn get_or_create_null_group(
         &mut self,
         batch: &RecordBatch,
@@ -451,6 +623,7 @@ impl FastGroups {
             .collect();
         let accs = accs?;
         let id = self.accs.len() as u32;
+        self.cached_bytes += Self::group_bytes(&key, &accs);
         self.keys.push(key);
         self.scalars.push(scalar);
         self.accs.push(accs);
@@ -586,6 +759,7 @@ pub(super) fn fast_group_update(
     spills: &mut Vec<SpillFile>,
     spill_rows: usize,
 ) -> Result<()> {
+    let setup_t0 = std::time::Instant::now();
     let group_array = batch
         .column(gb_col)
         .ok_or_else(|| TaibaiError::Internal("fast group: group column missing".into()))?;
@@ -648,12 +822,32 @@ pub(super) fn fast_group_update(
             f.dict_gid.clear();
         }
     }
+    AGG_SETUP_NS.fetch_add(
+        setup_t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let join_t0 = std::time::Instant::now();
 
     let rows = batch.num_rows();
-    let lanes = crate::common::config::query_limits()
+    let max_lanes = crate::common::config::query_limits()
         .max_parallel_row_groups
         .clamp(1, 8);
-    let lanes = if rows >= PARALLEL_MIN_ROWS { lanes } else { 1 };
+    // The typed dictionary-key loop runs ~2ns/row: at typical batch sizes
+    // (~16K rows → ~35µs of work) splitting into 8 rayon lane tasks costs
+    // more in scheduling than the parallelism saves, so those run inline on
+    // a single lane. Branchier generic shapes and large batches keep lanes.
+    let typed_shape = matches!(&group_col, FastGroupCol::Dict(_, _, bm) if bm.null_count() == 0)
+        && aggregates
+            .iter()
+            .zip(arg_views.iter())
+            .all(|(agg, view)| TypedAcc::classify(agg, view).is_some());
+    let lanes = if typed_shape && rows < TYPED_INLINE_MAX_ROWS {
+        1
+    } else if rows >= PARALLEL_MIN_ROWS {
+        max_lanes
+    } else {
+        1
+    };
     // Grow only: shrinking the slot vec would drop the group state the
     // dropped slots accumulated for earlier batches.
     if tables.len() < lanes {
@@ -663,34 +857,54 @@ pub(super) fn fast_group_update(
     // remains valid); only the first `lanes` slots take rows this time.
     let lanes = lanes.min(tables.len());
 
-    let chunk_size = rows.div_ceil(lanes);
-    let results: Vec<Result<()>> = tables
-        .par_iter_mut()
-        .take(lanes)
-        .enumerate()
-        .map(|(slot, table)| {
-            let start = slot * chunk_size;
-            let end = (start + chunk_size).min(rows);
-            if start >= end {
-                return Ok(());
-            }
-            let table = table.get_or_insert_with(FastGroups::new);
-            table.update_row_range(
-                &group_col,
-                &arg_views,
-                batch,
-                gb_col,
-                aggregates,
-                physical_schema,
-                max_groups,
-                start,
-                end,
-            )
-        })
-        .collect();
-    for result in results {
-        result?;
+    if lanes == 1 {
+        let table = tables[0].get_or_insert_with(FastGroups::new);
+        table.update_row_range(
+            &group_col,
+            &arg_views,
+            batch,
+            gb_col,
+            aggregates,
+            physical_schema,
+            max_groups,
+            0,
+            rows,
+        )?;
+    } else {
+        let chunk_size = rows.div_ceil(lanes);
+        let results: Vec<Result<()>> = tables
+            .par_iter_mut()
+            .take(lanes)
+            .enumerate()
+            .map(|(slot, table)| {
+                let start = slot * chunk_size;
+                let end = (start + chunk_size).min(rows);
+                if start >= end {
+                    return Ok(());
+                }
+                let table = table.get_or_insert_with(FastGroups::new);
+                table.update_row_range(
+                    &group_col,
+                    &arg_views,
+                    batch,
+                    gb_col,
+                    aggregates,
+                    physical_schema,
+                    max_groups,
+                    start,
+                    end,
+                )
+            })
+            .collect();
+        for result in results {
+            result?;
+        }
     }
+    AGG_JOIN_NS.fetch_add(
+        join_t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let account_t0 = std::time::Instant::now();
 
     // Mirror the generic path's once-per-batch deep memory refresh and spill
     // boundary; the slot tables merge 1:1 into the generic structures.
@@ -707,6 +921,10 @@ pub(super) fn fast_group_update(
         memory.release();
         *estimated_group_bytes = 0;
     }
+    AGG_ACCOUNT_NS.fetch_add(
+        account_t0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(())
 }
 

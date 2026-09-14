@@ -519,7 +519,10 @@ fn exec_table_select(
         && table_names.len() == 1
         && detect_simple_metadata_aggregate(stmt, &table_names)
     {
-        extract_simple_metadata_aggregates(&plan)
+        extract_simple_metadata_aggregates(
+            &plan,
+            table_schemas.get(&table_names[0]).unwrap_or(&crate::types::batch::Schema::empty()),
+        )
     } else {
         None
     };
@@ -1068,7 +1071,7 @@ fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) ->
             let ok_func = name.eq_ignore_ascii_case("count")
                 || name.eq_ignore_ascii_case("min")
                 || name.eq_ignore_ascii_case("max")
-                || name.eq_ignore_ascii_case("min");
+                || name.eq_ignore_ascii_case("sum");
             ok_func
                 && args.len() == 1
                 && match &args[0] {
@@ -1086,6 +1089,7 @@ fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) ->
 /// caller falls back to the normal path.
 fn extract_simple_metadata_aggregates(
     plan: &LogicalPlan,
+    schema: &crate::types::batch::Schema,
 ) -> Option<Vec<crate::sql::planner::AggregateExpr>> {
     // The optimizer may wrap the aggregate in a projection; unwrap one level.
     let plan = match plan {
@@ -1094,15 +1098,40 @@ fn extract_simple_metadata_aggregates(
     };
     match plan {
         LogicalPlan::Aggregate(agg) if agg.group_by.is_empty() && !agg.distinct => {
-            // Restrict to COUNT/MIN/MAX to match detect_simple_metadata_aggregate.
+            // Restrict to COUNT/MIN/MAX/SUM to match
+            // detect_simple_metadata_aggregate. SUM additionally requires a
+            // numeric argument column: the metadata path answers it with the
+            // argument's integer/float representation, and a routed query
+            // never reaches the aggregate pipeline, so unanswerable shapes
+            // must stay unrouted.
             let all_supported = agg.aggregates.iter().all(|a| {
-                !a.distinct
-                    && matches!(
-                        a.func,
-                        crate::sql::planner::AggFunc::Count
-                            | crate::sql::planner::AggFunc::Min
-                            | crate::sql::planner::AggFunc::Max
-                    )
+                if a.distinct {
+                    return false;
+                }
+                match a.func {
+                    crate::sql::planner::AggFunc::Count
+                    | crate::sql::planner::AggFunc::Min
+                    | crate::sql::planner::AggFunc::Max => true,
+                    crate::sql::planner::AggFunc::Sum => match &*a.arg {
+                        crate::sql::planner::LogicalExpr::Column(idx) => schema
+                            .columns
+                            .get(*idx)
+                            .map(|c| {
+                                matches!(
+                                    c.data_type,
+                                    crate::protocol::types::DataType::Int64
+                                        | crate::protocol::types::DataType::Int32
+                                        | crate::protocol::types::DataType::Int16
+                                        | crate::protocol::types::DataType::Int8
+                                        | crate::protocol::types::DataType::Float64
+                                        | crate::protocol::types::DataType::Float32
+                                )
+                            })
+                            .unwrap_or(false),
+                        _ => false,
+                    },
+                    _ => false,
+                }
             });
             if all_supported {
                 Some(agg.aggregates.clone())

@@ -119,7 +119,7 @@ pub fn scan_memtables(
     // = (rows ever appended to the store) - (rows still in live memtables); the
     // leading rows below that watermark have been flushed and are served by the
     // segment scan, so the gather here skips them. This prefix invariant holds
-    // for the single-active-partition ingestion pattern (e.g. today's ticks).
+    // for the single-active-partition ingestion pattern.
     let has_live_memtable_data = memtables.iter().any(|mt| mt.row_count() > 0);
     // The shortcut below replaces the memtable scan with hot-store rows above
     // the watermark, which is only equivalent while every live memtable row is

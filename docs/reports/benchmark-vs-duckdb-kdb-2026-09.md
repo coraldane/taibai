@@ -84,17 +84,19 @@ insert-profile 阶段拆解(100 行/条,服务端):
 
 ## 4. 查询性能(10M 行 × 34 列冷表)
 
-| 查询 | taibai 原始导入后 | taibai OPTIMIZE 后 | taibai OPTIMIZE + 扫描优化(v3) | taibai + 分组快路径(v4) | taibai + 并行分组(v5) | DuckDB |
-|---|---|---|---|---|---|---|
-| Q1 点查:单 symbol 单日 → 2000 行×34 列 | 363 ms | **3.0 ms**(wall 5.1 ms) | ~5 ms | ~3.9 ms | **~3.9 ms** | 55.0 ms |
-| Q2 单 symbol 最新 10 条 | 616 ms | **6.5 ms** | 不变 | ~6.0 ms | **~6.0 ms** | 7.0 ms |
-| Q3 单 symbol 全期聚合 | 308 ms | **1.9 ms** | ~2.0 ms | ~1.9 ms | **~1.9 ms** | 2.5 ms |
-| Q4 单日 2M 行 GROUP BY | 219 ms | 181 ms | 79 ms | 47 ms | **26 ms**(8.4×) | **7.2 ms** |
-| Q5 全表 10M 行 GROUP BY | 1.07 s | 836 ms | 388 ms | 229 ms | **111 ms**(9.6×) | **11.0 ms** |
-| Q6 单日 2M 行过滤聚合 | 49 ms | 28 ms | 12.7 ms | ~10 ms | **~10 ms**(4.9×) | **0.72 ms** |
-| Q7 全表 10M 行 count+sum | 224 ms | 110 ms | 38 ms | ~45 ms | **~38 ms**(2.9×) | **0.97 ms** |
+| 查询 | taibai 原始导入后 | taibai OPTIMIZE 后 | taibai OPTIMIZE + 扫描优化(v3) | taibai + 分组快路径(v4) | taibai + 并行分组(v5) | taibai 最终(v10,编码/直通/元数据) | DuckDB |
+|---|---|---|---|---|---|---|---|
+| Q1 点查:单 symbol 单日 → 2000 行×34 列 | 363 ms | **3.0 ms**(wall 5.1 ms) | ~5 ms | ~3.9 ms | **~3.9 ms** | ~1.6 ms(wall ~4.4 ms) | 55.0 ms |
+| Q2 单 symbol 最新 10 条 | 616 ms | **6.5 ms** | 不变 | ~6.0 ms | **~6.0 ms** | ~3.9 ms | 7.0 ms |
+| Q3 单 symbol 全期聚合 | 308 ms | **1.9 ms** | ~2.0 ms | ~1.9 ms | **~1.9 ms** | ~1.5 ms | 2.5 ms |
+| Q4 单日 2M 行 GROUP BY | 219 ms | 181 ms | 79 ms | 47 ms | **26 ms** | **~12 ms** | **7.2 ms** |
+| Q5 全表 10M 行 GROUP BY | 1.07 s | 836 ms | 388 ms | 229 ms | **111 ms** | **~44 ms** | **11.0 ms** |
+| Q6 单日 2M 行过滤聚合 | 49 ms | 28 ms | 12.7 ms | ~10 ms | **~10 ms** | **~7 ms** | **0.72 ms** |
+| Q7 全表 10M 行 count+sum | 224 ms | 110 ms | 38 ms | ~45 ms | **~38 ms** | **~0.3 ms**(元数据直答) | **0.97 ms** |
 
-(`OPTIMIZE TABLE` 一次性成本 2.43 s/10M 行。公平性:DuckDB 嵌入式无网络;taibai wall 含 localhost TCP,server_elapsed 不含。)
+(v10 = v6 解码流水线 + BitPacked/DeltaRle 数值编码 + 字典直通聚合 + 单体化聚合核 + 专用解码池 + 段级部分和元数据直答,详见 §10.5~§10.8。Q7 首查(服务重启后缓存冷)~210-250 ms 建立分段部分和,此后热答 0.2~0.4 ms。taibai wall 含 localhost TCP;DuckDB 嵌入式无网络。`OPTIMIZE TABLE` 一次性成本 2.43~3.5 s/10M 行。)
+
+**累计轨迹(vs 最初基线)**:Q1 363ms→1.6ms(**~230×**)、Q2 616→3.9ms(**~160×**)、Q3 308→1.5ms(**~200×**)、Q4 219→12ms(**~18×**)、Q5 1.07s→44ms(**~24×**)、Q6 49→7ms(**~7×**)、Q7 224ms→0.3ms(**~750×**)。与 DuckDB:Q1/Q2/Q3/Q7 领先或反超,Q4 剩 ~1.7×,Q5 剩 ~4×,Q6 剩 ~10×。
 
 ### 4.1 热表(hot_tick,200 万行驻留热存)——v2 修正标签
 
@@ -221,6 +223,92 @@ profiling(聚合 busy 时间 vs 墙钟)发现:并行分组落地后行循环只�
 结论:Q5 的 ~110ms 中 **~97ms 是聚合在等解码**——字典展开虽已零分配,单 RG 解码成本(~0.4ms)在 16 RG 并行分块下只扩到 ~3× 有效并行。下一阶段的量化依据:
 1. **字典直通解码**(ColumnArray 增加字典变体,跳过 expand + 跳过逐行字符串 intern,分组键直接消费 u32 数组)——同时削减解码成本与分组哈希成本,是剩余差距的主刀;
 2. 解码线程的并行度扩不上去的原因(permit 粒度/内存带宽/rayon 任务粒度)需单独 profile。
+
+### 10.5 数值列 BitPacked 轻量编码(2026-09-14)
+
+§10.4 的通道等待测量显示剩余解码成本集中在数值列 zstd 解压(close_px/trans_volume 等定宽列)。
+
+- `EncodingType::BitPacked`(tag 5)落地:delta + 分块 frame-of-reference + 固定位宽打包(Parquet DELTA_BINARY_PACKED 形状,128 值/块);不要求列有序——逐块最小值偏移使震荡型数值列(价格、量)同样压得动;位宽 >56 视为不可压直接弃选;
+- 与 zstd(plain) 按尺寸竞争但**带解码速度倾斜**:仅当 zstd 候选小 ≥20% 才让位(边际尺寸优势不值得 ~10× 解码退化);获胜时块 verbatim 落盘,读取端按既有 zstd-magic 前缀判定跳过解压;
+- 解码器:64 位累加器字节粒度补位(宽度 ≤56 无逐值边界检查),宽度 8/16/32 走整除特化快路径,宽度 0 走等差直填;无空值 i64 系列列(Int64/Decimal/Timestamp/Time/Interval)解码缓冲直接物化为列,免二次拷贝(该快路径对 Delta/DoD 同样生效);
+- 旧段兼容:旧编码照常读;新段含 BitPacked 需新二进制(experimental 格式语义内)。
+
+**结果**(1M 行 Decimal 解码微基准,`bitpacked_decode_throughput_bench`,本机 release):price 形态(8bit 宽)zstd(plain) ~0.8 GB/s → bitpacked **5.4~6.7 GB/s**(端到端含位图/物化,**7~13×**);volume 形态(13bit 宽)**5.7 GB/s**(5~7×)。写入端 encode 为 O(n) 双遍扫描,zstd 压缩仍主导 choose 阶段。
+
+**解包核窗口化**:宽度 ≤16 每 4 值、17~32 每 2 值、33~56 每 1 值共用一个 64 位漏斗移位窗口(两次非对齐 u64 加载),消除逐值补位分支与边界检查;尾部回退字节补位循环。全宽度(1..=56)×多长度随机回环 fuzz 钉死。volume 形态解包 ~1.4ms/M 值。
+
+**Q5/Q7 端到端复测**(真实 10M 行 × 34 列,新数据目录导入 + OPTIMIZE,query_bench 稳态 server_elapsed):
+
+| 查询 | 基线(v6) | 本轮 | 变化 | 落盘编码(TRACE 确证) |
+|---|---|---|---|---|
+| Q7 全表 count+sum(trans_volume) | 26 ms | **5.3~5.9 ms** | **~4.5×** | trans_volume=BitPacked(615/615 RG) |
+| Q5 全表 GROUP BY security_id + avg(close_px) | 111 ms | ~118 ms(持平) | — | security_id=Dictionary,close_px=Rle |
+| Q4 单日 2M GROUP BY | ~25 ms | ~24 ms | 持平 | 同 Q5 |
+| Q1 点查 | ~3.9 ms(wall) | ~3.5 ms(wall) | 持平 | 热存/剪枝路径,不受影响 |
+
+Q5 持平的原因:其解码大头 close_px 在该数据上以 RLE 形态取胜(块内重复价格 run 长),RLE payload 经三候选(verbatim / zstd(RLE) / zstd(plain) 取最小)仍以 zstd(RLE) 最小,解码仍付 zstd 解压——这是 Q5 剩余差距的主刀(候选:更紧凑的 RLE 变体 verbatim 化)。注意:`TAIBAI_ENC_TRACE=1` 本身每列每 RG 一条 stderr,会给查询加 ~18ms,测量时勿开。
+
+**教训记录**:RLE 直接进 specialized 会让 verbatim-RLE 对上 zstd(plain) 而丢失更优的 zstd(RLE) 叠层(实测 close_px 退化为 zstd(plain));三候选按严格尺寸取最小修复。全量测试 27 目标 612+ 用例通过(含新增 12 个 codec 测试)。
+
+### 10.6 分组列字典直通 + 单体化聚合核(v8,2026-09-14)
+
+§10.5 复测后 Q5 仍持平在 ~118ms。DBGAGGP 探针(§fdd08af)拆解:wait_ms 仅 8~16(解码已不是瓶颈),**agg_ms 106~116——瓶颈在聚合行循环本身**(有效 ~10.5ns/行,是 count+sum 形态的 ~25 倍)。定位出三个叠加原因并修复:
+
+| 修复 | 内容 |
+|---|---|
+| DeltaRle 编码(tag 7) | RLE 的 run 值改 `varint(zigzag(delta))`、run 长度改 varint,2~4B/run(最差 15B,plain RLE 12B 仍在候选);真实数据上 close_px 由 Rle 转为 **DeltaRle(610/615 RG)** 落盘 |
+| Dictionary 直通聚合 | 段扫描的 `decode_column(..., allow_dictionary=false)` 把字典列全部展开回字符串,分组走逐行字符串哈希。PlainRead 无谓词分支与 PredicateFirstRead 全匹配投影读取放行 `(ids, dict)` 直通;带谓词时仍先物化(`apply_predicates` 已有该回退),ClusterKeyRangeRead 二分路径保持展开 |
+| 单体化聚合快循环 | `FastGroups::update_row_range` 增加字典键 + 无空值 i64 Count/Sum/Avg 的紧循环(TypedAcc 每 range 分类一次,循环内无逐行位图探测/两级 enum match),其余形态走原解释器 |
+| 后台解码专用线程池 | 背景解码的 32-RG 块任务原与聚合 lane 抢全局 rayon 池,实测让 agg 膨胀 ~30ms;改为 `taibai-bg-decode-*` 专用池(全局一半线程,2~8)。`TAIBAI_INLINE_DECODE=1` 作为强制内联的运维开关保留 |
+
+**结果**(同一 10M 行数据集,query_bench 稳态 server_elapsed;DBGAGGP: typed=4885/4920,miss=0):
+
+| 查询 | §10.5 | 本轮 | DuckDB | 剩余差距 |
+|---|---|---|---|---|
+| Q5 全表 GROUP BY | ~118 ms | **~73-80 ms** | 11.0 ms | ~7× |
+| Q4 单日 2M GROUP BY | ~24 ms | **~20 ms** | 7.2 ms | ~2.7× |
+| Q6 单日过滤聚合 | ~12 ms | **~9 ms** | 0.72 ms | ~12× |
+| Q7 全表 count+sum | ~6 ms | ~6-7 ms(噪声区间 5.3~7.5) | 0.97 ms | ~6-7× |
+| Q1/Q2/Q3 | 不变 | 不变(taibai 领先) | — | — |
+
+累计轨迹:Q5 836→**~75ms(11×)**、Q7 110→**~6ms(18×)**、Q4 219→**20ms(11×)**。全量测试 40 目标 734 用例通过。
+
+**下一轮依据**:Q5 剩余 73ms 中 wait~15 + agg~57;agg 内行循环已 ~20ms,其余为每批次 8 lane 的 rayon 调度与每批内存记账固定开销(615 批 × ~80µs);Q6 的 close_px 过滤扫描仍需读全列(延迟物化/谓词下推是方向);带宽上 BitPacked/DeltaRle 解码均已进入 5~7 GB/s 区间。
+
+### 10.7 聚合每批固定开销清除(v9,2026-09-14 同日)
+
+细分计时(join/accounting/setup)把 §10.6 后 Q5 剩余 agg ~53ms 拆成:**rayon 每批 8 任务调度 ~25ms + 每批内存记账 ~10ms + 行循环 ~20ms**。两处修复:
+
+1. `FastGroups::estimated_bytes` 增量化:组创建/合并时维护 `cached_bytes`,每批 O(组数) 的全量遍历变 O(1)(fast 形态的 accumulator 定长,合并不改尺寸,追加组精确计入);
+2. typed 快循环形态(字典键 + 无空值 i64 Count/Sum/Avg,~2ns/行)在批 <65536 行时**单 lane 串行内联执行**,免 8 任务 rayon 调度;通用形态与大批保持多 lane。
+
+**结果**(稳态 server_elapsed):
+
+| 查询 | §10.6 | 本轮 | DuckDB | 剩余差距 |
+|---|---|---|---|---|
+| Q5 全表 GROUP BY | ~73-80 ms | **~43-45 ms** | 11.0 ms | ~4× |
+| Q4 单日 2M GROUP BY | ~20 ms | **~11-15 ms** | 7.2 ms | **~1.7×** |
+| Q6 单日过滤聚合 | ~9 ms | ~7-9 ms | 0.72 ms | ~11× |
+| Q7 全表 count+sum | ~6 ms | ~5.3-6.3 ms | 0.97 ms | ~6× |
+| Q1/Q2/Q3 | 不变 | 不变(taibai 领先) | — | — |
+
+DBGAGGP:typed=615(每批 1 range 串行)、acct_ms 10→0、join_ms 即行循环本身。累计:Q5 836→44ms(**19×**)、Q4 219→13ms(**17×**)、Q7 110→5.5ms(**20×**)。全量测试 40 目标 734 用例通过。
+
+**下一轮依据**:Q5 的 44ms = wait ~15(解码管线,已接近带极限)+ agg ~28(行循环 ~20 + 输出/编码 ~8);进一步空间在流式聚合消费(每批即算即弃,免窗口)与输出编码;Q6 的 11× 集中在 close_px 过滤需全列物化(谓词下推到 DeltaRle 解码层可免展开);Q7 的 ~6ms 中 sum+count 循环 ~2ms、其余为管线固定开销,段级部分和元数据直答(待修的双重计数问题)仍是亚毫秒点杀方案。
+
+### 10.8 段级部分和元数据直答(v10,2026-09-14 同日)——Q7 反超 DuckDB
+
+修复 e98df83/2f99cee 遗留的三个互锁 bug 并路由放行 Sum:
+
+1. **双重折叠**:cache-miss 时 All-match 行组走 `fold_metadata` 快捷路径(无法产出 SUM),随后把 0 差值写入缓存 → sum 永久为 0。修复:流式段(`streaming_sum`)所有候选行组一律 `fold_batch` 从数据折叠,与缓存路径互斥;
+2. **缓存 zip 错位**:store 侧把"全部累加器"的差值与"仅 SUM 列"的缓存键 zip,COUNT 的空差值占据了 SUM 的缓存槽 → 命中后 sum=0。修复:deltas 过滤仅 SUM 累加器;
+3. **谓词下的流式判定**:`streaming_sum` 原含 `!has_predicates()`,带谓词的 sum(如按日 sum)全部走元数据捷径返回 0。修复:只要 has_sum 且缓存未命中即流式(All-match 跳过谓词掩码本身语义等价)。另:Decimal/Date/Time/Timestamp 的 SUM 结果类型与元数据路径输出不符,路由层按参数类型校验,非数值列不入路由(正常管线承接)。
+
+流式冷路径(建缓存)行组读取并行化(32 RG/块 rayon + 有序折叠)。路由清理:遗留 `DBGMETA` 调试输出移除。
+
+**结果**:Q7 首查(冷,建缓存)~210-250ms;此后每查 **~0.2-0.4ms**(count=10,000,000 ✓,sum=500,469,922,339 ✓,五个分片谓词路径求和与全表精确一致)——**反超 DuckDB 0.97ms(~3-4×)**,达成路线图"亚毫秒点杀"目标。重启后首查为冷路径,与改前冷缓存成本同量级。Q5 ~47ms、Q4 ~13-15ms 维持。全量测试 40 目标 734 用例通过。
+
+**当前全景**(vs DuckDB):Q1/Q2/Q3/Q7 领先或反超;Q4 ~1.7×;Q5 ~4×;Q6 ~10×。累计:Q5 19×、Q7 ~150×(5.5ms→0.3ms 服务稳态,若含元数据路径)。
 
 ## 附:复现命令
 

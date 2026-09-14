@@ -409,7 +409,19 @@ pub fn read_plain_row_group(
     reader: &SegmentReader,
     rg_idx: usize,
 ) -> Result<RecordBatch> {
-    let mut batch = read_projected_row_group(projection_cols, table_schema, reader, rg_idx)?;
+    // Dictionary passthrough: when nothing downstream needs per-row strings,
+    // dictionary-encoded columns stay as (ids, dict) so the grouped
+    // aggregate's fast path consumes u32 ids directly. Predicates materialize
+    // dictionary columns before typed evaluation, and delete-bitmap gathers
+    // need plain columns, so both cases keep the expanded form.
+    let allow_dictionary = !spec.has_predicates() && reader.delete_bitmap().is_empty();
+    let mut batch = read_projected_row_group_allow_dictionary(
+        projection_cols,
+        table_schema,
+        reader,
+        rg_idx,
+        allow_dictionary,
+    )?;
 
     if !reader.delete_bitmap().is_empty() {
         let rg_start_row: u64 = reader
@@ -448,6 +460,22 @@ pub fn read_projected_row_group(
     reader: &SegmentReader,
     rg_idx: usize,
 ) -> Result<RecordBatch> {
+    read_projected_row_group_allow_dictionary(
+        projection_cols,
+        table_schema,
+        reader,
+        rg_idx,
+        false,
+    )
+}
+
+pub fn read_projected_row_group_allow_dictionary(
+    projection_cols: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+    allow_dictionary: bool,
+) -> Result<RecordBatch> {
     if projection_cols.is_empty() {
         if reader_schema_differs(reader.schema(), table_schema) {
             let all_cols: Vec<usize> = (0..table_schema.num_columns()).collect();
@@ -457,7 +485,11 @@ pub fn read_projected_row_group(
     }
 
     if !reader_schema_differs(reader.schema(), table_schema) {
-        return reader.read_row_group_with_projection(rg_idx, projection_cols);
+        return reader.read_row_group_with_projection_and_dictionary(
+            rg_idx,
+            projection_cols,
+            allow_dictionary,
+        );
     }
 
     read_row_group_with_schema_mapping(projection_cols, table_schema, reader, rg_idx)

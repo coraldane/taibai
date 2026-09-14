@@ -15,6 +15,22 @@ use super::memtable;
 use super::partition;
 use super::row_group::RowGroupPruneResult;
 use super::runtime::ScanRuntime;
+
+/// Dedicated pool for the background decoder: its multi-millisecond chunk
+/// tasks must not queue the query thread's per-batch lane work (aggregate
+/// lanes, parallel scans) behind them on the global pool. Half the global
+/// threads, clamped so tiny deployments still get overlap.
+fn background_decode_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = (rayon::current_num_threads() / 2).clamp(2, 8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|idx| format!("taibai-bg-decode-{idx}"))
+            .build()
+            .expect("background decode thread pool")
+    })
+}
 use super::spec::{InPredicate, ScanSpec};
 use super::strategy::{self, ScanPlan};
 
@@ -264,6 +280,11 @@ impl ScanCursor {
     /// that the channel serves the scan. Returns false when the scan should
     /// stay on the inline sequential walk.
     fn try_spawn_background_decoder(&mut self) -> Result<bool> {
+        // Operational escape hatch: force inline decoding to isolate
+        // background-decode contention from consumer-side costs.
+        if std::env::var("TAIBAI_INLINE_DECODE").as_deref() == Ok("1") {
+            return Ok(false);
+        }
         let total_candidates: usize = self
             .segments
             .iter()
@@ -342,22 +363,27 @@ impl ScanCursor {
                     // Decode in parallel chunks (bounded by the global
                     // cpu/io permits); send in candidate order so the
                     // consumer sees the same sequence as the inline walk.
+                    // The dedicated pool keeps these chunk tasks from
+                    // queueing the consumer's per-batch lane work behind
+                    // multi-millisecond decode tasks on the global pool.
                     for chunk in candidates.chunks(32) {
-                        let decoded: Vec<_> = chunk
-                            .par_iter()
-                            .filter_map(|row_group| {
-                                let _cpu = crate::common::work_limiter::acquire_cpu();
-                                let _io = crate::common::work_limiter::acquire_io();
-                                strategy::read_row_group_with_strategy(
-                                    &spec,
-                                    &plan,
-                                    &table_schema,
-                                    &reader,
-                                    *row_group,
-                                )
-                                .ok()
-                            })
-                            .collect();
+                        let decoded: Vec<_> = background_decode_pool().install(|| {
+                            chunk
+                                .par_iter()
+                                .filter_map(|row_group| {
+                                    let _cpu = crate::common::work_limiter::acquire_cpu();
+                                    let _io = crate::common::work_limiter::acquire_io();
+                                    strategy::read_row_group_with_strategy(
+                                        &spec,
+                                        &plan,
+                                        &table_schema,
+                                        &reader,
+                                        *row_group,
+                                    )
+                                    .ok()
+                                })
+                                .collect()
+                        });
                         for batch in decoded {
                             if tx.send(Ok(batch)).is_err() {
                                 // Consumer went away (LIMIT early exit / drop).

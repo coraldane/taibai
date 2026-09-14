@@ -488,7 +488,16 @@ pub fn start_close_of_day_scheduler(engine: Arc<Engine>) -> std::thread::JoinHan
                 }
 
                 for (db, table, close_time, last_close_date) in hot_tables {
-                    let Some((target_h, target_m)) = parse_hh_mm(&close_time).or(Some((15, 30))) else {
+                    // CLOSE AT is validated at DDL time; an unparseable value
+                    // here means corrupt or legacy catalog state — skip the
+                    // table rather than guessing a default firing time.
+                    let Some((target_h, target_m)) = parse_hh_mm(&close_time) else {
+                        tracing::warn!(
+                            db,
+                            table,
+                            close_time,
+                            "close-of-day scheduler: unparseable HOT CLOSE AT, skipping table"
+                        );
                         continue;
                     };
                     let key = (db.clone(), table.clone(), today);
