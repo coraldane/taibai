@@ -323,7 +323,7 @@ fn boolean_combine(
 /// `Column op Literal` mask via the literal kernels. Mirrors the semantics of
 /// `eval_column_literal_comparison` in the filter operator, including Neq
 /// treating non-matching NULL rows as excluded.
-fn column_literal_mask(
+pub(crate) fn column_literal_mask(
     column: &ColumnArray,
     op: BinOp,
     literal: &ScalarValue,

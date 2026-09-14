@@ -6,29 +6,51 @@ use crate::types::array::ColumnArray;
 /// Expand dictionary columns into plain varchars before typed predicate
 /// evaluation. Recursion terminates: the materialized batch has no
 /// dictionary columns.
-fn materialize_dictionary_columns(
+/// Column indices referenced by the scalar predicates (batch-local). The
+/// remaining predicate is excluded: its evaluation kernels flatten dictionary
+/// columns on demand.
+fn predicate_dictionary_targets(
+    eq_predicates: &[(usize, ScalarValue)],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
+    in_predicates: &[InPredicate],
+) -> std::collections::HashSet<usize> {
+    let mut set = std::collections::HashSet::new();
+    for (idx, _) in eq_predicates {
+        set.insert(*idx);
+    }
+    for clause in range_predicates {
+        set.insert(clause.column_index);
+    }
+    for pred in in_predicates {
+        set.insert(pred.column_index);
+    }
+    set
+}
+
+/// Materialize only the dictionary columns the predicates actually touch;
+/// untouched dictionary columns stay encoded (read kernels flatten lazily).
+fn materialize_predicate_dictionaries(
     batch: &RecordBatch,
+    eq_predicates: &[(usize, ScalarValue)],
+    range_predicates: &[crate::storage::partition::pruning::RangeClause],
+    in_predicates: &[InPredicate],
 ) -> crate::common::error::Result<RecordBatch> {
-    if batch
+    let targets = predicate_dictionary_targets(eq_predicates, range_predicates, in_predicates);
+    let columns: crate::common::error::Result<Vec<ColumnArray>> = batch
         .columns
         .iter()
-        .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
-    {
-        let columns: crate::common::error::Result<Vec<ColumnArray>> = batch
-            .columns
-            .iter()
-            .map(|c| {
-                if matches!(c, ColumnArray::Dictionary { .. }) {
-                    Ok(c.materialize_varchar())
-                } else {
-                    Ok(c.clone())
-                }
-            })
-            .collect();
-        return RecordBatch::try_new(batch.schema.clone(), columns?);
-    }
-    Ok(batch.clone())
+        .enumerate()
+        .map(|(idx, c)| {
+            if targets.contains(&idx) && matches!(c, ColumnArray::Dictionary { .. }) {
+                Ok(c.materialize_varchar())
+            } else {
+                Ok(c.clone())
+            }
+        })
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns?)
 }
+
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
@@ -91,7 +113,7 @@ pub fn apply_predicates(
         .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
     {
         return apply_predicates(
-            &materialize_dictionary_columns(batch)?,
+            &materialize_predicate_dictionaries(batch, eq_predicates, range_predicates, in_predicates)?,
             eq_predicates,
             range_predicates,
             in_predicates,
@@ -151,7 +173,7 @@ pub fn apply_predicates_with_column_map(
         .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
     {
         return apply_predicates_with_column_map(
-            &materialize_dictionary_columns(batch)?,
+            &materialize_predicate_dictionaries(batch, eq_predicates, range_predicates, in_predicates)?,
             source_columns,
             eq_predicates,
             range_predicates,

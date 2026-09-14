@@ -50,6 +50,23 @@ const DEFAULT_CHUNK_ROWS: usize = 65_536;
 
 use crate::common::fast_hash::{FastBuild, FastHasher};
 
+/// Watermark cut for one chunk: how many of its appended rows fall below the
+/// scan's `min_offset` watermark and are therefore no longer resident.
+#[inline]
+fn watermark_cut(min_offset: u64, base: u64) -> u32 {
+    if min_offset > base {
+        (min_offset - base).min(u32::MAX as u64) as u32
+    } else {
+        0
+    }
+}
+
+/// The postings at or above the watermark cut (rows still held in memory).
+#[inline]
+fn resident_postings<'a>(postings: &'a [u32], cut: u32) -> &'a [u32] {
+    &postings[postings.partition_point(|&o| o < cut)..]
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ResidentCoverageSnapshot {
     fully_resident: bool,
@@ -1139,12 +1156,8 @@ impl HotStore {
                     let Some(postings) = postings else {
                         return (false, false, None);
                     };
-                    let cut = if min_offset > base {
-                        ((min_offset - base).min(u32::MAX as u64)) as u32
-                    } else {
-                        0
-                    };
-                    let slice = &postings[postings.partition_point(|&o| o < cut)..];
+                    let cut = watermark_cut(min_offset, base);
+                    let slice = resident_postings(postings, cut);
                     if slice.is_empty() {
                         return (true, false, None);
                     }
@@ -1245,13 +1258,8 @@ impl HotStore {
                 continue;
             };
             seen = true;
-            let cut = if min_offset > base {
-                ((min_offset - base).min(u32::MAX as u64)) as u32
-            } else {
-                0
-            };
-            let start = postings.partition_point(|&o| o < cut);
-            let slice = &postings[start..];
+            let cut = watermark_cut(min_offset, base);
+            let slice = resident_postings(postings, cut);
             if slice.is_empty() {
                 continue;
             }
@@ -1499,12 +1507,8 @@ impl HotStore {
                 continue;
             };
             seen = true;
-            let cut = if min_offset > base {
-                ((min_offset - base).min(u32::MAX as u64)) as u32
-            } else {
-                0
-            };
-            total += (postings.len() - postings.partition_point(|&o| o < cut)) as u64;
+            let cut = watermark_cut(min_offset, base);
+            total += resident_postings(postings, cut).len() as u64;
         }
         if !seen && skipped && !self.key_exists_anywhere(&st, &key, partition_key.as_ref()) {
             return None;
@@ -1542,11 +1546,7 @@ impl HotStore {
                 continue;
             };
             seen = true;
-            let cut = if min_offset > base {
-                ((min_offset - base).min(u32::MAX as u64)) as u32
-            } else {
-                0
-            };
+            let cut = watermark_cut(min_offset, base);
             let start = postings.partition_point(|&o| o < cut);
             if start >= postings.len() {
                 continue;
@@ -1784,12 +1784,8 @@ fn estimate_candidates(
             None => chunk.key_postings(key),
         };
         if let Some(postings) = postings {
-            let cut = if min_offset > base {
-                ((min_offset - base).min(u32::MAX as u64)) as u32
-            } else {
-                0
-            };
-            total += (postings.len() - postings.partition_point(|&o| o < cut)) as u64;
+            let cut = watermark_cut(min_offset, base);
+            total += resident_postings(postings, cut).len() as u64;
             if total >= PARALLEL_GATHER_MIN_ROWS {
                 break;
             }

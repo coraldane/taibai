@@ -83,7 +83,19 @@ impl SegmentManager {
             flush_paused,
             next_txn_id: AtomicU64::new(1),
             config,
+            pubsub: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wire the pub/sub hub once at engine startup. Deferred bulk/RELAXED
+    /// writes publish their change notifications when the segment footer
+    /// makes their rows visible.
+    pub fn set_pubsub(&self, hub: std::sync::Arc<crate::pubsub::PubSubHub>) {
+        let _ = self.pubsub.set(hub);
+    }
+
+    fn pubsub(&self) -> Option<std::sync::Arc<crate::pubsub::PubSubHub>> {
+        self.pubsub.get().cloned()
     }
 
     fn min_segment_seal_size(&self) -> u64 {

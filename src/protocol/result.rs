@@ -81,7 +81,10 @@ pub fn encode_binary_result_batches(schema: &Schema, batches: &[RecordBatch]) ->
     buf
 }
 
-fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
+/// Append one column's little-endian data bytes (variable-width values are
+/// u32-length-prefixed). Shared with the bulk-import wire encoder, which
+/// wraps it with its own null-bitmap section.
+pub(crate) fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
     macro_rules! append_fixed {
         ($data:expr) => {{
             if $data.is_empty() {

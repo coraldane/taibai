@@ -105,6 +105,10 @@ pub struct SegmentManager {
     flush_paused: Arc<AtomicBool>,
     next_txn_id: AtomicU64,
     config: SegmentConfig,
+    /// Hub for deferred-write change notifications. Set once at engine
+    /// startup after construction; `None` (unset) keeps the write path free
+    /// of pub/sub work.
+    pubsub: std::sync::OnceLock<std::sync::Arc<crate::pubsub::PubSubHub>>,
 }
 
 include!("segment_manager/manager_core.rs");

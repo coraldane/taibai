@@ -40,6 +40,12 @@ pub(super) struct ActiveSegmentWriter {
     pub(super) sidecar_row_groups_flushed: usize,
     pub(super) last_write_at: Instant,
     pub(super) row_group_target_rows: usize,
+    /// Change-feed handle for deferred bulk/RELAXED writes; `None` for
+    /// standalone/temporary writers that never feed notifications.
+    pub(super) pubsub: Option<std::sync::Arc<crate::pubsub::PubSubHub>>,
+    /// Row groups persisted to the data file but not yet visible (their
+    /// footer has not been written). Published when the footer lands.
+    pub(super) pending_publish: Vec<RecordBatch>,
 }
 
 impl ActiveSegmentWriter {
@@ -273,6 +279,32 @@ impl ActiveSegmentWriter {
         self.data_end = self.current_size;
         self.last_write_at = Instant::now();
 
+        // Rows persisted but not yet visible: stash them until the footer
+        // write makes them visible (see `publish_pending`).
+        if rows_to_flush > 0 {
+            if let Some(pubsub) = self.pubsub.as_ref() {
+                if pubsub.has_subscribers() && self.topic().is_some() {
+                    let indices: Vec<u32> = (0..rows_to_flush as u32).collect();
+                    let mut cols = Vec::with_capacity(num_cols);
+                    let mut ok = true;
+                    for col_idx in 0..num_cols {
+                        match buffered.column(col_idx) {
+                            Some(col) => cols.push(col.take(&indices)),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        if let Ok(batch) = RecordBatch::try_new(buffered.schema.clone(), cols) {
+                            self.pending_publish.push(batch);
+                        }
+                    }
+                }
+            }
+        }
+
         if FLUSH_META_AFTER_ROW_GROUP {
             self.flush_meta(invalidate_reader)?;
         }
@@ -355,6 +387,7 @@ impl ActiveSegmentWriter {
             "segment meta flushed"
         );
 
+        self.publish_pending();
         Ok(())
     }
 
@@ -421,6 +454,32 @@ impl ActiveSegmentWriter {
             &table_name,
             &segment_zone_maps,
         ))
+    }
+
+    /// `(db, table)` derived from the table directory this segment lives in.
+    fn topic(&self) -> Option<(String, String)> {
+        let table_dir = self.path.parent()?;
+        let db_dir = table_dir.parent()?;
+        Some((
+            db_dir.file_name()?.to_string_lossy().into_owned(),
+            table_dir.file_name()?.to_string_lossy().into_owned(),
+        ))
+    }
+
+    /// The footer above just made every pending row group visible: hand each
+    /// of them to the change feed as one delta notification.
+    fn publish_pending(&mut self) {
+        if self.pending_publish.is_empty() {
+            return;
+        }
+        match (self.pubsub.as_ref(), self.topic()) {
+            (Some(pubsub), Some((db, table))) => {
+                for batch in self.pending_publish.drain(..) {
+                    pubsub.publish_shared(&db, &table, std::sync::Arc::new(batch));
+                }
+            }
+            _ => self.pending_publish.clear(),
+        }
     }
 
     fn table_name(&self) -> String {

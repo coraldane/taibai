@@ -470,8 +470,15 @@ impl BatchWriter {
                     if memtable.row_count() == 0 {
                         continue;
                     }
-                    if let Some(snapshot) = memtable.read_snapshot_arc() {
-                        pubsub.publish_shared(memtable.db(), memtable.table(), snapshot);
+                    match memtable.read_snapshot_arc() {
+                        Some(snapshot) => {
+                            pubsub.publish_shared(memtable.db(), memtable.table(), snapshot)
+                        }
+                        None => tracing::warn!(
+                            db = %memtable.db(),
+                            table = %memtable.table(),
+                            "committed memtable snapshot unavailable; change notification skipped"
+                        ),
                     }
                 }
             }

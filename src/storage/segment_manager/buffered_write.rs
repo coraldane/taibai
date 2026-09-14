@@ -367,6 +367,8 @@ impl SegmentManager {
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
             row_group_target_rows: self.config.row_group_target_rows.max(1),
+            pubsub: self.pubsub(),
+            pending_publish: Vec::new(),
         })
     }
 
@@ -398,6 +400,8 @@ impl SegmentManager {
             buffered_rows: 0,
             dirty_meta: false,
             data_end: SEGMENT_HEADER_SIZE as u64,
+            pubsub: None,
+            pending_publish: Vec::new(),
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
             row_group_target_rows: self.config.row_group_target_rows.max(1),
@@ -542,6 +546,8 @@ impl SegmentManager {
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
             row_group_target_rows: self.config.row_group_target_rows.max(1),
+            pubsub: self.pubsub(),
+            pending_publish: Vec::new(),
         }))
     }
 }

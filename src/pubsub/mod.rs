@@ -194,8 +194,21 @@ pub struct PubSubHub {
 
 impl PubSubHub {
     pub fn new(settings: PubSubSettings) -> Arc<Self> {
+        let mut settings = settings;
+        let raw_capacity = settings.event_channel_capacity;
+        if !(1..=1_048_576).contains(&raw_capacity) {
+            tracing::warn!(
+                configured = raw_capacity,
+                "pubsub.event_channel_capacity out of range; clamping to [1, 1048576]"
+            );
+            settings.event_channel_capacity = raw_capacity.clamp(1, 1_048_576);
+        }
+        if settings.max_subscriptions == 0 {
+            tracing::warn!("pubsub.max_subscriptions is 0; enforcing a minimum of 1");
+            settings.max_subscriptions = 1;
+        }
         let (event_tx, event_rx) =
-            crossbeam_channel::bounded(settings.event_channel_capacity.clamp(1, 1_048_576));
+            crossbeam_channel::bounded(settings.event_channel_capacity);
         let fanout = Arc::new(FanoutState {
             subs: RwLock::new(Vec::new()),
             subscriber_count: AtomicU64::new(0),
@@ -314,6 +327,14 @@ impl PubSubHub {
             return Err(format!(
                 "subscription limit reached ({})",
                 self.settings.max_subscriptions
+            ));
+        }
+        if pattern.tokens.len() < 2 && pattern.as_str() != ">" {
+            // A single-token pattern never matches (matching compares two
+            // tokens); the protocol layer expands bare table names before
+            // reaching here.
+            return Err(format!(
+                "subscription topic '{topic}' cannot match any change; use 'db.table', 'db.*' or '>'"
             ));
         }
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);

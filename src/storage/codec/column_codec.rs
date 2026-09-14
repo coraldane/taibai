@@ -1647,6 +1647,16 @@ where
         value_offset = end;
     }
 
+    if out.len() != selected_rows.len() {
+        // selected_rows must be ascending and in bounds (callers guarantee
+        // it); falling short means the invariant broke and out would not
+        // line up with out_bitmap — fail loudly instead of silently
+        // returning a shorter column.
+        return Err(TaibaiError::Storage(
+            "selected decode did not cover every selected row".into(),
+        ));
+    }
+
     Ok(build(out, out_bitmap))
 }
 

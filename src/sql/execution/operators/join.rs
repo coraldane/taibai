@@ -1239,9 +1239,6 @@ impl HashJoinExec {
             .collect()
     }
 
-    fn collect_build_row_inner(&self, ht: &JoinHashTable, ptr: &RowPointer) -> Vec<ScalarValue> {
-        self.collect_build_row(ht, ptr)
-    }
 
     fn make_null_right_row(&self) -> Vec<ScalarValue> {
         self.right_schema
@@ -1283,7 +1280,7 @@ impl HashJoinExec {
         for ptr in &unmatched {
             let right_row = {
                 let ht = self.hash_table.as_ref().unwrap();
-                self.collect_build_row_inner(ht, ptr)
+                self.collect_build_row(ht, ptr)
             };
             self.probe_state
                 .output_buffer

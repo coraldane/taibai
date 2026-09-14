@@ -155,20 +155,12 @@ pub fn exec_update(
                 }
                 let mut new_columns = Vec::with_capacity(batch.num_columns());
                 for (col_idx, column) in batch.columns.iter().enumerate() {
-                    match assigned.get(&col_idx) {
-                        None => new_columns.push(column.take(&kept)),
-                        Some(value) => {
-                            let mut out = ColumnArray::empty(column.data_type());
-                            for (kept_idx, &src_row) in kept.iter().enumerate() {
-                                if kept_matched[kept_idx] {
-                                    out.push(value)?;
-                                } else {
-                                    out.push(&column.scalar(src_row as usize))?;
-                                }
-                            }
-                            new_columns.push(out);
-                        }
-                    }
+                    new_columns.push(rebuild_update_column(
+                        column,
+                        assigned.get(&col_idx),
+                        &kept,
+                        &kept_matched,
+                    )?);
                 }
                 let new_batch = RecordBatch::try_new(batch.schema.clone(), new_columns)?;
                 updated_count += kept_matched.iter().filter(|m| **m).count() as u64;
@@ -379,28 +371,44 @@ fn update_memtable_batch(
     let all_rows: Vec<u32> = (0..batch.num_rows() as u32).collect();
     let mut new_columns = Vec::with_capacity(batch.num_columns());
     for (col_idx, column) in batch.columns.iter().enumerate() {
-        match assigned.get(&col_idx) {
-            // Untouched columns: one bulk gather instead of a per-cell
-            // ScalarValue round-trip.
-            None => new_columns.push(column.take(&all_rows)),
-            Some(value) => {
-                let mut out = ColumnArray::empty(column.data_type());
-                for (row_idx, matches) in mask.iter().enumerate() {
-                    if *matches {
-                        out.push(value)?;
-                    } else {
-                        out.push(&column.scalar(row_idx))?;
-                    }
-                }
-                new_columns.push(out);
-            }
-        }
+        new_columns.push(rebuild_update_column(
+            column,
+            assigned.get(&col_idx),
+            &all_rows,
+            &mask,
+        )?);
     }
     let affected = mask.iter().filter(|matches| **matches).count() as u64;
     Ok((
         Some(RecordBatch::try_new(batch.schema.clone(), new_columns)?),
         affected,
     ))
+}
+
+/// Rebuild one column for the surviving rows of an UPDATE: untouched rows
+/// keep their value, matched survivors receive the (constant) assigned value.
+fn rebuild_update_column(
+    column: &ColumnArray,
+    assigned: Option<&ScalarValue>,
+    kept: &[u32],
+    kept_matched: &[bool],
+) -> Result<ColumnArray> {
+    match assigned {
+        // Untouched columns: one bulk gather instead of a per-cell
+        // ScalarValue round-trip.
+        None => Ok(column.take(kept)),
+        Some(value) => {
+            let mut out = ColumnArray::empty(column.data_type());
+            for (kept_idx, &src_row) in kept.iter().enumerate() {
+                if kept_matched[kept_idx] {
+                    out.push(value)?;
+                } else {
+                    out.push(&column.scalar(src_row as usize))?;
+                }
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// Assignment expressions are constant per statement (they are evaluated

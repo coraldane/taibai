@@ -46,121 +46,16 @@ pub fn encode_columnar_bulk_insert(table_name: &str, batch: &RecordBatch) -> Res
     Ok(Bytes::from(buf))
 }
 
+/// Bulk wire layout: column data bytes first (same little-endian /
+/// length-prefixed layout as the result encoder), then the null bitmap.
 fn encode_column_data(col: &ColumnArray) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut data = Vec::new();
-    let mut nulls = Vec::new();
-    let _row_count = col.len();
-
-    let null_bitmap = col.bitmap();
-    if !null_bitmap.is_all_valid() {
-        nulls = null_bitmap.to_bytes();
-    }
-
-    match col {
-        ColumnArray::Selected { .. } => return encode_column_data(col.flattened()),
-        ColumnArray::Dictionary { .. } => return encode_column_data(&col.materialize_varchar()),
-        ColumnArray::Bool { data: vals, .. } => {
-            for v in vals {
-                data.push(*v);
-            }
-        }
-        ColumnArray::Int8 { data: vals, .. } => {
-            for v in vals {
-                data.push(*v as u8);
-            }
-        }
-        ColumnArray::Int16 { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Int32 { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Int64 { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::UInt8 { data: vals, .. } => {
-            for v in vals {
-                data.push(*v);
-            }
-        }
-        ColumnArray::UInt16 { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::UInt32 { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::UInt64 { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Float32 { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Float64 { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Decimal { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Date { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Time { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Timestamp { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::Interval { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        ColumnArray::VarChar { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                data.extend_from_slice(v.as_bytes());
-            }
-        }
-        ColumnArray::Blob { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                data.extend_from_slice(v);
-            }
-        }
-        ColumnArray::Vector { data: vals, .. } => {
-            for v in vals {
-                data.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                for f in v {
-                    data.extend_from_slice(&f.to_le_bytes());
-                }
-            }
-        }
-    }
-
+    crate::protocol::result::append_column_data(col, &mut data);
+    let nulls = if col.bitmap().is_all_valid() {
+        Vec::new()
+    } else {
+        col.bitmap().to_bytes()
+    };
     Ok((data, nulls))
 }
 

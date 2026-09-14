@@ -285,33 +285,45 @@ impl ScanCursor {
         if std::env::var("TAIBAI_INLINE_DECODE").as_deref() == Ok("1") {
             return Ok(false);
         }
-        let total_candidates: usize = self
+        let pred = self.spec.to_row_group_predicate();
+        let bloom_checks = super::row_group::build_bloom_check_list(&self.spec);
+        let in_checks = super::row_group::build_in_check_list(&self.spec);
+        let set_checks = super::row_group::build_set_check_list(&self.spec);
+        let set_in_checks = super::row_group::build_set_in_check_list(&self.spec);
+        // Prune once here and hand the candidate lists to the decode thread,
+        // which would otherwise repeat the same metadata pruning per segment.
+        // `None` entries (metadata unavailable at spawn time) fall back to
+        // reader-based pruning inside the thread.
+        let per_segment_candidates: Vec<Option<Vec<usize>>> = self
             .segments
             .iter()
-            .filter_map(|segment| {
+            .map(|segment| {
                 let meta = self
                     .runtime
                     .segment_mgr()
                     .segment_meta(segment)
                     .ok()
                     .flatten()?;
-                let pred = self.spec.to_row_group_predicate();
                 if !super::row_group::prune_segment_by_zone_map(&pred, &meta.segment_zone_maps) {
-                    return Some(0usize);
+                    return Some(Vec::new());
                 }
                 Some(
                     super::row_group::prune_row_group_meta(
                         &meta.row_groups,
                         &pred,
-                        &super::row_group::build_bloom_check_list(&self.spec),
-                        &super::row_group::build_in_check_list(&self.spec),
-                        &super::row_group::build_set_check_list(&self.spec),
-                        &super::row_group::build_set_in_check_list(&self.spec),
+                        &bloom_checks,
+                        &in_checks,
+                        &set_checks,
+                        &set_in_checks,
                     )
-                    .candidate_indices
-                    .len(),
+                    .candidate_indices,
                 )
             })
+            .collect();
+        let total_candidates: usize = per_segment_candidates
+            .iter()
+            .flatten()
+            .map(|candidates| candidates.len())
             .sum();
         if total_candidates < BACKGROUND_DECODE_MIN_GROUPS {
             return Ok(false);
@@ -319,6 +331,13 @@ impl ScanCursor {
 
         let (tx, rx) = crossbeam_channel::bounded(DECODE_CHANNEL_CAPACITY);
         let spec = self.spec.clone();
+        // Small LIMIT queries waste decode work on 32-group chunks (the
+        // channel buffers batches far past the consumer's early exit);
+        // shrink the decode chunk for known-small limits.
+        let decode_chunk_size = match self.spec.limit {
+            Some(limit) => (limit / 4096).clamp(4, 32),
+            None => 32,
+        };
         let plan = self.plan.clone();
         let table_schema = self.table_schema.clone();
         let runtime = self.runtime.clone();
@@ -329,7 +348,7 @@ impl ScanCursor {
                 // A panic in this thread would close the channel and look like
                 // a normal end-of-stream: catch it and fail the query instead.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    for segment in &segments {
+                    for (segment, precomputed) in segments.iter().zip(per_segment_candidates) {
                         let reader =
                             match runtime.segment_mgr().open_reader_cached(segment) {
                                 Ok(r) => r,
@@ -352,30 +371,12 @@ impl ScanCursor {
                                     continue;
                                 }
                             };
-                        let candidates = if let Ok(Some(meta)) =
-                            runtime.segment_mgr().segment_meta(segment)
-                        {
-                            let pred = spec.to_row_group_predicate();
-                            if !super::row_group::prune_segment_by_zone_map(
-                                &pred,
-                                &meta.segment_zone_maps,
-                            ) {
-                                continue;
-                            }
-                            super::row_group::prune_row_group_meta(
-                                &meta.row_groups,
-                                &pred,
-                                &super::row_group::build_bloom_check_list(&spec),
-                                &super::row_group::build_in_check_list(&spec),
-                                &super::row_group::build_set_check_list(&spec),
-                                &super::row_group::build_set_in_check_list(&spec),
-                            )
-                            .candidate_indices
-                        } else {
-                            match strategy::prune_segment(&spec, &reader) {
+                        let candidates = match precomputed {
+                            Some(candidates) => candidates,
+                            None => match strategy::prune_segment(&spec, &reader) {
                                 Some(pruned) => pruned.candidate_indices,
                                 None => continue,
-                            }
+                            },
                         };
                         // Decode in parallel chunks (bounded by the global
                         // cpu/io permits); send in candidate order so the
@@ -383,7 +384,7 @@ impl ScanCursor {
                         // The dedicated pool keeps these chunk tasks from
                         // queueing the consumer's per-batch lane work behind
                         // multi-millisecond decode tasks on the global pool.
-                        for chunk in candidates.chunks(32) {
+                        for chunk in candidates.chunks(decode_chunk_size) {
                             let decoded: Vec<_> = background_decode_pool().install(|| {
                                 chunk
                                     .par_iter()

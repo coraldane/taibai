@@ -398,20 +398,7 @@ fn eval_column_literal_comparison(
         _ => return None,
     };
     let column = batch.column(column_idx)?;
-    Some(match op {
-        BinOp::Eq => column.eq_vec(literal),
-        BinOp::Neq => column
-            .eq_vec(literal)
-            .into_iter()
-            .enumerate()
-            .map(|(idx, matched)| column.bitmap().is_valid(idx) && !matched)
-            .collect(),
-        BinOp::Lt => column.lt_vec(literal),
-        BinOp::Lte => column.le_vec(literal),
-        BinOp::Gt => column.gt_vec(literal),
-        BinOp::Gte => column.ge_vec(literal),
-        _ => return None,
-    })
+    crate::sql::execution::expr_vec::column_literal_mask(column, op, literal)
 }
 
 fn eval_comparison(left: &ScalarValue, op: &BinOp, right: &ScalarValue) -> bool {

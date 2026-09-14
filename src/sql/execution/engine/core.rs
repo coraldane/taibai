@@ -103,6 +103,7 @@ impl Engine {
         SegmentManager::start_flush_thread(&segment_mgr);
 
         let pubsub = crate::pubsub::PubSubHub::new(pubsub_settings);
+        segment_mgr.set_pubsub(Arc::clone(&pubsub));
 
         let batch_writer = BatchWriter::new(
             BatchWriterConfig {

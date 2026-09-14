@@ -38,6 +38,8 @@ fn first_owned_batch_keeps_variable_buffer_allocation() {
         sidecar_row_groups_flushed: 0,
         last_write_at: Instant::now(),
         row_group_target_rows: 1024,
+        pubsub: None,
+        pending_publish: Vec::new(),
     };
 
     writer.append_batch_owned(batch, &|_| {}).unwrap();

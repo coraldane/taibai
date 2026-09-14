@@ -146,6 +146,18 @@ impl ColumnArray {
                 .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
                 .count()
                 as u64,
+            (ColumnArray::Time { data, .. }, ScalarValue::Time(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count()
+                as u64,
+            (ColumnArray::Interval { data, .. }, ScalarValue::Interval(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && data[i] == *v)
+                .count()
+                as u64,
+            (ColumnArray::Bool { data, .. }, ScalarValue::Bool(Some(v))) => (0..num_rows)
+                .filter(|&i| !bitmap.is_null(i) && (data[i] != 0) == *v)
+                .count()
+                as u64,
             _ => 0,
         }
     }

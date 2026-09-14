@@ -250,8 +250,7 @@ where
                 push = push_rx.recv() => {
                     match push {
                         Some(push) => {
-                            if let Err(error) = framed.send(push).await {
-                                tracing::error!(%error, "pubsub push send error");
+                            if !send_pubsub_push(&mut framed, push).await {
                                 cancelled.store(true, Ordering::Release);
                                 return Ok(());
                             }
@@ -285,8 +284,7 @@ where
                 push = push_rx.recv() => {
                     match push {
                         Some(push) => {
-                            if let Err(error) = framed.send(push).await {
-                                tracing::error!(%error, "pubsub push send error");
+                            if !send_pubsub_push(&mut framed, push).await {
                                 cancelled.store(true, Ordering::Release);
                                 worker.abort();
                                 return Ok(());
@@ -370,6 +368,21 @@ where
     outcome
 }
 
+/// Send one pubsub push frame. `false` means the socket is dead and the
+/// connection must wind down.
+async fn send_pubsub_push<S>(framed: &mut Framed<S, MessageCodec>, push: Message) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match framed.send(push).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, "pubsub push send error");
+            false
+        }
+    }
+}
+
 enum Incoming {
     /// A decoded protocol frame; `None` means the client closed the stream.
     Frame(Option<std::result::Result<Message, TaibaiError>>),
@@ -396,11 +409,10 @@ where
         push = push_rx.recv() => {
             match push {
                 Some(push) => {
-                    if let Err(error) = framed.send(push).await {
-                        tracing::error!(%error, "pubsub push send error");
-                        Incoming::Closed
-                    } else {
+                    if send_pubsub_push(framed, push).await {
                         Incoming::Pushed
+                    } else {
+                        Incoming::Closed
                     }
                 }
                 None => Incoming::Closed,

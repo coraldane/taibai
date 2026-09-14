@@ -92,8 +92,9 @@ enum FastGroupCol<'a> {
     I64(&'a [i64], &'a NullBitmap),
     I32(&'a [i32], &'a NullBitmap),
     /// Dictionary passthrough: rows map to dict entries by u32 index; the
-    /// per-slot `dict_gid` table maps entries to group ids with zero hashing.
-    Dict(&'a [u32], usize, &'a NullBitmap),
+    /// per-slot `dict_gid` table caches batch-local entry -> group id, and
+    /// the global `dict_map` keeps group identity stable across batches.
+    Dict(&'a [u32], &'a Utf8Buffer, &'a NullBitmap),
 }
 
 /// Accumulator shape resolved once per range for the tight dictionary-key
@@ -142,9 +143,13 @@ enum FastMergeTarget {
 pub(super) struct FastGroups {
     str_map: FastGroupMap<String>,
     i64_map: FastGroupMap<i64>,
-    /// Dictionary fast path: entry (per current batch's dict) -> group id.
-    /// Reset per batch because each batch carries its own dict.
+    /// Dictionary fast path: batch-local entry -> group id cache. Reset per
+    /// batch because each batch carries its own dict; group identity across
+    /// batches comes from `dict_map`.
     dict_gid: Vec<Option<u32>>,
+    /// Global dictionary-value -> group id map: keeps one group per distinct
+    /// value across batches instead of one per batch-local entry.
+    dict_map: FastGroupMap<String>,
     null_id: Option<u32>,
     keys: Vec<Vec<u8>>,
     scalars: Vec<ScalarValue>,
@@ -159,6 +164,7 @@ impl FastGroups {
         Self {
             str_map: FastGroupMap::default(),
             i64_map: FastGroupMap::default(),
+            dict_map: FastGroupMap::default(),
             dict_gid: Vec::new(),
             null_id: None,
             keys: Vec::new(),
@@ -193,6 +199,7 @@ impl FastGroups {
         let FastGroups {
             str_map: _,
             i64_map: _,
+            dict_map: _,
             dict_gid: _,
             null_id: _,
             keys,
@@ -300,7 +307,7 @@ impl FastGroups {
         // deref and typed adds — no bitmap probes, no per-row enum dispatch.
         // Any other shape (nulls, other types, DISTINCT) uses the generic
         // interpreter below.
-        if let FastGroupCol::Dict(ids, dict_len, gbm) = group_col {
+        if let FastGroupCol::Dict(ids, dict, gbm) = group_col {
             if gbm.null_count() == 0 {
                 let kinds = aggregates
                     .iter()
@@ -309,7 +316,7 @@ impl FastGroups {
                     .collect::<Option<Vec<_>>>();
                 if let Some(kinds) = kinds {
                     return self.update_row_range_dict_typed(
-                        ids, *dict_len, start, end, &kinds, batch, gb_col, aggregates,
+                        ids, dict, start, end, &kinds, batch, gb_col, aggregates,
                         physical_schema, max_groups,
                     );
                 }
@@ -323,18 +330,30 @@ impl FastGroups {
 
         for row in start..end {
             let group_id: u32 = match group_col {
-                FastGroupCol::Dict(ids, dict_len, bitmap) => {
+                FastGroupCol::Dict(ids, dict, bitmap) => {
                     if bitmap.is_null(row) {
                         self.get_or_create_null_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?
                     } else {
                         let entry = ids[row] as usize;
                         if entry >= self.dict_gid.len() {
-                            self.dict_gid.resize((*dict_len).max(entry + 1), None);
+                            self.dict_gid.resize(dict.len().max(entry + 1), None);
                         }
                         match self.dict_gid[entry] {
                             Some(id) => id,
                             None => {
-                                let id = self.new_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?;
+                                let value = dict.value(entry);
+                                let id = match self.dict_map.get(value).copied() {
+                                    Some(id) => id,
+                                    None => {
+                                        let id = self.new_group(
+                                            batch, gb_col, row, aggregates, physical_schema,
+                                            max_groups,
+                                        )?;
+                                        self.cached_bytes += value.len() + 24;
+                                        self.dict_map.insert(value.to_string(), id);
+                                        id
+                                    }
+                                };
                                 self.dict_gid[entry] = Some(id);
                                 id
                             }
@@ -470,7 +489,7 @@ impl FastGroups {
     fn update_row_range_dict_typed(
         &mut self,
         ids: &[u32],
-        dict_len: usize,
+        dict: &Utf8Buffer,
         start: usize,
         end: usize,
         kinds: &[TypedAcc],
@@ -481,16 +500,26 @@ impl FastGroups {
         max_groups: usize,
     ) -> Result<()> {
         TYPED_RANGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.dict_gid.len() < dict_len {
-            self.dict_gid.resize(dict_len, None);
+        if self.dict_gid.len() < dict.len() {
+            self.dict_gid.resize(dict.len(), None);
         }
         for row in start..end {
             let entry = ids[row] as usize;
             let group_id = match self.dict_gid[entry] {
                 Some(id) => id,
                 None => {
-                    let id =
-                        self.new_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?;
+                    let value = dict.value(entry);
+                    let id = match self.dict_map.get(value).copied() {
+                        Some(id) => id,
+                        None => {
+                            let id = self.new_group(
+                                batch, gb_col, row, aggregates, physical_schema, max_groups,
+                            )?;
+                            self.cached_bytes += value.len() + 24;
+                            self.dict_map.insert(value.to_string(), id);
+                            id
+                        }
+                    };
                     self.dict_gid[entry] = Some(id);
                     id
                 }
@@ -724,7 +753,7 @@ pub(super) fn fast_group_update(
     let group_col = match group_array {
         ColumnArray::VarChar { data, bitmap } => FastGroupCol::Str(data, bitmap),
         ColumnArray::Dictionary { ids, dict, bitmap, .. } => {
-            FastGroupCol::Dict(ids, dict.len(), bitmap)
+            FastGroupCol::Dict(ids, dict, bitmap)
         }
         ColumnArray::Int64 { data, bitmap }
         | ColumnArray::Decimal { data, bitmap }

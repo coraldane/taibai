@@ -2,6 +2,9 @@ use crate::common::error::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodingType {
+    /// Reserved wire tag 0: the adaptive decoder never produces or accepts
+    /// it (tag 0 fails decode with "unknown encoding"), but the numbering of
+    /// the real encodings depends on it staying in place.
     Plain,
     Rle,
     Dictionary,
