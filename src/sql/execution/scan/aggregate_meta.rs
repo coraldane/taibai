@@ -50,7 +50,10 @@ pub fn compute_simple_aggregate(
     memtable_mgr: &crate::storage::core::memtable::MemTableManager,
     hot_mgr: &crate::storage::core::hot_store::HotStoreManager,
     db: &str,
-) -> Result<RecordBatch> {
+) -> Result<Option<RecordBatch>> {
+    if !sum_aggregates_supported(aggregates, table_schema) {
+        return Ok(None);
+    }
     let aggregate_columns: Vec<Option<usize>> = aggregates
         .iter()
         .map(|aggregate| match &*aggregate.arg {
@@ -87,20 +90,71 @@ pub fn compute_simple_aggregate(
         })
         .collect::<Vec<_>>();
 
+    let has_sum = accumulators
+        .iter()
+        .any(|a| a.func == crate::sql::planner::AggFunc::Sum && !a.sum_unsupported);
+
     for segment_path in &segment_files {
         let meta = segment_mgr.segment_meta(segment_path)?;
-        if let Some(meta) = &meta {
-            if !row_group::prune_segment_by_zone_map(&predicate, &meta.segment_zone_maps) {
-                continue;
+        let meta_deleted = meta
+            .as_ref()
+            .map(|m| m.deleted_row_count)
+            .unwrap_or(u64::MAX);
+        let meta_rows = meta.as_ref().map(|m| m.row_count).unwrap_or(0);
+        let pruned = meta.as_ref().is_some_and(|m| {
+            !row_group::prune_segment_by_zone_map(&predicate, &m.segment_zone_maps)
+        });
+        if pruned {
+            continue;
+        }
+
+        // Sum accumulators need the column data (zone maps carry no sums);
+        // serve them from the per-segment partial-sum cache when possible.
+        if has_sum && !spec.has_predicates() && meta_deleted == 0 {
+            // COUNT/MIN/MAX fold from the segment zone maps.
+            if let Some(m) = &meta {
+                fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count)?;
             }
-            if !spec.has_predicates() && meta.deleted_row_count == 0 {
-                fold_metadata(&mut accumulators, &meta.segment_zone_maps, meta.row_count)?;
+            // SUM folds from the per-segment partial-sum cache; a miss falls
+            // through to the reader scan below, which populates the cache.
+            let needed: Vec<(String, bool)> = aggregates
+                .iter()
+                .zip(&aggregate_columns)
+                .filter(|(agg, _)| agg.func == crate::sql::planner::AggFunc::Sum)
+                .map(|(_agg, col)| {
+                    let name = col
+                        .and_then(|i| table_schema.columns.get(i))
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    let is_float = col
+                        .and_then(|i| table_schema.columns.get(i))
+                        .map(|c| matches!(c.data_type, DataType::Float32 | DataType::Float64))
+                        .unwrap_or(false);
+                    (name, is_float)
+                })
+                .collect();
+            let cached = segment_sum_cache_lookup(
+                segment_path.to_string_lossy().as_ref(),
+                meta_rows,
+                &needed,
+            );
+            if let Some(cached) = &cached {
+                let mut sum_idx = 0usize;
+                for accumulator in accumulators.iter_mut() {
+                    if accumulator.func != crate::sql::planner::AggFunc::Sum {
+                        continue;
+                    }
+                    if let Some(v) = cached.get(sum_idx) {
+                        accumulator.fold_cached_sum(v);
+                    }
+                    sum_idx += 1;
+                }
                 continue;
             }
         }
 
         let reader = segment_mgr.open_reader_cached(segment_path)?;
-        if !spec.has_predicates() && reader.deleted_row_count() == 0 {
+        if !spec.has_predicates() && reader.deleted_row_count() == 0 && !has_sum {
             fold_metadata(
                 &mut accumulators,
                 reader.segment_zone_maps(),
@@ -108,6 +162,15 @@ pub fn compute_simple_aggregate(
             )?;
             continue;
         }
+
+        let sum_before: Vec<(Option<i64>, Option<f64>)> = if has_sum {
+            accumulators
+                .iter()
+                .map(|a| (a.sum_i, a.sum_f))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let candidate_indices = if let Some(meta) = &meta {
             row_group::prune_row_group_meta(
@@ -186,6 +249,47 @@ pub fn compute_simple_aggregate(
             fold_batch(&mut accumulators, &aggregate_positions, &batch)?;
             row_start += row_group_meta.row_count;
         }
+
+        if has_sum && !spec.has_predicates() && reader.deleted_row_count() == 0 {
+            let needed: Vec<(String, bool)> = aggregates
+                .iter()
+                .zip(&aggregate_columns)
+                .filter(|(agg, _)| agg.func == crate::sql::planner::AggFunc::Sum)
+                .map(|(_agg, col)| {
+                    let name = col
+                        .and_then(|i| table_schema.columns.get(i))
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    let is_float = col
+                        .and_then(|i| table_schema.columns.get(i))
+                        .map(|c| matches!(c.data_type, DataType::Float32 | DataType::Float64))
+                        .unwrap_or(false);
+                    (name, is_float)
+                })
+                .collect();
+            let deltas: Vec<SumCacheValue> = accumulators
+                .iter()
+                .zip(sum_before.iter())
+                .map(|(a, (i0, f0))| SumCacheValue {
+                    i: match (a.sum_i, *i0) {
+                        (Some(v), Some(base)) => Some(v.wrapping_sub(base)),
+                        (v, None) => v,
+                        (None, Some(_)) => None,
+                    },
+                    f: match (a.sum_f, *f0) {
+                        (Some(v), Some(base)) => Some(v - base),
+                        (v, None) => v,
+                        (None, Some(_)) => None,
+                    },
+                })
+                .collect();
+            segment_sum_cache_store(
+                segment_path.to_string_lossy().as_ref(),
+                meta_rows,
+                &needed,
+                &deltas,
+            );
+        }
     }
 
     let memtable_batches =
@@ -218,7 +322,7 @@ pub fn compute_simple_aggregate(
             .ok_or_else(|| crate::common::error::TaibaiError::Internal("agg col".into()))?
             .push(&value)?;
     }
-    Ok(batch)
+    Ok(Some(batch))
 }
 
 fn aggregate_source_columns(spec: &ScanSpec, aggregate_columns: &[Option<usize>]) -> Vec<usize> {
@@ -260,6 +364,11 @@ struct AggAccum {
     best_min: Option<ScalarValue>,
     best_max: Option<ScalarValue>,
     col_type: DataType,
+    sum_i: Option<i64>,
+    sum_f: Option<f64>,
+    /// SUM over a column type the metadata fast path cannot answer
+    /// (non-numeric argument columns).
+    sum_unsupported: bool,
 }
 
 impl AggAccum {
@@ -268,6 +377,22 @@ impl AggAccum {
             .and_then(|index| schema.columns.get(index))
             .map(|column| column.data_type)
             .unwrap_or(DataType::Int64);
+        let (sum_i, sum_f, sum_unsupported) = if func == AggFunc::Sum {
+            match col_type {
+                DataType::Float32 | DataType::Float64 => (None, Some(0.0), false),
+                DataType::Int64
+                | DataType::Int32
+                | DataType::Int16
+                | DataType::Int8
+                | DataType::Decimal
+                | DataType::Date
+                | DataType::Time
+                | DataType::Timestamp => (Some(0), None, false),
+                _ => (None, None, true),
+            }
+        } else {
+            (None, None, false)
+        };
         Self {
             func,
             column,
@@ -275,6 +400,9 @@ impl AggAccum {
             best_min: None,
             best_max: None,
             col_type,
+            sum_i,
+            sum_f,
+            sum_unsupported,
         }
     }
 
@@ -327,9 +455,38 @@ impl AggAccum {
                     self.merge_max(value);
                 }
             }
+            AggFunc::Sum => match self.sum_i {
+                Some(_) => {
+                    if let Some(part) = values.col_sum_i64() {
+                        self.sum_i =
+                            Some(self.sum_i.unwrap_or(0).wrapping_add(part));
+                    }
+                }
+                _ => {
+                    if let Some(part) = values.col_sum_f64() {
+                        self.sum_f = Some(self.sum_f.unwrap_or(0.0) + part);
+                    }
+                }
+            },
             _ => {}
         }
         Ok(())
+    }
+
+    /// Fold a cached per-segment partial sum into this accumulator.
+    fn fold_cached_sum(&mut self, cached: &SumCacheValue) {
+        match self.col_type {
+            DataType::Float32 | DataType::Float64 => {
+                self.sum_f = Some(self.sum_f.unwrap_or(0.0) + cached.f.unwrap_or(0.0));
+            }
+            _ => {
+                self.sum_i = Some(
+                    self.sum_i
+                        .unwrap_or(0)
+                        .wrapping_add(cached.i.unwrap_or(0)),
+                );
+            }
+        }
     }
 
     fn merge_min(&mut self, value: ScalarValue) {
@@ -367,6 +524,12 @@ impl AggAccum {
             AggFunc::Max => self
                 .best_max
                 .unwrap_or_else(|| null_scalar_of_type(self.col_type)),
+            AggFunc::Sum => match self.col_type {
+                DataType::Float32 | DataType::Float64 => {
+                    ScalarValue::Float64(self.sum_f)
+                }
+                _ => ScalarValue::Int64(self.sum_i),
+            },
             _ => ScalarValue::Int64(None),
         }
     }
@@ -391,4 +554,103 @@ fn null_scalar_of_type(dt: DataType) -> ScalarValue {
         DataType::Bool => ScalarValue::Bool(None),
         _ => ScalarValue::Int64(None),
     }
+}
+
+
+/// Per-segment partial sums for the metadata aggregate fast path. Keyed by
+/// (segment path, row count, column, float?) so appends, compaction, and
+/// deletes naturally invalidate entries. In-process only.
+fn segment_sum_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>,
+> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| {
+            std::sync::Mutex::new(std::collections::HashMap::new())
+        })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SumCacheValue {
+    i: Option<i64>,
+    f: Option<f64>,
+}
+
+fn segment_sum_cache_lookup(
+    segment: &str,
+    row_count: u64,
+    columns: &[(String, bool)],
+) -> Option<Vec<SumCacheValue>> {
+    let cache = segment_sum_cache().lock().unwrap();
+    columns
+        .iter()
+        .map(|(name, is_float)| {
+            cache
+                .get(
+                    &(
+                        segment.to_string(),
+                        name.clone(),
+                        row_count,
+                        0,
+                        *is_float,
+                    ),
+                )
+                .copied()
+        })
+        .collect()
+}
+
+fn segment_sum_cache_store(
+    segment: &str,
+    row_count: u64,
+    columns: &[(String, bool)],
+    values: &[SumCacheValue],
+) {
+    let mut cache = segment_sum_cache().lock().unwrap();
+    for ((name, is_float), value) in columns.iter().zip(values.iter()) {
+        cache.insert(
+            (segment.to_string(), name.clone(), row_count, 0u64, *is_float),
+            *value,
+        );
+    }
+}
+
+/// SUM is answerable by the metadata fast path only for numeric argument
+/// columns; other types keep the generic scan.
+fn sum_aggregates_supported(
+    aggregates: &[AggregateExpr],
+    table_schema: &Schema,
+) -> bool {
+    for agg in aggregates {
+        if agg.func != crate::sql::planner::AggFunc::Sum || agg.distinct {
+            continue;
+        }
+        let supported = match &*agg.arg {
+            crate::sql::planner::LogicalExpr::Column(idx) => table_schema
+                .columns
+                .get(*idx)
+                .map(|c| {
+                    matches!(
+                        c.data_type,
+                        crate::protocol::types::DataType::Int64
+                            | crate::protocol::types::DataType::Int32
+                            | crate::protocol::types::DataType::Int16
+                            | crate::protocol::types::DataType::Int8
+                            | crate::protocol::types::DataType::Decimal
+                            | crate::protocol::types::DataType::Date
+                            | crate::protocol::types::DataType::Time
+                            | crate::protocol::types::DataType::Timestamp
+                            | crate::protocol::types::DataType::Float64
+                            | crate::protocol::types::DataType::Float32
+                    )
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !supported {
+            return false;
+        }
+    }
+    true
 }

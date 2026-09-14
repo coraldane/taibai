@@ -296,13 +296,10 @@ impl Engine {
     /// tail recovery) must go through here so the resident fast path and the
     /// mirror bookkeeping stay consistent.
     pub fn invalidate_hot_store(&self, db: &str, table: &str) {
-        eprintln!("DBGREPL 5 invalidate enter");
         self.hot_store_mgr.invalidate(db, table);
-        eprintln!("DBGREPL 6 mgr done");
         self.batch_writer
             .memtable_manager()
             .clear_hot_unfed(db, table);
-        eprintln!("DBGREPL 7 invalidate done");
         self.batch_writer
             .memtable_manager()
             .clear_hot_unfed(db, table);

@@ -1086,6 +1086,11 @@ fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) ->
 fn extract_simple_metadata_aggregates(
     plan: &LogicalPlan,
 ) -> Option<Vec<crate::sql::planner::AggregateExpr>> {
+    // The optimizer may wrap the aggregate in a projection; unwrap one level.
+    let plan = match plan {
+        LogicalPlan::Project(plan) => plan.input.as_ref(),
+        other => other,
+    };
     match plan {
         LogicalPlan::Aggregate(agg) if agg.group_by.is_empty() && !agg.distinct => {
             // Restrict to COUNT/MIN/MAX to match detect_simple_metadata_aggregate.

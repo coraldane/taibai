@@ -169,6 +169,11 @@ impl<'a> ScanExecutor<'a> {
             .data_dir()
             .join(self.db)
             .join(&self.spec.table_name);
+        eprintln!(
+            "DBGMETA route aggs={} dir_exists={}",
+            aggs.len(),
+            table_dir.exists()
+        );
         let batch = if table_dir.exists() {
             super::aggregate_meta::compute_simple_aggregate(
                 self.spec,
@@ -194,6 +199,11 @@ impl<'a> ScanExecutor<'a> {
                 self.runtime.hot_store_manager(),
                 self.db,
             )?
+        };
+        let Some(batch) = batch else {
+            // Sum over a column the metadata path cannot answer: fall back to
+            // the regular scan+aggregate pipeline.
+            return self.execute_scan();
         };
         Ok(vec![batch])
     }
