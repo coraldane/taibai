@@ -11,6 +11,7 @@ Cargo.lock
 /.idea/
 /.vscode/
 /.motuo/
+/.zcode/
 /.emacs*
 /.vim/
 *.swp

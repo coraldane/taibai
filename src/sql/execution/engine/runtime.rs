@@ -262,7 +262,7 @@ impl Engine {
             .remove(table_dir);
     }
 
-    fn table_has_any_segment(table_dir: &std::path::Path) -> bool {
+    pub(crate) fn table_has_any_segment(table_dir: &std::path::Path) -> bool {
         SegmentManager::discover_segments(table_dir)
             .map(|segments| !segments.is_empty())
             .unwrap_or(true)

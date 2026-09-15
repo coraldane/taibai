@@ -296,6 +296,9 @@ impl Engine {
     ) -> Result<u64> {
         self.validate_batch_unique_constraints(db, table, &batch)?;
         let resident_coverage_before_bulk = self.begin_hot_bulk_write(db, table, table_meta);
+        let had_segments_before =
+            resident_coverage_before_bulk.is_some()
+                && !Self::table_has_any_segment(&self.segment_mgr.table_dir(db, table));
         let hot_batch = if resident_coverage_before_bulk.is_some() {
             Some(batch.clone())
         } else {
@@ -331,6 +334,7 @@ impl Engine {
                     table_meta,
                     batch,
                     resident_coverage_before_bulk,
+                    had_segments_before,
                 );
             } else {
                 self.hot_store_mgr.clear_resident_coverage(db, table);
@@ -436,6 +440,8 @@ impl Engine {
         } else {
             None
         };
+        let had_segments_before = hot_payload_should_feed
+            && !Self::table_has_any_segment(&self.segment_mgr.table_dir(db, &table_name));
         let write_start = std::time::Instant::now();
         let result = match self.segment_mgr.bulk_insert_payload_with_catalog(
             db,
@@ -464,6 +470,7 @@ impl Engine {
                     table_meta,
                     payload,
                     resident_coverage_before_bulk,
+                    had_segments_before,
                 );
             }
         } else if result > 0 {
@@ -533,6 +540,40 @@ impl Engine {
         Some(snapshot)
     }
 
+    /// After a successful hot-store feed: when the written rows are the
+    /// table's entire row set (no segments existed before the write), the
+    /// store now provably covers every row, so mark it fully resident — this
+    /// is what lets intraday point queries answer from the in-memory
+    /// inverted index instead of scanning segments. Otherwise restore the
+    /// pre-write coverage snapshot as before. The marker is additionally
+    /// gated on zero unmirrored-row accounting.
+    fn restore_or_mark_full_resident(
+        &self,
+        db: &str,
+        table: &str,
+        resident_coverage_before_bulk: Option<
+            crate::storage::core::hot_store::ResidentCoverageSnapshot,
+        >,
+        had_segments_before: bool,
+    ) {
+        if !had_segments_before
+            && self
+                .batch_writer
+                .memtable_manager()
+                .hot_partition_mirrored(db, table, "")
+        {
+            let store = self.hot_store_mgr.get(db, table);
+            if store.is_some_and(|s| s.row_count() > 0) {
+                self.apply_hot_resident_mark(db, table, HotResidentMark::FullTable);
+                return;
+            }
+        }
+        if let Some(snapshot) = resident_coverage_before_bulk {
+            self.hot_store_mgr
+                .restore_resident_coverage(db, table, snapshot);
+        }
+    }
+
     fn feed_hot_store_after_batch(
         &self,
         db: &str,
@@ -542,6 +583,7 @@ impl Engine {
         resident_coverage_before_bulk: Option<
             crate::storage::core::hot_store::ResidentCoverageSnapshot,
         >,
+        had_segments_before: bool,
     ) {
         let feed = self.begin_hot_feed(db, table);
         let feed_result = match self.feed_hot_store(db, table, table_meta, batch, &feed) {
@@ -555,10 +597,13 @@ impl Engine {
 
         match feed_result {
             Ok(()) => {
-                if let Some(snapshot) = resident_coverage_before_bulk {
-                    self.hot_store_mgr
-                        .restore_resident_coverage(db, table, snapshot);
-                }
+                Self::restore_or_mark_full_resident(
+                    self,
+                    db,
+                    table,
+                    resident_coverage_before_bulk,
+                    had_segments_before,
+                );
             }
             Err(e) => {
                 self.hot_store_mgr.clear_resident_coverage(db, table);
@@ -582,6 +627,7 @@ impl Engine {
         resident_coverage_before_bulk: Option<
             crate::storage::core::hot_store::ResidentCoverageSnapshot,
         >,
+        had_segments_before: bool,
     ) {
         let parse_result = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)
             .and_then(|req| {
@@ -616,10 +662,13 @@ impl Engine {
 
         match feed_result {
             Ok(()) => {
-                if let Some(snapshot) = resident_coverage_before_bulk {
-                    self.hot_store_mgr
-                        .restore_resident_coverage(db, table, snapshot);
-                }
+                Self::restore_or_mark_full_resident(
+                    self,
+                    db,
+                    table,
+                    resident_coverage_before_bulk,
+                    had_segments_before,
+                );
             }
             Err(e) => {
                 self.hot_store_mgr.clear_resident_coverage(db, table);
