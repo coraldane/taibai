@@ -3,7 +3,7 @@ use futures::StreamExt;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -162,8 +162,7 @@ where
         stream,
         MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),
     );
-    let mut handler = Handler::new(config, engine.clone());
-    let mut pending_messages = VecDeque::new();
+    let mut handler = Some(Handler::new(config, engine.clone()));
     // Per-connection push queue for pubsub notifications. The pubsub fan-out
     // thread only ever `try_send`s, so a stalled client drops notifications
     // (counted) instead of blocking writers or growing memory unboundedly.
@@ -171,49 +170,42 @@ where
     // while the handler (holding the other clone) is moved into a worker.
     let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<Message>(notification_capacity);
     let keep_push_tx = push_tx.clone();
-    handler.set_push_channel(push_tx);
+    handler
+        .as_mut()
+        .expect("handler exists before the first request")
+        .set_push_channel(push_tx);
+    let mut pending_messages = VecDeque::new();
 
     let outcome = 'connection: loop {
-        let next = if let Some(msg) = pending_messages.pop_front() {
-            Incoming::Frame(Some(Ok(msg)))
-        } else {
+        // Fetch the next request frame, giving the pending queue priority so
+        // frames buffered while a request was in flight are not starved.
+        let msg = 'fetch: loop {
+            if let Some(msg) = pending_messages.pop_front() {
+                break 'fetch msg;
+            }
             // Delivering a queued notification counts as connection activity
             // and restarts the idle window, so a pure subscriber that pushes
             // data but sends no frames is not disconnected mid-stream.
-            loop {
-                let wait = next_frame_or_push(&mut framed, &mut push_rx);
-                let result = if idle_timeout_secs == 0 {
-                    wait.await
-                } else {
-                    match timeout(Duration::from_secs(idle_timeout_secs), wait).await {
-                        Ok(result) => result,
-                        Err(_) => {
-                            tracing::warn!(idle_timeout_secs, "closing idle connection");
-                            break 'connection Ok(());
-                        }
+            let wait = next_frame_or_push(&mut framed, &mut push_rx);
+            let incoming = if idle_timeout_secs == 0 {
+                wait.await
+            } else {
+                match timeout(Duration::from_secs(idle_timeout_secs), wait).await {
+                    Ok(incoming) => incoming,
+                    Err(_) => {
+                        tracing::warn!(idle_timeout_secs, "closing idle connection");
+                        break 'connection Ok(());
                     }
-                };
-                match result {
-                    Incoming::Pushed => continue,
-                    other => break other,
                 }
-            }
-        };
-        let next = match next {
-            Incoming::Closed => break Ok(()),
-            // The inner wait loop consumes `Pushed` itself; reaching this arm
-            // would mean it escaped, which is impossible today.
-            Incoming::Pushed => break Ok(()),
-            Incoming::Frame(frame) => frame,
-        };
-        let Some(result) = next else {
-            break Ok(());
-        };
-        let msg = match result {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::error!(error = %e, "decode error");
-                break Err(e);
+            };
+            match incoming {
+                Incoming::Pushed => continue,
+                Incoming::Closed | Incoming::Frame(None) => break 'connection Ok(()),
+                Incoming::Frame(Some(Err(error))) => {
+                    tracing::error!(error = %error, "decode error");
+                    break 'connection Err(error);
+                }
+                Incoming::Frame(Some(Ok(msg))) => break 'fetch msg,
             }
         };
 
@@ -222,7 +214,7 @@ where
         let cancelled = Arc::new(AtomicBool::new(false));
         let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
         let worker = run_handler(
-            handler,
+            handler.take().expect("handler available between requests"),
             msg,
             Arc::clone(&request_limiter),
             Arc::clone(&cancelled),
@@ -230,109 +222,105 @@ where
             request_queue_timeout_ms,
         );
         tokio::pin!(worker);
-        let mut worker = loop {
+        // Single wait loop for the whole request lifetime (queueing for a
+        // permit and executing): stream result chunks, forward pubsub pushes,
+        // and buffer pipelined frames. Every disconnect/error exit sets
+        // `disconnect_outcome` and falls through to the same bounded reaping,
+        // so the handler always reaches the normal `flush_on_disconnect`
+        // cleanup instead of being dropped mid-flight.
+        let mut disconnect_outcome: Option<Result<()>> = None;
+        let (returned_handler, request_outcome) = 'request: loop {
             tokio::select! {
-                result = &mut worker => break result?,
-                next = framed.next() => {
-                    match next {
-                        Some(Ok(msg)) => pending_messages.push_back(msg),
-                        Some(Err(error)) => {
-                            tracing::error!(%error, "decode error while waiting for request capacity");
-                            cancelled.store(true, Ordering::Release);
-                            return Err(error);
-                        }
-                        None => {
-                            cancelled.store(true, Ordering::Release);
-                            return Ok(());
-                        }
-                    }
-                }
-                push = push_rx.recv() => {
-                    match push {
-                        Some(push) => {
-                            if !send_pubsub_push(&mut framed, push).await {
-                                cancelled.store(true, Ordering::Release);
-                                return Ok(());
-                            }
-                        }
-                        None => {
-                            cancelled.store(true, Ordering::Release);
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        };
-        let mut disconnected = false;
-        let (returned_handler, responses) = loop {
-            tokio::select! {
-                result = &mut worker => {
-                    break result.map_err(|error| {
-                        TaibaiError::Internal(format!("request worker failed: {error}"))
-                    })?;
+                joined = &mut worker => {
+                    let (handler, responses) = unpack_worker_output(joined);
+                    break 'request (handler, RequestOutcome::Completed(responses));
                 }
                 chunk = stream_receiver.recv() => {
                     if let Some(chunk) = chunk {
                         if let Err(error) = framed.send(chunk).await {
                             tracing::error!(%error, "query stream send error");
                             cancelled.store(true, Ordering::Release);
-                            worker.abort();
-                            return Ok(());
+                            disconnect_outcome = Some(Ok(()));
                         }
                     }
+                    // `None`: the worker finished racing this recv; the worker
+                    // arm is now ready and wins the next iteration.
                 }
                 push = push_rx.recv() => {
                     match push {
                         Some(push) => {
                             if !send_pubsub_push(&mut framed, push).await {
                                 cancelled.store(true, Ordering::Release);
-                                worker.abort();
-                                return Ok(());
+                                disconnect_outcome = Some(Ok(()));
                             }
                         }
                         None => {
                             cancelled.store(true, Ordering::Release);
-                            worker.abort();
-                            return Ok(());
+                            disconnect_outcome = Some(Ok(()));
                         }
                     }
                 }
                 next = framed.next() => {
                     match next {
-                        Some(Ok(msg)) => pending_messages.push_back(msg),
+                        Some(Ok(msg)) => {
+                            if pending_messages.len() >= MAX_PENDING_MESSAGES {
+                                tracing::warn!(
+                                    limit = MAX_PENDING_MESSAGES,
+                                    "pipelined request backlog limit reached; closing connection"
+                                );
+                                let error = TaibaiError::ResourceBusy(format!(
+                                    "too many pipelined requests (limit {MAX_PENDING_MESSAGES})"
+                                ));
+                                cancelled.store(true, Ordering::Release);
+                                if let Err(send_error) =
+                                    framed.send(build_error(&error.to_string())).await
+                                {
+                                    tracing::error!(error = %send_error, "send backlog error response failed");
+                                }
+                                disconnect_outcome = Some(Err(error));
+                            } else {
+                                pending_messages.push_back(msg);
+                            }
+                        }
                         Some(Err(error)) => {
                             tracing::error!(%error, "decode error while query was running");
                             cancelled.store(true, Ordering::Release);
-                            disconnected = true;
+                            disconnect_outcome = Some(Err(error));
                         }
                         None => {
                             cancelled.store(true, Ordering::Release);
-                            disconnected = true;
+                            disconnect_outcome = Some(Ok(()));
                         }
                     }
-                    if disconnected {
-                        match timeout(DISCONNECT_WORKER_WAIT, &mut worker).await {
-                            Ok(result) => {
-                                break result.map_err(|error| {
-                                    TaibaiError::Internal(format!("request worker failed: {error}"))
-                                })?;
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    "client disconnected but the request worker did not stop; aborting the worker and closing the connection"
-                                );
-                                worker.abort();
-                                return Ok(());
-                            }
+                }
+            }
+            if let Some(outcome) = disconnect_outcome.take() {
+                // Give the worker a bounded window to observe the cancellation
+                // flag and hand the handler back. `abort` is advisory for
+                // blocking workers; the cancelled flag does the real work.
+                match timeout(DISCONNECT_WORKER_WAIT, &mut worker).await {
+                    Ok(joined) => {
+                        let (handler, responses) = unpack_worker_output(joined);
+                        if let Err(error) = responses {
+                            tracing::error!(%error, "request worker failed while disconnecting");
                         }
+                        break 'request (handler, RequestOutcome::Disconnected(outcome));
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "client disconnected but the request worker did not stop; abandoning the worker and closing the connection"
+                        );
+                        worker.abort();
+                        break 'request (None, RequestOutcome::Disconnected(outcome));
                     }
                 }
             }
         };
         handler = returned_handler;
-        if disconnected {
-            break Ok(());
-        }
+        let responses = match request_outcome {
+            RequestOutcome::Disconnected(outcome) => break 'connection outcome,
+            RequestOutcome::Completed(responses) => responses,
+        };
         while let Ok(chunk) = stream_receiver.try_recv() {
             if let Err(error) = framed.send(chunk).await {
                 tracing::error!(%error, "query stream send error");
@@ -345,13 +333,13 @@ where
                 tracing::error!(%error, "request handler error");
                 if let Err(send_error) = framed.send(build_error(&error.to_string())).await {
                     tracing::error!(error = %send_error, "send error response failed");
-                    break Err(send_error);
+                    break 'connection Err(send_error);
                 }
-                break Err(error);
+                break 'connection Err(error);
             }
         };
         if responses.is_empty() {
-            break Ok(());
+            break 'connection Ok(());
         }
 
         for resp in responses {
@@ -362,7 +350,9 @@ where
         }
     };
 
-    cleanup_handler_blocking(handler, request_limiter).await;
+    if let Some(handler) = handler.take() {
+        cleanup_handler_blocking(handler, request_limiter).await;
+    }
     tracing::info!("connection closed");
     drop(keep_push_tx);
     outcome
@@ -421,50 +411,128 @@ where
     }
 }
 
+/// Pipelined frames buffered while a request is in flight. A malicious or
+/// runaway client must not be able to grow this without bound merely by
+/// flooding frames faster than the server drains them.
+const MAX_PENDING_MESSAGES: usize = 1024;
+
+/// How often a queued heavy request re-checks the cancellation flag while
+/// waiting for a limiter slot, so a disconnect does not have to wait out the
+/// full queue timeout.
+const QUEUE_CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// How long disconnect cleanup waits for an in-flight request worker to hand
+/// the handler back before abandoning it.
 const DISCONNECT_WORKER_WAIT: Duration = Duration::from_secs(5);
 
-async fn run_handler(
+/// How the request wait loop ended.
+enum RequestOutcome {
+    /// The worker finished on its own; deliver its responses.
+    Completed(Result<Vec<Message>>),
+    /// The connection is going away; this is the final connection result.
+    Disconnected(Result<()>),
+}
+
+/// Normalize a finished worker into its handler and responses. `None` means
+/// the worker panicked; the handler was dropped together with the panic,
+/// which already released its pubsub subscriptions, so nothing is left to
+/// clean up.
+fn unpack_worker_output(
+    joined: std::result::Result<
+        (Option<Handler>, Result<Vec<Message>>),
+        tokio::task::JoinError,
+    >,
+) -> (Option<Handler>, Result<Vec<Message>>) {
+    match joined {
+        Ok(output) => output,
+        Err(join_error) => {
+            tracing::error!(%join_error, "request worker task failed");
+            (
+                None,
+                Err(TaibaiError::Internal("request worker failed".into())),
+            )
+        }
+    }
+}
+
+/// Spawn the request worker. The returned task always terminates with the
+/// handler (`None` only when the worker panicked), so disconnect cleanup can
+/// recover it after a bounded wait.
+fn run_handler(
     mut handler: Handler,
     msg: Message,
     request_limiter: Arc<Semaphore>,
     cancelled: Arc<AtomicBool>,
     stream_sender: tokio::sync::mpsc::Sender<Message>,
     queue_timeout_ms: u64,
-) -> Result<tokio::task::JoinHandle<(Handler, Result<Vec<Message>>)>> {
-    if is_heavy_request(msg.msg_type) {
-        let queue_timeout = Duration::from_millis(queue_timeout_ms.max(1));
-        let permit = match timeout(queue_timeout, request_limiter.acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                return Err(TaibaiError::Internal("request limiter closed".into()));
+) -> tokio::task::JoinHandle<(Option<Handler>, Result<Vec<Message>>)> {
+    tokio::task::spawn(async move {
+        if !is_heavy_request(msg.msg_type) {
+            let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
+            return (Some(handler), responses);
+        }
+
+        // Wait for a request slot while watching the cancellation flag, so a
+        // disconnect during a full queue does not stall cleanup for the whole
+        // queue timeout.
+        let deadline = Instant::now() + Duration::from_millis(queue_timeout_ms.max(1));
+        let permit = loop {
+            if cancelled.load(Ordering::Acquire) {
+                return (
+                    Some(handler),
+                    Ok(vec![build_error(
+                        "request cancelled because the client disconnected",
+                    )]),
+                );
             }
-            Err(_) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 tracing::warn!(
                     msg_type = msg.msg_type,
                     queue_timeout_ms,
                     "request queue wait timeout; rejecting request with overload error"
                 );
-                return Ok(tokio::spawn(async move {
-                    (
-                        handler,
-                        Ok(vec![build_error(
-                            "server overloaded: request queue wait timeout",
-                        )]),
-                    )
-                }));
+                return (
+                    Some(handler),
+                    Ok(vec![build_error(
+                        "server overloaded: request queue wait timeout",
+                    )]),
+                );
+            }
+            match timeout(
+                remaining.min(QUEUE_CANCEL_POLL),
+                Arc::clone(&request_limiter).acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => break permit,
+                Ok(Err(_)) => {
+                    return (
+                        Some(handler),
+                        Err(TaibaiError::Internal("request limiter closed".into())),
+                    );
+                }
+                Err(_elapsed) => {} // poll tick: re-check cancelled / deadline
             }
         };
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let joined = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
             (handler, responses)
-        }))
-    } else {
-        Ok(tokio::spawn(async move {
-            let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
-            (handler, responses)
-        }))
-    }
+        })
+        .await;
+        match joined {
+            Ok((handler, responses)) => (Some(handler), responses),
+            Err(join_error) => {
+                tracing::error!(%join_error, "request worker panicked");
+                (
+                    None,
+                    Err(TaibaiError::Internal("request worker panicked".into())),
+                )
+            }
+        }
+    })
 }
 
 async fn cleanup_handler_blocking(mut handler: Handler, request_limiter: Arc<Semaphore>) {

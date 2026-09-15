@@ -203,3 +203,84 @@ async fn handler_errors_still_release_bulk_import_session_state() {
     assert!(connection_result.is_err());
     assert_eq!(engine.bulk_mode_session_count(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnect_during_capacity_wait_still_flushes_bulk_import() {
+    let (_dir, engine) = test_engine();
+    let limiter = Arc::new(Semaphore::new(1));
+    let (mut client, server) = spawn_test_connection_with_limiter(Arc::clone(&engine), Arc::clone(&limiter));
+    login(&mut client, "root").await;
+
+    client.send(query("START BULK IMPORT")).await.unwrap();
+    client.next().await.unwrap().unwrap();
+    assert_eq!(engine.bulk_mode_session_count(), 1);
+
+    // Hold the only permit so the next heavy request queues, then disconnect.
+    // The queued request must be cancelled promptly (cancel-aware queueing)
+    // and the bulk-import flush must still run instead of leaking the session.
+    let _held_permit = Arc::clone(&limiter).acquire_owned().await.unwrap();
+    client.send(query("SELECT 1")).await.unwrap();
+    drop(client);
+
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("cancel-aware queueing must not wait for the full queue timeout")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        engine.bulk_mode_session_count(),
+        0,
+        "bulk import session must be released by the disconnect flush"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipelined_backlog_limit_closes_connection() {
+    let (_dir, engine) = test_engine();
+    let (mut client, server) = spawn_test_connection(engine);
+    login(&mut client, "root").await;
+
+    // Flood with heavy requests so the queue outpaces the drain and the
+    // pending backlog hits its cap. The server closes the connection as soon
+    // as the cap trips, so late sends may fail with a broken pipe.
+    for _ in 0..(MAX_PENDING_MESSAGES * 3) {
+        if client.send(query("SELECT 1")).await.is_err() {
+            break;
+        }
+    }
+
+    let mut saw_error = false;
+    for _ in 0..(MAX_PENDING_MESSAGES * 3) {
+        match timeout(Duration::from_secs(5), client.next())
+            .await
+            .expect("server should keep answering during the flood")
+        {
+            Some(Ok(msg)) if msg.msg_type == crate::protocol::message::MSG_TYPE_ERROR => {
+                assert!(String::from_utf8_lossy(&msg.payload).contains("pipelined"));
+                saw_error = true;
+                break;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(error)) => panic!("unexpected decode error: {error}"),
+            None => panic!("connection closed before the backlog error"),
+        }
+    }
+    assert!(saw_error, "backlog limit should produce an error response");
+
+    let closed = timeout(Duration::from_secs(5), client.next())
+        .await
+        .expect("server should close the connection after the backlog error");
+    assert!(
+        closed.is_none(),
+        "connection should close after the backlog error"
+    );
+
+    let server_result = timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server task should finish")
+        .expect("server task should not panic");
+    assert!(
+        server_result.is_err(),
+        "backlog violation should fail the connection"
+    );
+}
