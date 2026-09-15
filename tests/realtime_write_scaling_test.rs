@@ -57,6 +57,7 @@ fn start_engine_async_fsync(dir: &TempDir) -> Engine {
         64 * 1024 * 1024,
         true,
         taibai::common::config::PubSubSettings::default(),
+        false,
     )
     .expect("failed to create async-fsync engine")
 }

@@ -8,6 +8,7 @@ impl Engine {
             8 * 1024 * 1024 * 1024,
             false,
             crate::common::config::PubSubSettings::default(),
+            true,
         )
     }
     pub fn new_with_storage_config(
@@ -23,6 +24,7 @@ impl Engine {
             8 * 1024 * 1024 * 1024,
             false,
             crate::common::config::PubSubSettings::default(),
+            true,
         )
     }
 
@@ -35,6 +37,7 @@ impl Engine {
         hot_store_memory_limit_bytes: u64,
         tail_async_fsync: bool,
         pubsub_settings: crate::common::config::PubSubSettings,
+        hot_warmup_enabled: bool,
     ) -> Result<Self> {
         super::ddl::recover_database_drop_tombstones(data_dir)?;
         let mut catalogs = HashMap::new();
@@ -185,7 +188,9 @@ impl Engine {
             performance_baselines,
             hot_partition_segments: Mutex::new(HashMap::new()),
         };
-        engine.warmup_hot_stores();
+        if hot_warmup_enabled {
+            engine.warmup_hot_stores();
+        }
         for (db, table) in recovered_tail_tables {
             engine.invalidate_hot_store(&db, &table);
         }

@@ -343,6 +343,10 @@ fn default_low_rate_memtable_max_age_secs() -> u64 {
     3600
 }
 
+fn default_hot_warmup_enabled() -> bool {
+    true
+}
+
 fn default_hot_store_memory_limit_mb() -> u64 {
     8192
 }
@@ -551,6 +555,13 @@ pub struct StorageSettings {
     pub low_rate_memtable_max_age_secs: u64,
     #[serde(default = "default_hot_store_memory_limit_mb")]
     pub hot_store_memory_limit_mb: u64,
+    /// Rebuild resident hot stores from segments at startup. Close-aware:
+    /// segments archived by a close-of-day flush are not reloaded, only
+    /// segments written after the last close. Disable to keep every restart
+    /// cold, trading resident point-lookup speed for zero warmup I/O and
+    /// memory.
+    #[serde(default = "default_hot_warmup_enabled")]
+    pub hot_warmup_enabled: bool,
     #[serde(default = "default_row_group_target_rows")]
     pub row_group_target_rows: usize,
     /// Ack durable-tail appends once the bytes reach the page cache. The tail
@@ -816,6 +827,7 @@ fn default_storage_settings() -> StorageSettings {
         low_rate_memtable_max_rows: default_low_rate_memtable_max_rows(),
         low_rate_memtable_max_age_secs: default_low_rate_memtable_max_age_secs(),
         hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
+        hot_warmup_enabled: default_hot_warmup_enabled(),
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
         tail_async_fsync: false,

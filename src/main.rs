@@ -208,6 +208,7 @@ where
             .saturating_mul(1024 * 1024),
         config.storage.tail_async_fsync,
         pubsub_settings,
+        config.storage.hot_warmup_enabled,
     ) {
         Ok(e) => e,
         Err(e) => {

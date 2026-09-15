@@ -630,12 +630,14 @@ impl Engine {
                 );
             }
         }
-        let today = chrono::Local::now().date_naive().to_string();
+        let now = chrono::Local::now();
+        let today = now.date_naive().to_string();
         {
             let mut catalogs = self.catalogs.write().unwrap();
             if let Some(catalog) = catalogs.get_mut(db) {
                 if let Some(meta) = catalog.get_table_mut(table) {
                     meta.hot_last_close_date = Some(today);
+                    meta.hot_last_close_at = Some(now.timestamp_millis());
                 }
                 let meta_dir = self.data_dir.join("meta");
                 catalog.save(&meta_dir)?;
@@ -658,6 +660,13 @@ impl Engine {
     /// the store. For each hot-eligible table we load the most recently written
     /// segments (up to a row budget) so the inverted index is warm again.
     /// Best-effort: unreadable segments are skipped.
+    ///
+    /// Close-aware: segments archived by a close-of-day flush are NOT
+    /// reloaded. Only segments modified after the recorded close completion
+    /// (`hot_last_close_at`) are eligible, because a continuously-running
+    /// server would hold nothing older resident — the close evicted it. A
+    /// table closed by a legacy binary that recorded only
+    /// `hot_last_close_date` stays cold until its next close.
     pub fn warmup_hot_stores(&self) {
         use crate::storage::core::hot_store::resolve_key_column;
         use crate::storage::partition::parse_partition_key;
@@ -688,16 +697,56 @@ impl Engine {
                     continue;
                 }
 
+                // Close-aware recency cutoff. A close-of-day flush archives
+                // the resident mirror and evicts it, so a continuously-running
+                // server holds nothing for the table until new writes arrive.
+                // Reloading every segment on restart would undo that memory
+                // release, so only segments written after the recorded close
+                // completion are eligible for the rebuild.
+                let close_cutoff_ms: Option<i64> = if let Some(at) = table_meta.hot_last_close_at {
+                    Some(at)
+                } else if table_meta.hot_last_close_date.is_some() {
+                    // Legacy catalog state: closed before this binary began
+                    // recording the completion instant. The archived set
+                    // cannot be separated from post-close writes, so keep the
+                    // table cold; the next close records the cutoff.
+                    tracing::info!(
+                        db,
+                        table,
+                        last_close_date = ?table_meta.hot_last_close_date,
+                        "warmup: table closed without a recorded close instant, skipping hot store rebuild"
+                    );
+                    continue;
+                } else {
+                    None
+                };
+
                 let mut mtimed: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
                 for seg in &segments {
                     if let Ok(meta) = std::fs::metadata(seg) {
                         if let Ok(mtime) = meta.modified() {
+                            if let Some(cutoff) = close_cutoff_ms {
+                                let mtime_ms = mtime
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(i64::MAX);
+                                if mtime_ms <= cutoff {
+                                    continue;
+                                }
+                            }
                             mtimed.push((mtime, seg.clone()));
                         }
                     }
                 }
                 mtimed.sort_by(|a, b| b.cmp(a));
                 if mtimed.is_empty() {
+                    if close_cutoff_ms.is_some() {
+                        tracing::info!(
+                            db,
+                            table,
+                            "warmup: no segments written after the last close, hot store stays cold"
+                        );
+                    }
                     continue;
                 }
 
@@ -705,6 +754,8 @@ impl Engine {
                 let mut loaded_segments: HashSet<std::path::PathBuf> = HashSet::new();
                 let mut failed_segments: HashSet<std::path::PathBuf> = HashSet::new();
                 let mut budget_exhausted = false;
+                let eligible: HashSet<std::path::PathBuf> =
+                    mtimed.iter().map(|(_, path)| path.clone()).collect();
                 for (_, seg_path) in &mtimed {
                     if loaded_rows >= WARMUP_ROW_BUDGET {
                         budget_exhausted = true;
@@ -785,12 +836,19 @@ impl Engine {
                                 .push(seg.clone());
                         }
                         for (partition_key, partition_segments) in by_partition {
+                            // The store may answer a partition alone only when
+                            // it holds the partition's complete row set: every
+                            // segment must be inside the close-recency window
+                            // and fully loaded. A partition with any archived
+                            // (pre-cutoff) segment stays cold, matching a
+                            // server that never restarted.
                             if partition_segments
                                 .iter()
-                                .all(|seg| loaded_segments.contains(seg))
-                                && partition_segments
-                                    .iter()
-                                    .all(|seg| !failed_segments.contains(seg))
+                                .all(|seg| {
+                                    eligible.contains(seg)
+                                        && loaded_segments.contains(seg)
+                                        && !failed_segments.contains(seg)
+                                })
                             {
                                 store.mark_partition_resident(partition_key);
                             }

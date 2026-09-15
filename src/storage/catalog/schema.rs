@@ -152,6 +152,13 @@ pub struct TableMeta {
     pub hot_close_time: Option<String>,
     #[serde(default)]
     pub hot_last_close_date: Option<String>,
+    /// Epoch millis of the moment the last close-of-day flush completed
+    /// (after seal, resident eviction and optimize). Startup warmup uses it
+    /// as the recency cutoff: only segments modified after this instant are
+    /// reloaded into the hot store, because older ones were archived by that
+    /// close and a continuously-running server would not hold them resident.
+    #[serde(default)]
+    pub hot_last_close_at: Option<i64>,
     #[serde(default)]
     pub hot_index_column: Option<String>,
     #[serde(default = "default_row_group_size")]
@@ -203,6 +210,7 @@ impl TableMeta {
             hot_time_column: None,
             hot_close_time: None,
             hot_last_close_date: None,
+            hot_last_close_at: None,
             hot_index_column: None,
             row_group_size: 8192,
             partition_key: String::new(),
