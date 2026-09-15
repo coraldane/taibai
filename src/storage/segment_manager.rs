@@ -97,6 +97,12 @@ pub struct SegmentManager {
     reader_cache: Mutex<ReaderCache>,
     segment_meta_cache: Mutex<SegmentMetaCache>,
     cluster_meta_cache: Mutex<ClusterMetaCache>,
+    /// Readers for active (mutable) segments keyed by path. A mutable reader
+    /// only ever exposes the *published* footer state, so it stays valid while
+    /// the writer has nothing pending; `invalidate_reader` (every visibility
+    /// change and seal) evicts it. Caching them keeps read-heavy tables from
+    /// re-opening and re-parsing the segment footer on every query.
+    mutable_reader_cache: Mutex<HashMap<PathBuf, std::sync::Arc<SegmentReader>>>,
     /// Per-table count of successful memtable flushes. Unique-index snapshots stamp
     /// this epoch at build time; a later mismatch means segment rows landed after
     /// the snapshot was built, so the snapshot must be rebuilt before probing.

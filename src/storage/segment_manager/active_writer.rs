@@ -49,12 +49,28 @@ pub(super) struct ActiveSegmentWriter {
 }
 
 impl ActiveSegmentWriter {
+    /// Rows appended to this segment that a fresh reader cannot see yet: row
+    /// groups written to the data file after the last footer publish plus the
+    /// not-yet-row-grouped buffer. Reclaim paths must treat these as not
+    /// persisted — dropping their hot-store mirror before the footer publish
+    /// makes them invisible to every query until the next publish.
+    pub(super) fn unpublished_row_count(&self) -> u64 {
+        let published: u64 = self
+            .row_groups
+            .iter()
+            .take(self.sidecar_row_groups_flushed)
+            .map(|rg| rg.row_count)
+            .sum();
+        self.total_rows
+            .saturating_sub(published)
+            .saturating_add(self.buffered_rows as u64)
+    }
+
     pub(super) fn append_batch(
         &mut self,
         batch: &RecordBatch,
         invalidate_reader: &dyn Fn(&Path),
-    ) -> Result<()> {
-        if let Some(ref mut buffered) = self.buffered_batch {
+    ) -> Result<()> {        if let Some(ref mut buffered) = self.buffered_batch {
             for col_idx in 0..batch.num_columns() {
                 let src = batch.column(col_idx).unwrap();
                 let dst = buffered.column_mut(col_idx).unwrap();

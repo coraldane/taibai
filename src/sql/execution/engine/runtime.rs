@@ -309,7 +309,11 @@ impl Engine {
             // yet are neither persisted nor counted in `live`: subtracting
             // them keeps the persisted-prefix estimate stable while their
             // write is in progress.
-            .saturating_sub(self.hot_store_mgr.in_flight(db, table));
+            .saturating_sub(self.hot_store_mgr.in_flight(db, table))
+            // Rows sitting in the active segment without a published footer
+            // are not queryable yet; dropping their mirror here would hide
+            // them from every query until the next footer publish.
+            .saturating_sub(self.segment_mgr.unpublished_active_rows(db, table));
         if prefix > 0 {
             let dropped = self.hot_store_mgr.compact_prefix(db, table, prefix);
             // Rows below the new front are gone from the store: retract

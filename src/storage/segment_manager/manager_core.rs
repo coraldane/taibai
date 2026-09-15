@@ -78,6 +78,7 @@ impl SegmentManager {
             reader_cache: Mutex::new(ReaderCache::new(reader_cache_capacity())),
             segment_meta_cache: Mutex::new(SegmentMetaCache::new(reader_cache_capacity())),
             cluster_meta_cache: Mutex::new(ClusterMetaCache::new()),
+            mutable_reader_cache: Mutex::new(HashMap::new()),
             flush_epochs: RwLock::new(HashMap::new()),
             flush_stop,
             flush_paused,
@@ -423,13 +424,28 @@ impl SegmentManager {
     }
 
     pub fn open_reader_cached(&self, path: &Path) -> Result<Arc<SegmentReader>> {
-        // Active writers can change their data and sidecar footer at any time, so
-        // readers for them must remain uncached snapshots. A small *inactive*
-        // segment may be resumed later, but is stable until that happens; cache an
-        // owned snapshot for it and let recovery invalidate the cache before append.
+        // Active writers can change their data and sidecar footer at any time,
+        // but between writes the published state is stable. Reopening a large
+        // active segment costs a full footer/sidecar parse per query, which
+        // dominated read latency on write-heavy tables, so reuse the last
+        // opened reader while the writer has nothing pending. Any append
+        // falls back to the reopen path, whose `open_mutable_reader_owned`
+        // also publishes a dirty footer first (preserving old semantics).
         if self.is_mutable_segment_path(path) {
+            let cached = self.mutable_reader_cache.lock().unwrap().get(path).cloned();
+            if let Some(reader) = cached {
+                if !self.mutable_segment_has_pending_writes(path) {
+                    return Ok(reader);
+                }
+            }
             self.invalidate_reader(path);
-            return Ok(Arc::new(self.open_mutable_reader_owned(path)?));
+            let reader = std::sync::Arc::new(self.open_mutable_reader_owned(path)?);
+            let mut cache = self.mutable_reader_cache.lock().unwrap();
+            if cache.len() >= reader_cache_capacity().max(1) * 4 {
+                cache.clear();
+            }
+            cache.insert(path.to_path_buf(), reader.clone());
+            return Ok(reader);
         }
 
         if let Some(reader) = self.reader_cache.lock().unwrap().get(path) {
@@ -452,13 +468,52 @@ impl SegmentManager {
             .put(path.to_path_buf(), reader))
     }
 
+    /// True when the active segment for `path` has appended rows that are not
+    /// part of its published footer yet (dirty meta, append buffer, or
+    /// row groups written without a footer publish). While this is false, a
+    /// cached mutable reader exposes exactly the state a fresh open would.
+    fn mutable_segment_has_pending_writes(&self, path: &Path) -> bool {
+        let Some(state) = self.state_for_segment_path(path) else {
+            return true;
+        };
+        let active_guard = state.active_segments.lock().unwrap();
+        for segment in active_guard.values() {
+            if same_segment_path(&segment.path, path) {
+                return segment.dirty_meta
+                    || segment.buffered_rows > 0
+                    || segment.unpublished_row_count() > 0;
+            }
+        }
+        true
+    }
+
+    /// Rows written to this table's active segments that a fresh reader
+    /// cannot see yet (footer not published / still in the append buffer).
+    /// Hot-store reclamation must not count these as persisted.
+    pub fn unpublished_active_rows(&self, db: &str, table: &str) -> u64 {
+        let state = {
+            let tables = self.tables.read().unwrap();
+            match tables.get(&table_key(db, table)) {
+                Some(state) => state.clone(),
+                None => return 0,
+            }
+        };
+        let guard = state.active_segments.lock().unwrap();
+        guard.values().map(|seg| seg.unpublished_row_count()).sum()
+    }
+
     pub fn invalidate_reader(&self, path: &Path) {
+        self.mutable_reader_cache.lock().unwrap().remove(path);
         self.reader_cache.lock().unwrap().invalidate(path);
         self.segment_meta_cache.lock().unwrap().invalidate(path);
         self.cluster_meta_cache.lock().unwrap().invalidate(path);
     }
 
     pub fn invalidate_readers_under(&self, dir: &Path) {
+        self.mutable_reader_cache
+            .lock()
+            .unwrap()
+            .retain(|path, _| !path.starts_with(dir));
         self.reader_cache.lock().unwrap().invalidate_under(dir);
         self.segment_meta_cache
             .lock()
