@@ -1189,3 +1189,239 @@ fn committed_transaction_disables_resident_fast_path_for_partition() {
 
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn restart_warmup_after_close_only_reloads_post_close_segments() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE tick_close (
+                    security_id VARCHAR,
+                    deal_date INT64,
+                    deal_time INT32,
+                    gmt_trade TIMESTAMP,
+                    price INT32
+                ) CLUSTER BY (security_id, deal_date, deal_time)
+                  HOT BY (gmt_trade) INDEX (security_id) CLOSE AT '23:59'
+                  PARTITION BY deal_date",
+            )
+            .expect("create tick_close");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO tick_close VALUES
+                    ('688256.SH', 20260709, 103904, 1783564744000000, 10),
+                    ('688256.SH', 20260709, 103913, 1783564753000000, 30)",
+            )
+            .expect("insert pre-close rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE tick_close")
+            .expect("flush pre-close rows");
+
+        // Archive the pre-close partition: seals segments, evicts the resident
+        // mirror and records hot_last_close_at.
+        engine
+            .close_of_day_flush_table("main", "tick_close")
+            .expect("close-of-day flush");
+
+        // Post-close writes land in a new partition whose segments stay
+        // eligible for the restart warmup. Sleep so the segment mtime clearly
+        // postdates the recorded close instant (mtime has ms granularity).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO tick_close VALUES
+                    ('688256.SH', 20260710, 103904, 1783651144000000, 50),
+                    ('000001.SZ', 20260710, 103999, 1783651199000000, 70)",
+            )
+            .expect("insert post-close rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE tick_close")
+            .expect("flush post-close rows");
+        engine.shutdown().expect("shutdown engine");
+    }
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    let store = engine
+        .hot_store_manager()
+        .get("main", "tick_close")
+        .expect("post-close segments should rebuild a hot store");
+    assert_eq!(
+        store.row_count(),
+        2,
+        "only post-close rows may be reloaded; rows archived by the close must stay cold"
+    );
+    assert!(store.is_resident_for_partition(Some("20260710")));
+    assert!(
+        !store.is_resident_for_partition(Some("20260709")),
+        "the archived partition must not be marked resident"
+    );
+
+    // The post-close partition keeps the memory fast path.
+    let plan = explain_text(
+        engine
+            .execute(
+                &mut session,
+                "EXPLAIN ANALYZE SELECT price FROM tick_close
+                 WHERE deal_date = 20260710 AND security_id = '688256.SH'",
+            )
+            .expect("explain post-close resident lookup"),
+    );
+    assert!(
+        !plan.contains("segments      :"),
+        "post-close partition lookup should skip segment scan, got:\n{}",
+        plan
+    );
+
+    // Archived rows remain queryable through the segment scan.
+    let archived = collect_count(
+        engine
+            .execute(
+                &mut session,
+                "SELECT count(*) FROM tick_close WHERE deal_date = 20260709",
+            )
+            .expect("archived partition still queryable"),
+    );
+    assert_eq!(archived, 2);
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn restart_warmup_skips_table_closed_without_recorded_instant() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE tick_legacy (
+                    security_id VARCHAR,
+                    deal_date INT64,
+                    deal_time INT32,
+                    gmt_trade TIMESTAMP,
+                    price INT32
+                ) CLUSTER BY (security_id, deal_date, deal_time)
+                  HOT BY (gmt_trade) INDEX (security_id)
+                  PARTITION BY deal_date",
+            )
+            .expect("create tick_legacy");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO tick_legacy VALUES
+                    ('688256.SH', 20260709, 103904, 1783564744000000, 10)",
+            )
+            .expect("insert rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE tick_legacy")
+            .expect("flush rows");
+        engine.shutdown().expect("shutdown engine");
+    }
+
+    // Simulate a catalog written by a legacy binary: the table was closed,
+    // but only the close date was recorded, not the completion instant.
+    let catalog_path = temp_dir
+        .path()
+        .join("meta")
+        .join("catalogs")
+        .join("main.json");
+    let raw = std::fs::read_to_string(&catalog_path).expect("read catalog");
+    let mut json: serde_json::Value = serde_json::from_str(&raw).expect("parse catalog");
+    json["tables"]["tick_legacy"]["hot_last_close_date"] =
+        serde_json::Value::String("2026-09-16".to_string());
+    json["tables"]["tick_legacy"]
+        .as_object_mut()
+        .expect("table object")
+        .remove("hot_last_close_at");
+    std::fs::write(&catalog_path, serde_json::to_vec(&json).expect("serialize catalog"))
+        .expect("write catalog");
+
+    let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
+    assert!(
+        engine
+            .hot_store_manager()
+            .get("main", "tick_legacy")
+            .is_none(),
+        "a table closed without a recorded instant must stay cold until its next close"
+    );
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn warmup_disabled_keeps_restart_cold() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    {
+        let mut engine = Engine::new(temp_dir.path(), "main").expect("failed to create engine");
+        let mut session = Session::new("root".to_string(), "main".to_string());
+
+        engine
+            .execute(
+                &mut session,
+                "CREATE TABLE tick_switch (
+                    security_id VARCHAR,
+                    deal_date INT64,
+                    deal_time INT32,
+                    gmt_trade TIMESTAMP,
+                    price INT32
+                ) CLUSTER BY (security_id, deal_date, deal_time)
+                  HOT BY (gmt_trade) INDEX (security_id)
+                  PARTITION BY deal_date",
+            )
+            .expect("create tick_switch");
+        engine
+            .execute(
+                &mut session,
+                "INSERT INTO tick_switch VALUES
+                    ('688256.SH', 20260709, 103904, 1783564744000000, 10)",
+            )
+            .expect("insert rows");
+        engine
+            .execute(&mut session, "FLUSH TABLE tick_switch")
+            .expect("flush rows");
+        engine.shutdown().expect("shutdown engine");
+    }
+
+    let engine = Engine::new_with_storage_config_and_auto_compact(
+        temp_dir.path(),
+        "main",
+        taibai::storage::segment_manager::SegmentConfig::default(),
+        taibai::sql::execution::AutoCompactConfig::default(),
+        64 * 1024 * 1024,
+        false,
+        taibai::common::config::PubSubSettings::default(),
+        false,
+    )
+    .expect("restart with warmup disabled");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    assert!(
+        engine
+            .hot_store_manager()
+            .get("main", "tick_switch")
+            .is_none(),
+        "warmup disabled must not rebuild a resident store"
+    );
+    let count = collect_count(
+        engine
+            .execute(
+                &mut session,
+                "SELECT count(*) FROM tick_switch WHERE deal_date = 20260709",
+            )
+            .expect("segment scan still serves the data"),
+    );
+    assert_eq!(count, 1);
+
+    engine.segment_mgr().shutdown();
+}
