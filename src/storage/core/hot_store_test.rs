@@ -735,3 +735,85 @@ fn parallel_gather_matches_serial_semantics() {
         .lookup_filtered(&ScalarValue::Int64(Some(9)), None, None, 0, false, None, &[], &[])
         .is_none());
 }
+
+/// Regression: partitioned hot table (PARTITION BY MONTH(deal_date)) with a
+/// VARCHAR cluster key and an Int32 partition column. Bulk-style multi-batch
+/// appends scatter each security's rows across chunk boundaries; an equality
+/// query pinning the partition column must return every row of that day.
+#[test]
+fn lookup_partition_eq_month_partitioned_table() {
+    let schema = Schema::new(vec![
+        ColumnDef::new("security_id", DataType::VarChar),
+        ColumnDef::new("deal_date", DataType::Int32),
+        ColumnDef::new("deal_time", DataType::Int32),
+        ColumnDef::new("val", DataType::Int64),
+    ]);
+    let mut meta = TableMeta::new("main", "minute_part", schema.columns.clone());
+    meta.cluster_key = vec!["security_id".to_string()];
+    meta.hot_time_column = Some("gmt_create".to_string());
+    meta.partition_key = "deal_date".to_string();
+    meta.partition_type = crate::storage::catalog::schema::PartitionType::Month;
+    meta.update_partition_key_idx();
+
+    let mgr = HotStoreManager::new();
+
+    // Two securities x 240 minute bars, appended in 20k-row batches with the
+    // rows shuffled per batch, mimicking an unordered CSV bulk load.
+    let total_rows = 200_000;
+    let mut rows: Vec<(u32, i32, i32)> = Vec::with_capacity(total_rows);
+    for r in 0..total_rows {
+        let sec = (r % 2) as u32; // 0,1 alternating = worst-case scatter
+        let deal_time = 930 + (r % 240) as i32;
+        rows.push((sec, 20260916, deal_time));
+    }
+
+    let batch_size = 20_000;
+    let mut start = 0usize;
+    while start < total_rows {
+        let end = (start + batch_size).min(total_rows);
+        let mut batch = RecordBatch::new(schema.clone());
+        let c0 = batch.column_mut(0).unwrap();
+        for r in &rows[start..end] {
+            c0.push(&ScalarValue::VarChar(Some(format!("sec{:05}", r.0)))).unwrap();
+        }
+        let c1 = batch.column_mut(1).unwrap();
+        for r in &rows[start..end] {
+            c1.push(&ScalarValue::Int32(Some(r.1))).unwrap();
+        }
+        let c2 = batch.column_mut(2).unwrap();
+        for r in &rows[start..end] {
+            c2.push(&ScalarValue::Int32(Some(r.2))).unwrap();
+        }
+        let c3 = batch.column_mut(3).unwrap();
+        for r in &rows[start..end] {
+            c3.push(&ScalarValue::Int64(Some(r.0 as i64 * 1_000_000))).unwrap();
+        }
+        mgr.try_append("main", "minute_part", &meta, &batch).unwrap();
+        start = end;
+    }
+
+    let store = mgr.get("main", "minute_part").unwrap();
+    assert_eq!(store.row_count(), total_rows as u64);
+
+    let key = ScalarValue::VarChar(Some("sec00000".into()));
+    let partition = ScalarValue::Int64(Some(20260916));
+
+    // Plain key lookup: every row of the security.
+    let all = owned(store.lookup(&key, None, None, 0, false).unwrap());
+    assert_eq!(all.num_rows(), total_rows / 2);
+
+    // Composite key+partition lookup: still every row of the day.
+    let day = owned(store
+        .lookup_filtered(&key, Some(&partition), None, 0, false, None, &[], &[])
+        .unwrap());
+    assert_eq!(
+        day.num_rows(),
+        total_rows / 2,
+        "composite key+partition lookup lost rows"
+    );
+
+    let count = store
+        .count_by_key_partition_from(&key, Some(&partition), 0)
+        .unwrap();
+    assert_eq!(count, (total_rows as u64) / 2, "composite count lost rows");
+}

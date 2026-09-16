@@ -90,6 +90,10 @@ fn full_memtables_flush_while_write_queue_stays_active() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
+    // The write queue drains asynchronously; pull this table's remaining
+    // memtable buffers into segments synchronously before counting rows.
+    writer.flush_table(TEST_DB, TEST_TABLE)?;
+
     assert_eq!(
         crate::storage::core::durable_tail::generation_file_count(&table_dir)?,
         0

@@ -14,6 +14,17 @@ impl IndexManager {
         schedule.pause_count = schedule.pause_count.saturating_add(1);
     }
 
+    /// Whether physical maintenance that rewrites location-index base
+    /// snapshots must currently stay deferred (an active bulk import holds
+    /// the compaction pause).
+    pub fn unique_index_compaction_paused(&self) -> bool {
+        self.unique_index_compaction
+            .lock()
+            .unwrap()
+            .pause_count
+            > 0
+    }
+
     pub fn resume_unique_index_compaction(&self) {
         let pending = {
             let mut schedule = self.unique_index_compaction.lock().unwrap();
@@ -66,6 +77,20 @@ impl IndexManager {
         index_name: &str,
         state: &Arc<UniqueIndexState>,
     ) {
+        // Final re-check under the schedule lock: a dispatch racing a fresh
+        // `begin_bulk_import` (e.g. a resume draining its pending set while a
+        // new import pauses compaction) must re-queue instead of rewriting the
+        // base snapshot mid-import. Every dispatch path funnels through here,
+        // so this is the single choke point that keeps the pause airtight.
+        {
+            let mut schedule = self.unique_index_compaction.lock().unwrap();
+            if schedule.pause_count > 0 {
+                schedule
+                    .pending
+                    .insert((db.to_string(), table.to_string(), index_name.to_string()));
+                return;
+            }
+        }
         if state.compaction_in_flight.swap(true, Ordering::AcqRel) {
             return;
         }

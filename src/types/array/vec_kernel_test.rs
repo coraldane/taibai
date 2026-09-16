@@ -282,3 +282,34 @@ fn selected_and_dictionary_columns_compare_through_flat_form() {
         Some(std::cmp::Ordering::Less)
     );
 }
+
+/// Regression: Int32 column compared against an Int64 literal with lt/le —
+/// the literal `20260916` in SQL arrives as Int64 while minute bars store
+/// deal_time as Int32; `deal_time <= 1033` must not lose every row.
+#[test]
+fn int32_column_cross_type_ordering_masks() {
+    use crate::types::batch::ColumnDef;
+    let mut col = ColumnArray::with_capacity(crate::protocol::types::DataType::Int32, 3);
+    for v in [930i32, 1034, 500] {
+        col.push(&ScalarValue::Int32(Some(v))).unwrap();
+    }
+    assert_eq!(
+        col.le_vec(&ScalarValue::Int64(Some(1033))),
+        vec![true, false, true],
+        "le_vec Int32 col vs Int64 literal"
+    );
+    assert_eq!(
+        col.lt_vec(&ScalarValue::Int64(Some(1033))),
+        vec![true, false, true],
+        "lt_vec Int32 col vs Int64 literal"
+    );
+    assert_eq!(
+        col.ge_vec(&ScalarValue::Int64(Some(930))),
+        vec![true, true, false],
+        "ge_vec Int32 col vs Int64 literal"
+    );
+    assert_eq!(
+        col.compare_scalar_at(0, &ScalarValue::Int64(Some(1033))),
+        Some(std::cmp::Ordering::Less)
+    );
+}

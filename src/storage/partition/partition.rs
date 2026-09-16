@@ -1,4 +1,5 @@
 use crate::common::error::{Result, TaibaiError};
+use crate::storage::partition::partition_function::strict_temporal_partition_key;
 use crate::types::scalar::ScalarValue;
 
 /// Partition strategy for a table.
@@ -103,6 +104,16 @@ impl PartitionPruner {
         Self { strategy }
     }
 
+    fn partition_function(&self) -> crate::storage::partition::partition_function::PartitionFunction {
+        use crate::storage::partition::partition_function::PartitionFunction;
+        match self.strategy {
+            PartitionStrategy::Day => PartitionFunction::Day,
+            PartitionStrategy::Year => PartitionFunction::Year,
+            PartitionStrategy::Month => PartitionFunction::Month,
+            PartitionStrategy::None => PartitionFunction::Value,
+        }
+    }
+
     pub fn prune(
         &self,
         available_partitions: &[String],
@@ -113,8 +124,21 @@ impl PartitionPruner {
             return available_partitions.to_vec();
         }
 
-        let lower_key = lower_bound.and_then(|v| compute_partition_key(v, self.strategy).ok());
-        let upper_key = upper_bound.and_then(|v| compute_partition_key(v, self.strategy).ok());
+        // A bound that cannot be interpreted as a partition key in the same
+        // date units as the partition column disables pruning on that side.
+        // Falling back to an epoch-style reinterpretation here once turned a
+        // `deal_time <= 2000` upper bound into month key "197001" and pruned
+        // every partition.
+        let lower_key = lower_bound
+            .and_then(|v| strict_temporal_partition_key(&self.partition_function(), v));
+        let upper_key = upper_bound
+            .and_then(|v| strict_temporal_partition_key(&self.partition_function(), v));
+        if lower_bound.is_some() && lower_key.is_none() {
+            return available_partitions.to_vec();
+        }
+        if upper_bound.is_some() && upper_key.is_none() {
+            return available_partitions.to_vec();
+        }
 
         available_partitions
             .iter()

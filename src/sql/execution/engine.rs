@@ -278,6 +278,14 @@ fn start_auto_compaction_thread(
                 && last_fragmentation_scan
                     .is_none_or(|last| last.elapsed() >= config.fragmentation_scan_interval);
             let compactor = Compactor::new(Arc::clone(&segment_mgr), data_dir.clone());
+            // A bulk import holds the unique-index compaction pause: segment
+            // rewrites here would rebuild location-index base snapshots
+            // mid-import (the delta-compaction dispatcher is paused, but this
+            // pass reaches the same files from a different subsystem). Defer
+            // the whole pass to the next tick instead.
+            if index_manager.unique_index_compaction_paused() {
+                continue;
+            }
             let table_metas = {
                 let catalogs = catalogs.read().unwrap();
                 catalogs

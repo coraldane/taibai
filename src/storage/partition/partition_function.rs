@@ -154,6 +154,38 @@ fn date_parts_from_scalar(val: &ScalarValue) -> Option<DateParts> {
     }
 }
 
+/// Like [`temporal_partition_key`], but without the epoch-micros fallback for
+/// bare integers: a bound that is not a valid YYYYMMDD-style date number (for
+/// example a `deal_time` wall-clock value like `930`, or an invalid date such
+/// as `20261000`) yields `None`. Range-pruning callers treat `None` as "no
+/// bound on this side" so a misparsed literal can never eliminate partitions.
+pub fn strict_temporal_partition_key(
+    func: &PartitionFunction,
+    val: &ScalarValue,
+) -> Option<String> {
+    let parts = match val {
+        ScalarValue::Timestamp(Some(v)) => date_parts_from_epoch_micros(*v),
+        ScalarValue::Date(Some(days)) => date_parts_from_epoch_days(*days as i64),
+        ScalarValue::Int32(Some(v)) => date_parts_from_date_number(*v as i64)?,
+        ScalarValue::Int64(Some(v)) => date_parts_from_date_number(*v)?,
+        ScalarValue::UInt32(Some(v)) => date_parts_from_date_number(*v as i64)?,
+        ScalarValue::UInt64(Some(v)) if *v <= i64::MAX as u64 => {
+            date_parts_from_date_number(*v as i64)?
+        }
+        ScalarValue::VarChar(Some(s)) => date_parts_from_str(s)?,
+        _ => return None,
+    };
+    match func {
+        PartitionFunction::Day => Some(format!(
+            "{:04}{:02}{:02}",
+            parts.year, parts.month, parts.day
+        )),
+        PartitionFunction::Month => Some(format!("{:04}{:02}", parts.year, parts.month)),
+        PartitionFunction::Year => Some(format!("{:04}", parts.year)),
+        _ => None,
+    }
+}
+
 fn date_parts_from_str(s: &str) -> Option<DateParts> {
     let trimmed = s.trim();
     if trimmed.len() >= 10 && trimmed.as_bytes().get(4) == Some(&b'-') {

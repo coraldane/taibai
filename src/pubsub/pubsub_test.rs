@@ -80,10 +80,20 @@ fn publish_delivers_notification_with_seq_and_topic() {
     // encoded batch body present
     assert!(rest.len() > 4);
 
-    let stats = hub.subscription_stats();
-    assert_eq!(stats.len(), 1);
-    assert_eq!(stats[0].sent, 1);
-    assert_eq!(stats[0].dropped, 0);
+    // The fan-out worker bumps the sent counter right after try_send; under
+    // load the notification can be observed before the counter lands. Wait
+    // for the stats to catch up instead of asserting immediately.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stats = hub.subscription_stats();
+        if stats.len() == 1 && stats[0].sent == 1 && stats[0].dropped == 0 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("expected sent=1 dropped=0, got {stats:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     // second publish bumps the per-topic sequence
     hub.publish("main", "ticks", int_batch(vec![4]));
@@ -126,16 +136,24 @@ fn slow_consumer_drops_without_blocking() {
     for i in 0..16 {
         hub.publish("db", "t", int_batch(vec![i as i64]));
     }
+    // The fan-out worker drains the event channel asynchronously: wait until
+    // every event has been accounted as either sent or dropped instead of
+    // racing the first drop.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while hub.subscription_stats()[0].dropped == 0 {
+    loop {
+        let stats = hub.subscription_stats();
+        if stats[0].sent + stats[0].dropped == 16 {
+            assert!(stats[0].dropped >= 1);
+            break;
+        }
         if std::time::Instant::now() > deadline {
-            panic!("expected dropped counter to increase");
+            panic!(
+                "expected all 16 events to be accounted, got sent={} dropped={}",
+                stats[0].sent, stats[0].dropped
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let stats = hub.subscription_stats();
-    assert_eq!(stats[0].sent + stats[0].dropped, 16);
-    assert!(stats[0].dropped >= 1);
     hub.shutdown();
 }
 
