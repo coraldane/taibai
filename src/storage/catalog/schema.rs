@@ -159,6 +159,16 @@ pub struct TableMeta {
     /// close and a continuously-running server would not hold them resident.
     #[serde(default)]
     pub hot_last_close_at: Option<i64>,
+    /// Partition-column raw value bound establishing the partial-residency
+    /// invariant: the hot mirror holds every row whose partition-column value
+    /// is strictly greater than this bound. Established at close-of-day as the
+    /// max over archived segment zone maps (the mirror is empty at that
+    /// instant, so only post-close writes — all mirrored — can exceed it) and
+    /// re-established by restart warmup when every post-close segment was
+    /// fully loaded. Any mirror bypass (`hot_unfed_rows`) invalidates the
+    /// claim at query time via `hot_partition_mirrored`.
+    #[serde(default)]
+    pub hot_mirror_covers_from: Option<i64>,
     #[serde(default)]
     pub hot_index_column: Option<String>,
     #[serde(default = "default_row_group_size")]
@@ -211,6 +221,7 @@ impl TableMeta {
             hot_close_time: None,
             hot_last_close_date: None,
             hot_last_close_at: None,
+            hot_mirror_covers_from: None,
             hot_index_column: None,
             row_group_size: 8192,
             partition_key: String::new(),

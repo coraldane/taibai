@@ -10,12 +10,18 @@ use taibai::net::client::Client;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let host = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:5252".into());
+    let host = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:5252".into());
     let database = args.get(2).cloned().unwrap_or_else(|| "main".into());
     let table = args.get(3).cloned().expect("table name required");
     let csv_path = args.get(4).cloned().expect("csv path required");
     let batch_rows: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(2_000);
-    let max_rows: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max_rows: usize = args
+        .get(6)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
     let no_header = args.iter().any(|a| a == "--no-header");
 
     let mut client = Client::connect(host.as_str()).await?;
@@ -29,9 +35,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     reader.read_line(&mut header)?;
     let cols: Vec<String> = if no_header {
         vec![
-            "id".into(), "gmt_create".into(), "security_id".into(), "deal_date".into(),
-            "deal_time".into(), "time_key".into(), "open_px".into(), "high_px".into(),
-            "low_px".into(), "close_px".into(), "trans_volume".into(), "trans_value".into(),
+            "id".into(),
+            "gmt_create".into(),
+            "security_id".into(),
+            "deal_date".into(),
+            "deal_time".into(),
+            "time_key".into(),
+            "open_px".into(),
+            "high_px".into(),
+            "low_px".into(),
+            "close_px".into(),
+            "trans_volume".into(),
+            "trans_value".into(),
             "mean".into(),
         ]
     } else {

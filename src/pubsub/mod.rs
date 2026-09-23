@@ -207,8 +207,7 @@ impl PubSubHub {
             tracing::warn!("pubsub.max_subscriptions is 0; enforcing a minimum of 1");
             settings.max_subscriptions = 1;
         }
-        let (event_tx, event_rx) =
-            crossbeam_channel::bounded(settings.event_channel_capacity);
+        let (event_tx, event_rx) = crossbeam_channel::bounded(settings.event_channel_capacity);
         let fanout = Arc::new(FanoutState {
             subs: RwLock::new(Vec::new()),
             subscriber_count: AtomicU64::new(0),
@@ -279,9 +278,7 @@ impl PubSubHub {
         // sequence gap subscribers observe covers hub-level drops too.
         let seq = {
             let mut seqs = self.topic_seqs.lock().unwrap();
-            let seq = seqs
-                .entry(format!("{db}.{table}"))
-                .or_insert(0);
+            let seq = seqs.entry(format!("{db}.{table}")).or_insert(0);
             *seq = seq.wrapping_add(1);
             *seq
         };

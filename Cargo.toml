@@ -132,6 +132,14 @@ name = "hot_store_fast_path_test"
 path = "tests/hot_store_fast_path_test.rs"
 
 [[test]]
+name = "hybrid_hot_mirror_test"
+path = "tests/hybrid_hot_mirror_test.rs"
+
+[[test]]
+name = "hybrid_bench_test"
+path = "tests/hybrid_bench_test.rs"
+
+[[test]]
 name = "aggregate_streaming_test"
 path = "tests/aggregate_streaming_test.rs"
 

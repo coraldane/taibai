@@ -632,12 +632,30 @@ impl Engine {
         }
         let now = chrono::Local::now();
         let today = now.date_naive().to_string();
+        // Establish the partial-residency coverage bound. The mirror was just
+        // emptied, so every row whose partition-column value exceeds the
+        // archived maximum can only come from post-close writes, which the
+        // insert path mirrors; any later bypass re-closes the gate through
+        // `hot_partition_mirrored`.
+        let covers_from = match SegmentManager::discover_segments(&self.segment_mgr.table_dir(db, table))
+        {
+            // An empty table legitimately yields i64::MIN (nothing archived,
+            // every future row is post-close). A discovery FAILURE must not:
+            // the mirror is empty here, so claiming full coverage would hide
+            // every archived row — decline the feature for this cycle.
+            Ok(segments) => self.max_partition_value_of_segments(&table_meta, &segments),
+            Err(e) => {
+                tracing::warn!(db, table, error = %e, "close-of-day: segment discovery failed, hybrid mirror coverage disabled");
+                None
+            }
+        };
         {
             let mut catalogs = self.catalogs.write().unwrap();
             if let Some(catalog) = catalogs.get_mut(db) {
                 if let Some(meta) = catalog.get_table_mut(table) {
                     meta.hot_last_close_date = Some(today);
                     meta.hot_last_close_at = Some(now.timestamp_millis());
+                    meta.hot_mirror_covers_from = covers_from;
                 }
                 let meta_dir = self.data_dir.join("meta");
                 catalog.save(&meta_dir)?;
@@ -649,9 +667,49 @@ impl Engine {
             rows_written = stats.rows_written,
             rows_dropped = stats.rows_dropped,
             partitions_optimized = dirty_partitions.len(),
+            hot_mirror_covers_from = ?covers_from,
             "close-of-day: table resident state evicted and optimized"
         );
         Ok(())
+    }
+
+    /// Max partition-column value across `segments`' zone maps, as i64 in the
+    /// column's own value domain (integer partition columns only). `None`
+    /// means the mirror-coverage claim cannot be proven (unreadable segment
+    /// metadata or a non-integer partition column); `Some(i64::MIN)` when
+    /// there is nothing archived, so every future row is post-close.
+    fn max_partition_value_of_segments(
+        &self,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        segments: &[std::path::PathBuf],
+    ) -> Option<i64> {
+        use crate::types::scalar::ScalarValue;
+        let pk_idx = table_meta.get_partition_column_index()?;
+        let column = table_meta.columns.get(pk_idx)?;
+        if !matches!(
+            column.data_type,
+            crate::protocol::types::DataType::Int32 | crate::protocol::types::DataType::Int64
+        ) {
+            return None;
+        }
+        if segments.is_empty() {
+            return Some(i64::MIN);
+        }
+        let mut max: Option<i64> = None;
+        for seg in segments {
+            let meta = self.segment_mgr.segment_meta(seg).ok().flatten()?;
+            let zone = meta.segment_zone_maps.get(pk_idx)?;
+            if zone.row_count == 0 {
+                continue;
+            }
+            let value = match zone.max_value.clone() {
+                ScalarValue::Int32(Some(v)) => v as i64,
+                ScalarValue::Int64(Some(v)) => v,
+                _ => return None,
+            };
+            max = Some(max.map_or(value, |m| m.max(value)));
+        }
+        Some(max.unwrap_or(i64::MIN))
     }
 
     /// Rebuild resident hot stores from on-disk segments after a restart (design
@@ -676,6 +734,7 @@ impl Engine {
 
         const WARMUP_ROW_BUDGET: u64 = 20_000_000;
 
+        let mut covers_updates: Vec<(String, String, i64)> = Vec::new();
         let catalogs = self.catalogs.read().unwrap();
         for (db, catalog) in catalogs.iter() {
             for (table, table_meta) in catalog.tables.iter() {
@@ -862,6 +921,44 @@ impl Engine {
                         loaded_rows,
                         "warmup: rebuilt resident hot store from segments"
                     );
+                }
+
+                // Re-establish the partial-residency bound: when every
+                // post-close segment was fully loaded, the mirror holds all
+                // rows above the archived maximum, so hybrid scans may serve
+                // that range without full-partition residency. Applied to the
+                // catalog after the read lock is released.
+                if close_cutoff_ms.is_some()
+                    && !budget_exhausted
+                    && eligible
+                        .iter()
+                        .all(|seg| loaded_segments.contains(seg) && !failed_segments.contains(seg))
+                {
+                    let archived: Vec<std::path::PathBuf> = segments
+                        .iter()
+                        .filter(|seg| !eligible.contains(*seg))
+                        .cloned()
+                        .collect();
+                    if let Some(covers) =
+                        self.max_partition_value_of_segments(table_meta, &archived)
+                    {
+                        covers_updates.push((db.clone(), table.clone(), covers));
+                    }
+                }
+            }
+        }
+        drop(catalogs);
+        if !covers_updates.is_empty() {
+            let mut catalogs = self.catalogs.write().unwrap();
+            for (db, table, covers) in covers_updates {
+                if let Some(catalog) = catalogs.get_mut(&db) {
+                    if let Some(meta) = catalog.get_table_mut(&table) {
+                        meta.hot_mirror_covers_from = Some(covers);
+                    }
+                    let meta_dir = self.data_dir.join("meta");
+                    if let Err(e) = catalog.save(&meta_dir) {
+                        tracing::warn!(db, table, error = %e, "warmup: persisting mirror coverage failed");
+                    }
                 }
             }
         }

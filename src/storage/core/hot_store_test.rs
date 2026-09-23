@@ -51,15 +51,17 @@ fn append_then_lookup_varchar_key() {
     let store = mgr.get("main", "events").unwrap();
     assert_eq!(store.row_count(), 3);
 
-    let result = owned(store
-        .lookup(
-            &ScalarValue::VarChar(Some("alpha".into())),
-            None,
-            None,
-            0,
-            false,
-        )
-        .unwrap());
+    let result = owned(
+        store
+            .lookup(
+                &ScalarValue::VarChar(Some("alpha".into())),
+                None,
+                None,
+                0,
+                false,
+            )
+            .unwrap(),
+    );
     assert_eq!(result.num_rows(), 3);
     assert_eq!(result.num_columns(), 4);
     match result.column(0).unwrap() {
@@ -132,15 +134,17 @@ fn incremental_index_across_appends() {
         store.count_by_key_partition_from(&ScalarValue::VarChar(Some("A".into())), None, 0),
         Some(3)
     );
-    let a = owned(store
-        .lookup(
-            &ScalarValue::VarChar(Some("A".into())),
-            None,
-            Some(&[1, 3]),
-            0,
-            false,
-        )
-        .unwrap());
+    let a = owned(
+        store
+            .lookup(
+                &ScalarValue::VarChar(Some("A".into())),
+                None,
+                Some(&[1, 3]),
+                0,
+                false,
+            )
+            .unwrap(),
+    );
     assert_eq!(a.num_rows(), 3);
     assert_eq!(a.num_columns(), 2);
 }
@@ -196,17 +200,18 @@ fn lookup_uses_key_partition_index_and_reverse_offsets() {
     }
     mgr.try_append("main", "ticks", &meta, &batch).unwrap();
 
-    let out = owned(mgr
-        .get("main", "ticks")
-        .unwrap()
-        .lookup(
-            &ScalarValue::VarChar(Some("A".to_string())),
-            Some(&ScalarValue::Int64(Some(20260709))),
-            Some(&[3]),
-            0,
-            true,
-        )
-        .unwrap());
+    let out = owned(
+        mgr.get("main", "ticks")
+            .unwrap()
+            .lookup(
+                &ScalarValue::VarChar(Some("A".to_string())),
+                Some(&ScalarValue::Int64(Some(20260709))),
+                Some(&[3]),
+                0,
+                true,
+            )
+            .unwrap(),
+    );
     assert_eq!(out.num_rows(), 2);
     match out.column(0).unwrap() {
         ColumnArray::Int32 { data, .. } => assert_eq!(data, &vec![20, 10]),
@@ -214,25 +219,27 @@ fn lookup_uses_key_partition_index_and_reverse_offsets() {
     }
 
     let store = mgr.get("main", "ticks").unwrap();
-    let filtered = owned(store
-        .lookup_filtered(
-            &ScalarValue::VarChar(Some("A".to_string())),
-            Some(&ScalarValue::Int64(Some(20260709))),
-            Some(&[3]),
-            0,
-            true,
-            Some(1),
-            &[
-                (0, ScalarValue::VarChar(Some("A".to_string()))),
-                (1, ScalarValue::Int64(Some(20260709))),
-            ],
-            &[RangeClause {
-                column_index: 2,
-                op: RangeOp::Ge,
-                value: ScalarValue::Int32(Some(93001)),
-            }],
-        )
-        .unwrap());
+    let filtered = owned(
+        store
+            .lookup_filtered(
+                &ScalarValue::VarChar(Some("A".to_string())),
+                Some(&ScalarValue::Int64(Some(20260709))),
+                Some(&[3]),
+                0,
+                true,
+                Some(1),
+                &[
+                    (0, ScalarValue::VarChar(Some("A".to_string()))),
+                    (1, ScalarValue::Int64(Some(20260709))),
+                ],
+                &[RangeClause {
+                    column_index: 2,
+                    op: RangeOp::Ge,
+                    value: ScalarValue::Int32(Some(93001)),
+                }],
+            )
+            .unwrap(),
+    );
     assert_eq!(filtered.num_rows(), 1);
     match filtered.column(0).unwrap() {
         ColumnArray::Int32 { data, .. } => assert_eq!(data, &vec![20]),
@@ -275,9 +282,11 @@ fn integer_key_point_lookup() {
         store.count_by_key_partition_from(&ScalarValue::Int64(Some(10)), None, 0),
         Some(2)
     );
-    let r = owned(store
-        .lookup(&ScalarValue::Int64(Some(10)), None, None, 0, false)
-        .unwrap());
+    let r = owned(
+        store
+            .lookup(&ScalarValue::Int64(Some(10)), None, None, 0, false)
+            .unwrap(),
+    );
     assert_eq!(r.num_rows(), 2);
     match r.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![10, 10]),
@@ -317,28 +326,32 @@ fn lookup_watermark_excludes_flushed_prefix() {
     assert_eq!(store.row_count(), 4);
 
     // No watermark: all three A rows.
-    let all = owned(store
-        .lookup(
-            &ScalarValue::VarChar(Some("A".into())),
-            None,
-            Some(&[3]),
-            0,
-            false,
-        )
-        .unwrap());
+    let all = owned(
+        store
+            .lookup(
+                &ScalarValue::VarChar(Some("A".into())),
+                None,
+                Some(&[3]),
+                0,
+                false,
+            )
+            .unwrap(),
+    );
     assert_eq!(all.num_rows(), 3);
 
     // Watermark 3 simulates "offsets [0,3) already persisted to segments";
     // only the live A row at offset 3 is gathered (volume = 4).
-    let live = owned(store
-        .lookup(
-            &ScalarValue::VarChar(Some("A".into())),
-            None,
-            Some(&[3]),
-            3,
-            false,
-        )
-        .unwrap());
+    let live = owned(
+        store
+            .lookup(
+                &ScalarValue::VarChar(Some("A".into())),
+                None,
+                Some(&[3]),
+                3,
+                false,
+            )
+            .unwrap(),
+    );
     assert_eq!(live.num_rows(), 1);
     match live.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![4]),
@@ -346,15 +359,17 @@ fn lookup_watermark_excludes_flushed_prefix() {
     }
 
     // Watermark past every A offset -> empty result (segment scan covers them).
-    let none = owned(store
-        .lookup(
-            &ScalarValue::VarChar(Some("A".into())),
-            None,
-            Some(&[3]),
-            4,
-            false,
-        )
-        .unwrap());
+    let none = owned(
+        store
+            .lookup(
+                &ScalarValue::VarChar(Some("A".into())),
+                None,
+                Some(&[3]),
+                4,
+                false,
+            )
+            .unwrap(),
+    );
     assert_eq!(none.num_rows(), 0);
 }
 
@@ -439,7 +454,11 @@ fn kv_batch(ids: std::ops::Range<i64>) -> RecordBatch {
 /// Materialize `Selected` view columns so tests can pattern-match owned
 /// variants.
 fn owned(batch: RecordBatch) -> RecordBatch {
-    let cols = batch.columns.iter().map(|c| c.flattened().clone()).collect();
+    let cols = batch
+        .columns
+        .iter()
+        .map(|c| c.flattened().clone())
+        .collect();
     RecordBatch::try_new(batch.schema.clone(), cols).unwrap()
 }
 
@@ -469,9 +488,11 @@ fn chunk_seal_keeps_global_order_across_boundaries() {
     assert_eq!(store.row_count(), 20);
 
     // Forward lookup gathers ascending append order across chunk boundaries.
-    let fwd = owned(store
-        .lookup(&ScalarValue::Int64(Some(0)), None, Some(&[1]), 0, false)
-        .unwrap());
+    let fwd = owned(
+        store
+            .lookup(&ScalarValue::Int64(Some(0)), None, Some(&[1]), 0, false)
+            .unwrap(),
+    );
     match fwd.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => {
             assert_eq!(data, &vec![0, 30, 60, 90, 120, 150, 180]);
@@ -481,27 +502,31 @@ fn chunk_seal_keeps_global_order_across_boundaries() {
 
     // Reverse lookup starts at the newest row, even when it lives in the open
     // chunk, and the LIMIT short-circuits without walking older chunks.
-    let rev = owned(store
-        .lookup_filtered(
-            &ScalarValue::Int64(Some(0)),
-            None,
-            Some(&[1]),
-            0,
-            true,
-            Some(2),
-            &[],
-            &[],
-        )
-        .unwrap());
+    let rev = owned(
+        store
+            .lookup_filtered(
+                &ScalarValue::Int64(Some(0)),
+                None,
+                Some(&[1]),
+                0,
+                true,
+                Some(2),
+                &[],
+                &[],
+            )
+            .unwrap(),
+    );
     match rev.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![180, 150]),
         _ => panic!("expected int64 payload column"),
     }
 
     // Watermark above both sealed chunks leaves only the open-chunk row.
-    let live = owned(store
-        .lookup(&ScalarValue::Int64(Some(0)), None, Some(&[1]), 16, false)
-        .unwrap());
+    let live = owned(
+        store
+            .lookup(&ScalarValue::Int64(Some(0)), None, Some(&[1]), 16, false)
+            .unwrap(),
+    );
     match live.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![180]),
         _ => panic!("expected int64 payload column"),
@@ -532,16 +557,20 @@ fn compact_prefix_drops_whole_chunks_and_trims_boundary() {
     assert!(store
         .lookup(&ScalarValue::Int64(Some(9)), None, None, 0, false)
         .is_none());
-    let kept = owned(store
-        .lookup(&ScalarValue::Int64(Some(10)), None, Some(&[1]), 0, false)
-        .unwrap());
+    let kept = owned(
+        store
+            .lookup(&ScalarValue::Int64(Some(10)), None, Some(&[1]), 0, false)
+            .unwrap(),
+    );
     match kept.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![100]),
         _ => panic!("expected int64 payload column"),
     }
-    let from_open = owned(store
-        .lookup(&ScalarValue::Int64(Some(19)), None, Some(&[1]), 0, false)
-        .unwrap());
+    let from_open = owned(
+        store
+            .lookup(&ScalarValue::Int64(Some(19)), None, Some(&[1]), 0, false)
+            .unwrap(),
+    );
     match from_open.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![190]),
         _ => panic!("expected int64 payload column"),
@@ -585,9 +614,11 @@ fn compact_prefix_drops_whole_chunks_and_trims_boundary() {
     assert!(store
         .lookup(&ScalarValue::Int64(Some(17)), None, None, 0, false)
         .is_none());
-    let tail = owned(store
-        .lookup(&ScalarValue::Int64(Some(18)), None, Some(&[1]), 0, false)
-        .unwrap());
+    let tail = owned(
+        store
+            .lookup(&ScalarValue::Int64(Some(18)), None, Some(&[1]), 0, false)
+            .unwrap(),
+    );
     match tail.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(data, &vec![180]),
         _ => panic!("expected int64 payload column"),
@@ -601,7 +632,10 @@ fn hard_memory_limit_rejects_before_mutation() {
     let err = store
         .append(&kv_batch(0..4))
         .expect_err("append must be rejected under backpressure");
-    assert!(matches!(err, crate::common::error::TaibaiError::ResourceBusy(_)));
+    assert!(matches!(
+        err,
+        crate::common::error::TaibaiError::ResourceBusy(_)
+    ));
     assert_eq!(store.row_count(), 0);
     assert_eq!(
         store.count_by_key_partition_from(&ScalarValue::Int64(Some(1)), None, 0),
@@ -664,9 +698,20 @@ fn parallel_gather_matches_serial_semantics() {
     let expected: Vec<i64> = (0..rows).filter(|i| i % 7 == 3).collect();
 
     // Full-key gather across both chunks (parallel path), ascending order.
-    let fwd = owned(store
-        .lookup_filtered(&ScalarValue::Int64(Some(3)), None, Some(&[1]), 0, false, None, &[], &[])
-        .unwrap());
+    let fwd = owned(
+        store
+            .lookup_filtered(
+                &ScalarValue::Int64(Some(3)),
+                None,
+                Some(&[1]),
+                0,
+                false,
+                None,
+                &[],
+                &[],
+            )
+            .unwrap(),
+    );
     assert_eq!(fwd.num_rows() as i64, rows / 7);
     match fwd.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(&data[..], &expected[..]),
@@ -674,9 +719,20 @@ fn parallel_gather_matches_serial_semantics() {
     }
 
     // Reverse full gather (parallel path), descending append order.
-    let rev = owned(store
-        .lookup_filtered(&ScalarValue::Int64(Some(3)), None, Some(&[1]), 0, true, None, &[], &[])
-        .unwrap());
+    let rev = owned(
+        store
+            .lookup_filtered(
+                &ScalarValue::Int64(Some(3)),
+                None,
+                Some(&[1]),
+                0,
+                true,
+                None,
+                &[],
+                &[],
+            )
+            .unwrap(),
+    );
     match rev.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => {
             let mut reversed = expected.clone();
@@ -688,18 +744,20 @@ fn parallel_gather_matches_serial_semantics() {
 
     // Watermark cuts both chunks; only rows at or after offset 60_000 remain.
     let expected_from: Vec<i64> = (60_000i64..rows).filter(|i| i % 7 == 3).collect();
-    let live = owned(store
-        .lookup_filtered(
-            &ScalarValue::Int64(Some(3)),
-            None,
-            Some(&[1]),
-            60_000,
-            false,
-            None,
-            &[],
-            &[],
-        )
-        .unwrap());
+    let live = owned(
+        store
+            .lookup_filtered(
+                &ScalarValue::Int64(Some(3)),
+                None,
+                Some(&[1]),
+                60_000,
+                false,
+                None,
+                &[],
+                &[],
+            )
+            .unwrap(),
+    );
     match live.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(&data[..], &expected_from[..]),
         _ => panic!("expected int64 payload column"),
@@ -710,29 +768,40 @@ fn parallel_gather_matches_serial_semantics() {
     );
 
     // Parallel path with a pushed-down predicate, and an unseen key.
-    let filtered = owned(store
-        .lookup_filtered(
-            &ScalarValue::Int64(Some(3)),
-            None,
-            Some(&[1]),
-            0,
-            false,
-            None,
-            &[],
-            &[RangeClause {
-                column_index: 1,
-                op: RangeOp::Lt,
-                value: ScalarValue::Int64(Some(35_000)),
-            }],
-        )
-        .unwrap());
+    let filtered = owned(
+        store
+            .lookup_filtered(
+                &ScalarValue::Int64(Some(3)),
+                None,
+                Some(&[1]),
+                0,
+                false,
+                None,
+                &[],
+                &[RangeClause {
+                    column_index: 1,
+                    op: RangeOp::Lt,
+                    value: ScalarValue::Int64(Some(35_000)),
+                }],
+            )
+            .unwrap(),
+    );
     let expected_filtered: Vec<i64> = expected.iter().copied().filter(|v| *v < 35_000).collect();
     match filtered.column(0).unwrap() {
         ColumnArray::Int64 { data, .. } => assert_eq!(&data[..], &expected_filtered[..]),
         _ => panic!("expected int64 payload column"),
     }
     assert!(store
-        .lookup_filtered(&ScalarValue::Int64(Some(9)), None, None, 0, false, None, &[], &[])
+        .lookup_filtered(
+            &ScalarValue::Int64(Some(9)),
+            None,
+            None,
+            0,
+            false,
+            None,
+            &[],
+            &[]
+        )
         .is_none());
 }
 
@@ -774,7 +843,8 @@ fn lookup_partition_eq_month_partitioned_table() {
         let mut batch = RecordBatch::new(schema.clone());
         let c0 = batch.column_mut(0).unwrap();
         for r in &rows[start..end] {
-            c0.push(&ScalarValue::VarChar(Some(format!("sec{:05}", r.0)))).unwrap();
+            c0.push(&ScalarValue::VarChar(Some(format!("sec{:05}", r.0))))
+                .unwrap();
         }
         let c1 = batch.column_mut(1).unwrap();
         for r in &rows[start..end] {
@@ -786,9 +856,11 @@ fn lookup_partition_eq_month_partitioned_table() {
         }
         let c3 = batch.column_mut(3).unwrap();
         for r in &rows[start..end] {
-            c3.push(&ScalarValue::Int64(Some(r.0 as i64 * 1_000_000))).unwrap();
+            c3.push(&ScalarValue::Int64(Some(r.0 as i64 * 1_000_000)))
+                .unwrap();
         }
-        mgr.try_append("main", "minute_part", &meta, &batch).unwrap();
+        mgr.try_append("main", "minute_part", &meta, &batch)
+            .unwrap();
         start = end;
     }
 
@@ -803,9 +875,11 @@ fn lookup_partition_eq_month_partitioned_table() {
     assert_eq!(all.num_rows(), total_rows / 2);
 
     // Composite key+partition lookup: still every row of the day.
-    let day = owned(store
-        .lookup_filtered(&key, Some(&partition), None, 0, false, None, &[], &[])
-        .unwrap());
+    let day = owned(
+        store
+            .lookup_filtered(&key, Some(&partition), None, 0, false, None, &[], &[])
+            .unwrap(),
+    );
     assert_eq!(
         day.num_rows(),
         total_rows / 2,

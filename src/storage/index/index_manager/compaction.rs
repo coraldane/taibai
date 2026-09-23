@@ -18,11 +18,7 @@ impl IndexManager {
     /// snapshots must currently stay deferred (an active bulk import holds
     /// the compaction pause).
     pub fn unique_index_compaction_paused(&self) -> bool {
-        self.unique_index_compaction
-            .lock()
-            .unwrap()
-            .pause_count
-            > 0
+        self.unique_index_compaction.lock().unwrap().pause_count > 0
     }
 
     pub fn resume_unique_index_compaction(&self) {
@@ -85,9 +81,11 @@ impl IndexManager {
         {
             let mut schedule = self.unique_index_compaction.lock().unwrap();
             if schedule.pause_count > 0 {
-                schedule
-                    .pending
-                    .insert((db.to_string(), table.to_string(), index_name.to_string()));
+                schedule.pending.insert((
+                    db.to_string(),
+                    table.to_string(),
+                    index_name.to_string(),
+                ));
                 return;
             }
         }

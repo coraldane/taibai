@@ -119,7 +119,9 @@ fn pruner_ignores_bounds_that_are_not_valid_date_numbers() {
     );
     let upper_before = ScalarValue::Int64(Some(20260831));
     assert!(
-        pruner.prune(&partitions, None, Some(&upper_before)).is_empty(),
+        pruner
+            .prune(&partitions, None, Some(&upper_before))
+            .is_empty(),
         "earlier-month upper bound prunes the partition"
     );
 }

@@ -5,6 +5,18 @@ impl SegmentManager {
         FLUSH_TRANSITION_DELAY_MS.store(ms, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn partition_lock_arc_for_tests(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Arc<std::sync::Mutex<()>> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        partition_mutation_lock_arc(&state, partition_key)
+    }
+
     pub(crate) fn flush_transition_delay() -> u64 {
         FLUSH_TRANSITION_DELAY_MS.load(Ordering::Acquire)
     }
@@ -663,6 +675,12 @@ impl SegmentManager {
         Ok(())
     }
 
+    /// Run `f` while holding the table-wide mutation gate. The gate excludes
+    /// every other mutator of the table: other table-wide operations (via
+    /// `mutation_lock`) and all partition-scoped writers (via the frozen
+    /// `partition_locks` registry plus every partition mutex held for the
+    /// duration of `f`). Partition-scoped writers should prefer
+    /// `with_partition_mutation_lock` so unrelated partitions stay parallel.
     pub fn with_table_mutation_lock<T>(
         &self,
         db: &str,
@@ -671,8 +689,53 @@ impl SegmentManager {
     ) -> Result<T> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _guard = acquire_mutation_lock(&state, &key)?;
-        ensure_state_not_retired(&state, db, table)?;
+        self.with_state_table_mutation_lock(&state, &key, || {
+            ensure_state_not_retired(&state, db, table)?;
+            f()
+        })
+    }
+
+    /// Acquire the wide mutation gate for an already-resolved table state.
+    /// Callers are responsible for the retired-state check.
+    ///
+    /// The gate freezes partition-scoped writers through `partition_gate`:
+    /// the registry write guard is only held for the partition-mutex
+    /// snapshot, then released while `f` runs so new partitions can still be
+    /// created (their writers will self-freeze on the gate flag).
+    fn with_state_table_mutation_lock<T>(
+        &self,
+        state: &Arc<TableSegmentState>,
+        key: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _mutation_guard = acquire_mutation_lock(state, key)?;
+        state.partition_gate.store(true, Ordering::Release);
+        let _gate_reset = PartitionGateReset(Arc::clone(state));
+        let registry = state.partition_locks.write().unwrap();
+        let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
+        partition_keys.sort();
+        let partition_locks = partition_keys
+            .iter()
+            .map(|partition| Arc::clone(&registry[partition]))
+            .collect::<Vec<_>>();
+        drop(registry);
+        let mut partition_guards = Vec::with_capacity(partition_locks.len());
+        let mut acquisition_error = None;
+        for (partition, lock) in partition_keys.iter().zip(&partition_locks) {
+            match lock.lock() {
+                Ok(guard) => partition_guards.push(guard),
+                Err(poisoned) => {
+                    acquisition_error = Some(TaibaiError::Storage(format!(
+                        "partition mutation lock poisoned on {} partition {}: {}",
+                        key, partition, poisoned
+                    )));
+                    break;
+                }
+            }
+        }
+        if let Some(error) = acquisition_error {
+            return Err(error);
+        }
         f()
     }
 
@@ -692,12 +755,141 @@ impl SegmentManager {
             .iter()
             .map(|key| self.get_or_create_state(key))
             .collect::<Vec<_>>();
-        let mut guards = Vec::with_capacity(states.len());
+        let mut mutation_guards = Vec::with_capacity(states.len());
         for (key, state) in keys.iter().zip(states.iter()) {
-            guards.push(acquire_mutation_lock(state, key)?);
+            mutation_guards.push(acquire_mutation_lock(state, key)?);
         }
-        let _guards = guards;
+        for state in &states {
+            state.partition_gate.store(true, Ordering::Release);
+        }
+        let _gate_reset = DatabaseGatesReset(states.clone());
+        let mut registries = Vec::with_capacity(states.len());
+        let mut partition_arc_sets = Vec::with_capacity(states.len());
+        let mut partition_key_sets = Vec::with_capacity(states.len());
+        for state in &states {
+            let registry = state.partition_locks.write().unwrap();
+            let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
+            partition_keys.sort();
+            let mut arcs = Vec::with_capacity(partition_keys.len());
+            for partition in &partition_keys {
+                arcs.push(Arc::clone(&registry[partition]));
+            }
+            partition_arc_sets.push(arcs);
+            partition_key_sets.push(partition_keys);
+            registries.push(registry);
+        }
+        drop(registries);
+        let mut partition_guard_sets = Vec::with_capacity(states.len());
+        let mut collection_error = None;
+        'collection: for (table_idx, key) in keys.iter().enumerate() {
+            let mut guards = Vec::new();
+            let partitions = &partition_key_sets[table_idx];
+            for (partition, lock) in partitions.iter().zip(&partition_arc_sets[table_idx]) {
+                match lock.lock() {
+                    Ok(guard) => guards.push(guard),
+                    Err(poisoned) => {
+                        collection_error = Some(TaibaiError::Storage(format!(
+                            "partition mutation lock poisoned on {} partition {}: {}",
+                            key, partition, poisoned
+                        )));
+                        partition_guard_sets.push(guards);
+                        break 'collection;
+                    }
+                }
+            }
+            partition_guard_sets.push(guards);
+        }
+        if let Some(error) = collection_error {
+            return Err(error);
+        }
         f()
+    }
+
+    /// Run `f` while holding only one partition's mutation lock. Mutators of
+    /// other partitions of the same table proceed in parallel; table-wide
+    /// mutation operations still exclude this writer through the wide gate.
+    pub fn with_partition_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let lock = partition_mutation_lock_arc(&state, partition_key);
+        let _guard = acquire_partition_mutation_lock(&state, &lock, &key, partition_key)?;
+        ensure_state_not_retired(&state, db, table)?;
+        f()
+    }
+
+    /// Run `f` while holding the mutation locks of an explicit partition
+    /// subset. Locks are acquired in sorted order so overlapping subset
+    /// operations cannot deadlock; table-wide mutations exclude this caller
+    /// through the wide-gate re-check inside each partition acquisition, and
+    /// partitions outside the set stay fully parallel.
+    pub fn with_partition_set_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        partition_keys: &[&str],
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if partition_keys.is_empty() {
+            return f();
+        }
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let mut sorted: Vec<&str> = partition_keys.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let locks = sorted
+            .iter()
+            .map(|partition| partition_mutation_lock_arc(&state, partition))
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(locks.len());
+        for (partition, lock) in sorted.iter().zip(&locks) {
+            guards.push(acquire_partition_mutation_lock(
+                &state, lock, &key, partition,
+            )?);
+        }
+        ensure_state_not_retired(&state, db, table)?;
+        f()
+    }
+
+    pub fn try_with_partition_mutation_lock<T>(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        let lock = {
+            let registry = match state.partition_locks.try_read() {
+                Ok(registry) => registry,
+                Err(_) => return Ok(None),
+            };
+            match registry.get(partition_key) {
+                Some(lock) => Some(Arc::clone(lock)),
+                None => None,
+            }
+        };
+        let lock = match lock {
+            Some(lock) => lock,
+            None => partition_mutation_lock_arc(&state, partition_key),
+        };
+        let _guard = match lock.try_lock() {
+            Ok(guard) if !state.partition_gate.load(Ordering::Acquire) => guard,
+            Ok(_) => return Ok(None),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("partition mutation lock poisoned: {}", poisoned)
+            }
+        };
+        ensure_state_not_retired(&state, db, table)?;
+        f().map(Some)
     }
 
     pub fn try_with_table_mutation_lock<T>(
@@ -708,15 +900,40 @@ impl SegmentManager {
     ) -> Result<Option<T>> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _guard = match state.mutation_lock.try_lock() {
+        let _mutation_guard = match state.mutation_lock.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 panic!("table mutation lock poisoned: {}", poisoned)
             }
         };
+        let registry = match state.partition_locks.try_write() {
+            Ok(registry) => registry,
+            Err(_) => return Ok(None),
+        };
+        let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
+        partition_keys.sort();
+        let partition_locks = partition_keys
+            .iter()
+            .map(|partition| Arc::clone(&registry[partition]))
+            .collect::<Vec<_>>();
+        let mut partition_guards = Vec::with_capacity(partition_locks.len());
+        for (_partition, lock) in partition_keys.iter().zip(&partition_locks) {
+            let guard = match lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    panic!("partition mutation lock poisoned: {}", poisoned)
+                }
+            };
+            partition_guards.push(guard);
+        }
         ensure_state_not_retired(&state, db, table)?;
-        f().map(Some)
+        let result = f().map(Some);
+        drop(partition_guards);
+        drop(partition_locks);
+        drop(registry);
+        result
     }
 
     pub fn try_with_database_mutation_locks<T>(
@@ -735,15 +952,45 @@ impl SegmentManager {
             .iter()
             .map(|key| self.get_or_create_state(key))
             .collect::<Vec<_>>();
-        let mut guards = Vec::with_capacity(states.len());
-        for state in &states {
-            match state.mutation_lock.try_lock() {
-                Ok(guard) => guards.push(guard),
+        let mut mutation_guards = Vec::with_capacity(states.len());
+        let mut registries = Vec::with_capacity(states.len());
+        let mut partition_arc_sets = Vec::with_capacity(states.len());
+        for (_key, state) in keys.iter().zip(states.iter()) {
+            let mutation_guard = match state.mutation_lock.try_lock() {
+                Ok(guard) => guard,
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                     panic!("table mutation lock poisoned: {}", poisoned)
                 }
+            };
+            let registry = match state.partition_locks.try_write() {
+                Ok(registry) => registry,
+                Err(_) => return Ok(None),
+            };
+            let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
+            partition_keys.sort();
+            let mut arcs = Vec::with_capacity(partition_keys.len());
+            for partition in &partition_keys {
+                arcs.push(Arc::clone(&registry[partition]));
             }
+            mutation_guards.push(mutation_guard);
+            partition_arc_sets.push(arcs);
+            registries.push(registry);
+        }
+        let mut partition_guard_sets = Vec::with_capacity(states.len());
+        for partition_locks in &partition_arc_sets {
+            let mut guards = Vec::new();
+            for lock in partition_locks {
+                let guard = match lock.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        panic!("partition mutation lock poisoned: {}", poisoned)
+                    }
+                };
+                guards.push(guard);
+            }
+            partition_guard_sets.push(guards);
         }
         f().map(Some)
     }
@@ -919,6 +1166,24 @@ impl SegmentManager {
 /// (slow fsync, durable-tail rewrite, compaction) must surface as an explicit
 /// timeout error instead of blocking the caller forever, and slow acquisitions
 /// are logged so lock queueing is visible in the server log.
+struct PartitionGateReset(Arc<TableSegmentState>);
+
+impl Drop for PartitionGateReset {
+    fn drop(&mut self) {
+        self.0.partition_gate.store(false, Ordering::Release);
+    }
+}
+
+struct DatabaseGatesReset(Vec<Arc<TableSegmentState>>);
+
+impl Drop for DatabaseGatesReset {
+    fn drop(&mut self) {
+        for state in &self.0 {
+            state.partition_gate.store(false, Ordering::Release);
+        }
+    }
+}
+
 fn acquire_mutation_lock<'a>(
     state: &'a TableSegmentState,
     key: &str,
@@ -956,5 +1221,75 @@ fn acquire_mutation_lock<'a>(
                 panic!("table mutation lock poisoned: {}", poisoned)
             }
         }
+    }
+}
+
+/// Clone (or lazily create) the partition's mutation lock. The Arc is owned
+/// by the caller's scope so the subsequent `MutexGuard` borrows a stable
+/// local instead of registry internals.
+fn partition_mutation_lock_arc(
+    state: &TableSegmentState,
+    partition_key: &str,
+) -> Arc<std::sync::Mutex<()>> {
+    if let Some(lock) = state.partition_locks.read().unwrap().get(partition_key) {
+        return Arc::clone(lock);
+    }
+    let mut registry = state.partition_locks.write().unwrap();
+    Arc::clone(
+        registry
+            .entry(partition_key.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(()))),
+    )
+}
+
+/// Acquire a partition mutation lock with the same bounded wait, slow-lock
+/// warning, and timeout error as the table-wide mutation lock, so partition
+/// lock queueing is equally visible in the server log. After acquiring the
+/// mutex the writer re-checks the table's wide-gate flag: a table-wide
+/// mutation operation that has already snapshotted this partition holds the
+/// mutex, so the writer releases and retries until the gate clears.
+fn acquire_partition_mutation_lock<'a>(
+    state: &TableSegmentState,
+    lock: &'a std::sync::Mutex<()>,
+    key: &str,
+    partition_key: &str,
+) -> Result<std::sync::MutexGuard<'a, ()>> {
+    let timeouts = crate::common::config::storage_timeouts();
+    let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
+    let warn_after = Duration::from_millis(timeouts.mutation_lock_warn_ms.max(1));
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => {
+                if !state.partition_gate.load(Ordering::Acquire) {
+                    let waited = start.elapsed();
+                    if waited >= warn_after {
+                        tracing::warn!(
+                            table = key,
+                            partition = partition_key,
+                            wait_ms = waited.as_millis() as u64,
+                            "partition mutation lock acquisition was slow"
+                        );
+                    }
+                    return Ok(guard);
+                }
+                drop(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("partition mutation lock poisoned: {}", poisoned)
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "partition mutation lock timeout after {}ms waiting on {} partition {}",
+                timeout.as_millis(),
+                key,
+                partition_key
+            )));
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(16));
     }
 }

@@ -1073,8 +1073,7 @@ pub fn recover_index(table_dir: &Path, _schema: &Schema) -> Result<Vec<Recovered
                 // Like a sub-header file, nothing was fsynced into it, so
                 // treat it as absent instead of failing the whole table's
                 // recovery.
-                let partition_len =
-                    u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+                let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
                 if bytes.len() < 8usize.saturating_add(partition_len) {
                     continue;
                 }

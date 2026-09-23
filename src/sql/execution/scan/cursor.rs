@@ -143,11 +143,7 @@ impl ScanCursor {
                     }
                     continue;
                 }
-                let received = match self
-                    .decode_rx
-                    .as_ref()
-                    .and_then(|rx| rx.recv().ok())
-                {
+                let received = match self.decode_rx.as_ref().and_then(|rx| rx.recv().ok()) {
                     Some(batch) => batch,
                     None => {
                         self.decode_rx = None;
@@ -181,9 +177,7 @@ impl ScanCursor {
             }
 
             let reader = self.current_reader.as_ref().unwrap().clone();
-            while self.candidate_pos < self.current_candidates.len()
-                || !self.prefetch.is_empty()
-            {
+            while self.candidate_pos < self.current_candidates.len() || !self.prefetch.is_empty() {
                 if self.prefetch.is_empty() {
                     self.fill_prefetch(&reader);
                 }
@@ -238,14 +232,8 @@ impl ScanCursor {
             .filter_map(|rg_idx| {
                 let _cpu = crate::common::work_limiter::acquire_cpu();
                 let _io = crate::common::work_limiter::acquire_io();
-                strategy::read_row_group_with_strategy(
-                    &spec,
-                    &plan,
-                    &table_schema,
-                    &reader,
-                    rg_idx,
-                )
-                .ok()
+                strategy::read_row_group_with_strategy(&spec, &plan, &table_schema, &reader, rg_idx)
+                    .ok()
             })
             .collect();
         for batch in batches {
@@ -349,28 +337,27 @@ impl ScanCursor {
                 // a normal end-of-stream: catch it and fail the query instead.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     for (segment, precomputed) in segments.iter().zip(per_segment_candidates) {
-                        let reader =
-                            match runtime.segment_mgr().open_reader_cached(segment) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    if segment.exists() {
-                                        // The file is still there but cannot be
-                                        // opened: a real error, not a compaction
-                                        // race — fail the query like the inline
-                                        // walk would.
-                                        let _ = tx.send(Err(e));
-                                        return;
-                                    }
-                                    // Segment removed under us by a concurrent
-                                    // compaction: skip it the way the inline
-                                    // pruning would.
-                                    tracing::warn!(
-                                        segment = %segment.display(),
-                                        "cursor background decode: segment vanished mid-scan; skipping"
-                                    );
-                                    continue;
+                        let reader = match runtime.segment_mgr().open_reader_cached(segment) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if segment.exists() {
+                                    // The file is still there but cannot be
+                                    // opened: a real error, not a compaction
+                                    // race — fail the query like the inline
+                                    // walk would.
+                                    let _ = tx.send(Err(e));
+                                    return;
                                 }
-                            };
+                                // Segment removed under us by a concurrent
+                                // compaction: skip it the way the inline
+                                // pruning would.
+                                tracing::warn!(
+                                    segment = %segment.display(),
+                                    "cursor background decode: segment vanished mid-scan; skipping"
+                                );
+                                continue;
+                            }
+                        };
                         let candidates = match precomputed {
                             Some(candidates) => candidates,
                             None => match strategy::prune_segment(&spec, &reader) {
@@ -504,6 +491,37 @@ impl ScanCursor {
             return Ok(());
         }
 
+        // Hybrid partial-residency leg: the mirror answers the rows above its
+        // coverage bound; the segment and memtable legs below run with the
+        // complementary `<= covers` range clause so the two sides never
+        // overlap.
+        let mut hybrid_mirror_batch = None;
+        if self.spec.hot_mirror_bound.is_none() {
+            let mut hybrid_spec = self.spec.clone();
+            hybrid_spec.projection = Some(self.plan.projection_cols.clone());
+            if let Some((batch, pk_idx, covers)) = memtable::hybrid_hot_mirror_scan(
+                self.runtime.hot_store_manager(),
+                self.runtime.memtable_manager(),
+                &self.db,
+                &self.table_meta,
+                &hybrid_spec,
+            ) {
+                self.spec
+                    .range_predicates
+                    .push(crate::storage::partition::pruning::RangeClause {
+                        column_index: pk_idx,
+                        op: crate::storage::partition::pruning::RangeOp::Le,
+                        value: covers.clone(),
+                    });
+                self.spec.hot_mirror_bound = Some((pk_idx, covers));
+                self.plan =
+                    strategy::ScanPlanner::new(&self.spec, &self.table_schema, &self.table_meta)
+                        .build();
+                self.remaining_limit = self.plan.scan_limit;
+                hybrid_mirror_batch = Some(batch);
+            }
+        }
+
         let table_dir = self
             .runtime
             .data_dir()
@@ -528,6 +546,11 @@ impl ScanCursor {
             &self.spec.table_name,
             &memtable_spec,
         );
+        // The mirror batch rides the memtable drain path, which applies the
+        // TTL filter, projection and limit identically.
+        if let Some(batch) = hybrid_mirror_batch {
+            self.memtable_batches.push(batch);
+        }
 
         if self.try_spawn_background_decoder()? {
             self.initialized = true;

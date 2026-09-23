@@ -438,10 +438,7 @@ enum RequestOutcome {
 /// which already released its pubsub subscriptions, so nothing is left to
 /// clean up.
 fn unpack_worker_output(
-    joined: std::result::Result<
-        (Option<Handler>, Result<Vec<Message>>),
-        tokio::task::JoinError,
-    >,
+    joined: std::result::Result<(Option<Handler>, Result<Vec<Message>>), tokio::task::JoinError>,
 ) -> (Option<Handler>, Result<Vec<Message>>) {
     match joined {
         Ok(output) => output,

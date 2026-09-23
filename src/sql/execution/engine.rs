@@ -184,36 +184,34 @@ impl TablePhysicalHealth {
 
 fn table_physical_health(
     segment_mgr: &SegmentManager,
-    db: &str,
-    table: &str,
+    _db: &str,
+    _table: &str,
     table_dir: &Path,
     target_row_group_rows: u64,
     collect_fragmentation: bool,
 ) -> Result<TablePhysicalHealth> {
-    segment_mgr.with_table_mutation_lock(db, table, || {
-        let mut health = TablePhysicalHealth::default();
-        let small_limit = target_row_group_rows.max(1).div_ceil(4);
-        for path in SegmentManager::discover_segments(table_dir)? {
-            let reader = segment_mgr.open_reader_cached(&path)?;
-            health.deleted_rows = health
-                .deleted_rows
-                .saturating_add(reader.deleted_row_count());
-            health.live_rows = health.live_rows.saturating_add(
-                reader
-                    .row_count()
-                    .saturating_sub(reader.deleted_row_count()),
-            );
-            if collect_fragmentation {
-                health.row_groups = health.row_groups.saturating_add(reader.num_row_groups());
-                for row_group_idx in 0..reader.num_row_groups() {
-                    if reader.row_group_rows(row_group_idx) <= small_limit {
-                        health.small_row_groups = health.small_row_groups.saturating_add(1);
-                    }
+    let mut health = TablePhysicalHealth::default();
+    let small_limit = target_row_group_rows.max(1).div_ceil(4);
+    for path in SegmentManager::discover_segments(table_dir)? {
+        let reader = segment_mgr.open_reader_cached(&path)?;
+        health.deleted_rows = health
+            .deleted_rows
+            .saturating_add(reader.deleted_row_count());
+        health.live_rows = health.live_rows.saturating_add(
+            reader
+                .row_count()
+                .saturating_sub(reader.deleted_row_count()),
+        );
+        if collect_fragmentation {
+            health.row_groups = health.row_groups.saturating_add(reader.num_row_groups());
+            for row_group_idx in 0..reader.num_row_groups() {
+                if reader.row_group_rows(row_group_idx) <= small_limit {
+                    health.small_row_groups = health.small_row_groups.saturating_add(1);
                 }
             }
         }
-        Ok(health)
-    })
+    }
+    Ok(health)
 }
 
 fn rebuild_compacted_location_indexes(

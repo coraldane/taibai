@@ -45,11 +45,13 @@ Taibai 的可见性以 **memtable 为粒度**，不是行级多版本（MVCC）�
 
 ## 并发写入
 
-- 同一张表上的所有写操作（INSERT / UPDATE / DELETE / REPLACE / 事务提交 / flush）在存储层按 **(数据库, 表) 粒度互斥串行**执行。
+- 存储层写入互斥为**两级锁**：单分区操作（普通 INSERT、事务提交、分区 flush、bulk 追加）按 **(数据库, 表, 分区) 粒度互斥**；REPLACE、未命中分区裁剪的 UPDATE / DELETE、DDL 等全表一致操作获取表级宽锁执行。
+- **分区裁剪命中时锁更细**：分区键等值的 UPDATE / DELETE 只锁目标分区；compaction 按分区并行执行、每个分区重写只锁自己；后台健康统计为纯读，不再加锁。集合外分区的写入不受影响。
+- 同一分区上的写入仍然严格串行；**不同分区之间互不阻塞**。对按时间分区的大表（如分钟级行情表），历史分区的 flush / compaction 不再阻塞当前分区的实时写入。
 - **没有行级锁**。两个会话修改同一行时，后执行者覆盖先执行者（last-writer-wins），不报错也不等待。
 - 主键与唯一约束的冲突检查在写入前完成：违反约束的批会在**写入任何行之前**整批报错（语句级原子性）。
-- 跨多张表的操作按表名排序后依次加锁，避免相互等待造成死锁。
-- 长事务会在提交时集中持有各目标表的表锁；高并发写入同一张表的场景下，大事务提交可能表现为该表上的写入停顿。
+- 跨多张表的操作按表名排序后依次加锁，同一张表内多个分区按分区名排序加锁，避免相互等待造成死锁。
+- 长事务提交时会依次持有其涉及分区的分区锁；大事务提交只停顿它写过的分区，同表其他分区的写入不受影响。
 
 ## 并发读取
 
@@ -59,7 +61,7 @@ Taibai 的可见性以 **memtable 为粒度**，不是行级多版本（MVCC）�
 
 ## UPDATE 与 DELETE 的并发行为
 
-- UPDATE 按谓词重写受影响的 row group，DELETE 以删除位图做逻辑删除；两者都在表锁内执行，与并发写串行化。
+- UPDATE 按谓词重写受影响的 row group，DELETE 以删除位图做逻辑删除。谓词命中分区键等值条件时，两者只在目标分区的分区锁内执行，与该分区并发写串行化、不影响其他分区；其余情况在表级宽锁内执行。
 - UPDATE 拒绝修改分区键，避免行在分区之间"移动"造成不一致。
 - 删除后的可见性（memtable 内、flush 后、混合状态）由 `delete_visibility_regression_test` 覆盖。
 
@@ -79,7 +81,8 @@ Taibai 的可见性以 **memtable 为粒度**，不是行级多版本（MVCC）�
 |------|------|
 | 事务状态机与 ReadCommitted 默认值 | `src/storage/txn/txn.rs` |
 | memtable 可见性（`TxnVisibility` / `is_visible_to`） | `src/storage/core/memtable.rs` |
-| 表级写互斥与跨表锁排序 | `src/storage/segment_manager/manager_core.rs`（`with_table_mutation_lock` / `with_database_mutation_locks`） |
+| 表级宽锁、分区锁、分区子集锁与跨表锁排序 | `src/storage/segment_manager/manager_core.rs`（`with_table_mutation_lock` / `with_partition_mutation_lock` / `with_partition_set_mutation_lock` / `with_database_mutation_locks`） |
+| UPDATE / DELETE 与 compaction 的分区收窄 | `src/sql/execution/dml_update.rs`、`src/sql/execution/dml_delete.rs`、`src/storage/core/compactor.rs` |
 | 写入与提交流程 | `src/storage/core/batch_writer.rs`（`write_columns_with_txn` / `commit_txn` / `rollback_txn`） |
 | 读路径可见性过滤 | `src/sql/execution/scan/memtable.rs` |
 | 事务端到端行为 | `tests/transaction_integration_test.rs` |

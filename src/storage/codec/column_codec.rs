@@ -478,7 +478,8 @@ pub(crate) fn decode_i64_delta_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
     Ok(values)
 }
 
-fn encode_i64_delta_payload(values: &[i64]) -> Vec<u8> {    let mut out = Vec::with_capacity(12 + values.len() * 2);
+fn encode_i64_delta_payload(values: &[i64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + values.len() * 2);
     out.extend_from_slice(&(values.len() as u32).to_le_bytes());
     out.extend_from_slice(&values[0].to_le_bytes());
     let mut prev = values[0];
@@ -986,7 +987,13 @@ pub fn decode_column(
 
     let remaining_data = &data[4 + bitmap_len..];
     if remaining_data.starts_with(COLUMN_ENCODING_MAGIC) {
-        return decode_adaptive_column(remaining_data, row_count, col_def, bitmap, allow_dictionary);
+        return decode_adaptive_column(
+            remaining_data,
+            row_count,
+            col_def,
+            bitmap,
+            allow_dictionary,
+        );
     }
     let mut dc = Cursor::new(remaining_data);
 
@@ -1059,13 +1066,17 @@ pub fn decode_column(
                     continue;
                 }
                 if pos + 4 > remaining_data.len() {
-                    return Err(TaibaiError::Storage("varchar decode: truncated length".into()));
+                    return Err(TaibaiError::Storage(
+                        "varchar decode: truncated length".into(),
+                    ));
                 }
                 let len =
                     u32::from_le_bytes(remaining_data[pos..pos + 4].try_into().unwrap()) as usize;
                 pos += 4;
                 if pos + len > remaining_data.len() {
-                    return Err(TaibaiError::Storage("varchar decode: truncated value".into()));
+                    return Err(TaibaiError::Storage(
+                        "varchar decode: truncated value".into(),
+                    ));
                 }
                 let raw = &remaining_data[pos..pos + len];
                 match std::str::from_utf8(raw) {
@@ -1367,11 +1378,36 @@ fn build_numeric_column_from_i64(
     // second pass, no copy.
     if bitmap.null_count() == 0 {
         match col_def.data_type {
-            DataType::Int64 => return Ok(ColumnArray::Int64 { data: values, bitmap }),
-            DataType::Decimal => return Ok(ColumnArray::Decimal { data: values, bitmap }),
-            DataType::Time => return Ok(ColumnArray::Time { data: values, bitmap }),
-            DataType::Timestamp => return Ok(ColumnArray::Timestamp { data: values, bitmap }),
-            DataType::Interval => return Ok(ColumnArray::Interval { data: values, bitmap }),
+            DataType::Int64 => {
+                return Ok(ColumnArray::Int64 {
+                    data: values,
+                    bitmap,
+                })
+            }
+            DataType::Decimal => {
+                return Ok(ColumnArray::Decimal {
+                    data: values,
+                    bitmap,
+                })
+            }
+            DataType::Time => {
+                return Ok(ColumnArray::Time {
+                    data: values,
+                    bitmap,
+                })
+            }
+            DataType::Timestamp => {
+                return Ok(ColumnArray::Timestamp {
+                    data: values,
+                    bitmap,
+                })
+            }
+            DataType::Interval => {
+                return Ok(ColumnArray::Interval {
+                    data: values,
+                    bitmap,
+                })
+            }
             _ => {}
         }
     }

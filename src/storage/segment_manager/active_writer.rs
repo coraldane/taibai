@@ -70,7 +70,8 @@ impl ActiveSegmentWriter {
         &mut self,
         batch: &RecordBatch,
         invalidate_reader: &dyn Fn(&Path),
-    ) -> Result<()> {        if let Some(ref mut buffered) = self.buffered_batch {
+    ) -> Result<()> {
+        if let Some(ref mut buffered) = self.buffered_batch {
             for col_idx in 0..batch.num_columns() {
                 let src = batch.column(col_idx).unwrap();
                 let dst = buffered.column_mut(col_idx).unwrap();

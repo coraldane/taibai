@@ -91,6 +91,9 @@ pub struct ScanStats {
     pub rows_scanned: u64,
     pub rows_filtered_by_delete_bitmap: u64,
     pub bytes_read_compressed: u64,
+    /// Rows served by the hybrid hot-mirror leg (partial residency) instead
+    /// of being decoded from segments.
+    pub hot_mirror_rows: u64,
 }
 
 #[derive(Debug, Clone, Default)]

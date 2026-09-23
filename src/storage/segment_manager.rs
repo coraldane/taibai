@@ -156,3 +156,7 @@ fn is_incomplete_compaction_file(name: &str) -> bool {
 #[cfg(test)]
 #[path = "lock_test.rs"]
 mod lock_tests;
+
+#[cfg(test)]
+#[path = "partition_lock_test.rs"]
+mod partition_lock_tests;

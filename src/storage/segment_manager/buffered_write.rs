@@ -49,7 +49,9 @@ impl SegmentManager {
         std::fs::create_dir_all(&table_dir)?;
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let partition_lock = partition_mutation_lock_arc(&state, partition_key);
+        let _partition_guard =
+            acquire_partition_mutation_lock(&state, &partition_lock, &key, partition_key)?;
         ensure_state_not_retired(&state, db, table)?;
 
         self.append_batch_with_partition_owned_locked(
@@ -79,7 +81,9 @@ impl SegmentManager {
         std::fs::create_dir_all(&table_dir)?;
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let partition_lock = partition_mutation_lock_arc(&state, partition_key);
+        let _partition_guard =
+            acquire_partition_mutation_lock(&state, &partition_lock, &key, partition_key)?;
         ensure_state_not_retired(&state, db, table)?;
 
         self.append_batch_with_partition_locked(
@@ -115,7 +119,9 @@ impl SegmentManager {
 
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
+        let partition_lock = partition_mutation_lock_arc(&state, partition_key);
+        let _partition_guard =
+            acquire_partition_mutation_lock(&state, &partition_lock, &key, partition_key)?;
         ensure_state_not_retired(&state, db, table)?;
         self.flush_memtable_batch_under_table_lock_inner(
             db,

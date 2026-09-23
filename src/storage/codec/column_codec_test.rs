@@ -1,5 +1,5 @@
 use crate::protocol::types::DataType;
-use crate::storage::codec::column_codec::{COLUMN_ENCODING_MAGIC, decode_column, encode_column_ex};
+use crate::storage::codec::column_codec::{decode_column, encode_column_ex, COLUMN_ENCODING_MAGIC};
 use crate::storage::codec::encoding::EncodingType;
 use crate::types::array::ColumnArray;
 use crate::types::batch::ColumnDef;
@@ -442,7 +442,11 @@ fn bitpacked_payload_survives_maximal_deltas() {
     let mut values = Vec::new();
     let mut base = -(1i64 << 54);
     for i in 0..300 {
-        let delta = if i % 2 == 0 { 1i64 << 54 } else { -(1i64 << 54) };
+        let delta = if i % 2 == 0 {
+            1i64 << 54
+        } else {
+            -(1i64 << 54)
+        };
         base = base.wrapping_add(delta);
         values.push(base);
     }
@@ -484,7 +488,9 @@ fn rle_stored_choice_never_loses_to_the_old_stacked_form() {
         // Long-ish runs with moderate jumps.
         (
             "long runs".into(),
-            (0..4_096).map(|i| 1_000_000 + (i / 512) as i64 * 100).collect(),
+            (0..4_096)
+                .map(|i| 1_000_000 + (i / 512) as i64 * 100)
+                .collect(),
         ),
     ];
 
@@ -558,11 +564,7 @@ fn bitpacked_payload_roundtrip_all_widths() {
     for width in 1u32..=56 {
         // Deltas drawn from the width's full range keep the encoder from
         // bailing; center them so signed deltas wrap the frame of reference.
-        let delta_range: i64 = if width >= 63 {
-            0
-        } else {
-            1i64 << (width - 1)
-        };
+        let delta_range: i64 = if width >= 63 { 0 } else { 1i64 << (width - 1) };
         for len in [129usize, 130, 132, 255, 257, 383] {
             let mut values = Vec::with_capacity(len);
             let mut base = (next() % 2_000_000) as i64 - 1_000_000;
@@ -571,13 +573,12 @@ fn bitpacked_payload_roundtrip_all_widths() {
                 base = base.wrapping_add(delta);
                 values.push(base);
             }
-            let payload = match crate::storage::codec::column_codec::encode_i64_bitpacked_payload(
-                &values,
-            ) {
-                Some(payload) => payload,
-                // Blocks too wide for the 56-bit cap are declined wholesale.
-                None => continue,
-            };
+            let payload =
+                match crate::storage::codec::column_codec::encode_i64_bitpacked_payload(&values) {
+                    Some(payload) => payload,
+                    // Blocks too wide for the 56-bit cap are declined wholesale.
+                    None => continue,
+                };
             let decoded =
                 crate::storage::codec::column_codec::decode_i64_bitpacked_payload(&payload)
                     .unwrap();
@@ -709,8 +710,7 @@ fn bitpacked_decimal_tick_prices_roundtrip_via_stored_choice() {
 }
 
 fn delta_rle_roundtrip(values: &[i64]) {
-    let payload =
-        crate::storage::codec::column_codec::encode_i64_delta_rle_payload(values);
+    let payload = crate::storage::codec::column_codec::encode_i64_delta_rle_payload(values);
     let decoded =
         crate::storage::codec::column_codec::decode_i64_delta_rle_payload(&payload).unwrap();
     assert_eq!(decoded, values);
@@ -782,7 +782,10 @@ fn delta_rle_column_roundtrip_with_nulls_and_verbatim() {
     let raw = if stored.data.starts_with(&zstd_magic) {
         zstd::bulk::decompress(&stored.data, plain_bytes_cap(n)).unwrap()
     } else {
-        assert_eq!(stored_encoding_tag(&stored.data), Some(EncodingType::DeltaRle));
+        assert_eq!(
+            stored_encoding_tag(&stored.data),
+            Some(EncodingType::DeltaRle)
+        );
         stored.data.clone()
     };
 
@@ -826,7 +829,10 @@ fn bitpacked_decode_throughput_bench() {
         volume_values.push(v);
     }
 
-    for (name, values) in [("price-like", &price_values), ("volume-like", &volume_values)] {
+    for (name, values) in [
+        ("price-like", &price_values),
+        ("volume-like", &volume_values),
+    ] {
         let col = ColumnArray::Decimal {
             data: values.clone(),
             bitmap: NullBitmap::new_valid(n),
@@ -837,9 +843,13 @@ fn bitpacked_decode_throughput_bench() {
         let plain = crate::storage::codec::column_codec::encode_column_plain(&col, 0, n).unwrap();
         let zstd_block = zstd::bulk::compress(&plain, level).unwrap();
         let t0 = Instant::now();
-        let from_zstd =
-            decode_column(&zstd::bulk::decompress(&zstd_block, plain_bytes_cap(n)).unwrap(), n, &def, false)
-                .unwrap();
+        let from_zstd = decode_column(
+            &zstd::bulk::decompress(&zstd_block, plain_bytes_cap(n)).unwrap(),
+            n,
+            &def,
+            false,
+        )
+        .unwrap();
         let zstd_us = t0.elapsed().as_micros().max(1);
 
         // verbatim bit-packed storage candidate: no zstd frame, straight to
@@ -851,13 +861,14 @@ fn bitpacked_decode_throughput_bench() {
 
         // Break down the bit-packed path: raw payload unpack vs the full
         // decode_column (bitmap prefix + payload + column materialization).
-        let tag_pos = 4 + u32::from_le_bytes(adaptive[..4].try_into().unwrap()) as usize
+        let tag_pos = 4
+            + u32::from_le_bytes(adaptive[..4].try_into().unwrap()) as usize
             + COLUMN_ENCODING_MAGIC.len()
             + 1;
         let payload = &adaptive[tag_pos..];
         let t2 = Instant::now();
-        let unpacked = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload)
-            .unwrap();
+        let unpacked =
+            crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload).unwrap();
         let unpack_us = t2.elapsed().as_micros().max(1);
         assert_eq!(unpacked.len(), n);
 

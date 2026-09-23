@@ -60,16 +60,24 @@ pub fn exec_update(
         .batch_writer()
         .checkpoint_before_rewrite(db, table, 1)?;
 
-    let updated_count = mgr.with_table_mutation_lock(db, table, || {
+    let update_body = || -> Result<u64> {
         let mut updated_count = 0u64;
         let mut memtable_updates: Vec<(
             Arc<crate::storage::core::memtable::MemTable>,
             Arc<RecordBatch>,
         )> = Vec::new();
+        let narrowed_partition = target_partition_key
+            .as_deref()
+            .filter(|key| !key.is_empty());
         for memtable in engine
             .memtable_manager()
             .get_visible_to(db, table, reader_txn_id)
         {
+            if let Some(key) = narrowed_partition {
+                if memtable.partition_key() != key {
+                    continue;
+                }
+            }
             let Some(batch) = memtable.read_snapshot_arc() else {
                 continue;
             };
@@ -297,12 +305,26 @@ pub fn exec_update(
         // later INSERTs while older memtable rows are still live.
         engine.invalidate_hot_store(db, table);
 
-        // UPDATE rewrites rows into new segments, so old index locations die.
-        // Rebuild the location-index snapshots from a fresh scan while still
-        // holding the table lock so the next statement stays incremental; a
-        // failure falls back to wholesale invalidation, whose lazy rebuild on
-        // the next probe preserves correctness.
-        if updated_count > 0 {
+        Ok(updated_count)
+    };
+
+    let updated_count = match target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        Some(partition) => {
+            mgr.with_partition_set_mutation_lock(db, table, &[partition], update_body)?
+        }
+        None => mgr.with_table_mutation_lock(db, table, update_body)?,
+    };
+
+    if updated_count > 0 {
+        mgr.with_table_mutation_lock(db, table, || {
+            // UPDATE rewrites rows into new segments, so old index locations
+            // die. Rebuild the location-index snapshots from a fresh scan
+            // under the table-wide lock so concurrent index publishes cannot
+            // be lost; a failure falls back to wholesale invalidation, whose
+            // lazy rebuild on the next probe preserves correctness.
             if let Err(error) = super::dml_insert::rebuild_table_location_indexes(
                 engine,
                 db,
@@ -328,10 +350,9 @@ pub fn exec_update(
                     .index_manager()
                     .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
             }
-        }
-
-        Ok(updated_count)
-    })?;
+            Ok(())
+        })?;
+    }
 
     if updated_count == 0 {
         return Ok(ExecResult::Ok { rows_affected: 0 });

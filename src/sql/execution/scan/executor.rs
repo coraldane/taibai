@@ -14,7 +14,9 @@ use super::runtime::ScanRuntime;
 use super::spec::ScanSpec;
 
 pub struct ScanExecutor<'a> {
-    spec: &'a ScanSpec,
+    /// Owned clone of the caller's spec: the hybrid partial-residency leg
+    /// appends its complementary range clause to this copy at run time.
+    spec: ScanSpec,
     runtime: ScanRuntime,
     table_schema: crate::types::batch::Schema,
     table_meta: crate::storage::catalog::schema::TableMeta,
@@ -36,7 +38,7 @@ impl<'a> ScanExecutor<'a> {
         db: &'a str,
     ) -> Self {
         Self {
-            spec,
+            spec: spec.clone(),
             runtime: ScanRuntime::from_engine(engine),
             table_schema,
             table_meta,
@@ -54,7 +56,7 @@ impl<'a> ScanExecutor<'a> {
         db: &'a str,
     ) -> Self {
         Self {
-            spec,
+            spec: spec.clone(),
             runtime,
             table_schema,
             table_meta,
@@ -94,6 +96,16 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_count_star(&mut self) -> Result<Vec<RecordBatch>> {
+        if let Some((mirror_count, pk_idx, covers)) = memtable::hybrid_hot_mirror_count(
+            self.runtime.hot_store_manager(),
+            self.runtime.memtable_manager(),
+            self.db,
+            &self.table_meta,
+            &self.spec,
+        ) {
+            return self.execute_hybrid_count_star(mirror_count, pk_idx, covers);
+        }
+
         if let Some(count) = self.try_resident_hot_count()? {
             let result = count::build_count_star_result(count);
             return match result {
@@ -139,14 +151,14 @@ impl<'a> ScanExecutor<'a> {
                 self.runtime.hot_store_manager(),
                 self.db,
                 &self.spec.table_name,
-                self.spec,
+                &self.spec,
             )
             .unwrap_or_else(|| {
                 memtable::count_memtable_rows(
                     self.runtime.memtable_manager(),
                     self.db,
                     &self.spec.table_name,
-                    self.spec,
+                    &self.spec,
                 )
             });
             let result = count::build_count_star_result(count);
@@ -156,7 +168,7 @@ impl<'a> ScanExecutor<'a> {
             };
         }
         let count = count::count_star(
-            self.spec,
+            &self.spec,
             &self.table_meta,
             &table_dir,
             self.runtime.segment_mgr(),
@@ -169,6 +181,64 @@ impl<'a> ScanExecutor<'a> {
             crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Hybrid partial-residency count: the mirror answered the rows above the
+    /// coverage bound (`mirror_count`); count the complementary
+    /// `partition_column <= covers` range through the regular segment and
+    /// memtable paths. The added range clause keeps zone-map pruning effective
+    /// (date-pure row groups above the bound prune to nothing).
+    fn execute_hybrid_count_star(
+        &mut self,
+        mirror_count: u64,
+        pk_idx: usize,
+        covers: crate::types::scalar::ScalarValue,
+    ) -> Result<Vec<RecordBatch>> {
+        self.spec
+            .range_predicates
+            .push(crate::storage::partition::pruning::RangeClause {
+                column_index: pk_idx,
+                op: crate::storage::partition::pruning::RangeOp::Le,
+                value: covers,
+            });
+        let table_dir = self
+            .runtime
+            .data_dir()
+            .join(self.db)
+            .join(&self.spec.table_name);
+        let count = if !table_dir.exists() {
+            memtable::count_hot_memtable_rows(
+                self.runtime.memtable_manager(),
+                self.runtime.hot_store_manager(),
+                self.db,
+                &self.spec.table_name,
+                &self.spec,
+            )
+            .unwrap_or_else(|| {
+                memtable::count_memtable_rows(
+                    self.runtime.memtable_manager(),
+                    self.db,
+                    &self.spec.table_name,
+                    &self.spec,
+                )
+            })
+        } else {
+            count::count_star(
+                &self.spec,
+                &self.table_meta,
+                &table_dir,
+                self.runtime.segment_mgr(),
+                self.runtime.memtable_manager(),
+                self.db,
+                self.stats.as_deref_mut(),
+            )?
+        };
+        let total = mirror_count.saturating_add(count);
+        let result = count::build_count_star_result(total);
+        Ok(match result {
+            crate::sql::execution::engine::ExecResult::Query { batches, .. } => batches,
+            _ => Vec::new(),
+        })
     }
 
     /// Metadata-driven fast path for simple aggregate queries (no GROUP BY,
@@ -185,7 +255,7 @@ impl<'a> ScanExecutor<'a> {
             .join(&self.spec.table_name);
         let batch = if table_dir.exists() {
             super::aggregate_meta::compute_simple_aggregate(
-                self.spec,
+                &self.spec,
                 aggs,
                 &self.table_meta,
                 &self.table_schema,
@@ -198,7 +268,7 @@ impl<'a> ScanExecutor<'a> {
         } else {
             // No persisted segments; only memtable/hot store rows.
             super::aggregate_meta::compute_simple_aggregate(
-                self.spec,
+                &self.spec,
                 aggs,
                 &self.table_meta,
                 &self.table_schema,
@@ -232,8 +302,8 @@ impl<'a> ScanExecutor<'a> {
             .join(self.db)
             .join(&self.spec.table_name);
 
-        let plan =
-            super::strategy::ScanPlanner::new(self.spec, &self.table_schema, &self.table_meta)
+        let mut plan =
+            super::strategy::ScanPlanner::new(&self.spec, &self.table_schema, &self.table_meta)
                 .build();
         let mut scan_limit = plan.scan_limit;
 
@@ -241,6 +311,47 @@ impl<'a> ScanExecutor<'a> {
             output.set_limit(scan_limit);
             output.push(batch);
             return Ok(());
+        }
+
+        // Hybrid partial-residency leg: the mirror answers every row above
+        // its coverage bound through the inverted index; the segment and
+        // memtable legs below run with the complementary `<= covers` range
+        // clause so the two sides never overlap.
+        if let Some((mirror_batch, pk_idx, covers)) = memtable::hybrid_hot_mirror_scan(
+            self.runtime.hot_store_manager(),
+            self.runtime.memtable_manager(),
+            self.db,
+            &self.table_meta,
+            &self.spec,
+        ) {
+            let mirror_rows = mirror_batch.num_rows() as u64;
+            self.spec
+                .range_predicates
+                .push(crate::storage::partition::pruning::RangeClause {
+                    column_index: pk_idx,
+                    op: crate::storage::partition::pruning::RangeOp::Le,
+                    value: covers.clone(),
+                });
+            self.spec.hot_mirror_bound = Some((pk_idx, covers));
+            plan =
+                super::strategy::ScanPlanner::new(&self.spec, &self.table_schema, &self.table_meta)
+                    .build();
+            scan_limit = plan.scan_limit;
+            output.set_limit(scan_limit);
+            if let Some(s) = self.stats.as_deref_mut() {
+                s.entry(self.spec.table_name.clone())
+                    .or_default()
+                    .hot_mirror_rows += mirror_rows;
+            }
+            let mirror_batch = super::strategy::apply_ttl_filter_and_projection(
+                mirror_batch,
+                &self.table_meta,
+                &plan.projection_cols,
+                plan.strip_ttl_column,
+            )?;
+            if !output.push(mirror_batch) {
+                return Ok(());
+            }
         }
 
         let memtables_present = !self
@@ -257,7 +368,7 @@ impl<'a> ScanExecutor<'a> {
 
             let filtered_segments = partition::prune_segments_by_partition(
                 all_segments,
-                self.spec,
+                &self.spec,
                 Some(&self.table_meta),
             );
 
@@ -312,10 +423,10 @@ impl<'a> ScanExecutor<'a> {
                         super::row_group::prune_row_group_meta(
                             &meta.row_groups,
                             &pred,
-                            &super::row_group::build_bloom_check_list(self.spec),
-                            &super::row_group::build_in_check_list(self.spec),
-                            &super::row_group::build_set_check_list(self.spec),
-                            &super::row_group::build_set_in_check_list(self.spec),
+                            &super::row_group::build_bloom_check_list(&self.spec),
+                            &super::row_group::build_in_check_list(&self.spec),
+                            &super::row_group::build_set_check_list(&self.spec),
+                            &super::row_group::build_set_in_check_list(&self.spec),
                         )
                         .candidate_indices
                     });
@@ -340,7 +451,8 @@ impl<'a> ScanExecutor<'a> {
                     let candidate_indices = if let Some(candidates) = meta_candidate_indices {
                         candidates
                     } else {
-                        let Some(prune_result) = super::strategy::prune_segment(self.spec, &reader)
+                        let Some(prune_result) =
+                            super::strategy::prune_segment(&self.spec, &reader)
                         else {
                             continue;
                         };
@@ -365,7 +477,7 @@ impl<'a> ScanExecutor<'a> {
                         && self.spec.has_predicates()
                     {
                         super::strategy::rank_row_groups_for_limit(
-                            self.spec,
+                            &self.spec,
                             &reader,
                             &mut candidate_indices,
                         );
@@ -375,7 +487,7 @@ impl<'a> ScanExecutor<'a> {
                         for rg_idx in &candidate_indices {
                             self.record_row_group_read(&reader, *rg_idx, &plan);
                             let mut batch = match super::strategy::read_row_group_with_strategy(
-                                self.spec,
+                                &self.spec,
                                 &plan,
                                 &self.table_schema,
                                 &reader,
@@ -410,7 +522,7 @@ impl<'a> ScanExecutor<'a> {
                         let _cpu = crate::common::work_limiter::acquire_cpu();
                         let _io = crate::common::work_limiter::acquire_io();
                         super::strategy::read_row_group_with_strategy(
-                            self.spec,
+                            &self.spec,
                             &plan,
                             &self.table_schema,
                             &reader,
@@ -550,14 +662,14 @@ impl<'a> ScanExecutor<'a> {
                         super::row_group::prune_row_group_meta(
                             &meta.row_groups,
                             &predicate,
-                            &super::row_group::build_bloom_check_list(self.spec),
-                            &super::row_group::build_in_check_list(self.spec),
-                            &super::row_group::build_set_check_list(self.spec),
-                            &super::row_group::build_set_in_check_list(self.spec),
+                            &super::row_group::build_bloom_check_list(&self.spec),
+                            &super::row_group::build_in_check_list(&self.spec),
+                            &super::row_group::build_set_check_list(&self.spec),
+                            &super::row_group::build_set_in_check_list(&self.spec),
                         )
                         .candidate_indices
                     } else {
-                        super::strategy::prune_segment(self.spec, &reader)?.candidate_indices
+                        super::strategy::prune_segment(&self.spec, &reader)?.candidate_indices
                     };
                     // Row groups inside a segment decode in parallel as
                     // well; actual concurrency is bounded by the global
@@ -569,7 +681,7 @@ impl<'a> ScanExecutor<'a> {
                                 let _cpu = crate::common::work_limiter::acquire_cpu();
                                 let _io = crate::common::work_limiter::acquire_io();
                                 super::strategy::read_row_group_with_strategy(
-                                    self.spec,
+                                    &self.spec,
                                     plan,
                                     &self.table_schema,
                                     &reader,
@@ -604,7 +716,7 @@ impl<'a> ScanExecutor<'a> {
             self.runtime.memtable_manager(),
             self.db,
             &self.table_meta,
-            self.spec,
+            &self.spec,
         ))
     }
 

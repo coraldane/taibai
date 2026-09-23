@@ -384,7 +384,14 @@ fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
         .expect("spilled rows materialize");
     assert_eq!(snapshot.num_rows(), 3);
 
-    writer.write_columns(TEST_DB, TEST_TABLE, "", make_batch(&schema, 3, 2)?, schema, true)?;
+    writer.write_columns(
+        TEST_DB,
+        TEST_TABLE,
+        "",
+        make_batch(&schema, 3, 2)?,
+        schema,
+        true,
+    )?;
     let snapshot = writer.memtable_manager().get_by_table(TEST_DB, TEST_TABLE)[0]
         .read_snapshot()
         .unwrap();

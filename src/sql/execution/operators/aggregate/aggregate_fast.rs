@@ -49,14 +49,13 @@ pub(crate) static TYPED_MISS_KINDS: std::sync::atomic::AtomicU64 =
 
 /// Per-batch fixed-cost breakdown (nanoseconds, summed): lane par-join vs
 /// post-join memory accounting.
-pub(crate) static AGG_JOIN_NS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AGG_JOIN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static AGG_ACCOUNT_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-pub(crate) static AGG_SETUP_NS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static AGG_SETUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-type FastGroupMap<K> = HashMap<K, u32, std::hash::BuildHasherDefault<crate::common::fast_hash::FastHasher>>;
+type FastGroupMap<K> =
+    HashMap<K, u32, std::hash::BuildHasherDefault<crate::common::fast_hash::FastHasher>>;
 
 /// Typed view of one aggregate argument column, resolved once per batch so
 /// the row loop indexes plain slices instead of dispatching per row.
@@ -207,8 +206,11 @@ impl FastGroups {
             accs,
             cached_bytes: other_bytes,
         } = other;
-        for (key, scalar, mut accumulators) in
-            keys.into_iter().zip(scalars.into_iter()).zip(accs.into_iter()).map(|((k, s), a)| (k, s, a))
+        for (key, scalar, mut accumulators) in keys
+            .into_iter()
+            .zip(scalars.into_iter())
+            .zip(accs.into_iter())
+            .map(|((k, s), a)| (k, s, a))
         {
             // Resolve the target group in this table, creating it (with the
             // other table's accumulators) on first sight. A NULL key scalar
@@ -273,7 +275,12 @@ impl FastGroups {
     }
 
     /// Convert into the generic grouping structures (merge order kept).
-    pub(super) fn into_maps(self) -> (HashMap<Vec<u8>, Vec<Accumulator>>, Vec<(Vec<u8>, Vec<ScalarValue>)>) {
+    pub(super) fn into_maps(
+        self,
+    ) -> (
+        HashMap<Vec<u8>, Vec<Accumulator>>,
+        Vec<(Vec<u8>, Vec<ScalarValue>)>,
+    ) {
         let mut groups = HashMap::with_capacity(self.accs.len());
         for (i, accs) in self.accs.into_iter().enumerate() {
             groups.insert(self.keys[i].clone(), accs);
@@ -316,8 +323,16 @@ impl FastGroups {
                     .collect::<Option<Vec<_>>>();
                 if let Some(kinds) = kinds {
                     return self.update_row_range_dict_typed(
-                        ids, dict, start, end, &kinds, batch, gb_col, aggregates,
-                        physical_schema, max_groups,
+                        ids,
+                        dict,
+                        start,
+                        end,
+                        &kinds,
+                        batch,
+                        gb_col,
+                        aggregates,
+                        physical_schema,
+                        max_groups,
                     );
                 }
                 TYPED_MISS_KINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -332,7 +347,14 @@ impl FastGroups {
             let group_id: u32 = match group_col {
                 FastGroupCol::Dict(ids, dict, bitmap) => {
                     if bitmap.is_null(row) {
-                        self.get_or_create_null_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?
+                        self.get_or_create_null_group(
+                            batch,
+                            gb_col,
+                            row,
+                            aggregates,
+                            physical_schema,
+                            max_groups,
+                        )?
                     } else {
                         let entry = ids[row] as usize;
                         if entry >= self.dict_gid.len() {
@@ -346,7 +368,11 @@ impl FastGroups {
                                     Some(id) => id,
                                     None => {
                                         let id = self.new_group(
-                                            batch, gb_col, row, aggregates, physical_schema,
+                                            batch,
+                                            gb_col,
+                                            row,
+                                            aggregates,
+                                            physical_schema,
                                             max_groups,
                                         )?;
                                         self.cached_bytes += value.len() + 24;
@@ -362,33 +388,75 @@ impl FastGroups {
                 }
                 FastGroupCol::Str(data, bitmap) => {
                     if bitmap.is_null(row) {
-                        self.get_or_create_null_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?
+                        self.get_or_create_null_group(
+                            batch,
+                            gb_col,
+                            row,
+                            aggregates,
+                            physical_schema,
+                            max_groups,
+                        )?
                     } else if let Some(id) = self.str_map.get(&data[row]) {
                         *id
                     } else {
-                        let id = self.new_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?;
+                        let id = self.new_group(
+                            batch,
+                            gb_col,
+                            row,
+                            aggregates,
+                            physical_schema,
+                            max_groups,
+                        )?;
                         self.str_map.insert(data[row].to_owned(), id);
                         id
                     }
                 }
                 FastGroupCol::I64(data, bitmap) => {
                     if bitmap.is_null(row) {
-                        self.get_or_create_null_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?
+                        self.get_or_create_null_group(
+                            batch,
+                            gb_col,
+                            row,
+                            aggregates,
+                            physical_schema,
+                            max_groups,
+                        )?
                     } else if let Some(id) = self.i64_map.get(&data[row]) {
                         *id
                     } else {
-                        let id = self.new_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?;
+                        let id = self.new_group(
+                            batch,
+                            gb_col,
+                            row,
+                            aggregates,
+                            physical_schema,
+                            max_groups,
+                        )?;
                         self.i64_map.insert(data[row], id);
                         id
                     }
                 }
                 FastGroupCol::I32(data, bitmap) => {
                     if bitmap.is_null(row) {
-                        self.get_or_create_null_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?
+                        self.get_or_create_null_group(
+                            batch,
+                            gb_col,
+                            row,
+                            aggregates,
+                            physical_schema,
+                            max_groups,
+                        )?
                     } else if let Some(id) = self.i64_map.get(&(data[row] as i64)) {
                         *id
                     } else {
-                        let id = self.new_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?;
+                        let id = self.new_group(
+                            batch,
+                            gb_col,
+                            row,
+                            aggregates,
+                            physical_schema,
+                            max_groups,
+                        )?;
                         self.i64_map.insert(data[row] as i64, id);
                         id
                     }
@@ -513,7 +581,12 @@ impl FastGroups {
                         Some(id) => id,
                         None => {
                             let id = self.new_group(
-                                batch, gb_col, row, aggregates, physical_schema, max_groups,
+                                batch,
+                                gb_col,
+                                row,
+                                aggregates,
+                                physical_schema,
+                                max_groups,
                             )?;
                             self.cached_bytes += value.len() + 24;
                             self.dict_map.insert(value.to_string(), id);
@@ -754,9 +827,9 @@ pub(super) fn fast_group_update(
         .ok_or_else(|| TaibaiError::Internal("fast group: group column missing".into()))?;
     let group_col = match group_array {
         ColumnArray::VarChar { data, bitmap } => FastGroupCol::Str(data, bitmap),
-        ColumnArray::Dictionary { ids, dict, bitmap, .. } => {
-            FastGroupCol::Dict(ids, dict, bitmap)
-        }
+        ColumnArray::Dictionary {
+            ids, dict, bitmap, ..
+        } => FastGroupCol::Dict(ids, dict, bitmap),
         ColumnArray::Int64 { data, bitmap }
         | ColumnArray::Decimal { data, bitmap }
         | ColumnArray::Timestamp { data, bitmap }

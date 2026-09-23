@@ -13,7 +13,9 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
-use self::aggregate_fast::{fast_group_supported, fast_group_update, merge_slot_tables, FastGroups};
+use self::aggregate_fast::{
+    fast_group_supported, fast_group_update, merge_slot_tables, FastGroups,
+};
 use super::ExecutionOp;
 
 mod aggregate_fast;
@@ -672,8 +674,13 @@ impl ExecutionOp for HashAggregateExec {
             // per-lane tables merged at the end. Falls back to the generic
             // per-row loop for any unsupported shape.
             if !fast_unsupported && fast_tables.is_empty() {
-                if !fast_group_supported(&group_by, &gb_indices, &aggregates, &agg_col_indices, &batch)
-                {
+                if !fast_group_supported(
+                    &group_by,
+                    &gb_indices,
+                    &aggregates,
+                    &agg_col_indices,
+                    &batch,
+                ) {
                     fast_unsupported = true;
                 }
             }

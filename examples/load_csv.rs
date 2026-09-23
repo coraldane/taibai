@@ -13,7 +13,10 @@ use taibai::types::scalar::ScalarValue;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let host = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:5151".into());
+    let host = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:5151".into());
     let database = args.get(2).cloned().unwrap_or_else(|| "main".into());
     let table = args.get(3).cloned().expect("table name required");
     let csv_path = args.get(4).cloned().expect("csv path required");
@@ -73,11 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Map file columns to table columns by name.
     let mut col_map: Vec<Option<usize>> = Vec::with_capacity(file_columns.len());
     for fc in &file_columns {
-        col_map.push(
-            columns
-                .iter()
-                .position(|(n, _)| n.eq_ignore_ascii_case(fc)),
-        );
+        col_map.push(columns.iter().position(|(n, _)| n.eq_ignore_ascii_case(fc)));
     }
 
     let mut total = 0usize;
@@ -94,7 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         for (file_idx, target_idx) in col_map.iter().enumerate() {
-            let Some(target_idx) = target_idx else { continue };
+            let Some(target_idx) = target_idx else {
+                continue;
+            };
             let dt = columns[*target_idx].1;
             let field = trimmed.split(',').nth(file_idx).unwrap_or("");
             let value = parse_scalar(field.trim(), dt)?;

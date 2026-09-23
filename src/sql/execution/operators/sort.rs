@@ -232,7 +232,9 @@ fn compare_key_rows(
     for (index, (_, desc)) in sort_exprs.iter().enumerate() {
         let ordering = match &keys[index] {
             SortKeyColumn::Typed(column) => column.compare_at(left, right),
-            SortKeyColumn::Scalar(values) => compare_scalars_null_last(&values[left], &values[right]),
+            SortKeyColumn::Scalar(values) => {
+                compare_scalars_null_last(&values[left], &values[right])
+            }
         };
         let ordering = if *desc { ordering.reverse() } else { ordering };
         if !ordering.is_eq() {

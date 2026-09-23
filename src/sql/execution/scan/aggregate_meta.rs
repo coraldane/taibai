@@ -116,10 +116,7 @@ pub fn compute_simple_aggregate(
         // streams below with sums folded from data. Folding metadata for a
         // streaming segment would skip SUM and then cache a zero delta, so
         // the two paths are mutually exclusive.
-        let sum_cache = if has_sum
-            && !spec.has_predicates()
-            && meta_deleted == 0
-            && meta.is_some()
+        let sum_cache = if has_sum && !spec.has_predicates() && meta_deleted == 0 && meta.is_some()
         {
             segment_sum_cache_lookup(
                 segment_path.to_string_lossy().as_ref(),
@@ -164,10 +161,7 @@ pub fn compute_simple_aggregate(
         }
 
         let sum_before: Vec<(Option<i64>, Option<f64>)> = if has_sum {
-            accumulators
-                .iter()
-                .map(|a| (a.sum_i, a.sum_f))
-                .collect()
+            accumulators.iter().map(|a| (a.sum_i, a.sum_f)).collect()
         } else {
             Vec::new()
         };
@@ -239,10 +233,7 @@ pub fn compute_simple_aggregate(
                 && reader.delete_bitmap().is_empty()
                 && !streaming_sum
             {
-                meta_folds.push((
-                    &row_group_meta.zone_maps,
-                    row_group_meta.row_count,
-                ));
+                meta_folds.push((&row_group_meta.zone_maps, row_group_meta.row_count));
                 row_start += row_group_meta.row_count;
                 continue;
             }
@@ -264,10 +255,8 @@ pub fn compute_simple_aggregate(
             let batches: Vec<Result<RecordBatch>> = chunk
                 .par_iter()
                 .map(|fold| {
-                    let mut batch = reader.read_row_group_with_projection(
-                        fold.row_group_index,
-                        &source_columns,
-                    )?;
+                    let mut batch = reader
+                        .read_row_group_with_projection(fold.row_group_index, &source_columns)?;
                     if !delete_bitmap_is_empty {
                         batch = delete_bitmap::filter_batch(
                             &batch,
@@ -577,9 +566,7 @@ impl AggAccum {
                 .best_max
                 .unwrap_or_else(|| null_scalar_of_type(self.col_type)),
             AggFunc::Sum => match self.col_type {
-                DataType::Float32 | DataType::Float64 => {
-                    ScalarValue::Float64(self.sum_f)
-                }
+                DataType::Float32 | DataType::Float64 => ScalarValue::Float64(self.sum_f),
                 _ => ScalarValue::Int64(self.sum_i),
             },
             _ => ScalarValue::Int64(None),
@@ -608,7 +595,6 @@ fn null_scalar_of_type(dt: DataType) -> ScalarValue {
     }
 }
 
-
 /// Per-segment partial sums for the metadata aggregate fast path. Keyed by
 /// (segment path, column, row count, deleted row count, float?) so appends,
 /// compaction, and deletes naturally invalidate entries. In-process only.
@@ -616,11 +602,12 @@ fn segment_sum_cache() -> &'static std::sync::Mutex<
     std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>,
 > {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| {
-            std::sync::Mutex::new(std::collections::HashMap::new())
-        })
+    static CACHE: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<(String, String, u64, u64, bool), SumCacheValue>,
+        >,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -640,15 +627,13 @@ fn segment_sum_cache_lookup(
         .iter()
         .map(|(name, is_float)| {
             cache
-                .get(
-                    &(
-                        segment.to_string(),
-                        name.clone(),
-                        row_count,
-                        deleted_row_count,
-                        *is_float,
-                    ),
-                )
+                .get(&(
+                    segment.to_string(),
+                    name.clone(),
+                    row_count,
+                    deleted_row_count,
+                    *is_float,
+                ))
                 .copied()
         })
         .collect()
@@ -664,7 +649,13 @@ fn segment_sum_cache_store(
     let mut cache = segment_sum_cache().lock().unwrap();
     for ((name, is_float), value) in columns.iter().zip(values.iter()) {
         cache.insert(
-            (segment.to_string(), name.clone(), row_count, deleted_row_count, *is_float),
+            (
+                segment.to_string(),
+                name.clone(),
+                row_count,
+                deleted_row_count,
+                *is_float,
+            ),
             *value,
         );
     }
@@ -672,10 +663,7 @@ fn segment_sum_cache_store(
 
 /// SUM is answerable by the metadata fast path only for numeric argument
 /// columns; other types keep the generic scan.
-fn sum_aggregates_supported(
-    aggregates: &[AggregateExpr],
-    table_schema: &Schema,
-) -> bool {
+fn sum_aggregates_supported(aggregates: &[AggregateExpr], table_schema: &Schema) -> bool {
     for agg in aggregates {
         if agg.func != crate::sql::planner::AggFunc::Sum || agg.distinct {
             continue;

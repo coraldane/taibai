@@ -23,6 +23,7 @@
 - [CLUSTER BY Binary Search Integration Design](design/cluster-by-binary-search-design.md)
 - [SQL Transaction Support Analysis](design/transaction-hooks-analysis.md)
 - [Transaction State Model and Session Management](design/transaction-state-model.md)
+- [分区级 mutation lock 设计](design/partition-mutation-locks.md)
 - [通用性能基础](general-performance-foundations.md)
 
 ## 计划

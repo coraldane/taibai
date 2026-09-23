@@ -108,22 +108,24 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
         return Ok(0);
     }
 
+    let mgr = engine.segment_mgr();
     // Memtable-resident rows of the expired partitions must land on disk
     // (into the files we are about to remove); otherwise a later flush would
     // recreate the partition. The read-time TTL filter keeps them invisible
-    // either way, but flushing avoids resurrecting the files.
-    engine.segment_mgr().flush_table_active(db, table)?;
-
-    let mgr = engine.segment_mgr();
-    // Phase A — delete the expired segment files under the mutation lock so
-    // no concurrent flush recreates them mid-delete. The catalog is NOT
-    // touched here: DDL takes catalogs().write() first and then waits for
-    // this lock, so acquiring the catalog lock while holding the mutation
-    // lock would deadlock against it (the order dml_insert/lock_order_test
-    // pins).
+    // either way, but flushing avoids resurrecting the files. The flush runs
+    // inside the partition locks below so a concurrent writer cannot append
+    // to an expired partition between the flush and the deletion.
+    // Phase A — delete the expired segment files under those partition
+    // locks so no concurrent flush recreates them mid-delete. The catalog is
+    // NOT touched here: DDL takes catalogs().write() first and then waits
+    // for these locks, so acquiring the catalog lock while holding the
+    // partition locks would deadlock against it (the order
+    // dml_insert/lock_order_test pins).
+    let expired_keys = expired.iter().map(String::as_str).collect::<Vec<_>>();
     let mut file_rows: i64 = 0;
-    mgr.with_table_mutation_lock(db, table, || -> Result<()> {
+    mgr.with_partition_set_mutation_lock(db, table, &expired_keys, || -> Result<()> {
         for key in &expired {
+            mgr.flush_partition_active(db, table, key)?;
             for path in &files_by_key[key] {
                 mgr.invalidate_readers_under(path);
                 // Count live rows from the segment itself: the catalog's
@@ -151,7 +153,9 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
     // partitions may be cached as resident: drop the residency marks and the
     // cached partition→segment knowledge so scans fall back to the (now
     // smaller) segment set. The read-time TTL filter stays as the safety net.
-    engine.hot_store_manager().clear_resident_coverage(db, table);
+    engine
+        .hot_store_manager()
+        .clear_resident_coverage(db, table);
     engine.clear_hot_partition_segments(&table_dir);
 
     // Phase B — retire catalog entries while holding only catalogs().write().

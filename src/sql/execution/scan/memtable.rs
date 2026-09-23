@@ -62,6 +62,125 @@ pub fn count_resident_hot_store(
     count_hot_store_by_key(&store, spec, 0)
 }
 
+/// Partial-residency gate. Returns `(partition_column_index, covers_value)`
+/// when the mirror provably holds every row whose partition-column value is
+/// strictly greater than `covers_value` (`TableMeta::hot_mirror_covers_from`,
+/// established at close-of-day / restart warmup) and the scan carries an
+/// equality on that column above the bound. `hot_partition_mirrored` closes
+/// the gate after any mirror bypass, prefix reclaim or transaction delta.
+fn hybrid_hot_mirror_bound(
+    store: &HotStore,
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<(usize, ScalarValue)> {
+    if spec.reader_txn_id != 0 || table_meta.ttl.is_some() {
+        return None;
+    }
+    if !crate::common::config::query_limits().hybrid_hot_scan_enabled {
+        return None;
+    }
+    if store.row_count() == 0 {
+        return None;
+    }
+    let covers_from = table_meta.hot_mirror_covers_from?;
+    let pk_idx = table_meta.get_partition_column_index()?;
+    let value = spec.eq_value_for_column(pk_idx)?;
+    let value_i64 = match value {
+        ScalarValue::Int32(Some(v)) => *v as i64,
+        ScalarValue::Int64(Some(v)) => *v,
+        _ => return None,
+    };
+    if value_i64 <= covers_from {
+        return None;
+    }
+    let partition_info = spec.partition_info.as_ref()?;
+    let partition_key =
+        super::partition::extract_partition_eq_value(spec, partition_info, table_meta)?;
+    if !memtable_mgr.hot_partition_mirrored(db, &spec.table_name, &partition_key) {
+        return None;
+    }
+    let column = table_meta.columns.get(pk_idx)?;
+    let covers = match column.data_type {
+        crate::protocol::types::DataType::Int32 => {
+            // A bound below the column's representable range means "covers
+            // everything", which i32::MIN expresses exactly; a bound above it
+            // cannot be represented and must not be approximated.
+            if covers_from > i32::MAX as i64 {
+                return None;
+            }
+            ScalarValue::Int32(Some(
+                covers_from.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+            ))
+        }
+        crate::protocol::types::DataType::Int64 => ScalarValue::Int64(Some(covers_from)),
+        _ => return None,
+    };
+    Some((pk_idx, covers))
+}
+
+fn spec_with_mirror_bound(
+    spec: &ScanSpec,
+    pk_idx: usize,
+    covers: &ScalarValue,
+    op: crate::storage::partition::pruning::RangeOp,
+) -> ScanSpec {
+    let mut bound_spec = spec.clone();
+    bound_spec
+        .range_predicates
+        .push(crate::storage::partition::pruning::RangeClause {
+            column_index: pk_idx,
+            op,
+            value: covers.clone(),
+        });
+    bound_spec
+}
+
+/// Hybrid partial-residency mirror leg: gather the rows the mirror owns
+/// (`partition_column > covers`) through the inverted index. The caller adds
+/// the complementary `<= covers` range clause to every non-mirror leg, so the
+/// two sides partition the table exactly with no overlap. Returns `None` when
+/// the gate declines or the scan has no key equality for the index gather.
+pub fn hybrid_hot_mirror_scan(
+    hot_mgr: &HotStoreManager,
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<(RecordBatch, usize, ScalarValue)> {
+    let store = hot_mgr.get(db, &spec.table_name)?;
+    let (pk_idx, covers) = hybrid_hot_mirror_bound(&store, memtable_mgr, db, table_meta, spec)?;
+    let mirror_spec = spec_with_mirror_bound(
+        spec,
+        pk_idx,
+        &covers,
+        crate::storage::partition::pruning::RangeOp::Gt,
+    );
+    let batch = scan_hot_store_by_key(&store, &mirror_spec, 0)?;
+    Some((batch, pk_idx, covers))
+}
+
+/// Count counterpart of [`hybrid_hot_mirror_scan`].
+pub fn hybrid_hot_mirror_count(
+    hot_mgr: &HotStoreManager,
+    memtable_mgr: &MemTableManager,
+    db: &str,
+    table_meta: &TableMeta,
+    spec: &ScanSpec,
+) -> Option<(u64, usize, ScalarValue)> {
+    let store = hot_mgr.get(db, &spec.table_name)?;
+    let (pk_idx, covers) = hybrid_hot_mirror_bound(&store, memtable_mgr, db, table_meta, spec)?;
+    let mirror_spec = spec_with_mirror_bound(
+        spec,
+        pk_idx,
+        &covers,
+        crate::storage::partition::pruning::RangeOp::Gt,
+    );
+    let count = count_hot_store_by_key(&store, &mirror_spec, 0)?;
+    Some((count, pk_idx, covers))
+}
+
 /// The hot store may answer a partition scan alone only when it holds the
 /// partition's full row set: the store must mark the partition resident AND
 /// no write may have bypassed the hot-store mirror for it. The second check

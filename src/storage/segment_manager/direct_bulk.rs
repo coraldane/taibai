@@ -27,7 +27,8 @@ impl SegmentManager {
         let compressed_columns = self.compress_direct_bulk_columns(&req.columns)?;
 
         {
-            let _mutation_guard = state.mutation_lock.lock().unwrap();
+            let partition_lock = partition_mutation_lock_arc(&state, "");
+            let _partition_guard = acquire_partition_mutation_lock(&state, &partition_lock, &key, "")?;
             ensure_state_not_retired(&state, db, req.table_name)?;
 
             let mut active_guard = state.active_segments.lock().unwrap();
@@ -150,63 +151,75 @@ impl SegmentManager {
             Some(self.direct_bulk_key_column_indices(schema, table_meta))
         };
 
-        let _mutation_guard = state.mutation_lock.lock().unwrap();
-        ensure_state_not_retired(&state, db, req.table_name)?;
+        let mut partition_keys = prepared_groups
+            .iter()
+            .map(|group| group.partition_key.clone())
+            .collect::<Vec<_>>();
+        partition_keys.sort();
+        partition_keys.dedup();
+        let partition_refs = partition_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
 
-        let mut written = 0u64;
-        let mut active_guard = state.active_segments.lock().unwrap();
-        for group in prepared_groups {
-            self.get_or_create_active_segment_for_partition_locked(
-                &table_dir,
-                schema,
-                &group.partition_key,
-                &mut active_guard,
-            )?;
-            let seg = active_guard.get_mut(&group.partition_key).unwrap();
-            match &group.columns {
-                PreparedDirectColumns::Borrowed(columns) => {
-                    seg.append_direct_row_group(
-                        columns,
-                        &group.compressed_columns,
-                        group.row_count as u64,
-                        build_value_sets,
-                        zone_map_columns.as_deref(),
-                    )?;
+        self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
+            ensure_state_not_retired(&state, db, req.table_name)?;
+
+            let mut written = 0u64;
+            for group in prepared_groups {
+                let mut active_guard = state.active_segments.lock().unwrap();
+                self.get_or_create_active_segment_for_partition_locked(
+                    &table_dir,
+                    schema,
+                    &group.partition_key,
+                    &mut active_guard,
+                )?;
+                let seg = active_guard.get_mut(&group.partition_key).unwrap();
+                match &group.columns {
+                    PreparedDirectColumns::Borrowed(columns) => {
+                        seg.append_direct_row_group(
+                            columns,
+                            &group.compressed_columns,
+                            group.row_count as u64,
+                            build_value_sets,
+                            zone_map_columns.as_deref(),
+                        )?;
+                    }
+                    PreparedDirectColumns::Owned(storage) => {
+                        let columns: Vec<DirectBulkColumn<'_>> = storage
+                            .iter()
+                            .map(|col| DirectBulkColumn {
+                                name: col.name,
+                                data_type: col.data_type,
+                                scale: col.scale,
+                                precision: col.precision,
+                                data: &col.data,
+                                nulls: &col.nulls,
+                                variable_ranges: col.variable_ranges.clone(),
+                            })
+                            .collect();
+                        seg.append_direct_row_group(
+                            &columns,
+                            &group.compressed_columns,
+                            group.row_count as u64,
+                            build_value_sets,
+                            zone_map_columns.as_deref(),
+                        )?;
+                    }
                 }
-                PreparedDirectColumns::Owned(storage) => {
-                    let columns: Vec<DirectBulkColumn<'_>> = storage
-                        .iter()
-                        .map(|col| DirectBulkColumn {
-                            name: col.name,
-                            data_type: col.data_type,
-                            scale: col.scale,
-                            precision: col.precision,
-                            data: &col.data,
-                            nulls: &col.nulls,
-                            variable_ranges: col.variable_ranges.clone(),
-                        })
-                        .collect();
-                    seg.append_direct_row_group(
-                        &columns,
-                        &group.compressed_columns,
-                        group.row_count as u64,
-                        build_value_sets,
-                        zone_map_columns.as_deref(),
-                    )?;
+                if seg.current_size >= self.max_segment_size() {
+                    seg.seal(&|path| self.invalidate_reader(path))?;
+                    active_guard.remove(&group.partition_key);
+                } else if flush_immediately {
+                    seg.flush_meta(&|path| self.invalidate_reader(path))?;
                 }
+                written += group.row_count as u64;
             }
-            if seg.current_size >= self.max_segment_size() {
-                seg.seal(&|path| self.invalidate_reader(path))?;
-                active_guard.remove(&group.partition_key);
-            } else if flush_immediately {
-                seg.flush_meta(&|path| self.invalidate_reader(path))?;
+            if written > 0 {
+                self.note_direct_segment_append(db, req.table_name);
             }
-            written += group.row_count as u64;
-        }
-        if written > 0 {
-            self.note_direct_segment_append(db, req.table_name);
-        }
-        Ok(written)
+            Ok(written)
+        })
     }
 
     fn direct_bulk_key_column_indices(

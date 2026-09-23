@@ -68,7 +68,9 @@ fn tick_batch(base_ts: i64, rows: usize) -> RecordBatch {
         batch
             .column_mut(2)
             .unwrap()
-            .push(&ScalarValue::Float64(Some(100.0 + (seq % 997) as f64 / 10.0)))
+            .push(&ScalarValue::Float64(Some(
+                100.0 + (seq % 997) as f64 / 10.0,
+            )))
             .unwrap();
         batch
             .column_mut(3)
@@ -180,5 +182,8 @@ fn bench_hot_store_append_and_point_lookup() {
         "count:   {SYMBOLS} key counts in {:.2?} -> total {total}",
         count_elapsed
     );
-    println!("resident estimate: {} bytes", store.estimated_memory_bytes());
+    println!(
+        "resident estimate: {} bytes",
+        store.estimated_memory_bytes()
+    );
 }

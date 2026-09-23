@@ -460,13 +460,7 @@ pub fn read_projected_row_group(
     reader: &SegmentReader,
     rg_idx: usize,
 ) -> Result<RecordBatch> {
-    read_projected_row_group_allow_dictionary(
-        projection_cols,
-        table_schema,
-        reader,
-        rg_idx,
-        false,
-    )
+    read_projected_row_group_allow_dictionary(projection_cols, table_schema, reader, rg_idx, false)
 }
 
 pub fn read_projected_row_group_allow_dictionary(

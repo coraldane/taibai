@@ -111,7 +111,7 @@ impl Compactor {
             &[]
         };
         let output_row_group_rows = self.segment_mgr.row_group_target_rows();
-        let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+        let partition_groups = self.segment_mgr.with_table_mutation_lock(db, table, || {
             if seal_active {
                 self.segment_mgr
                     .seal_table_active_under_table_lock(db, table)?;
@@ -120,7 +120,7 @@ impl Compactor {
                 .segment_mgr
                 .discover_inactive_segments(db, table, &table_dir)?;
             if segment_files.is_empty() {
-                return Ok(CompactStats::default());
+                return Ok(Vec::new());
             }
 
             tracing::info!(
@@ -132,76 +132,88 @@ impl Compactor {
                 "starting table optimization"
             );
 
-            let mut stats = CompactStats {
-                segments_read: segment_files.len(),
-                ..CompactStats::default()
-            };
-
-            let partition_groups = group_segments_by_partition(segment_files)
+            Ok(group_segments_by_partition(segment_files)
                 .into_iter()
-                .collect::<Vec<_>>();
-            let partition_count = partition_groups.len();
-            let partition_stats = partition_groups
-                .into_par_iter()
-                .map(|(partition_key, files)| -> Result<CompactStats> {
-                    // Keep the acquisition order aligned with query scans to
-                    // avoid CPU/IO permit inversion. Holding both permits for
-                    // the partition bounds process-wide compaction pressure.
-                    let _cpu_permit = crate::common::work_limiter::acquire_cpu();
-                    let _io_permit = crate::common::work_limiter::acquire_io();
+                .collect::<Vec<_>>())
+        })?;
+        if partition_groups.is_empty() {
+            return Ok(CompactStats::default());
+        }
 
-                    // A clean single segment can only be skipped when this
-                    // operation has no physical ordering requirement and its
-                    // row groups are already compact. A segment can contain
-                    // thousands of tiny row groups after many small flushes;
-                    // skipping it makes OPTIMIZE unable to repair the main
-                    // source of read amplification.
-                    if sort_key_indices.is_empty() && files.len() == 1 {
-                        let reader = self.segment_mgr.open_reader_cached(&files[0])?;
-                        let compact_row_groups =
-                            reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
-                        let needs_row_group_compaction =
-                            reader.num_row_groups() > compact_row_groups.max(1);
-                        if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
-                            tracing::info!(
-                                db,
-                                table,
-                                partition_key = partition_key.as_deref().unwrap_or("<none>"),
-                                segment = %files[0].display(),
-                                "skipping clean single-segment optimization"
-                            );
+        let mut stats = CompactStats {
+            segments_read: partition_groups.iter().map(|(_, files)| files.len()).sum(),
+            ..CompactStats::default()
+        };
+
+        let partition_count = partition_groups.len();
+        let partition_stats = partition_groups
+            .into_par_iter()
+            .map(|(partition_key, files)| -> Result<CompactStats> {
+                let lock_key = partition_key.as_deref().unwrap_or("");
+                self.segment_mgr
+                    .with_partition_mutation_lock(db, table, lock_key, || {
+                        // Keep the acquisition order aligned with query scans to
+                        // avoid CPU/IO permit inversion. Holding both permits for
+                        // the partition bounds process-wide compaction pressure.
+                        let _cpu_permit = crate::common::work_limiter::acquire_cpu();
+                        let _io_permit = crate::common::work_limiter::acquire_io();
+
+                        let files: Vec<PathBuf> =
+                            files.into_iter().filter(|path| path.exists()).collect();
+                        if files.is_empty() {
                             return Ok(CompactStats::default());
                         }
-                    }
-                    self.compact_segment_group(
-                        db,
-                        table,
-                        &table_dir,
-                        partition_key.as_deref(),
-                        &files,
-                        &schema,
-                        sort_key_indices,
-                        &cluster_key_indices,
-                        output_row_group_rows,
-                        ttl,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for part_stats in partition_stats {
-                stats.segments_written += part_stats.segments_written;
-                stats.rows_written += part_stats.rows_written;
-                stats.rows_dropped += part_stats.rows_dropped;
-            }
 
-            tracing::info!(
-                db,
-                table,
-                partitions = partition_count,
-                "table optimization partition workers completed"
-            );
+                        // A clean single segment can only be skipped when this
+                        // operation has no physical ordering requirement and its
+                        // row groups are already compact. A segment can contain
+                        // thousands of tiny row groups after many small flushes;
+                        // skipping it makes OPTIMIZE unable to repair the main
+                        // source of read amplification.
+                        if sort_key_indices.is_empty() && files.len() == 1 {
+                            let reader = self.segment_mgr.open_reader_cached(&files[0])?;
+                            let compact_row_groups =
+                                reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
+                            let needs_row_group_compaction =
+                                reader.num_row_groups() > compact_row_groups.max(1);
+                            if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
+                                tracing::info!(
+                                    db,
+                                    table,
+                                    partition_key = partition_key.as_deref().unwrap_or("<none>"),
+                                    segment = %files[0].display(),
+                                    "skipping clean single-segment optimization"
+                                );
+                                return Ok(CompactStats::default());
+                            }
+                        }
+                        self.compact_segment_group(
+                            db,
+                            table,
+                            &table_dir,
+                            partition_key.as_deref(),
+                            &files,
+                            &schema,
+                            sort_key_indices,
+                            &cluster_key_indices,
+                            output_row_group_rows,
+                            ttl,
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for part_stats in partition_stats {
+            stats.segments_written += part_stats.segments_written;
+            stats.rows_written += part_stats.rows_written;
+            stats.rows_dropped += part_stats.rows_dropped;
+        }
 
-            Ok(stats)
-        })?;
+        tracing::info!(
+            db,
+            table,
+            partitions = partition_count,
+            "table optimization partition workers completed"
+        );
 
         tracing::info!(
             db,
@@ -254,7 +266,7 @@ impl Compactor {
             Some((idx, info.duration_secs))
         });
         let output_row_group_rows = self.segment_mgr.row_group_target_rows();
-        let stats = self.segment_mgr.with_table_mutation_lock(db, table, || {
+        let matched = self.segment_mgr.with_table_mutation_lock(db, table, || {
             for candidate in &candidates {
                 self.segment_mgr
                     .seal_partition_active_under_table_lock(db, table, candidate)?;
@@ -262,12 +274,11 @@ impl Compactor {
             let segment_files = self
                 .segment_mgr
                 .discover_inactive_segments(db, table, &table_dir)?;
-            let mut groups = group_segments_by_partition(segment_files);
+            let groups = group_segments_by_partition(segment_files);
             let matched_key = candidates
                 .iter()
                 .find(|candidate| groups.contains_key(&Some((*candidate).clone())))
                 .cloned();
-
             let Some(matched_key) = matched_key else {
                 let available = groups
                     .keys()
@@ -288,38 +299,49 @@ impl Compactor {
             };
 
             let files = groups
-                .remove(&Some(matched_key.clone()))
+                .get(&Some(matched_key.clone()))
+                .cloned()
                 .unwrap_or_default();
-            if files.is_empty() {
-                return Ok(CompactStats::default());
-            }
-
-            tracing::info!(
-                db,
-                table,
-                table_full_name = %format!("{}.{}", db, table),
-                partition_key = %matched_key,
-                requested_partition = partition_key,
-                cluster_key = ?table_meta.cluster_key,
-                segments = files.len(),
-                "starting requested partition optimization"
-            );
-
-            let _cpu_permit = crate::common::work_limiter::acquire_cpu();
-            let _io_permit = crate::common::work_limiter::acquire_io();
-            self.compact_segment_group(
-                db,
-                table,
-                &table_dir,
-                Some(&matched_key),
-                &files,
-                &schema,
-                &cluster_key_indices,
-                &cluster_key_indices,
-                output_row_group_rows,
-                ttl,
-            )
+            Ok(Some((matched_key, files)))
         })?;
+        let Some((matched_key, mut files)) = matched else {
+            return Ok(CompactStats::default());
+        };
+
+        let stats =
+            self.segment_mgr
+                .with_partition_mutation_lock(db, table, &matched_key, || {
+                    files.retain(|path| path.exists());
+                    if files.is_empty() {
+                        return Ok(CompactStats::default());
+                    }
+
+                    tracing::info!(
+                        db,
+                        table,
+                        table_full_name = %format!("{}.{}", db, table),
+                        partition_key = %matched_key,
+                        requested_partition = partition_key,
+                        cluster_key = ?table_meta.cluster_key,
+                        segments = files.len(),
+                        "starting requested partition optimization"
+                    );
+
+                    let _cpu_permit = crate::common::work_limiter::acquire_cpu();
+                    let _io_permit = crate::common::work_limiter::acquire_io();
+                    self.compact_segment_group(
+                        db,
+                        table,
+                        &table_dir,
+                        Some(&matched_key),
+                        &files,
+                        &schema,
+                        &cluster_key_indices,
+                        &cluster_key_indices,
+                        output_row_group_rows,
+                        ttl,
+                    )
+                })?;
 
         tracing::info!(
             db,

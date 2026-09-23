@@ -104,7 +104,9 @@ impl PartitionPruner {
         Self { strategy }
     }
 
-    fn partition_function(&self) -> crate::storage::partition::partition_function::PartitionFunction {
+    fn partition_function(
+        &self,
+    ) -> crate::storage::partition::partition_function::PartitionFunction {
         use crate::storage::partition::partition_function::PartitionFunction;
         match self.strategy {
             PartitionStrategy::Day => PartitionFunction::Day,
@@ -129,10 +131,10 @@ impl PartitionPruner {
         // Falling back to an epoch-style reinterpretation here once turned a
         // `deal_time <= 2000` upper bound into month key "197001" and pruned
         // every partition.
-        let lower_key = lower_bound
-            .and_then(|v| strict_temporal_partition_key(&self.partition_function(), v));
-        let upper_key = upper_bound
-            .and_then(|v| strict_temporal_partition_key(&self.partition_function(), v));
+        let lower_key =
+            lower_bound.and_then(|v| strict_temporal_partition_key(&self.partition_function(), v));
+        let upper_key =
+            upper_bound.and_then(|v| strict_temporal_partition_key(&self.partition_function(), v));
         if lower_bound.is_some() && lower_key.is_none() {
             return available_partitions.to_vec();
         }

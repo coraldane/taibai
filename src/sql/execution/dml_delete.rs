@@ -978,7 +978,7 @@ pub fn exec_delete(
 
     let mut index_maintenance = DeleteIndexMaintenance::plan(&table_meta, &table_schema);
 
-    let indexes_maintained = mgr.with_table_mutation_lock(db, table, || {
+    let mut delete_body = || -> Result<bool> {
         // Memtable-resident rows are removed in place (no forced flush),
         // mirroring the REPLACE conflict path; durable tails are rewritten
         // so crash recovery cannot resurrect deleted rows.
@@ -1129,7 +1129,17 @@ pub fn exec_delete(
         }
 
         Ok(index_maintenance.apply(engine, db, table))
-    })?;
+    };
+
+    let indexes_maintained = match target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        Some(partition) => {
+            mgr.with_partition_set_mutation_lock(db, table, &[partition], &mut delete_body)?
+        }
+        None => mgr.with_table_mutation_lock(db, table, &mut delete_body)?,
+    };
 
     if total_deleted > 0 {
         if !indexes_maintained {

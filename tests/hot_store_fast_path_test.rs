@@ -1112,16 +1112,26 @@ fn flushed_partition_still_served_by_resident_hot_store() {
 
     let rows = collect_ts_values(
         engine
-            .execute(&mut session, "SELECT ts FROM ticks WHERE sym = 'A' AND deal_date = 20260108")
+            .execute(
+                &mut session,
+                "SELECT ts FROM ticks WHERE sym = 'A' AND deal_date = 20260108",
+            )
             .expect("post-flush point lookup"),
     );
-    assert_eq!(rows, vec![1, 2], "hot store must serve the flushed partition");
+    assert_eq!(
+        rows,
+        vec![1, 2],
+        "hot store must serve the flushed partition"
+    );
 
     // Row counts stay consistent after the flush too.
     assert_eq!(
         collect_count(
             engine
-                .execute(&mut session, "SELECT count(*) FROM ticks WHERE deal_date = 20260108")
+                .execute(
+                    &mut session,
+                    "SELECT count(*) FROM ticks WHERE deal_date = 20260108"
+                )
                 .expect("post-flush count")
         ),
         3
@@ -1157,18 +1167,14 @@ fn committed_transaction_disables_resident_fast_path_for_partition() {
         )
         .expect("auto-commit row");
 
-    engine
-        .execute(&mut session, "BEGIN")
-        .expect("begin txn");
+    engine.execute(&mut session, "BEGIN").expect("begin txn");
     engine
         .execute(
             &mut session,
             "INSERT INTO ticks VALUES ('A', 20260108, 1782718238000001, 2)",
         )
         .expect("txn row");
-    engine
-        .execute(&mut session, "COMMIT")
-        .expect("commit txn");
+    engine.execute(&mut session, "COMMIT").expect("commit txn");
 
     assert!(
         engine
@@ -1182,7 +1188,10 @@ fn committed_transaction_disables_resident_fast_path_for_partition() {
     // Correctness first: the point lookup still sees both rows.
     let rows = collect_ts_values(
         engine
-            .execute(&mut session, "SELECT ts FROM ticks WHERE sym = 'A' AND deal_date = 20260108")
+            .execute(
+                &mut session,
+                "SELECT ts FROM ticks WHERE sym = 'A' AND deal_date = 20260108",
+            )
             .expect("post-txn point lookup"),
     );
     assert_eq!(rows, vec![1, 2]);
@@ -1344,8 +1353,11 @@ fn restart_warmup_skips_table_closed_without_recorded_instant() {
         .as_object_mut()
         .expect("table object")
         .remove("hot_last_close_at");
-    std::fs::write(&catalog_path, serde_json::to_vec(&json).expect("serialize catalog"))
-        .expect("write catalog");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec(&json).expect("serialize catalog"),
+    )
+    .expect("write catalog");
 
     let engine = Engine::new(temp_dir.path(), "main").expect("restart engine");
     assert!(

@@ -521,7 +521,9 @@ fn exec_table_select(
     {
         extract_simple_metadata_aggregates(
             &plan,
-            table_schemas.get(&table_names[0]).unwrap_or(&crate::types::batch::Schema::empty()),
+            table_schemas
+                .get(&table_names[0])
+                .unwrap_or(&crate::types::batch::Schema::empty()),
         )
     } else {
         None

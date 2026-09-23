@@ -30,6 +30,13 @@ pub struct ScanSpec {
     pub minmax_index_columns: Vec<usize>,
     pub set_index_columns: Vec<usize>,
     pub reader_txn_id: u64,
+    /// Partial-residency bound when the hybrid hot-mirror leg is active:
+    /// `(partition_column_index, covers_from_value)`. The mirror answers rows
+    /// with `column > value` (its leg adds a `Gt` clause); every non-mirror
+    /// leg gains a `Le` clause on the same column so the two sides partition
+    /// the table exactly. Set only when the mirror provably covers all rows
+    /// above the bound (`TableMeta::hot_mirror_covers_from`).
+    pub hot_mirror_bound: Option<(usize, ScalarValue)>,
 
     /// Simple metadata-only aggregate fast path (COUNT/MIN/MAX, no GROUP BY).
     /// When set, the scan executor answers the query from row-group zone maps
@@ -79,6 +86,7 @@ impl ScanSpec {
             minmax_index_columns: Vec::new(),
             set_index_columns: Vec::new(),
             reader_txn_id: 0,
+            hot_mirror_bound: None,
             simple_metadata_aggregates: None,
         }
     }

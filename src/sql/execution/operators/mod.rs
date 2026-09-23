@@ -236,11 +236,13 @@ pub fn build_pipeline_with_subqueries(
             // subquery pipelines) instead of silently dropping the columns.
             let input_schema = get_scan_schema(&window.input);
             let input = build_pipeline_with_subqueries(*window.input, table_batches, subqueries)?;
-            Ok(Box::new(crate::sql::execution::operators::window::WindowExec::new(
-                input,
-                window.funcs,
-                input_schema,
-            )))
+            Ok(Box::new(
+                crate::sql::execution::operators::window::WindowExec::new(
+                    input,
+                    window.funcs,
+                    input_schema,
+                ),
+            ))
         }
         LogicalPlan::Empty => Ok(Box::new(ScanExec::new(vec![], None))),
     }

@@ -242,22 +242,8 @@ fn window_functions_on_interleaved_unsorted_input() {
     assert_eq!(
         rows,
         vec![
-            vec![
-                vs("AAPL"),
-                i64(1),
-                i64(1),
-                i64(1),
-                i64(1),
-                f64(10.0)
-            ],
-            vec![
-                vs("AAPL"),
-                i64(2),
-                i64(2),
-                i64(1),
-                i64(1),
-                f64(12.0)
-            ],
+            vec![vs("AAPL"), i64(1), i64(1), i64(1), i64(1), f64(10.0)],
+            vec![vs("AAPL"), i64(2), i64(2), i64(1), i64(1), f64(12.0)],
             vec![
                 vs("AAPL"),
                 i64(3),
@@ -266,22 +252,8 @@ fn window_functions_on_interleaved_unsorted_input() {
                 i64(2),
                 ScalarValue::Float64(None)
             ],
-            vec![
-                vs("MSFT"),
-                i64(1),
-                i64(1),
-                i64(1),
-                i64(1),
-                f64(22.0)
-            ],
-            vec![
-                vs("MSFT"),
-                i64(2),
-                i64(2),
-                i64(2),
-                i64(2),
-                f64(23.0)
-            ],
+            vec![vs("MSFT"), i64(1), i64(1), i64(1), i64(1), f64(22.0)],
+            vec![vs("MSFT"), i64(2), i64(2), i64(2), i64(2), f64(23.0)],
             vec![
                 vs("MSFT"),
                 i64(3),

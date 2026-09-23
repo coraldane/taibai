@@ -134,6 +134,12 @@ pub fn exec_explain(
             let s = &stats[t];
             out.push_str(&format!("Scan {}:\n", t));
             out.push_str(&format!("  segments      : {}\n", s.segments_opened));
+            if s.hot_mirror_rows > 0 {
+                out.push_str(&format!(
+                    "  hot_mirror    : {} rows served by the hybrid resident mirror\n",
+                    s.hot_mirror_rows
+                ));
+            }
             if s.segments_pruned_by_cluster_key > 0 {
                 out.push_str(&format!(
                     "  segment_prune : {} by cluster key\n",

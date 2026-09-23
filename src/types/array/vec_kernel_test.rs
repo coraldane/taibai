@@ -245,8 +245,7 @@ fn selected_and_dictionary_columns_compare_through_flat_form() {
     let source = i64_col(vec![Some(5), None, Some(7)]);
     let indices: Arc<[u32]> = vec![0u32, 2].into();
     let parts: SelectedParts = vec![(Arc::new(source), indices)].into();
-    let selected =
-        ColumnArray::selected(parts, crate::protocol::types::DataType::Int64, 2);
+    let selected = ColumnArray::selected(parts, crate::protocol::types::DataType::Int64, 2);
 
     assert_eq!(
         selected.compare_scalar_at(0, &ScalarValue::Int64(Some(5))),

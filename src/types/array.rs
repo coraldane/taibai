@@ -462,7 +462,10 @@ impl ColumnArray {
     pub fn compare_scalar_at(&self, row: usize, value: &ScalarValue) -> Option<std::cmp::Ordering> {
         // Zero-copy views / dictionary encodings compare through their
         // materialized form; row indexes are preserved by `flattened`.
-        if matches!(self, ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. }) {
+        if matches!(
+            self,
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. }
+        ) {
             return self.flattened().compare_scalar_at(row, value);
         }
         if self.bitmap().is_null(row) || value.is_null() {
@@ -631,7 +634,12 @@ impl ColumnArray {
     /// themselves.
     pub fn flattened(&self) -> &ColumnArray {
         match self {
-            ColumnArray::Selected { parts, data_type, flat, .. } => flat.get_or_init(|| {
+            ColumnArray::Selected {
+                parts,
+                data_type,
+                flat,
+                ..
+            } => flat.get_or_init(|| {
                 let mut out = ColumnArray::empty(*data_type);
                 for (source, indices) in parts.iter() {
                     source
@@ -650,7 +658,10 @@ impl ColumnArray {
     /// Expand dictionary ids into plain per-row varchar values. Identity
     /// (clone) for every other variant.
     fn expand_dictionary(&self) -> ColumnArray {
-        if let ColumnArray::Dictionary { ids, dict, bitmap, .. } = self {
+        if let ColumnArray::Dictionary {
+            ids, dict, bitmap, ..
+        } = self
+        {
             let mut buffer = Utf8Buffer::with_capacity(ids.len());
             for (row, id) in ids.iter().enumerate() {
                 if bitmap.is_null(row) {
@@ -931,7 +942,10 @@ impl ColumnArray {
                 })
                 .sum();
         }
-        if let ColumnArray::Dictionary { ids, dict, bitmap, .. } = self {
+        if let ColumnArray::Dictionary {
+            ids, dict, bitmap, ..
+        } = self
+        {
             return ids.capacity() * 4
                 + dict.data_capacity()
                 + dict.offsets().len() * 4
@@ -941,10 +955,7 @@ impl ColumnArray {
         match self {
             ColumnArray::Selected { .. } => unreachable!("handled above"),
             ColumnArray::Dictionary { ids, dict, .. } => {
-                ids.capacity() * 4
-                    + dict.data_capacity()
-                    + dict.offsets().len() * 4
-                    + bitmap
+                ids.capacity() * 4 + dict.data_capacity() + dict.offsets().len() * 4 + bitmap
             }
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => {
                 bitmap + data.capacity()
@@ -1066,14 +1077,14 @@ impl ColumnArray {
         }
         match self {
             ColumnArray::Selected { .. } => unreachable!("handled above"),
-            ColumnArray::Dictionary { ids, dict, bitmap, .. } => {
+            ColumnArray::Dictionary {
+                ids, dict, bitmap, ..
+            } => {
                 if bitmap.is_null(idx) {
                     ScalarValue::VarChar(None)
                 } else {
                     ScalarValue::VarChar(Some(
-                        dict.get(ids[idx] as usize)
-                            .unwrap_or("")
-                            .to_string(),
+                        dict.get(ids[idx] as usize).unwrap_or("").to_string(),
                     ))
                 }
             }

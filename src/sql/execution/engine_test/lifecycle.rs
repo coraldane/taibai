@@ -206,3 +206,138 @@ fn close_of_day_only_optimizes_partitions_written_since_last_close() -> Result<(
     }));
     Ok(())
 }
+
+#[test]
+fn optimize_partition_does_not_freeze_other_partitions() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main")?);
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE opt_freeze (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(&mut session, "INSERT INTO opt_freeze VALUES (1, 10)")?;
+    engine.execute(&mut session, "INSERT INTO opt_freeze VALUES (2, 20)")?;
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+
+    let held = engine
+        .segment_mgr()
+        .partition_lock_arc_for_tests("main", "opt_freeze", "1");
+    let held_guard = held.lock().unwrap();
+
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    let optimize_engine = Arc::clone(&engine);
+    let optimizer_session =
+        crate::net::session::Session::new("root".to_string(), "main".to_string());
+    let optimizer = std::thread::spawn(move || {
+        let mut session = optimizer_session;
+        let ok = optimize_engine
+            .execute(&mut session, "OPTIMIZE TABLE opt_freeze ON PARTITION p1")
+            .is_ok();
+        done_tx.send(ok).unwrap();
+    });
+
+    engine.execute(&mut session, "INSERT INTO opt_freeze VALUES (2, 21)")?;
+
+    assert!(
+        done_rx.try_recv().is_err(),
+        "optimize must stay blocked while the target partition lock is held"
+    );
+
+    drop(held_guard);
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("optimize thread must not hang"),
+        "optimize must succeed after the partition lock is released"
+    );
+    optimizer.join().unwrap();
+
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM opt_freeze")?,
+            0,
+            0
+        ),
+        3
+    );
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM opt_freeze WHERE id = 1")?,
+            0,
+            0
+        ),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn delete_partition_eq_does_not_freeze_other_partitions() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(dir.path(), "main")?);
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE del_freeze (id INT64, value INT64) PARTITION BY id",
+    )?;
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine.execute(&mut session, "INSERT INTO del_freeze VALUES (1, 10)")?;
+    engine.execute(&mut session, "INSERT INTO del_freeze VALUES (2, 20)")?;
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+
+    let held = engine
+        .segment_mgr()
+        .partition_lock_arc_for_tests("main", "del_freeze", "1");
+    let held_guard = held.lock().unwrap();
+
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    let delete_engine = Arc::clone(&engine);
+    let deleter_session = crate::net::session::Session::new("root".to_string(), "main".to_string());
+    let deleter = std::thread::spawn(move || {
+        let mut session = deleter_session;
+        let ok = delete_engine
+            .execute(&mut session, "DELETE FROM del_freeze WHERE id = 1")
+            .is_ok();
+        done_tx.send(ok).unwrap();
+    });
+
+    engine.execute(&mut session, "INSERT INTO del_freeze VALUES (2, 21)")?;
+
+    assert!(
+        done_rx.try_recv().is_err(),
+        "delete must stay blocked while the target partition lock is held"
+    );
+
+    drop(held_guard);
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("delete thread must not hang"),
+        "delete must succeed after the partition lock is released"
+    );
+    deleter.join().unwrap();
+
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM del_freeze")?,
+            0,
+            0
+        ),
+        2
+    );
+    Ok(())
+}

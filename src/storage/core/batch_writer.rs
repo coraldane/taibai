@@ -286,18 +286,20 @@ impl BatchWriter {
             self.write_epoch.fetch_add(1, Ordering::Release);
         }
         let prepared = (txn_id == 0).then(|| PreparedTailAppend::new(&batch));
-        let (rows, pending) = self.segment_mgr.with_table_mutation_lock(db, table, || {
-            self.write_columns_grouped_under_table_lock(
-                db,
-                table,
-                partition_key,
-                batch,
-                schema,
-                txn_id,
-                prepared,
-                hot_fed,
-            )
-        })?;
+        let (rows, pending) =
+            self.segment_mgr
+                .with_partition_mutation_lock(db, table, partition_key, || {
+                    self.write_columns_grouped_under_table_lock(
+                        db,
+                        table,
+                        partition_key,
+                        batch,
+                        schema,
+                        txn_id,
+                        prepared,
+                        hot_fed,
+                    )
+                })?;
         if let Some((ticket, memtable)) = pending {
             if let Err(error) = ticket.wait() {
                 tracing::warn!(
@@ -490,9 +492,10 @@ impl BatchWriter {
                     pending.push(submitted);
                 }
             } else {
-                let submitted = self.segment_mgr.with_table_mutation_lock(
+                let submitted = self.segment_mgr.with_partition_mutation_lock(
                     memtable.db(),
                     memtable.table(),
+                    memtable.partition_key(),
                     || self.submit_memtable_tail(memtable),
                 )?;
                 if let Some(submitted) = submitted {
@@ -973,25 +976,37 @@ impl BatchWriter {
                 break;
             }
             let table_dir = segment_mgr.table_dir(&db, &table);
-            let result = segment_mgr.with_table_mutation_lock(&db, &table, || {
-                tail_committer.barrier(&table_dir)?;
-                let ids = mts.iter().map(|mt| mt.id()).collect::<Vec<_>>();
-                let live_paths =
-                    crate::storage::core::durable_tail::live_tail_paths_batch(&table_dir, &ids)?;
-                let mut count = 0usize;
-                for mt in &mts {
-                    if memtable_mgr.total_estimated_memory_bytes() <= target {
-                        break;
+            let mut partition_keys = mts
+                .iter()
+                .map(|mt| mt.partition_key().to_string())
+                .collect::<Vec<_>>();
+            partition_keys.sort();
+            partition_keys.dedup();
+            let partition_refs = partition_keys
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let result =
+                segment_mgr.with_partition_set_mutation_lock(&db, &table, &partition_refs, || {
+                    tail_committer.barrier(&table_dir)?;
+                    let ids = mts.iter().map(|mt| mt.id()).collect::<Vec<_>>();
+                    let live_paths = crate::storage::core::durable_tail::live_tail_paths_batch(
+                        &table_dir, &ids,
+                    )?;
+                    let mut count = 0usize;
+                    for mt in &mts {
+                        if memtable_mgr.total_estimated_memory_bytes() <= target {
+                            break;
+                        }
+                        if Self::try_spill_memtable(
+                            live_paths.get(&mt.id()).and_then(|path| path.clone()),
+                            mt,
+                        ) {
+                            count += 1;
+                        }
                     }
-                    if Self::try_spill_memtable(
-                        live_paths.get(&mt.id()).and_then(|path| path.clone()),
-                        mt,
-                    ) {
-                        count += 1;
-                    }
-                }
-                Ok(count)
-            });
+                    Ok(count)
+                });
             match result {
                 Ok(count) => spilled += count,
                 Err(error) => {
@@ -1070,7 +1085,7 @@ impl BatchWriter {
         let result = if table_lock_held {
             Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)
         } else {
-            segment_mgr.with_table_mutation_lock(&db, &table, || {
+            segment_mgr.with_partition_mutation_lock(&db, &table, mt.partition_key(), || {
                 Self::flush_memtable_under_table_lock(segment_mgr, mt, tail_committer)
             })
         };
@@ -1224,7 +1239,7 @@ impl BatchWriter {
         let result = if table_lock_held {
             Self::flush_memtable_group_under_table_lock(segment_mgr, group, tail_committer)
         } else {
-            segment_mgr.with_table_mutation_lock(&db, &table, || {
+            segment_mgr.with_partition_mutation_lock(&db, &table, group[0].partition_key(), || {
                 Self::flush_memtable_group_under_table_lock(segment_mgr, group, tail_committer)
             })
         };

@@ -67,6 +67,10 @@ pub struct QueryLimits {
     pub max_parallel_segments: usize,
     pub global_io_permits: usize,
     pub global_cpu_permits: usize,
+    /// Hybrid partial-residency scans: let the resident hot mirror answer
+    /// rows above its close-aware coverage bound while segment scans handle
+    /// the complement. See `TableMeta::hot_mirror_covers_from`.
+    pub hybrid_hot_scan_enabled: bool,
 }
 
 impl Default for QueryLimits {
@@ -82,6 +86,7 @@ impl Default for QueryLimits {
             max_parallel_segments: default_max_parallel_segments(),
             global_io_permits: default_global_io_permits(),
             global_cpu_permits: default_global_cpu_permits(),
+            hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         }
     }
 }
@@ -161,6 +166,7 @@ pub fn set_query_limits(limits: QueryLimits) -> Result<(), QueryLimits> {
 /// Read the process-wide query limits (defaults if unset).
 pub fn query_limits() -> QueryLimits {
     *QUERY_LIMITS.get().unwrap_or(&QueryLimits {
+        hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         query_memory_limit_mb: default_query_memory_limit_mb(),
         max_result_message_bytes: default_max_message_size(),
         max_aggregate_groups: default_max_aggregate_groups(),
@@ -341,6 +347,10 @@ fn default_low_rate_memtable_max_rows() -> u64 {
 
 fn default_low_rate_memtable_max_age_secs() -> u64 {
     3600
+}
+
+fn default_hybrid_hot_scan_enabled() -> bool {
+    true
 }
 
 fn default_hot_warmup_enabled() -> bool {
@@ -562,6 +572,10 @@ pub struct StorageSettings {
     /// memory.
     #[serde(default = "default_hot_warmup_enabled")]
     pub hot_warmup_enabled: bool,
+    /// Hybrid partial-residency scans (see `QueryLimits`). Disable to serve
+    /// every query from segments and memtables only.
+    #[serde(default = "default_hybrid_hot_scan_enabled")]
+    pub hybrid_hot_scan_enabled: bool,
     #[serde(default = "default_row_group_target_rows")]
     pub row_group_target_rows: usize,
     /// Ack durable-tail appends once the bytes reach the page cache. The tail
@@ -828,6 +842,7 @@ fn default_storage_settings() -> StorageSettings {
         low_rate_memtable_max_age_secs: default_low_rate_memtable_max_age_secs(),
         hot_store_memory_limit_mb: default_hot_store_memory_limit_mb(),
         hot_warmup_enabled: default_hot_warmup_enabled(),
+        hybrid_hot_scan_enabled: default_hybrid_hot_scan_enabled(),
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
         tail_async_fsync: false,

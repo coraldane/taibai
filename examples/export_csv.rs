@@ -8,8 +8,14 @@ use taibai::net::client::{Client, QueryResult};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let host = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:5151".into());
-    let database = args.get(2).cloned().unwrap_or_else(|| "base_realtime".into());
+    let host = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:5151".into());
+    let database = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "base_realtime".into());
     let sql = args
         .get(3)
         .cloned()
@@ -24,12 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let result = client.query(&sql).await?;
     let rows = match result {
-        QueryResult::Rows { schema, batches, .. } => {
-            let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&out_path)?);
-            let names: Vec<String> = schema
-                .column_names()
-                .map(|s| csv_escape(&s))
-                .collect();
+        QueryResult::Rows {
+            schema, batches, ..
+        } => {
+            let mut out =
+                std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&out_path)?);
+            let names: Vec<String> = schema.column_names().map(|s| csv_escape(&s)).collect();
             writeln!(out, "{}", names.join(","))?;
             let mut total = 0usize;
             for batch in &batches {

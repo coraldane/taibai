@@ -238,10 +238,7 @@ pub(crate) fn direct_bulk_request_to_batch(
 /// element-wise without `ScalarValue` boxing, VarChar bytes are pushed
 /// straight into the UTF-8 buffer (no per-row `String` allocation), and only
 /// columns that actually carry NULLs pay for per-row bitmap work.
-fn direct_bulk_column_to_array(
-    col: &DirectBulkColumn<'_>,
-    rows: usize,
-) -> Result<ColumnArray> {
+fn direct_bulk_column_to_array(col: &DirectBulkColumn<'_>, rows: usize) -> Result<ColumnArray> {
     let has_nulls = !col.nulls.is_empty() && (0..rows).any(|r| null_bit_is_set(col.nulls, r));
     if has_nulls {
         // Rare path: per-row decode honouring the NULL bitmap.
@@ -329,8 +326,10 @@ fn direct_bulk_column_to_array(
                     let mut buf = crate::types::array::Utf8Buffer::with_capacity(rows);
                     buf.reserve_values(rows, total_bytes);
                     for &(offset, len) in ranges {
-                        let value = std::str::from_utf8(&col.data[offset..offset + len])
-                            .map_err(|_| TaibaiError::Protocol("invalid utf8 in bulk varchar".into()))?;
+                        let value =
+                            std::str::from_utf8(&col.data[offset..offset + len]).map_err(|_| {
+                                TaibaiError::Protocol("invalid utf8 in bulk varchar".into())
+                            })?;
                         buf.push_str(value);
                     }
                     return Ok(ColumnArray::VarChar {
@@ -735,7 +734,10 @@ mod bulk_decode_bench {
             .into_iter()
             .map(|v| Box::leak(v.into_boxed_slice()) as &'static [u8])
             .collect();
-        let mk = |name: &'static str, dtype: DataType, data: &'static [u8], ranges: Option<&'static [(usize, usize)]>| DirectBulkColumn {
+        let mk = |name: &'static str,
+                  dtype: DataType,
+                  data: &'static [u8],
+                  ranges: Option<&'static [(usize, usize)]>| DirectBulkColumn {
             name,
             data_type: dtype,
             scale: 0,
@@ -745,13 +747,25 @@ mod bulk_decode_bench {
             variable_ranges: ranges.map(|r| r.to_vec()),
         };
         let columns = vec![
-            mk("security_id", DataType::VarChar, symbol_bytes, Some(symbol_ranges)),
+            mk(
+                "security_id",
+                DataType::VarChar,
+                symbol_bytes,
+                Some(symbol_ranges),
+            ),
             mk("deal_date", DataType::Int32, fixed_static[0], None),
             mk("price", DataType::Decimal, fixed_static[1], None),
             mk("trans_volume", DataType::Int64, fixed_static[2], None),
             mk("local_time", DataType::Timestamp, fixed_static[3], None),
         ];
-        (DirectBulkRequest { table_name: "t", row_count: rows, columns }, Vec::new())
+        (
+            DirectBulkRequest {
+                table_name: "t",
+                row_count: rows,
+                columns,
+            },
+            Vec::new(),
+        )
     }
 
     #[test]

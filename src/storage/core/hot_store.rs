@@ -103,7 +103,14 @@ impl StringPool {
         Self {
             forward: HashMap::with_hasher(FastBuild::default()),
             reverse: Vec::new(),
-            cache: vec![PoolCacheSlot { hash: 0, id: 0, _pad: 0 }; POOL_CACHE_SLOTS],
+            cache: vec![
+                PoolCacheSlot {
+                    hash: 0,
+                    id: 0,
+                    _pad: 0
+                };
+                POOL_CACHE_SLOTS
+            ],
         }
     }
 
@@ -432,10 +439,7 @@ where
             if let (ColumnArray::$variant { data, .. }, SV::$scalar(Some(v))) = (col, value) {
                 return RowPred::Fast {
                     bitmap: col.bitmap(),
-                    pred: FastPred::$field {
-                        data,
-                        v: v.clone(),
-                    },
+                    pred: FastPred::$field { data, v: v.clone() },
                     op,
                 };
             }
@@ -630,7 +634,11 @@ impl OpenChunk {
     /// The open chunk keeps its data so readers already holding the lock (or
     /// about to acquire it) still observe every published row.
     fn freeze_at(&self, base: u64) -> Chunk {
-        let memory_bytes = self.columns.iter().map(|c| c.estimated_size_bytes() as u64).sum::<u64>()
+        let memory_bytes = self
+            .columns
+            .iter()
+            .map(|c| c.estimated_size_bytes() as u64)
+            .sum::<u64>()
             + self.index.estimate_bytes();
         Chunk {
             base,
@@ -649,7 +657,10 @@ impl OpenChunk {
     }
 
     fn estimated_memory_bytes(&self) -> u64 {
-        self.columns.iter().map(|c| c.estimated_size_bytes() as u64).sum::<u64>()
+        self.columns
+            .iter()
+            .map(|c| c.estimated_size_bytes() as u64)
+            .sum::<u64>()
             + self.index.estimate_bytes()
     }
 }
@@ -935,9 +946,7 @@ impl HotStore {
             let partition_keys = match self.partition_column_index {
                 Some(partition_idx) => {
                     let partition_col = batch.column(partition_idx).ok_or_else(|| {
-                        TaibaiError::Internal(
-                            "hot store: missing partition column in batch".into(),
-                        )
+                        TaibaiError::Internal("hot store: missing partition column in batch".into())
                     })?;
                     Some(collect_keys(partition_col, &mut pool)?)
                 }
@@ -1131,13 +1140,8 @@ impl HotStore {
         // stay on the serial walk with its early exit.
         if row_limit.is_none()
             && visit.len() > 1
-            && estimate_candidates(
-                &visit,
-                &key,
-                partition_key.as_ref(),
-                min_offset,
-                front,
-            ) >= PARALLEL_GATHER_MIN_ROWS
+            && estimate_candidates(&visit, &key, partition_key.as_ref(), min_offset, front)
+                >= PARALLEL_GATHER_MIN_ROWS
         {
             use rayon::prelude::*;
             // (probed, skipped below watermark, gathered part)
@@ -1339,8 +1343,7 @@ impl HotStore {
                                     (source.clone(), std::sync::Arc::from(rows.clone()))
                                 }
                                 SelectionSource::Owned(owned) => {
-                                    let identity: Vec<u32> =
-                                        (0..owned.len() as u32).collect();
+                                    let identity: Vec<u32> = (0..owned.len() as u32).collect();
                                     (
                                         std::sync::Arc::new(owned.clone()),
                                         std::sync::Arc::from(identity),
@@ -1353,11 +1356,7 @@ impl HotStore {
                 .collect();
             return RecordBatch::try_new(Schema::new(defs), columns).ok();
         }
-        if seen
-            && !has_shared_part
-            && found <= SELECTED_MAX_ROWS
-            && chunk_selections.len() == 1
-        {
+        if seen && !has_shared_part && found <= SELECTED_MAX_ROWS && chunk_selections.len() == 1 {
             // Single open-chunk hit: the taken columns ARE the result; move
             // them without a copy.
             let (_, sources) = chunk_selections.remove(0);

@@ -184,9 +184,16 @@ fn histogram_equality_selectivity(
         return None;
     }
     let bucket = stats.histogram.iter().find(|bucket| {
-        crate::sql::execution::operators::sort::compare_scalars_null_last(value, &bucket.lower_bound).is_ge()
-            && crate::sql::execution::operators::sort::compare_scalars_null_last(value, &bucket.upper_bound)
-                .is_le()
+        crate::sql::execution::operators::sort::compare_scalars_null_last(
+            value,
+            &bucket.lower_bound,
+        )
+        .is_ge()
+            && crate::sql::execution::operators::sort::compare_scalars_null_last(
+                value,
+                &bucket.upper_bound,
+            )
+            .is_le()
     })?;
     if !crate::sql::execution::operators::sort::compare_scalars_null_last(
         &bucket.lower_bound,
@@ -234,13 +241,17 @@ fn histogram_cdf(
     }
     let mut preceding = 0u64;
     for bucket in histogram {
-        let lower_cmp =
-            crate::sql::execution::operators::sort::compare_scalars_null_last(value, &bucket.lower_bound);
+        let lower_cmp = crate::sql::execution::operators::sort::compare_scalars_null_last(
+            value,
+            &bucket.lower_bound,
+        );
         if lower_cmp.is_lt() {
             return Some(preceding as f64 / total as f64);
         }
-        let upper_cmp =
-            crate::sql::execution::operators::sort::compare_scalars_null_last(value, &bucket.upper_bound);
+        let upper_cmp = crate::sql::execution::operators::sort::compare_scalars_null_last(
+            value,
+            &bucket.upper_bound,
+        );
         if upper_cmp.is_gt() {
             preceding = preceding.saturating_add(bucket.sample_count as u64);
             continue;

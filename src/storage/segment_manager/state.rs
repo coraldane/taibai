@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::storage::segment_manager::active_writer::ActiveSegmentWriter;
 
@@ -9,6 +9,20 @@ pub(super) struct TableSegmentState {
     pub(super) partition_seq: Mutex<HashMap<String, u32>>,
     pub(super) active_segments: Mutex<HashMap<String, ActiveSegmentWriter>>,
     pub(super) mutation_lock: Mutex<()>,
+    /// Per-partition mutation locks. Partition-scoped writers (memtable
+    /// INSERT, single-partition bulk append, memtable flush/seal) take only
+    /// their partition's mutex; table-wide mutation ops take the wide gate
+    /// (`with_table_mutation_lock`), which freezes this registry and locks
+    /// every partition mutex, so the two levels stay mutually exclusive.
+    /// Lock order: `mutation_lock` → `partition_locks` (write) → partition
+    /// mutexes in sorted key order. Partition writers take one partition
+    /// mutex and must never re-enter `mutation_lock` or this registry.
+    pub(super) partition_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    /// Set while a table-wide mutation operation holds the wide gate.
+    /// Partition writers re-check it after acquiring their mutex and retry
+    /// until it clears, so the registry write guard only needs to be held
+    /// briefly for the partition snapshot.
+    pub(super) partition_gate: AtomicBool,
     pub(super) flush_visibility: RwLock<()>,
     pub(super) retired: AtomicBool,
 }
@@ -27,6 +41,8 @@ impl TableSegmentState {
             partition_seq: Mutex::new(partition_seq),
             active_segments: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
+            partition_locks: RwLock::new(HashMap::new()),
+            partition_gate: AtomicBool::new(false),
             flush_visibility: RwLock::new(()),
             retired: AtomicBool::new(false),
         }

@@ -361,14 +361,28 @@ fn frame_bounds(
     let lo = match start_spec {
         FrameBound::UnboundedPreceding => group_start,
         FrameBound::Preceding(n) if is_range => range_bound_pos(
-            order, order_cols, group_start, group_end, pos, *n, true, true,
+            order,
+            order_cols,
+            group_start,
+            group_end,
+            pos,
+            *n,
+            true,
+            true,
         )
         .unwrap_or_else(|| peer_start(order, order_cols, group_start, pos)),
         FrameBound::Preceding(n) => group_start + pos_in_group.saturating_sub(*n),
         FrameBound::CurrentRow if is_range => peer_start(order, order_cols, group_start, pos),
         FrameBound::CurrentRow => pos,
         FrameBound::Following(n) if is_range => range_bound_pos(
-            order, order_cols, group_start, group_end, pos, *n, true, false,
+            order,
+            order_cols,
+            group_start,
+            group_end,
+            pos,
+            *n,
+            true,
+            false,
         )
         .unwrap_or_else(|| peer_start(order, order_cols, group_start, pos)),
         FrameBound::Following(n) => group_start + (pos_in_group + n).min(group_len),
@@ -377,7 +391,14 @@ fn frame_bounds(
     let hi = match end_spec {
         FrameBound::UnboundedFollowing => group_end,
         FrameBound::Following(n) if is_range => range_bound_pos(
-            order, order_cols, group_start, group_end, pos, *n, false, false,
+            order,
+            order_cols,
+            group_start,
+            group_end,
+            pos,
+            *n,
+            false,
+            false,
         )
         .unwrap_or_else(|| peer_end(order, order_cols, group_start, group_end, pos)),
         FrameBound::Following(n) => group_start + (pos_in_group + n + 1).min(group_len),
@@ -393,7 +414,14 @@ fn frame_bounds(
             }
         }
         FrameBound::Preceding(n) if is_range => range_bound_pos(
-            order, order_cols, group_start, group_end, pos, *n, false, true,
+            order,
+            order_cols,
+            group_start,
+            group_end,
+            pos,
+            *n,
+            false,
+            true,
         )
         .unwrap_or_else(|| peer_end(order, order_cols, group_start, group_end, pos)),
         FrameBound::Preceding(n) => group_start + (pos_in_group + 1).saturating_sub(*n),
@@ -403,11 +431,7 @@ fn frame_bounds(
 }
 
 /// Numeric value of the first (single) ORDER BY key at sorted position `pos`.
-fn range_key_at(
-    order_cols: &[(Vec<ScalarValue>, bool)],
-    order: &[u32],
-    pos: usize,
-) -> Option<f64> {
+fn range_key_at(order_cols: &[(Vec<ScalarValue>, bool)], order: &[u32], pos: usize) -> Option<f64> {
     let (col, _) = order_cols.first()?;
     col.get(*order.get(pos)? as usize)?.numeric_f64()
 }

@@ -113,7 +113,12 @@ pub fn apply_predicates(
         .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
     {
         return apply_predicates(
-            &materialize_predicate_dictionaries(batch, eq_predicates, range_predicates, in_predicates)?,
+            &materialize_predicate_dictionaries(
+                batch,
+                eq_predicates,
+                range_predicates,
+                in_predicates,
+            )?,
             eq_predicates,
             range_predicates,
             in_predicates,
@@ -173,7 +178,12 @@ pub fn apply_predicates_with_column_map(
         .any(|c| matches!(c, ColumnArray::Dictionary { .. }))
     {
         return apply_predicates_with_column_map(
-            &materialize_predicate_dictionaries(batch, eq_predicates, range_predicates, in_predicates)?,
+            &materialize_predicate_dictionaries(
+                batch,
+                eq_predicates,
+                range_predicates,
+                in_predicates,
+            )?,
             source_columns,
             eq_predicates,
             range_predicates,

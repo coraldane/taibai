@@ -208,7 +208,8 @@ async fn handler_errors_still_release_bulk_import_session_state() {
 async fn disconnect_during_capacity_wait_still_flushes_bulk_import() {
     let (_dir, engine) = test_engine();
     let limiter = Arc::new(Semaphore::new(1));
-    let (mut client, server) = spawn_test_connection_with_limiter(Arc::clone(&engine), Arc::clone(&limiter));
+    let (mut client, server) =
+        spawn_test_connection_with_limiter(Arc::clone(&engine), Arc::clone(&limiter));
     login(&mut client, "root").await;
 
     client.send(query("START BULK IMPORT")).await.unwrap();

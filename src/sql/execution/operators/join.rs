@@ -1239,7 +1239,6 @@ impl HashJoinExec {
             .collect()
     }
 
-
     fn make_null_right_row(&self) -> Vec<ScalarValue> {
         self.right_schema
             .columns
