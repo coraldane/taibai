@@ -409,6 +409,10 @@ pub fn read_plain_row_group(
     reader: &SegmentReader,
     rg_idx: usize,
 ) -> Result<RecordBatch> {
+    if spec.has_predicates() && !projection_cols.is_empty() {
+        return read_predicated_plain_row_group(spec, projection_cols, table_schema, reader, rg_idx);
+    }
+
     // Dictionary passthrough: when nothing downstream needs per-row strings,
     // dictionary-encoded columns stay as (ids, dict) so the grouped
     // aggregate's fast path consumes u32 ids directly. Predicates materialize
@@ -437,21 +441,121 @@ pub fn read_plain_row_group(
         )?;
     }
 
-    if batch.num_rows() == 0 {
+    if batch.num_rows() == 0 || !spec.has_predicates() {
         return Ok(batch);
     }
 
-    if spec.has_predicates() {
-        row_filter::apply_predicates(
+    // Projection covers every column (empty projection reads the full row
+    // group above), so the full-table predicate indices line up as-is.
+    row_filter::apply_predicates(
+        &batch,
+        &spec.eq_predicates,
+        &spec.range_predicates,
+        &spec.in_predicates,
+        spec.remaining_predicate.as_ref(),
+    )
+}
+
+/// Predicated plain read. Predicates carry full-table column indices, but the
+/// caller's projection may not include the predicate columns at all (e.g. a
+/// GROUP BY scan narrowed to its group keys). On such a batch an equality on
+/// a filtered-out column would zero every row and a range on one would
+/// silently pass — so read the union of projection and predicate columns,
+/// evaluate with remapped indices, and project back down.
+fn read_predicated_plain_row_group(
+    spec: &ScanSpec,
+    projection_cols: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+) -> Result<RecordBatch> {
+    let mut union_cols = projection_cols.to_vec();
+    for idx in spec.all_predicate_columns() {
+        if !union_cols.contains(&idx) {
+            union_cols.push(idx);
+        }
+    }
+    union_cols.sort_unstable();
+
+    if union_cols.len() == projection_cols.len() {
+        let mut batch = read_row_group_with_schema_mapping(
+            projection_cols,
+            table_schema,
+            reader,
+            rg_idx,
+        )?;
+        batch = apply_delete_bitmap(reader, rg_idx, batch)?;
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+        return row_filter::apply_predicates_with_column_map(
             &batch,
+            projection_cols,
             &spec.eq_predicates,
             &spec.range_predicates,
             &spec.in_predicates,
             spec.remaining_predicate.as_ref(),
-        )
-    } else {
-        Ok(batch)
+        );
     }
+
+    let mut batch =
+        read_row_group_with_schema_mapping(&union_cols, table_schema, reader, rg_idx)?;
+    batch = apply_delete_bitmap(reader, rg_idx, batch)?;
+    if batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+    let filtered = row_filter::apply_predicates_with_column_map(
+        &batch,
+        &union_cols,
+        &spec.eq_predicates,
+        &spec.range_predicates,
+        &spec.in_predicates,
+        spec.remaining_predicate.as_ref(),
+    )?;
+    project_union_columns(filtered, &union_cols, projection_cols)
+}
+
+fn apply_delete_bitmap(
+    reader: &SegmentReader,
+    rg_idx: usize,
+    batch: RecordBatch,
+) -> Result<RecordBatch> {
+    if reader.delete_bitmap().is_empty() {
+        return Ok(batch);
+    }
+    let rg_start_row: u64 = reader
+        .footer_row_groups_info()
+        .iter()
+        .take(rg_idx)
+        .map(|r| r.row_count)
+        .sum();
+    crate::storage::segment::delete_bitmap::filter_batch(
+        &batch,
+        rg_start_row,
+        reader.delete_bitmap(),
+    )
+}
+
+/// Keep only `projection_cols` from a batch read over `union_cols`, in
+/// projection order.
+fn project_union_columns(
+    batch: RecordBatch,
+    union_cols: &[usize],
+    projection_cols: &[usize],
+) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(projection_cols.len());
+    let mut col_defs = Vec::with_capacity(projection_cols.len());
+    for &idx in projection_cols {
+        let pos = union_cols.iter().position(|&u| u == idx).ok_or_else(|| {
+            crate::common::error::TaibaiError::Internal(format!(
+                "projected column {idx} missing from predicate batch"
+            ))
+        })?;
+        columns.push(batch.columns[pos].clone());
+        col_defs.push(batch.schema.columns[pos].clone());
+    }
+    RecordBatch::try_new(Schema::new(col_defs), columns)
+        .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()))
 }
 
 pub fn read_projected_row_group(

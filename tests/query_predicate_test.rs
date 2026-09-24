@@ -273,3 +273,104 @@ fn in_subquery_can_be_used_with_or_predicate() {
         ]
     );
 }
+
+/// Regression: a GROUP BY scan narrowed to its group/aggregate columns must
+/// still filter rows correctly on segments whose writer schema differs from
+/// the current table schema (e.g. after ALTER TABLE). The schema-differs
+/// fallback used to apply full-table predicate indices against the narrow
+/// projected batch: an equality on a column outside the projection zeroed
+/// every row, and a range on one was silently skipped (row-group zone-map
+/// granularity only).
+#[test]
+fn group_by_predicates_on_schema_differring_segment() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE monitor_t (
+                id INT64,
+                deal_date INT32,
+                table_name VARCHAR,
+                status VARCHAR,
+                target_count INT64
+            )",
+        )
+        .expect("create table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO monitor_t VALUES
+                (1, 20250102, 't_a', 'COMPLETED', 100),
+                (2, 20250102, 't_b', 'COMPLETED', 200),
+                (3, 20250604, 't_a', 'COMPLETED', 300),
+                (4, 20250604, 't_b', 'COMPLETED', 400),
+                (5, 20240701, 't_a', 'COMPLETED', 500),
+                (6, 20240701, 't_b', 'COMPLETED', 600),
+                (7, 20260301, 't_a', 'COMPLETED', 700),
+                (8, 20260301, 't_b', 'COMPLETED', 800)",
+        )
+        .expect("insert rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE monitor_t")
+        .expect("flush rows");
+
+    // The segment now holds 5 columns while the table schema has 6, so
+    // every row group read takes the schema-differs fallback path.
+    engine
+        .execute(&mut session, "ALTER TABLE monitor_t ADD COLUMN extra VARCHAR")
+        .expect("add column");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT table_name, COUNT(*), MIN(deal_date), MAX(deal_date), SUM(target_count)
+                 FROM monitor_t
+                 WHERE status = 'COMPLETED' AND deal_date >= 20250101 AND deal_date <= 20251231
+                 GROUP BY table_name",
+            )
+            .expect("grouped aggregate over schema-differring segment"),
+    );
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                ScalarValue::VarChar(Some("t_a".into())),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int32(Some(20250102)),
+                ScalarValue::Int32(Some(20250604)),
+                ScalarValue::Int64(Some(400)),
+            ],
+            vec![
+                ScalarValue::VarChar(Some("t_b".into())),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Int32(Some(20250102)),
+                ScalarValue::Int32(Some(20250604)),
+                ScalarValue::Int64(Some(600)),
+            ],
+        ]
+    );
+
+    // Range-only variant: the 2024 and 2026 rows must not leak in.
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT table_name, COUNT(*), MIN(deal_date), MAX(deal_date)
+                 FROM monitor_t
+                 WHERE deal_date >= 20250101 AND deal_date <= 20251231
+                 GROUP BY table_name",
+            )
+            .expect("range grouped aggregate over schema-differring segment"),
+    );
+    for row in &rows {
+        assert_eq!(
+            row[1],
+            ScalarValue::Int64(Some(2)),
+            "range must filter to exactly the two 2025 rows per group"
+        );
+        assert_eq!(row[2], ScalarValue::Int32(Some(20250102)));
+        assert_eq!(row[3], ScalarValue::Int32(Some(20250604)));
+    }
+}
