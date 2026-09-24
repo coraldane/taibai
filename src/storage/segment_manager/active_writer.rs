@@ -18,9 +18,10 @@ use crate::storage::segment_manager::config::{
     SIDECAR_COMPACT_MIN_RECORDS,
 };
 use crate::storage::segment_manager::helpers::{
-    compute_value_sets_from_bulk_columns, compute_zone_maps_from_batch,
+    compute_value_sets_from_bulk_columns, compute_zone_map_from_column,
     compute_zone_maps_from_bulk_columns,
 };
+use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
@@ -252,7 +253,11 @@ impl ActiveSegmentWriter {
 
         let rows_to_flush = self.row_group_target_rows.min(total_buffered);
 
-        let compressed_columns: Vec<(Vec<u8>, u64)> = (0..num_cols)
+        // One pass per column in parallel: encode+compress, zone map and
+        // value set used to run value sets serially on the single flusher
+        // thread, where the per-row ScalarValue allocations of low-cardinality
+        // columns dominated the group write time.
+        let outputs = (0..num_cols)
             .into_par_iter()
             .map(|col_idx| {
                 let col = buffered.column(col_idx).unwrap();
@@ -260,9 +265,19 @@ impl ActiveSegmentWriter {
                 let orig_len = encoded.len() as u64;
                 let compressed = zstd::bulk::compress(&encoded, compression_level)
                     .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
-                Ok((compressed, orig_len))
+                let zone_map = compute_zone_map_from_column(col, 0, rows_to_flush);
+                let value_set = compute_value_set_from_column(col, 0, rows_to_flush);
+                Ok((compressed, orig_len, zone_map, value_set))
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut compressed_columns = Vec::with_capacity(num_cols);
+        let mut zone_maps = Vec::with_capacity(num_cols);
+        let mut value_sets = Vec::with_capacity(num_cols);
+        for (compressed, orig_len, zone_map, value_set) in outputs {
+            compressed_columns.push((compressed, orig_len));
+            zone_maps.push(zone_map);
+            value_sets.push(value_set);
+        }
 
         self.ensure_data_write_position()?;
 
@@ -283,12 +298,12 @@ impl ActiveSegmentWriter {
             offset,
             length: total_length,
             row_count: rows_to_flush as u64,
-            zone_maps: compute_zone_maps_from_batch(&buffered, 0, rows_to_flush),
+            zone_maps,
             column_compressed_sizes,
             compressed_sizes,
             uncompressed_sizes,
             bloom_filters: vec![None; self.schema.num_columns()],
-            value_sets: compute_value_sets_from_batch(&buffered, 0, rows_to_flush),
+            value_sets,
         });
         self.current_size += total_length;
         self.total_rows += rows_to_flush as u64;
@@ -352,12 +367,15 @@ impl ActiveSegmentWriter {
         self.file.flush()?;
         self.file.get_ref().set_len(self.data_end)?;
         self.file.seek(SeekFrom::Start(self.data_end))?;
-        self.file.get_ref().sync_all()?;
 
         let footer = self.encode_footer()?;
         self.file.write_all(&footer)?;
         self.file.write_all(&self.data_end.to_le_bytes())?;
         self.file.flush()?;
+        // A single sync_all is the durability barrier for both the row-group
+        // bytes and the footer that publishes them; a second sync before the
+        // footer doubled the per-row-group fsync cost without adding a
+        // guarantee.
         self.file.get_ref().sync_all()?;
 
         if self.sidecar_row_groups_flushed == 0
@@ -508,36 +526,149 @@ impl ActiveSegmentWriter {
     }
 }
 
-fn compute_value_sets_from_batch(
-    batch: &RecordBatch,
-    offset: usize,
-    count: usize,
-) -> Vec<Option<Vec<ScalarValue>>> {
-    let mut result = Vec::with_capacity(batch.num_columns());
-    for col_idx in 0..batch.num_columns() {
-        let col = batch.column(col_idx).unwrap();
-        let mut values = HashSet::new();
-        let mut complete = true;
-        for row_idx in offset..offset + count {
-            let value = col.scalar(row_idx);
-            if value.is_null() {
-                continue;
+/// Distinct values of one column up to `VALUE_SET_MAX_DISTINCT`, tracked on
+/// raw typed keys instead of a `ScalarValue` per row: the allocation-free
+/// probe keeps exact semantics (same null skip, same distinctness, same cap,
+/// same final sort) at a fraction of the cost for low-cardinality columns
+/// such as `deal_date`/`deal_time`, which previously had to walk every row.
+fn compute_value_set_from_column(
+    column: &ColumnArray,
+    start_row: usize,
+    row_count: usize,
+) -> Option<Vec<ScalarValue>> {
+    let end_row = start_row + row_count;
+    let bitmap = column.bitmap();
+
+    macro_rules! typed_value_set {
+        ($values:expr, $scalar:ident) => {{
+            let mut keys = HashSet::new();
+            for (row, &value) in $values.iter().enumerate().take(end_row).skip(start_row) {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                keys.insert(value);
+                if keys.len() > VALUE_SET_MAX_DISTINCT {
+                    return None;
+                }
             }
-            values.insert(value);
-            if values.len() > VALUE_SET_MAX_DISTINCT {
-                complete = false;
-                break;
+            let mut scalars: Vec<ScalarValue> =
+                keys.into_iter().map(|value| ScalarValue::$scalar(Some(value))).collect();
+            scalars.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+            return Some(scalars);
+        }};
+    }
+
+    match column {
+        ColumnArray::Bool { data, .. } => {
+            let mut keys = HashSet::new();
+            for (row, &raw) in data.iter().enumerate().take(end_row).skip(start_row) {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                keys.insert(raw != 0);
+                if keys.len() > VALUE_SET_MAX_DISTINCT {
+                    return None;
+                }
             }
+            let mut scalars: Vec<ScalarValue> =
+                keys.into_iter().map(|value| ScalarValue::Bool(Some(value))).collect();
+            scalars.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+            Some(scalars)
         }
-        if complete {
-            let mut values: Vec<ScalarValue> = values.into_iter().collect();
-            values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
-            result.push(Some(values));
-        } else {
-            result.push(None);
+        ColumnArray::Int8 { data, .. } => typed_value_set!(data, Int8),
+        ColumnArray::Int16 { data, .. } => typed_value_set!(data, Int16),
+        ColumnArray::Int32 { data, .. } => typed_value_set!(data, Int32),
+        ColumnArray::Int64 { data, .. } => typed_value_set!(data, Int64),
+        ColumnArray::UInt8 { data, .. } => typed_value_set!(data, UInt8),
+        ColumnArray::UInt16 { data, .. } => typed_value_set!(data, UInt16),
+        ColumnArray::UInt32 { data, .. } => typed_value_set!(data, UInt32),
+        ColumnArray::UInt64 { data, .. } => typed_value_set!(data, UInt64),
+        // +0.0 folds -0.0 onto 0.0 so float keys match f64 equality (the
+        // scalar-hash semantics they replace); every other value is unchanged.
+        ColumnArray::Float32 { data, .. } => {
+            // +0.0 folds -0.0 onto 0.0 (f64/f32 equality treats them as one
+            // value); bits give the key Hash+Eq.
+            let mut keys = HashSet::new();
+            for (row, &value) in data.iter().enumerate().take(end_row).skip(start_row) {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                keys.insert((value + 0.0).to_bits());
+                if keys.len() > VALUE_SET_MAX_DISTINCT {
+                    return None;
+                }
+            }
+            let mut scalars: Vec<ScalarValue> = keys
+                .into_iter()
+                .map(|bits| ScalarValue::Float32(Some(f32::from_bits(bits))))
+                .collect();
+            scalars.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+            Some(scalars)
+        }
+        ColumnArray::Float64 { data, .. } => {
+            let mut keys = HashSet::new();
+            for (row, &value) in data.iter().enumerate().take(end_row).skip(start_row) {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                keys.insert((value + 0.0).to_bits());
+                if keys.len() > VALUE_SET_MAX_DISTINCT {
+                    return None;
+                }
+            }
+            let mut scalars: Vec<ScalarValue> = keys
+                .into_iter()
+                .map(|bits| ScalarValue::Float64(Some(f64::from_bits(bits))))
+                .collect();
+            scalars.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+            Some(scalars)
+        }
+        ColumnArray::Decimal { data, .. } => typed_value_set!(data, Decimal),
+        ColumnArray::Date { data, .. } => typed_value_set!(data, Date),
+        ColumnArray::Time { data, .. } => typed_value_set!(data, Time),
+        ColumnArray::Timestamp { data, .. } => typed_value_set!(data, Timestamp),
+        ColumnArray::Interval { data, .. } => typed_value_set!(data, Interval),
+        ColumnArray::VarChar { data, .. } => {
+            let mut keys = HashSet::new();
+            for row in start_row..end_row {
+                if bitmap.is_null(row) {
+                    continue;
+                }
+                keys.insert(data.value(row));
+                if keys.len() > VALUE_SET_MAX_DISTINCT {
+                    return None;
+                }
+            }
+            let mut scalars: Vec<ScalarValue> = keys
+                .into_iter()
+                .map(|value| ScalarValue::VarChar(Some(value.to_string())))
+                .collect();
+            scalars.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+            Some(scalars)
+        }
+        _ => {
+            let mut values = HashSet::new();
+            let mut complete = true;
+            for row_idx in start_row..end_row {
+                let value = column.scalar(row_idx);
+                if value.is_null() {
+                    continue;
+                }
+                values.insert(value);
+                if values.len() > VALUE_SET_MAX_DISTINCT {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
+                let mut values: Vec<ScalarValue> = values.into_iter().collect();
+                values.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
+                Some(values)
+            } else {
+                None
+            }
         }
     }
-    result
 }
 
 #[cfg(test)]

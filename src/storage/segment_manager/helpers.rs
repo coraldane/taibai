@@ -72,19 +72,7 @@ pub(super) fn discover_max_partition_seq(
     max_seq
 }
 
-pub(super) fn compute_zone_maps_from_batch(
-    batch: &RecordBatch,
-    start_row: usize,
-    row_count: usize,
-) -> Vec<ZoneMap> {
-    batch
-        .columns
-        .iter()
-        .map(|column| compute_zone_map_from_column(column, start_row, row_count))
-        .collect()
-}
-
-fn compute_zone_map_from_column(
+pub(super) fn compute_zone_map_from_column(
     column: &ColumnArray,
     start_row: usize,
     row_count: usize,

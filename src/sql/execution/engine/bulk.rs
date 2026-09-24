@@ -57,7 +57,14 @@ fn prepare_direct_bulk_constraint_entries(
             }
             primary_keys.push(key);
         }
-        match engine.index_manager().unique_keys_exist(
+        // The staleness-triggered synchronous refresh inside
+        // `unique_keys_exist` can cost a full-table scan on large tables
+        // and stall the import for minutes. Bulk imports keep uniqueness
+        // tracked by the post-write index refresh, so when the in-memory
+        // state is stale the precheck is skipped instead of blocking;
+        // REPLACE-style multi-location entries remain the documented
+        // outcome of a client that does send duplicates.
+        match engine.index_manager().unique_keys_exist_if_current(
             db,
             table,
             PRIMARY_LOCATION_INDEX_NAME,
@@ -69,19 +76,7 @@ fn prepare_direct_bulk_constraint_entries(
                     table
                 )))
             }
-            Some(false) => {}
-            None => {
-                let batch =
-                    crate::storage::segment_manager::direct_bulk_request_to_batch(req, schema)?;
-                super::dml_insert::validate_primary_key_uniqueness(
-                    engine,
-                    db,
-                    table,
-                    &batch,
-                    schema,
-                    &primary_indices,
-                )?;
-            }
+            Some(false) | None => {}
         }
     }
 

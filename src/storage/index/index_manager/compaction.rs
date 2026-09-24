@@ -42,7 +42,7 @@ impl IndexManager {
                     .entry_count
                     .saturating_add(delta.tombstones.len() as u64)
             };
-            if unique_index_delta_needs_compaction(delta_count, state.base.entries.len()) {
+            if unique_index_delta_needs_compaction(delta_count, state.base.entry_count) {
                 self.dispatch_unique_index_compaction(&db, &table, &index_name, &state);
             }
         }
@@ -151,8 +151,8 @@ impl UniqueIndexCompactionJob {
         let Some(snapshot) = self.snapshot()? else {
             return Ok(());
         };
-        let (tmp_path, data) = self.build_compacted_base(&snapshot)?;
-        if !self.publish(snapshot.delta_bytes.len(), &tmp_path, data)? {
+        let tmp_path = self.build_compacted_base(&snapshot)?;
+        if !self.publish(snapshot.delta_bytes.len(), &tmp_path)? {
             let _ = std::fs::remove_file(&tmp_path);
         }
         Ok(())
@@ -213,34 +213,43 @@ impl UniqueIndexCompactionJob {
     pub(super) fn build_compacted_base(
         &self,
         snapshot: &UniqueIndexCompactionSnapshot,
-    ) -> Result<(PathBuf, UniqueIndexData)> {
-        let mut data = materialize_unique_index_state_parts(
-            &self.state.base,
+    ) -> Result<PathBuf> {
+        // Replay the delta to its final per-key state, then merge it into the
+        // sorted base in one streaming pass: base blocks are decoded one at a
+        // time and entry runs go straight to the output file, so peak memory
+        // is the delta (already capped by the compaction threshold) plus one
+        // block buffer instead of two whole snapshots.
+        let replayed = replay_unique_index_delta(
             &snapshot.delta_bytes,
-            &snapshot.tombstones,
-            &snapshot.removed_keys,
+            snapshot.removed_keys.clone(),
+            snapshot.tombstones.clone(),
         )?;
         // Embed the snapshot progress: the progress sidecar file may
         // advance during the merge and outranks this on restart.
-        data.flush_epoch = self.state.progress_epoch();
-        data.segment_watermarks = self.state.progress_watermarks();
-        compact_prepared_unique_index_entries(&mut data);
+        let flush_epoch = self.state.progress_epoch();
+        let segment_watermarks = self.state.progress_watermarks();
         let tmp = self.base_path().with_extension("keys.tbi.tmp");
-        std::fs::create_dir_all(self.index_dir())?;
-        std::fs::write(&tmp, encode_unique_index_data(&data)?)?;
-        Ok((tmp, data))
+        let file = std::fs::File::create(&tmp)?;
+        let mut writer = UniqueIndexBaseWriter::new(
+            std::io::BufWriter::new(file),
+            &self.state.base.db,
+            &self.state.base.table,
+            &self.state.base.index_name,
+            self.state.base.columns.clone(),
+        )?;
+        stream_merge_unique_index_base(&self.state.base, replayed, &mut writer)?;
+        let file = writer.finish(flush_epoch, &segment_watermarks)?;
+        file.into_inner()
+            .map_err(|error| crate::common::error::TaibaiError::Storage(error.to_string()))?
+            .sync_all()?;
+        Ok(tmp)
     }
 
     /// Publishes the compacted base. Appends that raced the merge (records
     /// past `snapshot_len`) survive as the rewritten delta file's only
     /// content. The base rename happens before the delta rewrite: a crash
     /// in between leaves duplicate-but-benign entries, never lost ones.
-    pub(super) fn publish(
-        &self,
-        snapshot_len: usize,
-        tmp_path: &Path,
-        data: UniqueIndexData,
-    ) -> Result<bool> {
+    pub(super) fn publish(&self, snapshot_len: usize, tmp_path: &Path) -> Result<bool> {
         let _guard = self.state.mutation_lock.lock().unwrap();
         if !self.state_is_current() {
             return Ok(false);
@@ -263,11 +272,15 @@ impl UniqueIndexCompactionJob {
             std::fs::write(&delta_tmp, suffix_file)?;
             std::fs::rename(delta_tmp, &delta_path)?;
         }
+        // The new state reads the rewritten base lazily; a failure here
+        // leaves the old state installed, whose block loads transparently
+        // resolve against the renamed file (a superset minus dead entries).
+        let base = UniqueIndexBase::open(&self.base_path())?;
         let progress = self.state.progress.read().unwrap().clone();
         self.unique_indexes.write().unwrap().insert(
             unique_index_key(&self.db, &self.table, &self.index_name),
             Arc::new(UniqueIndexState::with_progress(
-                data,
+                base,
                 suffix_state,
                 progress,
             )),

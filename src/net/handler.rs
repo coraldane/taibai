@@ -236,6 +236,27 @@ impl Handler {
         if !is_insert && !is_heartbeat_query(sql) {
             tracing::info!(sql, "query received");
         }
+        // TEST-INSTRUMENTATION (temporary): INSERT statements are otherwise
+        // invisible in logs, which made the 2026-09-24 15:42 write stall
+        // impossible to attribute. Log begin/end per INSERT with a row hint.
+        let insert_probe = if is_insert {
+            let table = sql
+                .split_at_checked("INSERT ".len())
+                .and_then(|(_, rest)| rest.strip_prefix("INTO "))
+                .map(|rest| {
+                    rest.split(|c: char| c.is_whitespace() || c == '(')
+                        .next()
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "?".to_string());
+            let rows_hint = 1 + sql.matches("),(").count();
+            let bytes = sql.len();
+            tracing::info!(table = %table, rows_hint, bytes, "insert begin");
+            Some((table, rows_hint, std::time::Instant::now()))
+        } else {
+            None
+        };
 
         let session = match &mut self.session {
             Some(s) => s,
@@ -333,6 +354,15 @@ impl Handler {
 
         match result {
             Ok(ExecResult::Ok { rows_affected }) => {
+                if let Some((table, rows_hint, begin_at)) = &insert_probe {
+                    tracing::info!(
+                        table = %table,
+                        rows_hint,
+                        rows_affected,
+                        elapsed_ms = begin_at.elapsed().as_millis() as u64,
+                        "insert done"
+                    );
+                }
                 if is_insert && rows_affected > 0 {
                     if let Some(s) = self.session.as_mut() {
                         s.had_writes = true;
@@ -377,6 +407,15 @@ impl Handler {
                 Ok(vec![msg])
             }
             Err(e) => {
+                if let Some((table, rows_hint, begin_at)) = &insert_probe {
+                    tracing::warn!(
+                        table = %table,
+                        rows_hint,
+                        elapsed_ms = begin_at.elapsed().as_millis() as u64,
+                        error = %e,
+                        "insert error"
+                    );
+                }
                 if !is_insert {
                     tracing::warn!(error = %e, sql, "query error");
                 }

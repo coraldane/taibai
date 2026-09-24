@@ -3,12 +3,19 @@ use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use super::types::{
-    PreparedUniqueIndexEntry, UniqueIndexBlock, UniqueIndexData, UniqueIndexDeltaState,
-    UniqueIndexEntry, UniqueIndexProgress, UniqueRowLocation,
+    PreparedUniqueIndexEntry, UniqueIndexBlock, UniqueIndexBlockEntries, UniqueIndexBlockRef,
+    UniqueIndexData, UniqueIndexDeltaState, UniqueIndexEntry, UniqueIndexProgress,
+    UniqueRowLocation,
 };
 use crate::common::error::{Result, TaibaiError};
 use crate::types::scalar::ScalarValue;
 pub(super) const UNIQUE_INDEX_MAGIC_V5: &[u8; 8] = b"TBIUKV5\0";
+/// V6 rewrites the base layout for on-demand reads: entry runs sit between a
+/// small header and a footer that carries the block directory (first key,
+/// entry range, byte range per block). Lookups parse header + footer only and
+/// read the bytes of blocks they touch; merge passes stream entries straight
+/// into the file instead of materializing the whole snapshot in memory.
+pub(super) const UNIQUE_INDEX_MAGIC_V6: &[u8; 8] = b"TBIUKV6\0";
 pub(super) const UNIQUE_INDEX_DELTA_MAGIC_V2: &[u8; 8] = b"TBIUKD2\0";
 pub(super) const UNIQUE_INDEX_PROGRESS_MAGIC: &[u8; 8] = b"TBIUKP1\0";
 pub(super) const UNIQUE_INDEX_BLOCK_SIZE: usize = 256;
@@ -40,67 +47,234 @@ pub(super) fn encode_unique_key(key: &[ScalarValue]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub(super) fn encode_unique_index_data(data: &UniqueIndexData) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.extend_from_slice(UNIQUE_INDEX_MAGIC_V5);
-    put_string(&mut out, &data.db);
-    put_string(&mut out, &data.table);
-    put_string(&mut out, &data.index_name);
-    put_u32(&mut out, data.columns.len() as u32);
-    for column in &data.columns {
-        put_string(&mut out, column);
-    }
-    put_u64(&mut out, data.entries.len() as u64);
-    put_u32(&mut out, UNIQUE_INDEX_BLOCK_SIZE as u32);
-    put_u32(&mut out, data.blocks.len() as u32);
-    for block in &data.blocks {
-        put_u64(&mut out, block.start as u64);
-        put_u32(&mut out, block.len as u32);
-        put_bytes(&mut out, &block.first_key);
-    }
-    let mut path_ids: HashMap<&str, u32> = HashMap::new();
-    let mut paths: Vec<&str> = Vec::new();
-    for entry in &data.entries {
-        let path = entry.location.segment_path.as_str();
-        if !path_ids.contains_key(path) {
-            path_ids.insert(path, paths.len() as u32);
-            paths.push(path);
+/// Streams an on-demand (V6) base file: header, then entry runs grouped into
+/// blocks of [`UNIQUE_INDEX_BLOCK_SIZE`], then a footer carrying the block
+/// directory, the segment-path table and the progress watermark. Entry bytes
+/// are written as they are pushed, so callers never hold the whole snapshot
+/// in memory; the only resident state is the directory (one small record per
+/// 256 entries) plus the open block's run buffer.
+pub(super) struct UniqueIndexBaseWriter<W: Write> {
+    writer: W,
+    bytes_written: u64,
+    db: String,
+    table: String,
+    index_name: String,
+    columns: Vec<String>,
+    next_entry_index: usize,
+    run: Vec<u8>,
+    run_entries: usize,
+    run_first_key: Vec<u8>,
+    blocks: Vec<UniqueIndexBlockRef>,
+    paths: Vec<String>,
+    path_ids: HashMap<String, u32>,
+}
+
+impl<W: Write> UniqueIndexBaseWriter<W> {
+    pub(super) fn new(
+        writer: W,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        columns: Vec<String>,
+    ) -> Result<Self> {
+        let mut out = Self {
+            writer,
+            bytes_written: 0,
+            db: db.to_string(),
+            table: table.to_string(),
+            index_name: index_name.to_string(),
+            columns,
+            next_entry_index: 0,
+            run: Vec::with_capacity(UNIQUE_INDEX_BLOCK_SIZE * 32),
+            run_entries: 0,
+            run_first_key: Vec::new(),
+            blocks: Vec::new(),
+            paths: Vec::new(),
+            path_ids: HashMap::new(),
+        };
+        let mut header = Vec::with_capacity(64);
+        header.extend_from_slice(UNIQUE_INDEX_MAGIC_V6);
+        put_string(&mut header, &out.db);
+        put_string(&mut header, &out.table);
+        put_string(&mut header, &out.index_name);
+        put_u32(&mut header, out.columns.len() as u32);
+        for column in &out.columns {
+            put_string(&mut header, column);
         }
+        out.write_all_bytes(&header)?;
+        Ok(out)
     }
-    for path in data.segment_watermarks.keys() {
-        if !path_ids.contains_key(path.as_str()) {
-            path_ids.insert(path.as_str(), paths.len() as u32);
-            paths.push(path.as_str());
+
+    fn write_all_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes)?;
+        self.bytes_written += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn path_id(&mut self, segment_path: &str) -> u32 {
+        if let Some(id) = self.path_ids.get(segment_path) {
+            return *id;
         }
+        let id = self.paths.len() as u32;
+        self.paths.push(segment_path.to_string());
+        self.path_ids.insert(segment_path.to_string(), id);
+        id
     }
-    put_u32(&mut out, paths.len() as u32);
-    for path in &paths {
-        put_string(&mut out, path);
+
+    /// Append one entry. Entries must be pushed in ascending encoded-key
+    /// order; the sort that guarantees this happens on the caller's side.
+    pub(super) fn push_entry(
+        &mut self,
+        encoded_key: &[u8],
+        location: &UniqueRowLocation,
+    ) -> Result<()> {
+        if self.run_entries == 0 {
+            self.run_first_key = encoded_key.to_vec();
+        }
+        let prefix_len = common_prefix_len(&self.run_first_key, encoded_key);
+        put_varint(&mut self.run, prefix_len as u64);
+        put_varint(&mut self.run, (encoded_key.len() - prefix_len) as u64);
+        self.run.extend_from_slice(&encoded_key[prefix_len..]);
+        let path_id = self.path_id(&location.segment_path);
+        put_varint(&mut self.run, path_id as u64);
+        put_varint(&mut self.run, location.row_id);
+        self.run_entries += 1;
+        self.next_entry_index += 1;
+        if self.run_entries == UNIQUE_INDEX_BLOCK_SIZE {
+            self.seal_block()?;
+        }
+        Ok(())
     }
-    for (idx, entry) in data.entries.iter().enumerate() {
-        let encoded_key = &data.encoded_keys[idx];
-        let prefix_len = data
-            .blocks
-            .get(idx / UNIQUE_INDEX_BLOCK_SIZE)
-            .map(|block| common_prefix_len(&block.first_key, encoded_key))
-            .unwrap_or(0);
-        put_varint(&mut out, prefix_len as u64);
-        put_varint(&mut out, (encoded_key.len() - prefix_len) as u64);
-        out.extend_from_slice(&encoded_key[prefix_len..]);
-        put_varint(
-            &mut out,
-            path_ids[entry.location.segment_path.as_str()] as u64,
-        );
-        put_varint(&mut out, entry.location.row_id);
+
+    fn seal_block(&mut self) -> Result<()> {
+        if self.run_entries == 0 {
+            return Ok(());
+        }
+        let block = UniqueIndexBlockRef {
+            first_key: std::mem::take(&mut self.run_first_key),
+            start: self.next_entry_index - self.run_entries,
+            len: self.run_entries,
+            data_offset: self.bytes_written,
+            data_len: self.run.len() as u32,
+        };
+        let run = std::mem::take(&mut self.run);
+        self.write_all_bytes(&run)?;
+        self.run_entries = 0;
+        self.blocks.push(block);
+        Ok(())
     }
-    out.push(if data.flush_epoch.is_some() { 1 } else { 0 });
-    put_u64(&mut out, data.flush_epoch.unwrap_or(0));
-    put_u32(&mut out, data.segment_watermarks.len() as u32);
-    for (path, row_count) in &data.segment_watermarks {
-        put_varint(&mut out, path_ids[path.as_str()] as u64);
-        put_u64(&mut out, *row_count);
+
+    /// Seal the open block, append the footer and flush. Returns the inner
+    /// writer so the caller can fsync before renaming the file into place.
+    pub(super) fn finish(
+        mut self,
+        flush_epoch: Option<u64>,
+        segment_watermarks: &HashMap<String, u64>,
+    ) -> Result<W> {
+        self.seal_block()?;
+        let mut footer = Vec::with_capacity(64 + self.blocks.len() * 48);
+        put_u64(&mut footer, self.next_entry_index as u64);
+        put_u32(&mut footer, UNIQUE_INDEX_BLOCK_SIZE as u32);
+        put_u32(&mut footer, self.blocks.len() as u32);
+        for block in &self.blocks {
+            put_bytes(&mut footer, &block.first_key);
+            put_u64(&mut footer, block.start as u64);
+            put_u32(&mut footer, block.len as u32);
+            put_u64(&mut footer, block.data_offset);
+            put_u32(&mut footer, block.data_len);
+        }
+        put_u32(&mut footer, self.paths.len() as u32);
+        for path in &self.paths {
+            put_string(&mut footer, path);
+        }
+        footer.push(if flush_epoch.is_some() { 1 } else { 0 });
+        put_u64(&mut footer, flush_epoch.unwrap_or(0));
+        put_u32(&mut footer, segment_watermarks.len() as u32);
+        for (segment_path, row_count) in segment_watermarks {
+            put_string(&mut footer, segment_path);
+            put_u64(&mut footer, *row_count);
+        }
+        let footer_offset = self.bytes_written;
+        self.write_all_bytes(&footer)?;
+        self.write_all_bytes(&footer_offset.to_le_bytes())?;
+        self.writer.flush()?;
+        Ok(self.writer)
     }
-    Ok(out)
+}
+
+/// Decode one block's entry run: per entry, a key stored as prefix lengths
+/// against the block's first key plus a path-table reference and row id.
+pub(super) fn decode_unique_index_block_run(
+    bytes: &[u8],
+    first_key: &[u8],
+    paths: &[String],
+) -> Result<UniqueIndexBlockEntries> {
+    let mut cursor = Cursor::new(bytes);
+    let mut block = UniqueIndexBlockEntries::default();
+    while (cursor.position() as usize) < bytes.len() {
+        let prefix_len = read_varint(&mut cursor)? as usize;
+        let suffix_len = read_varint(&mut cursor)? as usize;
+        if prefix_len > first_key.len() {
+            return Err(TaibaiError::Storage(
+                "corrupt unique index block key prefix".to_string(),
+            ));
+        }
+        let mut encoded_key = Vec::with_capacity(prefix_len + suffix_len);
+        encoded_key.extend_from_slice(&first_key[..prefix_len]);
+        let mut suffix = vec![0u8; suffix_len];
+        cursor.read_exact(&mut suffix)?;
+        encoded_key.extend_from_slice(&suffix);
+        let path_idx = read_varint(&mut cursor)? as usize;
+        let row_id = read_varint(&mut cursor)?;
+        let Some(segment_path) = paths.get(path_idx) else {
+            return Err(TaibaiError::Storage(
+                "corrupt unique index block path reference".to_string(),
+            ));
+        };
+        block.keys.push(encoded_key);
+        block.locations.push(UniqueRowLocation {
+            segment_path: segment_path.clone(),
+            row_id,
+        });
+    }
+    Ok(block)
+}
+
+/// Parse-only readers used by the on-demand base loader, which reads fields
+/// straight from the file instead of buffering it whole.
+pub(super) fn read_file_u8(file: &mut std::fs::File) -> Result<u8> {
+    use std::io::Read;
+    let mut buf = [0u8; 1];
+    file.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+pub(super) fn read_file_u32(file: &mut std::fs::File) -> Result<u32> {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    file.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+pub(super) fn read_file_u64(file: &mut std::fs::File) -> Result<u64> {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+pub(super) fn read_file_bytes(file: &mut std::fs::File) -> Result<Vec<u8>> {
+    let len = read_file_u32(file)? as usize;
+    use std::io::Read;
+    let mut bytes = vec![0u8; len];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn read_file_string(file: &mut std::fs::File) -> Result<String> {
+    let bytes = read_file_bytes(file)?;
+    String::from_utf8(bytes)
+        .map_err(|err| TaibaiError::Storage(format!("decode unique index string: {}", err)))
 }
 
 pub(super) fn append_prepared_unique_index_delta(

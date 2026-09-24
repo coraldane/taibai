@@ -85,10 +85,10 @@ impl IndexManager {
         self.persist_prepared_unique_index_data(db, table, index_name, data)
     }
 
-    /// Persist an already-prepared snapshot (entries and encoded keys aligned,
-    /// blocks built) without re-encoding or re-cloning it. Refresh and delta
-    /// compaction rewrite large snapshots through this path to keep peak
-    /// memory at one materialized copy plus the encoded bytes.
+    /// Persist an already-prepared snapshot (entries and encoded keys aligned)
+    /// by streaming it into the on-demand base format, then install a state
+    /// that reads that file lazily. Peak memory stays at the caller's prepared
+    /// snapshot; nothing re-encodes the whole index into one buffer.
     fn persist_prepared_unique_index_data(
         &self,
         db: &str,
@@ -102,17 +102,32 @@ impl IndexManager {
         let data_path = dir.join(format!("{}.keys.tbi", base));
         let data_tmp = data_path.with_extension("keys.tbi.tmp");
         let invalid_path = dir.join(format!("{}.invalid", base));
-        let data_bytes = encode_unique_index_data(&data)?;
-        std::fs::write(&data_tmp, data_bytes)?;
-        std::fs::rename(data_tmp, data_path)?;
+        let file = std::fs::File::create(&data_tmp)?;
+        let mut writer = UniqueIndexBaseWriter::new(
+            std::io::BufWriter::new(file),
+            db,
+            table,
+            index_name,
+            data.columns.clone(),
+        )?;
+        for (encoded, entry) in data.encoded_keys.iter().zip(&data.entries) {
+            writer.push_entry(encoded, &entry.location)?;
+        }
+        let buffered = writer.finish(data.flush_epoch, &data.segment_watermarks)?;
+        let file = buffered
+            .into_inner()
+            .map_err(|error| TaibaiError::Storage(error.to_string()))?;
+        file.sync_all()?;
+        std::fs::rename(&data_tmp, &data_path)?;
         let delta_path = dir.join(format!("{}.delta.tbi", base));
         let _ = std::fs::remove_file(delta_path);
         let _ = std::fs::remove_file(dir.join(format!("{}.progress.tbi", base)));
         let _ = std::fs::remove_file(invalid_path);
+        let base_reader = UniqueIndexBase::open(&data_path)?;
         self.unique_indexes.write().unwrap().insert(
             unique_index_key(db, table, index_name),
             Arc::new(UniqueIndexState::new(
-                data,
+                base_reader,
                 UniqueIndexDeltaState::default(),
             )),
         );
@@ -134,7 +149,7 @@ impl IndexManager {
             table: state.base.table.clone(),
             index_name: state.base.index_name.clone(),
             columns: state.base.columns.clone(),
-            key_count: state.base.entries.len() + delta.entry_count as usize,
+            key_count: state.base.entry_count + delta.entry_count as usize,
         }))
     }
 
@@ -157,13 +172,7 @@ impl IndexManager {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = std::fs::read(path)?;
-        let Some(mut data) = decode_unique_index_data(&bytes)? else {
-            return Ok(None);
-        };
-        if data.encoded_keys.len() != data.entries.len() {
-            prepare_unique_index_data(&mut data)?;
-        }
+        let base_reader = self.open_unique_index_base(&path)?;
         let delta_path = self
             .unique_index_dir(db, table)
             .join(format!("{}.delta.tbi", base));
@@ -175,9 +184,13 @@ impl IndexManager {
         let progress_path = dir.join(format!("{}.progress.tbi", base));
         let state = if progress_path.exists() {
             let progress = decode_unique_index_progress(&std::fs::read(progress_path)?);
-            Arc::new(UniqueIndexState::with_progress(data, delta, progress))
+            Arc::new(UniqueIndexState::with_progress(
+                base_reader,
+                delta,
+                progress,
+            ))
         } else {
-            Arc::new(UniqueIndexState::new(data, delta))
+            Arc::new(UniqueIndexState::new(base_reader, delta))
         };
         let current = self
             .unique_indexes
@@ -189,40 +202,29 @@ impl IndexManager {
         Ok(Some(current))
     }
 
-    fn materialize_unique_index_state(
-        &self,
-        db: &str,
-        table: &str,
-        index_name: &str,
-        state: &UniqueIndexState,
-    ) -> Result<UniqueIndexData> {
-        let (tombstones, removed_keys) = {
-            let delta = state.delta.read().unwrap();
-            (delta.tombstones.clone(), delta.removed_keys.clone())
+    /// Open a persisted base snapshot. On-demand (V6) files parse their
+    /// header and footer only, so a 500 MB index loads in microseconds and
+    /// stays resident at one small directory; legacy (V5) files fall back to
+    /// a full in-memory decode until the next compaction rewrites them.
+    fn open_unique_index_base(&self, path: &Path) -> Result<UniqueIndexBase> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)?;
+        drop(file);
+        if magic == *UNIQUE_INDEX_MAGIC_V6 {
+            return UniqueIndexBase::open(path);
+        }
+        let bytes = std::fs::read(path)?;
+        let Some(mut data) = decode_unique_index_data(&bytes)? else {
+            return Err(TaibaiError::Storage(
+                "unsupported unique index version".to_string(),
+            ));
         };
-        let dir = self.unique_index_dir(db, table);
-        let base = sanitize_file_component(index_name);
-        let delta_path = dir.join(format!("{}.delta.tbi", base));
-        let delta_bytes = if delta_path.exists() {
-            std::fs::read(&delta_path)?
-        } else {
-            Vec::new()
-        };
-        materialize_unique_index_state_parts(&state.base, &delta_bytes, &tombstones, &removed_keys)
-    }
-
-    pub fn load_unique_index_data(
-        &self,
-        db: &str,
-        table: &str,
-        index_name: &str,
-    ) -> Result<Option<Arc<UniqueIndexData>>> {
-        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
-            return Ok(None);
-        };
-        Ok(Some(Arc::new(self.materialize_unique_index_state(
-            db, table, index_name, &state,
-        )?)))
+        if data.encoded_keys.len() != data.entries.len() {
+            prepare_unique_index_data(&mut data)?;
+        }
+        Ok(UniqueIndexBase::from_decoded(data))
     }
 
     pub fn unique_index_columns(
@@ -457,7 +459,7 @@ impl IndexManager {
                 .saturating_add(delta.tombstones.len() as u64)
         };
         let needs_compaction =
-            unique_index_delta_needs_compaction(delta_count, state.base.entries.len());
+            unique_index_delta_needs_compaction(delta_count, state.base.entry_count);
         state.set_progress(Some(epoch_before), watermarks);
         self.persist_unique_index_progress(db, table, index_name)?;
         drop(_mutation_guard);
@@ -558,26 +560,12 @@ impl IndexManager {
                             .cloned(),
                     );
                 }
-                let Ok(mut idx) = state
-                    .base
-                    .encoded_keys
-                    .binary_search_by(|value| value.as_slice().cmp(encoded))
-                else {
-                    continue;
-                };
-                while idx > 0 && state.base.encoded_keys[idx - 1] == *encoded {
-                    idx -= 1;
-                }
-                while idx < state.base.encoded_keys.len()
-                    && state.base.encoded_keys[idx] == *encoded
-                {
-                    let location = &state.base.entries[idx].location;
+                for location in state.base.find_locations(encoded)? {
                     if !location.segment_path.is_empty()
-                        && !unique_index_tombstones_contains(&delta.tombstones, location)
+                        && !unique_index_tombstones_contains(&delta.tombstones, &location)
                     {
-                        locations.push(location.clone());
+                        locations.push(location);
                     }
-                    idx += 1;
                 }
             }
             locations
@@ -638,6 +626,58 @@ impl IndexManager {
             };
             state = refreshed;
         }
+        Self::state_contains_any_encoded_key(
+            &self.segment_mgr,
+            state,
+            db,
+            table,
+            index_name,
+            keys,
+        )
+    }
+
+    pub fn unique_keys_exist_if_current<I>(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        keys: I,
+    ) -> Result<Option<bool>>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
+    {
+        let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            return Ok(None);
+        };
+        if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+            // Stale state: a synchronous refresh can cost a full-table
+            // scan, which a bulk import must not pay on its write path.
+            // Post-write index refresh keeps uniqueness tracked either way.
+            return Ok(None);
+        }
+        Self::state_contains_any_encoded_key(
+            &self.segment_mgr,
+            state,
+            db,
+            table,
+            index_name,
+            keys,
+        )
+    }
+
+    fn state_contains_any_encoded_key<I>(
+        segment_mgr: &SegmentManager,
+        state: Arc<UniqueIndexState>,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        keys: I,
+    ) -> Result<Option<bool>>
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
+    {
         let mut encoded_keys = keys
             .into_iter()
             .map(|key| encode_unique_key(key.borrow()))
@@ -645,7 +685,7 @@ impl IndexManager {
         encoded_keys.sort();
         encoded_keys.dedup();
         Ok(Some(unique_index_state_contains_any_key(
-            &self.segment_mgr,
+            segment_mgr,
             &state,
             &encoded_keys,
         )?))
@@ -714,7 +754,7 @@ impl IndexManager {
                     .entry_count
                     .saturating_add(delta.tombstones.len() as u64)
             };
-            unique_index_delta_needs_compaction(delta_count, state.base.entries.len())
+            unique_index_delta_needs_compaction(delta_count, state.base.entry_count)
         };
         if needs_compaction {
             self.try_dispatch_unique_index_compaction(db, table, index_name, &state);
@@ -775,7 +815,7 @@ impl IndexManager {
             };
             unique_index_delta_needs_compaction(
                 delta_count.0.saturating_add(delta_count.1),
-                state.base.entries.len(),
+                state.base.entry_count,
             )
         };
         if needs_compaction {
@@ -844,7 +884,7 @@ impl IndexManager {
                     .entry_count
                     .saturating_add(delta.tombstones.len() as u64)
             };
-            unique_index_delta_needs_compaction(delta_count, state.base.entries.len())
+            unique_index_delta_needs_compaction(delta_count, state.base.entry_count)
         };
         if needs_compaction {
             self.try_dispatch_unique_index_compaction(db, table, index_name, &state);

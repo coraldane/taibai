@@ -131,6 +131,7 @@ fn tail_file_pressure_forces_table_flush() -> Result<()> {
         &segment_mgr,
         writer.memtable_manager(),
         &writer.tail_committer,
+        writer.flush_gate_for_test(),
         4,
     )?;
 
