@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
@@ -37,6 +38,64 @@ pub struct CompactStats {
     pub rows_dropped: u64,
 }
 
+/// Identity of a compaction input file at the moment the unlocked heavy
+/// phase starts: (file length, row count, deleted rows). The commit phase
+/// re-reads it under the partition lock; any drift means another mutator
+/// touched the file while the rewrite ran without the lock, and the
+/// prepared output must be discarded.
+type SegmentFileIdentity = (u64, u64, u64);
+
+/// Outcome of the unlocked heavy phase (decode/sort/tmp write) of one
+/// partition compaction. The commit phase validates and installs it under
+/// the partition mutation lock.
+enum PreparedCompaction {
+    /// Nothing to rewrite this round (empty input or clean single segment).
+    Skipped,
+    /// Every input row is deleted or expired; commit removes the inputs.
+    AllDropped {
+        segment_files: Vec<PathBuf>,
+        identities: Vec<SegmentFileIdentity>,
+        segments_read: usize,
+        rows_dropped: u64,
+    },
+    /// Replacement segment written to a non-discoverable tmp path; commit
+    /// re-validates the inputs and atomically swaps it in.
+    Replacement {
+        segment_files: Vec<PathBuf>,
+        identities: Vec<SegmentFileIdentity>,
+        tmp_path: PathBuf,
+        final_path: PathBuf,
+        segments_read: usize,
+        rows_to_write: usize,
+        rows_dropped: u64,
+    },
+}
+
+/// TEST-INSTRUMENTATION (temporary): stalls the unlocked heavy phase so
+/// tests can prove that INSERTs into the compacted partition proceed while
+/// the decode/sort/write runs. Production value is 0.
+static COMPACTION_HEAVY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+fn compaction_input_identity(
+    segment_mgr: &SegmentManager,
+    path: &Path,
+) -> Option<SegmentFileIdentity> {
+    let len = std::fs::metadata(path).ok()?.len();
+    let reader = segment_mgr.open_reader_cached(path).ok()?;
+    Some((len, reader.row_count(), reader.deleted_row_count()))
+}
+
+fn compaction_inputs_unchanged(
+    segment_mgr: &SegmentManager,
+    files: &[PathBuf],
+    identities: &[SegmentFileIdentity],
+) -> bool {
+    files
+        .iter()
+        .zip(identities.iter())
+        .all(|(path, expected)| compaction_input_identity(segment_mgr, path) == Some(*expected))
+}
+
 pub struct Compactor {
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
@@ -47,6 +106,18 @@ impl Compactor {
         Self {
             segment_mgr,
             data_dir,
+        }
+    }
+
+    /// TEST-INSTRUMENTATION (temporary): see `COMPACTION_HEAVY_DELAY_MS`.
+    pub fn set_heavy_phase_delay_for_tests(ms: u64) {
+        COMPACTION_HEAVY_DELAY_MS.store(ms, AtomicOrdering::Release);
+    }
+
+    fn sleep_heavy_phase_delay() {
+        let ms = COMPACTION_HEAVY_DELAY_MS.load(AtomicOrdering::Acquire);
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
         }
     }
 
@@ -153,55 +224,35 @@ impl Compactor {
             .into_par_iter()
             .map(|(partition_key, files)| -> Result<CompactStats> {
                 let lock_key = partition_key.as_deref().unwrap_or("");
+                // Permits are acquired BEFORE the partition lock, in the same
+                // order as query scans (cpu then io). Sleeping on the global
+                // work limiter while holding the partition lock would freeze
+                // that partition's INSERTs for the whole queue delay.
+                let prepared = {
+                    let _cpu_permit = crate::common::work_limiter::acquire_cpu();
+                    let _io_permit = crate::common::work_limiter::acquire_io();
+                    self.prepare_compact_segment_group(
+                        db,
+                        table,
+                        &table_dir,
+                        partition_key.as_deref(),
+                        files,
+                        &schema,
+                        sort_key_indices,
+                        &cluster_key_indices,
+                        output_row_group_rows,
+                        ttl,
+                        compression_level,
+                    )?
+                };
                 self.segment_mgr
                     .with_partition_mutation_lock(db, table, lock_key, || {
-                        // Keep the acquisition order aligned with query scans to
-                        // avoid CPU/IO permit inversion. Holding both permits for
-                        // the partition bounds process-wide compaction pressure.
-                        let _cpu_permit = crate::common::work_limiter::acquire_cpu();
-                        let _io_permit = crate::common::work_limiter::acquire_io();
-
-                        let files: Vec<PathBuf> =
-                            files.into_iter().filter(|path| path.exists()).collect();
-                        if files.is_empty() {
-                            return Ok(CompactStats::default());
-                        }
-
-                        // A clean single segment can only be skipped when this
-                        // operation has no physical ordering requirement and its
-                        // row groups are already compact. A segment can contain
-                        // thousands of tiny row groups after many small flushes;
-                        // skipping it makes OPTIMIZE unable to repair the main
-                        // source of read amplification.
-                        if sort_key_indices.is_empty() && files.len() == 1 {
-                            let reader = self.segment_mgr.open_reader_cached(&files[0])?;
-                            let compact_row_groups =
-                                reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
-                            let needs_row_group_compaction =
-                                reader.num_row_groups() > compact_row_groups.max(1);
-                            if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
-                                tracing::info!(
-                                    db,
-                                    table,
-                                    partition_key = partition_key.as_deref().unwrap_or("<none>"),
-                                    segment = %files[0].display(),
-                                    "skipping clean single-segment optimization"
-                                );
-                                return Ok(CompactStats::default());
-                            }
-                        }
-                        self.compact_segment_group(
+                        self.commit_prepared_compaction(
                             db,
                             table,
                             &table_dir,
                             partition_key.as_deref(),
-                            &files,
-                            &schema,
-                            sort_key_indices,
-                            &cluster_key_indices,
-                            output_row_group_rows,
-                            ttl,
-                            compression_level,
+                            prepared,
                         )
                     })
             })
@@ -311,45 +362,41 @@ impl Compactor {
                 .unwrap_or_default();
             Ok(Some((matched_key, files)))
         })?;
-        let Some((matched_key, mut files)) = matched else {
+        let Some((matched_key, files)) = matched else {
             return Ok(CompactStats::default());
         };
 
-        let stats =
+        // Permits before the partition lock, heavy decode/sort/write outside
+        // it — same split as `compact_table`'s partition workers.
+        let stats = {
+            let prepared = {
+                let _cpu_permit = crate::common::work_limiter::acquire_cpu();
+                let _io_permit = crate::common::work_limiter::acquire_io();
+                self.prepare_compact_segment_group(
+                    db,
+                    table,
+                    &table_dir,
+                    Some(matched_key.as_str()),
+                    files,
+                    &schema,
+                    &cluster_key_indices,
+                    &cluster_key_indices,
+                    output_row_group_rows,
+                    ttl,
+                    compression_level,
+                )?
+            };
             self.segment_mgr
                 .with_partition_mutation_lock(db, table, &matched_key, || {
-                    files.retain(|path| path.exists());
-                    if files.is_empty() {
-                        return Ok(CompactStats::default());
-                    }
-
-                    tracing::info!(
-                        db,
-                        table,
-                        table_full_name = %format!("{}.{}", db, table),
-                        partition_key = %matched_key,
-                        requested_partition = partition_key,
-                        cluster_key = ?table_meta.cluster_key,
-                        segments = files.len(),
-                        "starting requested partition optimization"
-                    );
-
-                    let _cpu_permit = crate::common::work_limiter::acquire_cpu();
-                    let _io_permit = crate::common::work_limiter::acquire_io();
-                    self.compact_segment_group(
+                    self.commit_prepared_compaction(
                         db,
                         table,
                         &table_dir,
-                        Some(&matched_key),
-                        &files,
-                        &schema,
-                        &cluster_key_indices,
-                        &cluster_key_indices,
-                        output_row_group_rows,
-                        ttl,
-                        compression_level,
+                        Some(matched_key.as_str()),
+                        prepared,
                     )
-                })?;
+                })?
+        };
 
         tracing::info!(
             db,
@@ -367,21 +414,81 @@ impl Compactor {
         Ok(stats)
     }
 
+    /// Heavy phase of one partition compaction, run WITHOUT the partition
+    /// mutation lock: decode every source row group, purge TTL/deleted rows,
+    /// optionally cluster-sort, and write the replacement segment to a tmp
+    /// path. Input identities are recorded before any read so the commit
+    /// phase can detect concurrent mutations of the inputs.
     #[allow(clippy::too_many_arguments)]
-    fn compact_segment_group(
+    fn prepare_compact_segment_group(
         &self,
         db: &str,
         table: &str,
         table_dir: &Path,
         partition_key: Option<&str>,
-        segment_files: &[PathBuf],
+        segment_files: Vec<PathBuf>,
         schema: &Schema,
         sort_key_indices: &[usize],
         bloom_column_indices: &[usize],
         output_row_group_rows: usize,
         ttl: Option<(usize, i64)>,
         compression_level: i32,
-    ) -> Result<CompactStats> {
+    ) -> Result<PreparedCompaction> {
+        let segment_files: Vec<PathBuf> = segment_files
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect();
+        if segment_files.is_empty() {
+            return Ok(PreparedCompaction::Skipped);
+        }
+        let identities = segment_files
+            .iter()
+            .map(|path| compaction_input_identity(&self.segment_mgr, path))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                TaibaiError::Storage(format!(
+                    "compaction input unreadable before rewrite on {}.{} partition {}",
+                    db,
+                    table,
+                    partition_key.unwrap_or("<none>")
+                ))
+            })?;
+        let segments_read = segment_files.len();
+        let partition_label = partition_key.unwrap_or("<unpartitioned>");
+
+        // A clean single segment can only be skipped when this operation has
+        // no physical ordering requirement and its row groups are already
+        // compact. A segment can contain thousands of tiny row groups after
+        // many small flushes; skipping it makes OPTIMIZE unable to repair
+        // the main source of read amplification.
+        if sort_key_indices.is_empty() && segment_files.len() == 1 {
+            let reader = self.segment_mgr.open_reader_cached(&segment_files[0])?;
+            let compact_row_groups =
+                reader.row_count().div_ceil(output_row_group_rows as u64) as usize;
+            let needs_row_group_compaction = reader.num_row_groups() > compact_row_groups.max(1);
+            if reader.deleted_row_count() == 0 && !needs_row_group_compaction {
+                tracing::info!(
+                    db,
+                    table,
+                    partition_key = partition_key.unwrap_or("<none>"),
+                    segment = %segment_files[0].display(),
+                    "skipping clean single-segment optimization"
+                );
+                return Ok(PreparedCompaction::Skipped);
+            }
+        }
+
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key = partition_label,
+            segments = segment_files.len(),
+            "compact partition started"
+        );
+
+        Self::sleep_heavy_phase_delay();
+
         // The clustered path follows the original Go implementation's
         // index-only sort design: concatenate each decoded column into one
         // global column, sort compact u32 row indices, then gather directly
@@ -394,23 +501,13 @@ impl Compactor {
         let mut sorted_indices = Vec::new();
         let source_row_group_count;
         let mut deleted_rows = 0u64;
-        let partition_label = partition_key.unwrap_or("<unpartitioned>");
-
-        tracing::info!(
-            db,
-            table,
-            table_full_name = %format!("{}.{}", db, table),
-            partition_key = partition_label,
-            segments = segment_files.len(),
-            "compact partition started"
-        );
 
         if sort_key_indices.is_empty() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_micros() as i64;
-            for seg_path in segment_files {
+            for seg_path in &segment_files {
                 let reader = self.segment_mgr.open_reader(seg_path)?;
                 let mut segment_row_base = 0u64;
                 for rg_idx in 0..reader.num_row_groups() {
@@ -459,7 +556,7 @@ impl Compactor {
 
             let mut sources = Vec::new();
             let mut global_row_base = 0usize;
-            for seg_path in segment_files {
+            for seg_path in &segment_files {
                 let reader = Arc::new(self.segment_mgr.open_reader(seg_path)?);
                 let mut segment_row_base = 0u64;
                 for rg_idx in 0..reader.num_row_groups() {
@@ -575,22 +672,11 @@ impl Compactor {
             sorted_indices.len()
         };
         if rows_to_write == 0 {
-            for old_seg in segment_files {
-                self.segment_mgr.remove_segment_file(old_seg)?;
-            }
-            tracing::info!(
-                db,
-                table,
-                table_full_name = %format!("{}.{}", db, table),
-                partition_key = partition_label,
-                segments_read = segment_files.len(),
-                rows_dropped = deleted_rows,
-                "compact partition removed empty/deleted segments"
-            );
-            return Ok(CompactStats {
-                segments_read: segment_files.len(),
+            return Ok(PreparedCompaction::AllDropped {
+                segment_files,
+                identities,
+                segments_read,
                 rows_dropped: deleted_rows,
-                ..CompactStats::default()
             });
         }
 
@@ -641,27 +727,135 @@ impl Compactor {
             return Err(err);
         }
 
-        self.segment_mgr
-            .replace_segments_with_tmp(&tmp_path, &final_path, segment_files)?;
-
-        tracing::info!(
-            db,
-            table,
-            table_full_name = %format!("{}.{}", db, table),
-            partition_key = partition_label,
-            final_path = %final_path.display(),
-            segments_read = segment_files.len(),
-            rows_written = rows_to_write,
-            rows_dropped = deleted_rows,
-            "compact partition completed"
-        );
-
-        Ok(CompactStats {
-            segments_read: segment_files.len(),
-            segments_written: 1,
-            rows_written: rows_to_write as u64,
+        Ok(PreparedCompaction::Replacement {
+            segment_files,
+            identities,
+            tmp_path,
+            final_path,
+            segments_read,
+            rows_to_write,
             rows_dropped: deleted_rows,
         })
+    }
+
+    /// Commit phase, run under the target partition's mutation lock:
+    /// re-validate that no other mutator touched the input files while the
+    /// heavy phase ran unlocked, then either remove the (fully deleted)
+    /// inputs or atomically swap the replacement segment in. Both steps are
+    /// metadata-only, so the lock is held for milliseconds, not for the
+    /// length of the rewrite I/O.
+    fn commit_prepared_compaction(
+        &self,
+        db: &str,
+        table: &str,
+        table_dir: &Path,
+        partition_key: Option<&str>,
+        prepared: PreparedCompaction,
+    ) -> Result<CompactStats> {
+        let partition_label = partition_key.unwrap_or("<unpartitioned>");
+        match prepared {
+            PreparedCompaction::Skipped => Ok(CompactStats::default()),
+            PreparedCompaction::AllDropped {
+                segment_files,
+                identities,
+                segments_read,
+                rows_dropped,
+            } => {
+                if !compaction_inputs_unchanged(&self.segment_mgr, &segment_files, &identities) {
+                    tracing::info!(
+                        db,
+                        table,
+                        partition_key = partition_label,
+                        "compact inputs changed while rewriting; deferring empty-input cleanup"
+                    );
+                    return Ok(CompactStats {
+                        segments_read,
+                        ..CompactStats::default()
+                    });
+                }
+                for old_seg in &segment_files {
+                    self.segment_mgr.remove_segment_file(old_seg)?;
+                }
+                tracing::info!(
+                    db,
+                    table,
+                    table_full_name = %format!("{}.{}", db, table),
+                    partition_key = partition_label,
+                    segments_read,
+                    rows_dropped,
+                    "compact partition removed empty/deleted segments"
+                );
+                Ok(CompactStats {
+                    segments_read,
+                    rows_dropped,
+                    ..CompactStats::default()
+                })
+            }
+            PreparedCompaction::Replacement {
+                segment_files,
+                identities,
+                tmp_path,
+                final_path,
+                segments_read,
+                rows_to_write,
+                rows_dropped,
+            } => {
+                if !compaction_inputs_unchanged(&self.segment_mgr, &segment_files, &identities) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
+                    tracing::info!(
+                        db,
+                        table,
+                        partition_key = partition_label,
+                        "compact inputs changed while rewriting; discarding prepared replacement"
+                    );
+                    return Ok(CompactStats {
+                        segments_read,
+                        ..CompactStats::default()
+                    });
+                }
+                // A concurrent compaction round of the same partition may
+                // have committed its own replacement between our discovery
+                // and this commit (both heavy phases ran unlocked); our
+                // inputs survived validation only when the sets were
+                // disjoint, so re-target a free final name instead of
+                // failing the rename.
+                let mut tmp_path = tmp_path;
+                let mut final_path = final_path;
+                if final_path.exists() {
+                    final_path = self
+                        .segment_mgr
+                        .next_replacement_segment_path(table_dir, partition_key)?;
+                    let retargeted_tmp = store::replacement_tmp_path(&final_path, "compact_tmp");
+                    std::fs::rename(&tmp_path, &retargeted_tmp)?;
+                    tmp_path = retargeted_tmp;
+                }
+                self.segment_mgr.replace_segments_with_tmp(
+                    &tmp_path,
+                    &final_path,
+                    &segment_files,
+                )?;
+
+                tracing::info!(
+                    db,
+                    table,
+                    table_full_name = %format!("{}.{}", db, table),
+                    partition_key = partition_label,
+                    final_path = %final_path.display(),
+                    segments_read,
+                    rows_written = rows_to_write,
+                    rows_dropped,
+                    "compact partition completed"
+                );
+
+                Ok(CompactStats {
+                    segments_read,
+                    segments_written: 1,
+                    rows_written: rows_to_write as u64,
+                    rows_dropped,
+                })
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

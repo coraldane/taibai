@@ -301,9 +301,23 @@ pub fn exec_update(
             }
         }
         if tail_persist_failed {
-            engine
-                .batch_writer()
-                .flush_table_under_table_lock(db, table)?;
+            // Partition-pruned UPDATEs run under the target partition's lock
+            // only; flushing the whole table with the "table lock held"
+            // freeze would race concurrent appends in OTHER partitions.
+            // Flush just the pruned partition, whose appenders this
+            // statement's partition lock already excludes.
+            if let Some(partition) = target_partition_key
+                .as_deref()
+                .filter(|key| !key.is_empty())
+            {
+                engine
+                    .batch_writer()
+                    .flush_partition_under_partition_lock(db, table, partition)?;
+            } else {
+                engine
+                    .batch_writer()
+                    .flush_table_under_table_lock(db, table)?;
+            }
         }
 
         // HotStore is append-only. Once rows are updated in place it is no

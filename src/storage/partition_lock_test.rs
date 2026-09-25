@@ -60,6 +60,48 @@ fn wide_gate_resets_after_panic_inside_critical_section() {
 }
 
 #[test]
+fn wide_gate_collection_is_bounded_while_partition_lock_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = SegmentManager::new(dir.path()).unwrap();
+    let held = manager.partition_lock_arc_for_tests(TEST_DB, TEST_TABLE, "p1");
+    let _held_guard = held.lock().unwrap();
+
+    // A wide-gate holder must not block indefinitely behind one long-held
+    // partition lock: the collection wait is bounded and surfaces as an
+    // explicit ResourceBusy error, releasing the gate and every partition
+    // lock it already collected.
+    let started = std::time::Instant::now();
+    let outcome = acquire_partition_lock_for_wide_gate(
+        &held,
+        "main:t_partition_locks",
+        "p1",
+        Duration::from_millis(200),
+    );
+    assert!(
+        outcome.is_err(),
+        "bounded wide-gate collection must time out behind a held partition lock"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "collection timeout must be honored promptly"
+    );
+
+    // Other partitions stay untouched by the failed collection.
+    let other = manager.try_with_partition_mutation_lock(TEST_DB, TEST_TABLE, "p2", || Ok(5));
+    assert_eq!(other.unwrap(), Some(5));
+
+    drop(_held_guard);
+    let guard = acquire_partition_lock_for_wide_gate(
+        &held,
+        "main:t_partition_locks",
+        "p1",
+        Duration::from_secs(2),
+    )
+    .expect("collection must succeed once the partition lock is free");
+    drop(guard);
+}
+
+#[test]
 fn partition_locks_are_independent() {
     let dir = tempfile::tempdir().unwrap();
     let manager = SegmentManager::new(dir.path()).unwrap();

@@ -753,22 +753,13 @@ impl SegmentManager {
             .map(|partition| Arc::clone(&registry[partition]))
             .collect::<Vec<_>>();
         drop(registry);
+        let timeouts = crate::common::config::storage_timeouts();
+        let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
         let mut partition_guards = Vec::with_capacity(partition_locks.len());
-        let mut acquisition_error = None;
         for (partition, lock) in partition_keys.iter().zip(&partition_locks) {
-            match lock.lock() {
-                Ok(guard) => partition_guards.push(guard),
-                Err(poisoned) => {
-                    acquisition_error = Some(TaibaiError::Storage(format!(
-                        "partition mutation lock poisoned on {} partition {}: {}",
-                        key, partition, poisoned
-                    )));
-                    break;
-                }
-            }
-        }
-        if let Some(error) = acquisition_error {
-            return Err(error);
+            partition_guards.push(acquire_partition_lock_for_wide_gate(
+                lock, key, partition, timeout,
+            )?);
         }
         f()
     }
@@ -813,28 +804,19 @@ impl SegmentManager {
             registries.push(registry);
         }
         drop(registries);
+        let timeouts = crate::common::config::storage_timeouts();
+        let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
         let mut partition_guard_sets = Vec::with_capacity(states.len());
-        let mut collection_error = None;
-        'collection: for (table_idx, key) in keys.iter().enumerate() {
+        for (table_idx, key) in keys.iter().enumerate() {
             let mut guards = Vec::new();
             let partitions = &partition_key_sets[table_idx];
             for (partition, lock) in partitions.iter().zip(&partition_arc_sets[table_idx]) {
-                match lock.lock() {
+                match acquire_partition_lock_for_wide_gate(lock, key, partition, timeout) {
                     Ok(guard) => guards.push(guard),
-                    Err(poisoned) => {
-                        collection_error = Some(TaibaiError::Storage(format!(
-                            "partition mutation lock poisoned on {} partition {}: {}",
-                            key, partition, poisoned
-                        )));
-                        partition_guard_sets.push(guards);
-                        break 'collection;
-                    }
+                    Err(error) => return Err(error),
                 }
             }
             partition_guard_sets.push(guards);
-        }
-        if let Some(error) = collection_error {
-            return Err(error);
         }
         f()
     }
@@ -1257,6 +1239,42 @@ fn acquire_mutation_lock<'a>(
                 panic!("table mutation lock poisoned: {}", poisoned)
             }
         }
+    }
+}
+
+/// Bounded acquisition of one partition mutex by a wide-gate holder. The
+/// caller has already set `partition_gate`, so the gate re-check loop of
+/// `acquire_partition_mutation_lock` must not be reused here (it would retry
+/// against our own gate until its timeout); this variant bounds only the
+/// wait. A long-held partition lock (slow partition-scoped mutation) must
+/// surface as an explicit timeout instead of freezing every partition
+/// writer behind the raised gate for the same duration.
+fn acquire_partition_lock_for_wide_gate<'a>(
+    lock: &'a std::sync::Mutex<()>,
+    key: &str,
+    partition_key: &str,
+    timeout: Duration,
+) -> Result<std::sync::MutexGuard<'a, ()>> {
+    let start = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                panic!("partition mutation lock poisoned on {} partition {}: {}", key, partition_key, poisoned)
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "table-wide mutation gate timed out after {}ms waiting on {} partition {}; a long partition mutation is in flight",
+                timeout.as_millis(),
+                key,
+                partition_key
+            )));
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(16));
     }
 }
 

@@ -742,10 +742,16 @@ pub fn exec_analyze_table(engine: &Engine, db: &str, table: &str) -> Result<Exec
     };
     let table_dir = engine.data_dir().join(db).join(table);
     let composite_groups = analyze_composite_groups(&table_meta);
+    // Statistics are advisory and the scan below is read-only over
+    // immutable segments, so it does NOT take the wide mutation gate:
+    // holding that gate for a full-table scan would freeze every
+    // partition's INSERTs for the scan duration. The flush-visibility
+    // read lock only keeps the scan from observing a memtable→segment
+    // transition mid-flip.
     let (row_count, columns, composite_columns) =
         engine
             .segment_mgr()
-            .with_table_mutation_lock(db, table, || {
+            .with_table_flush_read_lock(db, table, || {
                 let paths =
                     crate::storage::segment_manager::SegmentManager::discover_segments(&table_dir)?;
                 let mut collectors = table_meta

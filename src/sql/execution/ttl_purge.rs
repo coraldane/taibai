@@ -112,39 +112,26 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
     // Memtable-resident rows of the expired partitions must land on disk
     // (into the files we are about to remove); otherwise a later flush would
     // recreate the partition. The read-time TTL filter keeps them invisible
-    // either way, but flushing avoids resurrecting the files. The flush runs
+    // either way, but flushing avoids resurrecting the files. Everything runs
     // inside the partition locks below so a concurrent writer cannot append
     // to an expired partition between the flush and the deletion.
-    // Phase A — delete the expired segment files under those partition
-    // locks so no concurrent flush recreates them mid-delete. The catalog is
-    // NOT touched here: DDL takes catalogs().write() first and then waits
-    // for these locks, so acquiring the catalog lock while holding the
-    // partition locks would deadlock against it (the order
+    // Phase A — drain memtables, then delete the partition's segment files
+    // under those partition locks so no concurrent flush recreates them
+    // mid-delete. The file list is re-scanned AFTER the flush: the flush may
+    // materialize fresh files for the partition, and those must go too. The
+    // catalog is NOT touched here: DDL takes catalogs().write() first and
+    // then waits for these locks, so acquiring the catalog lock while holding
+    // the partition locks would deadlock against it (the order
     // dml_insert/lock_order_test pins).
     let expired_keys = expired.iter().map(String::as_str).collect::<Vec<_>>();
     let mut file_rows: i64 = 0;
     mgr.with_partition_set_mutation_lock(db, table, &expired_keys, || -> Result<()> {
         for key in &expired {
+            engine
+                .batch_writer()
+                .flush_partition_under_partition_lock(db, table, key)?;
             mgr.flush_partition_active(db, table, key)?;
-            for path in &files_by_key[key] {
-                mgr.invalidate_readers_under(path);
-                // Count live rows from the segment itself: the catalog's
-                // partition list is not always maintained by the write
-                // path, so the file is the source of truth here.
-                if let Ok(reader) = mgr.open_reader(path) {
-                    file_rows += reader
-                        .row_count()
-                        .saturating_sub(reader.deleted_row_count())
-                        as i64;
-                }
-                let sidecar = crate::storage::segment::meta::sidecar_meta_path(path);
-                if let Err(error) = std::fs::remove_file(path) {
-                    tracing::warn!(path = %path.display(), error = %error, "ttl purge: failed to remove segment file");
-                }
-                if sidecar.exists() {
-                    let _ = std::fs::remove_file(&sidecar);
-                }
-            }
+            file_rows += remove_partition_files(&table_dir, key, mgr)?;
         }
         Ok(())
     })?;
@@ -205,16 +192,55 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
 /// True when at least one segment file for `key` currently exists under
 /// `table_dir`.
 fn partition_files_exist(table_dir: &std::path::Path, key: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(table_dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .and_then(parse_partition_key)
-            .is_some_and(|k| k == key)
-    })
+    std::fs::read_dir(table_dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(parse_partition_key)
+                    .is_some_and(|k| k == key)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Remove every segment file (and sidecar) of `key` under `table_dir`,
+/// invalidating cached readers first. Returns the number of live rows the
+/// removed files carried. A failed removal only logs: the purge is an
+/// idempotent reconciliation and the next run converges.
+fn remove_partition_files(
+    table_dir: &std::path::Path,
+    key: &str,
+    mgr: &crate::storage::segment_manager::SegmentManager,
+) -> Result<i64> {
+    let mut file_rows: i64 = 0;
+    for entry in std::fs::read_dir(table_dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if parse_partition_key(name).as_deref() != Some(key) {
+            continue;
+        }
+        mgr.invalidate_readers_under(&path);
+        // Count live rows from the segment itself: the catalog's partition
+        // list is not always maintained by the write path, so the file is
+        // the source of truth here.
+        if let Ok(reader) = mgr.open_reader(&path) {
+            file_rows += reader
+                .row_count()
+                .saturating_sub(reader.deleted_row_count()) as i64;
+        }
+        let sidecar = crate::storage::segment::meta::sidecar_meta_path(&path);
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::warn!(path = %path.display(), error = %error, "ttl purge: failed to remove segment file");
+        }
+        if sidecar.exists() {
+            let _ = std::fs::remove_file(&sidecar);
+        }
+    }
+    Ok(file_rows)
 }
 
 fn now_micros() -> i64 {

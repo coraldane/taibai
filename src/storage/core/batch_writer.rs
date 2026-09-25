@@ -692,6 +692,40 @@ impl BatchWriter {
         Ok(())
     }
 
+    /// Flush one partition's memtables while the caller already holds that
+    /// partition's mutation lock (or a superset like the TTL purge's
+    /// partition-set lock). The held lock already excludes appenders for
+    /// this partition, so the freeze needs no further synchronization;
+    /// segment I/O still runs under the flush I/O gate per the split-flush
+    /// contract, never under the caller's partition lock. Callers must NOT
+    /// use this while holding only the wide table gate for a DIFFERENT
+    /// purpose — `flush_table_under_table_lock` is the wide-gate variant.
+    pub(crate) fn flush_partition_under_partition_lock(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Result<()> {
+        self.wait_out_table_flush_io(db, table);
+        let mts = self
+            .memtable_mgr
+            .get_by_table(db, table)
+            .into_iter()
+            .filter(|memtable| memtable.partition_key() == partition_key)
+            .collect::<Vec<_>>();
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(
+                &self.segment_mgr,
+                &group,
+                true,
+                &self.tail_committer,
+                &self.flush_gate,
+            )?;
+        }
+        self.memtable_mgr.remove_flushed();
+        Ok(())
+    }
+
     pub(crate) fn flush_table_under_table_lock(&self, db: &str, table: &str) -> Result<()> {
         self.wait_out_table_flush_io(db, table);
         let mts = self.memtable_mgr.get_by_table(db, table);

@@ -141,6 +141,81 @@ fn ttl_purge_drops_expired_day_partitions_and_updates_catalog() {
 }
 
 #[test]
+fn ttl_purge_drains_expired_partition_memtables_before_deleting_files() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE events_mem (
+                ts TIMESTAMP,
+                value DOUBLE
+            ) PARTITION BY DAY(ts) TTL (ts, 3600)",
+        )
+        .expect("create events_mem");
+
+    // Rows on disk make the partition a purge candidate...
+    engine.begin_bulk_import();
+    session.bulk_import_mode = true;
+    engine
+        .execute(
+            &mut session,
+            &format!(
+                "INSERT INTO events_mem VALUES ({}, 1.0), ({}, 2.0)",
+                micros("2024-01-15 10:00:00"),
+                micros("2024-01-15 11:00:00")
+            ),
+        )
+        .expect("insert old to segments");
+    session.bulk_import_mode = false;
+    engine.end_bulk_import();
+
+    // ...and rows that are still memtable-resident for the same expired
+    // partition. The purge must drain them inside the partition lock and
+    // delete the flushed files too; otherwise a later flush resurrects the
+    // partition.
+    engine
+        .execute(
+            &mut session,
+            &format!(
+                "INSERT INTO events_mem VALUES ({}, 3.0), ({}, 4.0)",
+                micros("2024-01-15 12:00:00"),
+                micros("2024-01-15 13:00:00")
+            ),
+        )
+        .expect("insert old to memtable");
+
+    let reclaimed = engine.run_ttl_partition_purge().expect("purge");
+    assert_eq!(reclaimed, 4);
+
+    engine
+        .execute(&mut session, "FLUSH TABLE events_mem")
+        .expect("flush after purge");
+
+    let table_dir = temp_dir.path().join("main").join("events_mem");
+    let leftovers = taibai::storage::segment_manager::SegmentManager::discover_segments(&table_dir)
+        .expect("discover");
+    assert!(
+        leftovers.iter().all(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !name.starts_with("p20240115"))
+        }),
+        "expired partition must not resurrect after the purge: {:?}",
+        leftovers
+    );
+
+    let count = engine
+        .execute(&mut session, "SELECT COUNT(*) FROM events_mem")
+        .expect("count after purge");
+    assert_eq!(scalar_i64(count), 0);
+
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
 fn compaction_physically_purges_expired_rows() {
     let temp_dir = TempDir::new().expect("temp dir");
     let engine = Engine::new(temp_dir.path(), "main").expect("engine");

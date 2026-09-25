@@ -308,7 +308,7 @@ pub(super) fn append_prepared_unique_index_delta(
         write_u32(&mut file, record.len() as u32)?;
         file.write_all(&record)?;
     }
-    let mut file = file
+    let file = file
         .into_inner()
         .map_err(|e| TaibaiError::Storage(format!("unique index delta flush failed: {}", e)))?;
     file.sync_all()?;
