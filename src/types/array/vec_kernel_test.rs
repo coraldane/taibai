@@ -287,7 +287,6 @@ fn selected_and_dictionary_columns_compare_through_flat_form() {
 /// deal_time as Int32; `deal_time <= 1033` must not lose every row.
 #[test]
 fn int32_column_cross_type_ordering_masks() {
-    use crate::types::batch::ColumnDef;
     let mut col = ColumnArray::with_capacity(crate::protocol::types::DataType::Int32, 3);
     for v in [930i32, 1034, 500] {
         col.push(&ScalarValue::Int32(Some(v))).unwrap();

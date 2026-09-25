@@ -128,7 +128,7 @@ fn perf_month_partition_point_lookup() {
         PRE_CLOSE_SNAPSHOTS_PER_DAY
     );
     for day_offset in 0..PRE_CLOSE_DAYS {
-        let day = (20260910 + day_offset as i32);
+        let day = 20260910 + day_offset as i32;
         for snap in 0..PRE_CLOSE_SNAPSHOTS_PER_DAY {
             snapshot_insert(&engine, &mut session, "bench_minute", day, snap);
         }

@@ -2050,7 +2050,6 @@ impl BatchWriter {
             }
             return Err(error);
         }
-        let finish_start = std::time::Instant::now();
         if let Err(error) = crate::storage::core::durable_tail::finish_flush_batch(
             table_dir,
             std::iter::once(intent).collect(),

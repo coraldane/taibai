@@ -626,14 +626,7 @@ impl IndexManager {
             };
             state = refreshed;
         }
-        Self::state_contains_any_encoded_key(
-            &self.segment_mgr,
-            state,
-            db,
-            table,
-            index_name,
-            keys,
-        )
+        Self::state_contains_any_encoded_key(&self.segment_mgr, state, keys)
     }
 
     pub fn unique_keys_exist_if_current<I>(
@@ -656,22 +649,12 @@ impl IndexManager {
             // Post-write index refresh keeps uniqueness tracked either way.
             return Ok(None);
         }
-        Self::state_contains_any_encoded_key(
-            &self.segment_mgr,
-            state,
-            db,
-            table,
-            index_name,
-            keys,
-        )
+        Self::state_contains_any_encoded_key(&self.segment_mgr, state, keys)
     }
 
     fn state_contains_any_encoded_key<I>(
         segment_mgr: &SegmentManager,
         state: Arc<UniqueIndexState>,
-        db: &str,
-        table: &str,
-        index_name: &str,
         keys: I,
     ) -> Result<Option<bool>>
     where
