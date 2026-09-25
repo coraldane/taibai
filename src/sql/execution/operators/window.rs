@@ -74,6 +74,7 @@ impl ExecutionOp for WindowExec {
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut num_rows = 0usize;
         while let Some(batch) = self.input.next_batch()? {
+            crate::common::query_cancel::check()?;
             num_rows += batch.num_rows();
             batches.push(batch);
         }

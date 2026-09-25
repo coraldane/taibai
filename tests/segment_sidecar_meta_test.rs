@@ -214,7 +214,7 @@ fn seal_removes_sidecar_and_keeps_dat_footer() {
 fn standalone_sealed_segment_has_no_sidecar() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("seg_0001.dat");
-    let mut writer = SegmentWriter::create(&path, schema(), 1024).unwrap();
+    let mut writer = SegmentWriter::create(&path, schema(), 1024, 3).unwrap();
     writer.write_batch(&batch(1, 3)).unwrap();
     writer.seal().unwrap();
 

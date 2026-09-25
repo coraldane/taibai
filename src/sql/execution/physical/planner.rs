@@ -84,6 +84,78 @@ pub fn drain_pipeline(
     Ok((result_schema.unwrap_or_else(Schema::empty), result_batches))
 }
 
+/// Rewrite the input of `SELECT DISTINCT` into a zone-map-answering scan
+/// when the shape is a single plain column reference over an unfiltered
+/// scan: the scan's projection is narrowed to that column and flagged with
+/// `distinct_column`, and the wrapping Project is remapped onto it. Returns
+/// `None` when the fast path does not apply.
+fn try_rewrite_distinct_scan(
+    input: &LogicalPlan,
+    ctx: &PhysicalContext<'_>,
+) -> Option<LogicalPlan> {
+    let (project, scan) = match input {
+        LogicalPlan::Project(p) => {
+            if p.expressions.len() != 1 || p.aliases.len() != p.expressions.len() {
+                return None;
+            }
+            let LogicalExpr::Column(col_idx) = p.expressions[0] else {
+                return None;
+            };
+            let LogicalPlan::Scan(s) = p.input.as_ref() else {
+                return None;
+            };
+            (Some((p, col_idx)), s)
+        }
+        LogicalPlan::Scan(s) => (None, s),
+        _ => return None,
+    };
+
+    // The zone-map answer is only exact for an unfiltered, unordered scan.
+    let eligible = scan.pushed_filter.is_none()
+        && scan.zone_map_filters.is_empty()
+        && scan.pushed_limit.is_none()
+        && scan.pushed_order.is_none()
+        && scan.partition_filter.is_none()
+        && scan.time_range.is_none()
+        && scan.index_columns.is_empty()
+        && scan.bloom_filter_columns.is_empty()
+        && scan.minmax_index_columns.is_empty()
+        && scan.set_index_columns.is_empty();
+    if !eligible {
+        return None;
+    }
+
+    // Resolve the projected column to its index in the table schema.
+    let table_idx = match (&scan.projection, &project) {
+        (Some(projection), Some((_, col_idx))) => *projection.get(*col_idx)?,
+        (Some(projection), None) => {
+            if projection.len() != 1 {
+                return None;
+            }
+            projection[0]
+        }
+        (None, Some((_, col_idx))) => *col_idx,
+        (None, None) => return None,
+    };
+
+    let table_schema = ctx.schema(&scan.table_name)?;
+    let column = table_schema.columns.get(table_idx)?;
+    let column_name = column.name.clone();
+
+    let mut new_scan = scan.clone();
+    new_scan.projection = Some(vec![table_idx]);
+    new_scan.distinct_column = Some(column_name);
+
+    match project {
+        Some((p, _)) => Some(LogicalPlan::Project(ProjectPlan {
+            expressions: vec![LogicalExpr::Column(0)],
+            aliases: p.aliases.clone(),
+            input: Box::new(LogicalPlan::Scan(new_scan)),
+        })),
+        None => Some(LogicalPlan::Scan(new_scan)),
+    }
+}
+
 fn build_operator_with_limit(
     plan: LogicalPlan,
     ctx: &mut PhysicalContext<'_>,
@@ -364,8 +436,20 @@ fn build_operator_with_limit(
             )))
         }
         LogicalPlan::Distinct(distinct) => {
+            // `SELECT DISTINCT <single column>` over an unfiltered scan is
+            // answered from row-group zone maps by flagging the scan; the
+            // DistinctExec/Project above it then see one already-distinct
+            // batch and pass it through unchanged.
+            let input_plan = if table_batches.is_none() {
+                match try_rewrite_distinct_scan(distinct.input.as_ref(), ctx) {
+                    Some(rewritten) => rewritten,
+                    None => *distinct.input,
+                }
+            } else {
+                *distinct.input
+            };
             let input = build_operator_with_limit(
-                *distinct.input,
+                input_plan,
                 ctx,
                 None,
                 table_batches,

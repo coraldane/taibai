@@ -565,6 +565,7 @@ impl ExecutionOp for HashAggregateExec {
                 std::iter::repeat_with(|| None).take(accums.len()).collect();
 
             while let Some(batch) = self.input.next_batch()? {
+                crate::common::query_cancel::check()?;
                 if physical_schema.is_none() {
                     physical_schema = Some(batch.schema.clone());
                 }
@@ -634,6 +635,7 @@ impl ExecutionOp for HashAggregateExec {
         let mut fast_unsupported = false;
 
         while let Some(batch) = self.input.next_batch()? {
+            crate::common::query_cancel::check()?;
             if physical_schema.is_none() {
                 physical_schema = Some(batch.schema.clone());
             }
@@ -1221,6 +1223,7 @@ impl GroupSpillMerge {
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         loop {
+            crate::common::query_cancel::check()?;
             if self.heap.is_empty() {
                 return Ok(None);
             }
@@ -1529,6 +1532,7 @@ impl DistinctSpillAccumulator {
         let mut summary = DistinctSummary::default();
         let mut previous = None;
         while let Some(item) = heap.pop() {
+            crate::common::query_cancel::check()?;
             if previous.as_ref() != Some(&item.value) {
                 summary.add_value(decode_key_scalar(&item.value), self.is_count_star);
                 previous = Some(item.value.clone());

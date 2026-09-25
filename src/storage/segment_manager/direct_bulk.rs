@@ -24,7 +24,8 @@ impl SegmentManager {
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
 
-        let compressed_columns = self.compress_direct_bulk_columns(&req.columns)?;
+        let compressed_columns =
+            self.compress_direct_bulk_columns(&req.columns, bulk_compression_level())?;
 
         {
             let partition_lock = partition_mutation_lock_arc(&state, "");
@@ -136,11 +137,17 @@ impl SegmentManager {
     ) -> Result<u64> {
         let table_dir = self.data_dir.join(db).join(req.table_name);
         std::fs::create_dir_all(&table_dir)?;
+        self.set_table_compression_level(db, req.table_name, table_meta.compression_level);
+        let compression_level =
+            crate::storage::segment_manager::config::resolve_compression_level(
+                table_meta.compression_level,
+            );
         let partition_groups = self.direct_bulk_partition_groups(req, table_meta)?;
         let prepared_groups = self.prepare_direct_bulk_groups(
             req,
             partition_groups,
             self.config.row_group_target_rows.max(1),
+            compression_level,
         )?;
         let key = table_key(db, req.table_name);
         let state = self.get_or_create_state(&key);
@@ -286,6 +293,7 @@ impl SegmentManager {
         req: &'a DirectBulkRequest<'a>,
         partition_groups: Vec<(String, Vec<usize>)>,
         row_group_target_rows: usize,
+        compression_level: i32,
     ) -> Result<Vec<PreparedDirectBulkGroup<'a>>> {
         let mut prepared = Vec::with_capacity(partition_groups.len());
         for (partition_key, rows) in partition_groups {
@@ -307,7 +315,8 @@ impl SegmentManager {
                         variable_ranges: col.variable_ranges.clone(),
                     })
                     .collect();
-                let compressed_columns = self.compress_direct_bulk_columns(&columns)?;
+                let compressed_columns =
+                    self.compress_direct_bulk_columns(&columns, compression_level)?;
                 prepared.push(PreparedDirectBulkGroup {
                     partition_key: partition_key.clone(),
                     row_count: req.row_count,
@@ -328,7 +337,8 @@ impl SegmentManager {
                         variable_ranges: col.variable_ranges.clone(),
                     })
                     .collect();
-                let compressed_columns = self.compress_direct_bulk_columns(&columns)?;
+                let compressed_columns =
+                    self.compress_direct_bulk_columns(&columns, compression_level)?;
                 prepared.push(PreparedDirectBulkGroup {
                     partition_key: partition_key.clone(),
                     row_count: chunk.len(),
@@ -440,9 +450,9 @@ impl SegmentManager {
     fn compress_direct_bulk_columns(
         &self,
         columns: &[DirectBulkColumn<'_>],
+        compression_level: i32,
     ) -> Result<Vec<(Vec<u8>, u64)>> {
         use rayon::prelude::*;
-        let compression_level = bulk_compression_level();
         columns
             .par_iter()
             .map(|col| {

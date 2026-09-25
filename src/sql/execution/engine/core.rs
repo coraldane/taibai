@@ -105,6 +105,21 @@ impl Engine {
         let segment_mgr = Arc::new(SegmentManager::with_config(data_dir, segment_config)?);
         SegmentManager::start_flush_thread(&segment_mgr);
 
+        // Seed per-table zstd level overrides before any recovery pass can
+        // create writers, so flushed tails and recovered active segments use
+        // the table's COMPRESSION_LEVEL instead of the global default.
+        for (db_name, catalog) in &catalogs {
+            for table_meta in catalog.tables.values() {
+                if table_meta.compression_level.is_some() {
+                    segment_mgr.set_table_compression_level(
+                        db_name,
+                        &table_meta.name,
+                        table_meta.compression_level,
+                    );
+                }
+            }
+        }
+
         let pubsub = crate::pubsub::PubSubHub::new(pubsub_settings);
         segment_mgr.set_pubsub(Arc::clone(&pubsub));
 
@@ -187,6 +202,7 @@ impl Engine {
             hot_store_mgr,
             performance_baselines,
             hot_partition_segments: Mutex::new(HashMap::new()),
+            query_registry: Arc::new(crate::sql::execution::query_registry::QueryRegistry::new()),
         };
         if hot_warmup_enabled {
             engine.warmup_hot_stores();
@@ -424,10 +440,11 @@ impl Engine {
                 ttl,
                 hot,
                 durability,
+                compression_level,
             } => {
                 let db = name.effective_database(&session.database).to_string();
                 let table = name.name.clone();
-                
+
                 super::ddl::exec_create_table(
                     self,
                     &db,
@@ -441,6 +458,7 @@ impl Engine {
                     ttl,
                     hot,
                     durability,
+                    compression_level,
                 )
             }
             Statement::CreateIndex {
@@ -726,6 +744,9 @@ impl Engine {
             }
             Statement::ShowEngines => super::ddl::exec_show_engines(self),
             Statement::ShowProcesslist { full } => super::ddl::exec_show_processlist(self, *full),
+            Statement::KillQuery { query_id } => {
+                super::ddl::exec_kill_query(self, &session.username, *query_id)
+            }
             Statement::ResetPerformanceBaselines => {
                 super::performance::exec_reset_performance_baselines(self, &session.database)
             }
@@ -964,6 +985,7 @@ impl Engine {
             | Statement::ShowRoles
             | Statement::ShowGrants { .. }
             | Statement::ShowProcesslist { .. }
+            | Statement::KillQuery { .. }
             | Statement::PauseFlush
             | Statement::ResumeFlush
             | Statement::ResetPerformanceBaselines => self.require_global_admin(session),

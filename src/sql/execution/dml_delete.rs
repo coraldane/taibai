@@ -976,6 +976,10 @@ pub fn exec_delete(
         .batch_writer()
         .checkpoint_before_rewrite(db, table, 1)?;
 
+    // From here the statement rewrites memtables and segment tails; the work
+    // is no longer safely abortable, so cancellation checks stop firing.
+    crate::common::query_cancel::enter_committing_phase();
+
     let mut index_maintenance = DeleteIndexMaintenance::plan(&table_meta, &table_schema);
 
     let mut delete_body = || -> Result<bool> {

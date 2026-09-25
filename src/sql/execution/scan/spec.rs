@@ -42,6 +42,10 @@ pub struct ScanSpec {
     /// When set, the scan executor answers the query from row-group zone maps
     /// / footers instead of streaming the data.
     pub simple_metadata_aggregates: Option<Vec<AggregateExpr>>,
+
+    /// DISTINCT fast path target column (name in the table schema). Set only
+    /// for single-column, predicate-free `SELECT DISTINCT` scans.
+    pub distinct_column: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +92,7 @@ impl ScanSpec {
             reader_txn_id: 0,
             hot_mirror_bound: None,
             simple_metadata_aggregates: None,
+            distinct_column: None,
         }
     }
 
@@ -149,6 +154,10 @@ pub fn compile_scan_spec(
     table_meta: &TableMeta,
 ) -> ScanSpec {
     let mut spec = ScanSpec::new(table_name);
+
+    if let LogicalPlan::Scan(scan) = plan {
+        spec.distinct_column = scan.distinct_column.clone();
+    }
 
     if !table_meta.cluster_key.is_empty() {
         spec.cluster_key = Some(table_meta.cluster_key.clone());

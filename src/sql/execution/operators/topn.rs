@@ -52,6 +52,7 @@ impl TopNExec {
         }
         let mut acc = Accumulator::new(self.capacity, &self.sort_keys, self.schema.clone());
         while let Some(batch) = self.input.next_batch()? {
+            crate::common::query_cancel::check()?;
             acc.push_batch(&batch)?;
         }
         acc.finish()

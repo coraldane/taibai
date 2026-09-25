@@ -93,6 +93,8 @@ pub struct Engine {
     /// INSERT path does not re-run `read_dir` per statement. Positive-only
     /// entries (never invalidated by time) keep the filter conservative.
     hot_partition_segments: Mutex<HashMap<std::path::PathBuf, HashSet<String>>>,
+    /// Running queries as seen by `SHOW PROCESSLIST` / `KILL QUERY`.
+    query_registry: Arc<crate::sql::execution::query_registry::QueryRegistry>,
 }
 
 enum HotResidentMark {

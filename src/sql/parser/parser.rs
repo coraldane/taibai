@@ -65,6 +65,7 @@ impl Parser {
             Token::Commit => self.parse_commit(),
             Token::Rollback => self.parse_rollback(),
             Token::Flush => self.parse_flush(),
+            Token::Kill => self.parse_kill(),
             Token::Optimize => self.parse_optimize(),
             Token::Analyze => self.parse_analyze_table(),
             Token::Rebuild => self.parse_rebuild(),

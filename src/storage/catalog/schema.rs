@@ -201,6 +201,10 @@ pub struct TableMeta {
     pub statistics: Option<TableStatisticsMeta>,
     #[serde(default)]
     pub durability: TableDurability,
+    /// Per-table zstd compression level override (1..=22) applied to segment
+    /// writes; `None` follows the global `compression.bulk_zstd_level` config.
+    #[serde(default)]
+    pub compression_level: Option<i32>,
 }
 
 impl TableMeta {
@@ -238,6 +242,7 @@ impl TableMeta {
             dropped_columns: Vec::new(),
             statistics: None,
             durability: TableDurability::Strict,
+            compression_level: None,
         };
         meta.ensure_column_ids();
         meta

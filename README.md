@@ -2,11 +2,9 @@
 
 Taibai 是一个用 Rust 编写的列式数据库服务端。
 
-> **项目状态：实验性。** 当前 `0.x` 版本适合数据库内核研究、功能验证和性能测试，尚未声明生产就绪。数据格式、协议、配置和 SQL 行为可能发生不兼容变化，详见[项目状态与限制](docs/user-guide/limitations.md)。
-
 第一次使用请从[五分钟快速开始](docs/getting-started/quick-start.md)开始。
 
-简单说，它是一个偏分析场景的数据库：适合写入大量数据，然后按列扫描、统计、聚合和查询。项目目前还在开发和完善中，更适合用来做数据库内核实验、功能验证和性能测试。
+简单说，它是一个偏分析场景的数据库：适合写入大量数据，然后按列扫描、统计、聚合和查询。生产部署前的准备事项见[兼容性与部署指引](docs/user-guide/limitations.md)。
 
 ## 它能做什么
 
@@ -111,6 +109,14 @@ CREATE TABLE ticks (
   volume INT64
 ) CLUSTER BY (symbol, ts);
 
+-- 归档表可提高压缩级别（1..=22，默认跟随配置 compression.bulk_zstd_level）
+CREATE TABLE ticks_archive (
+  symbol VARCHAR,
+  ts TIMESTAMP,
+  price FLOAT64,
+  volume INT64
+) COMPRESSION_LEVEL = 19;
+
 INSERT INTO ticks VALUES
   ('AAPL', 1717200000000, 191.2, 1000),
   ('AAPL', 1717200001000, 191.5, 800),
@@ -202,7 +208,7 @@ log:
 - `docs/getting-started/quick-start.md`：五分钟快速开始。
 - `docs/overview/project-summary.md`：工程功能总览。
 - `docs/user-guide/pubsub.md`：变更订阅（pub/sub）协议、权限与配置。
-- `docs/user-guide/limitations.md`：项目状态、兼容性和使用限制。
+- `docs/user-guide/limitations.md`：兼容性与部署指引。
 - `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。
 - `docs/operations/data-import-flow.md`：数据导入流程。
 - `docs/operations/windows-installation.md`：Windows 图形安装包和系统服务安装说明。

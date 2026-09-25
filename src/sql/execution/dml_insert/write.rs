@@ -324,6 +324,14 @@ fn materialize_insert_values(
         .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
         .clone();
 
+    // Keep the storage-side per-table zstd level override in sync with the
+    // catalog before any append/flush can create a writer.
+    engine.segment_mgr().set_table_compression_level(
+        db,
+        table,
+        table_meta.compression_level,
+    );
+
     let schema = Schema::new(table_meta.columns.clone());
 
     let auto_inc_cols: Vec<usize> = schema
@@ -433,6 +441,9 @@ fn exec_materialized_insert_batch(
     publish_unique_index_entries: bool,
     publish_catalog: bool,
 ) -> Result<ExecResult> {
+    // Values are materialized; from here on the statement installs rows into
+    // memtables and indexes, which cannot be undone by cancellation.
+    crate::common::query_cancel::enter_committing_phase();
     let auto_inc_cols: Vec<usize> = schema
         .columns
         .iter()

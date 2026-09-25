@@ -12,6 +12,7 @@ pub fn exec_create_table(
     ttl: &Option<TtlDef>,
     hot: &Option<HotDef>,
     durability: &Option<DurabilityLevel>,
+    compression_level: &Option<i32>,
 ) -> Result<ExecResult> {
     let mut catalogs = engine.catalogs().write().unwrap();
     let catalog = get_existing_catalog(&mut catalogs, db)?;
@@ -54,6 +55,8 @@ pub fn exec_create_table(
         validate_hot_def(&col_defs, name, hot_def)?;
     }
 
+    validate_compression_level(compression_level)?;
+
     catalog.create_table(name, col_defs)?;
 
     if let Some(meta) = catalog.get_table_mut(name) {
@@ -94,6 +97,9 @@ pub fn exec_create_table(
                 DurabilityLevel::Strict => TableDurability::Strict,
                 DurabilityLevel::Relaxed => TableDurability::Relaxed,
             };
+        }
+        if let Some(level) = compression_level {
+            meta.compression_level = Some(*level);
         }
     }
 
@@ -147,6 +153,10 @@ pub fn exec_create_table(
 
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
+
+    engine
+        .segment_mgr()
+        .set_table_compression_level(db, name, *compression_level);
 
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
@@ -767,6 +777,15 @@ fn exec_rename_table(engine: &Engine, db: &str, name: &str, new_name: &str) -> R
     };
     drop(catalogs);
 
+    // The renamed table's storage state was removed with the old name; carry
+    // the compression-level override over to the new table's state.
+    let compression_level = catalog_before
+        .get_table(name)
+        .and_then(|meta| meta.compression_level);
+    engine
+        .segment_mgr()
+        .set_table_compression_level(db, new_name, compression_level);
+
     engine
         .auto_increment_manager()
         .rename_table(db, name, new_name);
@@ -1281,11 +1300,24 @@ pub fn exec_alter_table(
                 })?;
                 meta.clear_ttl();
             }
+            AlterOperation::SetCompressionLevel { level } => {
+                validate_compression_level(&level)?;
+                let meta = catalog.get_table_mut(name).ok_or_else(|| {
+                    TaibaiError::Sql(format!("table '{}.{}' does not exist", db, name))
+                })?;
+                meta.compression_level = *level;
+            }
         }
     }
 
     let meta_dir = engine.data_dir().join("meta");
     catalog.save(&meta_dir)?;
+
+    if let [AlterOperation::SetCompressionLevel { level }] = operations {
+        engine
+            .segment_mgr()
+            .set_table_compression_level(db, name, *level);
+    }
 
     Ok(ExecResult::Ok { rows_affected: 0 })
 }
@@ -1360,6 +1392,20 @@ fn validate_ttl_columns(columns: &[ColumnDef], ttl: &TtlDef) -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+/// zstd supports levels 1..=22; anything outside is a user error rather than
+/// something to silently clamp.
+pub(crate) fn validate_compression_level(level: &Option<i32>) -> Result<()> {
+    if let Some(level) = level {
+        if !(1..=22).contains(level) {
+            return Err(TaibaiError::Sql(format!(
+                "COMPRESSION_LEVEL must be between 1 and 22, got {}",
+                level
+            )));
+        }
+    }
     Ok(())
 }
 

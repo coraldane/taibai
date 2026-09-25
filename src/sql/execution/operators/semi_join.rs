@@ -78,6 +78,7 @@ impl SemiJoinExec {
     fn collect_right(&mut self) -> Result<()> {
         let has_keys = !self.right_key_cols.is_empty();
         while let Some(batch) = self.right.next_batch()? {
+            crate::common::query_cancel::check()?;
             for row in 0..batch.num_rows() {
                 let values: Vec<ScalarValue> = (0..batch.num_columns())
                     .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
@@ -105,6 +106,7 @@ impl SemiJoinExec {
     fn collect_left(&mut self) -> Result<()> {
         let has_keys = !self.left_key_cols.is_empty();
         while let Some(batch) = self.left.next_batch()? {
+            crate::common::query_cancel::check()?;
             let batch_start = self.matched_left_rows.len();
             self.matched_left_rows.extend(vec![false; batch.num_rows()]);
             for row in 0..batch.num_rows() {

@@ -384,7 +384,12 @@ impl BatchWriter {
                     error = %error,
                     "group-committed durable tail write failed; flushing target memtable"
                 );
-                Self::flush_memtable(&self.segment_mgr, &memtable, &self.tail_committer, &self.flush_gate)?;
+                Self::flush_memtable(
+                    &self.segment_mgr,
+                    &memtable,
+                    &self.tail_committer,
+                    &self.flush_gate,
+                )?;
             }
         }
         Ok(rows)
@@ -496,7 +501,13 @@ impl BatchWriter {
                     error = %error,
                     "durable tail write failed; flushing target memtable"
                 );
-                Self::flush_memtable_inner(&self.segment_mgr, &mt, true, &self.tail_committer, &self.flush_gate)?;
+                Self::flush_memtable_inner(
+                    &self.segment_mgr,
+                    &mt,
+                    true,
+                    &self.tail_committer,
+                    &self.flush_gate,
+                )?;
             }
         } else {
             mt.append_owned(batch)?;
@@ -649,7 +660,13 @@ impl BatchWriter {
         self.wait_out_table_flush_io(db, table);
         let mts = self.memtable_mgr.get_by_table(db, table);
         for group in Self::group_memtables_for_flush(mts) {
-            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer, &self.flush_gate)?;
+            Self::flush_memtable_group(
+                &self.segment_mgr,
+                &group,
+                false,
+                &self.tail_committer,
+                &self.flush_gate,
+            )?;
         }
         Ok(())
     }
@@ -663,7 +680,13 @@ impl BatchWriter {
             .filter(|memtable| memtable.partition_key() == partition_key)
             .collect::<Vec<_>>();
         for group in Self::group_memtables_for_flush(mts) {
-            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer, &self.flush_gate)?;
+            Self::flush_memtable_group(
+                &self.segment_mgr,
+                &group,
+                false,
+                &self.tail_committer,
+                &self.flush_gate,
+            )?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -673,7 +696,13 @@ impl BatchWriter {
         self.wait_out_table_flush_io(db, table);
         let mts = self.memtable_mgr.get_by_table(db, table);
         for group in Self::group_memtables_for_flush(mts) {
-            Self::flush_memtable_group(&self.segment_mgr, &group, true, &self.tail_committer, &self.flush_gate)?;
+            Self::flush_memtable_group(
+                &self.segment_mgr,
+                &group,
+                true,
+                &self.tail_committer,
+                &self.flush_gate,
+            )?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -730,7 +759,13 @@ impl BatchWriter {
     pub fn flush_all(&self) -> Result<()> {
         let mts = self.memtable_mgr.get_all_pending();
         for group in Self::group_memtables_for_flush(mts) {
-            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer, &self.flush_gate)?;
+            Self::flush_memtable_group(
+                &self.segment_mgr,
+                &group,
+                false,
+                &self.tail_committer,
+                &self.flush_gate,
+            )?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -751,7 +786,13 @@ impl BatchWriter {
             })
             .collect();
         for group in Self::group_memtables_for_flush(mts) {
-            Self::flush_memtable_group(&self.segment_mgr, &group, false, &self.tail_committer, &self.flush_gate)?;
+            Self::flush_memtable_group(
+                &self.segment_mgr,
+                &group,
+                false,
+                &self.tail_committer,
+                &self.flush_gate,
+            )?;
         }
         self.memtable_mgr.remove_flushed();
         Ok(())
@@ -974,7 +1015,10 @@ impl BatchWriter {
         );
         let checkpoint_start = std::time::Instant::now();
         let mut failed = false;
-        for (idx, group) in Self::group_memtables_for_flush(full).into_iter().enumerate() {
+        for (idx, group) in Self::group_memtables_for_flush(full)
+            .into_iter()
+            .enumerate()
+        {
             let group_rows: u64 = group.iter().map(|mt| mt.row_count()).sum();
             let group_start = std::time::Instant::now();
             if let Err(error) =
@@ -1294,7 +1338,13 @@ impl BatchWriter {
         &self,
         memtable: &Arc<crate::storage::core::memtable::MemTable>,
     ) -> Result<()> {
-        Self::flush_memtable_inner(&self.segment_mgr, memtable, true, &self.tail_committer, &self.flush_gate)?;
+        Self::flush_memtable_inner(
+            &self.segment_mgr,
+            memtable,
+            true,
+            &self.tail_committer,
+            &self.flush_gate,
+        )?;
         let _ = crate::storage::core::durable_tail::clear(
             &self.segment_mgr.table_dir(memtable.db(), memtable.table()),
             memtable.id(),
@@ -1440,9 +1490,7 @@ impl BatchWriter {
             let frozen = if table_lock_held {
                 group
                     .iter()
-                    .filter_map(|mt| {
-                        Self::freeze_memtable_locked(mt).map(|b| (mt.clone(), b))
-                    })
+                    .filter_map(|mt| Self::freeze_memtable_locked(mt).map(|b| (mt.clone(), b)))
                     .collect::<Vec<_>>()
             } else {
                 Self::freeze_memtable_group_under_partition_lock(segment_mgr, group)?
@@ -1469,10 +1517,12 @@ impl BatchWriter {
     fn freeze_memtable_group_under_partition_lock(
         segment_mgr: &Arc<SegmentManager>,
         group: &[Arc<crate::storage::core::memtable::MemTable>],
-    ) -> Result<Vec<(
-        Arc<crate::storage::core::memtable::MemTable>,
-        Arc<RecordBatch>,
-    )>> {
+    ) -> Result<
+        Vec<(
+            Arc<crate::storage::core::memtable::MemTable>,
+            Arc<RecordBatch>,
+        )>,
+    > {
         segment_mgr.with_partition_mutation_lock(
             group[0].db(),
             group[0].table(),
@@ -1480,9 +1530,7 @@ impl BatchWriter {
             || {
                 Ok(group
                     .iter()
-                    .filter_map(|mt| {
-                        Self::freeze_memtable_locked(mt).map(|b| (mt.clone(), b))
-                    })
+                    .filter_map(|mt| Self::freeze_memtable_locked(mt).map(|b| (mt.clone(), b)))
                     .collect::<Vec<_>>())
             },
         )

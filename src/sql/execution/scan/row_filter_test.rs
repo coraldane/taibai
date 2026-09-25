@@ -34,7 +34,7 @@ fn cluster_key_range_read_returns_only_matching_sorted_range() {
     }
 
     {
-        let mut writer = SegmentWriter::create(&path, schema, 8192).unwrap();
+        let mut writer = SegmentWriter::create(&path, schema, 8192, 3).unwrap();
         writer.write_batch(&batch).unwrap();
         writer.seal().unwrap();
     }
@@ -123,7 +123,7 @@ fn cluster_key_range_read_falls_back_when_key_column_is_unsorted() {
     }
 
     {
-        let mut writer = SegmentWriter::create(&path, schema, 8192).unwrap();
+        let mut writer = SegmentWriter::create(&path, schema, 8192, 3).unwrap();
         writer.write_batch(&batch).unwrap();
         writer.seal().unwrap();
     }
@@ -195,7 +195,7 @@ fn cluster_key_range_read_binary_searches_composite_key() {
     }
 
     {
-        let mut writer = SegmentWriter::create(&path, schema, 8192).unwrap();
+        let mut writer = SegmentWriter::create(&path, schema, 8192, 3).unwrap();
         writer.write_batch(&batch).unwrap();
         writer.seal().unwrap();
     }

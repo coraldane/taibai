@@ -42,7 +42,10 @@ buffer:
 
 compression:
   enabled: true
-  # bulk segment 写入的 zstd 压缩级别（1..=22，启动时截断）
+  # bulk segment 写入的 zstd 压缩级别（1..=22，启动时截断）。
+  # 这是所有表的默认级别；建表时可用 COMPRESSION_LEVEL = n 按表覆盖
+  # （如归档表 COMPRESSION_LEVEL = 19，热表 COMPRESSION_LEVEL = 1），
+  # 也可用 ALTER TABLE ... SET COMPRESSION_LEVEL = n | DEFAULT 修改。
   bulk_zstd_level: 3
 
 # 变更订阅（pubsub）：客户端通过 SUBSCRIBE 协议消息订阅表的插入变更，

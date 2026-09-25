@@ -5,6 +5,7 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use super::count;
 use super::memtable;
@@ -86,6 +87,12 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_unlocked(&mut self) -> Result<Vec<RecordBatch>> {
+        if let Some(column) = self.spec.distinct_column.clone() {
+            if let Some(batch) = self.execute_distinct_metadata(&column)? {
+                self.metadata_answered = true;
+                return Ok(vec![batch]);
+            }
+        }
         if let Some(aggs) = self.spec.simple_metadata_aggregates.clone() {
             return self.execute_simple_metadata_aggregate(&aggs);
         }
@@ -244,6 +251,28 @@ impl<'a> ScanExecutor<'a> {
     /// Metadata-driven fast path for simple aggregate queries (no GROUP BY,
     /// select list is only COUNT/MIN/MAX). Answers from row-group zone maps /
     /// footers without streaming the data.
+    /// Single-column DISTINCT answered from row-group zone maps. Returns
+    /// `None` when the fast path declines (caller falls back to the normal
+    /// scan + DistinctExec pipeline).
+    fn execute_distinct_metadata(&mut self, column: &str) -> Result<Option<RecordBatch>> {
+        let table_dir = self
+            .runtime
+            .data_dir()
+            .join(self.db)
+            .join(&self.spec.table_name);
+        super::aggregate_meta::compute_distinct_column(
+            &self.spec,
+            &self.table_meta,
+            &self.table_schema,
+            &table_dir,
+            self.runtime.segment_mgr(),
+            self.runtime.memtable_manager(),
+            self.runtime.hot_store_manager(),
+            self.db,
+            column,
+        )
+    }
+
     fn execute_simple_metadata_aggregate(
         &mut self,
         aggs: &[crate::sql::planner::AggregateExpr],
@@ -405,12 +434,14 @@ impl<'a> ScanExecutor<'a> {
                 && crate::common::config::query_limits().max_parallel_segments > 1;
             if use_segment_parallel {
                 for batch in self.scan_segments_parallel(&filtered_segments, &mgr, &plan)? {
+                    crate::common::query_cancel::check()?;
                     if !output.push(batch) {
                         return Ok(());
                     }
                 }
             } else {
                 for seg_path in &filtered_segments {
+                    crate::common::query_cancel::check()?;
                     let meta = mgr.segment_meta(seg_path).ok().flatten();
                     let meta_candidate_indices = meta.as_ref().map(|meta| {
                         let pred = self.spec.to_row_group_predicate();
@@ -485,6 +516,7 @@ impl<'a> ScanExecutor<'a> {
 
                     if scan_limit.is_some() || ordered_limit.is_some() {
                         for rg_idx in &candidate_indices {
+                            crate::common::query_cancel::check()?;
                             self.record_row_group_read(&reader, *rg_idx, &plan);
                             let mut batch = match super::strategy::read_row_group_with_strategy(
                                 &self.spec,
@@ -518,7 +550,17 @@ impl<'a> ScanExecutor<'a> {
                     let limits = crate::common::config::query_limits();
                     let max_parallel = limits.max_parallel_row_groups.max(1);
                     let min_parallel = limits.parallel_scan_min_row_groups.max(2);
+                    // Rayon lanes do not inherit the ambient cancellation
+                    // context, so capture the flag here and let the closure
+                    // stop starting new row-group reads once it is set.
+                    let cancel_flag = crate::common::query_cancel::current_flag();
                     let read_one = |pos: usize, rg_idx: &usize| {
+                        if cancel_flag
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire))
+                        {
+                            return None;
+                        }
                         let _cpu = crate::common::work_limiter::acquire_cpu();
                         let _io = crate::common::work_limiter::acquire_io();
                         super::strategy::read_row_group_with_strategy(
@@ -544,6 +586,7 @@ impl<'a> ScanExecutor<'a> {
                         let mut batches = Vec::new();
                         for (chunk_idx, chunk) in candidate_indices.chunks(max_parallel).enumerate()
                         {
+                            crate::common::query_cancel::check()?;
                             let base = chunk_idx * max_parallel;
                             let mut chunk_batches: Vec<(usize, RecordBatch)> = chunk
                                 .par_iter()
@@ -592,6 +635,7 @@ impl<'a> ScanExecutor<'a> {
             &self.spec.table_name,
             &memtable_spec,
         ) {
+            crate::common::query_cancel::check()?;
             let batch = super::strategy::apply_ttl_filter_and_projection(
                 batch,
                 &self.table_meta,
@@ -640,13 +684,23 @@ impl<'a> ScanExecutor<'a> {
         let max_parallel = crate::common::config::query_limits()
             .max_parallel_segments
             .max(1);
+        // Rayon lanes do not inherit the ambient cancellation context, so
+        // capture the flag and let lane closures stop starting new reads.
+        let cancel_flag = crate::common::query_cancel::current_flag();
         let mut output = Vec::new();
         for (chunk_index, chunk) in paths.chunks(max_parallel).enumerate() {
+            crate::common::query_cancel::check()?;
             let base = chunk_index * max_parallel;
             let mut scanned = chunk
                 .par_iter()
                 .enumerate()
                 .filter_map(|(position, path)| {
+                    if cancel_flag
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Acquire))
+                    {
+                        return None;
+                    }
                     let reader = {
                         let _io = crate::common::work_limiter::acquire_io();
                         manager.open_reader_cached(path).ok()?
@@ -677,6 +731,12 @@ impl<'a> ScanExecutor<'a> {
                     let batches: Vec<_> = candidates
                         .into_par_iter()
                         .filter_map(|row_group| {
+                            if cancel_flag
+                                .as_ref()
+                                .is_some_and(|flag| flag.load(Ordering::Acquire))
+                            {
+                                return None;
+                            }
                             let batch_result = {
                                 let _cpu = crate::common::work_limiter::acquire_cpu();
                                 let _io = crate::common::work_limiter::acquire_io();

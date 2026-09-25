@@ -101,6 +101,7 @@ pub enum Token {
     // New keywords for extended SQL commands
     Union,
     Flush,
+    Kill,
     Optimize,
     Rebuild,
     Pause,
@@ -236,6 +237,7 @@ impl std::fmt::Display for Token {
             Token::CurrentTimestamp => write!(f, "CURRENT_TIMESTAMP"),
             Token::Union => write!(f, "UNION"),
             Token::Flush => write!(f, "FLUSH"),
+            Token::Kill => write!(f, "KILL"),
             Token::Optimize => write!(f, "OPTIMIZE"),
             Token::Rebuild => write!(f, "REBUILD"),
             Token::Pause => write!(f, "PAUSE"),
@@ -620,6 +622,7 @@ impl<'a> Lexer<'a> {
             "CURRENT_TIMESTAMP" => Token::CurrentTimestamp,
             "UNION" => Token::Union,
             "FLUSH" => Token::Flush,
+            "KILL" => Token::Kill,
             "OPTIMIZE" => Token::Optimize,
             "REBUILD" => Token::Rebuild,
             "PAUSE" => Token::Pause,

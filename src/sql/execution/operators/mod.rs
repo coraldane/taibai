@@ -61,6 +61,7 @@ impl ExecutionOp for DistinctExec {
             return Ok(None);
         }
         while let Some(batch) = self.input.next_batch()? {
+            crate::common::query_cancel::check()?;
             if batch.num_rows() == 0 {
                 continue;
             }

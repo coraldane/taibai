@@ -61,6 +61,7 @@ impl PartitionProbeState {
         let mut table = JoinHashTable::new(key_columns.to_vec());
         let mut bytes = 0usize;
         while self.next_build_row_group < self.build_reader.num_row_groups() {
+            crate::common::query_cancel::check()?;
             let batch = self
                 .build_reader
                 .read_row_group(self.next_build_row_group)?;
@@ -280,6 +281,7 @@ fn partition_input(
         )?;
     }
     while let Some(batch) = input.next_batch()? {
+        crate::common::query_cancel::check()?;
         write_partitioned_batch(
             &batch,
             schema,

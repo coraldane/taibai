@@ -14,8 +14,7 @@ use crate::storage::segment::meta::{
 use crate::storage::segment::writer::VALUE_SET_MAX_DISTINCT;
 use crate::storage::segment::{encode_segment_footer, RowGroupMeta};
 use crate::storage::segment_manager::config::{
-    bulk_compression_level, FLUSH_META_AFTER_ROW_GROUP, SIDECAR_COMPACT_MIN_BYTES,
-    SIDECAR_COMPACT_MIN_RECORDS,
+    FLUSH_META_AFTER_ROW_GROUP, SIDECAR_COMPACT_MIN_BYTES, SIDECAR_COMPACT_MIN_RECORDS,
 };
 use crate::storage::segment_manager::helpers::{
     compute_value_sets_from_bulk_columns, compute_zone_map_from_column,
@@ -47,6 +46,9 @@ pub(super) struct ActiveSegmentWriter {
     /// Row groups persisted to the data file but not yet visible (their
     /// footer has not been written). Published when the footer lands.
     pub(super) pending_publish: Vec<RecordBatch>,
+    /// zstd level for row groups written by this writer: the table's
+    /// `COMPRESSION_LEVEL` override, or the global configured level.
+    pub(super) compression_level: i32,
 }
 
 impl ActiveSegmentWriter {
@@ -248,7 +250,7 @@ impl ActiveSegmentWriter {
         let total_buffered = self.buffered_rows;
         self.buffered_rows = 0;
 
-        let compression_level = bulk_compression_level();
+        let compression_level = self.compression_level;
         let num_cols = buffered.num_columns();
 
         let rows_to_flush = self.row_group_target_rows.min(total_buffered);
@@ -551,8 +553,10 @@ fn compute_value_set_from_column(
                     return None;
                 }
             }
-            let mut scalars: Vec<ScalarValue> =
-                keys.into_iter().map(|value| ScalarValue::$scalar(Some(value))).collect();
+            let mut scalars: Vec<ScalarValue> = keys
+                .into_iter()
+                .map(|value| ScalarValue::$scalar(Some(value)))
+                .collect();
             scalars.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
             return Some(scalars);
         }};
@@ -570,8 +574,10 @@ fn compute_value_set_from_column(
                     return None;
                 }
             }
-            let mut scalars: Vec<ScalarValue> =
-                keys.into_iter().map(|value| ScalarValue::Bool(Some(value))).collect();
+            let mut scalars: Vec<ScalarValue> = keys
+                .into_iter()
+                .map(|value| ScalarValue::Bool(Some(value)))
+                .collect();
             scalars.sort_by(crate::storage::index::sort_key::compare_scalars_for_sort);
             Some(scalars)
         }

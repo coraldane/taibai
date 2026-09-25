@@ -4,7 +4,7 @@
 
 1. [五分钟快速开始](getting-started/quick-start.md)：构建、启动、连接并执行第一组 SQL。
 2. [工程主要功能总结](overview/project-summary.md)：了解项目目标、架构和主要能力。
-3. [项目状态与限制](user-guide/limitations.md)：了解实验性状态、兼容性与生产边界。
+3. [兼容性与部署指引](user-guide/limitations.md)：了解兼容性、安全边界和生产部署检查。
 4. [参与贡献](../CONTRIBUTING.md)：搭建开发环境并提交改动。
 
 ## 使用与运维

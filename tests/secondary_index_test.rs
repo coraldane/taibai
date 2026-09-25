@@ -83,7 +83,7 @@ fn seed_two_row_group_segment(engine: &Engine, db: &str, table: &str) {
     let segment_path = engine.data_dir().join(db).join(table).join("seg_00001.dat");
     engine
         .segment_mgr()
-        .write_new_segment(&segment_path, schema, 8192, &batch)
+        .write_new_segment(&segment_path, schema, 8192, &batch, 3)
         .expect("write segment");
 }
 

@@ -48,6 +48,9 @@ pub enum AlterOperation {
     SetHot { hot: HotDef },
     SetTtl { ttl: TtlDef },
     DropTtl,
+    /// `SET COMPRESSION_LEVEL = n`; `None` means `DEFAULT`, resetting the
+    /// table to follow the global compression level again.
+    SetCompressionLevel { level: Option<i32> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +104,9 @@ pub enum Statement {
         ttl: Option<TtlDef>,
         hot: Option<HotDef>,
         durability: Option<DurabilityLevel>,
+        /// Per-table zstd compression level (1..=22); `None` follows the
+        /// global `compression.bulk_zstd_level` config.
+        compression_level: Option<i32>,
     },
     DropTable {
         name: ObjectName,
@@ -253,6 +259,9 @@ pub enum Statement {
     PauseFlush,
     ResumeFlush,
     ResetPerformanceBaselines,
+    KillQuery {
+        query_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

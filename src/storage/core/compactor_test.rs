@@ -56,7 +56,7 @@ fn make_batch(schema: &Schema, rows: &[(i64, &str)]) -> Result<RecordBatch> {
 
 fn write_segment(path: &Path, schema: &Schema, rows: &[(i64, &str)]) -> Result<()> {
     let batch = make_batch(schema, rows)?;
-    let mut writer = SegmentWriter::create(path, schema.clone(), TEST_ROW_GROUP_SIZE)?;
+    let mut writer = SegmentWriter::create(path, schema.clone(), TEST_ROW_GROUP_SIZE, 3)?;
     writer.write_batch(&batch)?;
     writer.seal()
 }
@@ -68,7 +68,7 @@ fn write_segment_with_row_group_size(
     row_group_size: usize,
 ) -> Result<()> {
     let batch = make_batch(schema, rows)?;
-    let mut writer = SegmentWriter::create(path, schema.clone(), row_group_size)?;
+    let mut writer = SegmentWriter::create(path, schema.clone(), row_group_size, 3)?;
     writer.write_batch(&batch)?;
     writer.seal()
 }

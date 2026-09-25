@@ -282,10 +282,15 @@ pub(super) fn append_prepared_unique_index_delta(
     entries: &[PreparedUniqueIndexEntry],
 ) -> Result<()> {
     let is_new = !path.exists() || std::fs::metadata(path)?.len() == 0;
-    let mut file = std::fs::OpenOptions::new()
+    let raw = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+    // Batch the per-record writes through a BufWriter: a large bulk payload
+    // appends hundreds of thousands of records, and issuing each record's
+    // length prefix and body as unbuffered syscalls dominated direct-bulk
+    // insert latency on tables with a primary key.
+    let mut file = std::io::BufWriter::with_capacity(1 << 20, raw);
     if is_new {
         file.write_all(UNIQUE_INDEX_DELTA_MAGIC_V2)?;
     }
@@ -303,6 +308,9 @@ pub(super) fn append_prepared_unique_index_delta(
         write_u32(&mut file, record.len() as u32)?;
         file.write_all(&record)?;
     }
+    let mut file = file
+        .into_inner()
+        .map_err(|e| TaibaiError::Storage(format!("unique index delta flush failed: {}", e)))?;
     file.sync_all()?;
     Ok(())
 }

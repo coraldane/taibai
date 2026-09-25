@@ -131,7 +131,7 @@ fn update_preserves_unmatched_row_groups_in_rewritten_segment() {
     let seg_path = table_dir.join("seg_00001.dat");
     engine
         .segment_mgr()
-        .write_new_segment(&seg_path, schema, 2, &batch)
+        .write_new_segment(&seg_path, schema, 2, &batch, 3)
         .expect("write multi-row-group segment");
 
     let updated = engine

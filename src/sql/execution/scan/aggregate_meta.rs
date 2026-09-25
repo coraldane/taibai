@@ -692,3 +692,129 @@ fn sum_aggregates_supported(aggregates: &[AggregateExpr], table_schema: &Schema)
     }
     true
 }
+
+/// Answer a single-column `SELECT DISTINCT` from row-group zone maps.
+///
+/// Row groups whose zone map carries one non-null value (`min == max`) and
+/// whose segment has no deleted rows contribute that value without reading
+/// column data — for append-clustered columns (e.g. `deal_date`) this covers
+/// nearly every row group, so the query cost collapses from a full column
+/// scan to a metadata walk. Multi-valued row groups and segments carrying
+/// deletes stream their column and fold per value, exactly like the simple
+/// aggregate path folds MIN/MAX. Live memtable / hot-store rows are folded
+/// via `scan_memtables`. Duplicates are harmless (DISTINCT is idempotent),
+/// so overlapping sources cannot corrupt the result — only missing sources
+/// could, and those match what the regular scan pipeline reads.
+///
+/// Returns `None` when the fast path declines (schema mismatch, unexpected
+/// zone maps), and the caller falls back to the regular scan pipeline.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_distinct_column(
+    spec: &ScanSpec,
+    table_meta: &TableMeta,
+    table_schema: &Schema,
+    table_dir: &Path,
+    segment_mgr: &SegmentManager,
+    memtable_mgr: &crate::storage::core::memtable::MemTableManager,
+    hot_mgr: &crate::storage::core::hot_store::HotStoreManager,
+    db: &str,
+    column_name: &str,
+) -> Result<Option<RecordBatch>> {
+    // Zone-map shortcuts are only exact without predicates; the planner only
+    // sets `distinct_column` for predicate-free scans, but stay defensive.
+    if spec.has_predicates() {
+        return Ok(None);
+    }
+    let Some(col_def_idx) = table_schema
+        .columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(column_name))
+    else {
+        return Ok(None);
+    };
+    let col_type = table_schema.columns[col_def_idx].data_type.clone();
+    let null_value = ScalarValue::null_for_type(col_type);
+
+    let mut seen: std::collections::HashSet<ScalarValue> = std::collections::HashSet::new();
+    let mut ordered: Vec<ScalarValue> = Vec::new();
+    fn insert(
+        seen: &mut std::collections::HashSet<ScalarValue>,
+        ordered: &mut Vec<ScalarValue>,
+        value: ScalarValue,
+    ) {
+        if seen.insert(value.clone()) {
+            ordered.push(value);
+        }
+    }
+
+    let segment_files = if table_dir.as_os_str().is_empty() || !table_dir.exists() {
+        Vec::new()
+    } else {
+        partition::prune_segments_by_partition(
+            SegmentManager::discover_segments(table_dir)?,
+            spec,
+            Some(table_meta),
+        )
+    };
+
+    for segment_path in &segment_files {
+        let reader = segment_mgr.open_reader_cached(segment_path)?;
+        let Some(col_idx) = reader.schema().index_of(column_name) else {
+            return Ok(None);
+        };
+        let segment_has_deletes = reader.deleted_row_count() > 0;
+        let bitmap = reader.delete_bitmap();
+        let bitmap_is_empty = bitmap.is_empty();
+
+        for rg_idx in 0..reader.num_row_groups() {
+            let Some(zone_map) = reader.zone_maps(rg_idx).get(col_idx) else {
+                return Ok(None);
+            };
+            let single_valued = !zone_map.min_value.is_null()
+                && !zone_map.max_value.is_null()
+                && zone_map.min_value == zone_map.max_value;
+            if single_valued && !segment_has_deletes {
+                insert(&mut seen, &mut ordered, zone_map.min_value.clone());
+                if zone_map.null_count > 0 {
+                    insert(&mut seen, &mut ordered, null_value.clone());
+                }
+                continue;
+            }
+            let mut batch = reader.read_row_group_with_projection(rg_idx, &[col_idx])?;
+            if !bitmap_is_empty {
+                let row_start = reader.row_group_start_row(rg_idx);
+                batch = delete_bitmap::filter_batch(&batch, row_start, bitmap)?;
+            }
+            let Some(column) = batch.column(0) else {
+                return Ok(None);
+            };
+            for row in 0..batch.num_rows() {
+                insert(&mut seen, &mut ordered, column.scalar(row));
+            }
+        }
+    }
+
+    let memtable_batches =
+        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, spec);
+    for batch in &memtable_batches {
+        let Some(idx) = batch.schema.index_of(column_name) else {
+            return Ok(None);
+        };
+        let Some(column) = batch.column(idx) else {
+            return Ok(None);
+        };
+        for row in 0..batch.num_rows() {
+            insert(&mut seen, &mut ordered, column.scalar(row));
+        }
+    }
+
+    let schema = Schema::new(vec![table_schema.columns[col_def_idx].clone()]);
+    let mut batch = RecordBatch::new(schema);
+    for value in &ordered {
+        batch
+            .column_mut(0)
+            .ok_or_else(|| crate::common::error::TaibaiError::Internal("distinct col".into()))?
+            .push(value)?;
+    }
+    Ok(Some(batch))
+}

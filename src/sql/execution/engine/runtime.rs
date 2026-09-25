@@ -28,6 +28,12 @@ impl Engine {
         &self.performance_baselines
     }
 
+    /// Running-query registry backing `SHOW PROCESSLIST` and `KILL QUERY`.
+    /// The request handler registers every heavy request here.
+    pub fn query_registry(&self) -> Arc<crate::sql::execution::query_registry::QueryRegistry> {
+        Arc::clone(&self.query_registry)
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

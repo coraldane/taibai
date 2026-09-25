@@ -311,6 +311,10 @@ pub fn exec_show_create_table(engine: &Engine, db: &str, table: &str) -> Result<
         create_sql.push_str(" DURABILITY = RELAXED");
     }
 
+    if let Some(level) = table_meta.compression_level {
+        create_sql.push_str(&format!(" COMPRESSION_LEVEL = {}", level));
+    }
+
     for secondary_index in &table_meta.secondary_indexes {
         let cols = secondary_index.columns.join(", ");
         create_sql.push_str(&format!(
@@ -553,7 +557,8 @@ pub fn exec_show_engines(_engine: &Engine) -> Result<ExecResult> {
     })
 }
 
-pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult> {
+pub fn exec_show_processlist(engine: &Engine, full: bool) -> Result<ExecResult> {
+    let entries = engine.query_registry().list();
     let schema = Schema::new(vec![
         ColumnDef::new("Id", DataType::Int64),
         ColumnDef::new("User", DataType::VarChar),
@@ -563,11 +568,73 @@ pub fn exec_show_processlist(_engine: &Engine, _full: bool) -> Result<ExecResult
         ColumnDef::new("State", DataType::VarChar),
         ColumnDef::new("Info", DataType::VarChar),
     ]);
-    let batch = RecordBatch::new(schema.clone());
+    let mut batch = RecordBatch::new(schema.clone());
+    for entry in entries {
+        batch
+            .column_mut(0)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(entry.query_id as i64)))?;
+        batch
+            .column_mut(1)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(entry.username.clone())))?;
+        batch
+            .column_mut(2)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(entry.database.clone())))?;
+        batch
+            .column_mut(3)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some("Query".to_string())))?;
+        batch
+            .column_mut(4)
+            .unwrap()
+            .push(&ScalarValue::Int64(Some(entry.elapsed_secs as i64)))?;
+        let state = if entry.cancelled {
+            "Killed".to_string()
+        } else {
+            match entry.phase {
+                crate::common::query_cancel::QueryPhase::Planning => "Planning".to_string(),
+                crate::common::query_cancel::QueryPhase::Executing => "Executing".to_string(),
+                crate::common::query_cancel::QueryPhase::Committing => "Committing".to_string(),
+            }
+        };
+        batch.column_mut(5).unwrap().push(&ScalarValue::VarChar(Some(state)))?;
+        batch
+            .column_mut(6)
+            .unwrap()
+            .push(&ScalarValue::VarChar(Some(processlist_info(&entry.sql, full))))?;
+    }
     Ok(ExecResult::Query {
         schema,
         batches: vec![batch],
     })
+}
+
+/// The `Info` column: the retained statement snippet in full, or truncated
+/// to 100 characters like MySQL's default processlist.
+fn processlist_info(sql: &str, full: bool) -> String {
+    if full || sql.len() <= 100 {
+        return sql.to_string();
+    }
+    let mut truncated: String = sql.chars().take(100).collect();
+    truncated.push_str("...");
+    truncated
+}
+
+pub fn exec_kill_query(engine: &Engine, killer: &str, query_id: u64) -> Result<ExecResult> {
+    let killed = engine.query_registry().kill(
+        query_id,
+        format!("query {} was killed by user '{}'", query_id, killer),
+    );
+    if !killed {
+        return Err(TaibaiError::Sql(format!(
+            "query {} is not running",
+            query_id
+        )));
+    }
+    tracing::info!(query_id, killer, "KILL QUERY dispatched");
+    Ok(ExecResult::Ok { rows_affected: 0 })
 }
 
 pub fn exec_flush_table(engine: &Engine, db: &str, table: &Option<String>) -> Result<ExecResult> {

@@ -157,6 +157,7 @@ impl HashJoinExec {
                 let right_key_cols = self.right_key_cols.to_vec();
                 let mut ht = JoinHashTable::new(right_key_cols);
                 while let Some(batch) = self.right.next_batch()? {
+                    crate::common::query_cancel::check()?;
                     ht.insert_batch(batch);
                 }
                 ht.finalize();
@@ -169,6 +170,7 @@ impl HashJoinExec {
                 let plan = self.asof_join_plan()?;
                 let mut batches = Vec::new();
                 while let Some(batch) = self.right.next_batch()? {
+                    crate::common::query_cancel::check()?;
                     batches.push(batch);
                 }
                 let mut asof_idx = AsofJoinIndex::new();
@@ -183,6 +185,7 @@ impl HashJoinExec {
                 }
                 let mut ht = JoinHashTable::new(self.left_key_cols.clone());
                 while let Some(batch) = self.left.next_batch()? {
+                    crate::common::query_cancel::check()?;
                     ht.insert_batch(batch);
                 }
                 ht.finalize();
@@ -206,6 +209,7 @@ impl HashJoinExec {
         let mut memory = MemoryManager::reservation();
 
         loop {
+            crate::common::query_cancel::check()?;
             let batch = if self.build_left {
                 self.left.next_batch()?
             } else {

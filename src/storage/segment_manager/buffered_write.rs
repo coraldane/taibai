@@ -375,6 +375,7 @@ impl SegmentManager {
             row_group_target_rows: self.config.row_group_target_rows.max(1),
             pubsub: self.pubsub(),
             pending_publish: Vec::new(),
+            compression_level: self.table_compression_level_for_path(table_dir)?,
         })
     }
 
@@ -411,6 +412,7 @@ impl SegmentManager {
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
             row_group_target_rows: self.config.row_group_target_rows.max(1),
+            compression_level: self.table_compression_level_for_path(path)?,
         };
         writer.append_batch(batch, &|segment_path| self.invalidate_reader(segment_path))?;
         writer.seal(&|segment_path| self.invalidate_reader(segment_path))?;
@@ -554,6 +556,7 @@ impl SegmentManager {
             row_group_target_rows: self.config.row_group_target_rows.max(1),
             pubsub: self.pubsub(),
             pending_publish: Vec::new(),
+            compression_level: self.table_compression_level_for_path(seg_path)?,
         }))
     }
 }

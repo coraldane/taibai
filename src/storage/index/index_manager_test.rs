@@ -614,7 +614,7 @@ fn write_value_segment(path: &Path, values: &[i64]) -> Result<()> {
             .unwrap()
             .push(&ScalarValue::Int64(Some(*value)))?;
     }
-    let mut writer = SegmentWriter::create(path, schema, 8192)?;
+    let mut writer = SegmentWriter::create(path, schema, 8192, 3)?;
     writer.write_batch(&batch)?;
     writer.seal()?;
     Ok(())

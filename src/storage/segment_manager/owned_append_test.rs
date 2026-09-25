@@ -40,6 +40,7 @@ fn first_owned_batch_keeps_variable_buffer_allocation() {
         row_group_target_rows: 1024,
         pubsub: None,
         pending_publish: Vec::new(),
+        compression_level: 3,
     };
 
     writer.append_batch_owned(batch, &|_| {}).unwrap();

@@ -36,6 +36,7 @@ pub fn exec_update(
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
+    mgr.set_table_compression_level(db, table, table_meta.compression_level);
     if table_meta.is_partitioned()
         && assignments.iter().any(|assignment| {
             assignment
@@ -59,6 +60,10 @@ pub fn exec_update(
     engine
         .batch_writer()
         .checkpoint_before_rewrite(db, table, 1)?;
+
+    // From here the statement rewrites memtables and segment tails; the work
+    // is no longer safely abortable, so cancellation checks stop firing.
+    crate::common::query_cancel::enter_committing_phase();
 
     let update_body = || -> Result<u64> {
         let mut updated_count = 0u64;
@@ -267,6 +272,7 @@ pub fn exec_update(
                 schema,
                 mgr.row_group_target_rows(),
                 &batches,
+                mgr.table_compression_level(db, table),
             );
             if let Err(error) = write_result {
                 let _ = std::fs::remove_file(&tmp_path);

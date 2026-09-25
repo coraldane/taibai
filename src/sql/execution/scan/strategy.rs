@@ -410,7 +410,13 @@ pub fn read_plain_row_group(
     rg_idx: usize,
 ) -> Result<RecordBatch> {
     if spec.has_predicates() && !projection_cols.is_empty() {
-        return read_predicated_plain_row_group(spec, projection_cols, table_schema, reader, rg_idx);
+        return read_predicated_plain_row_group(
+            spec,
+            projection_cols,
+            table_schema,
+            reader,
+            rg_idx,
+        );
     }
 
     // Dictionary passthrough: when nothing downstream needs per-row strings,
@@ -478,12 +484,8 @@ fn read_predicated_plain_row_group(
     union_cols.sort_unstable();
 
     if union_cols.len() == projection_cols.len() {
-        let mut batch = read_row_group_with_schema_mapping(
-            projection_cols,
-            table_schema,
-            reader,
-            rg_idx,
-        )?;
+        let mut batch =
+            read_row_group_with_schema_mapping(projection_cols, table_schema, reader, rg_idx)?;
         batch = apply_delete_bitmap(reader, rg_idx, batch)?;
         if batch.num_rows() == 0 {
             return Ok(batch);
@@ -498,8 +500,7 @@ fn read_predicated_plain_row_group(
         );
     }
 
-    let mut batch =
-        read_row_group_with_schema_mapping(&union_cols, table_schema, reader, rg_idx)?;
+    let mut batch = read_row_group_with_schema_mapping(&union_cols, table_schema, reader, rg_idx)?;
     batch = apply_delete_bitmap(reader, rg_idx, batch)?;
     if batch.num_rows() == 0 {
         return Ok(batch);

@@ -105,6 +105,9 @@ impl Compactor {
             let idx = table_meta.get_ttl_column_index_cached()?;
             Some((idx, info.duration_secs))
         });
+        let compression_level = crate::storage::segment_manager::resolve_compression_level(
+            table_meta.compression_level,
+        );
         let sort_key_indices = if sort_by_cluster_key {
             cluster_key_indices.as_slice()
         } else {
@@ -198,6 +201,7 @@ impl Compactor {
                             &cluster_key_indices,
                             output_row_group_rows,
                             ttl,
+                            compression_level,
                         )
                     })
             })
@@ -265,6 +269,9 @@ impl Compactor {
             let idx = table_meta.get_ttl_column_index_cached()?;
             Some((idx, info.duration_secs))
         });
+        let compression_level = crate::storage::segment_manager::resolve_compression_level(
+            table_meta.compression_level,
+        );
         let output_row_group_rows = self.segment_mgr.row_group_target_rows();
         let matched = self.segment_mgr.with_table_mutation_lock(db, table, || {
             for candidate in &candidates {
@@ -340,6 +347,7 @@ impl Compactor {
                         &cluster_key_indices,
                         output_row_group_rows,
                         ttl,
+                        compression_level,
                     )
                 })?;
 
@@ -372,6 +380,7 @@ impl Compactor {
         bloom_column_indices: &[usize],
         output_row_group_rows: usize,
         ttl: Option<(usize, i64)>,
+        compression_level: i32,
     ) -> Result<CompactStats> {
         // The clustered path follows the original Go implementation's
         // index-only sort design: concatenate each decoded column into one
@@ -615,6 +624,7 @@ impl Compactor {
             &row_refs,
             &sorted_indices,
             output_row_group_rows,
+            compression_level,
         );
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
@@ -669,12 +679,14 @@ impl Compactor {
         row_refs: &[RowRef],
         sorted_indices: &[u32],
         output_row_group_rows: usize,
+        compression_level: i32,
     ) -> Result<()> {
         let mut writer = SegmentWriter::create_with_bloom_columns(
             path,
             schema.clone(),
             output_row_group_rows,
             bloom_column_indices,
+            compression_level,
         )?;
         let write_gather_chunk_rows = output_row_group_rows.max(1);
         let write_progress_rows = write_gather_chunk_rows.saturating_mul(16).max(1);
@@ -695,7 +707,7 @@ impl Compactor {
             fallback_cache_capacity = row_group_cache.capacity(),
             chunk_rows = write_gather_chunk_rows,
             output_row_group_rows,
-            compression_level = crate::storage::segment_manager::bulk_compression_level(),
+            compression_level,
             "compact write using index-only gather"
         );
 

@@ -163,6 +163,8 @@ impl IndexManager {
         if let Some(state) = self.unique_indexes.read().unwrap().get(&cache_key).cloned() {
             return Ok(Some(state));
         }
+        let t_load = std::time::Instant::now();
+        log_index_profile("load_state_cache_miss", 0, std::time::Duration::ZERO);
         let base = sanitize_file_component(index_name);
         let dir = self.unique_index_dir(db, table);
         if dir.join(format!("{}.invalid", base)).exists() {
@@ -199,6 +201,7 @@ impl IndexManager {
             .entry(cache_key)
             .or_insert_with(|| Arc::clone(&state))
             .clone();
+        log_index_profile("load_state_full_decode", 0, t_load.elapsed());
         Ok(Some(current))
     }
 
@@ -280,6 +283,7 @@ impl IndexManager {
         table: &str,
         keys: &[Vec<ScalarValue>],
     ) -> Result<bool> {
+        let t0 = std::time::Instant::now();
         let cache_key = format!("{}\0{}", db, table);
         let mut indexes = self.primary_key_indexes.write().unwrap();
         let Some(current) = indexes.get_mut(&cache_key) else {
@@ -288,6 +292,7 @@ impl IndexManager {
         for key in keys {
             current.insert(encode_unique_key(key)?);
         }
+        log_index_profile("append_pk_insert", keys.len(), t0.elapsed());
         Ok(true)
     }
 
@@ -383,14 +388,25 @@ impl IndexManager {
                 })
                 .cloned());
         }
+        let prof_start = std::time::Instant::now();
         let progress_watermarks = state.progress_watermarks();
         let mut additions = Vec::new();
         let mut watermarks = HashMap::new();
+        let mut prof_scanned_rows: u64 = 0;
         let table_dir = self.data_dir.join(db).join(table);
         if table_dir.exists() {
             for seg_path in SegmentManager::discover_segments(&table_dir)? {
+                let reader_t = std::time::Instant::now();
                 let reader = self.segment_mgr.open_reader_cached(&seg_path)?;
                 let current_rows = reader.row_count();
+                let reader_open_us = reader_t.elapsed().as_micros() as u64;
+                if reader_open_us > 1000 {
+                    log_index_profile(
+                        "stale_reader_open",
+                        current_rows as usize,
+                        std::time::Duration::from_micros(reader_open_us),
+                    );
+                }
                 let segment_path = seg_path.to_string_lossy().to_string();
                 let watermark = progress_watermarks.get(&segment_path).copied().unwrap_or(0);
                 watermarks.insert(segment_path, current_rows);
@@ -418,7 +434,17 @@ impl IndexManager {
                     if rg_start + rg_rows <= watermark {
                         continue;
                     }
+                    let rg_t = std::time::Instant::now();
                     let batch = reader.read_row_group_with_projection(rg_idx, &indices)?;
+                    prof_scanned_rows += batch.num_rows() as u64;
+                    let rg_us = rg_t.elapsed().as_micros() as u64;
+                    if rg_us > 5000 {
+                        log_index_profile(
+                            "stale_rg_read",
+                            batch.num_rows(),
+                            std::time::Duration::from_micros(rg_us),
+                        );
+                    }
                     let delete_bitmap = reader.delete_bitmap();
                     for row_idx in 0..batch.num_rows() {
                         let row_id = rg_start + row_idx as u64;
@@ -439,11 +465,24 @@ impl IndexManager {
                 }
             }
         }
+        log_index_profile(
+            "stale_scan_total",
+            prof_scanned_rows as usize,
+            prof_start.elapsed(),
+        );
+        let prep_t = std::time::Instant::now();
         let prepared_additions = self.prepare_unique_index_entries(additions)?;
+        log_index_profile("stale_prepare", prepared_additions.len(), prep_t.elapsed());
         let delta_path = self
             .unique_index_dir(db, table)
             .join(format!("{}.delta.tbi", sanitize_file_component(index_name)));
+        let delta_t = std::time::Instant::now();
         append_prepared_unique_index_delta(&delta_path, &prepared_additions)?;
+        log_index_profile(
+            "stale_delta_append",
+            prepared_additions.len(),
+            delta_t.elapsed(),
+        );
         let delta_count = {
             let mut delta = state.delta.write().unwrap();
             for addition in prepared_additions {
@@ -461,7 +500,18 @@ impl IndexManager {
         let needs_compaction =
             unique_index_delta_needs_compaction(delta_count, state.base.entry_count);
         state.set_progress(Some(epoch_before), watermarks);
+        let prog_t = std::time::Instant::now();
         self.persist_unique_index_progress(db, table, index_name)?;
+        log_index_profile(
+            "stale_progress_persist",
+            delta_count as usize,
+            prog_t.elapsed(),
+        );
+        log_index_profile(
+            "stale_needs_compaction",
+            if needs_compaction { 1 } else { 0 },
+            std::time::Duration::ZERO,
+        );
         drop(_mutation_guard);
         if needs_compaction {
             self.try_dispatch_unique_index_compaction(db, table, index_name, state);
@@ -499,13 +549,18 @@ impl IndexManager {
         table: &str,
         index_name: &str,
     ) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let Some(state) = self.load_unique_index_state(db, table, index_name)? else {
+            log_index_profile("refresh_no_state", 0, t0.elapsed());
             return Ok(());
         };
         if state.progress_epoch() == Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
+            log_index_profile("refresh_current", 0, t0.elapsed());
             return Ok(());
         }
+        let t1 = std::time::Instant::now();
         self.refresh_stale_unique_index_state(db, table, index_name, &state)?;
+        log_index_profile("refresh_stale", 0, t1.elapsed());
         Ok(())
     }
 
@@ -960,5 +1015,16 @@ impl Default for IndexManager {
         let segment_mgr = SegmentManager::new(std::path::Path::new("/tmp/taibai_default"))
             .expect("failed to create default SegmentManager");
         Self::new(Arc::new(segment_mgr))
+    }
+}
+
+fn log_index_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
+    if crate::common::config::insert_profile_enabled() {
+        println!(
+            "[insert-profile] stage=index_{} rows={} elapsed_us={}",
+            stage,
+            rows,
+            elapsed.as_micros()
+        );
     }
 }

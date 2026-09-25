@@ -1,6 +1,6 @@
 # 五分钟快速开始
 
-本指南用于在本地启动 Taibai、执行第一组 SQL，并确认读写链路正常。Taibai 当前处于实验性阶段，本流程只适用于开发和功能验证。
+本指南用于在本地启动 Taibai、执行第一组 SQL，并确认读写链路正常。
 
 ## 1. 准备环境
 
@@ -112,5 +112,5 @@ DROP TABLE quick_start_ticks;
 
 - [工程功能总览](../overview/project-summary.md)
 - [示例工具使用指南](../operations/examples-guide.md)
-- [项目状态与限制](../user-guide/limitations.md)
+- [兼容性与部署指引](../user-guide/limitations.md)
 - [参与贡献](../../CONTRIBUTING.md)

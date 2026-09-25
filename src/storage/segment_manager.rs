@@ -28,6 +28,7 @@ use crate::storage::segment::{
 use crate::types::batch::{RecordBatch, Schema};
 
 pub(crate) use config::bulk_compression_level;
+pub(crate) use config::resolve_compression_level;
 pub use config::SegmentConfig;
 pub use helpers::table_key;
 pub(crate) use helpers::{direct_bulk_column_scalar_at, direct_bulk_request_to_batch};
@@ -160,3 +161,7 @@ mod lock_tests;
 #[cfg(test)]
 #[path = "partition_lock_test.rs"]
 mod partition_lock_tests;
+
+#[cfg(test)]
+#[path = "compression_level_test.rs"]
+mod compression_level_tests;

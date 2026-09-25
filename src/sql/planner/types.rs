@@ -37,6 +37,10 @@ pub struct ScanPlan {
     pub minmax_index_columns: Vec<String>,
     pub set_index_columns: Vec<String>,
     pub partition_filter: Option<PartitionFilter>,
+    /// Set by the DISTINCT fast path: answer `SELECT DISTINCT <column>` from
+    /// row-group zone maps instead of streaming the column (see
+    /// `aggregate_meta::compute_distinct_column`).
+    pub distinct_column: Option<String>,
 }
 
 impl ScanPlan {
@@ -55,6 +59,7 @@ impl ScanPlan {
             minmax_index_columns: Vec::new(),
             set_index_columns: Vec::new(),
             partition_filter: None,
+            distinct_column: None,
         }
     }
 }

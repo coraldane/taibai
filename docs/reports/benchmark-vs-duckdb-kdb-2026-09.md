@@ -2,7 +2,7 @@
 
 > 对象:taibai 0.2.4(dev 分支 ed3d7d5 + 本轮修复,本机构建)与 DuckDB 1.5.5、kdb+(公开数据,见 §6)。
 > 场景:行情 tick 类时序负载 —— 批量导入、实时写入、按 symbol 点查、按日聚合。
-> 性质:单机功能/性能对比,**非生产就绪性评估**;taibai 为实验性项目(见 README)。
+> 性质:单机功能/性能对比。
 > 修订:v2 —— 修正了 v1 中对"刷盘后热存失效"的误诊(真因是收盘归档调度器,见 §5),并补入本轮修复与插入优化的实测结果(§7、§8)。
 
 ## 1. 测试环境
@@ -231,7 +231,7 @@ profiling(聚合 busy 时间 vs 墙钟)发现:并行分组落地后行循环只�
 - `EncodingType::BitPacked`(tag 5)落地:delta + 分块 frame-of-reference + 固定位宽打包(Parquet DELTA_BINARY_PACKED 形状,128 值/块);不要求列有序——逐块最小值偏移使震荡型数值列(价格、量)同样压得动;位宽 >56 视为不可压直接弃选;
 - 与 zstd(plain) 按尺寸竞争但**带解码速度倾斜**:仅当 zstd 候选小 ≥20% 才让位(边际尺寸优势不值得 ~10× 解码退化);获胜时块 verbatim 落盘,读取端按既有 zstd-magic 前缀判定跳过解压;
 - 解码器:64 位累加器字节粒度补位(宽度 ≤56 无逐值边界检查),宽度 8/16/32 走整除特化快路径,宽度 0 走等差直填;无空值 i64 系列列(Int64/Decimal/Timestamp/Time/Interval)解码缓冲直接物化为列,免二次拷贝(该快路径对 Delta/DoD 同样生效);
-- 旧段兼容:旧编码照常读;新段含 BitPacked 需新二进制(experimental 格式语义内)。
+- 旧段兼容:旧编码照常读;新段含 BitPacked 需新二进制。
 
 **结果**(1M 行 Decimal 解码微基准,`bitpacked_decode_throughput_bench`,本机 release):price 形态(8bit 宽)zstd(plain) ~0.8 GB/s → bitpacked **5.4~6.7 GB/s**(端到端含位图/物化,**7~13×**);volume 形态(13bit 宽)**5.7 GB/s**(5~7×)。写入端 encode 为 O(n) 双遍扫描,zstd 压缩仍主导 choose 阶段。
 

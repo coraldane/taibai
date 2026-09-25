@@ -151,6 +151,7 @@ fn incomplete_flush_recovers_tail_and_completed_flush_suppresses_it() -> Result<
         &temp.path().join("seg_00001.dat"),
         schema.clone(),
         DEFAULT_ROW_GROUP_SIZE,
+        3,
     )?;
     writer.write_batch(&batch)?;
     writer.seal()?;
@@ -172,6 +173,7 @@ fn flush_intent_watermark_requires_segment_row_count() -> Result<()> {
         &temp.path().join("seg_00001.dat"),
         schema.clone(),
         DEFAULT_ROW_GROUP_SIZE,
+        3,
     )?;
     writer.write_batch(&batch)?;
     writer.seal()?;
@@ -197,6 +199,7 @@ fn flush_intent_watermark_satisfied_by_shared_segment_growth() -> Result<()> {
         &temp.path().join("seg_00001.dat"),
         schema.clone(),
         DEFAULT_ROW_GROUP_SIZE,
+        3,
     )?;
     writer.write_batch(&first)?;
     writer.write_batch(&second)?;
@@ -225,6 +228,7 @@ fn batched_tail_queries_match_single_id_semantics() -> Result<()> {
         &temp.path().join("seg_00001.dat"),
         schema.clone(),
         DEFAULT_ROW_GROUP_SIZE,
+        3,
     )?;
     writer.write_batch(&flushed_batch)?;
     writer.seal()?;

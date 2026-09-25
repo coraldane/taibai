@@ -277,6 +277,40 @@ impl SegmentManager {
             .clone()
     }
 
+    /// Refresh the per-table zstd level override used by storage-internal
+    /// writers (memtable flush, recovery, direct bulk). Called from DDL and
+    /// the engine write paths that hold fresh `TableMeta`.
+    pub fn set_table_compression_level(&self, db: &str, table: &str, level: Option<i32>) {
+        let key = table_key(db, table);
+        let state = self.get_or_create_state(&key);
+        state.set_compression_level_override(level);
+    }
+
+    /// Effective level for the table right now: its DDL override, or the
+    /// global configured level when unset.
+    pub(crate) fn table_compression_level(&self, db: &str, table: &str) -> i32 {
+        let key = table_key(db, table);
+        let tables = self.tables.read().unwrap();
+        let override_level = tables
+            .get(&key)
+            .and_then(|state| state.compression_level_override());
+        crate::storage::segment_manager::config::resolve_compression_level(override_level)
+    }
+
+    /// Same resolution, keyed by any path inside the table directory (a
+    /// segment file or the dir itself). Used by writers that only carry a
+    /// path, e.g. recovery and standalone tail-flush segments.
+    fn table_compression_level_for_path(&self, path: &Path) -> Result<i32> {
+        let key = self.table_state_key_from_dir(path)?;
+        let tables = self.tables.read().unwrap();
+        let override_level = tables
+            .get(&key)
+            .and_then(|state| state.compression_level_override());
+        Ok(crate::storage::segment_manager::config::resolve_compression_level(
+            override_level,
+        ))
+    }
+
     fn table_state_key_from_dir(&self, table_dir: &Path) -> Result<String> {
         let relative = table_dir.strip_prefix(&self.data_dir).map_err(|_| {
             TaibaiError::Storage(format!(
@@ -1049,8 +1083,9 @@ impl SegmentManager {
         schema: Schema,
         row_group_size: usize,
         batch: &RecordBatch,
+        compression_level: i32,
     ) -> Result<()> {
-        let mut writer = SegmentWriter::create(path, schema, row_group_size)?;
+        let mut writer = SegmentWriter::create(path, schema, row_group_size, compression_level)?;
         writer.write_batch(batch)?;
         writer.seal()?;
         Ok(())
@@ -1062,6 +1097,7 @@ impl SegmentManager {
         schema: Schema,
         row_group_size: usize,
         batches: &[std::sync::Arc<RecordBatch>],
+        compression_level: i32,
     ) -> Result<()> {
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         let mut combined = RecordBatch::with_capacity(schema.clone(), total_rows);
@@ -1084,7 +1120,7 @@ impl SegmentManager {
                     )?;
             }
         }
-        let mut writer = SegmentWriter::create(path, schema, row_group_size)?;
+        let mut writer = SegmentWriter::create(path, schema, row_group_size, compression_level)?;
         if combined.num_rows() > 0 {
             writer.write_batch(&combined)?;
         }

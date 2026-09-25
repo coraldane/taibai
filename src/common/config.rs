@@ -521,6 +521,15 @@ pub struct ServerSettings {
     /// saturated engine surfaces backpressure instead of silently hanging.
     #[serde(default = "default_request_queue_timeout_ms")]
     pub request_queue_timeout_ms: u64,
+    /// Maximum wall-clock time one statement may run before it is cancelled
+    /// at the next safe point (irreversible commit phases run to completion).
+    /// Set to 0 to disable the statement timeout.
+    #[serde(default = "default_statement_timeout_secs")]
+    pub statement_timeout_secs: u64,
+}
+
+fn default_statement_timeout_secs() -> u64 {
+    0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -816,6 +825,7 @@ fn default_server_settings() -> ServerSettings {
         connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
         tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
         request_queue_timeout_ms: default_request_queue_timeout_ms(),
+        statement_timeout_secs: default_statement_timeout_secs(),
     }
 }
 

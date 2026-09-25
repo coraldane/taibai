@@ -279,3 +279,27 @@ fn table_statistics_are_used_only_for_matching_row_and_schema_versions() {
     meta.schema_version += 1;
     assert!(meta.valid_statistics().is_none());
 }
+
+#[test]
+fn compression_level_round_trips_and_defaults_to_none() {
+    let mut meta = TableMeta::new(
+        "testdb",
+        "archive",
+        vec![ColumnDef::new("id", DataType::Int64)],
+    );
+    assert_eq!(meta.compression_level, None);
+    meta.compression_level = Some(19);
+
+    let json = serde_json::to_string(&meta).unwrap();
+    assert!(json.contains("compression_level"));
+    let restored: TableMeta = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.compression_level, Some(19));
+
+    // Catalog JSON written before the field existed must keep loading.
+    let legacy_json = serde_json::to_value(&restored).unwrap();
+    let mut legacy = legacy_json.as_object().unwrap().clone();
+    legacy.remove("compression_level");
+    let without_field: TableMeta = serde_json::from_value(serde_json::Value::Object(legacy))
+        .unwrap();
+    assert_eq!(without_field.compression_level, None);
+}

@@ -287,7 +287,7 @@ fn write_ordered_segment(path: &Path, rows: &[(i32, i32)]) {
             .push(&ScalarValue::Int32(Some(*deal_time)))
             .unwrap();
     }
-    let mut writer = SegmentWriter::create(path, schema, 8192).expect("create segment");
+    let mut writer = SegmentWriter::create(path, schema, 8192, 3).expect("create segment");
     writer.write_batch(&batch).expect("write segment");
     writer.seal().expect("seal segment");
 }

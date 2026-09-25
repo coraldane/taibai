@@ -1,7 +1,7 @@
 use futures::SinkExt;
 use futures::StreamExt;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -13,13 +13,10 @@ use tokio_util::codec::Framed;
 
 use crate::common::config::ServerConfig;
 use crate::common::error::{Result, TaibaiError};
-use crate::net::handler::{build_error, Handler};
+use crate::net::handler::{build_error, is_heavy_request, Handler};
 use crate::net::tls::TlsMode;
 use crate::protocol::codec::MessageCodec;
-use crate::protocol::message::{
-    Message, MSG_TYPE_BATCH_EXECUTE, MSG_TYPE_BULK_INSERT_COLUMNAR, MSG_TYPE_COMMIT_TXN,
-    MSG_TYPE_CURSOR, MSG_TYPE_EXECUTE, MSG_TYPE_FLUSH, MSG_TYPE_QUERY, MSG_TYPE_ROLLBACK_TXN,
-};
+use crate::protocol::message::Message;
 use crate::sql::execution::Engine;
 
 pub struct Server {
@@ -162,7 +159,7 @@ where
         stream,
         MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),
     );
-    let mut handler = Some(Handler::new(config, engine.clone()));
+    let mut handler = Some(Handler::new(Arc::clone(&config), engine.clone()));
     // Per-connection push queue for pubsub notifications. The pubsub fan-out
     // thread only ever `try_send`s, so a stalled client drops notifications
     // (counted) instead of blocking writers or growing memory unboundedly.
@@ -211,17 +208,19 @@ where
 
         tracing::debug!(msg_type = msg.msg_type, "message received");
 
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let context = build_query_context(&config, Arc::new(AtomicBool::new(false)));
         let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
-        let worker = run_handler(
+        let mut worker = run_handler(
             handler.take().expect("handler available between requests"),
             msg,
             Arc::clone(&request_limiter),
-            Arc::clone(&cancelled),
+            Arc::clone(&context),
             stream_sender,
             request_queue_timeout_ms,
         );
-        tokio::pin!(worker);
+        // `JoinHandle` is `Unpin`, so `&mut worker` can be polled directly in
+        // the select below; the handle is also movable into the disconnect
+        // reaper if the worker outlives the graceful window.
         // Single wait loop for the whole request lifetime (queueing for a
         // permit and executing): stream result chunks, forward pubsub pushes,
         // and buffer pipelined frames. Every disconnect/error exit sets
@@ -239,7 +238,7 @@ where
                     if let Some(chunk) = chunk {
                         if let Err(error) = framed.send(chunk).await {
                             tracing::error!(%error, "query stream send error");
-                            cancelled.store(true, Ordering::Release);
+                            context.cancel();
                             disconnect_outcome = Some(Ok(()));
                         }
                     }
@@ -250,12 +249,12 @@ where
                     match push {
                         Some(push) => {
                             if !send_pubsub_push(&mut framed, push).await {
-                                cancelled.store(true, Ordering::Release);
+                                context.cancel();
                                 disconnect_outcome = Some(Ok(()));
                             }
                         }
                         None => {
-                            cancelled.store(true, Ordering::Release);
+                            context.cancel();
                             disconnect_outcome = Some(Ok(()));
                         }
                     }
@@ -271,7 +270,7 @@ where
                                 let error = TaibaiError::ResourceBusy(format!(
                                     "too many pipelined requests (limit {MAX_PENDING_MESSAGES})"
                                 ));
-                                cancelled.store(true, Ordering::Release);
+                                context.cancel();
                                 if let Err(send_error) =
                                     framed.send(build_error(&error.to_string())).await
                                 {
@@ -284,11 +283,11 @@ where
                         }
                         Some(Err(error)) => {
                             tracing::error!(%error, "decode error while query was running");
-                            cancelled.store(true, Ordering::Release);
+                            context.cancel();
                             disconnect_outcome = Some(Err(error));
                         }
                         None => {
-                            cancelled.store(true, Ordering::Release);
+                            context.cancel();
                             disconnect_outcome = Some(Ok(()));
                         }
                     }
@@ -296,8 +295,8 @@ where
             }
             if let Some(outcome) = disconnect_outcome.take() {
                 // Give the worker a bounded window to observe the cancellation
-                // flag and hand the handler back. `abort` is advisory for
-                // blocking workers; the cancelled flag does the real work.
+                // flag and hand the handler back. `abort` cannot stop a
+                // blocking worker; the cancelled flag does the real work.
                 match timeout(DISCONNECT_WORKER_WAIT, &mut worker).await {
                     Ok(joined) => {
                         let (handler, responses) = unpack_worker_output(joined);
@@ -308,9 +307,24 @@ where
                     }
                     Err(_) => {
                         tracing::warn!(
-                            "client disconnected but the request worker did not stop; abandoning the worker and closing the connection"
+                            "client disconnected but the request worker did not stop; a reaper task will clean up when it does"
                         );
-                        worker.abort();
+                        // The blocking worker keeps running until it reaches a
+                        // safe point and observes the cancellation flag, so it
+                        // cannot be torn down here. Hand it to a detached
+                        // reaper: when the query finally stops, the handler
+                        // still reaches `flush_on_disconnect` instead of being
+                        // dropped with bulk-import dirty data unflushed.
+                        let reaper_limiter = Arc::clone(&request_limiter);
+                        tokio::spawn(async move {
+                            let (handler, responses) = unpack_worker_output(worker.await);
+                            if let Err(error) = responses {
+                                tracing::error!(%error, "abandoned request worker failed");
+                            }
+                            if let Some(handler) = handler {
+                                cleanup_handler_blocking(handler, reaper_limiter).await;
+                            }
+                        });
                         break 'request (None, RequestOutcome::Disconnected(outcome));
                     }
                 }
@@ -452,35 +466,53 @@ fn unpack_worker_output(
     }
 }
 
+/// Build the per-request cancellation context: the connection-owned
+/// disconnect flag plus the configured statement deadline (0 = no limit).
+fn build_query_context(
+    config: &ServerConfig,
+    cancelled: Arc<AtomicBool>,
+) -> Arc<crate::common::query_cancel::QueryContext> {
+    let deadline_secs = config.server.statement_timeout_secs;
+    let deadline = if deadline_secs == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_secs(deadline_secs))
+    };
+    Arc::new(crate::common::query_cancel::QueryContext::new(cancelled).with_deadline(deadline))
+}
+
 /// Spawn the request worker. The returned task always terminates with the
 /// handler (`None` only when the worker panicked), so disconnect cleanup can
-/// recover it after a bounded wait.
+/// recover it after a bounded wait. Heavy requests are listed in the engine's
+/// query registry before queueing, so queued work shows in `SHOW PROCESSLIST`
+/// and can be cancelled via `KILL QUERY`.
 fn run_handler(
     mut handler: Handler,
     msg: Message,
     request_limiter: Arc<Semaphore>,
-    cancelled: Arc<AtomicBool>,
+    context: Arc<crate::common::query_cancel::QueryContext>,
     stream_sender: tokio::sync::mpsc::Sender<Message>,
     queue_timeout_ms: u64,
 ) -> tokio::task::JoinHandle<(Option<Handler>, Result<Vec<Message>>)> {
+    // Registered on the connection task before the worker spawns; the guard
+    // lives across the queue wait and the execution.
+    let registration = handler.register_running_query(&context, &msg);
     tokio::task::spawn(async move {
+        // Keep the registration alive for the whole request (queue wait and
+        // execution); dropping it unlists the query.
+        let _registration = registration;
         if !is_heavy_request(msg.msg_type) {
-            let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
+            let responses = handler.handle_message_cancellable(msg, context, Some(stream_sender));
             return (Some(handler), responses);
         }
 
-        // Wait for a request slot while watching the cancellation flag, so a
-        // disconnect during a full queue does not stall cleanup for the whole
-        // queue timeout.
+        // Wait for a request slot while watching the cancellation context, so
+        // a disconnect (or KILL) during a full queue does not stall cleanup
+        // for the whole queue timeout.
         let deadline = Instant::now() + Duration::from_millis(queue_timeout_ms.max(1));
         let permit = loop {
-            if cancelled.load(Ordering::Acquire) {
-                return (
-                    Some(handler),
-                    Ok(vec![build_error(
-                        "request cancelled because the client disconnected",
-                    )]),
-                );
+            if let Err(error) = context.check() {
+                return (Some(handler), Ok(vec![build_error(&error.to_string())]));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -515,7 +547,7 @@ fn run_handler(
 
         let joined = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let responses = handler.handle_message_cancellable(msg, cancelled, Some(stream_sender));
+            let responses = handler.handle_message_cancellable(msg, context, Some(stream_sender));
             (handler, responses)
         })
         .await;
@@ -557,20 +589,6 @@ async fn cleanup_handler_blocking(mut handler: Handler, request_limiter: Arc<Sem
     {
         tracing::error!(%error, "connection cleanup worker failed");
     }
-}
-
-fn is_heavy_request(msg_type: u8) -> bool {
-    matches!(
-        msg_type,
-        MSG_TYPE_QUERY
-            | MSG_TYPE_BULK_INSERT_COLUMNAR
-            | MSG_TYPE_FLUSH
-            | MSG_TYPE_EXECUTE
-            | MSG_TYPE_BATCH_EXECUTE
-            | MSG_TYPE_COMMIT_TXN
-            | MSG_TYPE_ROLLBACK_TXN
-            | MSG_TYPE_CURSOR
-    )
 }
 
 #[cfg(test)]

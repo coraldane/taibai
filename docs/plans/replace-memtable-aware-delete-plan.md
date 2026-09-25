@@ -237,7 +237,7 @@ memtable，不会与已 flush 内容重复，因为 flush 的是删除后的 kep
      REPLACE → 强制 flush → 再 REPLACE 同 key（epoch 守卫触发重建）→ 无重复；
      REPLACE 插入后 plain INSERT 同唯一键 → 拒绝（伪位置存在性）；
    - 回归：现有 replace/transaction/hot store/unique index 相关测试。
-7. `docs/user-guide/limitations.md` 或变更日志中记录行为变化（REPLACE 不再立即
+7. 变更日志中记录行为变化（REPLACE 不再立即
    落盘，行驻留 memtable 直到攒满 row group——与纯 INSERT 一致）。
 
 ## 8. 后续可选

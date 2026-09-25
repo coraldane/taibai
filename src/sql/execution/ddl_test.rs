@@ -1246,3 +1246,120 @@ fn create_table_durability_rejects_unknown_level() {
     assert!(engine.get_table_meta("main", "bad_t").is_none());
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn create_table_compression_level_round_trip() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE archive_t (id INT64) COMPRESSION_LEVEL = 19",
+        )
+        .expect("create archive table");
+    let meta = engine.get_table_meta("main", "archive_t").expect("meta");
+    assert_eq!(meta.compression_level, Some(19));
+    assert_eq!(engine.segment_mgr().table_compression_level("main", "archive_t"), 19);
+
+    match engine
+        .execute(&mut session, "SHOW CREATE TABLE archive_t")
+        .expect("show create table")
+    {
+        ExecResult::Query { batches, .. } => {
+            let sql = match batches[0].scalar(0, 1) {
+                Some(ScalarValue::VarChar(Some(value))) => value,
+                other => panic!("unexpected create sql: {other:?}"),
+            };
+            assert!(
+                sql.contains("COMPRESSION_LEVEL = 19"),
+                "SHOW CREATE TABLE must render compression level: {sql}"
+            );
+        }
+        other => panic!("unexpected show result: {other:?}"),
+    }
+
+    // A table without the option follows the global configured level.
+    engine
+        .execute(&mut session, "CREATE TABLE default_t (id INT64)")
+        .expect("create default table");
+    let meta = engine.get_table_meta("main", "default_t").expect("meta");
+    assert_eq!(meta.compression_level, None);
+    assert_eq!(
+        engine.segment_mgr().table_compression_level("main", "default_t"),
+        crate::common::config::bulk_zstd_level()
+    );
+
+    engine
+        .execute(&mut session, "DROP TABLE archive_t")
+        .expect("drop table");
+    engine
+        .execute(&mut session, "DROP TABLE default_t")
+        .expect("drop table");
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn create_table_compression_level_rejects_out_of_range() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    for level in [0, 23] {
+        let error = engine
+            .execute(
+                &mut session,
+                &format!("CREATE TABLE bad_t (id INT64) COMPRESSION_LEVEL = {level}"),
+            )
+            .expect_err("out-of-range compression level must fail");
+        assert!(
+            error.to_string().contains("COMPRESSION_LEVEL"),
+            "unexpected error: {error}"
+        );
+    }
+    assert!(engine.get_table_meta("main", "bad_t").is_none());
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn alter_table_compression_level_set_and_reset() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let engine = Engine::new(temp_dir.path(), "main").expect("create engine");
+    let mut session = Session::new("root".to_string(), "main".to_string());
+
+    engine
+        .execute(&mut session, "CREATE TABLE logs_t (id INT64)")
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO logs_t VALUES (1)")
+        .expect("insert row");
+
+    engine
+        .execute(
+            &mut session,
+            "ALTER TABLE logs_t SET COMPRESSION_LEVEL = 22",
+        )
+        .expect("alter set compression level");
+    let meta = engine.get_table_meta("main", "logs_t").expect("meta");
+    assert_eq!(meta.compression_level, Some(22));
+    assert_eq!(engine.segment_mgr().table_compression_level("main", "logs_t"), 22);
+
+    engine
+        .execute(
+            &mut session,
+            "ALTER TABLE logs_t SET COMPRESSION_LEVEL = DEFAULT",
+        )
+        .expect("alter reset compression level");
+    let meta = engine.get_table_meta("main", "logs_t").expect("meta");
+    assert_eq!(meta.compression_level, None);
+    assert_eq!(
+        engine.segment_mgr().table_compression_level("main", "logs_t"),
+        crate::common::config::bulk_zstd_level()
+    );
+
+    engine
+        .execute(&mut session, "DROP TABLE logs_t")
+        .expect("drop table");
+    engine.segment_mgr().shutdown();
+}

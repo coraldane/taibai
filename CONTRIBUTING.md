@@ -1,6 +1,6 @@
 # 参与贡献
 
-感谢参与 Taibai。项目仍处于实验性开发阶段，提交改动前请先了解 [项目限制](docs/user-guide/limitations.md) 和 [整体设计](docs/design/TAIBAI_DESIGN_ZH.md)。
+感谢参与 Taibai。提交改动前请先了解 [兼容性与部署指引](docs/user-guide/limitations.md) 和 [整体设计](docs/design/TAIBAI_DESIGN_ZH.md)。
 
 ## 开发环境
 

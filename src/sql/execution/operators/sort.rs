@@ -68,6 +68,7 @@ impl SortExec {
             .max(1);
 
         while let Some(batch) = self.input.next_batch()? {
+            crate::common::query_cancel::check()?;
             if output_schema.is_none() {
                 let physical_schema = batch.schema.clone();
                 sort_exprs = Some(

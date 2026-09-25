@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -103,11 +102,25 @@ impl Handler {
     pub fn handle_message_cancellable(
         &mut self,
         msg: Message,
-        cancelled: Arc<AtomicBool>,
+        context: Arc<crate::common::query_cancel::QueryContext>,
         stream_sender: Option<tokio::sync::mpsc::Sender<Message>>,
     ) -> Result<Vec<Message>> {
         self.stream_sender = stream_sender;
-        let _cancellation = crate::common::query_cancel::QueryCancellationGuard::enter(cancelled);
+        // Commit/rollback/flush and bulk-import chunks mutate durable state in
+        // steps that cannot be rolled back cheaply, so they run to completion
+        // even when the client disconnects mid-request.
+        if matches!(
+            msg.msg_type,
+            MSG_TYPE_COMMIT_TXN
+                | MSG_TYPE_ROLLBACK_TXN
+                | MSG_TYPE_FLUSH
+                | MSG_TYPE_BULK_INSERT_COLUMNAR
+        ) {
+            context.enter_phase(crate::common::query_cancel::QueryPhase::Committing);
+        } else if context.phase() == crate::common::query_cancel::QueryPhase::Planning {
+            context.enter_phase(crate::common::query_cancel::QueryPhase::Executing);
+        }
+        let _cancellation = crate::common::query_cancel::QueryCancellationGuard::enter(context);
         let result = match msg.msg_type {
             MSG_TYPE_LOGIN => self.handle_login(&msg.payload),
             MSG_TYPE_PING => Ok(vec![build_pong()]),
@@ -150,6 +163,34 @@ impl Handler {
         };
         self.stream_sender = None;
         result
+    }
+
+    /// List the request in the engine's running-query registry so it is
+    /// visible to `SHOW PROCESSLIST` and stoppable via `KILL QUERY`. Called
+    /// by the connection task before the request queues, so queued work is
+    /// killable too. Requests before login (or lightweight ones) are not
+    /// registered; dropping the returned guard unregisters.
+    pub(crate) fn register_running_query(
+        &self,
+        context: &Arc<crate::common::query_cancel::QueryContext>,
+        msg: &Message,
+    ) -> Option<crate::sql::execution::query_registry::QueryRegistration> {
+        if !is_heavy_request(msg.msg_type) {
+            return None;
+        }
+        let session = self.session.as_ref()?;
+        let sql = if msg.msg_type == MSG_TYPE_QUERY {
+            message_sql_snippet(&msg.payload)
+        } else {
+            String::new()
+        };
+        Some(self.engine.query_registry().register(
+            Arc::clone(context),
+            session.session_id_string(),
+            session.username.clone(),
+            session.database.clone(),
+            &sql,
+        ))
     }
 
     fn handle_login(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -1354,6 +1395,36 @@ fn is_heartbeat_query(sql: &str) -> bool {
         (tokens.next(), tokens.next(), tokens.next()),
         (Some(select), Some("1"), None) if select.eq_ignore_ascii_case("SELECT")
     )
+}
+
+/// Requests that run outside the async networking path and can outlive the
+/// client's patience; these are the ones worth listing and killing.
+pub(crate) fn is_heavy_request(msg_type: u8) -> bool {
+    matches!(
+        msg_type,
+        MSG_TYPE_QUERY
+            | MSG_TYPE_BULK_INSERT_COLUMNAR
+            | MSG_TYPE_FLUSH
+            | MSG_TYPE_EXECUTE
+            | MSG_TYPE_BATCH_EXECUTE
+            | MSG_TYPE_COMMIT_TXN
+            | MSG_TYPE_ROLLBACK_TXN
+            | MSG_TYPE_CURSOR
+    )
+}
+
+/// Best-effort SQL text from a QUERY payload (`[database][sql]`), bounded by
+/// the registry's snippet cap. Malformed payloads fall back to the raw bytes.
+fn message_sql_snippet(payload: &[u8]) -> String {
+    if let Ok((_, rest)) = read_len_prefixed_string(payload) {
+        if let Ok((sql, _)) = read_len_prefixed_string(rest) {
+            return sql.trim().to_string();
+        }
+    }
+    std::str::from_utf8(payload)
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn should_log_query_sql(sql: &str) -> bool {

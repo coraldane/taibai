@@ -168,6 +168,7 @@ impl ScanCursor {
         }
 
         while self.segment_pos < self.segments.len() {
+            crate::common::query_cancel::check()?;
             if self.current_reader.is_none() {
                 self.open_current_segment();
                 if self.current_reader.is_none() {
@@ -178,6 +179,7 @@ impl ScanCursor {
 
             let reader = self.current_reader.as_ref().unwrap().clone();
             while self.candidate_pos < self.current_candidates.len() || !self.prefetch.is_empty() {
+                crate::common::query_cancel::check()?;
                 if self.prefetch.is_empty() {
                     self.fill_prefetch(&reader);
                 }
@@ -196,6 +198,7 @@ impl ScanCursor {
         }
 
         while self.memtable_pos < self.memtable_batches.len() {
+            crate::common::query_cancel::check()?;
             let batch = self.memtable_batches[self.memtable_pos].clone();
             self.memtable_pos += 1;
             let batch = strategy::apply_ttl_filter_and_projection(
@@ -227,9 +230,18 @@ impl ScanCursor {
         let plan = self.plan.clone();
         let table_schema = self.table_schema.clone();
         let reader = Arc::clone(reader);
+        // Rayon lanes do not inherit the ambient cancellation context, so
+        // capture the flag and stop starting new decodes once it is set.
+        let cancel_flag = crate::common::query_cancel::current_flag();
         let batches: Vec<_> = rgs
             .into_par_iter()
             .filter_map(|rg_idx| {
+                if cancel_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    return None;
+                }
                 let _cpu = crate::common::work_limiter::acquire_cpu();
                 let _io = crate::common::work_limiter::acquire_io();
                 strategy::read_row_group_with_strategy(&spec, &plan, &table_schema, &reader, rg_idx)
@@ -413,6 +425,7 @@ impl ScanCursor {
 
     fn drain_memtable_leg(&mut self) -> Result<Option<RecordBatch>> {
         while self.memtable_pos < self.memtable_batches.len() {
+            crate::common::query_cancel::check()?;
             let batch = self.memtable_batches[self.memtable_pos].clone();
             self.memtable_pos += 1;
             let batch = strategy::apply_ttl_filter_and_projection(

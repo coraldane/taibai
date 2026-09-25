@@ -1,6 +1,6 @@
 fn log_direct_bulk_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     if crate::common::config::insert_profile_enabled() {
-        eprintln!(
+        println!(
             "[insert-profile] stage=direct_bulk_{} rows={} elapsed_us={}",
             stage,
             rows,
@@ -289,6 +289,8 @@ impl Engine {
         batch: RecordBatch,
         force_deferred: bool,
     ) -> Result<u64> {
+        self.segment_mgr
+            .set_table_compression_level(db, table, table_meta.compression_level);
         self.validate_batch_unique_constraints(db, table, &batch)?;
         let resident_coverage_before_bulk = self.begin_hot_bulk_write(db, table, table_meta);
         let had_segments_before =
@@ -457,6 +459,8 @@ impl Engine {
         if result > 0 && (bulk_import_mode || self.is_bulk_mode()) {
             self.mark_bulk_dirty_table(db, &table_name);
         }
+        let hot_feed_start = std::time::Instant::now();
+        log_direct_bulk_profile("should_feed", if hot_payload_should_feed { 1 } else { 0 }, hot_feed_start.elapsed());
         if result > 0 && hot_payload_should_feed {
             if let Some(table_meta) = table_meta_for_hot.as_ref() {
                 self.feed_hot_store_after_direct_bulk(
@@ -469,6 +473,7 @@ impl Engine {
                 );
             }
         } else if result > 0 {
+            let else_start = std::time::Instant::now();
             self.hot_store_mgr.clear_resident_coverage(db, &table_name);
             // Bulk-mode writes skip the hot-store feed entirely and their
             // partitions are not derived here; retire the fast path for the
@@ -480,6 +485,7 @@ impl Engine {
                     .memtable_manager()
                     .note_hot_unfed_table(db, &table_name, result);
             }
+            log_direct_bulk_profile("else_branch", result as usize, else_start.elapsed());
         }
 
         if result > 0 {
@@ -498,6 +504,7 @@ impl Engine {
                 self.index_manager
                     .refresh_unique_index_state(db, &table_name, index_name)?;
             }
+            log_direct_bulk_profile("hot_feed", result as usize, hot_feed_start.elapsed());
             log_direct_bulk_profile("index_refresh", result as usize, index_start.elapsed());
         }
 
@@ -624,6 +631,7 @@ impl Engine {
         >,
         had_segments_before: bool,
     ) {
+        let hot_parse_start = std::time::Instant::now();
         let parse_result = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)
             .and_then(|req| {
                 let schema = Schema::new(table_meta.columns.clone());
@@ -633,6 +641,7 @@ impl Engine {
         let feed = self.begin_hot_feed(db, table);
         let feed_result = match parse_result {
             Ok(batch) => {
+            log_direct_bulk_profile("hot_feed_parse", 0, hot_parse_start.elapsed());
                 let fed = match self.feed_hot_store(db, table, table_meta, &batch, &feed) {
                     Ok(()) => Ok(()),
                     Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {

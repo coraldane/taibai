@@ -67,12 +67,24 @@ pub struct SegmentWriter {
     current_group: Option<BuildingRowGroup>,
     total_rows: u64,
     bloom_columns: Vec<bool>,
+    compression_level: i32,
 }
 
 impl SegmentWriter {
-    pub fn create(path: &Path, schema: Schema, row_group_size: usize) -> Result<Self> {
+    pub fn create(
+        path: &Path,
+        schema: Schema,
+        row_group_size: usize,
+        compression_level: i32,
+    ) -> Result<Self> {
         let bloom_columns: Vec<usize> = (0..schema.num_columns()).collect();
-        Self::create_with_bloom_columns(path, schema, row_group_size, &bloom_columns)
+        Self::create_with_bloom_columns(
+            path,
+            schema,
+            row_group_size,
+            &bloom_columns,
+            compression_level,
+        )
     }
 
     pub fn create_with_bloom_columns(
@@ -80,6 +92,7 @@ impl SegmentWriter {
         schema: Schema,
         row_group_size: usize,
         bloom_column_indices: &[usize],
+        compression_level: i32,
     ) -> Result<Self> {
         remove_sidecar_meta(path)?;
         let mut file = fs::OpenOptions::new()
@@ -107,6 +120,7 @@ impl SegmentWriter {
             current_group: None,
             total_rows: 0,
             bloom_columns,
+            compression_level,
         })
     }
 
@@ -149,7 +163,7 @@ impl SegmentWriter {
                     col,
                     offset,
                     to_write,
-                    crate::storage::segment_manager::bulk_compression_level(),
+                    self.compression_level,
                     single_block,
                 )?;
 
@@ -223,7 +237,7 @@ impl SegmentWriter {
                     col,
                     row_offset,
                     row_count,
-                    crate::storage::segment_manager::bulk_compression_level(),
+                    self.compression_level,
                     true,
                 )?;
                 let value_set = metadata.value_set.map(|mut values| {

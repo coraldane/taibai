@@ -130,6 +130,7 @@ impl SpillFile {
             schema,
             row_group_rows.max(1),
             &[],
+            crate::storage::segment_manager::bulk_compression_level(),
         )?;
         for batch in batches {
             let batch = batch?;
@@ -157,6 +158,7 @@ impl SpillWriter {
             schema,
             row_group_rows.max(1),
             &[],
+            crate::storage::segment_manager::bulk_compression_level(),
         )?;
         Ok(Self {
             writer: Some(writer),

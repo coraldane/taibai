@@ -317,7 +317,10 @@ fn group_by_predicates_on_schema_differring_segment() {
     // The segment now holds 5 columns while the table schema has 6, so
     // every row group read takes the schema-differs fallback path.
     engine
-        .execute(&mut session, "ALTER TABLE monitor_t ADD COLUMN extra VARCHAR")
+        .execute(
+            &mut session,
+            "ALTER TABLE monitor_t ADD COLUMN extra VARCHAR",
+        )
         .expect("add column");
 
     let rows = collect_rows(
