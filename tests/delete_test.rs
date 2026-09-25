@@ -493,3 +493,112 @@ fn bulk_import_insert_is_visible_before_stop_bulk_import() {
     engine.end_bulk_import();
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn delete_with_as_alias_filters_by_qualified_column() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE t (id INT32, value INT32) PARTITION BY id",
+        )
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .expect("insert rows");
+    engine.execute(&mut session, "FLUSH TABLE t").expect("flush rows");
+
+    let deleted = engine
+        .execute(&mut session, "DELETE FROM t AS a WHERE a.value >= 20")
+        .expect("delete rows with AS alias");
+    match deleted {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 2),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    let remaining = engine
+        .execute(&mut session, "SELECT id FROM t ORDER BY id")
+        .expect("select remaining rows");
+    assert_eq!(row_count(remaining), 1);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn delete_with_implicit_alias_filters_matching_rows() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")
+        .expect("insert rows");
+    engine.execute(&mut session, "FLUSH TABLE t").expect("flush rows");
+
+    let deleted = engine
+        .execute(&mut session, "DELETE FROM t tgt WHERE tgt.id = 2")
+        .expect("delete rows with implicit alias");
+    match deleted {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    let remaining = engine
+        .execute(&mut session, "SELECT id FROM t")
+        .expect("select remaining rows");
+    assert_eq!(row_count(remaining), 1);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn delete_with_alias_without_where_removes_all_rows() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")
+        .expect("insert rows");
+    engine.execute(&mut session, "FLUSH TABLE t").expect("flush rows");
+
+    let deleted = engine
+        .execute(&mut session, "DELETE FROM t AS a")
+        .expect("delete all rows through alias");
+    match deleted {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 2),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    let remaining = engine
+        .execute(&mut session, "SELECT COUNT(*) FROM t")
+        .expect("count remaining rows");
+    assert_eq!(count_star(remaining), 0);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn delete_with_alias_still_prunes_the_target_partition() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE partitioned (id INT32, value INT32) PARTITION BY id",
+        )
+        .expect("create partitioned table");
+    engine
+        .execute(&mut session, "INSERT INTO partitioned VALUES (1, 10), (2, 20)")
+        .expect("insert rows");
+
+    let deleted = engine
+        .execute(&mut session, "DELETE FROM partitioned AS p WHERE p.id = 1")
+        .expect("delete one partition through alias");
+    match deleted {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    let remaining = engine
+        .execute(&mut session, "SELECT COUNT(*) FROM partitioned")
+        .expect("count remaining rows");
+    assert_eq!(count_star(remaining), 1);
+    engine.segment_mgr().shutdown();
+}

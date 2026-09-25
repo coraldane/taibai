@@ -99,6 +99,7 @@ UPDATE t SET salary = 60000.0 WHERE id = 1;
 
 -- 删除
 DELETE FROM t WHERE id = 1;
+DELETE FROM t AS a WHERE a.id = 1;
 
 -- 批量插入（高性能）
 INSERT_BATCH t VALUES (...);

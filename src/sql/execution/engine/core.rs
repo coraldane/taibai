@@ -640,7 +640,11 @@ impl Engine {
             Statement::Delete {
                 table,
                 where_clause,
+                ..
             } => {
+                // The table alias only matters for WHERE-clause qualification;
+                // qualified columns resolve by column name regardless of the
+                // qualifier, so the alias needs no execution-time handling.
                 let db = table.effective_database(&session.database).to_string();
                 let result = super::dml_delete::exec_delete(self, &db, &table.name, where_clause);
                 if result.is_ok() && session.in_txn() {

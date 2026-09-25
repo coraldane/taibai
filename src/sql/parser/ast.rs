@@ -183,6 +183,9 @@ pub enum Statement {
     },
     Delete {
         table: ObjectName,
+        /// Optional `DELETE FROM t [AS] alias` table alias; usable as the
+        /// column qualifier in the WHERE clause.
+        alias: Option<String>,
         where_clause: Option<Expr>,
     },
     Select {

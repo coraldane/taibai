@@ -129,6 +129,18 @@ impl Parser {
         self.expect(&Token::From)?;
         let table = self.parse_object_name()?;
 
+        // MySQL-style optional table alias: `DELETE FROM t [AS] a WHERE a.id = 1`.
+        // WHERE is a keyword token, so a bare identifier here can only be an
+        // implicit alias.
+        let alias = if self.peek() == &Token::As {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else if matches!(self.peek(), Token::Ident(_)) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+
         let where_clause = if self.peek() == &Token::Where {
             self.advance();
             Some(self.parse_expr()?)
@@ -138,6 +150,7 @@ impl Parser {
 
         Ok(Statement::Delete {
             table,
+            alias,
             where_clause,
         })
     }
