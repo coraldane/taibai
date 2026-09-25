@@ -622,7 +622,11 @@ impl Engine {
                 table,
                 assignments,
                 where_clause,
+                ..
             } => {
+                // The table alias only qualifies SET targets and WHERE
+                // columns; both resolve by bare column name, so the alias
+                // needs no execution-time handling.
                 let db = table.effective_database(&session.database).to_string();
                 let result = super::dml_update::exec_update(
                     self,

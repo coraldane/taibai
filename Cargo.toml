@@ -116,6 +116,10 @@ name = "segment_sidecar_meta_test"
 path = "tests/segment_sidecar_meta_test.rs"
 
 [[test]]
+name = "update_test"
+path = "tests/update_test.rs"
+
+[[test]]
 name = "topn_offset_test"
 path = "tests/topn_offset_test.rs"
 

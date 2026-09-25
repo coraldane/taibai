@@ -96,6 +96,7 @@ INSERT INTO t (id, name) VALUES (1, 'Bob'), (2, 'Carol');
 
 -- 更新
 UPDATE t SET salary = 60000.0 WHERE id = 1;
+UPDATE t AS a SET a.salary = 60000.0 WHERE a.id = 1;
 
 -- 删除
 DELETE FROM t WHERE id = 1;

@@ -591,3 +591,126 @@ fn scattered_inserts_materialize_only_at_row_group_target() {
     );
     engine.segment_mgr().shutdown();
 }
+
+#[test]
+fn update_with_as_alias_updates_through_qualified_set_and_where() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+        .expect("create table");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+        )
+        .expect("insert rows");
+    engine.execute(&mut session, "FLUSH TABLE t").expect("flush rows");
+
+    let updated = engine
+        .execute(
+            &mut session,
+            "UPDATE t AS a SET a.value = 99 WHERE a.id = 2",
+        )
+        .expect("update row through alias");
+    match updated {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    let values = collect_i32(
+        engine
+            .execute(&mut session, "SELECT value FROM t ORDER BY id")
+            .expect("select updated rows"),
+        0,
+    );
+    assert_eq!(values, vec![10, 99, 30]);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn update_with_implicit_alias_updates_matching_rows() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")
+        .expect("insert rows");
+
+    let updated = engine
+        .execute(
+            &mut session,
+            "UPDATE t tgt SET value = 50 WHERE tgt.id = 2",
+        )
+        .expect("update row through implicit alias");
+    match updated {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    let values = collect_i32(
+        engine
+            .execute(&mut session, "SELECT value FROM t ORDER BY id")
+            .expect("select updated rows"),
+        0,
+    );
+    assert_eq!(values, vec![10, 50]);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn update_set_column_qualified_by_table_name_still_works() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE t (id INT32, value INT32)")
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")
+        .expect("insert rows");
+
+    let updated = engine
+        .execute(
+            &mut session,
+            "UPDATE t SET t.value = 70 WHERE t.id = 1",
+        )
+        .expect("update row with table-name-qualified column");
+    match updated {
+        ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
+        other => panic!("expected ok, got {:?}", other),
+    }
+
+    let values = collect_i32(
+        engine
+            .execute(&mut session, "SELECT value FROM t ORDER BY id")
+            .expect("select updated rows"),
+        0,
+    );
+    assert_eq!(values, vec![70, 20]);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn update_with_alias_still_rejects_partition_key_assignment() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE partitioned (id INT32, value INT32) PARTITION BY id",
+        )
+        .expect("create partitioned table");
+    engine
+        .execute(&mut session, "INSERT INTO partitioned VALUES (1, 10)")
+        .expect("insert row");
+
+    let error = engine
+        .execute(
+            &mut session,
+            "UPDATE partitioned AS p SET p.id = 2 WHERE p.value = 10",
+        )
+        .expect_err("partition key assignment must be rejected");
+    assert!(
+        error.to_string().contains("updating partition key"),
+        "unexpected error: {error}"
+    );
+    engine.segment_mgr().shutdown();
+}

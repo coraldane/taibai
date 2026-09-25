@@ -178,6 +178,9 @@ pub enum Statement {
     },
     Update {
         table: ObjectName,
+        /// Optional `UPDATE t [AS] alias` table alias; usable as the column
+        /// qualifier in SET targets and the WHERE clause.
+        alias: Option<String>,
         assignments: Vec<Assignment>,
         where_clause: Option<Expr>,
     },
