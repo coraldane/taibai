@@ -4,7 +4,7 @@
 > 每完成一个里程碑在本文勾销状态标记。P3.4 与第一步无依赖,可穿插实施。
 >
 > **与现有计划的关系**:
-> - 延续 `docs/plans/query-performance-architecture-refactor-plan.md` 的方向(该计划 Phase 0-5 已完成),
+> - 延续已完成的"查询性能架构重构计划"(Phase 0-5,该计划文档已随实施完成清理,历史见 git),
 >   本路线图的第一步是其 Phase 4"向量化谓词执行"的自然延伸:从"谓词归一"推进到"表达式与算子全链路类型化"。
 > - 实时摄取侧(A2 ingest profile DDL、A3 symbol dictionary、C3 replay、M2-M4)仍归
 >   `docs/plans/realtime-market-data-ingestion-plan.md` 管,不在本文范围。

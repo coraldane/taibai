@@ -11,7 +11,7 @@ Taibai 是一个使用 Rust 实现的列式数据库服务器，目标是提供�
 - `taibai` 服务端二进制：启动数据库服务。
 - `taibai client` 命令行客户端：连接服务端、登录、执行 SQL 或进入交互模式。
 - `segment` 工具：用于检查和调试 segment 存储文件。
-- 示例工程：批量导入、多行插入、预处理语句等使用场景。
+- 示例工程：批量导入、多行插入、预处理语句、CSV 导出/导入、热数据写入、变更订阅等使用场景，详见[示例工具使用指南](../operations/examples-guide.md)。
 
 ## 整体架构
 
@@ -64,17 +64,17 @@ Taibai 可以读取 YAML 配置并启动数据库服务，主要配置包括监�
 SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行器。当前语句覆盖面较广：
 
 - DDL：`CREATE/DROP DATABASE`、`CREATE/DROP/ALTER/TRUNCATE TABLE`。
-- 表结构能力：主键、默认值、`AUTO_INCREMENT`、`CLUSTER BY`、`PARTITION BY`、`TTL`。
+- 表结构能力：主键、默认值、`AUTO_INCREMENT`、`CLUSTER BY`、`PARTITION BY`、`TTL`、`COMPRESSION_LEVEL`（按表设置 zstd 级别 1..=22）。
 - 分区策略：`VALUE`、`DAY`、`MONTH`、`YEAR`、`HASH`、`MOD`。
-- DML：`INSERT`、多行插入、`UPDATE`、`DELETE`。
+- DML：`INSERT`、多行插入、`REPLACE INTO`、`UPDATE`、`DELETE`；`UPDATE` / `DELETE` 支持 MySQL 风格的表别名（`DELETE FROM t AS a WHERE a.x = 1`）。
 - 查询：`SELECT`、`WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT/OFFSET`、`DISTINCT`。
 - Join：Inner、Left、Right、Full、Cross、Semi、Anti,以及 ASOF JOIN / LEFT ASOF JOIN（按等值键分区、时间键二分的行情最近匹配连接）。
 - 子查询：`IN`、`EXISTS`、标量子查询等。
 - 集合查询：`UNION` / `UNION ALL`。
 - 窗口函数：`ROW_NUMBER`、`RANK`、`DENSE_RANK`、`LEAD`、`LAG`，以及窗口聚合。
-- 管理语句：`USE`、`SHOW TABLES/DATABASES/COLUMNS/INDEXES/CREATE TABLE/USERS/ROLES/GRANTS/PARTITIONS/STATS/ENGINES/PROCESSLIST`。
+- 管理语句：`USE`、`SHOW TABLES/DATABASES/COLUMNS/INDEXES/CREATE TABLE/USERS/ROLES/GRANTS/PARTITIONS/STATS/ENGINES/PROCESSLIST`、`KILL QUERY`（终止运行中的查询）。
 - 诊断语句：`EXPLAIN`、`EXPLAIN ANALYZE`。
-- 运维语句：`FLUSH TABLE`、`OPTIMIZE TABLE`、`PAUSE FLUSH`、`RESUME FLUSH`。
+- 运维语句：`FLUSH TABLE`、`OPTIMIZE TABLE`、`ANALYZE TABLE`（重建统计信息）、`PAUSE FLUSH`、`RESUME FLUSH`；`ALTER TABLE ... SET HOT` 控制常驻热存，`ALTER TABLE ... SET COMPRESSION_LEVEL = n | DEFAULT` 调整压缩级别。
 - 事务语句：`BEGIN`、`COMMIT`、`ROLLBACK`。
 
 内置函数注册表支持数学、字符串、日期时间、控制流、类型转换和向量函数，例如 `abs`、`sqrt`、`upper`、`substring`、`now`、`coalesce`、`to_int`、`vector_distance`、`vector_norm`、`vector_dot` 等。
@@ -102,12 +102,16 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 
 针对扫描与分析场景，工程还提供：
 
-- `COUNT(*)` 快速路径。
+- `COUNT(*)` 快速路径；单列无谓词 `SELECT DISTINCT` 由 row group zone map 元数据直接应答。
+- 向量化表达式求值（`expr_vec`）：过滤比较与投影优先走列式内核。
 - MemTable 与 segment 合并扫描。
-- 分区裁剪。
+- 分区裁剪（含 `BETWEEN` / `IN` 字面量按列类型转换后的裁剪）。
 - 行组裁剪。
 - 行过滤。
-- 基于聚簇键和统计信息的扫描优化。
+- 基于聚簇键和统计信息的扫描优化（前缀等值 + 范围复合二分裁剪）。
+- 字典直通解码：低基数 VARCHAR 以字典编码形式直接参与分组聚合，免展开往返。
+
+查询执行带阶段跟踪（Planning / Executing / Committing）与取消机制：`SHOW PROCESSLIST` 列出真实运行中的查询，`KILL QUERY` 可终止排队或执行中的请求，`statement_timeout_secs` 提供语句级超时。详见[查询管理与语句超时](../user-guide/query-management.md)。
 
 ## 存储引擎
 
@@ -123,10 +127,13 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - SegmentManager 管理表数据文件、活跃 segment、flush 与读取。
 - Segment 文件包含 header、压缩列数据、row group 元数据、footer 和 footer offset。
 - Row Group 默认大小为 8192 行。
-- 列数据使用 zstd 压缩。
+- 列数据按形态选择编码：定宽列支持 Raw、BitPacked、DeltaRle，低基数 VARCHAR 走字典编码，编码后统一 zstd 压缩；压缩级别可按表用 `COMPRESSION_LEVEL` 覆盖全局默认。
 - Footer 记录 schema、row group offset/length、列压缩大小、Zone Map、Bloom Filter、删除位图等。
 - 支持删除标记和逻辑删除。
-- 支持 `OPTIMIZE TABLE` 触发 segment 合并、排序和清理。
+- 唯一索引按需加载并以 base + delta 增量维护，direct bulk 批量导入只追加增量，不随历史数据量线性变慢。
+- 支持 `OPTIMIZE TABLE` 触发 segment 合并、排序和清理；compaction 的重写阶段在分区锁外运行，压缩期间目标分区仍可写入。
+- 写入互斥按 (库, 表, 分区) 粒度加锁，分区间的写入、flush 与 compaction 互不阻塞；全表操作取表级宽锁，等待受 `mutation_lock_timeout_ms` 有界限制。
+- 常驻热存（`ALTER TABLE ... SET HOT`）：当日分区的点查走内存倒排索引；重启预热只加载日结之后写入的段（`storage.hot_warmup_enabled` 控制），批量写覆盖全表后自动标记全表常驻。
 - Reader cache、buffer pool、列编码和快速扫描相关模块用于提升读取性能。
 
 ## 数据类型
@@ -170,16 +177,19 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - 最近事件保存在内存队列中。
 - 事务内插入在提交后才发布变更事件。
 - 可按数据库和表过滤最近变更。
+- 变更订阅（Pub/Sub）：客户端通过 `SUBSCRIBE` 协议消息订阅表的插入变更，服务端带序号异步推送，主题支持通配符；详见[变更订阅文档](../user-guide/pubsub.md)。
 
 ## 批量导入与性能方向
 
 工程对高吞吐写入做了专门设计：
 
-- 协议支持列式批量插入消息。
+- 协议支持列式批量插入消息，包括 direct bulk 二进制列载荷（定宽列整段对齐拷贝、VarChar 走连续缓冲）。
 - 服务端支持 `START BULK IMPORT` / `STOP BULK IMPORT` 模式。
 - `START BULK IMPORT` 启用统一的批量导入模式；当前无独立 WAL 写入。
 - 客户端支持 pipeline，在多个批次请求未完成时继续发送后续批次。
 - `examples/batch_import` 针对股票 tick CSV 数据实现了高性能导入示例，包括块读取、字符串池化、列式编码、批大小控制和进度输出。
+- `examples/export_csv` / `insert_csv` / `load_csv` 覆盖 CSV 导出、普通 INSERT 与列式 bulk 两种导入路径。
+- 持久化由 durable tail（组提交 + 自适应 fsync 窗口）承担，实时小批次吞吐与崩溃安全可按 `tail_async_fsync` 权衡。
 
 ## 测试覆盖重点
 

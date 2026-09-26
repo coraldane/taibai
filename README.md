@@ -13,7 +13,8 @@ Taibai 是一个用 Rust 编写的列式数据库服务端。
 - 数据按列存储，更适合统计分析类查询。
 - 支持批量导入，适合一次性写入大量数据。
 - 支持事务、用户权限、分区、数据过期清理和变更订阅等数据库能力。
-- 支持压缩数据，减少存储空间和网络传输开销。
+- 支持查询管理：`SHOW PROCESSLIST` 查看运行中的查询，`KILL QUERY` 终止失控语句，可配置语句超时。
+- 支持压缩数据，减少存储空间和网络传输开销；压缩级别可按表调整。
 - 支持可选的 TLS 加密连接。
 - 支持独立 SQL Query Log，可通过 `log.query_file` 配置查询日志文件。
 - 提供命令行客户端和若干示例程序。
@@ -200,6 +201,10 @@ log:
 | `examples/prepare_test` | 预处理语句示例 |
 | `examples/hot_insert` | 热数据持续写入示例 |
 | `examples/pubsub_demo` | 变更订阅示例：订阅表插入变更并接收服务端推送 |
+| `examples/export_csv` | 把查询结果导出为 CSV |
+| `examples/load_csv` / `examples/insert_csv` | 把 CSV 分别经 bulk 直写与普通 INSERT 路径导入 |
+
+各示例的参数与用法见[示例工具使用指南](docs/operations/examples-guide.md)。
 
 运行示例前，请先启动 Taibai 服务端，并根据示例源码调整连接参数。
 
@@ -207,6 +212,8 @@ log:
 
 - `docs/getting-started/quick-start.md`：五分钟快速开始。
 - `docs/overview/project-summary.md`：工程功能总览。
+- `docs/user-guide/transactions-and-concurrency.md`：事务与并发语义。
+- `docs/user-guide/query-management.md`：查询管理与语句超时。
 - `docs/user-guide/pubsub.md`：变更订阅（pub/sub）协议、权限与配置。
 - `docs/user-guide/limitations.md`：兼容性与部署指引。
 - `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。

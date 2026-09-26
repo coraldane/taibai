@@ -76,7 +76,7 @@ gate 复位由 drop 守卫（`PartitionGateReset` / `DatabaseGatesReset`）完�
 
 - 跨表：`with_database_mutation_locks` 按 `db:table` 键排序去重后依次获取（原有行为不变）；
 - 表内：分区锁按分区名字典序获取；
-- 禁止在持有分区锁时获取另一张表的任何锁（与既有 `docs/plans/direct-bulk-unique-index-maintenance-plan.md` 的锁序约束一致）。
+- 禁止在持有分区锁时获取另一张表的任何锁（与 direct bulk 唯一索引维护引入的锁序约束一致）。
 
 ## 正确性边界
 

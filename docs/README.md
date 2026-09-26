@@ -7,45 +7,55 @@
 3. [兼容性与部署指引](user-guide/limitations.md)：了解兼容性、安全边界和生产部署检查。
 4. [参与贡献](../CONTRIBUTING.md)：搭建开发环境并提交改动。
 
-## 使用与运维
+## 使用指南
 
-- [事务与并发语义](user-guide/transactions-and-concurrency.md)
-- [变更订阅（Pub/Sub）](user-guide/pubsub.md)
-- [示例工具使用指南](operations/examples-guide.md)
+面向日常使用，描述当前版本的实际行为：
+
+- [事务与并发语义](user-guide/transactions-and-concurrency.md)：隔离级别、可见性、锁与持久化边界。
+- [查询管理与语句超时](user-guide/query-management.md)：`SHOW PROCESSLIST`、`KILL QUERY` 与语句超时配置。
+- [变更订阅（Pub/Sub）](user-guide/pubsub.md)：订阅表插入变更、主题通配符与慢消费者策略。
+
+## 运维
+
+- [示例工具使用指南](operations/examples-guide.md)：导入、导出、订阅与性能测试示例的用法。
 - [数据导入流程说明](operations/data-import-flow.md)
 - [Windows 安装说明](operations/windows-installation.md)
 - [金融行情场景验证与测试清单](operations/financial-market-data-validation-checklist.md)
 
 ## 架构与设计
 
-- [Taibai 列式数据库服务器](design/TAIBAI_DESIGN_ZH.md)
-- [Rust 列式数据库架构方案](design/columnar-database-design.md)
-- [CLUSTER BY Binary Search Integration Design](design/cluster-by-binary-search-design.md)
-- [SQL Transaction Support Analysis](design/transaction-hooks-analysis.md)
+- [Taibai 列式数据库服务器](design/TAIBAI_DESIGN_ZH.md)：整体架构与各子系统设计。
+- [Rust 列式数据库架构方案](design/columnar-database-design.md)：最初的架构设计文档。
+- [分区级 mutation lock 设计](design/partition-mutation-locks.md)：写入互斥的锁粒度与锁序。
 - [Transaction State Model and Session Management](design/transaction-state-model.md)
-- [分区级 mutation lock 设计](design/partition-mutation-locks.md)
+- [SQL Transaction Support Analysis](design/transaction-hooks-analysis.md)
+- [CLUSTER BY Binary Search Integration Design](design/cluster-by-binary-search-design.md)
+- [实时 tick 内存态设计](design/realtime-tick-inmemory-design.md)
+- [Direct Bulk 二进制协议](design/direct-bulk-binary-protocol.md)
 - [通用性能基础](general-performance-foundations.md)
 
 ## 计划
 
-计划文档描述设计方向，不代表功能已经发布或稳定支持。
+计划文档描述尚未完成的设计方向，不代表功能已经发布或稳定支持；已实施完成的计划会从本目录清理（历史版本见 git 记录）。
 
-- [Implementation Plan](plans/implementation-plan.md)
-- [导入性能优化方案](plans/import-optimization-plan.md)
-- [查询性能架构重构计划](plans/query-performance-architecture-refactor-plan.md)
+- [向量化执行 → Parquet/Arrow → 时序金融深化路线图](plans/vectorization-parquet-timeseries-roadmap.md)：当前主线路线图。
+- [行情数据实时落库改造方案](plans/realtime-market-data-ingestion-plan.md)：实时摄取链路（ingest profile、二进制列式直写）。
+- [ScalarValue 演进与聚合执行器路线图](plans/scalar-value-evolution-roadmap.md)
+- [普通 INSERT 持久化路径磁盘 I/O 优化方案](plans/ordinary-insert-disk-io-optimization-plan.md)
+- [Durable Tail 升级为可查询 spill 层](plans/memtable-tail-spill-layer-plan.md)：Phase 1+2 已实施，Phase 3 未实施。
 
 ## 报告
 
 报告中的数据只适用于文档记录的版本、配置和测试环境。
 
-- [性能测试与验证报告](reports/performance-verification-report.md)
-- [Quest Completion Report](reports/quest-completion-report.md)
+- [Taibai vs DuckDB vs kdb+ 性能对比报告](reports/benchmark-vs-duckdb-kdb-2026-09.md)：当前版本的对照基准。
+- [性能测试与验证报告](reports/performance-verification-report.md)：写入路径性能与瓶颈分析。
+- [SQL 查询语义支持度审计报告](reports/sql-semantics-audit-report.md)
 
 ## 项目治理
 
 - [贡献指南](../CONTRIBUTING.md)
 - [安全策略](../SECURITY.md)
 - [社区行为准则](../CODE_OF_CONDUCT.md)
-- [更新日志](../CHANGELOG.md)
 - [MIT 许可证](../LICENSE-MIT)
 - [Apache 2.0 许可证](../LICENSE-APACHE)
