@@ -14,6 +14,7 @@
 - [事务与并发语义](user-guide/transactions-and-concurrency.md)：隔离级别、可见性、锁与持久化边界。
 - [查询管理与语句超时](user-guide/query-management.md)：`SHOW PROCESSLIST`、`KILL QUERY` 与语句超时配置。
 - [变更订阅（Pub/Sub）](user-guide/pubsub.md)：订阅表插入变更、主题通配符与慢消费者策略。
+- [建表选项 SQL 参考](user-guide/table-options.md)：`CLUSTER BY`、`PARTITION BY`、`TTL`、`HOT`、`DURABILITY`、`COMPRESSION_LEVEL` 的语法与 `ALTER TABLE` 维护语句。
 
 ## 运维
 
