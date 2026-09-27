@@ -226,7 +226,6 @@ fn publish_with_no_subscribers_is_free() {
 }
 
 #[test]
-#[test]
 fn delete_and_update_events_carry_distinct_message_types() {
     let hub = PubSubHub::new(test_settings(64, 8));
     let (push_tx, mut push_rx) = tokio::sync::mpsc::channel(8);
