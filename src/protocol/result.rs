@@ -20,6 +20,13 @@ pub fn encode_binary_result(batch: &RecordBatch) -> Vec<u8> {
 
 pub fn encode_binary_result_batches(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
     let num_cols = schema.num_columns();
+    // Heterogeneous batches (mixed column counts) would desynchronize the
+    // stream layout — the bitmap section pads missing columns but the data
+    // section does not. Reject loudly instead of emitting a corrupt frame.
+    debug_assert!(
+        batches.iter().all(|b| b.num_columns() == num_cols),
+        "heterogeneous result batches"
+    );
     let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     // Rough size estimate so the payload builds with at most one realloc

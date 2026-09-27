@@ -450,8 +450,24 @@ impl Client {
 
         self.pipeline_mode.store(false, Ordering::Release);
         self.send(Message::empty(MSG_TYPE_PING)).await?;
-        self.recv().await?;
-        Ok(())
+        // The PING/PONG fences the pipeline: every buffered bulk response
+        // ordered before it must be drained first. Reading exactly one
+        // frame and discarding it (the old behavior) silently swallowed a
+        // late bulk response when the drain timed out, permanently shifting
+        // the request/response pairing.
+        for _ in 0..1000 {
+            let msg = self.recv().await?;
+            if msg.msg_type == MSG_TYPE_PONG {
+                return Ok(());
+            }
+            tracing::debug!(
+                msg_type = msg.msg_type,
+                "stop_pipeline: discarding response ordered before the PONG fence"
+            );
+        }
+        Err(TaibaiError::Protocol(
+            "pipeline stop: no PONG within the fence window".into(),
+        ))
     }
 
     pub async fn drain_pipeline(&mut self) -> Result<()> {
@@ -806,6 +822,7 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
             default_value: None,
             column_id: 0,
             previous_names: Vec::new(),
+            added_at_micros: None,
         });
         offset += 4 + name.len() + 3;
     }

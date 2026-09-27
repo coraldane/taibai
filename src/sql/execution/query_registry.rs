@@ -129,7 +129,16 @@ impl Drop for QueryRegistration {
 /// readable line per statement regardless of payload size.
 fn collapse_sql(sql: &str) -> String {
     let mut snippet: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    snippet.truncate(SQL_SNIPPET_LEN);
+    // `String::truncate` panics on non-char boundaries; multi-byte SQL
+    // (CJK identifiers/strings) hitting the 512-byte cut used to kill the
+    // connection task.
+    if snippet.len() > SQL_SNIPPET_LEN {
+        let mut cut = SQL_SNIPPET_LEN;
+        while cut > 0 && !snippet.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        snippet.truncate(cut);
+    }
     snippet
 }
 

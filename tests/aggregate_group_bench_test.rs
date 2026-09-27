@@ -196,7 +196,7 @@ fn segment_run_length_stats() {
         reader.row_count()
     );
     let rg = 0;
-    let rows = reader.row_group_rows(rg) as usize;
+    let _rows = reader.row_group_rows(rg) as usize;
     for (col_idx, col_def) in reader.schema().columns.iter().enumerate() {
         let raw = match reader.read_column_raw(rg, col_idx) {
             Ok(raw) => raw,

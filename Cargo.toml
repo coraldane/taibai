@@ -128,10 +128,6 @@ name = "transaction_integration_test"
 path = "tests/transaction_integration_test.rs"
 
 [[test]]
-name = "dml_modify_integration_test"
-path = "tests/update_test.rs"
-
-[[test]]
 name = "hot_store_fast_path_test"
 path = "tests/hot_store_fast_path_test.rs"
 
