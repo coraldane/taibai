@@ -132,12 +132,18 @@ fn plan_delete_memtable_rows(
     where_clause: &Option<Expr>,
     table_schema: &Schema,
     target_partition_key: Option<&str>,
+    reader_txn_id: u64,
 ) -> Result<Vec<ReplaceMemtableConflictPlan>> {
     let mut plans = Vec::new();
-    for memtable in engine.memtable_manager().get_by_table(db, table) {
-        if memtable.is_transactional() || memtable.visibility() != TxnVisibility::Committed {
-            continue;
-        }
+    // Visible-to-this-transaction memtables: committed rows plus this
+    // transaction's own uncommitted INSERTs, so a DELETE inside a
+    // transaction removes rows the same transaction just wrote (they used
+    // to survive the DELETE and reappear after COMMIT). Rows of other
+    // still-open transactions stay untouched.
+    for memtable in engine
+        .memtable_manager()
+        .get_visible_to(db, table, reader_txn_id)
+    {
         if let Some(key) = target_partition_key {
             if memtable.partition_key() != key {
                 continue;
@@ -207,19 +213,30 @@ pub(crate) fn apply_replace_memtable_conflicts(
             &plan.removed_positions,
             plan.original.num_rows(),
         );
-        if let Err(error) = crate::storage::core::durable_tail::persist(
-            &table_dir,
-            plan.memtable.id(),
-            plan.memtable.partition_key(),
-            &plan.filtered,
-        ) {
-            let _ = plan.memtable.replace_pending_batch(plan.original.clone());
-            let _ = crate::storage::core::durable_tail::persist(
+        // A transactional memtable has no durable tail yet — its rows only
+        // reach the tail at COMMIT — so only committed memtables rewrite
+        // the tail here. The in-memory batch swap above is exactly what
+        // ROLLBACK needs to undo.
+        let tail_result = if plan.memtable.is_transactional() {
+            Ok(())
+        } else {
+            crate::storage::core::durable_tail::persist(
                 &table_dir,
                 plan.memtable.id(),
                 plan.memtable.partition_key(),
-                &plan.original,
-            );
+                &plan.filtered,
+            )
+        };
+        if let Err(error) = tail_result {
+            let _ = plan.memtable.replace_pending_batch(plan.original.clone());
+            if !plan.memtable.is_transactional() {
+                let _ = crate::storage::core::durable_tail::persist(
+                    &table_dir,
+                    plan.memtable.id(),
+                    plan.memtable.partition_key(),
+                    &plan.original,
+                );
+            }
             let _ = restore_replace_memtable_undo(engine, &undo);
             return Err(error);
         }
@@ -946,6 +963,7 @@ pub fn exec_delete(
     db: &str,
     table: &str,
     where_clause: &Option<Expr>,
+    reader_txn_id: u64,
 ) -> Result<ExecResult> {
     let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
@@ -995,6 +1013,7 @@ pub fn exec_delete(
             target_partition_key
                 .as_deref()
                 .filter(|key| !key.is_empty()),
+            reader_txn_id,
         )?;
         if !memtable_plans.is_empty() {
             index_maintenance.record_memtable_rows(&memtable_plans);
@@ -1021,8 +1040,24 @@ pub fn exec_delete(
                 pred,
             )?;
         }
-        let key_projection = index_maintenance.projection(&predicate_projection);
-        let projected_key_positions = index_maintenance.projected_key_positions(&key_projection);
+        // When change subscribers exist the deleted rows themselves must
+        // be published, so row groups are read with every column instead of
+        // the key-only projection; index key positions then map to the full
+        // schema directly.
+        let publish_deletes = engine.pubsub().has_subscribers();
+        let key_projection = if publish_deletes {
+            Vec::new()
+        } else {
+            index_maintenance.projection(&predicate_projection)
+        };
+        let projected_key_positions = index_maintenance.projected_key_positions(
+            &if key_projection.is_empty() {
+                (0..table_schema.columns.len()).collect::<Vec<_>>()
+            } else {
+                key_projection.clone()
+            },
+        );
+        let mut deleted_row_batches: Vec<RecordBatch> = Vec::new();
         let mut first_rewrite_error: Option<crate::common::error::TaibaiError> = None;
         for seg_path in segment_files {
             let (new_bitmap, new_deleted_count, prev_deleted) = {
@@ -1071,11 +1106,15 @@ pub fn exec_delete(
                             reader.read_row_group_with_projection(rg_idx, &key_projection)?
                         };
                         let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
+                        let mut deleted_rows = Vec::new();
                         for (i, matches) in mask.into_iter().enumerate() {
                             if matches
                                 && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
                             {
                                 newly_deleted += 1;
+                                if publish_deletes {
+                                    deleted_rows.push(i as u32);
+                                }
                                 if let Some(segment_path) = segment_path_string.as_deref() {
                                     index_maintenance.record_segment_row(
                                         segment_path,
@@ -1085,6 +1124,17 @@ pub fn exec_delete(
                                         &projected_key_positions,
                                     );
                                 }
+                            }
+                        }
+                        if publish_deletes && !deleted_rows.is_empty() {
+                            let columns = batch
+                                .columns
+                                .iter()
+                                .map(|col| col.take(&deleted_rows))
+                                .collect();
+                            if let Ok(deleted) = RecordBatch::try_new(batch.schema.clone(), columns)
+                            {
+                                deleted_row_batches.push(deleted);
                             }
                         }
                         row_id += batch.num_rows() as u64;
@@ -1104,6 +1154,27 @@ pub fn exec_delete(
                                     i,
                                     &projected_key_positions,
                                 );
+                            }
+                        }
+                        row_id += rg_rows;
+                    } else if publish_deletes {
+                        let batch = reader.read_row_group(rg_idx)?;
+                        let mut deleted_rows = Vec::new();
+                        for i in 0..batch.num_rows() {
+                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64) {
+                                newly_deleted += 1;
+                                deleted_rows.push(i as u32);
+                            }
+                        }
+                        if !deleted_rows.is_empty() {
+                            let columns = batch
+                                .columns
+                                .iter()
+                                .map(|col| col.take(&deleted_rows))
+                                .collect();
+                            if let Ok(deleted) = RecordBatch::try_new(batch.schema.clone(), columns)
+                            {
+                                deleted_row_batches.push(deleted);
                             }
                         }
                         row_id += rg_rows;
@@ -1162,6 +1233,31 @@ pub fn exec_delete(
 
         if total_deleted > 0 {
             engine.invalidate_hot_store(db, table);
+        }
+
+        // Publish the deleted rows as change events only after every footer
+        // rewrite succeeded (errors return above), so subscribers never see
+        // deletions that did not physically happen.
+        if publish_deletes && total_deleted > 0 {
+            // Memtable-resident deletions first, then the segment rows.
+            if let Some((first, rest)) = deleted_row_batches.split_first() {
+                let schema = first.schema.clone();
+                let mut columns: Vec<crate::types::array::ColumnArray> = (0..schema.columns.len())
+                    .map(|c| first.column(c).unwrap().clone())
+                    .collect();
+                for batch in rest {
+                    for (c, col) in columns.iter_mut().enumerate() {
+                        col.append_owned(batch.column(c).unwrap().clone())?;
+                    }
+                }
+                let combined = RecordBatch::try_new(schema, columns)?;
+                engine.pubsub().publish_change(
+                    crate::pubsub::ChangeKind::Delete,
+                    db,
+                    table,
+                    combined,
+                );
+            }
         }
 
         Ok(index_maintenance.apply(engine, db, table))

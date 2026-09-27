@@ -24,6 +24,11 @@ const TAIL_LOG_MAGIC_V2: u32 = 0x544C_4F48;
 const FLUSH_MAGIC: u32 = 0x464C_5553;
 const TAIL_DIR: &str = "memtable_tail";
 static TAIL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Monotonic high-water for generation sequences. Wall-clock nanos alone let
+/// an NTP step backwards make new generations sort before existing ones,
+/// resurrecting deleted tails during arbitration. Seeded from sequences seen
+/// on disk and never allowed to regress within the process.
+static TAIL_SEQUENCE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
 const GROUP_COMMIT_MAX_DELAY: Duration = Duration::from_micros(500);
 /// Once the previous group held several statements the workload is
@@ -1004,6 +1009,9 @@ fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf)>> {
         let Some((id, generation)) = parse_generation(&path) else {
             continue;
         };
+        // Seed the monotonic high-water so sequences minted after a clock
+        // rollback still sort after every generation already on disk.
+        TAIL_SEQUENCE_HIGH_WATER.fetch_max(generation.sequence, Ordering::AcqRel);
         by_id.entry(id).or_default().push(generation);
     }
 
@@ -1405,7 +1413,12 @@ fn next_sequence() -> u64 {
         .as_nanos()
         .min(u64::MAX as u128) as u64;
     let counter = TAIL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    nanos.saturating_add(counter & 0xFFFF)
+    let wall_based = nanos.saturating_add(counter & 0xFFFF);
+    // Never hand out a sequence at or below one already observed on disk or
+    // previously issued: arbitration compares sequences within one memtable
+    // id, and a regression would flip the winner.
+    let high = TAIL_SEQUENCE_HIGH_WATER.fetch_max(wall_based, Ordering::AcqRel);
+    wall_based.max(high.saturating_add(1))
 }
 
 /// A tail file shorter than the V2 log header cannot hold even one committed

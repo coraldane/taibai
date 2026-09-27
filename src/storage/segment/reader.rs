@@ -18,6 +18,7 @@ use crate::types::scalar::ScalarValue;
 
 use super::constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use super::footer::{parse_segment_footer, reserved_section_offset, ParsedSegmentFooter};
+use super::writer::FOOTER_CRC_EXTENSION_MAGIC;
 use super::meta::{read_embedded_footer, read_latest_sidecar_footer};
 use super::RowGroupMeta;
 
@@ -241,13 +242,20 @@ impl SegmentReader {
         let source = Self::read_dat_footer_source(path, None)?;
         let res_offset = reserved_section_offset(&source.footer)?;
 
-        let mut new_footer = Vec::with_capacity(res_offset + 12 + delete_bitmap.len());
+        // The rebuilt footer keeps the row-group prefix (including the
+        // per-row-group CRC extensions) verbatim — the column blocks are
+        // untouched — and replaces the delete section, so the whole-footer
+        // checksum must be recomputed, never copied.
+        let mut new_footer = Vec::with_capacity(res_offset + 20 + delete_bitmap.len());
         new_footer.extend_from_slice(&source.footer[..res_offset]);
         new_footer.extend_from_slice(&deleted_row_count.to_le_bytes());
         new_footer.extend_from_slice(&(delete_bitmap.len() as u32).to_le_bytes());
         if !delete_bitmap.is_empty() {
             new_footer.extend_from_slice(delete_bitmap);
         }
+        let footer_crc = crc32fast::hash(&new_footer);
+        new_footer.extend_from_slice(&FOOTER_CRC_EXTENSION_MAGIC.to_le_bytes());
+        new_footer.extend_from_slice(&footer_crc.to_le_bytes());
 
         // The in-place truncate-and-rewrite below is not atomic: a crash
         // between `set_len` and the new footer reaching disk would leave the
@@ -439,6 +447,18 @@ impl SegmentReader {
             )));
         }
         let compressed = &data[col_offset..col_end];
+
+        // Block checksum (present for segments written with the CRC
+        // extension): bit rot must fail the read instead of decompressing
+        // into garbage values.
+        if let Some(&expected) = rg.column_crcs.get(column_idx) {
+            if crc32fast::hash(compressed) != expected {
+                return Err(TaibaiError::Storage(format!(
+                    "segment column checksum mismatch at row group {} column {}",
+                    row_group, column_idx
+                )));
+            }
+        }
 
         Ok(Self::decompress_column_block(compressed)?.into_owned())
     }

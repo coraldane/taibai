@@ -24,6 +24,8 @@ pub(crate) const VALUE_SET_MAX_DISTINCT: usize = 1024;
 /// Present per row group only when sums were computed (segments written
 /// before the extension keep omitting it).
 pub(crate) const COL_SUM_EXTENSION_MAGIC: u32 = 0x4353_554D; // CSUM
+pub(crate) const COLUMN_CRC_EXTENSION_MAGIC: u32 = 0x4343_5233; // CCR3
+pub(crate) const FOOTER_CRC_EXTENSION_MAGIC: u32 = 0x4643_5233; // FCR3
 
 struct BuildingRowGroup {
     columns: Vec<Vec<u8>>,
@@ -278,8 +280,10 @@ impl SegmentWriter {
         let mut bloom_filters = Vec::with_capacity(encoded_columns.len());
         let mut value_sets = Vec::with_capacity(encoded_columns.len());
         let mut col_sums = Vec::with_capacity(encoded_columns.len());
+        let mut column_crcs = Vec::with_capacity(encoded_columns.len());
         for encoded in encoded_columns {
             let compressed_size = encoded.compressed.len() as u64;
+            column_crcs.push(crc32fast::hash(&encoded.compressed));
             self.file.write_all(&encoded.compressed)?;
             compressed_sizes.push(compressed_size);
             uncompressed_sizes.push(encoded.uncompressed_size);
@@ -300,6 +304,7 @@ impl SegmentWriter {
             bloom_filters,
             value_sets,
             col_sums,
+            column_crcs,
         });
         Ok(())
     }
@@ -339,11 +344,13 @@ impl SegmentWriter {
 
         let mut compressed_sizes = Vec::with_capacity(group.columns.len());
         let mut column_compressed_sizes = Vec::with_capacity(group.columns.len());
+        let mut column_crcs = Vec::with_capacity(group.columns.len());
 
         for col_data in &group.columns {
             let n = col_data.len() as u64;
             compressed_sizes.push(n);
             column_compressed_sizes.push(n);
+            column_crcs.push(crc32fast::hash(col_data));
             self.file.write_all(col_data)?;
         }
 
@@ -391,6 +398,7 @@ impl SegmentWriter {
             bloom_filters,
             value_sets,
             col_sums: group.col_sums,
+            column_crcs,
         });
 
         Ok(())
@@ -534,6 +542,15 @@ pub fn encode_segment_footer(
                 buf.extend_from_slice(&sum.to_le_bytes());
             }
         }
+
+        // Per-row-group column block checksums, same presence rule.
+        if rg.column_crcs.len() == schema.columns.len() {
+            buf.extend_from_slice(&COLUMN_CRC_EXTENSION_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&(rg.column_crcs.len() as u32).to_le_bytes());
+            for &crc in &rg.column_crcs {
+                buf.extend_from_slice(&crc.to_le_bytes());
+            }
+        }
     }
 
     buf.extend_from_slice(&deleted_row_count.to_le_bytes());
@@ -541,6 +558,12 @@ pub fn encode_segment_footer(
     if !delete_bitmap.is_empty() {
         buf.extend_from_slice(delete_bitmap);
     }
+
+    // Whole-footer checksum: a flipped footer byte used to surface as
+    // garbage zone maps or silently-skipped blocks instead of an error.
+    let footer_crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&FOOTER_CRC_EXTENSION_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&footer_crc.to_le_bytes());
 
     buf
 }

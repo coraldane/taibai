@@ -40,6 +40,12 @@ pub const MSG_TYPE_UNSUBSCRIBE: u8 = 0x61;
 /// thread (when above the compression threshold), so the codec must not
 /// compress them again.
 pub const MSG_TYPE_NOTIFICATION: u8 = 0x62;
+/// Row-insert change event (same payload layout as MSG_TYPE_NOTIFICATION).
+pub const MSG_TYPE_NOTIFICATION_INSERT: u8 = 0x63;
+/// Row-delete change event: the payload carries the deleted rows.
+pub const MSG_TYPE_NOTIFICATION_DELETE: u8 = 0x64;
+/// Row-update change event: the payload carries the post-update rows.
+pub const MSG_TYPE_NOTIFICATION_UPDATE: u8 = 0x65;
 
 #[derive(Debug, Clone)]
 pub struct MessageHeader {

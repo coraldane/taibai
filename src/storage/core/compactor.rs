@@ -45,6 +45,36 @@ pub struct CompactStats {
 /// prepared output must be discarded.
 type SegmentFileIdentity = (u64, u64, u64);
 
+/// Memory budget for the clustered-compaction in-memory fast path. Beyond
+/// it the rewrite switches to an external merge sort (bounded-size sorted
+/// runs spilled to temp segment files, then a k-way merge into the output),
+/// so peak memory no longer scales with partition size.
+const CLUSTERED_MERGE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Test hook: when non-zero, overrides the in-memory budget so the external
+/// merge path can be exercised on small data sets.
+#[cfg(test)]
+pub(crate) static CLUSTERED_MERGE_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn clustered_merge_budget_bytes() -> usize {
+    let override_value = CLUSTERED_MERGE_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if override_value > 0 {
+        override_value
+    } else {
+        CLUSTERED_MERGE_BUDGET_BYTES
+    }
+}
+
+#[cfg(not(test))]
+fn clustered_merge_budget_bytes() -> usize {
+    CLUSTERED_MERGE_BUDGET_BYTES
+}
+/// Maximum number of sorted runs merged at once; larger run counts are
+/// merged in waves.
+const CLUSTERED_MERGE_MAX_RUNS: usize = 64;
+
 /// Outcome of the unlocked heavy phase (decode/sort/tmp write) of one
 /// partition compaction. The commit phase validates and installs it under
 /// the partition mutation lock.
@@ -575,6 +605,62 @@ impl Compactor {
                 }
             }
             source_row_group_count = sources.len();
+
+            let estimated_width = estimated_row_width_bytes(schema);
+            let in_memory_budget_rows = (clustered_merge_budget_bytes() / estimated_width)
+                .max(output_row_group_rows * 4);
+            if global_row_base > in_memory_budget_rows {
+                // Partition exceeds the in-memory budget: spill sorted runs
+                // to temp files and k-way merge them into the output, keeping
+                // peak memory proportional to the budget instead of the
+                // partition.
+                let final_path = self
+                    .segment_mgr
+                    .next_replacement_segment_path(table_dir, partition_key)?;
+                let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
+                let (rows_written, dropped) = self.prepare_clustered_external(
+                    db,
+                    table,
+                    partition_label,
+                    &tmp_path,
+                    &final_path,
+                    schema,
+                    sort_key_indices,
+                    bloom_column_indices,
+                    &segment_files,
+                    ttl,
+                    output_row_group_rows,
+                    compression_level,
+                )?;
+                if rows_written == 0 {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Ok(PreparedCompaction::AllDropped {
+                        segment_files,
+                        identities,
+                        segments_read,
+                        rows_dropped: dropped,
+                    });
+                }
+                tracing::info!(
+                    db,
+                    table,
+                    table_full_name = %format!("{}.{}", db, table),
+                    partition_key = partition_label,
+                    rows = rows_written,
+                    rows_dropped = dropped,
+                    elapsed_ms = decode_started.elapsed().as_millis(),
+                    "clustered optimization finished via external merge sort"
+                );
+                return Ok(PreparedCompaction::Replacement {
+                    segment_files,
+                    identities,
+                    tmp_path,
+                    final_path,
+                    segments_read,
+                    rows_to_write: rows_written,
+                    rows_dropped: dropped,
+                });
+            }
             if global_row_base > u32::MAX as usize {
                 return Err(TaibaiError::Storage(format!(
                     "clustered optimization supports at most {} rows per partition",
@@ -973,6 +1059,345 @@ impl Compactor {
         writer.seal()
     }
 
+    /// External-merge clustered rewrite: build bounded sorted runs, merge
+    /// them (in waves when necessary) into the output tmp segment. Returns
+    /// (rows written to the output, rows dropped as deleted/expired).
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_clustered_external(
+        &self,
+        db: &str,
+        table: &str,
+        partition_label: &str,
+        tmp_path: &Path,
+        final_path: &Path,
+        schema: &Schema,
+        sort_key_indices: &[usize],
+        bloom_column_indices: &[usize],
+        segment_files: &[PathBuf],
+        ttl: Option<(usize, i64)>,
+        output_row_group_rows: usize,
+        compression_level: i32,
+    ) -> Result<(usize, u64)> {
+        let estimated_width = estimated_row_width_bytes(schema);
+        let run_rows = (clustered_merge_budget_bytes() / estimated_width)
+            .max(output_row_group_rows * 4)
+            .max(1);
+
+        // ---- Pass A: bounded chunks, each sorted and spilled to a run ----
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        let duration = ttl.map(|(_, secs)| secs.saturating_mul(1_000_000));
+
+        let mut source_row_groups: Vec<SourceRowGroup> = Vec::new();
+        let mut rows_per_source: Vec<usize> = Vec::new();
+        for seg_path in segment_files {
+            let reader = self.segment_mgr.open_reader(seg_path)?;
+            for rg_idx in 0..reader.num_row_groups() {
+                source_row_groups.push(SourceRowGroup {
+                    segment_path: seg_path.clone(),
+                    row_group_idx: rg_idx,
+                });
+                rows_per_source.push(reader.row_group_rows(rg_idx) as usize);
+            }
+        }
+
+        let projection = (0..schema.num_columns()).collect::<Vec<_>>();
+        let mut cache = RowGroupCache::new(16, projection);
+        let mut refs: Vec<RowRef> = Vec::with_capacity(run_rows);
+        let mut run_paths: Vec<PathBuf> = Vec::new();
+        let mut run_seq = 0usize;
+        let mut dropped = 0u64;
+
+        let flush_run = |cache: &mut RowGroupCache,
+                             run_paths: &mut Vec<PathBuf>,
+                             run_seq: &mut usize,
+                             refs: &mut Vec<RowRef>|
+         -> Result<()> {
+            if refs.is_empty() {
+                return Ok(());
+            }
+            let batch =
+                self.gather_cached_chunk(schema, &source_row_groups, refs, cache)?;
+            let mut indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
+            sort_clustered_row_indices(&mut indices, &batch, sort_key_indices);
+            let sorted = gather_global_chunk(schema, &batch, &indices)?;
+            let run_path = merge_run_path(final_path, *run_seq);
+            *run_seq += 1;
+            let mut writer = SegmentWriter::create(&run_path, schema.clone(), run_rows, 0)?;
+            writer.write_batch_parallel(&sorted)?;
+            writer.seal()?;
+            run_paths.push(run_path);
+            refs.clear();
+            Ok(())
+        };
+
+        for (source_idx, source) in source_row_groups.iter().enumerate() {
+            let row_count = rows_per_source[source_idx];
+            let reader = self.segment_mgr.open_reader(&source.segment_path)?;
+            let mut segment_row_base = 0u64;
+            for prior in 0..source.row_group_idx {
+                segment_row_base += reader.row_group_rows(prior) as u64;
+            }
+            let ttl_col = ttl.and_then(|(idx, _)| reader.read_column(source.row_group_idx, idx).ok());
+            for row_idx in 0..row_count {
+                let row_id = segment_row_base + row_idx as u64;
+                if reader.is_row_deleted(row_id) {
+                    dropped += 1;
+                    continue;
+                }
+                if let (Some(col), Some(duration)) = (&ttl_col, duration) {
+                    let visible = matches!(
+                        col.scalar(row_idx),
+                        crate::types::scalar::ScalarValue::Timestamp(Some(ts))
+                            if ts.saturating_add(duration) > now
+                    );
+                    if !visible {
+                        dropped += 1;
+                        continue;
+                    }
+                }
+                refs.push(RowRef {
+                    batch_idx: source_idx,
+                    row_idx,
+                });
+                if refs.len() >= run_rows {
+                    flush_run(&mut cache, &mut run_paths, &mut run_seq, &mut refs)?;
+                }
+            }
+        }
+        flush_run(&mut cache, &mut run_paths, &mut run_seq, &mut refs)?;
+
+        if run_paths.is_empty() {
+            return Ok((0, dropped));
+        }
+
+        // ---- Pass B: k-way merge (waves when runs exceed the fan-in) ----
+        let cleanup_runs = |paths: &[PathBuf]| {
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+                let _ = crate::storage::segment::meta::remove_sidecar_meta(path);
+            }
+        };
+        let mut wave = 0usize;
+        let mut current_runs = run_paths;
+        let result = (|| -> Result<usize> {
+            while current_runs.len() > CLUSTERED_MERGE_MAX_RUNS {
+                wave += 1;
+                let mut next_runs = Vec::new();
+                let mut next_seq = 0usize;
+                for group in current_runs.chunks(CLUSTERED_MERGE_MAX_RUNS) {
+                    let merged_path = merge_wave_path(final_path, wave, next_seq);
+                    next_seq += 1;
+                    let mut writer =
+                        SegmentWriter::create(&merged_path, schema.clone(), output_row_group_rows, 0)?;
+                    self.merge_runs_into_writer(
+                        group,
+                        schema,
+                        sort_key_indices,
+                        output_row_group_rows,
+                        &mut writer,
+                    )?;
+                    writer.seal()?;
+                    next_runs.push(merged_path);
+                }
+                cleanup_runs(&current_runs);
+                current_runs = next_runs;
+            }
+
+            let mut writer = SegmentWriter::create_with_bloom_columns(
+                tmp_path,
+                schema.clone(),
+                output_row_group_rows,
+                bloom_column_indices,
+                compression_level,
+            )?;
+            let written = self.merge_runs_into_writer(
+                &current_runs,
+                schema,
+                sort_key_indices,
+                output_row_group_rows,
+                &mut writer,
+            )?;
+            writer.seal()?;
+            Ok(written)
+        })();
+        cleanup_runs(&current_runs);
+        let written = result?;
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key = partition_label,
+            runs = current_runs.len(),
+            rows_written = written,
+            "clustered external merge completed"
+        );
+        Ok((written, dropped))
+    }
+
+    /// K-way merge of sorted run files into `writer`, gathering rows through
+    /// a bounded row-group cache.
+    fn merge_runs_into_writer(
+        &self,
+        run_paths: &[PathBuf],
+        schema: &Schema,
+        sort_key_indices: &[usize],
+        output_row_group_rows: usize,
+        writer: &mut SegmentWriter,
+    ) -> Result<usize> {
+        // Streams are files; each file's row groups occupy contiguous slots
+        // in source_row_groups, so (source_idx, row_idx) ordering matches the
+        // original global row order for stable tie-breaks.
+        let mut source_row_groups: Vec<SourceRowGroup> = Vec::new();
+        let mut rows_per_source: Vec<usize> = Vec::new();
+        let mut file_bounds: Vec<(usize, usize)> = Vec::new(); // [start, end) source slots
+        for path in run_paths {
+            let reader = self.segment_mgr.open_reader(path)?;
+            let start = source_row_groups.len();
+            for rg_idx in 0..reader.num_row_groups() {
+                source_row_groups.push(SourceRowGroup {
+                    segment_path: path.clone(),
+                    row_group_idx: rg_idx,
+                });
+                rows_per_source.push(reader.row_group_rows(rg_idx) as usize);
+            }
+            file_bounds.push((start, source_row_groups.len()));
+        }
+
+        let projection = (0..schema.num_columns()).collect::<Vec<_>>();
+        let mut cache = RowGroupCache::new(32, projection);
+
+        struct MergeHead<'k> {
+            keys: Vec<crate::types::scalar::ScalarValue>,
+            source_idx: usize,
+            row_idx: usize,
+            sort_keys: &'k [usize],
+        }
+        impl PartialEq for MergeHead<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other) == std::cmp::Ordering::Equal
+            }
+        }
+        impl Eq for MergeHead<'_> {}
+        impl PartialOrd for MergeHead<'_> {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for MergeHead<'_> {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                for (col, _key_idx) in self.sort_keys.iter().enumerate() {
+                    let Some(left) = self.keys.get(col) else {
+                        continue;
+                    };
+                    let Some(right) = other.keys.get(col) else {
+                        continue;
+                    };
+                    let ord =
+                        crate::storage::index::sort_key::compare_scalars_for_sort(left, right);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord
+                            // Stable, deterministic tie-break: original row
+                            // order.
+                            .then(self.source_idx.cmp(&other.source_idx))
+                            .then(self.row_idx.cmp(&other.row_idx));
+                    }
+                }
+                self.source_idx
+                    .cmp(&other.source_idx)
+                    .then(self.row_idx.cmp(&other.row_idx))
+            }
+        }
+
+        // BinaryHeap is a max-heap; reverse for smallest-first.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
+
+        let materialize_keys = |cache: &mut RowGroupCache, source_idx: usize, row_idx: usize| -> Result<Vec<crate::types::scalar::ScalarValue>> {
+            let source = &source_row_groups[source_idx];
+            let batch = cache.get(source, &self.segment_mgr)?;
+            Ok(sort_key_indices
+                .iter()
+                .map(|&col| {
+                    batch
+                        .column(col)
+                        .map(|column| column.scalar(row_idx))
+                        .unwrap_or(crate::types::scalar::ScalarValue::Int64(None))
+                })
+                .collect())
+        };
+
+        for file_idx in 0..file_bounds.len() {
+            let (start, end) = file_bounds[file_idx];
+            if start == end {
+                continue;
+            }
+            if rows_per_source[start] == 0 {
+                continue;
+            }
+            let keys = materialize_keys(&mut cache, start, 0)?;
+            heap.push(Reverse(MergeHead {
+                keys,
+                source_idx: start,
+                row_idx: 0,
+                sort_keys: sort_key_indices,
+            }));
+        }
+
+        let mut chunk: Vec<RowRef> = Vec::with_capacity(output_row_group_rows);
+        let mut rows_written = 0usize;
+        while let Some(Reverse(head)) = heap.pop() {
+            chunk.push(RowRef {
+                batch_idx: head.source_idx,
+                row_idx: head.row_idx,
+            });
+            rows_written += 1;
+            // Advance this stream: next row in the same row group, else the
+            // next row group of the same file.
+            let mut next_source = head.source_idx;
+            let mut next_row = head.row_idx + 1;
+            if next_row >= rows_per_source[next_source] {
+                next_source += 1;
+                next_row = 0;
+                // Stay inside the file's row-group range.
+                let file = file_bounds
+                    .iter()
+                    .find(|&&(start, end)| head.source_idx >= start && head.source_idx < end);
+                if let Some(&(_start, end)) = file {
+                    if next_source >= end {
+                        continue; // file exhausted
+                    }
+                } else if next_source >= source_row_groups.len() {
+                    continue;
+                }
+                if rows_per_source[next_source] == 0 {
+                    continue;
+                }
+            }
+            let keys = materialize_keys(&mut cache, next_source, next_row)?;
+            heap.push(Reverse(MergeHead {
+                keys,
+                source_idx: next_source,
+                row_idx: next_row,
+                sort_keys: sort_key_indices,
+            }));
+
+            if chunk.len() >= output_row_group_rows {
+                let batch = self.gather_cached_chunk(schema, &source_row_groups, &chunk, &mut cache)?;
+                writer.write_batch_parallel(&batch)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            let batch = self.gather_cached_chunk(schema, &source_row_groups, &chunk, &mut cache)?;
+            writer.write_batch_parallel(&batch)?;
+        }
+        Ok(rows_written)
+    }
+
     fn gather_cached_chunk(
         &self,
         schema: &Schema,
@@ -1136,6 +1561,41 @@ fn compare_row_indices(
         }
     }
     Ordering::Equal
+}
+
+fn estimated_row_width_bytes(schema: &Schema) -> usize {
+    schema
+        .columns
+        .iter()
+        .map(|col| {
+            col.data_type
+                .fixed_size()
+                .map(|w| w as usize)
+                .unwrap_or(0)
+                .max(8)
+                + 24
+        })
+        .sum::<usize>()
+        .max(32)
+}
+
+/// Temp path for one sorted run of the external merge. The name never
+/// matches segment discovery patterns, and startup cleanup removes
+/// `.merge.tmp.` leftovers after a crash.
+fn merge_run_path(final_path: &Path, seq: usize) -> PathBuf {
+    let name = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "segment.dat".to_string());
+    final_path.with_file_name(format!("{}.merge.tmp.{}", name, seq))
+}
+
+fn merge_wave_path(final_path: &Path, wave: usize, seq: usize) -> PathBuf {
+    let name = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "segment.dat".to_string());
+    final_path.with_file_name(format!("{}.merge.tmp.w{}n{}", name, wave, seq))
 }
 
 fn sort_clustered_row_indices(

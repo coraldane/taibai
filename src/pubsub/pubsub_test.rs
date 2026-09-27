@@ -2,7 +2,11 @@ use std::time::Duration;
 
 use super::{PubSubHub, TopicPattern};
 use crate::common::config::PubSubSettings;
-use crate::protocol::message::{read_len_prefixed_string, MSG_TYPE_NOTIFICATION};
+use crate::protocol::message::{
+    read_len_prefixed_string, MSG_TYPE_NOTIFICATION, MSG_TYPE_NOTIFICATION_DELETE,
+    MSG_TYPE_NOTIFICATION_UPDATE,
+};
+use super::ChangeKind;
 use crate::protocol::types::DataType;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
@@ -218,6 +222,35 @@ fn publish_with_no_subscribers_is_free() {
     let hub = PubSubHub::new(test_settings(64, 8));
     hub.publish("main", "ticks", int_batch(vec![1]));
     assert_eq!(hub.subscriber_count(), 0);
+    hub.shutdown();
+}
+
+#[test]
+#[test]
+fn delete_and_update_events_carry_distinct_message_types() {
+    let hub = PubSubHub::new(test_settings(64, 8));
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::channel(8);
+    let conn = hub.create_conn(push_tx);
+    hub.subscribe(&conn, "main.ticks").expect("subscribe");
+
+    hub.publish_change(ChangeKind::Delete, "main", "ticks", int_batch(vec![7]));
+    let msg = recv_with_timeout(&mut push_rx, Duration::from_secs(5)).expect("delete event");
+    assert_eq!(msg.msg_type, MSG_TYPE_NOTIFICATION_DELETE);
+    let seq = u64::from_le_bytes(msg.payload[8..16].try_into().unwrap());
+    assert_eq!(seq, 1);
+
+    hub.publish_change(ChangeKind::Update, "main", "ticks", int_batch(vec![8]));
+    let msg = recv_with_timeout(&mut push_rx, Duration::from_secs(5)).expect("update event");
+    assert_eq!(msg.msg_type, MSG_TYPE_NOTIFICATION_UPDATE);
+    let seq = u64::from_le_bytes(msg.payload[8..16].try_into().unwrap());
+    assert_eq!(seq, 2, "change kinds share the per-topic sequence");
+
+    hub.publish("main", "ticks", int_batch(vec![9]));
+    let msg = recv_with_timeout(&mut push_rx, Duration::from_secs(5)).expect("insert event");
+    assert_eq!(msg.msg_type, MSG_TYPE_NOTIFICATION);
+    let seq = u64::from_le_bytes(msg.payload[8..16].try_into().unwrap());
+    assert_eq!(seq, 3);
+
     hub.shutdown();
 }
 

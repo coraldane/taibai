@@ -38,7 +38,7 @@ pub fn build_physical_pipeline(
 pub(crate) fn build_profiled_materialized_pipeline(
     plan: LogicalPlan,
     ctx: &mut PhysicalContext<'_>,
-    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_batches: &HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     scan_seeds: &HashMap<String, ScanProfileSeed>,
     profile: &QueryProfile,
 ) -> Result<Box<dyn ExecutionOp>> {
@@ -160,7 +160,7 @@ fn build_operator_with_limit(
     plan: LogicalPlan,
     ctx: &mut PhysicalContext<'_>,
     limit_hint: Option<usize>,
-    table_batches: Option<&HashMap<String, Vec<RecordBatch>>>,
+    table_batches: Option<&HashMap<String, Vec<std::sync::Arc<RecordBatch>>>>,
     scan_seeds: Option<&HashMap<String, ScanProfileSeed>>,
     profile: Option<&QueryProfile>,
     depth: usize,
@@ -191,7 +191,8 @@ fn build_operator_with_limit(
                     .cloned()
                     .unwrap_or_default();
                 Ok(Box::new(
-                    ScanExec::new(batches, scan.projection).with_table_schema(scan.schema),
+                    ScanExec::new_shared(batches, scan.projection)
+                        .with_table_schema(scan.schema),
                 ))
             } else {
                 let (physical_table_name, database) = {

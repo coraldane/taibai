@@ -65,6 +65,7 @@ impl SegmentManager {
                             }
                             let tbl_dir = tbl_entry.path();
                             cleanup_incomplete_compaction_files(&tbl_dir);
+                            recover_replace_journals(&tbl_dir);
                             let max_seq = discover_max_seq(&tbl_dir);
                             let partition_seq = discover_max_partition_seq(&tbl_dir);
                             let key = table_key(&db_name, &table_name);
@@ -650,6 +651,7 @@ impl SegmentManager {
         Ok(())
     }
 
+
     pub fn replace_segments_with_tmp(
         &self,
         tmp_path: &Path,
@@ -674,11 +676,36 @@ impl SegmentManager {
         // footer before replacing any source segment; no sidecar is required.
         read_embedded_segment_meta(tmp_path)?;
 
-        std::fs::rename(tmp_path, final_path)?;
+        // Two-phase commit: the journal records which old segments the
+        // replacement must retire. A crash between the rename and the old
+        // file removals used to leave the new AND old segments on disk, and
+        // every scan then counted those rows twice. Startup recovery
+        // (`recover_replace_journals`) finishes the retirement.
+        let journal = replace_journal_path(final_path);
+        write_replace_journal(&journal, old_segments)?;
+
+        if let Err(error) = std::fs::rename(tmp_path, final_path) {
+            let _ = std::fs::remove_file(&journal);
+            return Err(error.into());
+        }
+        // From here on the replacement is in effect: keep removing the old
+        // segments even after an individual failure (the journal lets
+        // startup recovery finish), and report the first error.
+        let mut first_removal_error = None;
         for old_seg in old_segments {
             if old_seg != final_path {
-                self.remove_segment_file(old_seg)?;
+                if let Err(error) = self.remove_segment_file(old_seg) {
+                    tracing::warn!(
+                        old_segment = %old_seg.display(),
+                        error = %error,
+                        "old segment removal failed; startup recovery will retry"
+                    );
+                    first_removal_error = first_removal_error.or(Some(error));
+                }
             }
+        }
+        if first_removal_error.is_none() {
+            let _ = std::fs::remove_file(&journal);
         }
 
         remove_sidecar_meta(tmp_path)?;
@@ -1380,4 +1407,136 @@ fn acquire_partition_mutation_lock<'a>(
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_millis(16));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Segment replacement journal (`<final>.replace`)
+//
+// Records the old segments a `replace_segments_with_tmp` call must retire, so
+// a crash between the rename and the removals cannot leave the new and old
+// segments visible at the same time (double-counted rows).
+// Layout: magic(8) | old_count u32 | per old: len u32 + utf8 path | crc32 u32
+// ---------------------------------------------------------------------------
+
+const REPLACE_JOURNAL_MAGIC: &[u8; 8] = b"TBREPJ01";
+
+pub(crate) fn replace_journal_path(final_path: &Path) -> PathBuf {
+let mut name = final_path.as_os_str().to_os_string();
+name.push(".replace");
+PathBuf::from(name)
+}
+
+pub(crate) fn write_replace_journal(journal: &Path, old_segments: &[PathBuf]) -> Result<()> {
+let mut body = Vec::new();
+body.extend_from_slice(&(old_segments.len() as u32).to_le_bytes());
+for old in old_segments {
+    let text = old.to_string_lossy();
+    body.extend_from_slice(&(text.len() as u32).to_le_bytes());
+    body.extend_from_slice(text.as_bytes());
+}
+let mut hasher = crc32fast::Hasher::new();
+hasher.update(&body);
+let crc = hasher.finalize();
+
+let tmp = {
+    let mut name = journal.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+};
+let mut file = std::fs::OpenOptions::new()
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .open(&tmp)?;
+use std::io::Write as _;
+file.write_all(REPLACE_JOURNAL_MAGIC)?;
+file.write_all(&body)?;
+file.write_all(&crc.to_le_bytes())?;
+file.sync_all()?;
+drop(file);
+std::fs::rename(&tmp, journal)?;
+Ok(())
+}
+
+/// Finish or discard interrupted segment replacements at startup. With the
+/// final segment present the rename had committed, so the retirement of the
+/// listed old segments is completed; without it the rename never happened.
+pub(crate) fn recover_replace_journals(table_dir: &Path) {
+let Ok(entries) = std::fs::read_dir(table_dir) else {
+    return;
+};
+for entry in entries.flatten() {
+    let path = entry.path();
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        continue;
+    };
+    let Some(final_name) = name.strip_suffix(".replace") else {
+        continue;
+    };
+    let final_path = table_dir.join(final_name);
+    let Some(olds) = read_replace_journal(&path) else {
+        let _ = std::fs::remove_file(&path);
+        continue;
+    };
+    if final_path.exists() {
+        for old in &olds {
+            if old != &final_path && old.exists() {
+                tracing::warn!(
+                    old_segment = %old.display(),
+                    "startup recovery: retiring old segment left by interrupted replacement"
+                );
+                let _ = std::fs::remove_file(old);
+                let _ = remove_sidecar_meta(old);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+}
+
+fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
+let bytes = std::fs::read(journal).ok()?;
+if bytes.len() < 8 + 4 + 4 || !bytes.starts_with(REPLACE_JOURNAL_MAGIC) {
+    return None;
+}
+let body = &bytes[8..bytes.len() - 4];
+let crc = u32::from_le_bytes(
+    bytes[bytes.len() - 4..]
+        .try_into()
+        .expect("crc slice has fixed length"),
+);
+let mut hasher = crc32fast::Hasher::new();
+hasher.update(body);
+if hasher.finalize() != crc {
+    return None;
+}
+let count = u32::from_le_bytes(body[0..4].try_into().expect("u32 slice")) as usize;
+let mut olds = Vec::with_capacity(count.min(4096));
+let mut pos = 4usize;
+for _ in 0..count {
+    if pos + 4 > body.len() {
+        return None;
+    }
+    let len = u32::from_le_bytes(body[pos..pos + 4].try_into().expect("u32 slice")) as usize;
+    pos += 4;
+    if pos + len > body.len() {
+        return None;
+    }
+    olds.push(PathBuf::from(
+        String::from_utf8_lossy(&body[pos..pos + len]).into_owned(),
+    ));
+    pos += len;
+}
+Some(olds)
+}
+
+
+/// Test-only re-exports of the replacement journal internals.
+#[cfg(test)]
+pub mod manager_core_test_support {
+    pub(crate) use super::{
+        recover_replace_journals as recover_replace_journals_for_test,
+        replace_journal_path as replace_journal_path_for_test,
+        write_replace_journal as write_replace_journal_for_test,
+    };
 }

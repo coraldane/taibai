@@ -83,7 +83,7 @@ pub fn exec_explain(
 
     let plan = plan_select(select_from, &table_schemas)?;
     let plan = crate::sql::optimizer::optimize(plan);
-    let mut extra_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut extra_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
     let plan = if let Some(query) = &resolved {
         let outcome = super::decorrelate::decorrelate(plan, &query.registry);
         extra_batches = outcome.extra_batches;

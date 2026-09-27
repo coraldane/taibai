@@ -152,10 +152,12 @@ impl ActiveSegmentWriter {
         let mut uncompressed_sizes = Vec::with_capacity(compressed_columns.len());
         let mut total_length = 0u64;
 
+        let mut column_crcs = Vec::with_capacity(compressed_columns.len());
         for (compressed, uncompressed_size) in compressed_columns {
             let n = compressed.len() as u64;
             column_compressed_sizes.push(n);
             compressed_sizes.push(n);
+            column_crcs.push(crc32fast::hash(compressed));
             uncompressed_sizes.push(*uncompressed_size);
             total_length += n;
             // `file` is already buffered. Writing each compressed column
@@ -186,6 +188,7 @@ impl ActiveSegmentWriter {
             bloom_filters: vec![None; self.schema.num_columns()],
             value_sets,
             col_sums,
+            column_crcs,
         });
         self.current_size += total_length;
         self.total_rows += row_count;
@@ -302,10 +305,12 @@ impl ActiveSegmentWriter {
         let mut compressed_sizes = Vec::with_capacity(num_cols);
         let mut uncompressed_sizes = Vec::with_capacity(num_cols);
         let mut total_length = 0u64;
+        let mut column_crcs = Vec::with_capacity(compressed_columns.len());
         for (compressed, uncompressed_size) in &compressed_columns {
             let n = compressed.len() as u64;
             column_compressed_sizes.push(n);
             compressed_sizes.push(n);
+            column_crcs.push(crc32fast::hash(compressed));
             uncompressed_sizes.push(*uncompressed_size);
             total_length += n;
             self.file.write_all(compressed)?;
@@ -321,6 +326,7 @@ impl ActiveSegmentWriter {
             bloom_filters: vec![None; self.schema.num_columns()],
             value_sets,
             col_sums,
+            column_crcs,
         });
         self.current_size += total_length;
         self.total_rows += rows_to_flush as u64;

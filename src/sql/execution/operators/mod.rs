@@ -113,7 +113,7 @@ pub fn apply_filter_mask(batch: &RecordBatch, mask: &[bool]) -> RecordBatch {
 
 pub fn build_pipeline(
     plan: LogicalPlan,
-    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_batches: &HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
 ) -> Result<Box<dyn ExecutionOp>> {
     build_pipeline_with_subqueries(plan, table_batches, None)
 }
@@ -124,7 +124,7 @@ pub fn build_pipeline(
 /// subqueries are rejected at bind time).
 pub fn build_pipeline_with_subqueries(
     plan: LogicalPlan,
-    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_batches: &HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     subqueries: Option<&SubqueryRegistry>,
 ) -> Result<Box<dyn ExecutionOp>> {
     match plan {
@@ -134,7 +134,8 @@ pub fn build_pipeline_with_subqueries(
                 .cloned()
                 .unwrap_or_default();
             Ok(Box::new(
-                ScanExec::new(batches, scan.projection).with_table_schema(scan.schema),
+                ScanExec::new_shared(batches, scan.projection)
+                    .with_table_schema(scan.schema),
             ))
         }
         LogicalPlan::Filter(filter) => {

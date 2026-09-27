@@ -28,7 +28,10 @@ use tokio::sync::mpsc;
 
 use crate::common::config::PubSubSettings;
 use crate::protocol::compress;
-use crate::protocol::message::{write_len_prefixed_string, Message, MSG_TYPE_NOTIFICATION};
+use crate::protocol::message::{
+    write_len_prefixed_string, Message, MSG_TYPE_NOTIFICATION, MSG_TYPE_NOTIFICATION_DELETE,
+    MSG_TYPE_NOTIFICATION_UPDATE,
+};
 use crate::protocol::result::encode_binary_result;
 use crate::types::batch::RecordBatch;
 
@@ -149,9 +152,17 @@ impl Subscription {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Insert,
+    Delete,
+    Update,
+}
+
 #[derive(Debug)]
 enum PubEvent {
     Change {
+        kind: ChangeKind,
         db: String,
         table: String,
         batch: Arc<RecordBatch>,
@@ -267,6 +278,37 @@ impl PubSubHub {
         self.publish_shared(db, table, Arc::new(batch));
     }
 
+    /// Publish a non-insert change event (deleted rows / post-update rows).
+    /// Payload layout matches insert notifications; only the message type
+    /// differs so existing subscribers can distinguish the kind.
+    pub fn publish_change(
+        &self,
+        kind: ChangeKind,
+        db: &str,
+        table: &str,
+        batch: RecordBatch,
+    ) {
+        if !self.has_subscribers() || batch.num_rows() == 0 {
+            return;
+        }
+        let seq = {
+            let mut seqs = self.topic_seqs.lock().unwrap();
+            let seq = seqs.entry(format!("{db}.{table}")).or_insert(0);
+            *seq = seq.wrapping_add(1);
+            *seq
+        };
+        let event = PubEvent::Change {
+            kind,
+            db: db.to_string(),
+            table: table.to_string(),
+            batch: Arc::new(batch),
+            seq,
+        };
+        if self.event_tx.try_send(event).is_err() {
+            self.record_dropped_event();
+        }
+    }
+
     /// Same as [`publish`](Self::publish) for a batch that is already shared
     /// (e.g. a memtable snapshot), avoiding a column copy on the caller.
     pub fn publish_shared(&self, db: &str, table: &str, batch: Arc<RecordBatch>) {
@@ -283,6 +325,7 @@ impl PubSubHub {
             *seq
         };
         let event = PubEvent::Change {
+            kind: ChangeKind::Insert,
             db: db.to_string(),
             table: table.to_string(),
             batch,
@@ -408,12 +451,13 @@ impl PubSubHub {
         loop {
             match rx.recv_timeout(FANOUT_POLL_INTERVAL) {
                 Ok(PubEvent::Change {
+                    kind,
                     db,
                     table,
                     batch,
                     seq,
                 }) => {
-                    Self::fanout_change(state, &db, &table, batch, seq);
+                    Self::fanout_change(state, kind, &db, &table, batch, seq);
                 }
                 Ok(PubEvent::Shutdown) => break,
                 Err(RecvTimeoutError::Timeout) => {
@@ -428,11 +472,17 @@ impl PubSubHub {
 
     fn fanout_change(
         state: &FanoutState,
+        kind: ChangeKind,
         db: &str,
         table: &str,
         batch: Arc<RecordBatch>,
         seq: u64,
     ) {
+        let msg_type = match kind {
+            ChangeKind::Insert => MSG_TYPE_NOTIFICATION,
+            ChangeKind::Delete => MSG_TYPE_NOTIFICATION_DELETE,
+            ChangeKind::Update => MSG_TYPE_NOTIFICATION_UPDATE,
+        };
         let topic = format!("{db}.{table}");
         // Encode and compress once; every subscriber shares the same buffer.
         let mut encoded = encode_binary_result(&batch);
@@ -458,7 +508,7 @@ impl PubSubHub {
                 payload.extend_from_slice(&seq.to_le_bytes());
                 write_len_prefixed_string(&mut payload, &topic);
                 payload.extend_from_slice(&encoded);
-                let msg = Message::new(MSG_TYPE_NOTIFICATION, Bytes::from(payload));
+                let msg = Message::new(msg_type, Bytes::from(payload));
                 match sub.conn.push_tx.try_send(msg) {
                     Ok(()) => {
                         sub.sent.fetch_add(1, Ordering::Relaxed);

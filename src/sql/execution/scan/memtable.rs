@@ -266,8 +266,7 @@ pub fn scan_memtables(
     let mut batches = Vec::new();
 
     for mt in &memtables {
-        for mt_batch in mt
-            .read_with(|source| {
+        if let Some(mt_batch) = mt.read_with(|source| {
                 if source.num_rows() == 0 {
                     return None;
                 }

@@ -25,6 +25,10 @@ pub struct RowGroupMeta {
     /// existed. Entries for columns outside [`column_sum_supported`] carry 0
     /// and are never consulted.
     pub col_sums: Vec<i64>,
+    /// CRC32 of each column's stored (compressed) block, persisted in the
+    /// footer's column-CRC extension. Empty for segments written before the
+    /// extension existed; readers verify block reads whenever present.
+    pub column_crcs: Vec<u32>,
 }
 
 /// Column types whose values have an exact i64 view, so a footer-persisted

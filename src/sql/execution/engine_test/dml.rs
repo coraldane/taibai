@@ -527,3 +527,59 @@ fn update_where_in_subquery_only_touches_matching_rows() -> Result<()> {
     engine.segment_mgr().shutdown();
     Ok(())
 }
+
+/// DELETE inside a transaction must remove rows the same transaction just
+/// inserted (they used to survive and reappear after COMMIT).
+#[test]
+fn delete_inside_transaction_removes_own_uncommitted_rows() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
+    engine.execute(&mut session, "BEGIN")?;
+    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")?;
+    // Visible inside the transaction...
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        2
+    );
+    engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        1,
+        "own uncommitted rows must be deletable inside the transaction"
+    );
+    engine.execute(&mut session, "COMMIT")?;
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        1,
+        "deleted rows must stay deleted after COMMIT"
+    );
+    engine.segment_mgr().shutdown();
+    Ok(())
+}
+
+/// A committed DELETE stays effective after a restart (durable-tail rewrite
+/// for memtable-resident rows).
+#[test]
+fn committed_delete_of_own_insert_survives_restart() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+        engine.execute(&mut session, "CREATE TABLE t (id INT64)")?;
+        engine.execute(&mut session, "BEGIN")?;
+        engine.execute(&mut session, "INSERT INTO t (id) VALUES (1), (2), (3)")?;
+        engine.execute(&mut session, "DELETE FROM t WHERE id = 2")?;
+        engine.execute(&mut session, "COMMIT")?;
+        engine.segment_mgr().shutdown();
+    }
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        2
+    );
+    engine.segment_mgr().shutdown();
+    Ok(())
+}

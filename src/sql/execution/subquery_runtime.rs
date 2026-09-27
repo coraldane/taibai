@@ -32,7 +32,7 @@ use super::operators::build_pipeline_with_subqueries;
 pub struct CorrelatedSnapshot {
     /// Inner FROM tables (and materialized derived tables) keyed by plan key.
     pub schemas: HashMap<String, Schema>,
-    pub batches: HashMap<String, Vec<RecordBatch>>,
+    pub batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     pub cache: HashMap<String, CachedResult>,
 }
 

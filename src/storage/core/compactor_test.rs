@@ -555,3 +555,95 @@ fn compaction_materializes_value_sets_in_rewritten_segment() -> Result<()> {
         .is_some_and(|values| values.len() == 3));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// External merge sort (bounded-memory clustered optimization)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn external_merge_sort_matches_in_memory_result() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = test_schema();
+    // Two shuffled segments with interleaved keys.
+    write_segment(
+        &table_dir.join("seg_00001.dat"),
+        &schema,
+        &[(5, "e"), (1, "a"), (9, "i"), (3, "c")],
+    )?;
+    write_segment(
+        &table_dir.join("seg_00002.dat"),
+        &schema,
+        &[(8, "h"), (2, "b"), (7, "g"), (4, "d"), (6, "f")],
+    )?;
+
+    // Force the external path with a tiny budget so the data spills into
+    // multiple sorted runs (and force small run chunks so more than one run
+    // is produced).
+    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
+        estimated_row_width_bytes(&schema) * 2,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+    let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &test_meta(&schema))?;
+
+    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    assert_eq!(stats.segments_written, 1);
+    assert_eq!(stats.rows_written, 9);
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        read_ids(&segments[0])?,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "external merge output must be fully sorted"
+    );
+    // No leftover merge temp files.
+    for entry in std::fs::read_dir(&table_dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        assert!(!name.contains(".merge.tmp."), "leftover run file {name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn external_merge_sort_drops_deleted_rows() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let table_dir = tmp.path().join("default").join("t");
+    std::fs::create_dir_all(&table_dir)?;
+
+    let schema = test_schema();
+    write_segment(
+        &table_dir.join("seg_00001.dat"),
+        &schema,
+        &[(4, "d"), (2, "b"), (6, "f")],
+    )?;
+
+    // Tombstone the middle row of the single row group.
+    {
+        let reader = SegmentReader::open(&table_dir.join("seg_00001.dat"))?;
+        let mut bitmap = vec![0u8; 3u64.div_ceil(8) as usize];
+        crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 1);
+        drop(reader);
+        SegmentReader::rewrite_footer_with_deletes(&table_dir.join("seg_00001.dat"), &bitmap, 1)?;
+    }
+
+    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(
+        estimated_row_width_bytes(&schema) * 2,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let segment_mgr = Arc::new(SegmentManager::new(tmp.path())?);
+    let compactor = Compactor::new(segment_mgr, tmp.path().to_path_buf());
+    let stats = compactor.optimize_table("default", "t", &test_meta(&schema))?;
+    CLUSTERED_MERGE_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    assert_eq!(stats.rows_written, 2);
+    assert_eq!(stats.rows_dropped, 1);
+    let segments = SegmentManager::discover_segments(&table_dir)?;
+    assert_eq!(read_ids(&segments[0])?, vec![4, 6]);
+    Ok(())
+}

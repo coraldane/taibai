@@ -133,6 +133,16 @@ fn cleanup_incomplete_compaction_files(table_dir: &Path) {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        // A delete-footer journal whose data file no longer exists (the
+        // segment was replaced by compaction before the journal was cleaned
+        // up) is garbage; a live one must stay for `discover_segments` to
+        // repair from.
+        if let Some(stem) = name.strip_suffix(".del") {
+            if !table_dir.join(stem).exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
         if !is_incomplete_compaction_file(name) {
             continue;
         }
@@ -155,9 +165,9 @@ fn is_incomplete_compaction_file(name: &str) -> bool {
         || name.ends_with(".meta.compact.tmp")
         || name.ends_with(".update_tmp")
         || name.ends_with(".epoch.tmp")
-        // Delete-footer rewrite journals whose data file vanished (segment
-        // replaced by compaction before the journal was cleaned up).
+        // Torn delete-footer / segment-replacement journal writes.
         || name.ends_with(".del.tmp")
+        || name.ends_with(".replace.tmp")
         || (name.starts_with(".tail_flush_") && name.ends_with(".tmp"))
 }
 

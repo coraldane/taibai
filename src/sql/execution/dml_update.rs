@@ -89,6 +89,10 @@ pub fn exec_update(
     crate::common::query_cancel::enter_committing_phase();
 
     let update_body = || -> Result<u64> {
+        // Updated rows are published as change events (post-update values
+        // for memtable rows, which are entirely in memory).
+        let publish_updates = engine.pubsub().has_subscribers();
+        let mut updated_row_batches: Vec<RecordBatch> = Vec::new();
         let mut updated_count = 0u64;
         let mut memtable_updates: Vec<(
             Arc<crate::storage::core::memtable::MemTable>,
@@ -109,10 +113,20 @@ pub fn exec_update(
             let Some(batch) = memtable.read_snapshot_arc() else {
                 continue;
             };
-            let (new_batch, affected) =
+            let (new_batch, affected, matched_rows) =
                 update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
             if let Some(new_batch) = new_batch {
                 updated_count += affected;
+                if publish_updates {
+                    let columns = batch
+                        .columns
+                        .iter()
+                        .map(|col| col.take(&matched_rows))
+                        .collect();
+                    if let Ok(updated) = RecordBatch::try_new(batch.schema.clone(), columns) {
+                        updated_row_batches.push(updated);
+                    }
+                }
                 memtable_updates.push((memtable, Arc::new(new_batch)));
             }
         }
@@ -172,6 +186,7 @@ pub fn exec_update(
 
                 segment_updated = true;
                 let batch = reader.read_row_group(rg_idx)?;
+                let rg_publish = publish_updates;
                 // Surviving rows keep their order; matched survivors receive
                 // the assigned value in their assigned columns only.
                 let start_row = reader.row_group_start_row(rg_idx);
@@ -200,6 +215,24 @@ pub fn exec_update(
                 }
                 let new_batch = RecordBatch::try_new(batch.schema.clone(), new_columns)?;
                 updated_count += kept_matched.iter().filter(|m| **m).count() as u64;
+                if rg_publish {
+                    let matched: Vec<u32> = kept_matched
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, m)| m.then_some(idx as u32))
+                        .collect();
+                    if !matched.is_empty() {
+                        let columns = new_batch
+                            .columns
+                            .iter()
+                            .map(|col| col.take(&matched))
+                            .collect();
+                        if let Ok(updated) = RecordBatch::try_new(new_batch.schema.clone(), columns)
+                        {
+                            updated_row_batches.push(updated);
+                        }
+                    }
+                }
                 row_group_updates.push((rg_idx, Some(new_batch)));
             }
 
@@ -397,6 +430,30 @@ pub fn exec_update(
         // later INSERTs while older memtable rows are still live.
         engine.invalidate_hot_store(db, table);
 
+        // Publish post-update rows as change events once every segment
+        // replacement has committed.
+        if publish_updates && updated_count > 0 {
+            if let Some((first, rest)) = updated_row_batches.split_first() {
+                let schema = first.schema.clone();
+                let mut columns: Vec<crate::types::array::ColumnArray> =
+                    (0..schema.columns.len())
+                        .map(|c| first.column(c).unwrap().clone())
+                        .collect();
+                for batch in rest {
+                    for (c, col) in columns.iter_mut().enumerate() {
+                        col.append_owned(batch.column(c).unwrap().clone())?;
+                    }
+                }
+                let combined = RecordBatch::try_new(schema, columns)?;
+                engine.pubsub().publish_change(
+                    crate::pubsub::ChangeKind::Update,
+                    db,
+                    table,
+                    combined,
+                );
+            }
+        }
+
         if updated_count > 0 {
             // Rebuild location indexes while STILL holding the mutation lock.
             // Doing this after releasing the lock (as before) left a window
@@ -493,7 +550,7 @@ fn update_memtable_batch(
     where_clause: &Option<Expr>,
     table_schema: &Schema,
     batch: &RecordBatch,
-) -> Result<(Option<RecordBatch>, u64)> {
+) -> Result<(Option<RecordBatch>, u64, Vec<u32>)> {
     let mask = if let Some(where_expr) = where_clause.as_ref() {
         eval_where_clause_batch(where_expr, batch, table_schema)?
     } else {
@@ -501,8 +558,13 @@ fn update_memtable_batch(
     };
     // `None` means no row matched, so the caller skips the memtable without
     // paying for any copy.
-    if !mask.iter().any(|matches| *matches) {
-        return Ok((None, 0));
+    let matched_rows: Vec<u32> = mask
+        .iter()
+        .enumerate()
+        .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
+        .collect();
+    if matched_rows.is_empty() {
+        return Ok((None, 0, Vec::new()));
     }
 
     let assigned = precompute_assigned_values(assignments, table_schema)?;
@@ -516,10 +578,11 @@ fn update_memtable_batch(
             &mask,
         )?);
     }
-    let affected = mask.iter().filter(|matches| **matches).count() as u64;
+    let affected = matched_rows.len() as u64;
     Ok((
         Some(RecordBatch::try_new(batch.schema.clone(), new_columns)?),
         affected,
+        matched_rows,
     ))
 }
 

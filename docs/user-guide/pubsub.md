@@ -66,3 +66,19 @@ pubsub:
   max_subscriptions: 1024              # 全局最大订阅数
   notification_channel_capacity: 1024  # 每连接通知队列容量
 ```
+
+
+## 变更事件类型
+
+通知消息按类型区分事件语义（负载布局完全一致：`[sub_id][seq][topic][行数据]`）：
+
+| 消息类型 | 含义 | 载荷 |
+|---|---|---|
+| `MSG_TYPE_NOTIFICATION` (0x62) | 插入 | 新插入的行 |
+| `MSG_TYPE_NOTIFICATION_DELETE` (0x64) | 删除 | 被删除的行（删除提交后发布） |
+| `MSG_TYPE_NOTIFICATION_UPDATE` (0x65) | 更新 | 更新后的行（新值，重写提交后发布） |
+
+说明：
+- DELETE/UPDATE 事件只在存在订阅者时才产生（否则零开销，DELETE 保持纯 tombstone 路径）。
+- 有订阅者时，DELETE 需要读取被删行的全部列来构造事件（无订阅者时仍使用仅键列投影的优化路径）。
+- 旧版本客户端会把 0x64/0x65 当作未知消息类型；客户端与服务端需一同升级。

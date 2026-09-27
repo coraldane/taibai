@@ -658,7 +658,12 @@ impl Client {
             // cap the OLDEST buffered notification is dropped: like the
             // server's bounded push queue this is at-most-once, and the seq
             // gap still tells the subscriber what happened.
-            if msg.msg_type == MSG_TYPE_NOTIFICATION {
+            if matches!(
+                msg.msg_type,
+                MSG_TYPE_NOTIFICATION
+                    | MSG_TYPE_NOTIFICATION_DELETE
+                    | MSG_TYPE_NOTIFICATION_UPDATE
+            ) {
                 if self.pending_notifications.len() >= MAX_BUFFERED_NOTIFICATIONS {
                     self.pending_notifications.pop_front();
                 }
@@ -733,8 +738,12 @@ impl Client {
             return notification;
         }
         let msg = self.next_frame().await?;
-        if msg.msg_type == MSG_TYPE_NOTIFICATION {
-            return parse_notification(&msg.payload);
+        if matches!(
+            msg.msg_type,
+            MSG_TYPE_NOTIFICATION | MSG_TYPE_NOTIFICATION_DELETE | MSG_TYPE_NOTIFICATION_UPDATE
+        ) {
+            let msg_type = msg.msg_type;
+            return parse_notification(msg_type, &msg.payload);
         }
         // Not a notification: park it so the following `recv` gets the
         // response intact instead of losing the frame.
@@ -758,7 +767,10 @@ impl Client {
 
     fn pop_buffered_notification(&mut self) -> Option<Result<Notification>> {
         let msg = self.pending_notifications.pop_front()?;
-        Some(parse_notification(&msg.payload))
+        {
+            let msg_type = msg.msg_type;
+            Some(parse_notification(msg_type, &msg.payload))
+        }
     }
 }
 
@@ -1400,8 +1412,18 @@ pub struct Notification {
     pub sub_id: u64,
     pub seq: u64,
     pub topic: String,
+    /// What the event carries: inserted rows, deleted rows, or post-update
+    /// rows. Older servers only push inserts.
+    pub kind: NotificationKind,
     pub schema: Schema,
     pub batches: Vec<RecordBatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationKind {
+    Insert,
+    Delete,
+    Update,
 }
 
 impl Notification {
@@ -1412,7 +1434,7 @@ impl Notification {
 
 /// Payload layout (MSG_TYPE_NOTIFICATION):
 /// `[u64 sub_id][u64 seq][string topic][binary result batches]`
-fn parse_notification(payload: &[u8]) -> Result<Notification> {
+fn parse_notification(msg_type: u8, payload: &[u8]) -> Result<Notification> {
     if payload.len() < 16 {
         return Err(TaibaiError::Protocol(
             "notification payload too short".into(),
@@ -1429,10 +1451,16 @@ fn parse_notification(payload: &[u8]) -> Result<Notification> {
             "notification body did not decode to rows".into(),
         ));
     };
+    let kind = match msg_type {
+        crate::protocol::message::MSG_TYPE_NOTIFICATION_DELETE => NotificationKind::Delete,
+        crate::protocol::message::MSG_TYPE_NOTIFICATION_UPDATE => NotificationKind::Update,
+        _ => NotificationKind::Insert,
+    };
     Ok(Notification {
         sub_id,
         seq,
         topic: topic.to_string(),
+        kind,
         schema,
         batches,
     })

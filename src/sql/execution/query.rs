@@ -412,7 +412,7 @@ fn exec_table_select(
     let resolved;
     let resolved_stmt;
     let derived_tables;
-    let mut decorrelated_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut decorrelated_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
     let subquery_registry;
     let has_correlated;
     let (stmt, from_clause) = if let Some(pre) = pre_resolved {
@@ -591,10 +591,10 @@ fn exec_table_select_materialized(
     reader_txn_id: u64,
     profile: Option<&QueryProfile>,
     derived_batches: HashMap<String, (Schema, Vec<RecordBatch>)>,
-    decorrelated_batches: HashMap<String, Vec<RecordBatch>>,
+    decorrelated_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     subqueries: Option<&super::subquery_runtime::SubqueryRegistry>,
 ) -> Result<ExecResult> {
-    let mut table_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut table_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
     let mut fully_applied_scan_filters: HashMap<String, bool> = HashMap::new();
     let mut scan_seeds: HashMap<String, ScanProfileSeed> = HashMap::new();
 
@@ -665,7 +665,10 @@ fn exec_table_select_materialized(
             });
         }
 
-        table_batches.insert(table_name.clone(), batches);
+        table_batches.insert(
+            table_name.clone(),
+            batches.into_iter().map(std::sync::Arc::new).collect(),
+        );
     }
 
     let plan = if profile.is_none()
@@ -687,7 +690,7 @@ fn exec_table_select_materialized(
     };
 
     for (key, (_, batches)) in derived_batches {
-        table_batches.insert(key, batches);
+        table_batches.insert(key, batches.into_iter().map(std::sync::Arc::new).collect());
     }
     for (key, batches) in decorrelated_batches {
         table_batches.entry(key).or_insert(batches);
@@ -1222,7 +1225,7 @@ fn extract_simple_metadata_aggregates(
 
 fn try_skip_sort_for_cluster_key(
     plan: LogicalPlan,
-    table_batches: &HashMap<String, Vec<RecordBatch>>,
+    table_batches: &HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
     table_cluster_keys: &HashMap<String, Vec<String>>,
     table_schemas: &HashMap<String, Schema>,
 ) -> LogicalPlan {
@@ -1356,7 +1359,7 @@ pub(crate) struct PreResolvedExec<'a> {
     pub resolved: &'a ResolvedQuery,
     /// Decorrelated right-side pseudo-table batches produced alongside the
     /// cached plan.
-    pub extra_batches: &'a HashMap<String, Vec<RecordBatch>>,
+    pub extra_batches: &'a HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
 }
 
 /// Resolve a SELECT statement for execution or planning (also used by
@@ -1827,7 +1830,7 @@ fn bind_correlated_subquery(
         _ => None,
     };
     let mut snapshot_schemas: HashMap<String, Schema> = HashMap::new();
-    let mut snapshot_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+    let mut snapshot_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
     if let Some(from) = &inner_from {
         for table_ref in extract_table_refs(from, db) {
             if table_ref.database == DERIVED_DB {
@@ -1838,11 +1841,23 @@ fn bind_correlated_subquery(
                     ))
                 })?;
                 snapshot_schemas.insert(table_ref.key.clone(), schema.clone());
-                snapshot_batches.insert(table_ref.key.clone(), batches.clone());
+                snapshot_batches.insert(
+                    table_ref.key.clone(),
+                    batches
+                        .iter()
+                        .map(|b| std::sync::Arc::new(b.clone()))
+                        .collect::<Vec<_>>(),
+                );
             } else {
                 let (schema, batches) = snapshot_table(engine, &table_ref)?;
                 snapshot_schemas.insert(table_ref.key.clone(), schema);
-                snapshot_batches.insert(table_ref.key.clone(), batches);
+                snapshot_batches.insert(
+                    table_ref.key.clone(),
+                    batches
+                        .into_iter()
+                        .map(std::sync::Arc::new)
+                        .collect::<Vec<_>>(),
+                );
             }
         }
     }

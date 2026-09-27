@@ -650,7 +650,8 @@ impl Engine {
                 // qualified columns resolve by column name regardless of the
                 // qualifier, so the alias needs no execution-time handling.
                 let db = table.effective_database(&session.database).to_string();
-                let result = super::dml_delete::exec_delete(self, &db, &table.name, where_clause);
+                let result =
+                    super::dml_delete::exec_delete(self, &db, &table.name, where_clause, session.active_txn_id());
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
                 }

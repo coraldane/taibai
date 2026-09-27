@@ -431,18 +431,6 @@ fn direct_bulk_variable_range_at(
     )))
 }
 
-pub(super) fn filter_batch_by_mask(
-    batch: &RecordBatch,
-    mask: &[bool],
-    match_count: usize,
-) -> Result<RecordBatch> {
-    let columns = batch
-        .columns
-        .iter()
-        .map(|col| col.filter_by_mask_fast(mask, match_count))
-        .collect();
-    RecordBatch::try_new(batch.schema.clone(), columns)
-}
 
 pub(super) fn slice_batch_fast(
     batch: &RecordBatch,

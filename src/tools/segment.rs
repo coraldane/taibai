@@ -202,6 +202,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         skip_bloom_filters(&mut cursor, footer_data.as_slice(), col_count)?;
         skip_value_sets_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
         skip_col_sums_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
+        skip_column_crcs_if_present(&mut cursor, footer_data.as_slice())?;
 
         row_groups.push(RowGroupInfo {
             offset: rg_offset,
@@ -452,6 +453,25 @@ fn skip_value_sets_if_present(
 /// Footer v6 stores per-row-group pre-aggregated sums (`[magic][col_count
 /// u32][col_count × i64]`) after the value-set extension. The inspector does
 /// not print them, but must advance past them like the other extensions.
+fn skip_column_crcs_if_present(cursor: &mut Cursor<&[u8]>, data: &[u8]) -> Result<()> {
+    let pos = cursor.position() as usize;
+    if pos + 4 > data.len() {
+        return Ok(());
+    }
+    let marker = u32::from_le_bytes(
+        data[pos..pos + 4]
+            .try_into()
+            .map_err(|_| TaibaiError::Storage("invalid column crc extension marker".to_string()))?,
+    );
+    if marker != crate::storage::segment::writer::COLUMN_CRC_EXTENSION_MAGIC {
+        return Ok(());
+    }
+    cursor.set_position((pos + 4) as u64);
+    let stored_count = read_u32_le(cursor)? as usize;
+    cursor.set_position(cursor.position() + stored_count as u64 * 4);
+    Ok(())
+}
+
 fn skip_col_sums_if_present(
     cursor: &mut Cursor<&[u8]>,
     data: &[u8],

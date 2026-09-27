@@ -36,7 +36,7 @@ use super::subquery_runtime::SubqueryRegistry;
 pub(crate) struct DecorrelateOutcome {
     pub plan: LogicalPlan,
     /// Snapshot batches staged under the namespaced pseudo table names.
-    pub extra_batches: HashMap<String, Vec<RecordBatch>>,
+    pub extra_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
 }
 
 /// Rewrite correlated markers into semi / anti joins where possible.
@@ -55,7 +55,7 @@ pub(crate) fn decorrelate(plan: LogicalPlan, registry: &SubqueryRegistry) -> Dec
 
 struct Ctx<'a> {
     registry: &'a SubqueryRegistry,
-    extra_batches: HashMap<String, Vec<RecordBatch>>,
+    extra_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>>,
 }
 
 fn rewrite_plan(plan: LogicalPlan, ctx: &mut Ctx) -> LogicalPlan {

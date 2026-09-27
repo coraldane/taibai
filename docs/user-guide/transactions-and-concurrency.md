@@ -70,6 +70,8 @@ Taibai 的可见性以 **memtable 为粒度**，不是行级多版本（MVCC）�
 
 以下是当前版本**不提供**的行为，使用时应显式规避：
 
+0. **bulk / RELAXED 模式的持久性窗口**：`START BULK IMPORT` 会话与 RELAXED 写入走直写段路径（deferred flush），已确认（ACK）的行在会话结束或缓冲刷盘前**只驻留页缓存，不执行 fsync，也没有 durable tail 兜底**。此窗口内进程崩溃会丢失整批已确认数据；掉电风险场景请使用普通 INSERT（组提交 + fsync）或显式事务。作为交换，bulk 模式换来了批量导入吞吐（延迟 catalog 落盘、合并 fsync）。
+1. **DELETE 的事务语义**：对已刷盘数据，DELETE 是**物理 tombstone，不参与事务回滚**——事务内 DELETE 后执行 `ROLLBACK`，段上已标记的删除不会恢复。事务内未提交 memtable 行（本事务先 INSERT 的行）的删除在 ROLLBACK 时可以恢复。UPDATE 同理：段重写不可回滚。
 1. **RepeatableRead / Serializable**：未实现。需要稳定快照的应用应在单条查询内完成读取，或自行在应用层加版本戳。
 2. **行级多版本（MVCC）**：不存在版本链；写冲突靠表级串行 + 约束检查解决。
 3. **事务内 DDL**：DDL 语句不检查活动事务，在事务内执行会**立即生效，且 `ROLLBACK` 不会回滚它**。事务应只包含 DML。
