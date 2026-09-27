@@ -20,6 +20,11 @@ pub struct PreparedStatement {
     pub params: Vec<ScalarValue>,
     pub cached_plan: Option<LogicalPlan>,
     pub planned_database: Option<String>,
+    /// Fingerprint of every referenced table's schema at plan time. DROP +
+    /// re-CREATE (or ALTER) of a same-named table changes it, and a stale
+    /// cached plan (column indices) must be discarded instead of reading
+    /// wrong columns.
+    pub planned_schema_fingerprint: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +82,7 @@ impl PreparedStatementCache {
             params: Vec::new(),
             cached_plan: None,
             planned_database: None,
+            planned_schema_fingerprint: None,
         };
 
         self.statements.insert(id, prepared.clone());

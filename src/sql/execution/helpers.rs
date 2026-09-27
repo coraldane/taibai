@@ -122,22 +122,42 @@ pub fn eval_where_clause_batch(
                 row_wise()
             }
             BinOp::Lte => {
+                // (col <= lit); for the swapped literal-first form the
+                // predicate flips: lit <= col <=> col >= lit.
                 if let Some(mask) = eval_col_lit_mask(
-                    col_lit_pair(left, right).or_else(|| col_lit_pair(right, left)),
+                    col_lit_pair(left, right),
                     batch,
                     schema,
                     crate::types::array::ColumnArray::le_vec,
                 ) {
                     return mask;
                 }
-                row_wise()
-            }
-            BinOp::Gte => {
                 if let Some(mask) = eval_col_lit_mask(
-                    col_lit_pair(left, right).or_else(|| col_lit_pair(right, left)),
+                    col_lit_pair(right, left),
                     batch,
                     schema,
                     crate::types::array::ColumnArray::ge_vec,
+                ) {
+                    return mask;
+                }
+                row_wise()
+            }
+            BinOp::Gte => {
+                // (col >= lit); swapped form: lit >= col <=> col <= lit
+                // (inclusive on both sides).
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(left, right),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::ge_vec,
+                ) {
+                    return mask;
+                }
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(right, left),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::le_vec,
                 ) {
                     return mask;
                 }
@@ -281,7 +301,11 @@ pub fn eval_where_clause_batch(
             }
             row_wise()
         }
-        Expr::Literal(v) => Ok(vec![!v.is_null(); num_rows]),
+        Expr::Literal(v) => {
+            // MySQL truthiness: nonzero numerics are TRUE, NULL/zero FALSE.
+            let keep = truthiness(v)?.unwrap_or(false);
+            Ok(vec![keep; num_rows])
+        }
         Expr::Like { .. } => row_wise(),
         _ => row_wise(),
     }
@@ -336,11 +360,16 @@ pub fn eval_where_clause3(
                     BinOp::Gt => Ok(Some(
                         compare_scalars(&left_val, &right_val) == Some(Ordering::Greater),
                     )),
+                    // Incomparable (but non-null) operands match nothing,
+                    // exactly like Lt/Gt and the SELECT filter path; the
+                    // `!= Some(...)` form used to make them match EVERY row.
                     BinOp::Lte => Ok(Some(
-                        compare_scalars(&left_val, &right_val) != Some(Ordering::Greater),
+                        matches!(compare_scalars(&left_val, &right_val), Some(o)
+                            if o != Ordering::Greater),
                     )),
                     BinOp::Gte => Ok(Some(
-                        compare_scalars(&left_val, &right_val) != Some(Ordering::Less),
+                        matches!(compare_scalars(&left_val, &right_val), Some(o)
+                            if o != Ordering::Less),
                     )),
                     _ => unreachable!(),
                 }
@@ -483,8 +512,15 @@ fn truthiness(v: &ScalarValue) -> Result<Option<bool>> {
         ScalarValue::Bool(Some(b)) => Ok(Some(*b)),
         value if value.is_null() => Ok(None),
         ScalarValue::Bool(None) => Ok(None),
+        // Numeric predicates follow MySQL truthiness: nonzero is TRUE.
+        // `DELETE FROM t WHERE 1` used to work before the evaluator
+        // rewrite and must keep working.
+        value if value.integer_i128().is_some() => {
+            Ok(Some(value.integer_i128() != Some(0)))
+        }
+        value if value.numeric_f64().is_some() => Ok(Some(value.numeric_f64() != Some(0.0))),
         other => Err(TaibaiError::Sql(format!(
-            "predicate must be boolean, got {:?}",
+            "predicate must be boolean or numeric, got {:?}",
             other.data_type()
         ))),
     }

@@ -277,7 +277,27 @@ impl Engine {
                     .planned_database
                     .as_deref()
                     .is_some_and(|db| db == session.database);
-                if let (Some(plan), true) = (prepared.cached_plan.as_ref(), plan_matches_database)
+                // Schema fingerprint guard: a rebuilt table with the same
+                // name invalidates cached column indices.
+                let current_fingerprint = self
+                    .gather_table_schemas(&session.database, &stmt)
+                    .ok()
+                    .map(|schemas| schema_fingerprint(&schemas));
+                let schema_unchanged = match (
+                    prepared.planned_schema_fingerprint,
+                    current_fingerprint,
+                ) {
+                    (Some(planned), Some(current)) => planned == current,
+                    // No fingerprint recorded (or none computable): only
+                    // trust the plan when no fingerprint was needed before.
+                    (None, _) => prepared.planned_schema_fingerprint.is_none(),
+                    (Some(_), None) => false,
+                };
+                if let (Some(plan), true, true) = (
+                    prepared.cached_plan.as_ref(),
+                    plan_matches_database,
+                    schema_unchanged,
+                )
                 {
                     super::query::exec_select_with_plan_and_txn(
                         self,
@@ -315,6 +335,10 @@ impl Engine {
                                         Some(crate::sql::optimizer::optimize(plan));
                                     prepared.planned_database =
                                         Some(session.database.clone());
+                                    prepared.planned_schema_fingerprint = self
+                                        .gather_table_schemas(&session.database, &stmt)
+                                        .ok()
+                                        .map(|schemas| schema_fingerprint(&schemas));
                                 }
                             }
                         }
@@ -425,6 +449,7 @@ impl Engine {
         }
         Ok(table_schemas)
     }
+
 
     fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
         self.ensure_permissions(session, stmt)?;
@@ -635,6 +660,7 @@ impl Engine {
                     assignments,
                     where_clause,
                     session.active_txn_id(),
+                    &session.username,
                 );
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
@@ -651,7 +677,14 @@ impl Engine {
                 // qualifier, so the alias needs no execution-time handling.
                 let db = table.effective_database(&session.database).to_string();
                 let result =
-                    super::dml_delete::exec_delete(self, &db, &table.name, where_clause, session.active_txn_id());
+                    super::dml_delete::exec_delete(
+                    self,
+                    &db,
+                    &table.name,
+                    where_clause,
+                    session.active_txn_id(),
+                    &session.username,
+                );
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
                 }
@@ -1054,4 +1087,25 @@ impl Engine {
             session.username, permission, object_type, object_name
         )))
     }
+}
+
+/// Stable fingerprint of the table schemas a prepared plan was compiled
+/// against: column names, types, scales and orders, plus table names.
+fn schema_fingerprint(
+    schemas: &std::collections::HashMap<String, crate::types::batch::Schema>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut names: Vec<&String> = schemas.keys().collect();
+    names.sort();
+    for name in names {
+        name.hash(&mut hasher);
+        let schema = &schemas[name];
+        for col in &schema.columns {
+            col.name.hash(&mut hasher);
+            (col.data_type as u8).hash(&mut hasher);
+            col.scale.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }

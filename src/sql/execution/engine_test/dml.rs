@@ -583,3 +583,209 @@ fn committed_delete_of_own_insert_survives_restart() -> Result<()> {
     engine.segment_mgr().shutdown();
     Ok(())
 }
+
+/// Regression: the rewritten batch evaluator mapped the literal-first
+/// `lit <= col` / `lit >= col` forms to the wrong column kernel, inverting
+/// the predicate.
+#[test]
+fn swapped_literal_comparison_predicates_delete_correct_rows() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+    )?;
+
+    engine.execute(&mut session, "DELETE FROM t WHERE 15 <= v")?;
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        1,
+        "15 <= v must keep only v=10"
+    );
+
+    engine.execute(&mut session, "UPDATE t SET v = 99 WHERE 50 >= v")?;
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE v = 99")?,
+            0,
+            0
+        ),
+        1,
+        "50 >= v must match v=10"
+    );
+    engine.segment_mgr().shutdown();
+    Ok(())
+}
+
+/// Regression: numeric literal predicates (`WHERE 1`) must keep MySQL
+/// truthiness after the evaluator rewrite.
+#[test]
+fn numeric_literal_predicate_follows_mysql_truthiness() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)"
+    )?;
+    engine.execute(&mut session, "DELETE FROM t WHERE 1")?;
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        0,
+        "WHERE 1 deletes every row"
+    );
+    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (3, 30)")?;
+    engine.execute(&mut session, "DELETE FROM t WHERE 0")?;
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        1,
+        "WHERE 0 matches nothing"
+    );
+    engine.segment_mgr().shutdown();
+    Ok(())
+}
+
+/// Regression: LIMIT pushdown used to pass straight through DISTINCT (and
+/// window) nodes, truncating the scan before dedup —
+/// `SELECT DISTINCT a, b FROM t LIMIT 4` returned fewer distinct rows.
+#[test]
+fn distinct_with_limit_returns_expected_row_count() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (a INT64, b INT64)",
+    )?;
+    // 12 rows collapsing to 6 distinct pairs.
+    let values: Vec<String> = (0..12)
+        .map(|i| format!("({}, {})", i % 3, i % 2))
+        .collect();
+    engine.execute(
+        &mut session,
+        &format!("INSERT INTO t VALUES {}", values.join(", ")),
+    )?;
+    let result = engine.execute(
+        &mut session,
+        "SELECT COUNT(*) FROM (SELECT DISTINCT a, b FROM t LIMIT 4) sub",
+    )?;
+    assert_eq!(first_i64(result, 0, 0), 4, "LIMIT applies after DISTINCT");
+    engine.segment_mgr().shutdown();
+    Ok(())
+}
+
+/// Regression: `WHERE col_a <= col_b` between INCOMPARABLE column types
+/// matched every row in DML (and still matches none in SELECT); both sides
+/// must agree: incomparable means no match.
+#[test]
+fn incomparable_column_comparison_matches_nothing() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, s VARCHAR, n INT64)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, s, n) VALUES (1, 'x', 5), (2, 'y', 10)",
+    )?;
+    let selected = first_i64(
+        engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE s <= n")?,
+        0,
+        0,
+    );
+    assert_eq!(selected, 0, "SELECT: incomparable types never match");
+    let result = engine.execute(&mut session, "DELETE FROM t WHERE s <= n");
+    assert!(
+        result.is_err() || matches!(result, Ok(crate::sql::execution::engine::ExecResult::Ok { rows_affected: 0 })),
+        "DML must not delete rows on incomparable comparison"
+    );
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        2,
+        "no rows lost"
+    );
+    engine.segment_mgr().shutdown();
+    Ok(())
+}
+
+/// Regression: a cached prepared plan survived DROP + re-CREATE of the same
+/// table with a different column order, so EXECUTE read wrong columns. The
+/// plan is now discarded when the schema fingerprint changes.
+#[test]
+fn prepared_plan_invalidated_by_table_rebuild() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (a INT64, b INT64)")?;
+    engine.execute(&mut session, "INSERT INTO t (a, b) VALUES (1, 2)")?;
+
+    // Prepare, execute once (plan gets cached), then rebuild the table with
+    // swapped columns. The cached plan's column index for `a` now points at
+    // `b`; without fingerprint invalidation EXECUTE returned 2 instead of 1.
+    let prepared = session.prepared_statements.prepare("SELECT a FROM t")?;
+    let id = prepared.id;
+    let mut stmt = session.prepared_statements.get_mut(id).unwrap().clone();
+    let first = engine.execute_prepared(&mut session, &mut stmt)?;
+    session.prepared_statements.insert(stmt);
+    let _ = first;
+
+    engine.execute(&mut session, "DROP TABLE t")?;
+    engine.execute(&mut session, "CREATE TABLE t (b INT64, a INT64)")?;
+    engine.execute(&mut session, "INSERT INTO t (b, a) VALUES (20, 10)")?;
+
+    let mut stmt = session.prepared_statements.get_mut(id).unwrap().clone();
+    let result = engine.execute_prepared(&mut session, &mut stmt)?;
+    session.prepared_statements.insert(stmt);
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    let value = batches
+        .iter()
+        .flat_map(|b| (0..b.num_rows()).filter_map(move |r| b.scalar(r, 0)))
+        .filter_map(|v| v.integer_i128())
+        .max();
+    // Row from the rebuilt table only (old table dropped); `a` is 10.
+    assert_eq!(value, Some(10), "SELECT a must read column a after rebuild");
+    engine.segment_mgr().shutdown();
+    Ok(())
+}
+
+/// Regression: ALTER TABLE ADD COLUMN DEFAULT CURRENT_TIMESTAMP backfilled
+/// pre-existing rows with the query instant, so repeated reads returned
+/// different values. The value is pinned at ALTER time now.
+#[test]
+fn alter_add_column_current_timestamp_is_stable() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (id INT64)")?;
+    engine.execute(&mut session, "INSERT INTO t (id) VALUES (1), (2)")?;
+    engine.execute(
+        &mut session,
+        "ALTER TABLE t ADD COLUMN created TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let first = engine.execute(&mut session, "SELECT created FROM t WHERE id = 1")?;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = engine.execute(&mut session, "SELECT created FROM t WHERE id = 1")?;
+    let v1 = collect_one_ts(first);
+    let v2 = collect_one_ts(second);
+    assert_eq!(v1, v2, "backfilled CURRENT_TIMESTAMP must be stable across reads");
+    engine.segment_mgr().shutdown();
+    Ok(())
+}
+
+fn collect_one_ts(result: crate::sql::execution::engine::ExecResult) -> Option<i64> {
+    let crate::sql::execution::engine::ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    batches
+        .iter()
+        .flat_map(|b| (0..b.num_rows()).filter_map(move |r| b.scalar(r, 0)))
+        .find_map(|v| match v {
+            crate::types::scalar::ScalarValue::Timestamp(ts) => ts,
+            _ => None,
+        })
+}

@@ -964,6 +964,7 @@ pub fn exec_delete(
     table: &str,
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
+    username: &str,
 ) -> Result<ExecResult> {
     let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
@@ -977,7 +978,11 @@ pub fn exec_delete(
         (Schema::new(meta.columns.clone()), meta)
     };
 
-    let resolved_where_clause = resolve_in_subqueries(engine, db, where_clause)?;
+    // Resolve subqueries through the permission-gated wrapper (a bare
+    // resolve_in_subqueries here would let WHERE IN (SELECT ...) read tables
+    // the user cannot SELECT).
+    let resolved_where_clause =
+        resolve_where_in_subqueries(engine, db, where_clause, username)?;
 
     let target_partition_key =
         delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
@@ -1001,6 +1006,8 @@ pub fn exec_delete(
     let mut index_maintenance = DeleteIndexMaintenance::plan(&table_meta, &table_schema);
 
     let mut delete_body = || -> Result<bool> {
+        // Deleted-row batches for the change feed (segments + memtables).
+        let mut deleted_row_batches: Vec<RecordBatch> = Vec::new();
         // Memtable-resident rows are removed in place (no forced flush),
         // mirroring the REPLACE conflict path; durable tails are rewritten
         // so crash recovery cannot resurrect deleted rows.
@@ -1017,6 +1024,30 @@ pub fn exec_delete(
         )?;
         if !memtable_plans.is_empty() {
             index_maintenance.record_memtable_rows(&memtable_plans);
+            // Collect memtable-resident deleted rows for the change feed
+            // before the plans are consumed.
+            if engine.pubsub().has_subscribers() {
+                for plan in &memtable_plans {
+                    if plan.removed_positions.is_empty() {
+                        continue;
+                    }
+                    let columns = plan
+                        .original
+                        .columns
+                        .iter()
+                        .map(|col| col.take(&plan.removed_positions))
+                        .collect();
+                    match RecordBatch::try_new(plan.original.schema.clone(), columns) {
+                        Ok(deleted) => deleted_row_batches.push(deleted),
+                        Err(error) => tracing::warn!(
+                            db,
+                            table,
+                            error = %error,
+                            "failed to build delete-event batch for memtable rows"
+                        ),
+                    }
+                }
+            }
             let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
             total_deleted += undo.deleted_rows();
         }
@@ -1057,7 +1088,6 @@ pub fn exec_delete(
                 key_projection.clone()
             },
         );
-        let mut deleted_row_batches: Vec<RecordBatch> = Vec::new();
         let mut first_rewrite_error: Option<crate::common::error::TaibaiError> = None;
         for seg_path in segment_files {
             let (new_bitmap, new_deleted_count, prev_deleted) = {
@@ -1132,9 +1162,14 @@ pub fn exec_delete(
                                 .iter()
                                 .map(|col| col.take(&deleted_rows))
                                 .collect();
-                            if let Ok(deleted) = RecordBatch::try_new(batch.schema.clone(), columns)
-                            {
-                                deleted_row_batches.push(deleted);
+                            match RecordBatch::try_new(batch.schema.clone(), columns) {
+                                Ok(deleted) => deleted_row_batches.push(deleted),
+                                Err(error) => tracing::warn!(
+                                    db,
+                                    table,
+                                    error = %error,
+                                    "failed to build delete-event batch"
+                                ),
                             }
                         }
                         row_id += batch.num_rows() as u64;
@@ -1172,9 +1207,14 @@ pub fn exec_delete(
                                 .iter()
                                 .map(|col| col.take(&deleted_rows))
                                 .collect();
-                            if let Ok(deleted) = RecordBatch::try_new(batch.schema.clone(), columns)
-                            {
-                                deleted_row_batches.push(deleted);
+                            match RecordBatch::try_new(batch.schema.clone(), columns) {
+                                Ok(deleted) => deleted_row_batches.push(deleted),
+                                Err(error) => tracing::warn!(
+                                    db,
+                                    table,
+                                    error = %error,
+                                    "failed to build delete-event batch"
+                                ),
                             }
                         }
                         row_id += rg_rows;
@@ -1237,26 +1277,15 @@ pub fn exec_delete(
 
         // Publish the deleted rows as change events only after every footer
         // rewrite succeeded (errors return above), so subscribers never see
-        // deletions that did not physically happen.
+        // deletions that did not physically happen. Each batch is a separate
+        // event: batches from different sources may carry different schemas
+        // (ALTER TABLE ADD COLUMN is metadata-only), and merging them by
+        // column index would panic or mix columns.
         if publish_deletes && total_deleted > 0 {
-            // Memtable-resident deletions first, then the segment rows.
-            if let Some((first, rest)) = deleted_row_batches.split_first() {
-                let schema = first.schema.clone();
-                let mut columns: Vec<crate::types::array::ColumnArray> = (0..schema.columns.len())
-                    .map(|c| first.column(c).unwrap().clone())
-                    .collect();
-                for batch in rest {
-                    for (c, col) in columns.iter_mut().enumerate() {
-                        col.append_owned(batch.column(c).unwrap().clone())?;
-                    }
-                }
-                let combined = RecordBatch::try_new(schema, columns)?;
-                engine.pubsub().publish_change(
-                    crate::pubsub::ChangeKind::Delete,
-                    db,
-                    table,
-                    combined,
-                );
+            for batch in deleted_row_batches {
+                engine
+                    .pubsub()
+                    .publish_change(crate::pubsub::ChangeKind::Delete, db, table, batch);
             }
         }
 
@@ -1316,12 +1345,145 @@ pub fn exec_delete(
 /// Resolve subqueries in a DML WHERE clause into literals. Shared with the
 /// UPDATE path, whose legacy evaluator otherwise treated unexpanded
 /// subqueries as "match every row".
+/// DML WHERE-clause subqueries execute below the statement-level permission
+/// check, so they must carry their own SELECT permission gate: without it a
+/// user with only DELETE on `t` could read any table via
+/// `DELETE FROM t WHERE id IN (SELECT secret FROM private)`.
+fn require_subquery_select_permissions(
+    engine: &Engine,
+    username: &str,
+    default_db: &str,
+    stmt: &crate::sql::parser::ast::Statement,
+) -> Result<()> {
+    use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
+    let mut tables = Vec::new();
+    collect_statement_tables(stmt, default_db, &mut tables);
+    for (db, table) in tables {
+        if !engine.auth_manager().check_permission(
+            username,
+            PermissionType::Select,
+            PermissionObjectType::Table,
+            &format!("{}.{}", db, table),
+        ) {
+            return Err(TaibaiError::Sql(format!(
+                "access denied for user '{}' to {:?} on {:?} '{}.{}' (subquery)",
+                username,
+                PermissionType::Select,
+                PermissionObjectType::Table,
+                db,
+                table
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collect_statement_tables(
+    stmt: &crate::sql::parser::ast::Statement,
+    default_db: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    use crate::sql::parser::ast::Statement;
+    match stmt {
+        Statement::Select { from, .. } => {
+            if let Some(from) = from {
+                for reference in super::query::extract_table_refs(from, default_db) {
+                    out.push((reference.database.clone(), reference.table.clone()));
+                }
+            }
+        }
+        Statement::Union { left, right, .. } => {
+            collect_statement_tables(left, default_db, out);
+            collect_statement_tables(right, default_db, out);
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn resolve_where_in_subqueries(
     engine: &Engine,
     db: &str,
     where_clause: &Option<Expr>,
+    username: &str,
 ) -> Result<Option<Expr>> {
+    if let Some(expr) = where_clause.as_ref() {
+        require_subquery_select_permissions_for_expr(engine, username, db, expr)?;
+    }
     resolve_in_subqueries(engine, db, where_clause)
+}
+
+/// Walk an expression tree, permission-checking every subquery statement
+/// found inside (SELECT/EXISTS/scalar).
+pub(super) fn require_subquery_select_permissions_for_expr(
+    engine: &Engine,
+    username: &str,
+    default_db: &str,
+    expr: &Expr,
+) -> Result<()> {
+    match expr {
+        Expr::Subquery(stmt) => {
+            require_subquery_select_permissions(engine, username, default_db, stmt)
+        }
+        Expr::Exists(inner) => {
+            if let Expr::Subquery(stmt) = inner.as_ref() {
+                require_subquery_select_permissions(engine, username, default_db, stmt)
+            } else {
+                require_subquery_select_permissions_for_expr(engine, username, default_db, inner)
+            }
+        }
+        Expr::UnaryNot(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner)
+        | Expr::UnaryMinus(inner) => {
+            require_subquery_select_permissions_for_expr(engine, username, default_db, inner)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            require_subquery_select_permissions_for_expr(engine, username, default_db, left)?;
+            require_subquery_select_permissions_for_expr(engine, username, default_db, right)
+        }
+        Expr::In { expr, values, .. } => {
+            require_subquery_select_permissions_for_expr(engine, username, default_db, expr)?;
+            for value in values {
+                require_subquery_select_permissions_for_expr(engine, username, default_db, value)?;
+            }
+            Ok(())
+        }
+        Expr::Between { expr, low, high, .. } => {
+            require_subquery_select_permissions_for_expr(engine, username, default_db, expr)?;
+            require_subquery_select_permissions_for_expr(engine, username, default_db, low)?;
+            require_subquery_select_permissions_for_expr(engine, username, default_db, high)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            require_subquery_select_permissions_for_expr(engine, username, default_db, expr)?;
+            require_subquery_select_permissions_for_expr(engine, username, default_db, pattern)
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                require_subquery_select_permissions_for_expr(engine, username, default_db, arg)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                require_subquery_select_permissions_for_expr(
+                    engine, username, default_db, operand,
+                )?;
+            }
+            for (when, then) in when_clauses {
+                require_subquery_select_permissions_for_expr(engine, username, default_db, when)?;
+                require_subquery_select_permissions_for_expr(engine, username, default_db, then)?;
+            }
+            if let Some(else_expr) = else_clause {
+                require_subquery_select_permissions_for_expr(
+                    engine, username, default_db, else_expr,
+                )?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 pub(super) fn resolve_expr_in_subqueries_pub(

@@ -21,6 +21,7 @@ pub fn exec_update(
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
+    username: &str,
 ) -> Result<ExecResult> {
     let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
@@ -55,17 +56,22 @@ pub fn exec_update(
     // (SELECT ...)` used to fall into the predicate evaluator's legacy
     // "match everything" fallback and rewrite the whole table.
     let resolved_where_clause =
-        super::dml_delete::resolve_where_in_subqueries(engine, db, where_clause)?;
+        super::dml_delete::resolve_where_in_subqueries(engine, db, where_clause, username)?;
     let resolved_assignments: Vec<Assignment> = assignments
         .iter()
         .map(|assignment| {
             Ok(Assignment {
                 column: assignment.column.clone(),
-                value: super::dml_delete::resolve_expr_in_subqueries_pub(
-                    engine,
-                    db,
-                    &assignment.value,
-                )?,
+                value: {
+                    super::dml_delete::require_subquery_select_permissions_for_expr(
+                        engine, username, db, &assignment.value,
+                    )?;
+                    super::dml_delete::resolve_expr_in_subqueries_pub(
+                        engine,
+                        db,
+                        &assignment.value,
+                    )?
+                },
             })
         })
         .collect::<Result<_>>()?;
@@ -123,8 +129,14 @@ pub fn exec_update(
                         .iter()
                         .map(|col| col.take(&matched_rows))
                         .collect();
-                    if let Ok(updated) = RecordBatch::try_new(batch.schema.clone(), columns) {
-                        updated_row_batches.push(updated);
+                    match RecordBatch::try_new(batch.schema.clone(), columns) {
+                        Ok(updated) => updated_row_batches.push(updated),
+                        Err(error) => tracing::warn!(
+                            db,
+                            table,
+                            error = %error,
+                            "failed to build update-event batch for memtable rows"
+                        ),
                     }
                 }
                 memtable_updates.push((memtable, Arc::new(new_batch)));
@@ -227,9 +239,14 @@ pub fn exec_update(
                             .iter()
                             .map(|col| col.take(&matched))
                             .collect();
-                        if let Ok(updated) = RecordBatch::try_new(new_batch.schema.clone(), columns)
-                        {
-                            updated_row_batches.push(updated);
+                        match RecordBatch::try_new(new_batch.schema.clone(), columns) {
+                            Ok(updated) => updated_row_batches.push(updated),
+                            Err(error) => tracing::warn!(
+                                db,
+                                table,
+                                error = %error,
+                                "failed to build update-event batch"
+                            ),
                         }
                     }
                 }
@@ -431,29 +448,16 @@ pub fn exec_update(
         engine.invalidate_hot_store(db, table);
 
         // Publish post-update rows as change events once every segment
-        // replacement has committed.
+        // replacement has committed. One event per batch: rewritten segments
+        // and memtables may carry different schemas after ALTER TABLE ADD
+        // COLUMN (metadata-only), so merging by column index would panic.
         if publish_updates && updated_count > 0 {
-            if let Some((first, rest)) = updated_row_batches.split_first() {
-                let schema = first.schema.clone();
-                let mut columns: Vec<crate::types::array::ColumnArray> =
-                    (0..schema.columns.len())
-                        .map(|c| first.column(c).unwrap().clone())
-                        .collect();
-                for batch in rest {
-                    for (c, col) in columns.iter_mut().enumerate() {
-                        col.append_owned(batch.column(c).unwrap().clone())?;
-                    }
-                }
-                let combined = RecordBatch::try_new(schema, columns)?;
-                engine.pubsub().publish_change(
-                    crate::pubsub::ChangeKind::Update,
-                    db,
-                    table,
-                    combined,
-                );
+            for batch in updated_row_batches {
+                engine
+                    .pubsub()
+                    .publish_change(crate::pubsub::ChangeKind::Update, db, table, batch);
             }
         }
-
         if updated_count > 0 {
             // Rebuild location indexes while STILL holding the mutation lock.
             // Doing this after releasing the lock (as before) left a window
