@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use crate::common::error::{Result, TaibaiError};
-use crate::storage::codec::column_codec::{decode_column, decode_column_selected};
+use crate::storage::codec::column_codec::{
+    decode_column, decode_column_selected, decode_column_with_runs,
+};
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
 use crate::storage::segment::delete_bitmap;
@@ -186,6 +188,14 @@ impl SegmentReader {
         self.footer.row_groups.clone()
     }
 
+    /// Borrowed footer row groups: metadata walks that only read zone maps
+    /// and sums must not pay the deep clone in
+    /// [`Self::footer_row_groups_info`] — value sets and bloom filters make
+    /// that expensive on wide clustered segments.
+    pub fn footer_row_groups(&self) -> &[RowGroupMeta] {
+        &self.footer.row_groups
+    }
+
     pub fn row_group_start_row(&self, row_group: usize) -> u64 {
         self.footer
             .row_groups
@@ -305,15 +315,28 @@ impl SegmentReader {
         column_idx: usize,
         allow_dictionary: bool,
     ) -> Result<ColumnArray> {
+        self.read_column_passthrough(row_group, column_idx, allow_dictionary, false)
+    }
+
+    /// `allow_runs` keeps Rle/DeltaRle columns in run form for run-aware
+    /// consumers (everything else flattens lazily).
+    pub fn read_column_passthrough(
+        &self,
+        row_group: usize,
+        column_idx: usize,
+        allow_dictionary: bool,
+        allow_runs: bool,
+    ) -> Result<ColumnArray> {
         let rg = &self.footer.row_groups[row_group];
         let col_def = &self.footer.schema.columns[column_idx];
 
         let decompressed = self.read_column_raw(row_group, column_idx)?;
-        decode_column(
+        decode_column_with_runs(
             &decompressed,
             rg.row_count as usize,
             col_def,
             allow_dictionary,
+            allow_runs,
         )
     }
 
@@ -344,6 +367,16 @@ impl SegmentReader {
         row_group: usize,
         column_indices: &[usize],
         allow_dictionary: bool,
+    ) -> Result<Vec<(usize, ColumnArray)>> {
+        self.read_row_group_batch_passthrough(row_group, column_indices, allow_dictionary, false)
+    }
+
+    pub fn read_row_group_batch_passthrough(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        allow_dictionary: bool,
+        allow_runs: bool,
     ) -> Result<Vec<(usize, ColumnArray)>> {
         if column_indices.is_empty() {
             return Ok(Vec::new());
@@ -381,11 +414,12 @@ impl SegmentReader {
                 let compressed = &all_data[col_offset..col_offset + col_len];
                 let decompressed = Self::decompress_column_block(compressed)?;
                 let col_def = &self.footer.schema.columns[col_idx];
-                let col_array = decode_column(
+                let col_array = decode_column_with_runs(
                     &decompressed,
                     rg.row_count as usize,
                     col_def,
                     allow_dictionary,
+                    allow_runs,
                 )?;
                 Ok(Some((col_idx, col_array)))
             })
@@ -464,10 +498,21 @@ impl SegmentReader {
         column_indices: &[usize],
         allow_dictionary: bool,
     ) -> Result<crate::types::batch::RecordBatch> {
-        let columns_data = self.read_row_group_batch_allow_dictionary(
+        self.read_columns_fast_passthrough(row_group, column_indices, allow_dictionary, false)
+    }
+
+    pub fn read_columns_fast_passthrough(
+        &self,
+        row_group: usize,
+        column_indices: &[usize],
+        allow_dictionary: bool,
+        allow_runs: bool,
+    ) -> Result<crate::types::batch::RecordBatch> {
+        let columns_data = self.read_row_group_batch_passthrough(
             row_group,
             column_indices,
             allow_dictionary,
+            allow_runs,
         )?;
 
         let mut columns = Vec::with_capacity(column_indices.len());
@@ -577,13 +622,24 @@ impl SegmentReader {
         projection: &[usize],
         allow_dictionary: bool,
     ) -> Result<crate::types::batch::RecordBatch> {
+        self.read_row_group_with_projection_passthrough(row_group, projection, allow_dictionary, false)
+    }
+
+    pub fn read_row_group_with_projection_passthrough(
+        &self,
+        row_group: usize,
+        projection: &[usize],
+        allow_dictionary: bool,
+        allow_runs: bool,
+    ) -> Result<crate::types::batch::RecordBatch> {
         let mut columns = Vec::with_capacity(projection.len());
         let mut col_defs = Vec::with_capacity(projection.len());
         for &col_idx in projection {
-            columns.push(self.read_column_allow_dictionary(
+            columns.push(self.read_column_passthrough(
                 row_group,
                 col_idx,
                 allow_dictionary,
+                allow_runs,
             )?);
             col_defs.push(self.footer.schema.columns[col_idx].clone());
         }

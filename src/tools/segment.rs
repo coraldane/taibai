@@ -201,6 +201,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         // before reading the next row group or the delete-bitmap section.
         skip_bloom_filters(&mut cursor, footer_data.as_slice(), col_count)?;
         skip_value_sets_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
+        skip_col_sums_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
 
         row_groups.push(RowGroupInfo {
             offset: rg_offset,
@@ -445,6 +446,32 @@ fn skip_value_sets_if_present(
             }
         }
     }
+    Ok(())
+}
+
+/// Footer v6 stores per-row-group pre-aggregated sums (`[magic][col_count
+/// u32][col_count × i64]`) after the value-set extension. The inspector does
+/// not print them, but must advance past them like the other extensions.
+fn skip_col_sums_if_present(
+    cursor: &mut Cursor<&[u8]>,
+    data: &[u8],
+    _col_count: usize,
+) -> Result<()> {
+    let pos = cursor.position() as usize;
+    if pos + 4 > data.len() {
+        return Ok(());
+    }
+    let marker = u32::from_le_bytes(
+        data[pos..pos + 4]
+            .try_into()
+            .map_err(|_| TaibaiError::Storage("invalid col sum extension marker".to_string()))?,
+    );
+    if marker != crate::storage::segment::writer::COL_SUM_EXTENSION_MAGIC {
+        return Ok(());
+    }
+    cursor.set_position((pos + 4) as u64);
+    let _stored_count = read_u32_le(cursor)? as usize;
+    cursor.set_position(cursor.position() + _stored_count as u64 * 8);
     Ok(())
 }
 

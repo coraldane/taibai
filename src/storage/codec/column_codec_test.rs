@@ -896,3 +896,68 @@ fn bitpacked_decode_throughput_bench() {
         );
     }
 }
+
+/// `decode_column_selected` on adaptive columns gathers typed values from
+/// the fully decoded column; pin it against the plain decode + per-row
+/// scalar reference for a run-heavy (Rle/DeltaRle) and a dictionary shape.
+#[test]
+fn decode_selected_adaptive_gather_matches_reference() {
+    use crate::storage::codec::column_codec::decode_column_selected;
+
+    fn check(
+        col: &ColumnArray,
+        dt: DataType,
+        encoded: &[u8],
+        row_count: usize,
+        selected: &[usize],
+    ) {
+        let gathered = decode_column_selected(encoded, row_count, &col_def(dt), selected).unwrap();
+        assert_eq!(gathered.len(), selected.len());
+        assert_eq!(gathered.data_type(), dt);
+        for (out_row, &src_row) in selected.iter().enumerate() {
+            assert_eq!(
+                gathered.scalar(out_row),
+                col.scalar(src_row),
+                "gathered row {} must equal source row {}",
+                out_row,
+                src_row
+            );
+        }
+    }
+
+    // DeltaRle shape: long repeated runs (the Q6 close_px form).
+    let mut values = Vec::new();
+    for &(v, len) in &[(7i64, 300usize), (42, 400), (-9, 250), (1000, 50)] {
+        values.extend(std::iter::repeat_n(v, len));
+    }
+    let decimal: ColumnArray = ColumnArray::Decimal {
+        data: values.clone(),
+        bitmap: NullBitmap::new_valid(values.len()),
+    };
+    let (encoded, _) = encode_column_ex(&decimal, 0, values.len()).unwrap();
+    assert_eq!(
+        crate::storage::codec::column_codec::stored_encoding_tag(&encoded),
+        Some(EncodingType::DeltaRle),
+        "fixture must be DeltaRle-encoded"
+    );
+    let selected: Vec<usize> = (0..values.len()).step_by(7).collect();
+    check(&decimal, DataType::Decimal, &encoded, values.len(), &selected);
+
+    // Dictionary varchar shape: dictionary passthrough decodes to plain.
+    let mut strings: Vec<&str> = Vec::new();
+    for i in 0..500 {
+        strings.push(if i % 5 == 0 { "aaa" } else { "bbbb" });
+    }
+    let owned: Vec<String> = strings.iter().map(|s| s.to_string()).collect();
+    let varchar: ColumnArray = ColumnArray::VarChar {
+        data: owned.clone().into(),
+        bitmap: NullBitmap::new_valid(owned.len()),
+    };
+    let (encoded, _) = encode_column_ex(&varchar, 0, owned.len()).unwrap();
+    let selected: Vec<usize> = (0..owned.len()).rev().step_by(3).collect();
+    let gathered = decode_column_selected(&encoded, owned.len(), &col_def(DataType::VarChar), &selected).unwrap();
+    assert_eq!(gathered.len(), selected.len());
+    for (out_row, &src_row) in selected.iter().enumerate() {
+        assert_eq!(gathered.scalar(out_row), varchar.scalar(src_row));
+    }
+}

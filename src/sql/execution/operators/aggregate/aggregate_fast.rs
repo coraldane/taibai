@@ -70,6 +70,11 @@ enum FastArgCol<'a> {
     I32(&'a [i32], &'a NullBitmap),
     F64(&'a [f64], &'a NullBitmap),
     F32(&'a [f32], &'a NullBitmap),
+    /// Run-length passthrough: `(value, row_count)` runs over the non-null
+    /// rows (the `Rle` column variant is null-free here by construction of
+    /// the run decode contract: run lengths cover exactly the non-null
+    /// rows, so a null-free bitmap means rows align 1:1 with run coverage).
+    Runs(&'a [(i64, u32)], &'a NullBitmap),
 }
 
 impl<'a> FastArgCol<'a> {
@@ -81,7 +86,8 @@ impl<'a> FastArgCol<'a> {
             | FastArgCol::I64(_, b)
             | FastArgCol::I32(_, b)
             | FastArgCol::F64(_, b)
-            | FastArgCol::F32(_, b) => !b.is_null(row),
+            | FastArgCol::F32(_, b)
+            | FastArgCol::Runs(_, b) => !b.is_null(row),
         }
     }
 }
@@ -103,6 +109,38 @@ enum TypedAcc<'a> {
     CountStar,
     SumI64(&'a [i64]),
     AvgI64(&'a [i64]),
+}
+
+/// Accumulator shape for the run-intersection loop: like [`TypedAcc`] but
+/// the argument arrives as runs. `Sum`/`Avg` fold `value × take` per
+/// (group-run × value-run) chunk — bit-identical to the per-row wrapping
+/// adds for Sum, and the same exact-i64-then-f64 form the metadata folds
+/// use for Avg.
+enum RunAcc<'a> {
+    CountStar,
+    SumI64(&'a [(i64, u32)]),
+    AvgI64(&'a [(i64, u32)]),
+}
+
+impl<'a> RunAcc<'a> {
+    fn classify(agg: &AggregateExpr, view: &FastArgCol<'a>) -> Option<Self> {
+        if agg.distinct {
+            return None;
+        }
+        match (&agg.func, view) {
+            (AggFunc::Count, FastArgCol::None) => Some(RunAcc::CountStar),
+            (AggFunc::Count, FastArgCol::Runs(_, bm)) if bm.null_count() == 0 => {
+                Some(RunAcc::CountStar)
+            }
+            (AggFunc::Sum, FastArgCol::Runs(runs, bm)) if bm.null_count() == 0 => {
+                Some(RunAcc::SumI64(runs))
+            }
+            (AggFunc::Avg, FastArgCol::Runs(runs, bm)) if bm.null_count() == 0 => {
+                Some(RunAcc::AvgI64(runs))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl<'a> TypedAcc<'a> {
@@ -316,6 +354,27 @@ impl FastGroups {
         // interpreter below.
         if let FastGroupCol::Dict(ids, dict, gbm) = group_col {
             if gbm.null_count() == 0 {
+                // Run intersection first: clustered keys and run-length
+                // arguments collapse the walk to O(ids compares + runs).
+                let run_kinds = aggregates
+                    .iter()
+                    .zip(arg_views.iter())
+                    .map(|(agg, view)| RunAcc::classify(agg, view))
+                    .collect::<Option<Vec<_>>>();
+                if let Some(run_kinds) = run_kinds {
+                    return self.update_row_range_dict_runs(
+                        ids,
+                        dict,
+                        start,
+                        end,
+                        &run_kinds,
+                        batch,
+                        gb_col,
+                        aggregates,
+                        physical_schema,
+                        max_groups,
+                    );
+                }
                 let kinds = aggregates
                     .iter()
                     .zip(arg_views.iter())
@@ -553,6 +612,161 @@ impl FastGroups {
     /// Count/Sum/Avg(i64-view) accumulators. `kinds` is classified once per
     /// range; unseen dict entries fall through to `new_group` at most
     /// `dict_len` times per batch.
+    /// Resolve a dictionary entry to its group id, creating the group on
+    /// first sight (batch-local entry cache + global value map). Shared by
+    /// the typed and run-intersection loops.
+    #[allow(clippy::too_many_arguments)]
+    fn dict_group_id(
+        &mut self,
+        entry: usize,
+        dict: &Utf8Buffer,
+        row: usize,
+        batch: &RecordBatch,
+        gb_col: usize,
+        aggregates: &[AggregateExpr],
+        physical_schema: &Schema,
+        max_groups: usize,
+    ) -> Result<u32> {
+        if let Some(id) = self.dict_gid.get(entry).copied().flatten() {
+            return Ok(id);
+        }
+        let value = dict.value(entry);
+        let id = match self.dict_map.get(value).copied() {
+            Some(id) => id,
+            None => {
+                let id = self.new_group(
+                    batch,
+                    gb_col,
+                    row,
+                    aggregates,
+                    physical_schema,
+                    max_groups,
+                )?;
+                self.cached_bytes += value.len() + 24;
+                self.dict_map.insert(value.to_string(), id);
+                id
+            }
+        };
+        if self.dict_gid.len() <= entry {
+            self.dict_gid.resize(entry + 1, None);
+        }
+        self.dict_gid[entry] = Some(id);
+        Ok(id)
+    }
+
+    /// Run-intersection loop over `[start, end)`: the dictionary id stream
+    /// is walked for maximal constant segments (clustered data makes those
+    /// long), and each argument's runs are intersected with the segment, so
+    /// accumulators fold `value × take` per chunk instead of per row. Per
+    /// row this costs one u32 compare — no hash lookup, no accumulator
+    /// deref. Falls back to the typed per-row loop for any non-run shape.
+    #[allow(clippy::too_many_arguments)]
+    fn update_row_range_dict_runs(
+        &mut self,
+        ids: &[u32],
+        dict: &Utf8Buffer,
+        start: usize,
+        end: usize,
+        kinds: &[RunAcc],
+        batch: &RecordBatch,
+        gb_col: usize,
+        aggregates: &[AggregateExpr],
+        physical_schema: &Schema,
+        max_groups: usize,
+    ) -> Result<()> {
+        TYPED_RANGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.dict_gid.len() < dict.len() {
+            self.dict_gid.resize(dict.len(), None);
+        }
+        // Per-argument run cursor `(run index, run start row)`, positioned
+        // once at `start` and advanced monotonically with the walk.
+        let mut cursors: Vec<(usize, usize)> = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            cursors.push(match kind {
+                RunAcc::SumI64(runs) | RunAcc::AvgI64(runs) => {
+                    locate_run(runs, start)
+                }
+                RunAcc::CountStar => (0, 0),
+            });
+        }
+        let mut i = start;
+        while i < end {
+            let id0 = ids[i];
+            let j = gallop_run_end(ids, i, end, id0);
+            let group_id = self.dict_group_id(
+                id0 as usize,
+                dict,
+                i,
+                batch,
+                gb_col,
+                aggregates,
+                physical_schema,
+                max_groups,
+            )?;
+            let accs = &mut self.accs[group_id as usize];
+            for (k, kind) in kinds.iter().enumerate() {
+                match *kind {
+                    RunAcc::CountStar => match &mut accs[k] {
+                        Accumulator::Count { count, .. } => {
+                            *count = count.wrapping_add((j - i) as u64);
+                        }
+                        _ => {
+                            return Err(TaibaiError::Internal(
+                                "fast group: accumulator shape mismatch".into(),
+                            ))
+                        }
+                    },
+                    RunAcc::SumI64(runs) | RunAcc::AvgI64(runs) => {
+                        let is_avg = matches!(kind, RunAcc::AvgI64(_));
+                        let (mut run_idx, mut run_start) = cursors[k];
+                        let mut pos = i;
+                        while pos < j {
+                            let &(value, len) = &runs[run_idx];
+                            let run_end = run_start + len as usize;
+                            let take = run_end.min(j) - pos;
+                            if is_avg {
+                                match &mut accs[k] {
+                                    Accumulator::Avg { sum, count, any } => {
+                                        *sum += (value.wrapping_mul(take as i64)) as f64;
+                                        *count += take as u64;
+                                        *any = true;
+                                    }
+                                    _ => {
+                                        return Err(TaibaiError::Internal(
+                                            "fast group: accumulator shape mismatch".into(),
+                                        ))
+                                    }
+                                }
+                            } else {
+                                match &mut accs[k] {
+                                    Accumulator::SumI(slot) => {
+                                        *slot = Some(
+                                            slot.unwrap_or(0)
+                                                .wrapping_add(value.wrapping_mul(take as i64)),
+                                        );
+                                    }
+                                    _ => {
+                                        return Err(TaibaiError::Internal(
+                                            "fast group: accumulator shape mismatch".into(),
+                                        ))
+                                    }
+                                }
+                            }
+                            pos += take;
+                            if pos >= run_end {
+                                run_idx += 1;
+                                run_start = run_end;
+                            }
+                        }
+                        cursors[k] = (run_idx, run_start);
+                    }
+                }
+            }
+            i = j;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn update_row_range_dict_typed(
         &mut self,
@@ -792,6 +1006,9 @@ pub(super) fn fast_group_supported(
                         | ColumnArray::Decimal { .. }
                         | ColumnArray::Float64 { .. }
                         | ColumnArray::Float32 { .. }
+                        // Run-length passthrough of an i64-view column: the
+                        // run loop folds it, other shapes flatten lazily.
+                        | ColumnArray::Rle { .. }
                 );
                 if !supported {
                     return false;
@@ -844,8 +1061,13 @@ pub(super) fn fast_group_update(
         }
     };
 
+    // Run views stay unflattened only when the whole shape classifies for
+    // the run-intersection loop; mixed shapes flatten their Rle arguments so
+    // the typed / generic per-row loops see plain slices.
+    let group_runs_ok =
+        matches!(&group_col, FastGroupCol::Dict(_, _, bm) if bm.null_count() == 0);
     let mut arg_views: Vec<FastArgCol> = Vec::with_capacity(aggregates.len());
-    for (_agg, col_idx) in aggregates.iter().zip(agg_col_indices) {
+    for (agg, col_idx) in aggregates.iter().zip(agg_col_indices) {
         let Some(idx) = col_idx else {
             arg_views.push(FastArgCol::None);
             continue;
@@ -854,7 +1076,29 @@ pub(super) fn fast_group_update(
             arg_views.push(FastArgCol::None);
             continue;
         };
+        if let ColumnArray::Rle { bitmap, .. } = array {
+            let runs_ok = group_runs_ok
+                && bitmap.null_count() == 0
+                && RunAcc::classify(agg, &FastArgCol::Runs(&[], bitmap)).is_some();
+            if !runs_ok {
+                // Flattened view: the Rle expansion is cached on the column,
+                // so repeated batches of the same shape expand once.
+                let flat = array.flattened();
+                arg_views.push(match flat {
+                    ColumnArray::Int64 { data, bitmap }
+                    | ColumnArray::Decimal { data, bitmap }
+                    | ColumnArray::Timestamp { data, bitmap }
+                    | ColumnArray::Time { data, bitmap } => FastArgCol::I64(data, bitmap),
+                    ColumnArray::Int32 { data, bitmap } | ColumnArray::Date { data, bitmap } => {
+                        FastArgCol::I32(data, bitmap)
+                    }
+                    _ => FastArgCol::Bitmap(flat.bitmap()),
+                });
+                continue;
+            }
+        }
         arg_views.push(match array {
+            ColumnArray::Rle { runs, bitmap, .. } => FastArgCol::Runs(runs, bitmap),
             ColumnArray::Int64 { data, bitmap }
             | ColumnArray::Decimal { data, bitmap }
             | ColumnArray::Timestamp { data, bitmap }
@@ -903,7 +1147,12 @@ pub(super) fn fast_group_update(
             .iter()
             .zip(arg_views.iter())
             .all(|(agg, view)| TypedAcc::classify(agg, view).is_some());
-    let lanes = if typed_shape && rows < TYPED_INLINE_MAX_ROWS {
+    let runs_shape = matches!(&group_col, FastGroupCol::Dict(_, _, bm) if bm.null_count() == 0)
+        && aggregates
+            .iter()
+            .zip(arg_views.iter())
+            .all(|(agg, view)| RunAcc::classify(agg, view).is_some());
+    let lanes = if (typed_shape || runs_shape) && rows < TYPED_INLINE_MAX_ROWS {
         1
     } else if rows >= PARALLEL_MIN_ROWS {
         max_lanes
@@ -992,6 +1241,52 @@ pub(super) fn fast_group_update(
 
 /// Merge every slot table into one (slot order, then each slot's insertion
 /// order), ready for `into_maps`.
+/// First index in `[i, end)` whose id differs from `ids[i]` (or `end`).
+/// Clustered id streams hold runs thousands of rows long, so a gallop
+/// (exponential probe + binary search) touches O(log run) entries instead
+/// of walking every row.
+#[inline]
+fn gallop_run_end(ids: &[u32], i: usize, end: usize, id0: u32) -> usize {
+    // Exponential probe: last confirmed equal position, first known
+    // different bound.
+    let mut equal = i;
+    let mut step = 1usize;
+    while equal + step < end {
+        if ids[equal + step] == id0 {
+            equal += step;
+            step *= 2;
+        } else {
+            break;
+        }
+    }
+    let bound = (equal + step).min(end);
+    // Binary search the boundary inside (equal, bound].
+    let mut lo = equal;
+    let mut hi = bound;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if ids[mid] == id0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Position of the run covering `row`: `(run index, run start row)`.
+fn locate_run(runs: &[(i64, u32)], row: usize) -> (usize, usize) {
+    let mut start = 0usize;
+    for (idx, &(_, len)) in runs.iter().enumerate() {
+        let end = start + len as usize;
+        if row < end {
+            return (idx, start);
+        }
+        start = end;
+    }
+    (runs.len(), start)
+}
+
 pub(super) fn merge_slot_tables(tables: &mut Vec<Option<FastGroups>>) -> FastGroups {
     let mut merged = FastGroups::new();
     for table in tables.iter_mut() {

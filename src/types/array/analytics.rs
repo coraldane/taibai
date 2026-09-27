@@ -242,7 +242,7 @@ impl ColumnArray {
             }};
         }
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
                 self.flattened().col_min()
             }
             ColumnArray::Int64 { data, .. } => numeric_min!(data, Int64),
@@ -337,7 +337,7 @@ impl ColumnArray {
             }};
         }
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
                 self.flattened().col_max()
             }
             ColumnArray::Int64 { data, .. } => numeric_max!(data, Int64),
@@ -421,44 +421,64 @@ impl ColumnArray {
     /// Column-wide sum as i64 for integer columns (vectorized). Returns None if
     /// all values are null or the column type is not integer.
     pub fn col_sum_i64(&self) -> Option<i64> {
+        self.col_sum_i64_range(0, self.len())
+    }
+
+    /// Sum of `[offset, offset + count)` as i64 (vectorized, wrapping),
+    /// skipping null rows. Returns None when the range holds no non-null
+    /// value or the column type is not i64-viewable — the same contract as
+    /// [`Self::col_sum_i64`].
+    pub fn col_sum_i64_range(&self, offset: usize, count: usize) -> Option<i64> {
         let bitmap = self.bitmap();
-        macro_rules! int_sum {
+        macro_rules! int_sum_range {
             ($data:expr, $cast:ty) => {{
                 let data = $data.as_slice();
+                let end = (offset + count).min(data.len());
+                if offset >= end {
+                    return None;
+                }
                 if bitmap.null_count() == 0 {
                     // Null-free fast path: a branch-free wrapping-add fold the
                     // compiler can auto-vectorize.
                     let mut sum: i64 = 0;
-                    for &v in data {
+                    for &v in &data[offset..end] {
                         sum = sum.wrapping_add(v as $cast as i64);
                     }
-                    (!data.is_empty()).then_some(sum)
+                    Some(sum)
                 } else {
-                    sum_valid_words(data, bitmap, |v| v as $cast as i64)
+                    sum_valid_range_words(data, bitmap, offset, end, |v| v as $cast as i64)
                 }
             }};
         }
         match self {
-            ColumnArray::Int64 { data, .. } => int_sum!(data, i64),
-            ColumnArray::Int32 { data, .. } => int_sum!(data, i64),
-            ColumnArray::Int16 { data, .. } => int_sum!(data, i64),
-            ColumnArray::Int8 { data, .. } => int_sum!(data, i64),
+            ColumnArray::Int64 { data, .. } => int_sum_range!(data, i64),
+            ColumnArray::Int32 { data, .. } => int_sum_range!(data, i64),
+            ColumnArray::Int16 { data, .. } => int_sum_range!(data, i64),
+            ColumnArray::Int8 { data, .. } => int_sum_range!(data, i64),
+            // u64 saturates into i64 like the original whole-column kernel.
             ColumnArray::UInt64 { data, .. } => {
-                let data: &[u64] = data;
+                let bitmap = self.bitmap();
+                let values: &[u64] = data;
+                let end = (offset + count).min(values.len());
+                if offset >= end {
+                    return None;
+                }
                 if bitmap.null_count() == 0 {
                     let mut sum: i64 = 0;
-                    for &v in data {
+                    for &v in &values[offset..end] {
                         sum = sum.wrapping_add(i64::try_from(v).unwrap_or(i64::MAX));
                     }
-                    (!data.is_empty()).then_some(sum)
+                    Some(sum)
                 } else {
-                    sum_valid_words(data, bitmap, |v| i64::try_from(v).unwrap_or(i64::MAX))
+                    sum_valid_range_words(values, bitmap, offset, end, |v| {
+                        i64::try_from(v).unwrap_or(i64::MAX)
+                    })
                 }
             }
-            ColumnArray::UInt32 { data, .. } => int_sum!(data, i64),
-            ColumnArray::UInt16 { data, .. } => int_sum!(data, i64),
-            ColumnArray::UInt8 { data, .. } => int_sum!(data, i64),
-            ColumnArray::Decimal { data, .. } => int_sum!(data, i64),
+            ColumnArray::UInt32 { data, .. } => int_sum_range!(data, i64),
+            ColumnArray::UInt16 { data, .. } => int_sum_range!(data, i64),
+            ColumnArray::UInt8 { data, .. } => int_sum_range!(data, i64),
+            ColumnArray::Decimal { data, .. } => int_sum_range!(data, i64),
             _ => None,
         }
     }
@@ -572,6 +592,72 @@ impl ColumnArray {
                 }
             }
             _ => self.filter_by_mask(mask),
+        }
+    }
+
+    /// Gather the rows at `selected` positions into a new column (typed
+    /// copy, no per-row scalar boxing). `selected` must be sorted ascending
+    /// and within bounds — callers build it from an ordered mask walk.
+    pub fn gather_rows(&self, selected: &[usize]) -> ColumnArray {
+        macro_rules! gather_column {
+            ($variant:ident, $data:expr, $bitmap:expr) => {{
+                let mut new_data = Vec::with_capacity(selected.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &row in selected {
+                    new_data.push($data[row]);
+                    if $bitmap.is_null(row) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::$variant {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }};
+        }
+
+        match self {
+            ColumnArray::Bool { data, bitmap } => gather_column!(Bool, data, bitmap),
+            ColumnArray::Int8 { data, bitmap } => gather_column!(Int8, data, bitmap),
+            ColumnArray::Int16 { data, bitmap } => gather_column!(Int16, data, bitmap),
+            ColumnArray::Int32 { data, bitmap } => gather_column!(Int32, data, bitmap),
+            ColumnArray::Int64 { data, bitmap } => gather_column!(Int64, data, bitmap),
+            ColumnArray::UInt8 { data, bitmap } => gather_column!(UInt8, data, bitmap),
+            ColumnArray::UInt16 { data, bitmap } => gather_column!(UInt16, data, bitmap),
+            ColumnArray::UInt32 { data, bitmap } => gather_column!(UInt32, data, bitmap),
+            ColumnArray::UInt64 { data, bitmap } => gather_column!(UInt64, data, bitmap),
+            ColumnArray::Float32 { data, bitmap } => gather_column!(Float32, data, bitmap),
+            ColumnArray::Float64 { data, bitmap } => gather_column!(Float64, data, bitmap),
+            ColumnArray::Decimal { data, bitmap } => gather_column!(Decimal, data, bitmap),
+            ColumnArray::Date { data, bitmap } => gather_column!(Date, data, bitmap),
+            ColumnArray::Time { data, bitmap } => gather_column!(Time, data, bitmap),
+            ColumnArray::Timestamp { data, bitmap } => gather_column!(Timestamp, data, bitmap),
+            ColumnArray::Interval { data, bitmap } => gather_column!(Interval, data, bitmap),
+            ColumnArray::VarChar { data, bitmap } => {
+                let mut new_data = Utf8Buffer::with_capacity(selected.len());
+                let mut new_bitmap = crate::types::bitmap::NullBitmap::new_valid(0);
+                for &row in selected {
+                    new_data.push_str(data.value(row));
+                    if bitmap.is_null(row) {
+                        new_bitmap.push_null();
+                    } else {
+                        new_bitmap.push_valid();
+                    }
+                }
+                ColumnArray::VarChar {
+                    data: new_data,
+                    bitmap: new_bitmap,
+                }
+            }
+            _ => {
+                let mut new_col = ColumnArray::empty(self.data_type());
+                for &row in selected {
+                    new_col.push(&self.scalar(row)).unwrap();
+                }
+                new_col
+            }
         }
     }
 
@@ -1312,30 +1398,30 @@ impl ColumnArray {
 }
 
 
-/// Word-at-a-time valid-row sum for integer-like data: skips all-null words
-/// outright and bulk-adds all-valid words, so dense columns pay no per-row
-/// bitmap test.
-fn sum_valid_words<T: Copy>(
+/// Word-at-a-time valid-row sum over `[offset, end)` for fixed-width data.
+fn sum_valid_range_words<T: Copy>(
     data: &[T],
     bitmap: &crate::types::bitmap::NullBitmap,
+    offset: usize,
+    end: usize,
     cvt: impl Fn(T) -> i64,
 ) -> Option<i64> {
     let mut sum: i64 = 0;
     let mut any = false;
     for (word_idx, &word) in bitmap.words().iter().enumerate() {
-        let start = word_idx * 64;
-        if start >= data.len() {
-            break;
+        let start = (word_idx * 64).max(offset);
+        let word_end = (word_idx * 64 + 64).min(end);
+        if start >= word_end {
+            continue;
         }
-        let end = (start + 64).min(data.len());
         if word == 0 {
-            for &v in &data[start..end] {
+            for &v in &data[start..word_end] {
                 sum = sum.wrapping_add(cvt(v));
             }
             any = true;
-        } else if word != u64::MAX {
-            for (bit, &v) in data[start..end].iter().enumerate() {
-                if word & (1u64 << bit) == 0 {
+        } else {
+            for (bit, &v) in data[start..word_end].iter().enumerate() {
+                if word & (1u64 << (start + bit) % 64) == 0 {
                     sum = sum.wrapping_add(cvt(v));
                     any = true;
                 }

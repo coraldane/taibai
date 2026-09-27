@@ -135,7 +135,10 @@ impl RowGroupPredicate {
     }
 }
 
-fn classify_clause(clause: &RangeClause, zone_map: &ZoneMap) -> PredicateMatch {
+/// Classify one clause against a zone map. `All` means every row of the
+/// group satisfies the clause (null_count == 0 is part of that contract:
+/// NULLs never satisfy a comparison), `None` means no row can.
+pub(crate) fn classify_clause(clause: &RangeClause, zone_map: &ZoneMap) -> PredicateMatch {
     if zone_map.row_count > 0 && zone_map.null_count == zone_map.row_count {
         return PredicateMatch::None;
     }

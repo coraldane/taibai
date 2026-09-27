@@ -32,7 +32,10 @@ use crate::sql::execution::scan::row_group;
 use crate::sql::execution::scan::spec::ScanSpec;
 use crate::sql::planner::{AggFunc, AggregateExpr, LogicalExpr};
 use crate::storage::catalog::schema::TableMeta;
+use crate::storage::codec::predicate_scan::{RunFold, RunPredicate};
+use crate::storage::partition::pruning::{classify_clause, PredicateMatch, ZoneMap};
 use crate::storage::segment::delete_bitmap;
+use crate::storage::segment::SegmentReader;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -53,7 +56,18 @@ pub fn compute_simple_aggregate(
     hot_mgr: &crate::storage::core::hot_store::HotStoreManager,
     db: &str,
 ) -> Result<Option<RecordBatch>> {
-    if !sum_aggregates_supported(aggregates, table_schema) {
+    // Cluster-key point shape (equality on the leading cluster column): the
+    // generic pipeline's ClusterKeyRangeRead binary-searches the sorted key
+    // and reads a sliver of the data, while this path would fold every
+    // zone-map-surviving row group. Decline and let the caller fall back.
+    if let Some(leading) = spec.cluster_key.as_ref().and_then(|keys| keys.first()) {
+        if let Some(column) = table_schema.index_of(leading) {
+            if spec.eq_value_for_column(column).is_some() {
+                return Ok(None);
+            }
+        }
+    }
+    if !aggregate_args_supported(aggregates, table_schema) {
         return Ok(None);
     }
     let aggregate_columns: Vec<Option<usize>> = aggregates
@@ -85,16 +99,16 @@ pub fn compute_simple_aggregate(
     let set_checks = row_group::build_set_check_list(spec);
     let set_in_checks = row_group::build_set_in_check_list(spec);
     let source_columns = aggregate_source_columns(spec, &aggregate_columns);
-    let aggregate_positions = aggregate_columns
-        .iter()
-        .map(|column| {
-            column.and_then(|index| source_columns.iter().position(|source| *source == index))
-        })
-        .collect::<Vec<_>>();
 
     let has_sum = accumulators
         .iter()
         .any(|a| a.func == crate::sql::planner::AggFunc::Sum && !a.sum_unsupported);
+    // AVG has no zone-map answer either: row groups must fold from data
+    // (batch folds, or the run-level fold planned below).
+    let has_avg = accumulators
+        .iter()
+        .any(|a| a.func == crate::sql::planner::AggFunc::Avg && !a.avg_unsupported);
+    let needs_data_fold = has_sum || has_avg;
 
     for segment_path in &segment_files {
         let meta = segment_mgr.segment_meta(segment_path)?;
@@ -110,13 +124,41 @@ pub fn compute_simple_aggregate(
             continue;
         }
 
+        // Footer-persisted per-row-group sums (new-format segments) answer
+        // SUM/AVG without reading any data — when present for every row
+        // group and every Sum/Avg argument has an exact i64 view. Segments
+        // without them keep the partial-sum cache / streaming fold below.
+        // The sidecar meta decides without touching the segment file; when
+        // it has not been written yet (first query after restart), the
+        // cached reader's already-parsed footer answers the same question.
+        let reader = segment_mgr.open_reader_cached(segment_path)?;
+        let footer_sums = if let Some(first) = meta
+            .as_ref()
+            .and_then(|m| m.row_groups.first())
+        {
+            first.col_sums.len() == first.zone_maps.len()
+        } else {
+            reader
+                .footer_row_groups()
+                .first()
+                .is_some_and(|rg| rg.col_sums.len() == rg.zone_maps.len())
+        };
+        let sums_answerable_from_footer = footer_sums
+            && accumulators
+                .iter()
+                .filter(|a| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
+                .all(|a| crate::storage::segment::column_sum_supported(a.col_type));
         // SUM has no zone-map representation: either the per-segment
         // partial-sum cache answers (COUNT/MIN/MAX fold from the zone maps
         // and SUM from the cache — no column reads at all), or the segment
         // streams below with sums folded from data. Folding metadata for a
         // streaming segment would skip SUM and then cache a zero delta, so
         // the two paths are mutually exclusive.
-        let sum_cache = if has_sum && !spec.has_predicates() && meta_deleted == 0 && meta.is_some()
+        let sum_cache = if has_sum
+            && !sums_answerable_from_footer
+            && !spec.has_predicates()
+            && meta_deleted == 0
+            && meta.is_some()
         {
             segment_sum_cache_lookup(
                 segment_path.to_string_lossy().as_ref(),
@@ -129,7 +171,7 @@ pub fn compute_simple_aggregate(
         };
         if let Some(cached) = &sum_cache {
             if let Some(m) = &meta {
-                fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count)?;
+                fold_metadata(&mut accumulators, &m.segment_zone_maps, m.row_count, &[])?;
             }
             let mut sum_idx = 0usize;
             for accumulator in accumulators.iter_mut() {
@@ -144,18 +186,22 @@ pub fn compute_simple_aggregate(
             continue;
         }
 
-        let reader = segment_mgr.open_reader_cached(segment_path)?;
         // Cache miss: stream candidate row groups and fold every function
         // from data, so the stored partial sums are real values.
-        // Any SUM needs data (zone maps carry no sums), predicates or not.
+        // Any SUM needs data (zone maps carry no sums), predicates or not —
+        // unless the footer's per-row-group sums answer it directly.
         // All-match row groups skip the predicate mask — every row matches —
         // so folding the raw batch there is still exact.
-        let streaming_sum = has_sum && sum_cache.is_none() && reader.deleted_row_count() == 0;
-        if !spec.has_predicates() && reader.deleted_row_count() == 0 && !has_sum {
+        let streaming_sum = has_sum
+            && !sums_answerable_from_footer
+            && sum_cache.is_none()
+            && reader.deleted_row_count() == 0;
+        if !spec.has_predicates() && reader.deleted_row_count() == 0 && !needs_data_fold {
             fold_metadata(
                 &mut accumulators,
                 reader.segment_zone_maps(),
                 reader.row_count(),
+                &[],
             )?;
             continue;
         }
@@ -188,7 +234,7 @@ pub fn compute_simple_aggregate(
             )
             .candidate_indices
         };
-        let row_groups = reader.footer_row_groups_info();
+        let row_groups = reader.footer_row_groups();
         let mut candidates = vec![false; row_groups.len()];
         for index in candidate_indices {
             if let Some(candidate) = candidates.get_mut(index) {
@@ -206,10 +252,30 @@ pub fn compute_simple_aggregate(
         struct DataFold {
             row_group_index: usize,
             row_start: u64,
+            run_fold: Option<RunFoldPlan>,
+            /// Columns the batch fold reads for this row group. All-vacuous
+            /// row groups drop their predicate columns (the mask would be
+            /// all-true); `source_columns` otherwise.
+            read_columns: Vec<usize>,
+            /// Aggregate argument positions within `read_columns`.
+            positions: Vec<Option<usize>>,
+            /// Whether the batch fold still evaluates predicates (false when
+            /// every clause is zone-map vacuous for this row group).
             apply_mask: bool,
         }
-        let mut meta_folds: Vec<(&[crate::storage::partition::pruning::ZoneMap], u64)> = Vec::new();
+        let mut meta_folds: Vec<(
+            &[crate::storage::partition::pruning::ZoneMap],
+            u64,
+            &[i64],
+        )> = Vec::new();
         let mut data_folds: Vec<DataFold> = Vec::new();
+
+        // Per-clause zone-map classification is only sound without IN /
+        // remaining predicates (they need per-row evaluation and extra
+        // columns).
+        let clause_vacuity_ok = reader.delete_bitmap().is_empty()
+            && spec.in_predicates.is_empty()
+            && spec.remaining_predicate.is_none();
 
         for (row_group_index, row_group_meta) in row_groups.iter().enumerate() {
             if !candidates[row_group_index] {
@@ -227,36 +293,159 @@ pub fn compute_simple_aggregate(
                 row_start += row_group_meta.row_count;
                 continue;
             }
-            // The metadata-only fold cannot produce SUM: a streaming_sum
-            // segment folds every function from data instead.
+            // The metadata-only fold cannot produce SUM or AVG — unless the
+            // footer's per-row-group sums answer them (this row group's
+            // extension present; the argument types were checked above). A
+            // streaming_sum segment folds every function from data instead.
+            let rg_sums_available =
+                sums_answerable_from_footer && row_group_meta.zone_maps.len() != 0
+                    && row_group_meta.col_sums.len() == row_group_meta.zone_maps.len();
             if predicate_match == crate::storage::partition::pruning::PredicateMatch::All
                 && reader.delete_bitmap().is_empty()
                 && !streaming_sum
+                && ((!has_sum && !has_avg) || rg_sums_available)
             {
-                meta_folds.push((&row_group_meta.zone_maps, row_group_meta.row_count));
+                meta_folds.push((
+                    &row_group_meta.zone_maps,
+                    row_group_meta.row_count,
+                    &row_group_meta.col_sums,
+                ));
                 row_start += row_group_meta.row_count;
                 continue;
             }
 
+            // Classify each clause against this row group's zone maps: All
+            // clauses are vacuous (every row satisfies them — no mask work,
+            // no predicate column read), Partial clauses must share one
+            // column to be run-foldable.
+            let mut fold_column: Option<usize> = None;
+            let mut run_predicates: Vec<RunPredicate> = Vec::new();
+            let mut discriminating = false;
+            let mut classifiable = clause_vacuity_ok;
+            if clause_vacuity_ok {
+                for clause in &predicate.clauses {
+                    let Some(zone_map) = row_group_meta.zone_maps.get(clause.column_index) else {
+                        classifiable = false;
+                        break;
+                    };
+                    match classify_clause(clause, zone_map) {
+                        PredicateMatch::All => {}
+                        PredicateMatch::None => {
+                            // classify_row_group above already skipped None
+                            // groups; keep the batch fold defensively.
+                            classifiable = false;
+                            break;
+                        }
+                        PredicateMatch::Partial => {
+                            if fold_column.is_some_and(|column| column != clause.column_index) {
+                                classifiable = false;
+                                break;
+                            }
+                            fold_column = Some(clause.column_index);
+                            run_predicates.push(RunPredicate::new(clause.op, &clause.value));
+                            discriminating = true;
+                        }
+                    }
+                }
+            }
+
+            let mut run_fold = None;
+            if classifiable && discriminating {
+                run_fold = plan_run_fold_on_column(
+                    fold_column,
+                    run_predicates,
+                    &accumulators,
+                    table_schema,
+                    &reader,
+                );
+            } else if classifiable && !predicate.clauses.is_empty() {
+                // Every clause is vacuous. When the aggregates share one
+                // i64-domain argument column, folding its runs answers them
+                // without decoding anything (the encoding sniff falls back
+                // to the reduced batch read below for non-Rle columns).
+                run_fold = plan_vacuous_run_fold(
+                    &aggregate_columns,
+                    &accumulators,
+                    table_schema,
+                    &row_group_meta.zone_maps,
+                    &reader,
+                );
+            }
+
+            // Batch-fold read set: all-vacuous row groups need only the
+            // aggregate argument columns and skip the (all-true) mask.
+            let all_vacuous = classifiable && !discriminating;
+            let (read_columns, apply_mask): (Vec<usize>, bool) = if all_vacuous {
+                let mut columns: Vec<usize> = Vec::with_capacity(source_columns.len());
+                for column in aggregate_columns.iter().flatten() {
+                    if !columns.contains(column) {
+                        columns.push(*column);
+                    }
+                }
+                (columns, false)
+            } else {
+                (source_columns.clone(), spec.has_predicates())
+            };
+            if read_columns.is_empty() {
+                // No aggregate reads a column (pure COUNT(*)) and every
+                // clause is vacuous: the footer answers it.
+                meta_folds.push((
+                    &row_group_meta.zone_maps,
+                    row_group_meta.row_count,
+                    &row_group_meta.col_sums,
+                ));
+                row_start += row_group_meta.row_count;
+                continue;
+            }
+            let positions = aggregate_columns
+                .iter()
+                .map(|column| {
+                    column.and_then(|col| read_columns.iter().position(|&read| read == col))
+                })
+                .collect();
+
             data_folds.push(DataFold {
                 row_group_index,
                 row_start,
-                apply_mask: spec.has_predicates(),
+                run_fold,
+                read_columns,
+                positions,
+                apply_mask,
             });
             row_start += row_group_meta.row_count;
         }
 
-        for (zone_maps, row_count) in meta_folds {
-            fold_metadata(&mut accumulators, zone_maps, row_count)?;
+        for (zone_maps, row_count, col_sums) in meta_folds {
+            fold_metadata(&mut accumulators, zone_maps, row_count, col_sums)?;
         }
 
         let delete_bitmap_is_empty = reader.delete_bitmap().is_empty();
+        // One outcome per data fold: either the run-level fold succeeded, or
+        // the row group went through the regular decode+mask batch fold
+        // (including the case where the fold column turned out not to be
+        // Rle/DeltaRle after the sniff).
+        enum RgOutcome {
+            Runs(RunFold),
+            Batch(RecordBatch),
+        }
         for chunk in data_folds.chunks(32) {
-            let batches: Vec<Result<RecordBatch>> = chunk
+            let outcomes: Vec<Result<RgOutcome>> = chunk
                 .par_iter()
                 .map(|fold| {
+                    if let Some(plan) = &fold.run_fold {
+                        let raw =
+                            reader.read_column_raw(fold.row_group_index, plan.segment_column)?;
+                        if let Some(folded) =
+                            crate::storage::codec::predicate_scan::fold_runs_from_raw(
+                                &raw,
+                                &plan.predicates,
+                            )
+                        {
+                            return folded.map(RgOutcome::Runs);
+                        }
+                    }
                     let mut batch = reader
-                        .read_row_group_with_projection(fold.row_group_index, &source_columns)?;
+                        .read_row_group_with_projection(fold.row_group_index, &fold.read_columns)?;
                     if !delete_bitmap_is_empty {
                         batch = delete_bitmap::filter_batch(
                             &batch,
@@ -267,22 +456,34 @@ pub fn compute_simple_aggregate(
                     if fold.apply_mask {
                         batch = row_filter::apply_predicates_with_column_map(
                             &batch,
-                            &source_columns,
+                            &fold.read_columns,
                             &spec.eq_predicates,
                             &spec.range_predicates,
                             &spec.in_predicates,
                             spec.remaining_predicate.as_ref(),
                         )?;
                     }
-                    Ok(batch)
+                    Ok(RgOutcome::Batch(batch))
                 })
                 .collect();
-            for (_fold, batch) in chunk.iter().zip(batches) {
-                fold_batch(&mut accumulators, &aggregate_positions, &batch?)?;
+            for (fold, outcome) in chunk.iter().zip(outcomes) {
+                match outcome? {
+                    RgOutcome::Runs(out) => {
+                        let plan = fold
+                            .run_fold
+                            .as_ref()
+                            .expect("run outcome implies a run fold plan");
+                        let col_type = table_schema.columns[plan.fold_column].data_type;
+                        fold_run_fold(&mut accumulators, col_type, &out);
+                    }
+                    RgOutcome::Batch(batch) => {
+                        fold_batch(&mut accumulators, &fold.positions, &batch)?;
+                    }
+                }
             }
         }
 
-        if has_sum && !spec.has_predicates() && reader.deleted_row_count() == 0 {
+        if has_sum && !sums_answerable_from_footer && !spec.has_predicates() && reader.deleted_row_count() == 0 {
             let needed = sum_needed_columns(aggregates, &aggregate_columns, table_schema);
             // Only SUM accumulators: `needed` (and the cache key order)
             // covers SUM aggregates exclusively, so zipping all accumulators
@@ -384,9 +585,10 @@ fn fold_metadata(
     accumulators: &mut [AggAccum],
     zone_maps: &[crate::storage::partition::pruning::ZoneMap],
     row_count: u64,
+    col_sums: &[i64],
 ) -> Result<()> {
     for accumulator in accumulators {
-        accumulator.fold_metadata(zone_maps, row_count)?;
+        accumulator.fold_metadata(zone_maps, row_count, col_sums)?;
     }
     Ok(())
 }
@@ -402,6 +604,160 @@ fn fold_batch(
     Ok(())
 }
 
+/// A row group's run-level fold plan: which column's encoded runs answer
+/// every aggregate, and which predicates the runs must satisfy.
+struct RunFoldPlan {
+    /// Table-schema index of the folded column.
+    fold_column: usize,
+    /// Segment-schema index of the same column (name-mapped).
+    segment_column: usize,
+    predicates: Vec<RunPredicate>,
+}
+
+/// Finalize a discriminating run fold on `fold_column`: the column type
+/// must be i64-representable, every aggregate must read it (COUNT(*) aside),
+/// and the segment must still carry it (name-mapped).
+fn plan_run_fold_on_column(
+    fold_column: Option<usize>,
+    predicates: Vec<RunPredicate>,
+    accumulators: &[AggAccum],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+) -> Option<RunFoldPlan> {
+    let fold_column = fold_column?;
+    if !run_fold_type_ok(table_schema.columns.get(fold_column)?.data_type) {
+        return None;
+    }
+    if accumulators
+        .iter()
+        .any(|a| a.column.is_some_and(|column| column != fold_column))
+    {
+        return None;
+    }
+    let segment_column = reader
+        .schema()
+        .index_of(&table_schema.columns.get(fold_column)?.name)?;
+    Some(RunFoldPlan {
+        fold_column,
+        segment_column,
+        predicates,
+    })
+}
+
+/// Plan a run fold for a row group where every predicate is vacuous: the
+/// aggregates must share one i64-domain argument column, and COUNT(*)
+/// additionally requires that column null-free (run lengths count non-null
+/// values only). No predicates — every run folds.
+fn plan_vacuous_run_fold(
+    aggregate_columns: &[Option<usize>],
+    accumulators: &[AggAccum],
+    table_schema: &Schema,
+    zone_maps: &[ZoneMap],
+    reader: &SegmentReader,
+) -> Option<RunFoldPlan> {
+    let mut distinct: Vec<usize> = Vec::new();
+    for &column in aggregate_columns.iter().flatten() {
+        if !distinct.contains(&column) {
+            distinct.push(column);
+        }
+    }
+    if distinct.len() != 1 {
+        return None;
+    }
+    let column = distinct[0];
+    if !run_fold_type_ok(table_schema.columns.get(column)?.data_type) {
+        return None;
+    }
+    let has_count_star = accumulators.iter().any(|a| a.column.is_none());
+    if has_count_star && zone_maps.get(column)?.null_count != 0 {
+        return None;
+    }
+    let segment_column = reader
+        .schema()
+        .index_of(&table_schema.columns.get(column)?.name)?;
+    Some(RunFoldPlan {
+        fold_column: column,
+        segment_column,
+        predicates: Vec::new(),
+    })
+}
+
+/// Run folding compares and sums the raw i64 run values, so the column must
+/// be i64-backed with an ordering the i64 view preserves (UInt64 excluded:
+/// its u64 domain can wrap the i64 view).
+fn run_fold_type_ok(dt: DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::Decimal
+            | DataType::Date
+            | DataType::Time
+            | DataType::Timestamp
+            | DataType::Interval
+    )
+}
+
+/// Fold one row group's run-level result into the accumulators. The shape
+/// checks in [`plan_run_fold`] guarantee every accumulator reads the fold
+/// column (or is COUNT(*)).
+fn fold_run_fold(accumulators: &mut [AggAccum], col_type: DataType, out: &RunFold) {
+    for accumulator in accumulators.iter_mut() {
+        match accumulator.func {
+            AggFunc::Count => accumulator.count += out.matched_rows,
+            AggFunc::Min => {
+                if out.any {
+                    accumulator.merge_min(raw_i64_scalar(col_type, out.min));
+                }
+            }
+            AggFunc::Max => {
+                if out.any {
+                    accumulator.merge_max(raw_i64_scalar(col_type, out.max));
+                }
+            }
+            AggFunc::Sum => {
+                if out.any {
+                    accumulator.sum_i =
+                        Some(accumulator.sum_i.unwrap_or(0).wrapping_add(out.sum_i));
+                }
+            }
+            AggFunc::Avg => {
+                if out.any {
+                    accumulator.avg_sum_f =
+                        Some(accumulator.avg_sum_f.unwrap_or(0.0) + out.sum_i as f64);
+                    accumulator.avg_count += out.matched_rows;
+                }
+            }
+        }
+    }
+}
+
+/// Reinterpret a raw run value as the column's scalar type. The i64 view is
+/// exact for every [`run_fold_type_ok`] type (narrow ints round-trip through
+/// the wider stored value by construction).
+fn raw_i64_scalar(dt: DataType, value: i64) -> ScalarValue {
+    match dt {
+        DataType::Int8 => ScalarValue::Int8(Some(value as i8)),
+        DataType::Int16 => ScalarValue::Int16(Some(value as i16)),
+        DataType::Int32 => ScalarValue::Int32(Some(value as i32)),
+        DataType::Int64 => ScalarValue::Int64(Some(value)),
+        DataType::UInt8 => ScalarValue::UInt8(Some(value as u8)),
+        DataType::UInt16 => ScalarValue::UInt16(Some(value as u16)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(value as u32)),
+        DataType::Decimal => ScalarValue::Decimal(Some(value)),
+        DataType::Date => ScalarValue::Date(Some(value as i32)),
+        DataType::Time => ScalarValue::Time(Some(value)),
+        DataType::Timestamp => ScalarValue::Timestamp(Some(value)),
+        DataType::Interval => ScalarValue::Interval(Some(value)),
+        _ => ScalarValue::Int64(Some(value)),
+    }
+}
+
 struct AggAccum {
     func: AggFunc,
     column: Option<usize>,
@@ -414,6 +770,12 @@ struct AggAccum {
     /// SUM over a column type the metadata fast path cannot answer
     /// (non-numeric argument columns).
     sum_unsupported: bool,
+    /// AVG accumulators: per-batch sums accumulate as f64 (mirroring
+    /// `Accumulator::Avg`), fed either from decoded batches or from exact
+    /// per-row-group i64 run folds.
+    avg_sum_f: Option<f64>,
+    avg_count: u64,
+    avg_unsupported: bool,
 }
 
 impl AggAccum {
@@ -433,6 +795,17 @@ impl AggAccum {
         } else {
             (None, None, false)
         };
+        let avg_unsupported = func == AggFunc::Avg
+            && !matches!(
+                col_type,
+                DataType::Int64
+                    | DataType::Int32
+                    | DataType::Int16
+                    | DataType::Int8
+                    | DataType::Float64
+                    | DataType::Float32
+                    | DataType::Decimal
+            );
         Self {
             func,
             column,
@@ -443,6 +816,9 @@ impl AggAccum {
             sum_i,
             sum_f,
             sum_unsupported,
+            avg_sum_f: None,
+            avg_count: 0,
+            avg_unsupported,
         }
     }
 
@@ -450,6 +826,7 @@ impl AggAccum {
         &mut self,
         zone_maps: &[crate::storage::partition::pruning::ZoneMap],
         row_count: u64,
+        col_sums: &[i64],
     ) -> Result<()> {
         let Some(column) = self.column else {
             if self.func == AggFunc::Count {
@@ -460,6 +837,12 @@ impl AggAccum {
         let Some(zone_map) = zone_maps.get(column) else {
             return Ok(());
         };
+        // An all-null row group contributes nothing to SUM/AVG — its footer
+        // sum is 0, which must not materialize a zero from an empty
+        // accumulator. `min_value` is only ever set from a non-null value, so
+        // it doubles as a path-independent "has values" signal (zone map
+        // `row_count` semantics differ between the column and bulk writers).
+        let has_values = !zone_map.min_value.is_null();
         match self.func {
             AggFunc::Count => self.count += row_count.saturating_sub(zone_map.null_count),
             AggFunc::Min if !zone_map.min_value.is_null() => {
@@ -467,6 +850,17 @@ impl AggAccum {
             }
             AggFunc::Max if !zone_map.max_value.is_null() => {
                 self.merge_max(zone_map.max_value.clone())
+            }
+            AggFunc::Sum if has_values => {
+                if let Some(&sum) = col_sums.get(column) {
+                    self.sum_i = Some(self.sum_i.unwrap_or(0).wrapping_add(sum));
+                }
+            }
+            AggFunc::Avg if has_values => {
+                if let Some(&sum) = col_sums.get(column) {
+                    self.avg_sum_f = Some(self.avg_sum_f.unwrap_or(0.0) + sum as f64);
+                    self.avg_count += row_count.saturating_sub(zone_map.null_count);
+                }
             }
             _ => {}
         }
@@ -507,7 +901,17 @@ impl AggAccum {
                     }
                 }
             },
-            _ => {}
+            AggFunc::Avg => {
+                let n = values.col_count_non_null();
+                if n > 0 {
+                    let part = values
+                        .col_sum_f64()
+                        .or_else(|| values.col_sum_i64().map(|x| x as f64))
+                        .unwrap_or(0.0);
+                    self.avg_sum_f = Some(self.avg_sum_f.unwrap_or(0.0) + part);
+                    self.avg_count += n;
+                }
+            }
         }
         Ok(())
     }
@@ -569,7 +973,15 @@ impl AggAccum {
                 DataType::Float32 | DataType::Float64 => ScalarValue::Float64(self.sum_f),
                 _ => ScalarValue::Int64(self.sum_i),
             },
-            _ => ScalarValue::Int64(None),
+            AggFunc::Avg => {
+                if self.avg_count > 0 {
+                    ScalarValue::Float64(Some(
+                        self.avg_sum_f.unwrap_or(0.0) / self.avg_count as f64,
+                    ))
+                } else {
+                    ScalarValue::Float64(None)
+                }
+            }
         }
     }
 }
@@ -661,30 +1073,56 @@ fn segment_sum_cache_store(
     }
 }
 
-/// SUM is answerable by the metadata fast path only for numeric argument
-/// columns; other types keep the generic scan.
-fn sum_aggregates_supported(aggregates: &[AggregateExpr], table_schema: &Schema) -> bool {
+/// Aggregate argument columns the metadata fast path can answer: SUM needs a
+/// plain numeric argument (the answer is the argument's integer/float
+/// representation); AVG additionally allows Decimal because its answer is
+/// always sum/count as Float64, summed in the raw i64 domain exactly like
+/// the regular pipeline's `col_sum_i64`. Anything else keeps the generic
+/// scan.
+fn aggregate_args_supported(aggregates: &[AggregateExpr], table_schema: &Schema) -> bool {
     for agg in aggregates {
-        if agg.func != crate::sql::planner::AggFunc::Sum || agg.distinct {
+        if agg.distinct {
             continue;
         }
-        let supported = match &*agg.arg {
-            crate::sql::planner::LogicalExpr::Column(idx) => table_schema
-                .columns
-                .get(*idx)
-                .map(|c| {
-                    matches!(
-                        c.data_type,
-                        crate::protocol::types::DataType::Int64
-                            | crate::protocol::types::DataType::Int32
-                            | crate::protocol::types::DataType::Int16
-                            | crate::protocol::types::DataType::Int8
-                            | crate::protocol::types::DataType::Float64
-                            | crate::protocol::types::DataType::Float32
-                    )
-                })
-                .unwrap_or(false),
-            _ => false,
+        let supported = match agg.func {
+            crate::sql::planner::AggFunc::Sum => match &*agg.arg {
+                crate::sql::planner::LogicalExpr::Column(idx) => table_schema
+                    .columns
+                    .get(*idx)
+                    .map(|c| {
+                        matches!(
+                            c.data_type,
+                            crate::protocol::types::DataType::Int64
+                                | crate::protocol::types::DataType::Int32
+                                | crate::protocol::types::DataType::Int16
+                                | crate::protocol::types::DataType::Int8
+                                | crate::protocol::types::DataType::Float64
+                                | crate::protocol::types::DataType::Float32
+                        )
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            },
+            crate::sql::planner::AggFunc::Avg => match &*agg.arg {
+                crate::sql::planner::LogicalExpr::Column(idx) => table_schema
+                    .columns
+                    .get(*idx)
+                    .map(|c| {
+                        matches!(
+                            c.data_type,
+                            crate::protocol::types::DataType::Int64
+                                | crate::protocol::types::DataType::Int32
+                                | crate::protocol::types::DataType::Int16
+                                | crate::protocol::types::DataType::Int8
+                                | crate::protocol::types::DataType::Float64
+                                | crate::protocol::types::DataType::Float32
+                                | crate::protocol::types::DataType::Decimal
+                        )
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            },
+            _ => continue,
         };
         if !supported {
             return false;

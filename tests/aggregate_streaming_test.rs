@@ -460,3 +460,233 @@ fn case_expressions_execute_in_projection_and_aggregates() {
     assert!(rows[1][1].is_null());
     engine.segment_mgr().shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Run-level predicate folding: AVG/COUNT/SUM/MIN/MAX over an RLE-encoded
+// column with eq/range predicates fold straight from the encoded runs
+// instead of decode + per-row mask + gather. These tests pin the semantics
+// against hand-computed results, including NULL rows, zero-match AVG,
+// vacuous (zone-map proven) predicates, and the delete-bitmap fallback.
+// ---------------------------------------------------------------------------
+
+fn seed_run_ticks(engine: &Engine, session: &mut Session) {
+    engine
+        .execute(
+            session,
+            "CREATE TABLE run_ticks (day INT, sym VARCHAR, px INT)",
+        )
+        .expect("create run_ticks");
+    // Long runs so the px column lands RLE-encoded after FLUSH: four value
+    // bands of 500 rows each, plus 50 NULL-px rows.
+    let mut parts = Vec::new();
+    for &(px, len) in &[(10i64, 500usize), (60, 500), (200, 500), (5, 500)] {
+        for i in 0..len {
+            parts.push(format!("(1, 's{}', {})", i % 7, px));
+        }
+    }
+    for i in 0..50 {
+        parts.push(format!("(1, 's{}', NULL)", i % 7));
+    }
+    let sql = format!("INSERT INTO run_ticks VALUES {}", parts.join(", "));
+    engine.execute(session, &sql).expect("insert run_ticks");
+    engine
+        .execute(session, "FLUSH TABLE run_ticks")
+        .expect("flush run_ticks");
+}
+
+#[test]
+fn run_fold_avg_count_sum_min_max_with_predicate() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    seed_run_ticks(&engine, &mut session);
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), AVG(px), SUM(px), MIN(px), MAX(px) FROM run_ticks WHERE px > 20",
+            )
+            .expect("run-fold aggregate"),
+    );
+    assert_eq!(rows.len(), 1);
+    let r = &rows[0];
+    // Matching rows: px=60 (500 rows) and px=200 (500 rows); the 50 NULL
+    // rows never satisfy the predicate.
+    assert_eq!(r[0], ScalarValue::Int64(Some(1000)));
+    match &r[1] {
+        ScalarValue::Float64(Some(v)) => assert!((v - 130.0).abs() < 1e-9, "avg {} vs 130", v),
+        other => panic!("unexpected avg scalar {:?}", other),
+    }
+    assert_eq!(r[2], ScalarValue::Int64(Some(130_000)));
+    assert_eq!(r[3], ScalarValue::Int32(Some(60)));
+    assert_eq!(r[4], ScalarValue::Int32(Some(200)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn run_fold_with_vacuous_partition_predicate() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    seed_run_ticks(&engine, &mut session);
+
+    // day = 1 holds for every row group (zone map min == max): the clause is
+    // vacuous, px >= 60 stays the only discriminating predicate.
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), AVG(px) FROM run_ticks WHERE day = 1 AND px >= 60",
+            )
+            .expect("vacuous + range aggregate"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int64(Some(1000)));
+    match &rows[0][1] {
+        ScalarValue::Float64(Some(v)) => assert!((v - 130.0).abs() < 1e-9),
+        other => panic!("unexpected avg scalar {:?}", other),
+    }
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn run_fold_zero_match_avg_is_null_and_count_zero() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    seed_run_ticks(&engine, &mut session);
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), AVG(px), SUM(px), MIN(px) FROM run_ticks WHERE px > 1000",
+            )
+            .expect("zero-match aggregate"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int64(Some(0)));
+    assert!(rows[0][1].is_null(), "avg over no rows is NULL");
+    assert!(rows[0][2].is_null(), "sum over no rows is NULL");
+    assert!(rows[0][3].is_null(), "min over no rows is NULL");
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn run_fold_decimal_avg_uses_raw_domain_threshold() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE dec_ticks (day INT, px DECIMAL(9,2))")
+        .expect("create dec_ticks");
+    let mut parts = Vec::new();
+    for &(px, len) in &[
+        ("10.00", 300usize),
+        ("60.50", 300),
+        ("200.25", 300),
+        ("5.75", 300),
+    ] {
+        for _ in 0..len {
+            parts.push(format!("(1, {})", px));
+        }
+    }
+    let sql = format!("INSERT INTO dec_ticks VALUES {}", parts.join(", "));
+    engine.execute(&mut session, &sql).expect("insert dec_ticks");
+    engine
+        .execute(&mut session, "FLUSH TABLE dec_ticks")
+        .expect("flush dec_ticks");
+
+    // The comparison happens in the raw scaled domain everywhere in the
+    // pipeline (`px > 10.00` thresholds raw 1000): the run fold must agree
+    // with the row kernels. Matching bands: 60.50 (raw 6050) and 200.25
+    // (raw 20025) -> avg = 7822500 / 600 = 13037.5 in the raw domain.
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), AVG(px) FROM dec_ticks WHERE px > 10.00",
+            )
+            .expect("decimal run-fold aggregate"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int64(Some(600)));
+    match &rows[0][1] {
+        ScalarValue::Float64(Some(v)) => {
+            assert!((v - 13037.5).abs() < 1e-9, "avg {} vs 13037.5", v)
+        }
+        other => panic!("unexpected avg scalar {:?}", other),
+    }
+
+    // Cross-check the same predicate through the GROUP BY pipeline: the
+    // routed (run-fold) answer must equal the generic engine answer.
+    let grouped = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), AVG(px) FROM dec_ticks WHERE px > 10.00 GROUP BY day",
+            )
+            .expect("decimal grouped cross-check"),
+    );
+    assert_eq!(rows[0], grouped[0], "routed must equal grouped");
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn run_fold_falls_back_correctly_with_delete_bitmap() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    seed_run_ticks(&engine, &mut session);
+
+    // A delete bitmap disables the run fold for that segment; the batch fold
+    // must produce the same answer over the surviving rows.
+    engine
+        .execute(&mut session, "DELETE FROM run_ticks WHERE px = 60")
+        .expect("delete px=60 band");
+
+    let rows = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), AVG(px), MIN(px), MAX(px) FROM run_ticks WHERE px > 20",
+            )
+            .expect("post-delete aggregate"),
+    );
+    assert_eq!(rows[0][0], ScalarValue::Int64(Some(500)));
+    match &rows[0][1] {
+        ScalarValue::Float64(Some(v)) => assert!((v - 200.0).abs() < 1e-9),
+        other => panic!("unexpected avg scalar {:?}", other),
+    }
+    assert_eq!(rows[0][2], ScalarValue::Int32(Some(200)));
+    assert_eq!(rows[0][3], ScalarValue::Int32(Some(200)));
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn avg_without_predicate_routes_and_matches_generic_pipeline() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    seed_run_ticks(&engine, &mut session);
+
+    // No-predicate AVG now routes through the metadata path's data folds;
+    // cross-check it against the GROUP BY pipeline over the same data.
+    let routed = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), COUNT(px), SUM(px), AVG(px) FROM run_ticks",
+            )
+            .expect("no-predicate avg"),
+    );
+    let grouped = collect_rows(
+        engine
+            .execute(
+                &mut session,
+                "SELECT COUNT(*), COUNT(px), SUM(px), AVG(px) FROM run_ticks GROUP BY day",
+            )
+            .expect("grouped avg cross-check"),
+    );
+    for (routed, grouped) in routed.iter().zip(grouped.iter()) {
+        assert_eq!(routed, grouped, "routed row must equal grouped row");
+    }
+    assert_eq!(routed[0][0], ScalarValue::Int64(Some(2050)));
+    // NULL literals now survive the flush (the buffered-insert encoder
+    // previously dropped the null bitmap), so both pipelines average the
+    // 2000 non-null px values: 137500 / 2000 = 68.75.
+    assert_eq!(routed[0][1], ScalarValue::Int64(Some(2000)), "count(px)");
+    match &routed[0][3] {
+        ScalarValue::Float64(Some(a)) => {
+            assert!((a - 68.75).abs() < 1e-9, "avg {} vs 68.75", a);
+        }
+        other => panic!("unexpected avg scalar {:?}", other),
+    }
+    engine.segment_mgr().shutdown();
+}

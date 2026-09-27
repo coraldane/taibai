@@ -274,6 +274,29 @@ fn apply_remaining_mask(
     Ok(())
 }
 
+/// Whether a zone map proves an eq/range clause holds for every row of the
+/// group (`classify_clause`'s `All` already accounts for NULLs never
+/// satisfying a comparison).
+fn zone_map_proves_clause(
+    zone_maps: &[crate::storage::partition::pruning::ZoneMap],
+    column: usize,
+    op: crate::storage::partition::pruning::RangeOp,
+    value: &ScalarValue,
+) -> bool {
+    zone_maps
+        .get(column)
+        .is_some_and(|zone_map| {
+            crate::storage::partition::pruning::classify_clause(
+                &crate::storage::partition::pruning::RangeClause {
+                    column_index: column,
+                    op,
+                    value: value.clone(),
+                },
+                zone_map,
+            ) == crate::storage::partition::pruning::PredicateMatch::All
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn predicate_first_read(
     reader: &crate::storage::segment::SegmentReader,
@@ -285,7 +308,97 @@ pub fn predicate_first_read(
     in_predicates: &[InPredicate],
     remaining_predicate: Option<&crate::sql::planner::LogicalExpr>,
 ) -> crate::common::error::Result<RecordBatch> {
-    let pred_batch = reader.read_columns_fast(rg_idx, predicate_cols)?;
+    // Zone-map vacuity: when only eq/range predicates are present, a clause
+    // the whole row group satisfies contributes an all-true mask — drop it
+    // from both the predicate-column read and the evaluation. A partition
+    // column pinned by equality (min == max across the group) vanishes for
+    // free. IN / remaining predicates may reference the same columns, so
+    // they disable the elimination.
+    let can_eliminate = in_predicates.is_empty() && remaining_predicate.is_none();
+    let zone_maps = reader.zone_maps(rg_idx);
+    let eq_predicates: Vec<&(usize, ScalarValue)> = eq_predicates
+        .iter()
+        .filter(|(column, value)| {
+            !can_eliminate
+                || !zone_map_proves_clause(
+                    zone_maps,
+                    *column,
+                    crate::storage::partition::pruning::RangeOp::Eq,
+                    value,
+                )
+        })
+        .collect();
+    let range_predicates: Vec<&crate::storage::partition::pruning::RangeClause> =
+        range_predicates
+            .iter()
+            .filter(|clause| {
+                !can_eliminate
+                    || !zone_map_proves_clause(
+                        zone_maps,
+                        clause.column_index,
+                        clause.op,
+                        &clause.value,
+                    )
+            })
+            .collect();
+
+    // Columns predicate evaluation still needs, in a stable order.
+    let mut eval_cols: Vec<usize> = Vec::with_capacity(predicate_cols.len());
+    for (column, _) in &eq_predicates {
+        if !eval_cols.contains(column) {
+            eval_cols.push(*column);
+        }
+    }
+    for clause in &range_predicates {
+        if !eval_cols.contains(&clause.column_index) {
+            eval_cols.push(clause.column_index);
+        }
+    }
+    for &column in predicate_cols {
+        if !eval_cols.contains(&column) {
+            eval_cols.push(column);
+        }
+    }
+
+    let row_count = reader.row_group_rows(rg_idx) as usize;
+    if eval_cols.is_empty() {
+        // Every predicate is vacuous: the whole row group matches modulo the
+        // delete bitmap. No predicate column needs decoding at all.
+        if reader.delete_bitmap().is_empty() {
+            return reader.read_columns_fast_allow_dictionary(rg_idx, projection_cols, true);
+        }
+        let rg_start_row = reader.row_group_start_row(rg_idx);
+        let selected_rows: Vec<usize> = (0..row_count)
+            .filter(|row| !reader.is_row_deleted(rg_start_row + *row as u64))
+            .collect();
+        if selected_rows.is_empty() {
+            return Ok(empty_with_projection(reader, rg_idx, projection_cols));
+        }
+        let mut columns_by_idx: std::collections::HashMap<usize, ColumnArray> =
+            std::collections::HashMap::with_capacity(projection_cols.len());
+        for (column, col) in reader.read_columns_filtered(rg_idx, projection_cols, &selected_rows)? {
+            columns_by_idx.insert(column, col);
+        }
+        let mut columns = Vec::with_capacity(projection_cols.len());
+        for &column in projection_cols {
+            let col = columns_by_idx.remove(&column).ok_or_else(|| {
+                crate::common::error::TaibaiError::Internal(format!(
+                    "projected column {column} was not read"
+                ))
+            })?;
+            columns.push(col);
+        }
+        let proj_schema = crate::types::batch::Schema::new(
+            projection_cols
+                .iter()
+                .map(|&idx| reader.schema().columns[idx].clone())
+                .collect(),
+        );
+        return crate::types::batch::RecordBatch::try_new(proj_schema, columns)
+            .map_err(|e| crate::common::error::TaibaiError::Internal(e.to_string()));
+    }
+
+    let pred_batch = reader.read_columns_fast(rg_idx, &eval_cols)?;
     if pred_batch.num_rows() == 0 {
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
@@ -302,14 +415,11 @@ pub fn predicate_first_read(
         return Ok(empty_with_projection(reader, rg_idx, projection_cols));
     }
 
-    let pred_to_batch_pos: std::collections::HashMap<usize, usize> = predicate_cols
-        .iter()
-        .enumerate()
-        .map(|(pos, &idx)| (idx, pos))
-        .collect();
+    let pred_to_batch_pos =
+        |column: usize| -> Option<usize> { eval_cols.iter().position(|&c| c == column) };
 
-    for (col_idx, value) in eq_predicates {
-        if let Some(&pos) = pred_to_batch_pos.get(col_idx) {
+    for (col_idx, value) in eq_predicates.iter().map(|(column, value)| (*column, value)) {
+        if let Some(pos) = pred_to_batch_pos(col_idx) {
             if let Some(col) = pred_batch.column(pos) {
                 let col_mask = col.eq_vec(value);
                 for (i, m) in col_mask.iter().enumerate() {
@@ -322,8 +432,8 @@ pub fn predicate_first_read(
         }
     }
 
-    for clause in range_predicates {
-        if let Some(&pos) = pred_to_batch_pos.get(&clause.column_index) {
+    for clause in range_predicates.iter() {
+        if let Some(pos) = pred_to_batch_pos(clause.column_index) {
             if let Some(col) = pred_batch.column(pos) {
                 let col_mask = match clause.op {
                     RangeOp::Eq => col.eq_vec(&clause.value),
@@ -343,7 +453,7 @@ pub fn predicate_first_read(
     }
 
     for pred in in_predicates {
-        if let Some(&pos) = pred_to_batch_pos.get(&pred.column_index) {
+        if let Some(pos) = pred_to_batch_pos(pred.column_index) {
             if let Some(col) = pred_batch.column(pos) {
                 for (i, m) in mask.iter_mut().enumerate() {
                     if !*m {
@@ -363,7 +473,12 @@ pub fn predicate_first_read(
     }
 
     if let Some(expr) = remaining_predicate {
-        let remapped_expr = remap_expr(expr, &pred_to_batch_pos)?;
+        let col_pos_by_original: std::collections::HashMap<usize, usize> = eval_cols
+            .iter()
+            .enumerate()
+            .map(|(pos, &column)| (column, pos))
+            .collect();
+        let remapped_expr = remap_expr(expr, &col_pos_by_original)?;
         apply_remaining_mask(&pred_batch, &remapped_expr, &mut mask)?;
     }
 
@@ -391,7 +506,7 @@ pub fn predicate_first_read(
         if columns_by_idx.contains_key(&col_idx) || cols_to_read.contains(&col_idx) {
             continue;
         }
-        if let Some(&pos) = pred_to_batch_pos.get(&col_idx) {
+        if let Some(pos) = pred_to_batch_pos(col_idx) {
             if let Some(col) = pred_batch.column(pos) {
                 columns_by_idx.insert(col_idx, col.filter_by_mask_fast(&mask, match_count));
                 continue;

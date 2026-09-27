@@ -17,8 +17,8 @@ use crate::storage::segment_manager::config::{
     FLUSH_META_AFTER_ROW_GROUP, SIDECAR_COMPACT_MIN_BYTES, SIDECAR_COMPACT_MIN_RECORDS,
 };
 use crate::storage::segment_manager::helpers::{
-    compute_value_sets_from_bulk_columns, compute_zone_map_from_column,
-    compute_zone_maps_from_bulk_columns,
+    col_sums_from_bulk_columns, compute_value_sets_from_bulk_columns,
+    compute_zone_map_from_column, compute_zone_maps_from_bulk_columns,
 };
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
@@ -169,6 +169,7 @@ impl ActiveSegmentWriter {
         } else {
             vec![None; self.schema.num_columns()]
         };
+        let col_sums = col_sums_from_bulk_columns(columns, row_count);
 
         self.row_groups.push(RowGroupMeta {
             offset,
@@ -184,6 +185,7 @@ impl ActiveSegmentWriter {
             uncompressed_sizes,
             bloom_filters: vec![None; self.schema.num_columns()],
             value_sets,
+            col_sums,
         });
         self.current_size += total_length;
         self.total_rows += row_count;
@@ -252,6 +254,12 @@ impl ActiveSegmentWriter {
 
         let compression_level = self.compression_level;
         let num_cols = buffered.num_columns();
+        let col_types: Vec<crate::protocol::types::DataType> = self
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.data_type)
+            .collect();
 
         let rows_to_flush = self.row_group_target_rows.min(total_buffered);
 
@@ -269,16 +277,22 @@ impl ActiveSegmentWriter {
                     .map_err(|e| TaibaiError::Storage(format!("zstd error: {}", e)))?;
                 let zone_map = compute_zone_map_from_column(col, 0, rows_to_flush);
                 let value_set = compute_value_set_from_column(col, 0, rows_to_flush);
-                Ok((compressed, orig_len, zone_map, value_set))
+                let col_sum = col
+                    .col_sum_i64_range(0, rows_to_flush)
+                    .filter(|_| crate::storage::segment::column_sum_supported(col_types[col_idx]))
+                    .unwrap_or(0);
+                Ok((compressed, orig_len, zone_map, value_set, col_sum))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut compressed_columns = Vec::with_capacity(num_cols);
         let mut zone_maps = Vec::with_capacity(num_cols);
         let mut value_sets = Vec::with_capacity(num_cols);
-        for (compressed, orig_len, zone_map, value_set) in outputs {
+        let mut col_sums = Vec::with_capacity(num_cols);
+        for (compressed, orig_len, zone_map, value_set, col_sum) in outputs {
             compressed_columns.push((compressed, orig_len));
             zone_maps.push(zone_map);
             value_sets.push(value_set);
+            col_sums.push(col_sum);
         }
 
         self.ensure_data_write_position()?;
@@ -306,6 +320,7 @@ impl ActiveSegmentWriter {
             uncompressed_sizes,
             bloom_filters: vec![None; self.schema.num_columns()],
             value_sets,
+            col_sums,
         });
         self.current_size += total_length;
         self.total_rows += rows_to_flush as u64;

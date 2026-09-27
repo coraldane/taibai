@@ -81,7 +81,9 @@ pub(crate) fn compress_prepared_batch_for_wal_with(
 fn encode_column_raw_into(col: &crate::types::array::ColumnArray, out: &mut Vec<u8>) {
     use crate::types::array::ColumnArray;
     match col {
-        ColumnArray::Selected { .. } => encode_column_raw_into(col.flattened(), out),
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+            encode_column_raw_into(col.flattened(), out)
+        }
         ColumnArray::Dictionary { .. } => encode_column_raw_into(&col.materialize_varchar(), out),
         ColumnArray::Bool { data, .. } => out.extend_from_slice(data),
         ColumnArray::Int8 { data, .. } => {

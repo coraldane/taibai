@@ -423,14 +423,20 @@ pub fn read_plain_row_group(
     // dictionary-encoded columns stay as (ids, dict) so the grouped
     // aggregate's fast path consumes u32 ids directly. Predicates materialize
     // dictionary columns before typed evaluation, and delete-bitmap gathers
-    // need plain columns, so both cases keep the expanded form.
-    let allow_dictionary = !spec.has_predicates() && reader.delete_bitmap().is_empty();
-    let mut batch = read_projected_row_group_allow_dictionary(
+    // need plain columns, so both cases keep the expanded form. Run
+    // passthrough rides the same gate for Rle/DeltaRle columns: the
+    // run-aware aggregate consumes runs directly, everything else flattens
+    // lazily.
+    let passthrough_safe = !spec.has_predicates() && reader.delete_bitmap().is_empty();
+    let allow_dictionary = passthrough_safe;
+    let allow_runs = passthrough_safe;
+    let mut batch = read_projected_row_group_passthrough(
         projection_cols,
         table_schema,
         reader,
         rg_idx,
         allow_dictionary,
+        allow_runs,
     )?;
 
     if !reader.delete_bitmap().is_empty() {
@@ -575,6 +581,27 @@ pub fn read_projected_row_group_allow_dictionary(
     rg_idx: usize,
     allow_dictionary: bool,
 ) -> Result<RecordBatch> {
+    read_projected_row_group_passthrough(
+        projection_cols,
+        table_schema,
+        reader,
+        rg_idx,
+        allow_dictionary,
+        false,
+    )
+}
+
+/// `allow_runs` keeps Rle/DeltaRle columns in run form: safe when no
+/// predicate must evaluate against them and no delete gather needs plain
+/// values — the same contract as dictionary passthrough.
+pub fn read_projected_row_group_passthrough(
+    projection_cols: &[usize],
+    table_schema: &Schema,
+    reader: &SegmentReader,
+    rg_idx: usize,
+    allow_dictionary: bool,
+    allow_runs: bool,
+) -> Result<RecordBatch> {
     if projection_cols.is_empty() {
         if reader_schema_differs(reader.schema(), table_schema) {
             let all_cols: Vec<usize> = (0..table_schema.num_columns()).collect();
@@ -584,10 +611,11 @@ pub fn read_projected_row_group_allow_dictionary(
     }
 
     if !reader_schema_differs(reader.schema(), table_schema) {
-        return reader.read_row_group_with_projection_and_dictionary(
+        return reader.read_row_group_with_projection_passthrough(
             rg_idx,
             projection_cols,
             allow_dictionary,
+            allow_runs,
         );
     }
 

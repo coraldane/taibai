@@ -525,8 +525,58 @@ pub(super) fn compute_zone_maps_from_bulk_columns(
     zone_maps
 }
 
-pub(super) fn compute_value_sets_from_bulk_columns(
+/// Footer-persisted running sums for one bulk-imported row group: wrapping
+/// i64 over the non-null values of each sum-supported column, read straight
+/// from the fixed-width LE payload. Unsupported columns carry 0.
+pub(super) fn col_sums_from_bulk_columns(
     columns: &[DirectBulkColumn<'_>],
+    row_count: u64,
+) -> Vec<i64> {
+    use DataType::{
+        Date, Decimal, Int16, Int32, Int64, Int8, Interval, Time, Timestamp, UInt16, UInt32, UInt8,
+    };
+    let elem_count = row_count as usize;
+    let mut col_sums = Vec::with_capacity(columns.len());
+    for col in columns {
+        let mut sum = 0i64;
+        let dtype = col.data_type;
+        if crate::storage::segment::column_sum_supported(dtype) {
+            let width = dtype.fixed_size().unwrap_or(0);
+            let data = col.data;
+            // (type, width, signed) read of one LE scalar as i64.
+            let read = |offset: usize| -> Option<i64> {
+                if width == 0 || offset + width > data.len() {
+                    return None;
+                }
+                let bytes = &data[offset..offset + width];
+                Some(match dtype {
+                    Int8 => bytes[0] as i8 as i64,
+                    UInt8 => bytes[0] as i64,
+                    Int16 => i16::from_le_bytes(bytes.try_into().unwrap()) as i64,
+                    UInt16 => u16::from_le_bytes(bytes.try_into().unwrap()) as i64,
+                    Int32 | Date => i32::from_le_bytes(bytes.try_into().unwrap()) as i64,
+                    UInt32 => u32::from_le_bytes(bytes.try_into().unwrap()) as i64,
+                    Int64 | Decimal | Time | Timestamp | Interval => {
+                        i64::from_le_bytes(bytes.try_into().unwrap())
+                    }
+                    _ => 0,
+                })
+            };
+            for row in 0..elem_count {
+                if col.is_null(row) {
+                    continue;
+                }
+                if let Some(raw) = read(row * width) {
+                    sum = sum.wrapping_add(raw);
+                }
+            }
+        }
+        col_sums.push(sum);
+    }
+    col_sums
+}
+
+pub(super) fn compute_value_sets_from_bulk_columns(    columns: &[DirectBulkColumn<'_>],
     row_count: u64,
 ) -> Result<Vec<Option<Vec<ScalarValue>>>> {
     let mut result = Vec::with_capacity(columns.len());

@@ -556,7 +556,7 @@ fn append_column_cell(line: &mut String, col: &types::array::ColumnArray, row: u
     }
 
     match col {
-        types::array::ColumnArray::Selected { .. } => {
+        types::array::ColumnArray::Selected { .. } | types::array::ColumnArray::Rle { .. } => {
             return append_column_cell(line, col.flattened(), row, scale);
         }
         types::array::ColumnArray::Dictionary { .. } => {

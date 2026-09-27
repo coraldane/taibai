@@ -633,8 +633,22 @@ impl ExecutionOp for HashAggregateExec {
             .max(1);
         let mut fast_tables: Vec<Option<FastGroups>> = Vec::new();
         let mut fast_unsupported = false;
+        // Env-gated phase probe: wall time split between waiting on the scan
+        // and everything else (aggregate compute). Diagnosis only.
+        let probe = std::env::var("TAIBAI_AGG_PHASE").as_deref() == Ok("1");
+        let probe_started = std::time::Instant::now();
+        let mut probe_wait_ns: u128 = 0;
+        let mut probe_batches: usize = 0;
 
-        while let Some(batch) = self.input.next_batch()? {
+        while let Some(batch) = {
+            let started = std::time::Instant::now();
+            let batch = self.input.next_batch()?;
+            if probe {
+                probe_wait_ns += started.elapsed().as_nanos();
+                probe_batches += 1;
+            }
+            batch
+        } {
             crate::common::query_cancel::check()?;
             if physical_schema.is_none() {
                 physical_schema = Some(batch.schema.clone());
@@ -801,6 +815,17 @@ impl ExecutionOp for HashAggregateExec {
                 estimated_group_bytes = 0;
                 memory.release();
             }
+        }
+
+        if probe {
+            let total_ns = probe_started.elapsed().as_nanos();
+            eprintln!(
+                "AGGPHASE batches={} wait_ms={:.1} compute_ms={:.1} fast={}",
+                probe_batches,
+                probe_wait_ns as f64 / 1e6,
+                total_ns.saturating_sub(probe_wait_ns) as f64 / 1e6,
+                !fast_unsupported,
+            );
         }
 
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());

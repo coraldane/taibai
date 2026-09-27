@@ -27,6 +27,9 @@
 - **实时写入(持久化)**:调优后 taibai **25.6 万行/s**(fsync ACK 语义),已超过 DuckDB appender 的 23.1 万行/s;高并发下组提交把 fsync 成本摊薄到接近免费(strict ≈ async)。
 - **点查(taibai 的主场)**:盘中热存路径 **~1ms**(2000 行结果,刷盘前后一致);收盘归档后 1.5~4ms;DuckDB 无二级索引、未聚类,同查询 55ms。
 - **扫描聚合(DuckDB 的主场)**:v3→v5 后差距大幅收敛(全表聚合 0.97ms vs ~38ms;千万行 GROUP BY 11ms vs 111ms——从 76× 收敛到 10×);剩余差距在字典直通解码与流水线重叠(见 §10)。
+- **v11 增量(§10.9)**:过滤聚合 run 级折叠 + 恒真谓词消除 + 类型化 gather,Q6 8.25→6.24ms、Q3 2.23→1.91ms、Q4 14.0→12.1ms,其余持平;结果值与基线逐位一致。
+- **v12 增量(§10.10)**:footer 行组级部分和元数据 + NULL 落盘 bug 修复,Q6 6.24→**2.26ms**(vs DuckDB 差距 ~11×→3.1×)、Q7 冷首查 210→155ms、Q1/Q2/Q3 再提速 1.3~1.8×;元数据应答位精确一致。
+- **v13 增量(§10.11)**:Rle 列直通 + run 交叉聚合(gallop 边界),Q5 45.45→**23.92ms**(1.90×,vs DuckDB 4.1×→2.2×)、Q4 1.09×、Q3 1.43×;测量发现聚簇行情列平均 run 长 1820。
 - **hotstore 进程内微基准**:append 1600万~1709万行/s,symbol 最新 N 条点查 1.2~2.0µs,整键 gather 1900万~2615万行/s。
 - **本轮修复**(§7):修掉 3 个热存快路径上的真实正确性 bug(事务行丢失、reclaim 后丢行、REPLACE 残留),并澄清 v1 报告的"352ms 缺口"真因是收盘归档调度。
 
@@ -310,7 +313,98 @@ DBGAGGP:typed=615(每批 1 range 串行)、acct_ms 10→0、join_ms 即行循环
 
 **当前全景**(vs DuckDB):Q1/Q2/Q3/Q7 领先或反超;Q4 ~1.7×;Q5 ~4×;Q6 ~10×。累计:Q5 19×、Q7 ~150×(5.5ms→0.3ms 服务稳态,若含元数据路径)。
 
-## 附:复现命令
+### 10.9 过滤聚合 run 级折叠与恒真谓词消除(v11,2026-09-26)
+
+针对 Q6(单日过滤聚合,当时 ~7-8ms vs DuckDB 0.72ms)与全管线恒真谓词开销的四项改动:
+
+| 改动 | 内容 |
+|---|---|
+| AVG 路由 | `avg` 进入简单聚合元数据路径(`AggAccum` 增加 Avg 臂:sum/count as Float64,零匹配返回 NULL;Decimal 按列 scale 折算后的 raw 域求和,与常规管线 `col_sum_i64 as f64` 逐行组一致)。带**聚簇点查守卫**:前导聚簇列等值查询(如 `WHERE security_id='X'`)不路由,保留流式管线的 ClusterKeyRangeRead 二分搜索 |
+| run 级谓词折叠 | `predicate_scan::fold_runs_from_raw`:Rle/DeltaRle 的每个 run 单值,对 eq/range 谓词要么全匹配要么全不匹配;无 GROUP BY 聚合只关心匹配行数与值,直接在编码 runs 上 O(runs) 折叠 count/sum/min/max,免解码展开、免逐行 mask、免 gather。NULL 语义天然正确(run 只含非空值,NULL 行不满足谓词,无需读位图);谓词阈值在 raw 数值域比较(`integer_i128`/`numeric_f64` 语义,与行内核一致);delete bitmap 非空的段回退批读路径 |
+| 恒真谓词消除 | 逐行组用 zone map `classify_clause` 分类每个子句:All(含 null_count==0)⇒ 恒真,免读该谓词列、免算 mask。`predicate_first_read` 因此跳过分区列等值(日分区内 min=max)的整列解码;`compute_simple_aggregate` 的数据折叠对全恒真行组只读聚合参数列且跳过 mask(Q3 形状的 All 行组不再白白展开字典编码的 security_id) |
+| 类型化 gather | `ColumnArray::gather_rows` 替换 `decode_column_selected` 自适应分支的逐行 `scalar()` 装箱——选择性过滤 + 投影自适应编码列(如 `WHERE close_px>50 GROUP BY security_id` 的 security_id)从每行装箱变为类型化索引拷贝 |
+
+**结果**(同机同数据,HEAD 基线 vs 本轮,`query_bench` 7 次取中位 server_elapsed;结果值逐位一致已核对):
+
+| 查询 | 基线 | 本轮 | 变化 | DuckDB |
+|---|---|---|---|---|
+| Q1 点查 | 2.82 ms | 2.69 ms | 持平 | 55 ms |
+| Q2 latest10 | 6.45 ms | 6.23 ms | 持平 | 7.0 ms |
+| Q3 单 symbol 聚合 | 2.23 ms | **1.91 ms** | 1.17× | 2.5 ms |
+| Q4 单日 GROUP BY | 14.0 ms | **12.1 ms** | 1.16× | 7.2 ms |
+| Q5 全表 GROUP BY | 49.6 ms | 46.5 ms | ~持平 | 11.0 ms |
+| Q6 过滤聚合 | 8.25 ms | **6.24 ms** | 1.32× | 0.72 ms |
+| Q7 count+sum | 0.27 ms | 0.33 ms | 持平(亚毫秒噪声) | 0.97 ms |
+
+**Q6 未达预期的根因记录**:该数据上 close_px 的 DeltaRle run 很短(随机游走价格),run 级 varint 遍历成本 ≈ 解码成本——折叠省掉的是展开物化、mask、gather、聚合循环(~30%),而非遍历本身。实测 Q6 各变体(全恒真 `>0`、部分 `>50`、无谓词日均)都在 ~4.5ms 地板 = 单日 31 个行组的 close_px 列读取 + run 遍历。**亚毫秒点杀需要行组级部分和元数据**(footer 持久化每 RG 的 sum/count/min/max,恒真行组免读数据;类似 §10.8 的段级部分和但粒度到 RG 且支持谓词分类),这是下一轮的明确方向。
+
+**过程中发现并规避的陷阱**:AVG 初版无条件路由使 Q3(前导聚簇列等值)从 2.2ms 退化到 12~17ms——元数据路径按 zone map 剪枝后的行组逐组折叠,而行组内多 symbol 时 zone map 无法剪枝,聚簇二分搜索才是一次读毫秒级的关键;双层守卫(AST 级 `where_pins_leading_cluster_column` 早退 + `compute_simple_aggregate` 入口复查)恢复并反超(1.91ms,类型化 gather 的贡献)。
+
+**正确性**:run 折叠内核 vs "全量解码+逐行过滤+聚合"参考实现的等价单测(负值/空匹配/全匹配/多谓词/浮点阈值/非 run 编码拒识);端到端覆盖 Decimal raw 域阈值、NULL 行、零匹配 AVG=NULL、分区列恒真谓词、delete bitmap 回退、无谓词 AVG 与 GROUP BY 管线交叉验证;全量 44 测试目标通过。
+
+### 10.10 行组级部分和元数据(footer col_sums)与 NULL 落盘修复(v12,2026-09-27)
+
+§10.9 记录的 Q6 亚毫秒方向落地:**footer 持久化每个行组的预聚合列和**。
+
+| 改动 | 内容 |
+|---|---|
+| footer col_sums 扩展 | `RowGroupMeta.col_sums`(每列一个 wrapping i64,仅非空值,类型限 [`column_sum_supported`]:Int8..64/UInt8..32/Decimal/Date/Time/Timestamp/Interval——与 `col_sum_i64` 位精确;UInt64 排除)。扩展块 `[CSUM magic][col_count u32][col_count × i64]` 逐行组可选写入(旧段重编码自然省略);读取端 peek 解析,列数校验防 magic 碰撞误读;`reserved_section_offset` 与 segment 检查工具同步跳过 |
+| 三条写入路径全覆盖 | 增量插入(`write_batch` 逐片累计)、压缩重写(`write_complete_row_group_parallel`)、缓冲刷新(`flush_buffer`)+ **bulk 直写路径**(`append_direct_row_group` 直接从定宽 LE payload 求 i64 和) |
+| 元数据折叠 | `compute_simple_aggregate`:段级检测 footer sums(sidecar meta 优先,缺失时直接用已解析的 reader footer——重启首查不再依赖 sidecar 就绪),恒真(All/无谓词)行组从 zone map + col_sums 直接应答 COUNT/MIN/MAX/**SUM/AVG**;全空列行组(has_values=false)不贡献,保持 SUM=NULL 语义。段级 partial-sum cache 与 streaming 数据折叠让位(footer 缺失或 Sum 浮点参数时照旧) |
+| **NULL 落盘 bug 修复** | 过程中发现并修复一个真实数据损坏:`encode_column_direct_range`(普通 INSERT 的缓冲落盘快路径)**硬编码 bitmap_len=0 且值流含 NULL 占位行**——NULL 落盘即变 valid 0,而同列 zone map 正确记了 null_count,元数据与数据从此分叉(IS NULL 永假、count(col) 按路径给不同答案)。修复:列含 NULL 时回退 `encode_column_plain`(真位图+跳过空值);无 NULL 列保留零拷贝 memcpy。两个编码旧 bug 期望的既有测试断言已更正(analyze 统计 null_count/直方图/估算行数) |
+| 借用替代深拷贝 | `footer_row_groups()` 返回 `&[RowGroupMeta]`:元数据巡走不再每查询深拷贝整个 footer(value_sets 是 1000 字符串×31 行组×34 列,深拷贝 ~1.2ms/段——v11 前 Q7 暖查询走 cache 臂躲过了它,巡走路径必踩) |
+
+**结果**(重新导入+OPTIMIZE 的新 footer 数据,7 次取中位;结果值与已知答案逐位一致):
+
+| 查询 | v11 | v12 | vs v11 | v12 冷首查 | DuckDB |
+|---|---|---|---|---|---|
+| Q1 点查 | 2.82 ms | **2.18 ms** | 1.29× | 33.8 ms | 55 ms |
+| Q2 latest10 | 6.45 ms | **3.66 ms** | 1.76× | 72.3 ms | 7.0 ms |
+| Q3 单 symbol 聚合 | 1.91 ms | **1.47 ms** | 1.30× | 1.7 ms | 2.5 ms |
+| Q4 单日 GROUP BY | 12.11 ms | 13.79 ms | ~持平* | 14.3 ms | 7.2 ms |
+| Q5 全表 GROUP BY | 46.47 ms | 45.45 ms | 持平 | 47.2 ms | 11.0 ms |
+| Q6 过滤聚合 | 6.24 ms | **2.26 ms** | **2.76×** | **2.18 ms** | 0.72 ms |
+| Q7 count+sum | 0.30 ms | **0.23 ms** | 1.30× | **155 ms**(v11 冷 210 ms) | 0.97 ms |
+
+*Q4 的 ~1ms 波动来自重新导入数据的段布局差异,量级内视为持平。
+
+**Q6 两轮累计:8.25 → 2.26ms(3.7×),与 DuckDB 0.72ms 的差距从 ~11× 收敛到 3.1×**。构成:恒真行组(价格区间整体在阈值上方)由 footer sums 直接应答(零数据读取),部分行组继续 §10.9 的 run 折叠。Q7 冷首查 210→155ms:剩余成本是 footer 自身解析(value_sets 字符串解码),属独立的 footer 瘦身课题。
+
+**格式兼容**:新二进制读旧段(col_sums 空→照旧走 cache/流式折叠)、旧 sidecar 重编码不伪造 sums;**旧二进制读新段 footer 会错位**——与 value_sets 扩展引入时的既定权衡一致,升级需先换二进制。
+
+**测试**:footer 往返(含混合有/无 sums 行组)、`col_sum_i64_range` 与整列求和等价、NULL 落盘修复的端到端(memtable/flush 后值、IS NULL、ANALYZE 统计)、既有 44 目标全量通过。
+
+### 10.11 run 直通与 run 交叉聚合(v13,2026-09-27)
+
+Q5(全表 GROUP BY,45ms vs DuckDB 11ms)的瓶颈定位与点杀:
+
+**测量先行**(env 门控探针 `TAIBAI_AGG_PHASE=1` 输出聚合等待/计算拆解;`segment_run_length_stats` 诊断测试输出列 run 统计):
+- Q5 阶段拆解推翻旧认知:wait 仅 2.7ms,**计算占 45.4ms**——616 个 16K 行批次走单 lane 内联紧循环(~4.5ns/行),v9 时代的"解码等待 15ms"已被后台解码流水线消化;
+- 聚簇后行情列的 run 长度惊人:**close_px 每 RG 仅 9 个 run(平均 1820 行)**——每 symbol 每日一个价格,10M 行实际只有 ~5500 个 (symbol×价格带) 段。逐行聚合与解码展开都在做 ~2000 倍的无效功。
+
+| 改动 | 内容 |
+|---|---|
+| `ColumnArray::Rle` 变体 | `(value, row_count)` runs + 懒展开 `flattened()`(OnceLock 缓存,类型化重建;窄整型经 i64 视图精确往返)。20 处既有匹配点机械适配——绝大多数是 `Selected|Dictionary` flatten-first 守卫加一个模式 |
+| 解码直通 | `decode_column_with_runs(..., allow_runs)`:Rle/DeltaRle 且 i64 域列直接产出 runs,免 varint 展开与 80MB 物化;run 长度与行数/空值数校验。reader/strategy 管道 `read_*_passthrough` 系列,cursor 路径经 `read_row_group_with_strategy` 自动覆盖;门控与字典直通一致(无谓词 + 无 delete 位图) |
+| run 交叉聚合 | `update_row_range_dict_runs`:字典 id 流按**倍增搜索(gallop)**找常量段边界(O(log run) 每 run,1820 长 run 从 1820 次比较降到 ~22 次),与每个参数列的 runs 做区间交叉,每 (组段×值段) 块折叠 `value×take`——Sum 与逐行 wrapping 加法位精确,Avg 与元数据折叠同为"精确 i64 后转 f64"。混合形态(某参数非 run)自动把 Rle 参数展平回落 typed/通用循环 |
+| 后台解码池实验 | 上限 8→16 实测更差(27ms,与消费者争核),回退 8 |
+
+**结果**(7 次取中位;Q5/Q3 数值与单 symbol 点查逐位交叉验证):
+
+| 查询 | v12 | v13 | vs v12 | DuckDB | 剩余差距 |
+|---|---|---|---|---|---|
+| **Q5 全表 GROUP BY** | 45.45 ms | **23.92 ms** | **1.90×** | 11.0 ms | **4.1× → 2.2×** |
+| Q4 单日 GROUP BY | 13.79 ms | **12.66 ms** | 1.09× | 7.2 ms | 1.8× |
+| Q3 单 symbol 聚合 | 1.47 ms | **1.03 ms** | 1.43× | 2.5 ms | 领先 2.4× |
+| Q1/Q2/Q6/Q7 | — | 持平 | — | — | — |
+
+**新瓶颈与下一步依据**:Q5 的 25ms = 解码侧 ~10ms(瓶颈翻转:字典 ids_full 展开 O(n)、zstd 解压、read_column_raw 的 Cow 拷贝,在 2-8 线程后台池上 ~22ms 墙钟)+ 聚合 ~13ms(616 批次 × ~15µs 固定开销为主,run 交叉本身已近零)。下一轮方向:① 字典解码侧顺带产出 id-runs(消费端 ids 比较消失,ids_full 懒物化);② 批次合并(616→154)摊薄固定开销;③ `read_column_raw` 消除 into_owned 拷贝。
+
+**测试**:新增 `run_intersection_aggregate_test`(聚簇多 symbol/日边界/NULL 键与 NULL 参数回落/单行与整段 run 边界 vs 手算参考与逐行语义),全量 45 目标通过。
+
+
+
+
 
 ```bash
 cargo build --release --workspace

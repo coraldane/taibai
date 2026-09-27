@@ -518,6 +518,13 @@ fn exec_table_select(
         && !has_correlated
         && table_names.len() == 1
         && detect_simple_metadata_aggregate(stmt, &table_names)
+        && !where_pins_leading_cluster_column(
+            stmt,
+            &table_metas
+                .get(&table_names[0])
+                .map(|meta| meta.cluster_key.clone())
+                .unwrap_or_default(),
+        )
     {
         extract_simple_metadata_aggregates(
             &plan,
@@ -1046,11 +1053,58 @@ fn detect_count_star(stmt: &Statement, table_names: &[String]) -> bool {
     }
 }
 
+/// Equality on the leading cluster column (e.g. `WHERE symbol = ?` on
+/// `CLUSTER BY (symbol, ...)`) turns the scan into a sorted-key binary
+/// search on the streaming pipeline. The metadata aggregate path would
+/// instead fold every zone-map-surviving row group, so keep such queries
+/// unrouted.
+fn where_pins_leading_cluster_column(stmt: &Statement, cluster_key: &[String]) -> bool {
+    let Some(leading) = cluster_key.first() else {
+        return false;
+    };
+    let Statement::Select {
+        where_clause: Some(expr),
+        ..
+    } = stmt
+    else {
+        return false;
+    };
+    expr_pins_column_eq(expr, leading)
+}
+
+fn expr_pins_column_eq(expr: &crate::sql::parser::ast::Expr, column: &str) -> bool {
+    use crate::sql::parser::ast::{BinOp, Expr};
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => expr_pins_column_eq(left, column) || expr_pins_column_eq(right, column),
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => bare_column_name(left)
+            .is_some_and(|name| name.eq_ignore_ascii_case(column))
+            || bare_column_name(right)
+                .is_some_and(|name| name.eq_ignore_ascii_case(column)),
+        _ => false,
+    }
+}
+
+fn bare_column_name(expr: &crate::sql::parser::ast::Expr) -> Option<&str> {
+    use crate::sql::parser::ast::Expr;
+    match expr {
+        Expr::Column(name) => Some(name),
+        Expr::QualifiedColumn { column, .. } => Some(column),
+        _ => None,
+    }
+}
+
 /// Detect a "simple" aggregate query answerable from row-group metadata:
 /// single table, no GROUP BY/HAVING, and every select item is a non-distinct
 /// `COUNT(*)` / `COUNT(col)` / `MIN(col)` / `MAX(col)`.
-fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) -> bool {
-    let (select_list, group_by, having) = match stmt {
+fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) -> bool {    let (select_list, group_by, having) = match stmt {
         Statement::Select {
             select_list,
             group_by,
@@ -1077,7 +1131,8 @@ fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) ->
             let ok_func = name.eq_ignore_ascii_case("count")
                 || name.eq_ignore_ascii_case("min")
                 || name.eq_ignore_ascii_case("max")
-                || name.eq_ignore_ascii_case("sum");
+                || name.eq_ignore_ascii_case("sum")
+                || name.eq_ignore_ascii_case("avg");
             ok_func
                 && args.len() == 1
                 && match &args[0] {
@@ -1104,12 +1159,15 @@ fn extract_simple_metadata_aggregates(
     };
     match plan {
         LogicalPlan::Aggregate(agg) if agg.group_by.is_empty() && !agg.distinct => {
-            // Restrict to COUNT/MIN/MAX/SUM to match
+            // Restrict to COUNT/MIN/MAX/SUM/AVG to match
             // detect_simple_metadata_aggregate. SUM additionally requires a
             // numeric argument column: the metadata path answers it with the
             // argument's integer/float representation, and a routed query
             // never reaches the aggregate pipeline, so unanswerable shapes
-            // must stay unrouted.
+            // must stay unrouted. AVG also needs a numeric argument (the
+            // answer is always sum/count as Float64, so Decimal is fine —
+            // the fold sums the raw i64 view like the regular pipeline's
+            // col_sum_i64 does).
             let all_supported = agg.aggregates.iter().all(|a| {
                 if a.distinct {
                     return false;
@@ -1136,7 +1194,25 @@ fn extract_simple_metadata_aggregates(
                             .unwrap_or(false),
                         _ => false,
                     },
-                    _ => false,
+                    crate::sql::planner::AggFunc::Avg => match &*a.arg {
+                        crate::sql::planner::LogicalExpr::Column(idx) => schema
+                            .columns
+                            .get(*idx)
+                            .map(|c| {
+                                matches!(
+                                    c.data_type,
+                                    crate::protocol::types::DataType::Int64
+                                        | crate::protocol::types::DataType::Int32
+                                        | crate::protocol::types::DataType::Int16
+                                        | crate::protocol::types::DataType::Int8
+                                        | crate::protocol::types::DataType::Float64
+                                        | crate::protocol::types::DataType::Float32
+                                        | crate::protocol::types::DataType::Decimal
+                                )
+                            })
+                            .unwrap_or(false),
+                        _ => false,
+                    },
                 }
             });
             if all_supported {

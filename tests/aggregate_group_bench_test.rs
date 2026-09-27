@@ -177,3 +177,42 @@ fn aggregate_group_benchmark() {
         &source,
     );
 }
+
+/// Diagnostic: run-length statistics of a real clustered segment's columns
+/// (how viable run-aware aggregation is on the bench data). Point
+/// TAIBAI_SEG_STAT at a segment file, e.g.
+/// E:/workspace/bench/taibai_data_v13/main/stock_tick_batch/p20260911_0002.dat
+#[test]
+fn segment_run_length_stats() {
+    let Ok(path) = std::env::var("TAIBAI_SEG_STAT") else {
+        eprintln!("TAIBAI_SEG_STAT not set; skipping");
+        return;
+    };
+    use taibai::storage::segment::SegmentReader;
+    let reader = SegmentReader::open(std::path::Path::new(&path)).expect("open segment");
+    println!(
+        "segment: {} row groups, {} rows",
+        reader.num_row_groups(),
+        reader.row_count()
+    );
+    let rg = 0;
+    let rows = reader.row_group_rows(rg) as usize;
+    for (col_idx, col_def) in reader.schema().columns.iter().enumerate() {
+        let raw = match reader.read_column_raw(rg, col_idx) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        if let Some((run_count, rows_covered)) =
+            taibai::storage::codec::predicate_scan::debug_run_stats_from_raw(&raw)
+        {
+            println!(
+                "col={:24} type={:?} runs={} rows={} avg_run_len={:.2}",
+                col_def.name,
+                col_def.data_type,
+                run_count,
+                rows_covered,
+                rows_covered as f64 / run_count as f64
+            );
+        }
+    }
+}

@@ -226,5 +226,9 @@ name = "pubsub_test"
 path = "tests/pubsub_test.rs"
 
 [[test]]
+name = "run_intersection_aggregate_test"
+path = "tests/run_intersection_aggregate_test.rs"
+
+[[test]]
 name = "join_fast_path_test"
 path = "tests/join_fast_path_test.rs"

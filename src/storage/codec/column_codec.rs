@@ -438,7 +438,7 @@ fn encode_i64_rle_payload(values: &[i64]) -> Vec<u8> {
 /// The per-run (not per-value) varint parse keeps decode cheap even when runs
 /// are short. Worst case (random 64-bit jumps) is 15 bytes/run, so the plain
 /// RLE candidate stays in the competition for that shape.
-fn encode_i64_delta_rle_payload(values: &[i64]) -> Vec<u8> {
+pub(crate) fn encode_i64_delta_rle_payload(values: &[i64]) -> Vec<u8> {
     let mut runs = Vec::new();
     let mut current = values[0];
     let mut len = 1u64;
@@ -937,7 +937,9 @@ fn encode_varchar_dictionary_adaptive(
 
 pub fn encode_value(buf: &mut Vec<u8>, col: &ColumnArray, idx: usize) {
     match col {
-        ColumnArray::Selected { .. } => encode_value(buf, col.flattened(), idx),
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+            encode_value(buf, col.flattened(), idx)
+        }
         ColumnArray::Dictionary { .. } => encode_value(buf, &col.materialize_varchar(), idx),
         ColumnArray::Bool { data, .. } => buf.push(data[idx]),
         ColumnArray::Int8 { data, .. } => buf.push(data[idx] as u8),
@@ -979,6 +981,20 @@ pub fn decode_column(
     col_def: &ColumnDef,
     allow_dictionary: bool,
 ) -> Result<ColumnArray> {
+    decode_column_with_runs(data, row_count, col_def, allow_dictionary, false)
+}
+
+/// `allow_runs` keeps Rle/DeltaRle columns in their run form
+/// ([`ColumnArray::Rle`]) instead of expanding them — the run-aware
+/// aggregate consumes runs directly, and every other consumer flattens
+/// lazily.
+pub fn decode_column_with_runs(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    allow_dictionary: bool,
+    allow_runs: bool,
+) -> Result<ColumnArray> {
     let mut cursor = Cursor::new(data);
     let bitmap_len = read_u32_le(&mut cursor)? as usize;
     let mut bitmap_data = vec![0u8; bitmap_len];
@@ -987,12 +1003,13 @@ pub fn decode_column(
 
     let remaining_data = &data[4 + bitmap_len..];
     if remaining_data.starts_with(COLUMN_ENCODING_MAGIC) {
-        return decode_adaptive_column(
+        return decode_adaptive_column_with_runs(
             remaining_data,
             row_count,
             col_def,
             bitmap,
             allow_dictionary,
+            allow_runs,
         );
     }
     let mut dc = Cursor::new(remaining_data);
@@ -1144,6 +1161,17 @@ pub(crate) fn decode_adaptive_column(
     bitmap: NullBitmap,
     allow_dictionary: bool,
 ) -> Result<ColumnArray> {
+    decode_adaptive_column_with_runs(data, row_count, col_def, bitmap, allow_dictionary, false)
+}
+
+pub(crate) fn decode_adaptive_column_with_runs(
+    data: &[u8],
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: NullBitmap,
+    allow_dictionary: bool,
+    allow_runs: bool,
+) -> Result<ColumnArray> {
     if data.len() < COLUMN_ENCODING_MAGIC.len() + 1 {
         return Err(TaibaiError::Storage(
             "adaptive column header truncated".into(),
@@ -1163,10 +1191,18 @@ pub(crate) fn decode_adaptive_column(
 
     match encoding {
         EncodingType::Rle => {
+            if allow_runs && crate::storage::segment::column_sum_supported(col_def.data_type) {
+                let runs = parse_i64_runs_plain_rle(payload)?;
+                return build_run_column(runs, row_count, col_def, bitmap);
+            }
             let values = decode_i64_rle_payload(payload)?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::DeltaRle => {
+            if allow_runs && crate::storage::segment::column_sum_supported(col_def.data_type) {
+                let runs = parse_i64_runs_delta_rle(payload)?;
+                return build_run_column(runs, row_count, col_def, bitmap);
+            }
             let values = decode_i64_delta_rle_payload(payload)?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
@@ -1205,6 +1241,60 @@ pub(crate) fn decode_adaptive_column(
             col_def.data_type.display_name()
         ))),
     }
+}
+
+/// Parse plain-Rle runs without expanding them: `(value, len)` pairs.
+fn parse_i64_runs_plain_rle(payload: &[u8]) -> Result<Vec<(i64, u32)>> {
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut runs = Vec::with_capacity(run_count);
+    for _ in 0..run_count {
+        let mut value_buf = [0u8; 8];
+        cursor.read_exact(&mut value_buf)?;
+        let value = i64::from_le_bytes(value_buf);
+        let len = read_u32_le(&mut cursor)?;
+        runs.push((value, len));
+    }
+    Ok(runs)
+}
+
+/// Parse DeltaRle runs without expanding them: varint(zigzag delta) values.
+fn parse_i64_runs_delta_rle(payload: &[u8]) -> Result<Vec<(i64, u32)>> {
+    let mut cursor = Cursor::new(payload);
+    let run_count = read_u32_le(&mut cursor)? as usize;
+    let mut runs = Vec::with_capacity(run_count);
+    let mut prev = 0i64;
+    for _ in 0..run_count {
+        let delta = crate::storage::codec::io_util::zigzag_decode(read_varint(&mut cursor)?);
+        prev = prev.wrapping_add(delta);
+        let len = read_varint(&mut cursor)? as u32;
+        runs.push((prev, len));
+    }
+    Ok(runs)
+}
+
+/// Validate run lengths against the row/null counts and hand the runs to
+/// the lazy [`ColumnArray::Rle`] variant.
+fn build_run_column(
+    runs: Vec<(i64, u32)>,
+    row_count: usize,
+    col_def: &ColumnDef,
+    bitmap: NullBitmap,
+) -> Result<ColumnArray> {
+    let covered: u64 = runs.iter().map(|&(_, len)| len as u64).sum();
+    let expected = row_count.saturating_sub(bitmap.null_count());
+    if covered as usize != expected {
+        return Err(TaibaiError::Storage(format!(
+            "run-length value count mismatch: got {}, expected {}",
+            covered, expected
+        )));
+    }
+    Ok(ColumnArray::rle(
+        runs,
+        col_def.data_type,
+        bitmap,
+        row_count,
+    ))
 }
 
 pub(crate) fn decode_i64_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
@@ -1518,20 +1608,6 @@ fn build_column_from_bits(
     };
     Ok(column)
 }
-fn project_column(col: &ColumnArray, selected_rows: &[usize]) -> Result<ColumnArray> {
-    let mut out = ColumnArray::empty(col.data_type());
-    for &row in selected_rows {
-        if row >= col.len() {
-            return Err(TaibaiError::Storage(format!(
-                "selected row {} out of bounds {}",
-                row,
-                col.len()
-            )));
-        }
-        out.push(&col.scalar(row))?;
-    }
-    Ok(out)
-}
 
 pub fn decode_column_selected(
     data: &[u8],
@@ -1548,7 +1624,18 @@ pub fn decode_column_selected(
 
     if values.starts_with(COLUMN_ENCODING_MAGIC) {
         let decoded = decode_adaptive_column(values, row_count, col_def, bitmap, false)?;
-        return project_column(&decoded, selected_rows);
+        if let Some(&row) = selected_rows.iter().max() {
+            if row >= decoded.len() {
+                return Err(TaibaiError::Storage(format!(
+                    "selected row {} out of bounds {}",
+                    row,
+                    decoded.len()
+                )));
+            }
+        }
+        // The adaptive decode produced a fully materialized column, so the
+        // gather is a typed indexed copy — no per-row `scalar()` boxing.
+        return Ok(decoded.gather_rows(selected_rows));
     }
 
     macro_rules! decode_fixed_variant {

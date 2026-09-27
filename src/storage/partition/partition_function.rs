@@ -497,7 +497,9 @@ pub fn value_text_at(column: &ColumnArray, row: usize) -> String {
         return String::new();
     }
     match column {
-        ColumnArray::Selected { .. } => value_text_at(column.flattened(), row),
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+            value_text_at(column.flattened(), row)
+        }
         ColumnArray::Dictionary {
             ids, dict, bitmap, ..
         } => {

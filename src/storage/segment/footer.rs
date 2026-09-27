@@ -10,7 +10,7 @@ use crate::types::batch::{ColumnDef, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::constants::SEGMENT_MAGIC;
-use super::writer::VALUE_SET_EXTENSION_MAGIC;
+use super::writer::{COL_SUM_EXTENSION_MAGIC, VALUE_SET_EXTENSION_MAGIC};
 use super::RowGroupMeta;
 
 pub struct ParsedSegmentFooter {
@@ -164,6 +164,8 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
             vec![None; col_count]
         };
 
+        let col_sums = parse_col_sum_extension(buf, &mut cursor, col_count)?;
+
         row_groups.push(RowGroupMeta {
             offset,
             length,
@@ -174,6 +176,7 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
             zone_maps,
             bloom_filters,
             value_sets,
+            col_sums,
         });
     }
 
@@ -209,6 +212,37 @@ fn peek_u32(buf: &[u8], cursor: &Cursor<&[u8]>) -> Option<u32> {
         return None;
     }
     Some(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?))
+}
+
+/// Parse the per-row-group column-sum extension when the magic is next.
+/// Absent magic (segments written before the extension) yields an empty
+/// vec, which every consumer treats as "sums unavailable". The stored
+/// column count must match the schema — a mismatch means the magic bytes
+/// were random data (e.g. a row-group offset colliding with the magic), so
+/// fail loudly instead of misfolding sums.
+fn parse_col_sum_extension(
+    buf: &[u8],
+    cursor: &mut Cursor<&[u8]>,
+    col_count: usize,
+) -> Result<Vec<i64>> {
+    if peek_u32(buf, cursor) != Some(COL_SUM_EXTENSION_MAGIC) {
+        return Ok(Vec::new());
+    }
+    let _magic = read_u32_le(cursor)?;
+    let stored_count = read_u32_le(cursor)? as usize;
+    if stored_count != col_count {
+        return Err(TaibaiError::Storage(format!(
+            "column-sum extension count mismatch: {} columns stored, {} in schema",
+            stored_count, col_count
+        )));
+    }
+    let mut col_sums = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let mut bytes = [0u8; 8];
+        cursor.read_exact(&mut bytes)?;
+        col_sums.push(i64::from_le_bytes(bytes));
+    }
+    Ok(col_sums)
 }
 
 pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
@@ -281,6 +315,7 @@ pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
             }
         }
         skip_value_set_extension(buf, &mut cursor, col_count)?;
+        skip_col_sum_extension(buf, &mut cursor, col_count)?;
     }
     Ok(cursor.position() as usize)
 }
@@ -304,6 +339,25 @@ fn skip_value_set_extension(
             }
         }
     }
+    Ok(())
+}
+
+fn skip_col_sum_extension(
+    buf: &[u8],
+    cursor: &mut Cursor<&[u8]>,
+    col_count: usize,
+) -> Result<()> {
+    if peek_u32(buf, cursor) != Some(COL_SUM_EXTENSION_MAGIC) {
+        return Ok(());
+    }
+    let _magic = read_u32_le(cursor)?;
+    let stored_count = read_u32_le(cursor)? as usize;
+    if stored_count != col_count {
+        return Err(TaibaiError::Storage(
+            "column-sum extension count mismatch while scanning footer".to_string(),
+        ));
+    }
+    cursor.set_position(cursor.position() + stored_count as u64 * 8);
     Ok(())
 }
 

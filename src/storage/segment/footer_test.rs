@@ -81,6 +81,7 @@ fn reserved_section_offset_skips_value_sets_for_all_row_groups() {
             }],
             bloom_filters: vec![None],
             value_sets: vec![Some(vec![ScalarValue::Int64(Some(1))])],
+            col_sums: vec![12345],
         },
         RowGroupMeta {
             offset: 40,
@@ -97,6 +98,9 @@ fn reserved_section_offset_skips_value_sets_for_all_row_groups() {
             }],
             bloom_filters: vec![None],
             value_sets: vec![Some(vec![ScalarValue::Int64(Some(2))])],
+            // No sums: footers re-encoded from pre-extension segments keep
+            // omitting the block, and the parser must leave them empty.
+            col_sums: Vec::new(),
         },
     ];
     let footer = encode_segment_footer(&schema, 2, &row_groups, &[0], 1, "t", &[]);
@@ -105,5 +109,7 @@ fn reserved_section_offset_skips_value_sets_for_all_row_groups() {
         reserved_section_offset(&footer).unwrap(),
         footer.len() - std::mem::size_of::<u64>() - std::mem::size_of::<u32>() - 1
     );
-    parse_segment_footer(&footer).unwrap();
+    let parsed = parse_segment_footer(&footer).unwrap();
+    assert_eq!(parsed.row_groups[0].col_sums, vec![12345]);
+    assert!(parsed.row_groups[1].col_sums.is_empty());
 }

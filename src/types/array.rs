@@ -397,6 +397,20 @@ pub enum ColumnArray {
         /// Lazily materialized identical owned column (never `Dictionary`).
         flat: OnceLock<Box<ColumnArray>>,
     },
+    /// Run-length encoded i64-backed column: `(value, row_count)` runs over
+    /// the non-null rows in order. Produced by decoding Rle/DeltaRle
+    /// segments when the consumer opted into run passthrough; anything that
+    /// needs per-row values expands lazily via [`ColumnArray::flattened`].
+    /// Clustered tick data collapses thousands of rows into a handful of
+    /// runs, which is what makes run-aware aggregation cheap.
+    Rle {
+        runs: std::sync::Arc<[(i64, u32)]>,
+        data_type: DataType,
+        bitmap: NullBitmap,
+        len: usize,
+        /// Lazily materialized identical owned column (never `Rle`).
+        flat: OnceLock<Box<ColumnArray>>,
+    },
     Blob {
         data: BinaryBuffer,
         bitmap: NullBitmap,
@@ -433,7 +447,7 @@ impl ColumnArray {
             };
         }
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
                 self.flattened().compare_at(left, right)
             }
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => cmp_ord!(data),
@@ -529,7 +543,9 @@ impl ColumnArray {
             };
         }
         match self {
-            ColumnArray::Selected { .. } => self.flattened().encode_key_at(row, out),
+            ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+                self.flattened().encode_key_at(row, out)
+            }
             // Dictionary values must encode byte-identically to plain
             // VarChar: `data_type()` already pushed the VarChar tag above,
             // and decoders / GROUP BY keys rely on the two forms agreeing.
@@ -651,7 +667,74 @@ impl ColumnArray {
             ColumnArray::Dictionary { flat, .. } => {
                 flat.get_or_init(|| Box::new(Self::expand_dictionary(self)))
             }
+            ColumnArray::Rle { flat, .. } => {
+                flat.get_or_init(|| Box::new(Self::expand_runs(self)))
+            }
             other => other,
+        }
+    }
+
+    /// Expand run-length values into the plain typed column. Run values are
+    /// exact i64 views of every run-decodable type (narrow ints round-trip
+    /// through the wider stored value by construction).
+    fn expand_runs(&self) -> ColumnArray {
+        let ColumnArray::Rle {
+            runs,
+            data_type,
+            bitmap,
+            len,
+            ..
+        } = self
+        else {
+            return self.clone();
+        };
+        macro_rules! build {
+            ($variant:ident, $ty:ty) => {{
+                let mut data = Vec::with_capacity(*len);
+                for &(value, count) in runs.iter() {
+                    data.extend(std::iter::repeat_n(value as $ty, count as usize));
+                }
+                ColumnArray::$variant {
+                    data,
+                    bitmap: bitmap.clone(),
+                }
+            }};
+        }
+        match data_type {
+            DataType::Int64 => build!(Int64, i64),
+            DataType::Decimal => build!(Decimal, i64),
+            DataType::Time => build!(Time, i64),
+            DataType::Timestamp => build!(Timestamp, i64),
+            DataType::Interval => build!(Interval, i64),
+            DataType::Int8 => build!(Int8, i8),
+            DataType::Int16 => build!(Int16, i16),
+            DataType::Int32 => build!(Int32, i32),
+            DataType::UInt8 => build!(UInt8, u8),
+            DataType::UInt16 => build!(UInt16, u16),
+            DataType::UInt32 => build!(UInt32, u32),
+            DataType::Date => build!(Date, i32),
+            other => unreachable!(
+                "run-length decode never produces {}",
+                other.display_name()
+            ),
+        }
+    }
+
+    /// Build a run-length column from decoded `(value, row_count)` runs over
+    /// the non-null rows. `row_count` is the full row count; the caller
+    /// guarantees that the run lengths sum to `row_count - null_count`.
+    pub fn rle(
+        runs: Vec<(i64, u32)>,
+        data_type: DataType,
+        bitmap: NullBitmap,
+        row_count: usize,
+    ) -> Self {
+        Self::Rle {
+            runs: runs.into(),
+            data_type,
+            bitmap,
+            len: row_count,
+            flat: OnceLock::new(),
         }
     }
 
@@ -682,7 +765,9 @@ impl ColumnArray {
     pub fn flatten_in_place(&mut self) {
         if matches!(
             self,
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. }
+            ColumnArray::Selected { .. }
+                | ColumnArray::Dictionary { .. }
+                | ColumnArray::Rle { .. }
         ) {
             *self = self.flattened().clone();
         }
@@ -867,7 +952,7 @@ impl ColumnArray {
     /// of once per call.
     pub fn materialize_varchar(&self) -> ColumnArray {
         match self {
-            ColumnArray::Dictionary { .. } => self.flattened().clone(),
+            ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => self.flattened().clone(),
             other => other.clone(),
         }
     }
@@ -875,6 +960,7 @@ impl ColumnArray {
     pub fn data_type(&self) -> DataType {
         match self {
             ColumnArray::Selected { data_type, .. } => *data_type,
+            ColumnArray::Rle { data_type, .. } => *data_type,
             ColumnArray::Bool { .. } => DataType::Bool,
             ColumnArray::Int8 { .. } => DataType::Int8,
             ColumnArray::Int16 { .. } => DataType::Int16,
@@ -902,6 +988,7 @@ impl ColumnArray {
         match self {
             ColumnArray::Selected { len, .. } => *len,
             ColumnArray::Dictionary { ids, .. } => ids.len(),
+            ColumnArray::Rle { len, .. } => *len,
             ColumnArray::Bool { data, .. } => data.len(),
             ColumnArray::Int8 { data, .. } => data.len(),
             ColumnArray::Int16 { data, .. } => data.len(),
@@ -954,6 +1041,9 @@ impl ColumnArray {
         let bitmap = self.bitmap().estimated_size_bytes();
         match self {
             ColumnArray::Selected { .. } => unreachable!("handled above"),
+            ColumnArray::Rle { runs, .. } => {
+                bitmap + runs.len() * (std::mem::size_of::<i64>() + std::mem::size_of::<u32>())
+            }
             ColumnArray::Dictionary { ids, dict, .. } => {
                 ids.capacity() * 4 + dict.data_capacity() + dict.offsets().len() * 4 + bitmap
             }
@@ -1011,6 +1101,7 @@ impl ColumnArray {
     pub fn bitmap(&self) -> &NullBitmap {
         match self {
             ColumnArray::Dictionary { bitmap, .. } => bitmap,
+            ColumnArray::Rle { bitmap, .. } => bitmap,
             ColumnArray::Selected { .. } => self.flattened().bitmap(),
             ColumnArray::Bool { bitmap, .. } => bitmap,
             ColumnArray::Int8 { bitmap, .. } => bitmap,
@@ -1038,7 +1129,7 @@ impl ColumnArray {
     pub fn bitmap_mut(&mut self) -> &mut NullBitmap {
         self.flatten_in_place();
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
                 unreachable!("flattened above")
             }
             ColumnArray::Bool { bitmap, .. } => bitmap,
@@ -1077,6 +1168,7 @@ impl ColumnArray {
         }
         match self {
             ColumnArray::Selected { .. } => unreachable!("handled above"),
+            ColumnArray::Rle { .. } => self.flattened().scalar(idx),
             ColumnArray::Dictionary {
                 ids, dict, bitmap, ..
             } => {
@@ -1395,7 +1487,7 @@ impl ColumnArray {
     pub fn push_null_value(&mut self) {
         self.flatten_in_place();
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
                 unreachable!("flattened above")
             }
             ColumnArray::Bool { data, bitmap } => {

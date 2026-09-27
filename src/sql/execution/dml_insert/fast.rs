@@ -496,7 +496,7 @@ fn materialize_fast_insert_row(
 fn push_fast_value_direct(col: &mut ColumnArray, value: FastValue<'_>, scale: i32) -> Result<()> {
     col.flatten_in_place();
     match col {
-        ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } => {
+        ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
             unreachable!("flattened above")
         }
         ColumnArray::Bool { data, bitmap } => {

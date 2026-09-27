@@ -101,7 +101,9 @@ pub(crate) fn append_column_data(col: &ColumnArray, buf: &mut Vec<u8>) {
     }
 
     match col {
-        ColumnArray::Selected { .. } => append_column_data(col.flattened(), buf),
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
+            append_column_data(col.flattened(), buf)
+        }
         ColumnArray::Dictionary { .. } => append_column_data(&col.materialize_varchar(), buf),
         ColumnArray::Bool { data, .. } => buf.extend_from_slice(data),
         ColumnArray::Int8 { data, .. } => {

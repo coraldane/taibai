@@ -266,6 +266,10 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
             let materialized = col.materialize_varchar();
             return collect_keys(&materialized, pool);
         }
+        ColumnArray::Rle { .. } => {
+            let materialized = col.flattened().clone();
+            return collect_keys(&materialized, pool);
+        }
         ColumnArray::Bool { data, .. } => {
             for (i, &raw) in data.iter().enumerate().take(n) {
                 out.push(if bm.is_null(i) {
