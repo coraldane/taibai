@@ -1079,8 +1079,11 @@ impl Compactor {
         compression_level: i32,
     ) -> Result<(usize, u64)> {
         let estimated_width = estimated_row_width_bytes(schema);
+        // Bound the run to the budget (no row-group-multiplier floor: wide
+        // rows must not lift the run past it). A small floor keeps the run
+        // count sane for very narrow rows.
         let run_rows = (clustered_merge_budget_bytes() / estimated_width)
-            .max(output_row_group_rows * 4)
+            .max(4096)
             .max(1);
 
         // ---- Pass A: bounded chunks, each sorted and spilled to a run ----
@@ -1110,6 +1113,12 @@ impl Compactor {
         let mut run_seq = 0usize;
         let mut dropped = 0u64;
 
+        let run_cleanup = |paths: &[PathBuf]| {
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+                let _ = crate::storage::segment::meta::remove_sidecar_meta(path);
+            }
+        };
         let flush_run = |cache: &mut RowGroupCache,
                              run_paths: &mut Vec<PathBuf>,
                              run_seq: &mut usize,
@@ -1125,9 +1134,17 @@ impl Compactor {
             let sorted = gather_global_chunk(schema, &batch, &indices)?;
             let run_path = merge_run_path(final_path, *run_seq);
             *run_seq += 1;
-            let mut writer = SegmentWriter::create(&run_path, schema.clone(), run_rows, 0)?;
-            writer.write_batch_parallel(&sorted)?;
-            writer.seal()?;
+            let written = (|| -> Result<()> {
+                let mut writer = SegmentWriter::create(&run_path, schema.clone(), run_rows, 0)?;
+                writer.write_batch_parallel(&sorted)?;
+                writer.seal()?;
+                Ok(())
+            })();
+            if written.is_err() {
+                let _ = std::fs::remove_file(&run_path);
+                let _ = crate::storage::segment::meta::remove_sidecar_meta(&run_path);
+                return written;
+            }
             run_paths.push(run_path);
             refs.clear();
             Ok(())
@@ -1167,7 +1184,10 @@ impl Compactor {
                 }
             }
         }
-        flush_run(&mut cache, &mut run_paths, &mut run_seq, &mut refs)?;
+        if let Err(error) = flush_run(&mut cache, &mut run_paths, &mut run_seq, &mut refs) {
+            run_cleanup(&run_paths);
+            return Err(error);
+        }
 
         if run_paths.is_empty() {
             return Ok((0, dropped));
@@ -1182,6 +1202,7 @@ impl Compactor {
         };
         let mut wave = 0usize;
         let mut current_runs = run_paths;
+        let mut created_in_round: Vec<PathBuf> = Vec::new();
         let result = (|| -> Result<usize> {
             while current_runs.len() > CLUSTERED_MERGE_MAX_RUNS {
                 wave += 1;
@@ -1200,6 +1221,7 @@ impl Compactor {
                         &mut writer,
                     )?;
                     writer.seal()?;
+                    created_in_round.push(merged_path.clone());
                     next_runs.push(merged_path);
                 }
                 cleanup_runs(&current_runs);
@@ -1224,6 +1246,9 @@ impl Compactor {
             Ok(written)
         })();
         cleanup_runs(&current_runs);
+        if result.is_err() {
+            run_cleanup(&created_in_round);
+        }
         let written = result?;
         tracing::info!(
             db,
@@ -1332,16 +1357,19 @@ impl Compactor {
 
         for file_idx in 0..file_bounds.len() {
             let (start, end) = file_bounds[file_idx];
-            if start == end {
+            // First NON-EMPTY row group of the file (a leading empty row
+            // group must not hide the rest of the file).
+            let mut first_source = start;
+            while first_source < end && rows_per_source[first_source] == 0 {
+                first_source += 1;
+            }
+            if first_source >= end {
                 continue;
             }
-            if rows_per_source[start] == 0 {
-                continue;
-            }
-            let keys = materialize_keys(&mut cache, start, 0)?;
+            let keys = materialize_keys(&mut cache, first_source, 0)?;
             heap.push(Reverse(MergeHead {
                 keys,
-                source_idx: start,
+                source_idx: first_source,
                 row_idx: 0,
                 sort_keys: sort_key_indices,
             }));
@@ -1356,25 +1384,25 @@ impl Compactor {
             });
             rows_written += 1;
             // Advance this stream: next row in the same row group, else the
-            // next row group of the same file.
+            // next NON-EMPTY row group of the same file (empty row groups
+            // must be skipped forward, not abandon the file).
             let mut next_source = head.source_idx;
             let mut next_row = head.row_idx + 1;
             if next_row >= rows_per_source[next_source] {
-                next_source += 1;
                 next_row = 0;
-                // Stay inside the file's row-group range.
                 let file = file_bounds
                     .iter()
                     .find(|&&(start, end)| head.source_idx >= start && head.source_idx < end);
-                if let Some(&(_start, end)) = file {
-                    if next_source >= end {
-                        continue; // file exhausted
-                    }
-                } else if next_source >= source_row_groups.len() {
-                    continue;
+                let end = match file {
+                    Some(&(_start, end)) => end,
+                    None => source_row_groups.len(),
+                };
+                next_source += 1;
+                while next_source < end && rows_per_source[next_source] == 0 {
+                    next_source += 1;
                 }
-                if rows_per_source[next_source] == 0 {
-                    continue;
+                if next_source >= end {
+                    continue; // file exhausted
                 }
             }
             let keys = materialize_keys(&mut cache, next_source, next_row)?;
@@ -1568,12 +1596,21 @@ fn estimated_row_width_bytes(schema: &Schema) -> usize {
         .columns
         .iter()
         .map(|col| {
-            col.data_type
+            // Variable-width columns (VarChar/Blob/Vector) carry a
+            // conservative per-value allowance: underestimating them let
+            // external-merge runs overshoot the memory budget.
+            let base = col
+                .data_type
                 .fixed_size()
                 .map(|w| w as usize)
                 .unwrap_or(0)
-                .max(8)
-                + 24
+                .max(8);
+            let variable_extra = if col.data_type.fixed_size().is_none() {
+                64
+            } else {
+                0
+            };
+            base + variable_extra + 24
         })
         .sum::<usize>()
         .max(32)

@@ -42,6 +42,13 @@ pub struct DistinctExec {
     seen: std::collections::HashSet<Vec<u8>>,
     key_buf: Vec<u8>,
     done: bool,
+    /// Memory accounting for the global key set: DISTINCT over a
+    /// high-cardinality input used to grow `seen` without any bound and
+    /// could take the process down. The set is charged to the shared query
+    /// memory budget; exceeding it fails the query with a clear error
+    /// instead of an OOM kill.
+    memory: crate::sql::execution::spill::MemoryReservation,
+    seen_bytes: usize,
 }
 
 impl DistinctExec {
@@ -51,7 +58,15 @@ impl DistinctExec {
             seen: std::collections::HashSet::new(),
             key_buf: Vec::new(),
             done: false,
+            memory: crate::sql::execution::spill::MemoryReservation::default(),
+            seen_bytes: 0,
         }
+    }
+}
+
+impl Default for crate::sql::execution::spill::MemoryReservation {
+    fn default() -> Self {
+        crate::sql::execution::spill::MemoryManager::reservation()
     }
 }
 
@@ -77,11 +92,21 @@ impl ExecutionOp for DistinctExec {
                     column.encode_key_at(row, &mut self.key_buf);
                 }
                 let is_new = self.seen.insert(self.key_buf.clone());
+                if is_new {
+                    // Vec header + heap buffer + hash-set slot overhead.
+                    self.seen_bytes += self.key_buf.len() + 24 + 32;
+                }
                 keep.push(is_new);
                 kept_count += is_new as usize;
             }
             if kept_count == 0 {
                 continue;
+            }
+            if !self.memory.try_resize(self.seen_bytes) {
+                return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                    "DISTINCT key set exceeds the query memory budget ({} bytes)",
+                    self.seen_bytes
+                )));
             }
             let kept_rows: Vec<u32> = keep
                 .iter()
