@@ -222,6 +222,12 @@ impl JoinHashTable {
         }
     }
 
+    /// Whether a build row is already marked matched (semi-join dedup).
+    pub fn is_marked(&self, ptr: &RowPointer) -> bool {
+        let offset = self.row_offset(ptr.batch_idx, ptr.row_idx);
+        offset < self.matched.len() && self.matched[offset]
+    }
+
     /// Get all unmatched build row pointers (for LEFT/FULL JOIN).
     pub fn unmatched_rows(&self) -> Vec<RowPointer> {
         let mut result = Vec::new();

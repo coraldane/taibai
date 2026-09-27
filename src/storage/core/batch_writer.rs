@@ -354,7 +354,9 @@ impl BatchWriter {
         if txn_id == 0 {
             self.write_epoch.fetch_add(1, Ordering::Release);
         }
-        let prepared = (txn_id == 0).then(|| PreparedTailAppend::new(&batch));
+        let prepared = (txn_id == 0)
+            .then(|| PreparedTailAppend::new(&batch))
+            .transpose()?;
         let lock_start = std::time::Instant::now();
         let (rows, pending) =
             self.segment_mgr
@@ -612,7 +614,7 @@ impl BatchWriter {
         let Some(batch) = memtable.read_snapshot_arc() else {
             return Ok(None);
         };
-        let prepared = PreparedTailAppend::new(&batch);
+        let prepared = PreparedTailAppend::new(&batch)?;
         let ticket = self.tail_committer.submit(
             self.segment_mgr.table_dir(memtable.db(), memtable.table()),
             memtable.id(),

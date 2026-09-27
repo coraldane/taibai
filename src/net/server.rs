@@ -171,13 +171,15 @@ where
         .as_mut()
         .expect("handler exists before the first request")
         .set_push_channel(push_tx);
-    let mut pending_messages = VecDeque::new();
+    let mut pending_messages: VecDeque<Message> = VecDeque::new();
+    let mut pending_bytes = 0usize;
 
     let outcome = 'connection: loop {
         // Fetch the next request frame, giving the pending queue priority so
         // frames buffered while a request was in flight are not starved.
         let msg = 'fetch: loop {
             if let Some(msg) = pending_messages.pop_front() {
+                pending_bytes = pending_bytes.saturating_sub(msg.payload.len());
                 break 'fetch msg;
             }
             // Delivering a queued notification counts as connection activity
@@ -262,13 +264,19 @@ where
                 next = framed.next() => {
                     match next {
                         Some(Ok(msg)) => {
-                            if pending_messages.len() >= MAX_PENDING_MESSAGES {
+                            let frame_bytes = msg.payload.len();
+                            if pending_messages.len() >= MAX_PENDING_MESSAGES
+                                || pending_bytes + frame_bytes > MAX_PENDING_BYTES
+                            {
                                 tracing::warn!(
                                     limit = MAX_PENDING_MESSAGES,
+                                    byte_limit = MAX_PENDING_BYTES,
+                                    pending_bytes,
                                     "pipelined request backlog limit reached; closing connection"
                                 );
                                 let error = TaibaiError::ResourceBusy(format!(
-                                    "too many pipelined requests (limit {MAX_PENDING_MESSAGES})"
+                                    "too many pipelined requests (limit {MAX_PENDING_MESSAGES} frames / {} bytes)",
+                                    MAX_PENDING_BYTES
                                 ));
                                 context.cancel();
                                 if let Err(send_error) =
@@ -278,6 +286,7 @@ where
                                 }
                                 disconnect_outcome = Some(Err(error));
                             } else {
+                                pending_bytes += frame_bytes;
                                 pending_messages.push_back(msg);
                             }
                         }
@@ -429,6 +438,11 @@ where
 /// runaway client must not be able to grow this without bound merely by
 /// flooding frames faster than the server drains them.
 const MAX_PENDING_MESSAGES: usize = 1024;
+
+/// Byte ceiling for the same queue: 1024 small frames and a handful of
+/// maximum-size (64MB) bulk frames are very different memory footprints, so
+/// the count limit alone was not a real bound.
+const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 
 /// How often a queued heavy request re-checks the cancellation flag while
 /// waiting for a limiter slot, so a disconnect does not have to wait out the

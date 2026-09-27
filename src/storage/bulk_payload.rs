@@ -160,7 +160,13 @@ fn direct_column_layout(
     }
 
     let mut offset = 0usize;
-    let mut ranges = Vec::with_capacity(elem_count);
+    // Bound the initial capacity by what the remaining payload can possibly
+    // contain: every element needs at least a 4-byte length prefix. The wire
+    // elem_count is attacker-controlled and used to be trusted directly,
+    // letting a ~20-byte malformed header request a ~68GB allocation (and
+    // with it an allocation-failure abort of the whole process).
+    let capacity_bound = (data.len() / 4).saturating_add(1);
+    let mut ranges = Vec::with_capacity(elem_count.min(capacity_bound));
     for _ in 0..elem_count {
         if offset + 4 > data.len() {
             return Err(TaibaiError::Protocol(

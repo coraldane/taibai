@@ -14,6 +14,19 @@ pub fn discover_segments(table_dir: &Path) -> Result<Vec<PathBuf>> {
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             if is_segment_filename(name) {
+                // Complete or discard an interrupted delete-footer rewrite
+                // before the segment is handed to readers. Without this, a
+                // crash mid-rewrite left the segment headerless and scans
+                // silently skipped it.
+                if let Err(error) =
+                    crate::storage::segment::SegmentReader::repair_pending_footer_rewrite(&path)
+                {
+                    tracing::warn!(
+                        file = %path.display(),
+                        error = %error,
+                        "segment delete-journal repair failed"
+                    );
+                }
                 files.push(path);
             }
         }

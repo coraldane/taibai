@@ -1,28 +1,38 @@
-use crate::common::error::Result;
+use crate::common::error::{Result, TaibaiError};
 
 #[cfg(test)]
 #[path = "wal_helper_test.rs"]
 mod tests;
 
-pub fn serialize_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Vec<u8> {
-    compress_prepared_batch_for_wal(prepare_batch_for_wal(batch))
+pub fn serialize_batch_for_wal(
+    batch: &crate::types::batch::RecordBatch,
+) -> Result<Vec<u8>> {
+    compress_prepared_batch_for_wal(prepare_batch_for_wal(batch)?)
 }
 
 /// Build the uncompressed WAL representation without taking a storage lock.
 /// The durable-tail commit thread performs level-3 compression serially so
 /// concurrent INSERT workers do not saturate memory bandwidth and naturally
 /// accumulate into a larger fsync group.
-pub(crate) fn prepare_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Vec<u8> {
+pub(crate) fn prepare_batch_for_wal(
+    batch: &crate::types::batch::RecordBatch,
+) -> Result<Vec<u8>> {
     const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
 
     let num_cols = batch.num_columns();
     let num_rows = batch.num_rows();
+    // u32 frame fields: refuse instead of silently wrapping (a wrapped
+    // length/row count corrupts recovery).
+    let num_cols_u32 =
+        u32::try_from(num_cols).map_err(|_| TaibaiError::Internal("WAL column count overflow".into()))?;
+    let num_rows_u32 =
+        u32::try_from(num_rows).map_err(|_| TaibaiError::Internal("WAL row count overflow".into()))?;
 
     let mut raw = Vec::with_capacity(64 + num_cols * 8 + num_rows * num_cols * 8);
     raw.extend_from_slice(&WAL_BATCH_MAGIC.to_le_bytes());
     raw.push(0u8);
-    raw.extend_from_slice(&(num_cols as u32).to_le_bytes());
-    raw.extend_from_slice(&(num_rows as u32).to_le_bytes());
+    raw.extend_from_slice(&num_cols_u32.to_le_bytes());
+    raw.extend_from_slice(&num_rows_u32.to_le_bytes());
 
     for col_idx in 0..num_cols {
         let col = batch.column(col_idx).unwrap();
@@ -47,20 +57,20 @@ pub(crate) fn prepare_batch_for_wal(batch: &crate::types::batch::RecordBatch) ->
         raw[len_offset..len_offset + 4].copy_from_slice(&data_len.to_le_bytes());
     }
 
-    raw
+    Ok(raw)
 }
 
-pub(crate) fn compress_prepared_batch_for_wal(raw: Vec<u8>) -> Vec<u8> {
+pub(crate) fn compress_prepared_batch_for_wal(raw: Vec<u8>) -> Result<Vec<u8>> {
     match zstd::bulk::Compressor::new(3) {
         Ok(mut compressor) => compress_prepared_batch_for_wal_with(&mut compressor, raw),
-        Err(_) => raw,
+        Err(_) => Ok(raw),
     }
 }
 
 pub(crate) fn compress_prepared_batch_for_wal_with(
     compressor: &mut zstd::bulk::Compressor<'_>,
     raw: Vec<u8>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
     const FLAG_COMPRESSED: u8 = 0x01;
 
@@ -69,12 +79,16 @@ pub(crate) fn compress_prepared_batch_for_wal_with(
             let mut out = Vec::with_capacity(13 + compressed.len());
             out.extend_from_slice(&WAL_BATCH_MAGIC.to_le_bytes());
             out.push(FLAG_COMPRESSED);
-            out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+            let raw_len = u32::try_from(raw.len())
+                .map_err(|_| TaibaiError::Internal("WAL payload length overflow".into()))?;
+            let compressed_len = u32::try_from(compressed.len())
+                .map_err(|_| TaibaiError::Internal("WAL payload length overflow".into()))?;
+            out.extend_from_slice(&raw_len.to_le_bytes());
+            out.extend_from_slice(&compressed_len.to_le_bytes());
             out.extend_from_slice(&compressed);
-            out
+            Ok(out)
         }
-        _ => raw,
+        _ => Ok(raw),
     }
 }
 

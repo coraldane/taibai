@@ -459,8 +459,8 @@ fn bulk_import_mode_is_reference_counted_across_connections() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
     let config = Arc::new(ServerConfig::default());
-    let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "first");
-    let mut second = logged_in_handler(config, Arc::clone(&engine), "second");
+    let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "root");
+    let mut second = logged_in_handler(config, Arc::clone(&engine), "admin");
 
     ok_rows(&first.handle_start_bulk_import("START BULK IMPORT").unwrap());
     assert!(engine.is_bulk_mode());
@@ -493,8 +493,8 @@ fn bulk_import_disconnect_releases_only_that_connection() {
     let dir = tempfile::TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path(), "main").unwrap());
     let config = Arc::new(ServerConfig::default());
-    let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "first");
-    let mut second = logged_in_handler(config, Arc::clone(&engine), "second");
+    let mut first = logged_in_handler(Arc::clone(&config), Arc::clone(&engine), "root");
+    let mut second = logged_in_handler(config, Arc::clone(&engine), "admin");
 
     ok_rows(&first.handle_start_bulk_import("START BULK IMPORT").unwrap());
     ok_rows(

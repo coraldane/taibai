@@ -68,12 +68,12 @@ pub(crate) struct PreparedTailAppend {
 }
 
 impl PreparedTailAppend {
-    pub(crate) fn new(batch: &RecordBatch) -> Self {
-        Self {
-            wal_payload: prepare_batch_for_wal(batch),
+    pub(crate) fn new(batch: &RecordBatch) -> Result<Self> {
+        Ok(Self {
+            wal_payload: prepare_batch_for_wal(batch)?,
             frame: None,
             rows: batch.num_rows() as u64,
-        }
+        })
     }
 
     fn encoded_len(&self) -> usize {
@@ -83,12 +83,13 @@ impl PreparedTailAppend {
             .unwrap_or(self.wal_payload.len())
     }
 
-    fn finish(&mut self, compressor: &mut zstd::bulk::Compressor<'_>) {
+    fn finish(&mut self, compressor: &mut zstd::bulk::Compressor<'_>) -> Result<()> {
         if self.frame.is_none() {
             let raw = std::mem::take(&mut self.wal_payload);
-            let payload = compress_prepared_batch_for_wal_with(compressor, raw);
+            let payload = compress_prepared_batch_for_wal_with(compressor, raw)?;
             self.frame = Some(encode_tail_frame_payload(&payload, self.rows));
         }
+        Ok(())
     }
 
     fn frame(&self) -> &[u8] {
@@ -616,7 +617,13 @@ fn write_append_group(
     let mut by_tail = HashMap::<TailKey, (Vec<Arc<CommitCompletion>>, usize)>::new();
     for mut command in group {
         let frame_bytes = command.prepared.encoded_len();
-        command.prepared.finish(compressor);
+        // Frame-encoding failure (payload beyond the WAL u32 length field)
+        // fails this request like a write error instead of poisoning the
+        // committer thread.
+        if let Err(error) = command.prepared.finish(compressor) {
+            command.completion.finish(Err(error.to_string()));
+            continue;
+        }
         match files.append(&command) {
             Ok(key) => {
                 let entry = by_tail.entry(key).or_insert_with(|| (Vec::new(), 0));
@@ -734,7 +741,7 @@ pub fn persist(table_dir: &Path, id: Uuid, partition_key: &str, batch: &RecordBa
     let tail_dir = table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
     let sequence = next_sequence();
-    let payload = encode_tail_log(partition_key, batch);
+    let payload = encode_tail_log(partition_key, batch)?;
     let stem = format!("{}.{}", id.simple(), sequence);
     let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
     let final_path = tail_dir.join(format!("{stem}.tail"));
@@ -758,7 +765,7 @@ pub fn append(table_dir: &Path, id: Uuid, partition_key: &str, delta: &RecordBat
     let tail_dir = table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
     let existing = newest_live_tail_path(&tail_dir, id)?;
-    let frame = encode_tail_frame(delta);
+    let frame = encode_tail_frame(delta)?;
 
     if let Some(path) = existing {
         if read_tail_log_partition_key(&path)?.as_deref() == Some(partition_key) {
@@ -777,7 +784,7 @@ pub fn append(table_dir: &Path, id: Uuid, partition_key: &str, delta: &RecordBat
     let stem = format!("{}.{}", id.simple(), sequence);
     let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
     let final_path = tail_dir.join(format!("{stem}.tail"));
-    write_new_synced(&tmp_path, &encode_tail_log(partition_key, delta))?;
+    write_new_synced(&tmp_path, &encode_tail_log(partition_key, delta)?)?;
     fs::rename(&tmp_path, &final_path)?;
     Ok(())
 }
@@ -1121,10 +1128,10 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn encode_tail_log(partition_key: &str, batch: &RecordBatch) -> Vec<u8> {
+fn encode_tail_log(partition_key: &str, batch: &RecordBatch) -> Result<Vec<u8>> {
     let mut bytes = encode_tail_log_header(partition_key);
-    bytes.extend_from_slice(&encode_tail_frame(batch));
-    bytes
+    bytes.extend_from_slice(&encode_tail_frame(batch)?);
+    Ok(bytes)
 }
 
 fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
@@ -1135,9 +1142,9 @@ fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
     bytes
 }
 
-fn encode_tail_frame(batch: &RecordBatch) -> Vec<u8> {
-    let payload = serialize_batch_for_wal(batch);
-    encode_tail_frame_payload(&payload, batch.num_rows() as u64)
+fn encode_tail_frame(batch: &RecordBatch) -> Result<Vec<u8>> {
+    let payload = serialize_batch_for_wal(batch)?;
+    Ok(encode_tail_frame_payload(&payload, batch.num_rows() as u64))
 }
 
 /// V2 frame layout: `[u64 payload_len][u64 rows][payload][crc32]`, with the

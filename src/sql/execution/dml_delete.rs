@@ -143,32 +143,32 @@ fn plan_delete_memtable_rows(
                 continue;
             }
         }
-        let planned = memtable.read_snapshot_arc().and_then(|batch| {
-            if batch.num_rows() == 0 {
-                return None;
-            }
-            let mask = match where_clause.as_ref() {
-                Some(expr) => eval_where_clause_batch(expr, &batch, table_schema).ok()?,
-                None => vec![true; batch.num_rows()],
-            };
-            let removed = mask.iter().filter(|matches| **matches).count();
-            if removed == 0 {
-                return None;
-            }
+        let Some(batch) = memtable.read_snapshot_arc() else {
+            continue;
+        };
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        // Propagate evaluation errors: swallowing them here used to make the
+        // memtable look "no match", deleting segment rows while leaving the
+        // memtable rows alive.
+        let mask = match where_clause.as_ref() {
+            Some(expr) => eval_where_clause_batch(expr, &batch, table_schema)?,
+            None => vec![true; batch.num_rows()],
+        };
+        let removed = mask.iter().filter(|matches| **matches).count();
+        if removed > 0 {
             let keep = mask.iter().map(|matches| !matches).collect::<Vec<_>>();
-            let filtered = filter_batch_keep(&batch, &keep, batch.num_rows() - removed).ok()?;
+            let filtered = filter_batch_keep(&batch, &keep, batch.num_rows() - removed)?;
             let removed_positions = mask
                 .iter()
                 .enumerate()
                 .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
                 .collect::<Vec<_>>();
-            Some((batch, Arc::new(filtered), removed_positions))
-        });
-        if let Some((original, filtered, removed_positions)) = planned {
             plans.push(ReplaceMemtableConflictPlan {
                 memtable,
-                original,
-                filtered,
+                original: batch,
+                filtered: Arc::new(filtered),
                 removed_positions,
             });
         }
@@ -1023,6 +1023,7 @@ pub fn exec_delete(
         }
         let key_projection = index_maintenance.projection(&predicate_projection);
         let projected_key_positions = index_maintenance.projected_key_positions(&key_projection);
+        let mut first_rewrite_error: Option<crate::common::error::TaibaiError> = None;
         for seg_path in segment_files {
             let (new_bitmap, new_deleted_count, prev_deleted) = {
                 let reader = mgr.open_reader_cached(&seg_path)?;
@@ -1125,7 +1126,38 @@ pub fn exec_delete(
                 continue;
             }
 
-            mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count)?;
+            // A failed footer rewrite must not abort the remaining segments:
+            // rows already tombstoned elsewhere stay deleted either way, and
+            // continuing maximizes how much of the statement is applied. The
+            // error is reported after the loop.
+            if let Err(error) = mgr.rewrite_delete_footer(&seg_path, &new_bitmap, new_deleted_count)
+            {
+                tracing::warn!(
+                    file = %seg_path.display(),
+                    error = %error,
+                    "DELETE footer rewrite failed; continuing with remaining segments"
+                );
+                // This segment's rows were not tombstoned after all.
+                total_deleted -= new_deleted_count - prev_deleted;
+                first_rewrite_error = first_rewrite_error.or(Some(error));
+            }
+        }
+
+        if let Some(error) = first_rewrite_error {
+            // Partial application: stale index snapshots could still point at
+            // rows deleted in the successfully rewritten segments.
+            engine
+                .index_manager()
+                .invalidate_primary_key_index(db, table);
+            let unique_index_names = table_meta
+                .unique_indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            engine
+                .index_manager()
+                .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+            return Err(error);
         }
 
         if total_deleted > 0 {
@@ -1183,6 +1215,25 @@ pub fn exec_delete(
     Ok(ExecResult::Ok {
         rows_affected: total_deleted,
     })
+}
+
+/// Resolve subqueries in a DML WHERE clause into literals. Shared with the
+/// UPDATE path, whose legacy evaluator otherwise treated unexpanded
+/// subqueries as "match every row".
+pub(super) fn resolve_where_in_subqueries(
+    engine: &Engine,
+    db: &str,
+    where_clause: &Option<Expr>,
+) -> Result<Option<Expr>> {
+    resolve_in_subqueries(engine, db, where_clause)
+}
+
+pub(super) fn resolve_expr_in_subqueries_pub(
+    engine: &Engine,
+    db: &str,
+    expr: &Expr,
+) -> Result<Expr> {
+    resolve_expr_in_subqueries(engine, db, expr)
 }
 
 fn resolve_in_subqueries(

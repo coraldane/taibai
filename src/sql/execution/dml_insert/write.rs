@@ -493,10 +493,14 @@ fn exec_materialized_insert_batch(
             Some(constraint_insert_lock(db, table).lock().unwrap())
         };
 
-    if validate_existing_constraints {
-        validate_unique_constraints(engine, db, table, &batch, &schema, &unique_constraints)?;
-    } else {
+    // The bulk/relaxed branch re-runs the full existing-data validation
+    // inside `exec_bulk_insert_partitioned`; probing the index here too
+    // doubled the constraint cost of every bulk SQL insert.
+    let bulk_branch = bulk_import_mode || relaxed_direct_insert;
+    if bulk_branch || !validate_existing_constraints {
         validate_unique_constraints_in_batch(table, &batch, &schema, &unique_constraints)?;
+    } else {
+        validate_unique_constraints(engine, db, table, &batch, &schema, &unique_constraints)?;
     }
 
     if !primary_key_indices.is_empty() {
@@ -505,7 +509,9 @@ fn exec_materialized_insert_batch(
             &is_missing_auto_inc,
         ) {
             validate_primary_key_values_present(&batch, &schema, &primary_key_indices)?;
-        } else if validate_existing_constraints {
+        } else if bulk_branch || !validate_existing_constraints {
+            validate_primary_key_uniqueness_in_batch(table, &batch, &schema, &primary_key_indices)?;
+        } else {
             validate_primary_key_uniqueness(
                 engine,
                 db,
@@ -514,8 +520,6 @@ fn exec_materialized_insert_batch(
                 &schema,
                 &primary_key_indices,
             )?;
-        } else {
-            validate_primary_key_uniqueness_in_batch(table, &batch, &schema, &primary_key_indices)?;
         }
     }
     advance_explicit_auto_increment_counters(
@@ -532,7 +536,6 @@ fn exec_materialized_insert_batch(
     } else {
         primary_keys_for_batch(&batch, &schema, &primary_key_indices)?
     };
-    let auto_increment_touched = !auto_inc_cols.is_empty();
     let mut unique_index_entries = if publish_unique_index_entries {
         build_unique_index_entries_for_batch(table_meta, &schema, &batch, &unique_constraints)?
     } else {
@@ -631,9 +634,11 @@ fn exec_materialized_insert_batch(
             !bulk_import_mode && txn_id > 0,
             !bulk_import_mode && txn_id == 0,
         )?;
-        if auto_increment_touched {
-            engine.persist_auto_increment_next_value(db, table, !bulk_import_mode && txn_id > 0)?;
-        }
+        // No follow-up persist_auto_increment_next_value call here:
+        // record_inserted_rows already writes the counter into the table
+        // meta under the same catalog lock (and saves under the same
+        // condition), so a second lock acquisition was pure serialization
+        // overhead on every INSERT.
     }
     log_insert_profile("catalog", row_count as usize, catalog_start.elapsed());
     log_insert_profile("total_exec", row_count as usize, total_start.elapsed());

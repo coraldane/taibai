@@ -87,14 +87,22 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn execute_unlocked(&mut self) -> Result<Vec<RecordBatch>> {
+        // Metadata fast paths (DISTINCT / simple aggregates) fold zone maps
+        // and footers directly and never apply the read-time TTL filter, so
+        // a table with an active TTL must take the regular scan path.
+        let ttl_active = self.table_meta.ttl.is_some();
         if let Some(column) = self.spec.distinct_column.clone() {
-            if let Some(batch) = self.execute_distinct_metadata(&column)? {
-                self.metadata_answered = true;
-                return Ok(vec![batch]);
+            if !ttl_active {
+                if let Some(batch) = self.execute_distinct_metadata(&column)? {
+                    self.metadata_answered = true;
+                    return Ok(vec![batch]);
+                }
             }
         }
         if let Some(aggs) = self.spec.simple_metadata_aggregates.clone() {
-            return self.execute_simple_metadata_aggregate(&aggs);
+            if !ttl_active {
+                return self.execute_simple_metadata_aggregate(&aggs);
+            }
         }
         if self.spec.is_count_star {
             return self.execute_count_star();
@@ -470,7 +478,20 @@ impl<'a> ScanExecutor<'a> {
 
                     let reader = match mgr.open_reader_cached(seg_path) {
                         Ok(r) => r,
-                        Err(_) => continue,
+                        Err(error) => {
+                            // A concurrent compaction may legitimately remove
+                            // a segment mid-scan; anything else (IO error,
+                            // corrupt footer) must fail the query instead of
+                            // silently skipping the whole segment's rows.
+                            if !seg_path.exists() {
+                                tracing::warn!(
+                                    segment = %seg_path.display(),
+                                    "scan: segment vanished mid-scan; skipping"
+                                );
+                                continue;
+                            }
+                            return Err(error);
+                        }
                     };
 
                     if let Some(s) = self.stats.as_deref_mut() {
@@ -526,7 +547,12 @@ impl<'a> ScanExecutor<'a> {
                                 *rg_idx,
                             ) {
                                 Ok(b) => b,
-                                Err(_) => continue,
+                                Err(error) => {
+                                    // Decode failures propagate: silently
+                                    // dropping a row group would return
+                                    // partial results as success.
+                                    return Err(error);
+                                }
                             };
                             if ordered_limit.is_some_and(|order| order.desc) {
                                 batch = reverse_batch(&batch)?;
@@ -554,7 +580,8 @@ impl<'a> ScanExecutor<'a> {
                     // context, so capture the flag here and let the closure
                     // stop starting new row-group reads once it is set.
                     let cancel_flag = crate::common::query_cancel::current_flag();
-                    let read_one = |pos: usize, rg_idx: &usize| {
+                    type ReadOutcome = std::result::Result<(usize, RecordBatch), crate::common::error::TaibaiError>;
+                    let read_one = |pos: usize, rg_idx: &usize| -> Option<ReadOutcome> {
                         if cancel_flag
                             .as_ref()
                             .is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -563,18 +590,22 @@ impl<'a> ScanExecutor<'a> {
                         }
                         let _cpu = crate::common::work_limiter::acquire_cpu();
                         let _io = crate::common::work_limiter::acquire_io();
-                        super::strategy::read_row_group_with_strategy(
+                        match super::strategy::read_row_group_with_strategy(
                             &self.spec,
                             &plan,
                             &self.table_schema,
                             &reader,
                             *rg_idx,
-                        )
-                        .ok()
-                        .filter(|batch| batch.num_rows() > 0)
-                        .map(|batch| (pos, batch))
+                        ) {
+                            // Decode failures must fail the query: silently
+                            // dropping a row group returned partial results
+                            // as success.
+                            Ok(batch) if batch.num_rows() > 0 => Some(Ok((pos, batch))),
+                            Ok(_) => None,
+                            Err(error) => Some(Err(error)),
+                        }
                     };
-                    let mut rg_batches: Vec<(usize, RecordBatch)> = if max_parallel == 1
+                    let rg_outcomes: Vec<ReadOutcome> = if max_parallel == 1
                         || candidate_indices.len() < min_parallel
                     {
                         candidate_indices
@@ -588,7 +619,7 @@ impl<'a> ScanExecutor<'a> {
                         {
                             crate::common::query_cancel::check()?;
                             let base = chunk_idx * max_parallel;
-                            let mut chunk_batches: Vec<(usize, RecordBatch)> = chunk
+                            let mut chunk_batches: Vec<ReadOutcome> = chunk
                                 .par_iter()
                                 .enumerate()
                                 .filter_map(|(pos, rg_idx)| read_one(base + pos, rg_idx))
@@ -597,6 +628,11 @@ impl<'a> ScanExecutor<'a> {
                         }
                         batches
                     };
+                    let mut rg_batches: Vec<(usize, RecordBatch)> =
+                        Vec::with_capacity(rg_outcomes.len());
+                    for outcome in rg_outcomes {
+                        rg_batches.push(outcome?);
+                    }
                     rg_batches.sort_by_key(|(pos, _)| *pos);
 
                     let rows_scanned = rg_batches
@@ -634,7 +670,7 @@ impl<'a> ScanExecutor<'a> {
             self.db,
             &self.spec.table_name,
             &memtable_spec,
-        ) {
+        )? {
             crate::common::query_cancel::check()?;
             let batch = super::strategy::apply_ttl_filter_and_projection(
                 batch,
@@ -691,10 +727,12 @@ impl<'a> ScanExecutor<'a> {
         for (chunk_index, chunk) in paths.chunks(max_parallel).enumerate() {
             crate::common::query_cancel::check()?;
             let base = chunk_index * max_parallel;
-            let mut scanned = chunk
+            type ScanOutcome =
+                std::result::Result<(usize, Vec<RecordBatch>), crate::common::error::TaibaiError>;
+            let mut scanned: Vec<ScanOutcome> = chunk
                 .par_iter()
                 .enumerate()
-                .filter_map(|(position, path)| {
+                .filter_map(|(position, path)| -> Option<ScanOutcome> {
                     if cancel_flag
                         .as_ref()
                         .is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -703,7 +741,22 @@ impl<'a> ScanExecutor<'a> {
                     }
                     let reader = {
                         let _io = crate::common::work_limiter::acquire_io();
-                        manager.open_reader_cached(path).ok()?
+                        match manager.open_reader_cached(path) {
+                            Ok(reader) => reader,
+                            // A segment removed by concurrent compaction is
+                            // skipped; any other open failure fails the query.
+                            Err(error) => {
+                                return if path.exists() {
+                                    Some(Err(error))
+                                } else {
+                                    tracing::warn!(
+                                        segment = %path.display(),
+                                        "parallel scan: segment vanished mid-scan; skipping"
+                                    );
+                                    None
+                                };
+                            }
+                        }
                     };
                     let candidates = if let Ok(Some(meta)) = manager.segment_meta(path) {
                         let predicate = self.spec.to_row_group_predicate();
@@ -711,7 +764,7 @@ impl<'a> ScanExecutor<'a> {
                             &predicate,
                             &meta.segment_zone_maps,
                         ) {
-                            return Some((base + position, Vec::new()));
+                            return Some(Ok((base + position, Vec::new())));
                         }
                         super::row_group::prune_row_group_meta(
                             &meta.row_groups,
@@ -727,15 +780,19 @@ impl<'a> ScanExecutor<'a> {
                     };
                     // Row groups inside a segment decode in parallel as
                     // well; actual concurrency is bounded by the global
-                    // cpu/io permits, not by rayon lane count.
-                    let batches: Vec<_> = candidates
+                    // cpu/io permits, not by rayon lane count. Decode and
+                    // TTL failures fail the query instead of silently
+                    // dropping rows.
+                    let batch_results: Vec<
+                        std::result::Result<Option<RecordBatch>, crate::common::error::TaibaiError>,
+                    > = candidates
                         .into_par_iter()
-                        .filter_map(|row_group| {
+                        .map(|row_group| {
                             if cancel_flag
                                 .as_ref()
                                 .is_some_and(|flag| flag.load(Ordering::Acquire))
                             {
-                                return None;
+                                return Ok(None);
                             }
                             let batch_result = {
                                 let _cpu = crate::common::work_limiter::acquire_cpu();
@@ -748,22 +805,31 @@ impl<'a> ScanExecutor<'a> {
                                     row_group,
                                 )
                             };
-                            let batch = batch_result.ok()?;
+                            let batch = batch_result?;
                             let batch = super::strategy::apply_ttl_filter_and_projection(
                                 batch,
                                 &self.table_meta,
                                 &plan.projection_cols,
                                 plan.strip_ttl_column,
-                            )
-                            .ok()?;
-                            (batch.num_rows() > 0).then_some(batch)
+                            )?;
+                            Ok((batch.num_rows() > 0).then_some(batch))
                         })
                         .collect();
-                    Some((base + position, batches))
+                    let mut batches = Vec::with_capacity(batch_results.len());
+                    for result in batch_results {
+                        match result {
+                            Ok(Some(batch)) => batches.push(batch),
+                            Ok(None) => {}
+                            Err(error) => return Some(Err(error)),
+                        }
+                    }
+                    Some(Ok((base + position, batches)))
                 })
-                .collect::<Vec<_>>();
-            scanned.sort_by_key(|(position, _)| *position);
-            for (_, mut batches) in scanned {
+                .collect();
+            scanned
+                .sort_by_key(|outcome| outcome.as_ref().map_or(usize::MAX, |(position, _)| *position));
+            for outcome in scanned {
+                let (_, mut batches) = outcome?;
                 output.append(&mut batches);
             }
         }

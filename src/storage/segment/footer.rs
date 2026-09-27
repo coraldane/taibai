@@ -84,7 +84,11 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
         }
     }
 
-    let mut row_groups = Vec::with_capacity(row_group_count as usize);
+    // Each row group consumes at least (3 + 3*col_count) u64s of footer
+    // space; a corrupted count must not turn into a multi-GB allocation
+    // before the read loop errors out.
+    let row_group_alloc_bound = buf.len() / 8 / (3 + col_count.max(1) * 3);
+    let mut row_groups = Vec::with_capacity((row_group_count as usize).min(row_group_alloc_bound));
     for _ in 0..row_group_count {
         let offset = read_u64_le(&mut cursor)?;
         let length = read_u64_le(&mut cursor)?;
@@ -182,6 +186,14 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
 
     let deleted_row_count = read_u64_le(&mut cursor).unwrap_or(0);
     let bitmap_len = read_u32_le(&mut cursor).unwrap_or(0) as usize;
+    // Bound by remaining footer bytes: a corrupted length must error out
+    // instead of allocating up to 4GB.
+    if bitmap_len > buf.len().saturating_sub(cursor.position() as usize) {
+        return Err(TaibaiError::Storage(format!(
+            "delete bitmap length {} exceeds remaining footer bytes",
+            bitmap_len
+        )));
+    }
     let mut delete_bitmap = vec![0u8; bitmap_len];
     if bitmap_len > 0 {
         cursor.read_exact(&mut delete_bitmap)?;

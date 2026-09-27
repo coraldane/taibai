@@ -335,11 +335,39 @@ pub fn eval_filter_with(
             negated,
         } => {
             let vals = eval_expr_column_with(expr, batch, subqueries)?;
-            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
-                let found = values
+            // Three-valued IN: a NULL operand makes the predicate UNKNOWN
+            // (row excluded for both IN and NOT IN), and NOT IN over a list
+            // containing NULL matches nothing.
+            let has_null_candidate = values.iter().any(|candidate| candidate.is_null());
+            // Hash-set prefilter for wide lists; the linear scan stays as
+            // the fallback for cross-type equality the exact-match set
+            // cannot see.
+            let fast_set = (values.len() >= 8).then(|| {
+                values
                     .iter()
-                    .any(|candidate| eval_comparison(&vals[i], &BinOp::Eq, candidate));
-                *m = if *negated { !found } else { found };
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            for (i, m) in mask.iter_mut().take(num_rows).enumerate() {
+                if vals[i].is_null() {
+                    *m = false;
+                    continue;
+                }
+                let found = if fast_set
+                    .as_ref()
+                    .is_some_and(|set| set.contains(&vals[i]))
+                {
+                    true
+                } else {
+                    values
+                        .iter()
+                        .any(|candidate| eval_comparison(&vals[i], &BinOp::Eq, candidate))
+                };
+                *m = if *negated {
+                    !found && !has_null_candidate
+                } else {
+                    found
+                };
             }
         }
         LogicalExpr::Like {

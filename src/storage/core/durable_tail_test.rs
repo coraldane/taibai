@@ -66,13 +66,13 @@ fn group_committer_acknowledges_only_recoverable_appends() -> Result<()> {
         temp.path().to_path_buf(),
         id,
         "2026".into(),
-        PreparedTailAppend::new(&first),
+        PreparedTailAppend::new(&first)?,
     );
     let second_ticket = committer.submit(
         temp.path().to_path_buf(),
         id,
         "2026".into(),
-        PreparedTailAppend::new(&second),
+        PreparedTailAppend::new(&second)?,
     );
     first_ticket.wait()?;
     second_ticket.wait()?;
@@ -100,7 +100,7 @@ fn async_fsync_committer_still_leaves_recoverable_tail() -> Result<()> {
         temp.path().to_path_buf(),
         id,
         "2026".into(),
-        PreparedTailAppend::new(&batch),
+        PreparedTailAppend::new(&batch)?,
     );
     ticket.wait()?;
     committer.barrier(temp.path())?;

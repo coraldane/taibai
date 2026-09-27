@@ -218,9 +218,15 @@ impl SegmentManager {
             .unwrap_or_else(|| read_flush_epoch_file(&path));
         let next = current.saturating_add(1);
         if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent)
-                .and_then(|_| std::fs::write(&path, next.to_string()))
-            {
+            // tmp+rename: a torn in-place overwrite of the epoch file made
+            // it fall back to 0 on read, wrongly marking index snapshots as
+            // stale (or fresh) after a crash.
+            let tmp = path.with_extension("epoch.tmp");
+            if let Err(error) = std::fs::create_dir_all(parent).and_then(|_| {
+                std::fs::write(&tmp, next.to_string())?;
+                std::fs::rename(&tmp, &path)
+            }) {
+                let _ = std::fs::remove_file(&tmp);
                 tracing::error!(
                     db,
                     table,
@@ -688,15 +694,34 @@ impl SegmentManager {
     ) -> Result<()> {
         let mutable = self.is_mutable_segment_path(path);
         self.invalidate_reader(path);
-        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
         if mutable {
+            // Hold the per-table active-segment lock across the whole
+            // truncate+rewrite: the background flush thread appends buffered
+            // rows and publishes footers under the same lock, so an
+            // unsynchronized set_len here could truncate freshly written
+            // rows before their footer was published. Flushing the target
+            // first also guarantees the embedded footer we rewrite from is
+            // current.
+            let Some(state) = self.state_for_segment_path(path) else {
+                SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+                remove_sidecar_meta(path)?;
+                return Ok(());
+            };
+            let mut active_guard = state.active_segments.lock().unwrap();
+            for segment in active_guard.values_mut() {
+                if same_segment_path(&segment.path, path) {
+                    if segment.buffered_rows > 0 {
+                        segment.flush_buffer(&|p| self.invalidate_reader(p))?;
+                    }
+                    if segment.dirty_meta {
+                        segment.flush_meta(&|p| self.invalidate_reader(p))?;
+                    }
+                    break;
+                }
+            }
+            SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
             let footer = read_embedded_footer(path)?;
             append_sidecar_footer(path, footer.data_end, &footer.footer)?;
-        } else {
-            remove_sidecar_meta(path)?;
-        }
-        if let Some(state) = self.state_for_segment_path(path) {
-            let mut active_guard = state.active_segments.lock().unwrap();
             for segment in active_guard.values_mut() {
                 if same_segment_path(&segment.path, path) {
                     segment.delete_bitmap = bitmap.to_vec();
@@ -705,7 +730,10 @@ impl SegmentManager {
                     break;
                 }
             }
+            return Ok(());
         }
+        SegmentReader::rewrite_footer_with_deletes(path, bitmap, deleted_count)?;
+        remove_sidecar_meta(path)?;
         Ok(())
     }
 
@@ -1019,6 +1047,12 @@ impl SegmentManager {
         let mut active_guard = state.active_segments.lock().unwrap();
         for segment in active_guard.values_mut() {
             if same_segment_path(&segment.path, path) {
+                // Flush buffered rows as well, not just dirty metadata:
+                // rows sitting in the writer's buffer are invisible to a
+                // reader, which made DELETE skip them.
+                if segment.buffered_rows > 0 {
+                    segment.flush_buffer(&|path| self.invalidate_reader(path))?;
+                }
                 if segment.dirty_meta {
                     segment.flush_meta(&|path| self.invalidate_reader(path))?;
                 }

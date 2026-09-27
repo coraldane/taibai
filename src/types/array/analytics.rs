@@ -507,6 +507,7 @@ impl ColumnArray {
     }
 
     cmp_vec_fn!(eq_vec, ==, ==, Equal);
+    cmp_vec_fn!(neq_vec, !=, !=, Equal);
     cmp_vec_fn!(lt_vec, <, ==, Less);
     cmp_vec_fn!(le_vec, <=, !=, Greater);
     cmp_vec_fn!(gt_vec, >, ==, Greater);

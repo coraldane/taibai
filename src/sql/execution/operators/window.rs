@@ -535,7 +535,7 @@ fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue]) -> ScalarValue {
                     has_float = true;
                     float_sum += value.numeric_f64().unwrap_or(0.0);
                 } else if let Some(i) = value.integer_i128() {
-                    int_sum = int_sum.wrapping_add(i as i64);
+                    int_sum = int_sum.saturating_add(i.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
                 } else if let Some(f) = value.numeric_f64() {
                     float_sum += f;
                 }

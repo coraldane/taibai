@@ -49,6 +49,29 @@ pub fn exec_update(
             table_meta.partition_key
         )));
     }
+
+    // Resolve subqueries in the WHERE clause and in assignment values up
+    // front, exactly like DELETE does. Without this, `UPDATE ... WHERE id IN
+    // (SELECT ...)` used to fall into the predicate evaluator's legacy
+    // "match everything" fallback and rewrite the whole table.
+    let resolved_where_clause =
+        super::dml_delete::resolve_where_in_subqueries(engine, db, where_clause)?;
+    let resolved_assignments: Vec<Assignment> = assignments
+        .iter()
+        .map(|assignment| {
+            Ok(Assignment {
+                column: assignment.column.clone(),
+                value: super::dml_delete::resolve_expr_in_subqueries_pub(
+                    engine,
+                    db,
+                    &assignment.value,
+                )?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let assignments = resolved_assignments.as_slice();
+    let where_clause = &resolved_where_clause;
+
     let predicate = build_row_group_predicate(where_clause, &table_schema);
     let predicate_projection = where_clause
         .as_ref()
@@ -208,7 +231,42 @@ pub fn exec_update(
             return Ok(0);
         }
 
-        if !table_meta.unique_indexes.is_empty() {
+        // Unique/PK validation. Only indexes whose columns are actually
+        // touched by this UPDATE can gain new collisions (assignments are
+        // constant per statement), and the primary key must be validated
+        // even though it is not listed in `unique_indexes` — UPDATE used to
+        // skip PK checks entirely, letting `SET id = <existing>` through.
+        let indexes_to_validate = indexes_touched_by_assignments(
+            &table_meta.unique_indexes,
+            &table_schema,
+            assigned.keys().copied().collect(),
+        );
+        if !indexes_to_validate.is_empty() {
+            // Materialize only the key columns (not whole rows) to keep the
+            // validation working set proportional to the index width.
+            let mut needed: Vec<usize> = indexes_to_validate
+                .iter()
+                .flat_map(|index| index.columns.iter())
+                .filter_map(|column| table_schema.index_of(column))
+                .collect();
+            needed.sort_unstable();
+            needed.dedup();
+            let validation_schema = Schema::new(
+                needed
+                    .iter()
+                    .map(|&idx| table_schema.columns[idx].clone())
+                    .collect(),
+            );
+            let project = |batch: &RecordBatch| -> RecordBatch {
+                RecordBatch::try_new(
+                    validation_schema.clone(),
+                    needed
+                        .iter()
+                        .map(|&idx| batch.columns[idx].clone())
+                        .collect(),
+                )
+                .expect("validation projection preserves column types")
+            };
             let mut validation_batches: Vec<Arc<RecordBatch>> = Vec::new();
             for seg_path in SegmentManager::discover_segments(&table_dir)? {
                 if rewritten_segments
@@ -228,14 +286,19 @@ pub fn exec_update(
                         )?;
                     }
                     if batch.num_rows() > 0 {
-                        validation_batches.push(Arc::new(batch));
+                        validation_batches.push(Arc::new(project(&batch)));
                     }
                 }
             }
             for (_, batches) in &rewritten_segments {
-                validation_batches.extend(batches.iter().cloned());
+                validation_batches.extend(batches.iter().map(|batch| Arc::new(project(batch))));
             }
-            for memtable in engine.memtable_manager().get_by_table(db, table) {
+            // Visible-to-this-transaction memtables only: another session's
+            // uncommitted keys used to cause spurious duplicate errors here.
+            for memtable in engine
+                .memtable_manager()
+                .get_visible_to(db, table, reader_txn_id)
+            {
                 let batch = memtable_updates
                     .iter()
                     .find(|(updated, _)| Arc::ptr_eq(updated, &memtable))
@@ -243,14 +306,14 @@ pub fn exec_update(
                     .or_else(|| memtable.read_snapshot_arc());
                 if let Some(batch) = batch {
                     if batch.num_rows() > 0 {
-                        validation_batches.push(batch);
+                        validation_batches.push(Arc::new(project(&batch)));
                     }
                 }
             }
             super::dml_insert::validate_unique_indexes_in_batches(
                 table,
-                &table_schema,
-                &table_meta.unique_indexes,
+                &validation_schema,
+                &indexes_to_validate,
                 &validation_batches,
             )?;
         }
@@ -279,7 +342,16 @@ pub fn exec_update(
                 let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
                 return Err(error);
             }
-            mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg])?;
+            if let Err(error) =
+                mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg])
+            {
+                // The replacement failed: drop the orphaned temp segment
+                // instead of leaking it (startup cleanup only knows the
+                // compaction temp patterns).
+                let _ = std::fs::remove_file(&tmp_path);
+                let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
+                return Err(error);
+            }
         }
 
         let mut tail_persist_failed = false;
@@ -325,26 +397,12 @@ pub fn exec_update(
         // later INSERTs while older memtable rows are still live.
         engine.invalidate_hot_store(db, table);
 
-        Ok(updated_count)
-    };
-
-    let updated_count = match target_partition_key
-        .as_deref()
-        .filter(|key| !key.is_empty())
-    {
-        Some(partition) => {
-            mgr.with_partition_set_mutation_lock(db, table, &[partition], update_body)?
-        }
-        None => mgr.with_table_mutation_lock(db, table, update_body)?,
-    };
-
-    if updated_count > 0 {
-        mgr.with_table_mutation_lock(db, table, || {
-            // UPDATE rewrites rows into new segments, so old index locations
-            // die. Rebuild the location-index snapshots from a fresh scan
-            // under the table-wide lock so concurrent index publishes cannot
-            // be lost; a failure falls back to wholesale invalidation, whose
-            // lazy rebuild on the next probe preserves correctness.
+        if updated_count > 0 {
+            // Rebuild location indexes while STILL holding the mutation lock.
+            // Doing this after releasing the lock (as before) left a window
+            // where a concurrent INSERT probed a stale index snapshot and
+            // committed a key this UPDATE had just introduced, permanently
+            // baking a duplicate into the rebuilt index.
             if let Err(error) = super::dml_insert::rebuild_table_location_indexes(
                 engine,
                 db,
@@ -370,25 +428,64 @@ pub fn exec_update(
                     .index_manager()
                     .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
             }
-            Ok(())
-        })?;
-    }
+        }
+
+        Ok(updated_count)
+    };
+
+    let updated_count = match target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        Some(partition) => {
+            mgr.with_partition_set_mutation_lock(db, table, &[partition], update_body)?
+        }
+        None => mgr.with_table_mutation_lock(db, table, update_body)?,
+    };
 
     if updated_count == 0 {
         return Ok(ExecResult::Ok { rows_affected: 0 });
     }
 
-    let mut catalogs = engine.catalogs().write().unwrap();
-    if let Some(catalog) = catalogs.get_mut(db) {
-        if let Some(_meta) = catalog.get_table_mut(table) {
-            let meta_dir = engine.data_dir().join("meta");
-            catalog.save(&meta_dir)?;
-        }
-    }
-
     Ok(ExecResult::Ok {
         rows_affected: updated_count,
     })
+}
+
+/// Unique indexes whose key can change under this UPDATE: an index needs
+/// revalidation only when at least one of its columns is assigned a new
+/// value. The primary key is included as a pseudo index — it is deliberately
+/// absent from `unique_indexes`, and UPDATE previously skipped it entirely.
+fn indexes_touched_by_assignments(
+    unique_indexes: &[crate::storage::catalog::schema::UniqueIndexMeta],
+    table_schema: &Schema,
+    assigned_columns: std::collections::HashSet<usize>,
+) -> Vec<crate::storage::catalog::schema::UniqueIndexMeta> {
+    let mut indexes: Vec<crate::storage::catalog::schema::UniqueIndexMeta> = unique_indexes
+        .iter()
+        .filter(|index| {
+            index.columns.iter().any(|column| {
+                table_schema
+                    .index_of(column)
+                    .is_some_and(|idx| assigned_columns.contains(&idx))
+            })
+        })
+        .cloned()
+        .collect();
+    let pk_columns: Vec<String> = table_schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(idx, column)| column.primary_key && assigned_columns.contains(idx))
+        .map(|(_, column)| column.name.clone())
+        .collect();
+    if !pk_columns.is_empty() {
+        indexes.push(crate::storage::catalog::schema::UniqueIndexMeta {
+            name: "PRIMARY".to_string(),
+            columns: pk_columns,
+        });
+    }
+    indexes
 }
 
 fn update_memtable_batch(

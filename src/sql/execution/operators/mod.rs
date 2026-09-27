@@ -156,6 +156,7 @@ pub fn build_pipeline_with_subqueries(
                 input,
                 input_schema,
                 subqueries: subqueries.cloned(),
+                remapped: None,
             }))
         }
         LogicalPlan::Sort(sort) => {

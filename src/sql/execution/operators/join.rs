@@ -374,7 +374,7 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
-            let right_row = match self.get_next_right_row() {
+            let right_row = match self.get_next_right_row()? {
                 Some(row) => row,
                 None => return Ok(None),
             };
@@ -407,7 +407,7 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
-            let left_row = match self.get_next_left_row() {
+            let left_row = match self.get_next_left_row()? {
                 Some(row) => row,
                 None => return Ok(None),
             };
@@ -440,7 +440,7 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
-            let right_row = match self.get_next_right_row() {
+            let right_row = match self.get_next_right_row()? {
                 Some(row) => row,
                 None => {
                     if self.probe_state.finalize_done {
@@ -493,7 +493,7 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
-            let left_row = match self.get_next_left_row() {
+            let left_row = match self.get_next_left_row()? {
                 Some(row) => row,
                 None => {
                     if self.probe_state.finalize_done {
@@ -546,7 +546,7 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
-            let left_row = match self.get_next_left_row() {
+            let left_row = match self.get_next_left_row()? {
                 Some(row) => row,
                 None => {
                     if self.probe_state.finalize_done {
@@ -618,7 +618,7 @@ impl HashJoinExec {
                     left_rows.push(vals);
                 }
             }
-            while let Ok(Some(batch)) = self.right.next_batch() {
+            while let Some(batch) = self.right.next_batch()? {
                 self.probe_state.right_batches.push(batch);
             }
             self.probe_state.right_collected = true;
@@ -648,7 +648,7 @@ impl HashJoinExec {
             if self.probe_state.buffer_pos < self.probe_state.output_buffer.len() {
                 return self.drain_buffer();
             }
-            let right_row = match self.get_next_right_row() {
+            let right_row = match self.get_next_right_row()? {
                 Some(row) => row,
                 None => return Ok(None),
             };
@@ -662,8 +662,14 @@ impl HashJoinExec {
                 ht.probe(&key)
             };
             for ptr in &matches {
+                // Semi join emits each left row at most once, even when it
+                // matches several right rows.
+                if self.hash_table.as_ref().unwrap().is_marked(ptr) {
+                    continue;
+                }
                 let left_row = self.collect_left_row(ptr);
                 if self.join_rows_match(&left_row, &right_row)? {
+                    self.hash_table.as_mut().unwrap().mark_matched(ptr);
                     self.probe_state.output_buffer.push((left_row, None));
                 }
             }
@@ -677,7 +683,7 @@ impl HashJoinExec {
     /// Anti join: emit left rows that have NO match in right.
     fn probe_anti(&mut self) -> Result<Option<RecordBatch>> {
         if !self.probe_state.right_collected {
-            while let Ok(Some(batch)) = self.right.next_batch() {
+            while let Some(batch) = self.right.next_batch()? {
                 for row in 0..batch.num_rows() {
                     let right_row: Vec<ScalarValue> = (0..batch.num_columns())
                         .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
@@ -727,7 +733,7 @@ impl HashJoinExec {
             if self.probe_state.output_buffer.len() >= Self::BATCH_SIZE {
                 return self.drain_buffer();
             }
-            let left_row = match self.get_next_left_row() {
+            let left_row = match self.get_next_left_row()? {
                 Some(row) => row,
                 None => {
                     if self.probe_state.output_buffer.is_empty() {
@@ -945,6 +951,10 @@ impl HashJoinExec {
                         | Some(DataType::Float64)
                         | Some(DataType::Blob)
                         | Some(DataType::Vector)
+                        // Decimal keys hash in the raw i64 domain, which is
+                        // scale-blind: mixed-scale equality must not skip
+                        // the residual comparison.
+                        | Some(DataType::Decimal)
                 )
             })
         };
@@ -954,9 +964,9 @@ impl HashJoinExec {
 
     /// Advance to the next probe batch on the right input; returns its index
     /// in `right_batches`, or `None` when the probe side is exhausted.
-    fn next_right_probe_batch(&mut self) -> Option<usize> {
+    fn next_right_probe_batch(&mut self) -> Result<Option<usize>> {
         if !self.probe_state.right_collected {
-            while let Ok(Some(batch)) = self.right.next_batch() {
+            while let Some(batch) = self.right.next_batch()? {
                 if batch.num_rows() > 0 {
                     self.probe_state.right_batches.push(batch);
                 }
@@ -966,18 +976,18 @@ impl HashJoinExec {
         let idx = self.probe_state.right_batch_idx;
         if idx < self.probe_state.right_batches.len() {
             self.probe_state.right_batch_idx += 1;
-            return Some(idx);
+            return Ok(Some(idx));
         }
-        None
+        Ok(None)
     }
 
     /// Advance to the next probe batch on the left input (lazily collected).
-    fn next_left_probe_batch(&mut self) -> Option<usize> {
+    fn next_left_probe_batch(&mut self) -> Result<Option<usize>> {
         loop {
             let idx = self.probe_state.left_batch_idx;
             if idx < self.probe_state.left_batches.len() {
                 self.probe_state.left_batch_idx += 1;
-                return Some(idx);
+                return Ok(Some(idx));
             }
             match self.left.next_batch() {
                 Ok(Some(batch)) => {
@@ -985,7 +995,8 @@ impl HashJoinExec {
                         self.probe_state.left_batches.push(batch);
                     }
                 }
-                _ => return None,
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1033,9 +1044,9 @@ impl HashJoinExec {
     /// probe side is exhausted.
     fn scan_next_fast_batch(&mut self, probe_left: bool) -> Result<bool> {
         let batch_idx = if probe_left {
-            self.next_left_probe_batch()
+            self.next_left_probe_batch()?
         } else {
-            self.next_right_probe_batch()
+            self.next_right_probe_batch()?
         };
         let Some(batch_idx) = batch_idx else {
             return Ok(false);
@@ -1166,9 +1177,11 @@ impl HashJoinExec {
 
     // --- Helper methods ---
 
-    fn get_next_right_row(&mut self) -> Option<Vec<ScalarValue>> {
+    fn get_next_right_row(&mut self) -> Result<Option<Vec<ScalarValue>>> {
         if !self.probe_state.right_collected {
-            while let Ok(Some(batch)) = self.right.next_batch() {
+            // Errors propagate: a probe side failing mid-scan used to look
+            // like end-of-input, silently truncating the join result.
+            while let Some(batch) = self.right.next_batch()? {
                 if batch.num_rows() > 0 {
                     self.probe_state.right_batches.push(batch);
                 }
@@ -1190,13 +1203,13 @@ impl HashJoinExec {
                     self.probe_state.right_batch_idx += 1;
                     self.probe_state.right_row_idx = 0;
                 }
-                return Some(row);
+                return Ok(Some(row));
             }
         }
-        None
+        Ok(None)
     }
 
-    fn get_next_left_row(&mut self) -> Option<Vec<ScalarValue>> {
+    fn get_next_left_row(&mut self) -> Result<Option<Vec<ScalarValue>>> {
         loop {
             if self.probe_state.left_batch_idx < self.probe_state.left_batches.len() {
                 let batch = &self.probe_state.left_batches[self.probe_state.left_batch_idx];
@@ -1213,7 +1226,7 @@ impl HashJoinExec {
                         self.probe_state.left_batch_idx += 1;
                         self.probe_state.left_row_idx = 0;
                     }
-                    return Some(row);
+                    return Ok(Some(row));
                 }
             }
             match self.left.next_batch() {
@@ -1225,7 +1238,10 @@ impl HashJoinExec {
                     self.probe_state.left_batch_idx = self.probe_state.left_batches.len() - 1;
                     self.probe_state.left_row_idx = 0;
                 }
-                _ => return None,
+                Ok(None) => return Ok(None),
+                // Propagate IO/cancellation instead of treating them as
+                // end-of-input, which truncated the join result silently.
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1493,7 +1509,7 @@ fn eval_join_expr(
                 .iter()
                 .map(|arg| eval_join_expr(arg, left_row, right_row, left_ncols))
                 .collect::<Result<Vec<_>>>()?;
-            FunctionRegistry::default().execute(name, &arg_values)
+            SHARED_JOIN_REGISTRY.with(|registry| registry.execute(name, &arg_values))
         }
         _ => Ok(ScalarValue::Int64(None)),
     }
@@ -1524,6 +1540,13 @@ fn eval_join_binary_scalar(left: &ScalarValue, op: &BinOp, right: &ScalarValue) 
         BinOp::Gte => ScalarValue::Bool(Some(cmp != Some(std::cmp::Ordering::Less))),
         _ => ScalarValue::Bool(None),
     }
+}
+
+thread_local! {
+    /// Shared per-thread function registry for residual-condition
+    /// evaluation: rebuilding ~80 registry entries per candidate row pair
+    /// showed up as pure overhead (the filter operator caches the same way).
+    static SHARED_JOIN_REGISTRY: FunctionRegistry = FunctionRegistry::default();
 }
 
 #[cfg(test)]

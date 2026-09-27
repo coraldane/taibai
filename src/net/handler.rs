@@ -491,6 +491,25 @@ impl Handler {
             return Ok(vec![build_error("not logged in")]);
         };
 
+        // Entering bulk mode globally defers unique-index compaction and
+        // catalog flushes: require an INSERT grant on the current database so
+        // read-only accounts cannot degrade the server for everyone else.
+        // Per-table writes are permission-checked again in the bulk handler.
+        if !self.engine.auth_manager().check_permission(
+            &session.username,
+            PermissionType::Insert,
+            PermissionObjectType::Database,
+            &session.database,
+        ) {
+            return Ok(vec![build_error(&format!(
+                "access denied for user '{}' to {:?} on {:?} '{}'",
+                session.username,
+                PermissionType::Insert,
+                PermissionObjectType::Database,
+                session.database
+            ))]);
+        }
+
         let active_sessions = if session.bulk_import_mode {
             self.engine.bulk_mode_session_count()
         } else {
@@ -546,13 +565,14 @@ impl Handler {
             session.had_writes = true;
         }
 
-        match self.engine.exec_bulk_insert_payload_with_options(
+        match self.engine.exec_bulk_insert_payload_as(
             &db,
             payload,
             self.session
                 .as_ref()
                 .map(|s| s.bulk_import_mode)
                 .unwrap_or(false),
+            self.session.as_ref().map(|s| s.username.as_str()),
         ) {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
             Err(e) => {

@@ -22,7 +22,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use crate::common::error::Result;
+use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
 use crate::sql::execution::operators::aggregate::aggregate_result_column_def;
 use crate::sql::execution::scan::memtable as scan_memtable;
@@ -474,7 +474,7 @@ pub fn compute_simple_aggregate(
                             .as_ref()
                             .expect("run outcome implies a run fold plan");
                         let col_type = table_schema.columns[plan.fold_column].data_type;
-                        fold_run_fold(&mut accumulators, col_type, &out);
+                        fold_run_fold(&mut accumulators, col_type, &out)?;
                     }
                     RgOutcome::Batch(batch) => {
                         fold_batch(&mut accumulators, &fold.positions, &batch)?;
@@ -517,7 +517,7 @@ pub fn compute_simple_aggregate(
     }
 
     let memtable_batches =
-        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, spec);
+        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, spec)?;
     for batch in &memtable_batches {
         for (accumulator, column) in accumulators.iter_mut().zip(&aggregate_columns) {
             let batch_column = column.and_then(|index| {
@@ -706,7 +706,11 @@ fn run_fold_type_ok(dt: DataType) -> bool {
 /// Fold one row group's run-level result into the accumulators. The shape
 /// checks in [`plan_run_fold`] guarantee every accumulator reads the fold
 /// column (or is COUNT(*)).
-fn fold_run_fold(accumulators: &mut [AggAccum], col_type: DataType, out: &RunFold) {
+fn fold_run_fold(
+    accumulators: &mut [AggAccum],
+    col_type: DataType,
+    out: &RunFold,
+) -> Result<()> {
     for accumulator in accumulators.iter_mut() {
         match accumulator.func {
             AggFunc::Count => accumulator.count += out.matched_rows,
@@ -722,8 +726,13 @@ fn fold_run_fold(accumulators: &mut [AggAccum], col_type: DataType, out: &RunFol
             }
             AggFunc::Sum => {
                 if out.any {
-                    accumulator.sum_i =
-                        Some(accumulator.sum_i.unwrap_or(0).wrapping_add(out.sum_i));
+                    accumulator.sum_i = Some(
+                        accumulator
+                            .sum_i
+                            .unwrap_or(0)
+                            .checked_add(out.sum_i)
+                            .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                    );
                 }
             }
             AggFunc::Avg => {
@@ -735,6 +744,7 @@ fn fold_run_fold(accumulators: &mut [AggAccum], col_type: DataType, out: &RunFol
             }
         }
     }
+    Ok(())
 }
 
 /// Reinterpret a raw run value as the column's scalar type. The i64 view is
@@ -776,6 +786,9 @@ struct AggAccum {
     avg_sum_f: Option<f64>,
     avg_count: u64,
     avg_unsupported: bool,
+    /// DECIMAL scale of the argument column: sums accumulate in the raw
+    /// scaled i64 domain, and finalize divides it back out.
+    col_scale: i32,
 }
 
 impl AggAccum {
@@ -784,6 +797,10 @@ impl AggAccum {
             .and_then(|index| schema.columns.get(index))
             .map(|column| column.data_type)
             .unwrap_or(DataType::Int64);
+        let col_scale = column
+            .and_then(|index| schema.columns.get(index))
+            .map(|column| column.scale)
+            .unwrap_or(0);
         let (sum_i, sum_f, sum_unsupported) = if func == AggFunc::Sum {
             match col_type {
                 DataType::Float32 | DataType::Float64 => (None, None, false),
@@ -819,6 +836,7 @@ impl AggAccum {
             avg_sum_f: None,
             avg_count: 0,
             avg_unsupported,
+            col_scale,
         }
     }
 
@@ -853,7 +871,12 @@ impl AggAccum {
             }
             AggFunc::Sum if has_values => {
                 if let Some(&sum) = col_sums.get(column) {
-                    self.sum_i = Some(self.sum_i.unwrap_or(0).wrapping_add(sum));
+                    self.sum_i = Some(
+                    self.sum_i
+                        .unwrap_or(0)
+                        .checked_add(sum)
+                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                );
                 }
             }
             AggFunc::Avg if has_values => {
@@ -975,8 +998,16 @@ impl AggAccum {
             },
             AggFunc::Avg => {
                 if self.avg_count > 0 {
+                    // Decimal sums accumulate raw scaled i64; divide the
+                    // scale back out (AVG used to come out 10^scale too
+                    // large for DECIMAL columns).
+                    let scale_divisor = if self.col_type == DataType::Decimal {
+                        10f64.powi(self.col_scale)
+                    } else {
+                        1.0
+                    };
                     ScalarValue::Float64(Some(
-                        self.avg_sum_f.unwrap_or(0.0) / self.avg_count as f64,
+                        self.avg_sum_f.unwrap_or(0.0) / self.avg_count as f64 / scale_divisor,
                     ))
                 } else {
                     ScalarValue::Float64(None)
@@ -1059,6 +1090,12 @@ fn segment_sum_cache_store(
     values: &[SumCacheValue],
 ) {
     let mut cache = segment_sum_cache().lock().unwrap();
+    // Bound the cache: keys embed (path, row_count, deleted) tuples, so
+    // appends and compactions keep producing fresh keys and the map would
+    // otherwise grow for the process lifetime.
+    if cache.len() >= 4096 {
+        cache.clear();
+    }
     for ((name, is_float), value) in columns.iter().zip(values.iter()) {
         cache.insert(
             (
@@ -1233,7 +1270,7 @@ pub fn compute_distinct_column(
     }
 
     let memtable_batches =
-        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, spec);
+        scan_memtable::scan_memtables(memtable_mgr, hot_mgr, db, &spec.table_name, spec)?;
     for batch in &memtable_batches {
         let Some(idx) = batch.schema.index_of(column_name) else {
             return Ok(None);

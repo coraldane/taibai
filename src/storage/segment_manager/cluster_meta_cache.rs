@@ -20,6 +20,12 @@ impl ClusterMetaCache {
     }
 
     pub(super) fn put(&mut self, path: PathBuf, col_idx: usize, zone_map: Option<ZoneMap>) {
+        // Bounded: entries are only removed when a segment is deleted, so
+        // long-lived tables with heavy compaction churn would grow this
+        // map without limit.
+        if self.entries.len() >= 16384 {
+            self.entries.clear();
+        }
         self.entries.insert((path, col_idx), zone_map);
     }
 

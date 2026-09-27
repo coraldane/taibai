@@ -38,7 +38,8 @@ pub struct ScanSpec {
     /// above the bound (`TableMeta::hot_mirror_covers_from`).
     pub hot_mirror_bound: Option<(usize, ScalarValue)>,
 
-    /// Simple metadata-only aggregate fast path (COUNT/MIN/MAX, no GROUP BY).
+    /// Simple metadata-only aggregate fast path (COUNT/MIN/MAX/SUM/AVG, no
+    /// GROUP BY).
     /// When set, the scan executor answers the query from row-group zone maps
     /// / footers instead of streaming the data.
     pub simple_metadata_aggregates: Option<Vec<AggregateExpr>>,

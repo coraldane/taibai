@@ -349,9 +349,43 @@ impl Engine {
         payload: &[u8],
         bulk_import_mode: bool,
     ) -> Result<u64> {
+        // Internal/test entry point: no authenticated user, so no per-table
+        // permission check. The network path must use
+        // `exec_bulk_insert_payload_as`.
+        self.exec_bulk_insert_payload_as(db, payload, bulk_import_mode, None)
+    }
+
+    pub fn exec_bulk_insert_payload_as(
+        &self,
+        db: &str,
+        payload: &[u8],
+        bulk_import_mode: bool,
+        username: Option<&str>,
+    ) -> Result<u64> {
         let _op_guard = self.begin_operation();
         let total_start = std::time::Instant::now();
         let table_name = bulk_payload_table_name(payload)?.to_string();
+        if let Some(username) = username {
+            // The columnar bulk message bypasses the SQL layer entirely, so
+            // it used to bypass the INSERT permission check that every SQL
+            // insert path performs.
+            use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
+            if !self.auth_manager.check_permission(
+                username,
+                PermissionType::Insert,
+                PermissionObjectType::Table,
+                &format!("{}.{}", db, table_name),
+            ) {
+                return Err(TaibaiError::Sql(format!(
+                    "access denied for user '{}' to {:?} on {:?} '{}.{}'",
+                    username,
+                    PermissionType::Insert,
+                    PermissionObjectType::Table,
+                    db,
+                    table_name
+                )));
+            }
+        }
         let catalog = {
             let catalogs = self.catalogs.read().unwrap();
             catalogs

@@ -5,130 +5,150 @@ use crate::types::scalar::ScalarValue;
 
 use crate::sql::parser::ast::{BinOp, Expr};
 
+/// (column, literal) operand pair in either order, normalized so the column
+/// comes first.
+fn col_lit_pair<'a>(left: &'a Expr, right: &'a Expr) -> Option<(&'a str, &'a ScalarValue)> {
+    match (left, right) {
+        (Expr::Column(col_name), Expr::Literal(val)) => Some((col_name.as_str(), val)),
+        _ => None,
+    }
+}
+
+/// Resolve a `(column, literal)` pair against the batch and run `kernel` on
+/// the column. Returns `None` when the shape does not match or the column is
+/// absent from this batch.
+fn eval_col_lit_mask(
+    pair: Option<(&str, &ScalarValue)>,
+    batch: &RecordBatch,
+    schema: &Schema,
+    kernel: fn(&crate::types::array::ColumnArray, &ScalarValue) -> Vec<bool>,
+) -> Option<Result<Vec<bool>>> {
+    let (col_name, val) = pair?;
+    let col_idx = schema.index_of(col_name)?;
+    let col = batch.column(col_idx)?;
+    let val = match coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(Ok(kernel(col, &val)))
+}
+
+/// Negated comparison kernel: `NOT (col <op> lit)` keeps only rows where the
+/// comparison is definitely false, which the direct kernels already express
+/// (NULL rows return false, i.e. SQL UNKNOWN is excluded).
+fn negated_kernel(op: BinOp) -> Option<fn(&crate::types::array::ColumnArray, &ScalarValue) -> Vec<bool>> {
+    match op {
+        BinOp::Eq => Some(crate::types::array::ColumnArray::neq_vec),
+        BinOp::Neq => Some(crate::types::array::ColumnArray::eq_vec),
+        BinOp::Lt => Some(crate::types::array::ColumnArray::ge_vec),
+        BinOp::Lte => Some(crate::types::array::ColumnArray::gt_vec),
+        BinOp::Gt => Some(crate::types::array::ColumnArray::le_vec),
+        BinOp::Gte => Some(crate::types::array::ColumnArray::lt_vec),
+        _ => None,
+    }
+}
+
 pub fn eval_where_clause_batch(
     expr: &Expr,
     batch: &RecordBatch,
     schema: &Schema,
 ) -> Result<Vec<bool>> {
     let num_rows = batch.num_rows();
+    let row_wise = || -> Result<Vec<bool>> {
+        (0..num_rows)
+            .map(|i| eval_where_clause(expr, batch, i, schema))
+            .collect()
+    };
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinOp::Eq => {
-                if let (Expr::Column(col_name), Expr::Literal(val)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    if let Some(col_idx) = schema.index_of(col_name) {
-                        if let Some(col) = batch.column(col_idx) {
-                            let val =
-                                coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type)?;
-                            return Ok(col.eq_vec(&val));
-                        }
-                    }
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(left, right).or_else(|| col_lit_pair(right, left)),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::eq_vec,
+                ) {
+                    return mask;
                 }
-                if let (Expr::Literal(val), Expr::Column(col_name)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    if let Some(col_idx) = schema.index_of(col_name) {
-                        if let Some(col) = batch.column(col_idx) {
-                            let val =
-                                coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type)?;
-                            return Ok(col.eq_vec(&val));
-                        }
-                    }
+                row_wise()
+            }
+            BinOp::Neq => {
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(left, right).or_else(|| col_lit_pair(right, left)),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::neq_vec,
+                ) {
+                    return mask;
                 }
-                (0..num_rows)
-                    .map(|i| eval_where_clause(expr, batch, i, schema))
-                    .collect()
+                row_wise()
             }
             BinOp::Lt => {
-                if let (Expr::Column(col_name), Expr::Literal(val)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    if let Some(col_idx) = schema.index_of(col_name) {
-                        if let Some(col) = batch.column(col_idx) {
-                            let val =
-                                coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type)?;
-                            return Ok(col.lt_vec(&val));
-                        }
-                    }
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(left, right),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::lt_vec,
+                ) {
+                    return mask;
                 }
-                if let (Expr::Literal(val), Expr::Column(col_name)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    if let Some(col_idx) = schema.index_of(col_name) {
-                        if let Some(col) = batch.column(col_idx) {
-                            let val =
-                                coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type)?;
-                            return Ok(col.gt_vec(&val));
-                        }
-                    }
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(right, left),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::gt_vec,
+                ) {
+                    return mask;
                 }
-                (0..num_rows)
-                    .map(|i| eval_where_clause(expr, batch, i, schema))
-                    .collect()
+                row_wise()
             }
             BinOp::Gt => {
-                if let (Expr::Column(col_name), Expr::Literal(val)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    if let Some(col_idx) = schema.index_of(col_name) {
-                        if let Some(col) = batch.column(col_idx) {
-                            let val =
-                                coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type)?;
-                            return Ok(col.gt_vec(&val));
-                        }
-                    }
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(left, right),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::gt_vec,
+                ) {
+                    return mask;
                 }
-                if let (Expr::Literal(val), Expr::Column(col_name)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    if let Some(col_idx) = schema.index_of(col_name) {
-                        if let Some(col) = batch.column(col_idx) {
-                            let val =
-                                coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type)?;
-                            return Ok(col.lt_vec(&val));
-                        }
-                    }
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(right, left),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::lt_vec,
+                ) {
+                    return mask;
                 }
-                (0..num_rows)
-                    .map(|i| eval_where_clause(expr, batch, i, schema))
-                    .collect()
+                row_wise()
             }
             BinOp::Lte => {
-                if let (Expr::Column(col_name), Expr::Literal(val)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    if let Some(col_idx) = schema.index_of(col_name) {
-                        if let Some(col) = batch.column(col_idx) {
-                            let val =
-                                coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type)?;
-                            return Ok(col.le_vec(&val));
-                        }
-                    }
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(left, right).or_else(|| col_lit_pair(right, left)),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::le_vec,
+                ) {
+                    return mask;
                 }
-                (0..num_rows)
-                    .map(|i| eval_where_clause(expr, batch, i, schema))
-                    .collect()
+                row_wise()
             }
             BinOp::Gte => {
-                if let (Expr::Column(col_name), Expr::Literal(val)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    if let Some(col_idx) = schema.index_of(col_name) {
-                        if let Some(col) = batch.column(col_idx) {
-                            let val =
-                                coerce_scalar_for_dtype(val, schema.columns[col_idx].data_type)?;
-                            return Ok(col.ge_vec(&val));
-                        }
-                    }
+                if let Some(mask) = eval_col_lit_mask(
+                    col_lit_pair(left, right).or_else(|| col_lit_pair(right, left)),
+                    batch,
+                    schema,
+                    crate::types::array::ColumnArray::ge_vec,
+                ) {
+                    return mask;
                 }
-                (0..num_rows)
-                    .map(|i| eval_where_clause(expr, batch, i, schema))
-                    .collect()
+                row_wise()
             }
             BinOp::And => {
                 let left_mask = eval_where_clause_batch(left, batch, schema)?;
                 let right_mask = eval_where_clause_batch(right, batch, schema)?;
+                // Two-valued AND over TRUE-only masks is exact for filtering:
+                // AND(false, UNKNOWN) = false and AND(true, UNKNOWN) = UNKNOWN
+                // both exclude the row.
                 Ok(left_mask
                     .iter()
                     .zip(right_mask.iter())
@@ -144,7 +164,7 @@ pub fn eval_where_clause_batch(
                     .map(|(l, r)| *l || *r)
                     .collect())
             }
-            _ => Ok(vec![true; num_rows]),
+            _ => row_wise(),
         },
         Expr::IsNull(inner) => {
             if let Expr::Column(col_name) = inner.as_ref() {
@@ -154,9 +174,7 @@ pub fn eval_where_clause_batch(
                     }
                 }
             }
-            (0..num_rows)
-                .map(|i| eval_where_clause(expr, batch, i, schema))
-                .collect()
+            row_wise()
         }
         Expr::IsNotNull(inner) => {
             if let Expr::Column(col_name) = inner.as_ref() {
@@ -166,37 +184,309 @@ pub fn eval_where_clause_batch(
                     }
                 }
             }
-            (0..num_rows)
-                .map(|i| eval_where_clause(expr, batch, i, schema))
-                .collect()
+            row_wise()
         }
         Expr::UnaryNot(inner) => {
-            let inner_mask = eval_where_clause_batch(inner, batch, schema)?;
-            Ok(inner_mask.iter().map(|b| !*b).collect())
+            // Fast path: NOT over a simple column comparison maps to the
+            // negated kernel, which keeps SQL UNKNOWN (NULL rows) excluded.
+            if let Expr::BinaryOp {
+                left,
+                op: inner_op,
+                right,
+            } = inner.as_ref()
+            {
+                if let Some(kernel) = negated_kernel(*inner_op) {
+                    if let Some(mask) = eval_col_lit_mask(
+                        col_lit_pair(left, right).or_else(|| col_lit_pair(right, left)),
+                        batch,
+                        schema,
+                        kernel,
+                    ) {
+                        return mask;
+                    }
+                }
+            }
+            // Everything else needs three-valued logic (NOT flips UNKNOWN,
+            // which a boolean mask cannot represent).
+            row_wise()
         }
         Expr::In {
             expr,
             values,
             negated,
         } => {
+            // Three-valued IN: a NULL operand makes the row UNKNOWN (excluded
+            // for both IN and NOT IN); NOT IN over a list containing NULL
+            // matches nothing.
+            let const_candidates: Vec<Option<&ScalarValue>> = values
+                .iter()
+                .map(|c| match c {
+                    Expr::Literal(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
             let mut mask = Vec::with_capacity(num_rows);
             for row_idx in 0..num_rows {
                 let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
-                let found = values.iter().any(|candidate| {
-                    eval_expr_for_row(candidate, batch, row_idx, schema)
-                        .map(|candidate| scalar_values_equal(&value, &candidate))
-                        .unwrap_or(false)
-                });
-                mask.push(if *negated { !found } else { found });
+                if value.is_null() {
+                    mask.push(false);
+                    continue;
+                }
+                let mut found = false;
+                let mut saw_null = false;
+                for (idx, candidate) in values.iter().enumerate() {
+                    let candidate = match const_candidates[idx] {
+                        Some(v) => v.clone(),
+                        None => eval_expr_for_row(candidate, batch, row_idx, schema)?,
+                    };
+                    if candidate.is_null() {
+                        saw_null = true;
+                        continue;
+                    }
+                    if scalar_values_equal(&value, &candidate) {
+                        found = true;
+                        break;
+                    }
+                }
+                let keep = if *negated { !found && !saw_null } else { found };
+                mask.push(keep);
             }
             Ok(mask)
         }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            if !*negated {
+                if let (Expr::Column(col_name), Expr::Literal(low_val), Expr::Literal(high_val)) =
+                    (expr.as_ref(), low.as_ref(), high.as_ref())
+                {
+                    if let Some(col_idx) = schema.index_of(col_name) {
+                        if let Some(col) = batch.column(col_idx) {
+                            let dt = schema.columns[col_idx].data_type;
+                            let low = coerce_scalar_for_dtype(low_val, dt)?;
+                            let high = coerce_scalar_for_dtype(high_val, dt)?;
+                            let ge = col.ge_vec(&low);
+                            let le = col.le_vec(&high);
+                            return Ok(ge
+                                .iter()
+                                .zip(le.iter())
+                                .map(|(a, b)| *a && *b)
+                                .collect());
+                        }
+                    }
+                }
+            }
+            row_wise()
+        }
         Expr::Literal(v) => Ok(vec![!v.is_null(); num_rows]),
-        Expr::Column(_) => Ok(vec![true; num_rows]),
-        Expr::Like { .. } => (0..num_rows)
-            .map(|i| eval_where_clause(expr, batch, i, schema))
-            .collect(),
-        _ => Ok(vec![true; num_rows]),
+        Expr::Like { .. } => row_wise(),
+        _ => row_wise(),
+    }
+}
+
+/// Three-valued (SQL NULL-aware) predicate evaluation used by DML paths.
+/// `None` models SQL UNKNOWN; row filters keep only rows whose predicate is
+/// definitely TRUE.
+pub fn eval_where_clause3(
+    expr: &Expr,
+    batch: &RecordBatch,
+    row_idx: usize,
+    schema: &Schema,
+) -> Result<Option<bool>> {
+    use std::cmp::Ordering;
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinOp::And => {
+                let l = eval_where_clause3(left, batch, row_idx, schema)?;
+                if l == Some(false) {
+                    return Ok(Some(false));
+                }
+                let r = eval_where_clause3(right, batch, row_idx, schema)?;
+                if r == Some(false) {
+                    return Ok(Some(false));
+                }
+                Ok(if l.is_none() || r.is_none() { None } else { Some(true) })
+            }
+            BinOp::Or => {
+                let l = eval_where_clause3(left, batch, row_idx, schema)?;
+                if l == Some(true) {
+                    return Ok(Some(true));
+                }
+                let r = eval_where_clause3(right, batch, row_idx, schema)?;
+                if r == Some(true) {
+                    return Ok(Some(true));
+                }
+                Ok(if l.is_none() || r.is_none() { None } else { Some(false) })
+            }
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => {
+                let left_val = eval_expr_for_row(left, batch, row_idx, schema)?;
+                let right_val = eval_expr_for_row(right, batch, row_idx, schema)?;
+                if left_val.is_null() || right_val.is_null() {
+                    return Ok(None);
+                }
+                match op {
+                    BinOp::Eq => Ok(Some(scalar_values_equal(&left_val, &right_val))),
+                    BinOp::Neq => Ok(Some(!scalar_values_equal(&left_val, &right_val))),
+                    BinOp::Lt => {
+                        Ok(Some(compare_scalars(&left_val, &right_val) == Some(Ordering::Less)))
+                    }
+                    BinOp::Gt => Ok(Some(
+                        compare_scalars(&left_val, &right_val) == Some(Ordering::Greater),
+                    )),
+                    BinOp::Lte => Ok(Some(
+                        compare_scalars(&left_val, &right_val) != Some(Ordering::Greater),
+                    )),
+                    BinOp::Gte => Ok(Some(
+                        compare_scalars(&left_val, &right_val) != Some(Ordering::Less),
+                    )),
+                    _ => unreachable!(),
+                }
+            }
+            _ => Err(TaibaiError::Sql(format!(
+                "operator {:?} cannot be used as a boolean predicate",
+                op
+            ))),
+        },
+        Expr::IsNull(inner) => {
+            let val = eval_expr_for_row(inner, batch, row_idx, schema)?;
+            Ok(Some(val.is_null()))
+        }
+        Expr::IsNotNull(inner) => {
+            let val = eval_expr_for_row(inner, batch, row_idx, schema)?;
+            Ok(Some(!val.is_null()))
+        }
+        Expr::UnaryNot(inner) => {
+            Ok(eval_where_clause3(inner, batch, row_idx, schema)?.map(|b| !b))
+        }
+        Expr::In {
+            expr,
+            values,
+            negated,
+        } => {
+            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+            if value.is_null() {
+                return Ok(None);
+            }
+            let mut found = false;
+            let mut saw_null = false;
+            for candidate in values {
+                let candidate = eval_expr_for_row(candidate, batch, row_idx, schema)?;
+                if candidate.is_null() {
+                    saw_null = true;
+                    continue;
+                }
+                if scalar_values_equal(&value, &candidate) {
+                    found = true;
+                    break;
+                }
+            }
+            let inner = if found {
+                Some(true)
+            } else if saw_null {
+                None
+            } else {
+                Some(false)
+            };
+            Ok(if *negated { inner.map(|b| !b) } else { inner })
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+            let low = eval_expr_for_row(low, batch, row_idx, schema)?;
+            let high = eval_expr_for_row(high, batch, row_idx, schema)?;
+            if value.is_null() || low.is_null() || high.is_null() {
+                return Ok(None);
+            }
+            let holds = compare_scalars(&value, &low).is_some_and(|o| o != Ordering::Less)
+                && compare_scalars(&value, &high).is_some_and(|o| o != Ordering::Greater);
+            Ok(Some(if *negated { !holds } else { holds }))
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            for (when, then) in when_clauses {
+                let matched = if let Some(operand) = operand {
+                    let left = eval_expr_for_row(operand, batch, row_idx, schema)?;
+                    if left.is_null() {
+                        continue;
+                    }
+                    let right = eval_expr_for_row(when, batch, row_idx, schema)?;
+                    if right.is_null() {
+                        continue;
+                    }
+                    scalar_values_equal(&left, &right)
+                } else {
+                    eval_where_clause3(when, batch, row_idx, schema)? == Some(true)
+                };
+                if matched {
+                    return truthiness(&eval_expr_for_row(then, batch, row_idx, schema)?);
+                }
+            }
+            match else_clause {
+                Some(else_expr) => {
+                    truthiness(&eval_expr_for_row(else_expr, batch, row_idx, schema)?)
+                }
+                None => Ok(None),
+            }
+        }
+        Expr::Literal(v) => Ok(truthiness(v)?),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
+            let pattern_value = eval_expr_for_row(pattern, batch, row_idx, schema)?;
+            if value.is_null() || pattern_value.is_null() {
+                return Ok(None);
+            }
+            let Some(pattern_text) = pattern_value.to_text() else {
+                return Ok(Some(false));
+            };
+            let matched = scalar_like_matches(&value, &pattern_text);
+            Ok(Some(if *negated { !matched } else { matched }))
+        }
+        Expr::Column(_) | Expr::QualifiedColumn { .. } => Err(TaibaiError::Sql(
+            "column reference cannot be used as a boolean predicate".to_string(),
+        )),
+        Expr::UnaryMinus(_) | Expr::WindowFunction { .. } | Expr::Placeholder(_) => {
+            Err(TaibaiError::Sql(
+                "unsupported predicate expression in DML statement".to_string(),
+            ))
+        }
+        Expr::Exists(_) | Expr::Subquery(_) => Err(TaibaiError::Sql(
+            "subqueries are not supported in this DML statement's WHERE clause"
+                .to_string(),
+        )),
+        Expr::Correlated(_) => Err(TaibaiError::Sql(
+            "correlated subqueries are not supported in this context".to_string(),
+        )),
+        Expr::Function { .. } => {
+            // Function predicates resolve to a scalar value here; comparisons
+            // above evaluate them per row.
+            truthiness(&eval_expr_for_row(expr, batch, row_idx, schema)?)
+        }
+    }
+}
+
+fn truthiness(v: &ScalarValue) -> Result<Option<bool>> {
+    match v {
+        ScalarValue::Bool(Some(b)) => Ok(Some(*b)),
+        value if value.is_null() => Ok(None),
+        ScalarValue::Bool(None) => Ok(None),
+        other => Err(TaibaiError::Sql(format!(
+            "predicate must be boolean, got {:?}",
+            other.data_type()
+        ))),
     }
 }
 
@@ -206,94 +496,7 @@ pub fn eval_where_clause(
     row_idx: usize,
     schema: &Schema,
 ) -> Result<bool> {
-    match expr {
-        Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_expr_for_row(left, batch, row_idx, schema)?;
-            let right_val = eval_expr_for_row(right, batch, row_idx, schema)?;
-            match op {
-                BinOp::Eq => Ok(scalar_values_equal(&left_val, &right_val)),
-                BinOp::Neq => Ok(!scalar_values_equal(&left_val, &right_val)),
-                BinOp::Lt => {
-                    Ok(compare_scalars(&left_val, &right_val) == Some(std::cmp::Ordering::Less))
-                }
-                BinOp::Gt => {
-                    Ok(compare_scalars(&left_val, &right_val) == Some(std::cmp::Ordering::Greater))
-                }
-                BinOp::Lte => {
-                    Ok(compare_scalars(&left_val, &right_val) != Some(std::cmp::Ordering::Greater))
-                }
-                BinOp::Gte => {
-                    Ok(compare_scalars(&left_val, &right_val) != Some(std::cmp::Ordering::Less))
-                }
-                BinOp::And => {
-                    let left_bool = eval_where_clause(left, batch, row_idx, schema)?;
-                    let right_bool = eval_where_clause(right, batch, row_idx, schema)?;
-                    Ok(left_bool && right_bool)
-                }
-                BinOp::Or => {
-                    let left_bool = eval_where_clause(left, batch, row_idx, schema)?;
-                    let right_bool = eval_where_clause(right, batch, row_idx, schema)?;
-                    Ok(left_bool || right_bool)
-                }
-                _ => Ok(true),
-            }
-        }
-        Expr::IsNull(inner) => {
-            let val = eval_expr_for_row(inner, batch, row_idx, schema)?;
-            Ok(val.is_null())
-        }
-        Expr::IsNotNull(inner) => {
-            let val = eval_expr_for_row(inner, batch, row_idx, schema)?;
-            Ok(!val.is_null())
-        }
-        Expr::UnaryNot(inner) => {
-            let inner_bool = eval_where_clause(inner, batch, row_idx, schema)?;
-            Ok(!inner_bool)
-        }
-        Expr::In {
-            expr,
-            values,
-            negated,
-        } => {
-            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
-            let found = values.iter().any(|candidate| {
-                eval_expr_for_row(candidate, batch, row_idx, schema)
-                    .map(|candidate| scalar_values_equal(&value, &candidate))
-                    .unwrap_or(false)
-            });
-            Ok(if *negated { !found } else { found })
-        }
-        Expr::Literal(v) => Ok(!v.is_null()),
-        Expr::Column(_) => Ok(true),
-        Expr::QualifiedColumn { .. } => Ok(true),
-        Expr::Function { .. } => Ok(true),
-        Expr::UnaryMinus(_) => Ok(true),
-        Expr::Between { .. } => Ok(true),
-        Expr::Case { .. } => Ok(true),
-        Expr::Like {
-            expr,
-            pattern,
-            negated,
-        } => {
-            let value = eval_expr_for_row(expr, batch, row_idx, schema)?;
-            let pattern_value = eval_expr_for_row(pattern, batch, row_idx, schema)?;
-            if value.is_null() || pattern_value.is_null() {
-                return Ok(false);
-            }
-            let Some(pattern_text) = pattern_value.to_text() else {
-                return Ok(false);
-            };
-            let matched = scalar_like_matches(&value, &pattern_text);
-            Ok(if *negated { !matched } else { matched })
-        }
-        Expr::Exists(_) => Ok(true),
-        Expr::Correlated(_) => Err(TaibaiError::Sql(
-            "correlated subqueries are not supported in this context".to_string(),
-        )),
-        Expr::Subquery(_) => Ok(true),
-        Expr::WindowFunction { .. } => Ok(true),
-        Expr::Placeholder(_) => Ok(true),
-    }
+    Ok(eval_where_clause3(expr, batch, row_idx, schema)? == Some(true))
 }
 
 pub fn eval_expr_for_row(
@@ -346,11 +549,74 @@ pub fn eval_expr_for_row(
                     schema.columns[col_idx].data_type,
                 )))
         }
-        Expr::Function { .. } => Ok(ScalarValue::Int64(None)),
-        Expr::UnaryMinus(_) => Ok(ScalarValue::Int64(None)),
+        Expr::Function { name, args, .. } => {
+            let arg_values = args
+                .iter()
+                .map(|a| eval_expr_for_row(a, batch, row_idx, schema))
+                .collect::<Result<Vec<_>>>()?;
+            SHARED_REGISTRY.with(|registry| registry.execute(name, &arg_values))
+        }
+        Expr::UnaryMinus(inner) => {
+            let value = eval_expr_for_row(inner, batch, row_idx, schema)?;
+            Ok(match value {
+                ScalarValue::Int64(Some(v)) => ScalarValue::Int64(Some(-v)),
+                ScalarValue::Int32(Some(v)) => ScalarValue::Int32(Some(-v)),
+                ScalarValue::Int16(Some(v)) => ScalarValue::Int16(Some(-v)),
+                ScalarValue::Int8(Some(v)) => ScalarValue::Int8(Some(-v)),
+                ScalarValue::Float64(Some(v)) => ScalarValue::Float64(Some(-v)),
+                ScalarValue::Float32(Some(v)) => ScalarValue::Float32(Some(-v)),
+                ScalarValue::Decimal(Some(v)) => ScalarValue::Decimal(Some(-v)),
+                other => other,
+            })
+        }
         Expr::In { .. } => Ok(ScalarValue::Bool(None)),
-        Expr::Between { .. } => Ok(ScalarValue::Bool(None)),
-        Expr::Case { .. } => Ok(ScalarValue::Int64(None)),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let holds = match eval_where_clause3(
+                &Expr::Between {
+                    expr: expr.clone(),
+                    low: low.clone(),
+                    high: high.clone(),
+                    negated: false,
+                },
+                batch,
+                row_idx,
+                schema,
+            )? {
+                Some(b) => b,
+                None => return Ok(ScalarValue::Bool(None)),
+            };
+            Ok(ScalarValue::Bool(Some(if *negated { !holds } else { holds })))
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            for (when, then) in when_clauses {
+                let matched = if let Some(operand) = operand {
+                    let left = eval_expr_for_row(operand, batch, row_idx, schema)?;
+                    let right = eval_expr_for_row(when, batch, row_idx, schema)?;
+                    if left.is_null() || right.is_null() {
+                        continue;
+                    }
+                    scalar_values_equal(&left, &right)
+                } else {
+                    eval_where_clause3(when, batch, row_idx, schema)? == Some(true)
+                };
+                if matched {
+                    return eval_expr_for_row(then, batch, row_idx, schema);
+                }
+            }
+            match else_clause {
+                Some(else_expr) => eval_expr_for_row(else_expr, batch, row_idx, schema),
+                None => Ok(ScalarValue::null_for_type(DataType::Bool)),
+            }
+        }
         Expr::Like {
             expr,
             pattern,
@@ -375,10 +641,24 @@ pub fn eval_expr_for_row(
         Expr::Correlated(_) => Err(TaibaiError::Sql(
             "correlated subqueries are not supported in this context".to_string(),
         )),
-        Expr::Subquery(_) => Ok(ScalarValue::Int64(None)),
-        Expr::WindowFunction { .. } => Ok(ScalarValue::Int64(None)),
-        Expr::Placeholder(_) => Ok(ScalarValue::Int64(None)),
+        Expr::Subquery(_) => Err(TaibaiError::Sql(
+            "subqueries are not supported in this row-level expression context".to_string(),
+        )),
+        Expr::WindowFunction { .. } => Err(TaibaiError::Sql(
+            "window functions are not supported in this context".to_string(),
+        )),
+        Expr::Placeholder(_) => Err(TaibaiError::Sql(
+            "unresolved placeholder in expression".to_string(),
+        )),
     }
+}
+
+thread_local! {
+    /// Shared per-thread function registry for row-level expression
+    /// evaluation (same rationale as `operators::filter`'s fallback
+    /// registry: rebuilding ~80 entries per call shows up in profiles).
+    static SHARED_REGISTRY: crate::sql::execution::functions::registry::FunctionRegistry =
+        crate::sql::execution::functions::registry::FunctionRegistry::default();
 }
 
 pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> Option<std::cmp::Ordering> {
@@ -806,8 +1086,17 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
             }
             _ => coerce_scalar_for_dtype(v, *dt),
         },
-        Expr::Column(_) => Ok(ScalarValue::null_for_type(*dt)),
-        _ => Ok(ScalarValue::null_for_type(*dt)),
+        // Column references and row-dependent expressions are not constant
+        // per statement. Erroring here is fail-safe: the previous silent
+        // NULL turned `UPDATE t SET a = b` into "set every a to NULL".
+        Expr::Column(col) => Err(TaibaiError::Sql(format!(
+            "column reference '{}' is not allowed here; only constant expressions are supported",
+            col
+        ))),
+        _ => Err(TaibaiError::Sql(
+            "unsupported expression: only constant expressions are allowed in this context"
+                .to_string(),
+        )),
     }
 }
 

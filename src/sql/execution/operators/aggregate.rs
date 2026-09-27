@@ -96,11 +96,14 @@ enum Accumulator {
     Max(Option<ScalarValue>),
     SumI(Option<i64>),
     SumF(Option<f64>),
-    /// Average tracks running sum + non-null count.
+    /// Average tracks running sum + non-null count. `decimal_scale`
+    /// records the argument column's DECIMAL scale: the sum accumulates in
+    /// the raw scaled i64 domain, and finalize divides it back out.
     Avg {
         sum: f64,
         count: u64,
         any: bool,
+        decimal_scale: Option<i32>,
     },
     /// DISTINCT sets need to remember seen values. Only used for
     /// COUNT/SUM/AVG DISTINCT over a single column. Values are stored as the
@@ -123,7 +126,7 @@ enum CountKind {
 }
 
 impl Accumulator {
-    fn new_for(agg: &AggregateExpr, input_col_type: DataType) -> Result<Self> {
+    fn new_for(agg: &AggregateExpr, input_col_type: DataType, input_scale: i32) -> Result<Self> {
         let col_idx = match &*agg.arg {
             LogicalExpr::Column(idx) => Some(*idx),
             _ => None,
@@ -154,6 +157,7 @@ impl Accumulator {
                 sum: 0.0,
                 count: 0,
                 any: false,
+                decimal_scale: (input_col_type == DataType::Decimal).then_some(input_scale),
             },
         })
     }
@@ -216,7 +220,9 @@ impl Accumulator {
                     if let Some(col_arr) = batch.column(c) {
                         if let Some(part) = col_arr.col_sum_i64() {
                             *acc = Some(match acc.take() {
-                                Some(prev) => prev.wrapping_add(part),
+                                Some(prev) => prev.checked_add(part).ok_or_else(|| {
+                                    TaibaiError::Sql("SUM overflow".to_string())
+                                })?,
                                 None => part,
                             });
                         }
@@ -240,7 +246,7 @@ impl Accumulator {
                     }
                 }
             }
-            Accumulator::Avg { sum, count, any } => {
+            Accumulator::Avg { sum, count, any, .. } => {
                 if let Some(c) = col_idx_opt {
                     if let Some(col_arr) = batch.column(c) {
                         let n = col_arr.col_count_non_null();
@@ -313,7 +319,8 @@ impl Accumulator {
                     .and_then(|column| batch.column(column))
                     .and_then(|col| col.numeric_i64_at(row))
                 {
-                    *value = Some(value.unwrap_or(0).wrapping_add(part));
+                    *value = Some(value.unwrap_or(0).checked_add(part)
+                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?);
                 }
             }
             Accumulator::SumF(value) => {
@@ -324,7 +331,7 @@ impl Accumulator {
                     *value = Some(value.unwrap_or(0.0) + part);
                 }
             }
-            Accumulator::Avg { sum, count, any } => {
+            Accumulator::Avg { sum, count, any, .. } => {
                 if let Some(part) = col_idx_opt
                     .and_then(|column| batch.column(column))
                     .and_then(|col| col.numeric_f64_at(row))
@@ -398,9 +405,17 @@ impl Accumulator {
                 _ => ScalarValue::Int64(*v),
             },
             Accumulator::SumF(v) => ScalarValue::Float64(*v),
-            Accumulator::Avg { sum, count, any } => {
+            Accumulator::Avg {
+                sum,
+                count,
+                any,
+                decimal_scale,
+            } => {
                 if *any && *count > 0 {
-                    ScalarValue::Float64(Some(*sum / *count as f64))
+                    // Decimal sums accumulate raw scaled i64; divide the
+                    // scale back out so AVG(price) is not 10^scale too large.
+                    let scale_divisor = decimal_scale.map_or(1.0, |sc| 10f64.powi(sc));
+                    ScalarValue::Float64(Some(*sum / *count as f64 / scale_divisor))
                 } else {
                     ScalarValue::Float64(None)
                 }
@@ -459,7 +474,9 @@ impl Accumulator {
             }
             (Accumulator::SumI(left), Accumulator::SumI(right)) => {
                 if let Some(right) = right {
-                    *left = Some(left.unwrap_or(0).wrapping_add(right));
+                    *left = Some(left.unwrap_or(0).checked_add(right).ok_or_else(|| {
+                        TaibaiError::Sql("SUM overflow".to_string())
+                    })?);
                 }
             }
             (Accumulator::SumF(left), Accumulator::SumF(right)) => {
@@ -468,16 +485,27 @@ impl Accumulator {
                 }
             }
             (
-                Accumulator::Avg { sum, count, any },
+                Accumulator::Avg {
+                    sum,
+                    count,
+                    any,
+                    decimal_scale,
+                },
                 Accumulator::Avg {
                     sum: rhs_sum,
                     count: rhs_count,
                     any: rhs_any,
+                    decimal_scale: rhs_scale,
                 },
             ) => {
                 *sum += rhs_sum;
                 *count = count.saturating_add(rhs_count);
                 *any |= rhs_any;
+                if *decimal_scale != rhs_scale {
+                    return Err(TaibaiError::Internal(
+                        "avg accumulator scale mismatch in spill merge".into(),
+                    ));
+                }
             }
             (
                 Accumulator::Distinct {
@@ -547,16 +575,16 @@ impl ExecutionOp for HashAggregateExec {
             // Pre-create using the logical (input) schema types; col indices are
             // remapped below once the physical schema is known.
             for agg in &self.aggregates {
-                let col_type = match &*agg.arg {
+                let (col_type, col_scale) = match &*agg.arg {
                     LogicalExpr::Column(idx) => self
                         .input_schema
                         .columns
                         .get(*idx)
-                        .map(|c| c.data_type)
-                        .unwrap_or(DataType::Int64),
-                    _ => DataType::Int64,
+                        .map(|c| (c.data_type, c.scale))
+                        .unwrap_or((DataType::Int64, 0)),
+                    _ => (DataType::Int64, 0),
                 };
-                accums.push(Accumulator::new_for(agg, col_type)?);
+                accums.push(Accumulator::new_for(agg, col_type, col_scale)?);
             }
             let spill_rows = crate::common::config::query_limits()
                 .spill_batch_rows
@@ -755,16 +783,16 @@ impl ExecutionOp for HashAggregateExec {
                             .aggregates
                             .iter()
                             .map(|agg| {
-                                let col_type = match &*agg.arg {
+                                let (col_type, col_scale) = match &*agg.arg {
                                     LogicalExpr::Column(idx) => self
                                         .input_schema
                                         .columns
                                         .get(*idx)
-                                        .map(|c| c.data_type)
-                                        .unwrap_or(DataType::Int64),
-                                    _ => DataType::Int64,
+                                        .map(|c| (c.data_type, c.scale))
+                                        .unwrap_or((DataType::Int64, 0)),
+                                    _ => (DataType::Int64, 0),
                                 };
-                                Accumulator::new_for(agg, col_type)
+                                Accumulator::new_for(agg, col_type, col_scale)
                             })
                             .collect();
                         let accums = accums?;
@@ -1489,9 +1517,9 @@ impl DistinctSummary {
                 ScalarValue::Float64(Some(self.float_sum))
             }
             AggFunc::Sum if col_type == DataType::Decimal => {
-                ScalarValue::Decimal(Some(self.integer_sum as i64))
+                ScalarValue::Decimal(Some(self.integer_sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64))
             }
-            AggFunc::Sum => ScalarValue::Int64(Some(self.integer_sum as i64)),
+            AggFunc::Sum => ScalarValue::Int64(Some(self.integer_sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64)),
             AggFunc::Avg if self.count == 0 => ScalarValue::Float64(None),
             AggFunc::Avg => ScalarValue::Float64(Some(self.float_sum / self.count as f64)),
             AggFunc::Min => self.min.unwrap_or_else(|| null_scalar_of_type(col_type)),

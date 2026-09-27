@@ -33,6 +33,7 @@ fn project_preserves_decimal_scale_for_plain_columns() {
         )),
         input_schema: schema,
         subqueries: None,
+        remapped: None,
     };
 
     let result = exec.next_batch().unwrap().unwrap();
@@ -91,6 +92,7 @@ fn project_reorders_plain_columns_without_rebuilding_scalars() {
         )),
         input_schema: schema,
         subqueries: None,
+        remapped: None,
     };
 
     let result = exec.next_batch().unwrap().unwrap();

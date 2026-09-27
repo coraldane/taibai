@@ -536,12 +536,22 @@ impl FastGroups {
                     Accumulator::SumI(value) => match &arg_views[k] {
                         FastArgCol::I64(data, bitmap) => {
                             if !bitmap.is_null(row) {
-                                *value = Some(value.unwrap_or(0).wrapping_add(data[row]));
+                                *value = Some(
+                                    value
+                                        .unwrap_or(0)
+                                        .checked_add(data[row])
+                                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                                );
                             }
                         }
                         FastArgCol::I32(data, bitmap) => {
                             if !bitmap.is_null(row) {
-                                *value = Some(value.unwrap_or(0).wrapping_add(data[row] as i64));
+                                *value = Some(
+                                    value
+                                        .unwrap_or(0)
+                                        .checked_add(data[row] as i64)
+                                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                                );
                             }
                         }
                         _ => {}
@@ -569,7 +579,7 @@ impl FastGroups {
                         }
                         _ => {}
                     },
-                    Accumulator::Avg { sum, count, any } => match &arg_views[k] {
+                    Accumulator::Avg { sum, count, any, .. } => match &arg_views[k] {
                         FastArgCol::I64(data, bitmap) => {
                             if !bitmap.is_null(row) {
                                 *sum += data[row] as f64;
@@ -708,7 +718,7 @@ impl FastGroups {
                 match *kind {
                     RunAcc::CountStar => match &mut accs[k] {
                         Accumulator::Count { count, .. } => {
-                            *count = count.wrapping_add((j - i) as u64);
+                            *count = count.saturating_add((j - i) as u64);
                         }
                         _ => {
                             return Err(TaibaiError::Internal(
@@ -726,7 +736,7 @@ impl FastGroups {
                             let take = run_end.min(j) - pos;
                             if is_avg {
                                 match &mut accs[k] {
-                                    Accumulator::Avg { sum, count, any } => {
+                                    Accumulator::Avg { sum, count, any, .. } => {
                                         *sum += (value.wrapping_mul(take as i64)) as f64;
                                         *count += take as u64;
                                         *any = true;
@@ -740,9 +750,15 @@ impl FastGroups {
                             } else {
                                 match &mut accs[k] {
                                     Accumulator::SumI(slot) => {
+                                        let contribution = value
+                                            .checked_mul(take as i64)
+                                            .ok_or_else(|| {
+                                                TaibaiError::Sql("SUM overflow".to_string())
+                                            })?;
                                         *slot = Some(
-                                            slot.unwrap_or(0)
-                                                .wrapping_add(value.wrapping_mul(take as i64)),
+                                            slot.unwrap_or(0).checked_add(contribution).ok_or_else(
+                                                || TaibaiError::Sql("SUM overflow".to_string()),
+                                            )?,
                                         );
                                     }
                                     _ => {
@@ -826,7 +842,12 @@ impl FastGroups {
                     },
                     TypedAcc::SumI64(data) => match &mut accs[k] {
                         Accumulator::SumI(value) => {
-                            *value = Some(value.unwrap_or(0).wrapping_add(data[row]));
+                            *value = Some(
+                                value
+                                    .unwrap_or(0)
+                                    .checked_add(data[row])
+                                    .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                            );
                         }
                         _ => {
                             return Err(TaibaiError::Internal(
@@ -835,7 +856,7 @@ impl FastGroups {
                         }
                     },
                     TypedAcc::AvgI64(data) => match &mut accs[k] {
-                        Accumulator::Avg { sum, count, any } => {
+                        Accumulator::Avg { sum, count, any, .. } => {
                             *sum += data[row] as f64;
                             *count += 1;
                             *any = true;
@@ -893,7 +914,17 @@ impl FastGroups {
         let scalar = array.scalar(row);
         let accs: Result<Vec<Accumulator>> = aggregates
             .iter()
-            .map(|agg| Accumulator::new_for(agg, arg_column_type(agg, physical_schema)))
+            .map(|agg| {
+                let scale = match &*agg.arg {
+                    LogicalExpr::Column(idx) => physical_schema
+                        .columns
+                        .get(*idx)
+                        .map(|c| c.scale)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                Accumulator::new_for(agg, arg_column_type(agg, physical_schema), scale)
+            })
             .collect();
         let accs = accs?;
         let id = self.accs.len() as u32;
@@ -933,11 +964,13 @@ fn merge_accumulator(dst: &mut Accumulator, src: Accumulator) {
                 sum: d_sum,
                 count: d_count,
                 any: d_any,
+                ..
             },
             Accumulator::Avg {
                 sum: s_sum,
                 count: s_count,
                 any: s_any,
+                ..
             },
         ) => {
             *d_sum += s_sum;

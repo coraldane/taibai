@@ -266,6 +266,7 @@ fn build_operator_with_limit(
                 input,
                 input_schema,
                 subqueries: ctx.subqueries.clone(),
+                remapped: None,
             }))
         }
         LogicalPlan::Sort(sort) => {
@@ -1893,11 +1894,76 @@ fn try_skip_sort_for_ordered_scan(plan: LogicalPlan, ctx: &PhysicalContext<'_>) 
                     .unwrap_or(false),
                 _ => false,
             });
-    if matches {
+    if matches
+        && ordered_cluster_scan_is_safe(ctx, meta, schema, &meta.cluster_key[0])
+    {
         *sort.input.clone()
     } else {
         plan
     }
+}
+
+/// Removing a Sort on the strength of the cluster key alone is only valid
+/// when the scan's output is globally ordered: segments must be mutually
+/// monotonic on the leading cluster column AND no memtable may hold
+/// unflushed rows (memtable batches restart the cluster-key ordering).
+/// This mirrors the streaming executor's `ordered_cluster_segments_are_monotonic`
+/// guard that the ordered-limit path has always required.
+fn ordered_cluster_scan_is_safe(
+    ctx: &PhysicalContext<'_>,
+    meta: &crate::storage::catalog::schema::TableMeta,
+    schema: &Schema,
+    leading_cluster_column: &str,
+) -> bool {
+    use crate::storage::segment_manager::SegmentManager;
+    let Some(col_idx) = schema
+        .columns
+        .iter()
+        .position(|c| c.name == leading_cluster_column)
+    else {
+        return false;
+    };
+    let table_dir = ctx
+        .scan_runtime
+        .data_dir()
+        .join(&meta.database)
+        .join(&meta.name);
+    let Ok(segments) = SegmentManager::discover_segments(&table_dir) else {
+        return false;
+    };
+    if segments.len() > 1 {
+        let mgr = ctx.scan_runtime.segment_mgr();
+        let mut prev_min: Option<crate::types::scalar::ScalarValue> = None;
+        let mut prev_max: Option<crate::types::scalar::ScalarValue> = None;
+        for segment in &segments {
+            // Same accessor the streaming executor's monotonicity guard
+            // uses (cluster_meta_cache-backed).
+            let Some(zm) = mgr.cluster_zone_map_cached(segment, col_idx) else {
+                return false;
+            };
+            let compare = crate::storage::index::sort_key::compare_scalars_for_sort;
+            if let Some(prev) = &prev_min {
+                if compare(&zm.min_value, prev) == std::cmp::Ordering::Less {
+                    return false;
+                }
+            }
+            if let Some(prev) = &prev_max {
+                if compare(&zm.max_value, prev) == std::cmp::Ordering::Less {
+                    return false;
+                }
+            }
+            prev_min = Some(zm.min_value);
+            prev_max = Some(zm.max_value);
+        }
+    }
+    !ctx.scan_runtime
+        .memtable_manager()
+        .get_by_table(&meta.database, &meta.name)
+        .iter()
+        .any(|mt| {
+            mt.read_snapshot_arc()
+                .is_some_and(|batch| batch.num_rows() > 0)
+        })
 }
 
 fn single_scan(plan: &LogicalPlan) -> Option<&crate::sql::planner::ScanPlan> {

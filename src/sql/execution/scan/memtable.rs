@@ -224,7 +224,7 @@ pub fn scan_memtables(
     db: &str,
     table_name: &str,
     spec: &ScanSpec,
-) -> Vec<RecordBatch> {
+) -> crate::common::error::Result<Vec<RecordBatch>> {
     let memtables = memtable_mgr
         .get_readable_by_table(db, table_name)
         .into_iter()
@@ -258,7 +258,7 @@ pub fn scan_memtables(
                 &store,
             );
             if let Some(batch) = scan_hot_store_by_key(&store, spec, watermark) {
-                return vec![batch];
+                return Ok(vec![batch]);
             }
         }
     }
@@ -266,7 +266,7 @@ pub fn scan_memtables(
     let mut batches = Vec::new();
 
     for mt in &memtables {
-        if let Some(mt_batch) = mt
+        for mt_batch in mt
             .read_with(|source| {
                 if source.num_rows() == 0 {
                     return None;
@@ -281,10 +281,9 @@ pub fn scan_memtables(
                         spec.remaining_predicate.as_ref(),
                     ) {
                         Ok(filtered) => filtered,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "memtable predicate evaluation failed");
-                            return None;
-                        }
+                        // Propagate: a failed predicate used to drop the
+                        // whole memtable batch from the result.
+                        Err(e) => return Some(Err(e)),
                     }
                 } else {
                     source.clone()
@@ -295,14 +294,15 @@ pub fn scan_memtables(
                 }
 
                 let ordered = apply_order_if_cluster_prefix_matches(filtered, spec);
-                Some(if let Some(proj) = &spec.projection {
+                Some(Ok(if let Some(proj) = &spec.projection {
                     apply_projection(&ordered, proj)
                 } else {
                     ordered
-                })
+                }))
             })
             .flatten()
         {
+            let mt_batch = mt_batch?;
             if mt_batch.num_rows() == 0 {
                 continue;
             }
@@ -310,7 +310,7 @@ pub fn scan_memtables(
         }
     }
 
-    batches
+    Ok(batches)
 }
 
 /// Per-value inverted-index gather fast path. Triggered when the scan carries

@@ -181,7 +181,7 @@ impl ScanCursor {
             while self.candidate_pos < self.current_candidates.len() || !self.prefetch.is_empty() {
                 crate::common::query_cancel::check()?;
                 if self.prefetch.is_empty() {
-                    self.fill_prefetch(&reader);
+                    self.fill_prefetch(&reader)?;
                 }
                 let Some(batch) = self.prefetch.pop_front() else {
                     continue;
@@ -219,7 +219,7 @@ impl ScanCursor {
     /// in parallel. `rayon` collect keeps candidate order, so ordered scans
     /// and LIMIT trimming behave exactly like the serial walk. Decode
     /// concurrency is bounded by the global cpu/io work permits.
-    fn fill_prefetch(&mut self, reader: &Arc<SegmentReader>) {
+    fn fill_prefetch(&mut self, reader: &Arc<SegmentReader>) -> crate::common::error::Result<()> {
         use rayon::prelude::*;
         let start = self.candidate_pos;
         let window = self.prefetch_window();
@@ -233,7 +233,9 @@ impl ScanCursor {
         // Rayon lanes do not inherit the ambient cancellation context, so
         // capture the flag and stop starting new decodes once it is set.
         let cancel_flag = crate::common::query_cancel::current_flag();
-        let batches: Vec<_> = rgs
+        // Collect Results: a decode failure must fail the query instead of
+        // silently shortening the stream.
+        let batches: Vec<crate::common::error::Result<RecordBatch>> = rgs
             .into_par_iter()
             .filter_map(|rg_idx| {
                 if cancel_flag
@@ -244,22 +246,23 @@ impl ScanCursor {
                 }
                 let _cpu = crate::common::work_limiter::acquire_cpu();
                 let _io = crate::common::work_limiter::acquire_io();
-                strategy::read_row_group_with_strategy(&spec, &plan, &table_schema, &reader, rg_idx)
-                    .ok()
+                Some(strategy::read_row_group_with_strategy(
+                    &spec, &plan, &table_schema, &reader, rg_idx,
+                ))
             })
             .collect();
         for batch in batches {
             let filtered = strategy::apply_ttl_filter_and_projection(
-                batch,
+                batch?,
                 &self.table_meta,
                 &self.plan.projection_cols,
                 self.plan.strip_ttl_column,
-            );
-            match filtered {
-                Ok(batch) if batch.num_rows() > 0 => self.prefetch.push_back(batch),
-                _ => {}
+            )?;
+            if filtered.num_rows() > 0 {
+                self.prefetch.push_back(filtered);
             }
         }
+        Ok(())
     }
 
     fn prefetch_window(&self) -> usize {
@@ -558,7 +561,7 @@ impl ScanCursor {
             &self.db,
             &self.spec.table_name,
             &memtable_spec,
-        );
+        )?;
         // The mirror batch rides the memtable drain path, which applies the
         // TTL filter, projection and limit identically.
         if let Some(batch) = hybrid_mirror_batch {

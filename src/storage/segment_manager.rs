@@ -40,7 +40,7 @@ use config::{
     SEGMENT_BUFWRITER_CAP,
 };
 use helpers::{
-    discover_max_partition_seq, discover_max_seq, ensure_state_not_retired, filter_batch_by_mask,
+    discover_max_partition_seq, discover_max_seq, ensure_state_not_retired,
     is_transient_footer_error, slice_batch_fast,
 };
 use reader_cache::ReaderCache;
@@ -151,7 +151,14 @@ fn cleanup_incomplete_compaction_files(table_dir: &Path) {
 }
 
 fn is_incomplete_compaction_file(name: &str) -> bool {
-    name.ends_with(".compact_tmp") || name.ends_with(".meta.compact.tmp")
+    name.ends_with(".compact_tmp")
+        || name.ends_with(".meta.compact.tmp")
+        || name.ends_with(".update_tmp")
+        || name.ends_with(".epoch.tmp")
+        // Delete-footer rewrite journals whose data file vanished (segment
+        // replaced by compaction before the journal was cleaned up).
+        || name.ends_with(".del.tmp")
+        || (name.starts_with(".tail_flush_") && name.ends_with(".tmp"))
 }
 
 #[cfg(test)]

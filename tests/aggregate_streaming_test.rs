@@ -590,8 +590,9 @@ fn run_fold_decimal_avg_uses_raw_domain_threshold() {
 
     // The comparison happens in the raw scaled domain everywhere in the
     // pipeline (`px > 10.00` thresholds raw 1000): the run fold must agree
-    // with the row kernels. Matching bands: 60.50 (raw 6050) and 200.25
-    // (raw 20025) -> avg = 7822500 / 600 = 13037.5 in the raw domain.
+    // with the row kernels. Matching bands: 60.50 and 200.25 across 600
+    // rows -> the raw-domain sum is 7822500, and AVG must divide out the
+    // DECIMAL(9,2) scale at finalize: 7822500 / 600 / 100 = 130.375.
     let rows = collect_rows(
         engine
             .execute(
@@ -603,7 +604,7 @@ fn run_fold_decimal_avg_uses_raw_domain_threshold() {
     assert_eq!(rows[0][0], ScalarValue::Int64(Some(600)));
     match &rows[0][1] {
         ScalarValue::Float64(Some(v)) => {
-            assert!((v - 13037.5).abs() < 1e-9, "avg {} vs 13037.5", v)
+            assert!((v - 130.375).abs() < 1e-9, "avg {} vs 130.375", v)
         }
         other => panic!("unexpected avg scalar {:?}", other),
     }

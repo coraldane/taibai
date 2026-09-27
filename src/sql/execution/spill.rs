@@ -122,6 +122,7 @@ impl SpillFile {
     {
         let dir = std::env::temp_dir().join("taibai-spill");
         std::fs::create_dir_all(&dir)?;
+        cleanup_stale_spill_files(&dir);
         let path = dir.join(format!("spill-{}.dat", uuid::Uuid::new_v4()));
         let spill = Self { path };
         let mut rows_written = 0u64;
@@ -151,6 +152,7 @@ impl SpillWriter {
     pub fn create(schema: Schema, row_group_rows: usize) -> Result<Self> {
         let dir = std::env::temp_dir().join("taibai-spill");
         std::fs::create_dir_all(&dir)?;
+        cleanup_stale_spill_files(&dir);
         let path = dir.join(format!("spill-{}.dat", uuid::Uuid::new_v4()));
         let spill = SpillFile { path };
         let writer = SegmentWriter::create_with_bloom_columns(
@@ -210,3 +212,27 @@ impl Drop for SpillFile {
 #[cfg(test)]
 #[path = "spill_test.rs"]
 mod tests;
+
+/// Best-effort removal of spill files left behind by crashed processes.
+/// Only files older than a day are touched: the directory is shared by every
+/// concurrent process/query, and their active spills must survive.
+fn cleanup_stale_spill_files(dir: &std::path::Path) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if meta.is_file()
+            && entry.file_name().to_string_lossy().starts_with("spill-")
+            && modified.elapsed().is_ok_and(|age| age > MAX_AGE)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}

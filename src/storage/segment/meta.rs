@@ -138,16 +138,31 @@ fn read_latest_sidecar_footer_from(meta_path: &Path) -> Result<Option<SidecarFoo
             break;
         };
 
-        let record_end =
-            offset + header.header_len + header.name_len + header.footer_len + RECORD_CRC_SIZE;
+        // All lengths come from disk; checked arithmetic prevents a
+        // corrupted sidecar from wrapping around the bounds check and
+        // panicking on the slice below.
+        let Some(record_end) = offset
+            .checked_add(header.header_len)
+            .and_then(|v| v.checked_add(header.name_len))
+            .and_then(|v| v.checked_add(header.footer_len))
+            .and_then(|v| v.checked_add(RECORD_CRC_SIZE))
+        else {
+            break;
+        };
         if record_end > buf.len() {
             break;
         }
 
-        let name_start = offset + header.header_len;
-        let name_end = name_start + header.name_len;
+        let Some(name_start) = offset.checked_add(header.header_len) else {
+            break;
+        };
+        let Some(name_end) = name_start.checked_add(header.name_len) else {
+            break;
+        };
         let footer_start = name_end;
-        let footer_end = footer_start + header.footer_len;
+        let Some(footer_end) = footer_start.checked_add(header.footer_len) else {
+            break;
+        };
         let stored_crc = u32::from_le_bytes(buf[footer_end..record_end].try_into().unwrap());
         let computed_crc = compute_crc(&buf[offset..footer_end]);
         if stored_crc != computed_crc {

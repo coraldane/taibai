@@ -90,11 +90,10 @@ fn run_intersection_group_by_matches_per_row_reference() {
         assert_eq!(row[2], ScalarValue::Int64(Some(vol_sum)), "{sym} sum(vol)");
         match &row[3] {
             ScalarValue::Float64(Some(v)) => {
-                let want = px_sum as f64 / n as f64;
-                assert!(
-                    (v - want).abs() < 1e-9,
-                    "{sym} avg {v} vs {want} (raw-domain decimal)"
-                );
+                // px_sum is raw-scaled (x100); AVG must divide the DECIMAL
+                // scale back out at finalize.
+                let want = px_sum as f64 / n as f64 / 100.0;
+                assert!((v - want).abs() < 1e-9, "{sym} avg {v} vs {want}");
             }
             other => panic!("{sym} avg scalar {other:?}"),
         }

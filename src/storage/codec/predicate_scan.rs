@@ -666,6 +666,17 @@ fn extract_i64_from_scalar(value: &ScalarValue) -> Option<i64> {
     }
 }
 
+/// Raw i64 payload of temporal scalars, the domain run values compare in.
+fn extract_temporal_raw_i64(value: &ScalarValue) -> Option<i64> {
+    match value {
+        ScalarValue::Date(Some(v)) => Some(*v as i64),
+        ScalarValue::Time(Some(v)) => Some(*v),
+        ScalarValue::Timestamp(Some(v)) => Some(*v),
+        ScalarValue::Interval(Some(v)) => Some(*v),
+        _ => None,
+    }
+}
+
 fn is_numeric_type(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -716,6 +727,16 @@ impl RunPredicate {
     pub fn new(op: RangeOp, value: &ScalarValue) -> Self {
         if let Some(i) = value.integer_i128() {
             return Self::Int { op, value: i };
+        }
+        // Temporal literals (Date/Time/Timestamp/Interval) carry raw i64
+        // payloads in the same domain the run values live in; without this
+        // they fell through to `Never`, silently dropping every matching row
+        // of Partial row groups during run-fold aggregation.
+        if let Some(i) = extract_temporal_raw_i64(value) {
+            return Self::Int {
+                op,
+                value: i as i128,
+            };
         }
         if let Some(f) = value.numeric_f64() {
             return Self::Float { op, value: f };

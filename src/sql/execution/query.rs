@@ -181,15 +181,10 @@ pub fn exec_union_with_txn(
     }
 
     if !*all {
+        // Typed keys: the old to_string-joined key could collide when a
+        // value contained the separator, silently dropping distinct rows.
         let mut seen = std::collections::HashSet::new();
-        rows.retain(|row| {
-            let key = row
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join("\u{1f}");
-            seen.insert(key)
-        });
+        rows.retain(|row| seen.insert(row.clone()));
     }
 
     if !order_by.is_empty() {
@@ -1103,7 +1098,7 @@ fn bare_column_name(expr: &crate::sql::parser::ast::Expr) -> Option<&str> {
 
 /// Detect a "simple" aggregate query answerable from row-group metadata:
 /// single table, no GROUP BY/HAVING, and every select item is a non-distinct
-/// `COUNT(*)` / `COUNT(col)` / `MIN(col)` / `MAX(col)`.
+/// `COUNT(*)` / `COUNT(col)` / `MIN(col)` / `MAX(col)` / `SUM(col)` / `AVG(col)`.
 fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) -> bool {    let (select_list, group_by, having) = match stmt {
         Statement::Select {
             select_list,

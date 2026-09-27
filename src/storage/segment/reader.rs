@@ -7,7 +7,7 @@ use memmap2::Mmap;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::codec::column_codec::{
-    decode_column, decode_column_selected, decode_column_with_runs,
+    decode_column_selected, decode_column_with_runs,
 };
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
@@ -249,14 +249,90 @@ impl SegmentReader {
             new_footer.extend_from_slice(delete_bitmap);
         }
 
-        let mut file = fs::OpenOptions::new().write(true).open(path)?;
-        file.set_len(source.data_end)?;
-        file.seek(SeekFrom::Start(source.data_end))?;
-        file.write_all(&new_footer)?;
-        file.write_all(&source.data_end.to_le_bytes())?;
-        file.flush()?;
-        file.sync_all()?;
+        // The in-place truncate-and-rewrite below is not atomic: a crash
+        // between `set_len` and the new footer reaching disk would leave the
+        // segment with neither embedded footer nor sidecar, silently dropping
+        // its data from every scan. A journal file (`<segment>.del`) makes
+        // the rewrite recoverable — see `repair_pending_footer_rewrite`,
+        // which discovery invokes when a segment fails to open.
+        let journal = pending_delete_journal_path(path);
+        write_delete_journal(&journal, source.data_end, &new_footer)?;
+
+        let write_result = Self::apply_footer_bytes_with_retry(path, source.data_end, &new_footer);
+        if write_result.is_err() {
+            // The journal stays behind: the next open of this segment
+            // repairs from it instead of losing the data block.
+            return write_result;
+        }
+        let _ = fs::remove_file(&journal);
         Ok(())
+    }
+
+    /// Truncate to `data_end` and append the new footer, retrying briefly:
+    /// on Windows, `set_len` fails while a reader holds the segment mmapped
+    /// (ERROR_USER_MAPPED_FILE). The write is idempotent, so retrying the
+    /// whole body after a partial attempt is safe.
+    fn apply_footer_bytes_with_retry(path: &Path, data_end: u64, footer: &[u8]) -> Result<()> {
+        const ATTEMPTS: usize = 20;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+        let mut last_err = None;
+        for attempt in 0..ATTEMPTS {
+            let result = (|| -> Result<()> {
+                let mut file = fs::OpenOptions::new().write(true).open(path)?;
+                file.set_len(data_end)?;
+                file.seek(SeekFrom::Start(data_end))?;
+                file.write_all(footer)?;
+                file.write_all(&data_end.to_le_bytes())?;
+                file.flush()?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // Non-retryable errors (permissions, missing file) fail
+                    // fast instead of burning the full retry window.
+                    if !error_is_retryable_file_conflict(&err) {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            TaibaiError::Storage("segment footer rewrite failed".to_string())
+        }))
+    }
+
+    /// Complete or discard an interrupted delete-footer rewrite. Returns
+    /// `true` when the embedded footer was repaired from the journal.
+    pub fn repair_pending_footer_rewrite(path: &Path) -> Result<bool> {
+        let journal = pending_delete_journal_path(path);
+        if !journal.exists() {
+            return Ok(false);
+        }
+        let Some((data_end, footer)) = read_delete_journal(&journal)? else {
+            // Unreadable journal: nothing we can safely apply. Remove it so
+            // it does not mask future rewrites of this segment.
+            let _ = fs::remove_file(&journal);
+            return Ok(false);
+        };
+        if Self::read_dat_footer_source(path, None).is_ok() {
+            // The embedded footer parses: the rewrite had completed and only
+            // the journal removal was lost.
+            let _ = fs::remove_file(&journal);
+            return Ok(false);
+        }
+        tracing::warn!(
+            file = %path.display(),
+            "repairing segment from interrupted delete-footer journal"
+        );
+        Self::apply_footer_bytes_with_retry(path, data_end, &footer)?;
+        let _ = fs::remove_file(&journal);
+        Ok(true)
     }
 
     fn read_footer_source(path: &Path, file_len_hint: Option<u64>) -> Result<FooterSource> {
@@ -344,12 +420,25 @@ impl SegmentReader {
         let rg = &self.footer.row_groups[row_group];
         let mut col_offset = rg.offset as usize;
         for i in 0..column_idx {
-            col_offset += rg.column_compressed_sizes[i] as usize;
+            col_offset = col_offset.wrapping_add(rg.column_compressed_sizes[i] as usize);
         }
         let col_len = rg.column_compressed_sizes[column_idx] as usize;
 
         let data = self.data.as_slice();
-        let compressed = &data[col_offset..col_offset + col_len];
+        // Footer offsets come from disk: a corrupted footer must surface as
+        // an error, not as an out-of-bounds panic.
+        let col_end = col_offset
+            .checked_add(col_len)
+            .ok_or_else(|| TaibaiError::Storage("segment column offset overflow".to_string()))?;
+        if col_offset > data.len() || col_end > data.len() {
+            return Err(TaibaiError::Storage(format!(
+                "segment column range {}..{} exceeds data length {}",
+                col_offset,
+                col_end,
+                data.len()
+            )));
+        }
+        let compressed = &data[col_offset..col_end];
 
         Ok(Self::decompress_column_block(compressed)?.into_owned())
     }
@@ -861,4 +950,94 @@ fn split_column(col: &ColumnArray, start: usize, end: usize) -> ColumnArray {
         new_col.push(&col.scalar(i)).unwrap();
     }
     new_col
+}
+
+// ---------------------------------------------------------------------------
+// Delete-footer rewrite journal
+//
+// `<segment-file>.del` records the exact bytes of a pending in-place footer
+// rewrite before truncation starts, so a crash mid-rewrite can be repaired
+// on the next open instead of silently losing the segment's data.
+// Layout: magic(8) | data_end u64 | footer_len u32 | footer bytes | crc32 u32
+// ---------------------------------------------------------------------------
+
+const DELETE_JOURNAL_MAGIC: &[u8; 8] = b"TBDELJ01";
+
+fn pending_delete_journal_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".del");
+    PathBuf::from(name)
+}
+
+fn write_delete_journal(journal: &Path, data_end: u64, footer: &[u8]) -> Result<()> {
+    let mut body = Vec::with_capacity(footer.len() + 12);
+    body.extend_from_slice(&data_end.to_le_bytes());
+    body.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+    body.extend_from_slice(footer);
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&body);
+    let crc = crc.finalize();
+
+    let tmp = {
+        let mut name = journal.as_os_str().to_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(DELETE_JOURNAL_MAGIC)?;
+    file.write_all(&body)?;
+    file.write_all(&crc.to_le_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    // Journal visibility must be atomic: fs::rename replaces the destination
+    // on both platforms (MoveFileEx(REPLACE_EXISTING) semantics on Windows).
+    fs::rename(&tmp, journal)?;
+    Ok(())
+}
+
+fn read_delete_journal(journal: &Path) -> Result<Option<(u64, Vec<u8>)>> {
+    let Ok(bytes) = fs::read(journal) else {
+        return Ok(None);
+    };
+    if bytes.len() < 8 + 12 + 4 || !bytes.starts_with(DELETE_JOURNAL_MAGIC) {
+        return Ok(None);
+    }
+    let body = &bytes[8..bytes.len() - 4];
+    let crc = u32::from_le_bytes(
+        bytes[bytes.len() - 4..]
+            .try_into()
+            .expect("crc slice has fixed length"),
+    );
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(body);
+    if hasher.finalize() != crc {
+        return Ok(None);
+    }
+    let data_end = u64::from_le_bytes(body[0..8].try_into().expect("u64 slice"));
+    let footer_len =
+        u32::from_le_bytes(body[8..12].try_into().expect("u32 slice")) as usize;
+    if body.len() < 12 + footer_len {
+        return Ok(None);
+    }
+    Ok(Some((
+        data_end,
+        body[12..12 + footer_len].to_vec(),
+    )))
+}
+
+/// Whether a footer-write failure is worth retrying: transient sharing
+/// violations (Windows mapped-file truncation) clear once in-flight readers
+/// drop their mmap handles.
+fn error_is_retryable_file_conflict(err: &TaibaiError) -> bool {
+    let text = err.to_string();
+    text.contains("Access is denied")
+        || text.contains("used by another process")
+        || text.contains("being used by another")
+        || text.contains("Permission denied")
+        || text.contains("share")
+        || text.contains("resource temporarily unavailable")
 }

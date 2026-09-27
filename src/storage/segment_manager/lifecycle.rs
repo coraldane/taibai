@@ -114,26 +114,25 @@ impl SegmentManager {
             return Ok(written);
         }
 
+        // Group by row indices (total O(rows)) instead of one N-wide bool
+        // mask per partition, which was O(partitions x rows) of pure memory.
         let mut key_order = Vec::new();
-        let mut groups: HashMap<String, Vec<bool>> = HashMap::new();
+        let mut groups: HashMap<String, Vec<u32>> = HashMap::new();
         for row_idx in 0..batch.num_rows() {
             let key = keys.key_at(row_idx);
             if !groups.contains_key(key) {
                 key_order.push(key.to_string());
-                groups.insert(key.to_string(), vec![false; batch.num_rows()]);
+                groups.insert(key.to_string(), Vec::new());
             }
-            if let Some(mask) = groups.get_mut(key) {
-                mask[row_idx] = true;
-            }
+            groups.get_mut(key).unwrap().push(row_idx as u32);
         }
 
         let mut written = 0;
         for partition_key in key_order {
-            let Some(mask) = groups.remove(&partition_key) else {
+            let Some(indices) = groups.remove(&partition_key) else {
                 continue;
             };
-            let match_count = mask.iter().filter(|keep| **keep).count();
-            let part_batch = filter_batch_by_mask(&batch, &mask, match_count)?;
+            let part_batch = take_batch_rows(&batch, &indices)?;
             written += self.bulk_insert_batch_with_partition_owned_inner(
                 db,
                 table,
@@ -379,4 +378,17 @@ impl SegmentManager {
         Ok(())
     }
 
+}
+
+/// Gather the selected rows of a batch (columnar take, no per-cell boxing).
+pub(super) fn take_batch_rows(
+    batch: &crate::types::batch::RecordBatch,
+    indices: &[u32],
+) -> crate::common::error::Result<crate::types::batch::RecordBatch> {
+    let columns = batch
+        .columns
+        .iter()
+        .map(|col| col.take(indices))
+        .collect::<Vec<_>>();
+    crate::types::batch::RecordBatch::try_new(batch.schema.clone(), columns)
 }
