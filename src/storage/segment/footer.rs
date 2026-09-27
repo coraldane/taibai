@@ -65,6 +65,7 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
             default_value: None,
             column_id,
             previous_names: Vec::new(),
+            added_at_micros: None,
         });
     }
     let schema = Schema::new(columns);
@@ -389,7 +390,16 @@ fn skip_column_crc_extension(
         return Ok(());
     }
     let _magic = read_u32_le(cursor)?;
-    let _count = read_u32_le(cursor)?;
+    let stored_count = read_u32_le(cursor)? as usize;
+    // Same validation as the full parser: a mismatched count must error,
+    // not silently desynchronize the reserved-section offset (the rewrite
+    // path would then truncate the footer at a wrong boundary).
+    if stored_count != col_count {
+        return Err(TaibaiError::Storage(format!(
+            "column-crc extension count mismatch: {} columns stored, {} in schema",
+            stored_count, col_count
+        )));
+    }
     for _ in 0..col_count {
         let mut bytes = [0u8; 4];
         cursor.read_exact(&mut bytes)?;

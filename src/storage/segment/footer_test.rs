@@ -64,6 +64,7 @@ fn reserved_section_offset_skips_value_sets_for_all_row_groups() {
         default_value: None,
         column_id: 1,
         previous_names: Vec::new(),
+            added_at_micros: None,
     }]);
     let row_groups = vec![
         RowGroupMeta {

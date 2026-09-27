@@ -1414,11 +1414,23 @@ fn next_sequence() -> u64 {
         .min(u64::MAX as u128) as u64;
     let counter = TAIL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let wall_based = nanos.saturating_add(counter & 0xFFFF);
-    // Never hand out a sequence at or below one already observed on disk or
-    // previously issued: arbitration compares sequences within one memtable
-    // id, and a regression would flip the winner.
-    let high = TAIL_SEQUENCE_HIGH_WATER.fetch_max(wall_based, Ordering::AcqRel);
-    wall_based.max(high.saturating_add(1))
+    // Strictly increasing under concurrency: a compare-exchange loop bumps
+    // the high-water past every previously issued or observed sequence, so
+    // arbitration within a memtable id can never see a tie or a regression
+    // (e.g. after an NTP clock step backwards).
+    let mut current = TAIL_SEQUENCE_HIGH_WATER.load(Ordering::Acquire);
+    loop {
+        let candidate = wall_based.max(current.saturating_add(1));
+        match TAIL_SEQUENCE_HIGH_WATER.compare_exchange_weak(
+            current,
+            candidate,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return candidate,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// A tail file shorter than the V2 log header cannot hold even one committed

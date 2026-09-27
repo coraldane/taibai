@@ -51,6 +51,10 @@ pub struct SegmentReader {
     data: SegmentData,
     footer: SegmentFooter,
     data_end: u64,
+    /// Prefix sums of row-group row counts, built once at open:
+    /// `row_group_start_row` used to re-sum per call (O(row_groups^2) per
+    /// scan segment during delete-bitmap filtering).
+    row_group_starts: Vec<u64>,
 }
 
 struct FooterSource {
@@ -142,11 +146,20 @@ impl SegmentReader {
 
         let parsed = parse_segment_footer(&footer_source.footer)?;
 
+        let footer: SegmentFooter = parsed.into();
+        let mut row_group_starts = Vec::with_capacity(footer.row_groups.len() + 1);
+        let mut running = 0u64;
+        for rg in &footer.row_groups {
+            row_group_starts.push(running);
+            running = running.saturating_add(rg.row_count);
+        }
+        row_group_starts.push(running);
         Ok(Self {
             path: path.to_path_buf(),
             data,
-            footer: parsed.into(),
+            footer,
             data_end: footer_source.data_end,
+            row_group_starts,
         })
     }
 
@@ -198,12 +211,12 @@ impl SegmentReader {
     }
 
     pub fn row_group_start_row(&self, row_group: usize) -> u64 {
-        self.footer
-            .row_groups
-            .iter()
-            .take(row_group)
-            .map(|r| r.row_count)
-            .sum()
+        // O(1) from the prefix built at open; the old re-summing made
+        // per-row-group delete filtering quadratic in the row-group count.
+        self.row_group_starts
+            .get(row_group)
+            .copied()
+            .unwrap_or_else(|| self.row_group_starts.last().copied().unwrap_or(0))
     }
 
     pub fn row_group_rows(&self, row_group: usize) -> u64 {
@@ -240,6 +253,11 @@ impl SegmentReader {
         // snapshot. SegmentManager refreshes the sidecar separately when this
         // is still an active segment.
         let source = Self::read_dat_footer_source(path, None)?;
+        // Validate the source footer with the full parser (footer checksum,
+        // extension structure) before copying any of it: a locally corrupt
+        // footer used to be copied verbatim and "laundered" by the freshly
+        // recomputed checksum.
+        parse_segment_footer(&source.footer)?;
         let res_offset = reserved_section_offset(&source.footer)?;
 
         // The rebuilt footer keeps the row-group prefix (including the
@@ -700,6 +718,7 @@ impl SegmentReader {
                     primary_key: self.footer.schema.columns[idx].primary_key,
                     default_value: self.footer.schema.columns[idx].default_value.clone(),
                     column_id: self.footer.schema.columns[idx].column_id,
+                    added_at_micros: None,
                     previous_names: self.footer.schema.columns[idx].previous_names.clone(),
                 })
                 .collect(),

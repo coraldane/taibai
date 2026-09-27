@@ -179,6 +179,20 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
     }
     drop(catalogs);
 
+    // Physically purged segments still appear in unique-index location
+    // snapshots (and their keys in key sets): without invalidation, a probe
+    // for a value the purge just deleted reports "exists" and re-inserting
+    // it fails with a phantom duplicate key until the next rebuild.
+    engine.index_manager().invalidate_primary_key_index(db, table);
+    let unique_index_names = previous_meta
+        .unique_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    engine
+        .index_manager()
+        .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+
     tracing::info!(
         db,
         table,
@@ -227,15 +241,27 @@ fn remove_partition_files(
         // Count live rows from the segment itself: the catalog's partition
         // list is not always maintained by the write path, so the file is
         // the source of truth here.
-        if let Ok(reader) = mgr.open_reader(&path) {
-            file_rows += reader
-                .row_count()
-                .saturating_sub(reader.deleted_row_count()) as i64;
-        }
+        let live_rows = mgr
+            .open_reader(&path)
+            .ok()
+            .map(|reader| {
+                reader
+                    .row_count()
+                    .saturating_sub(reader.deleted_row_count()) as i64
+            })
+            .unwrap_or(0);
         let sidecar = crate::storage::segment::meta::sidecar_meta_path(&path);
-        if let Err(error) = std::fs::remove_file(&path) {
+        // Windows sharing violations clear within a few hundred
+        // milliseconds (in-flight readers); retry like the DDL paths
+        // (`ddl::remove_file_with_retry`) instead of skipping on the first
+        // failure.
+        if let Err(error) = remove_file_with_retry(&path) {
+            // A file that survived the purge still holds its rows: counting
+            // them into file_rows would permanently drift row_count.
             tracing::warn!(path = %path.display(), error = %error, "ttl purge: failed to remove segment file");
+            continue;
         }
+        file_rows += live_rows;
         if sidecar.exists() {
             let _ = std::fs::remove_file(&sidecar);
         }
@@ -248,4 +274,29 @@ fn now_micros() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as i64
+}
+
+
+/// Bounded retry for segment file removal: transient Windows sharing
+/// violations from in-flight readers clear within milliseconds.
+fn remove_file_with_retry(path: &std::path::Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: usize = 5;
+    let mut delay = std::time::Duration::from_millis(50);
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = error.kind() == std::io::ErrorKind::PermissionDenied
+                    || format!("{error}").contains("being used by another process");
+                last_err = Some(error);
+                if !retryable || attempt + 1 == MAX_ATTEMPTS {
+                    break;
+                }
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("remove failed")))
 }

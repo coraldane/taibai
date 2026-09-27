@@ -169,6 +169,8 @@ fn is_incomplete_compaction_file(name: &str) -> bool {
         || name.ends_with(".del.tmp")
         || name.ends_with(".replace.tmp")
         || (name.starts_with(".tail_flush_") && name.ends_with(".tmp"))
+        // Clustered-compaction external merge sort runs (crash leftovers).
+        || name.contains(".merge.tmp.")
 }
 
 #[cfg(test)]

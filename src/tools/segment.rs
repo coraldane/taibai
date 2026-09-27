@@ -136,6 +136,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             default_value: None,
             column_id,
             previous_names: Vec::new(),
+            added_at_micros: None,
         });
     }
     let schema = Schema::new(columns);
@@ -202,7 +203,7 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         skip_bloom_filters(&mut cursor, footer_data.as_slice(), col_count)?;
         skip_value_sets_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
         skip_col_sums_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
-        skip_column_crcs_if_present(&mut cursor, footer_data.as_slice())?;
+        skip_column_crcs_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
 
         row_groups.push(RowGroupInfo {
             offset: rg_offset,
@@ -453,7 +454,11 @@ fn skip_value_sets_if_present(
 /// Footer v6 stores per-row-group pre-aggregated sums (`[magic][col_count
 /// u32][col_count × i64]`) after the value-set extension. The inspector does
 /// not print them, but must advance past them like the other extensions.
-fn skip_column_crcs_if_present(cursor: &mut Cursor<&[u8]>, data: &[u8]) -> Result<()> {
+fn skip_column_crcs_if_present(
+    cursor: &mut Cursor<&[u8]>,
+    data: &[u8],
+    col_count: usize,
+) -> Result<()> {
     let pos = cursor.position() as usize;
     if pos + 4 > data.len() {
         return Ok(());
@@ -468,6 +473,12 @@ fn skip_column_crcs_if_present(cursor: &mut Cursor<&[u8]>, data: &[u8]) -> Resul
     }
     cursor.set_position((pos + 4) as u64);
     let stored_count = read_u32_le(cursor)? as usize;
+    if stored_count != col_count {
+        // Pathological; keep the parser loud instead of misaligning.
+        return Err(TaibaiError::Storage(format!(
+            "column crc extension count mismatch: {stored_count} stored, {col_count} expected"
+        )));
+    }
     cursor.set_position(cursor.position() + stored_count as u64 * 4);
     Ok(())
 }
