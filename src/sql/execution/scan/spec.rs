@@ -21,6 +21,10 @@ pub struct ScanSpec {
     pub has_order_by: bool,
     pub has_group_by: bool,
     pub has_join: bool,
+    /// DISTINCT or window functions wrap the scan: a pushed-down LIMIT must
+    /// not truncate the scan, because the wrapper needs every row to dedup
+    /// or to compute frames before applying its own limit.
+    pub has_distinct_or_window: bool,
     pub limit: Option<usize>,
     pub order_by: Vec<ScanSortKey>,
 
@@ -80,6 +84,7 @@ impl ScanSpec {
             projection: None,
             is_count_star: false,
             has_aggregate: false,
+            has_distinct_or_window: false,
             has_order_by: false,
             has_group_by: false,
             has_join: false,
@@ -358,8 +363,14 @@ fn collect_from_plan(plan: &LogicalPlan, table_name: &str, schema: &Schema, spec
             set_scan_limit(spec, t.limit.saturating_add(t.offset));
             collect_from_plan(&t.input, table_name, schema, spec);
         }
-        LogicalPlan::Distinct(d) => collect_from_plan(&d.input, table_name, schema, spec),
-        LogicalPlan::Window(w) => collect_from_plan(&w.input, table_name, schema, spec),
+        LogicalPlan::Distinct(d) => {
+            spec.has_distinct_or_window = true;
+            collect_from_plan(&d.input, table_name, schema, spec);
+        }
+        LogicalPlan::Window(w) => {
+            spec.has_distinct_or_window = true;
+            collect_from_plan(&w.input, table_name, schema, spec);
+        }
         LogicalPlan::Join(j) => {
             spec.has_join = true;
             collect_from_plan(&j.left, table_name, schema, spec);
@@ -676,6 +687,18 @@ fn coerce_scalar(
         (DataType::Float32, ScalarValue::Float64(Some(v))) => {
             Some(ScalarValue::Float32(Some(*v as f32)))
         }
+        // Integer literals against float/unsigned-64 columns: without these
+        // arms the literal kept its Int64 tag, the bloom/set-index hash
+        // mismatched, and row groups containing matches were pruned away.
+        (DataType::Float64, ScalarValue::Int64(Some(v))) => {
+            Some(ScalarValue::Float64(Some(*v as f64)))
+        }
+        (DataType::Float32, ScalarValue::Int64(Some(v))) => {
+            Some(ScalarValue::Float32(Some(*v as f32)))
+        }
+        (DataType::UInt64, ScalarValue::Int64(Some(v))) => {
+            u64::try_from(*v).ok().map(|v| ScalarValue::UInt64(Some(v)))
+        }
         (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
             let m = 10_i64.checked_pow(scale as u32)?;
             Some(ScalarValue::Decimal(Some((*v * m as f64).round() as i64)))
@@ -685,7 +708,10 @@ fn coerce_scalar(
             v.checked_mul(m).map(|v| ScalarValue::Decimal(Some(v)))
         }
         (dt, v) if *dt == v.data_type() => Some(v.clone()),
-        _ => Some(value.clone()),
+        // Unhandled type combinations return None: the predicate then stays
+        // in the generic (row-level) filter instead of feeding an index
+        // probe with a mistyped value that would prune matching row groups.
+        _ => None,
     }
 }
 

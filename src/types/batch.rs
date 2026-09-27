@@ -34,6 +34,11 @@ pub struct ColumnDef {
     pub column_id: u32,
     #[serde(default)]
     pub previous_names: Vec<String>,
+    /// Wall-clock instant (micros) the column was added by ALTER TABLE;
+    /// DEFAULT CURRENT_TIMESTAMP backfill for pre-existing rows pins to it
+    /// so repeated reads return the same value instead of "now".
+    #[serde(default)]
+    pub added_at_micros: Option<i64>,
 }
 
 impl ColumnDef {
@@ -46,6 +51,7 @@ impl ColumnDef {
             precision: 0,
             auto_increment: false,
             primary_key: false,
+            added_at_micros: None,
             default_value: None,
             column_id: 0,
             previous_names: Vec::new(),

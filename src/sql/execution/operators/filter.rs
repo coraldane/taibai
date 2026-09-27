@@ -387,11 +387,17 @@ pub fn eval_filter_with(
             }
         }
         LogicalExpr::Literal(v) => {
+            // MySQL truthiness, matching the DML evaluator: booleans pass
+            // through, nonzero numerics are TRUE, zero/NULL are FALSE.
+            // (`WHERE 0` used to return every row here.)
+            let keep = match v {
+                ScalarValue::Bool(Some(value)) => *value,
+                other if other.is_null() => false,
+                other => other.integer_i128().is_some_and(|i| i != 0)
+                    || other.numeric_f64().is_some_and(|f| f != 0.0),
+            };
             for m in mask.iter_mut().take(num_rows) {
-                *m = match v {
-                    ScalarValue::Bool(Some(value)) => *value,
-                    _ => !v.is_null(),
-                };
+                *m = keep;
             }
         }
         _ => {

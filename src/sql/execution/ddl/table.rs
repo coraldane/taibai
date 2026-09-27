@@ -1123,6 +1123,15 @@ pub fn exec_alter_table(
                     .with_auto_increment(column.auto_increment)
                     .with_primary_key(column.primary_key)
                     .with_default_value(default_value);
+                // Pin CURRENT_TIMESTAMP backfill at ALTER time: pre-existing
+                // rows must read a stable value, not the query instant.
+                if matches!(col_def.default_value, Some(ColumnDefaultValue::CurrentTimestamp)) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
+                    col_def.added_at_micros = Some(now);
+                }
                 validate_column_constraints(std::slice::from_mut(&mut col_def))?;
                 if !col_def.nullable && col_def.default_value.is_none() {
                     let existing_rows = catalog

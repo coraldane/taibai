@@ -259,6 +259,30 @@ fn compute_func(
                 Some(arg) => Some(eval_expr_column(arg, batch)?),
                 None => None,
             };
+            // Default frame (RANGE UNBOUNDED PRECEDING -> CURRENT ROW, incl.
+            // peers) reduces to a running prefix aggregate: O(1) per row
+            // instead of re-materializing the whole frame per row.
+            if is_running_prefix_frame(plan) {
+                return compute_running_aggregate(
+                    func,
+                    arg_values.as_deref(),
+                    &order,
+                    &order_cols,
+                    &partition_cols,
+                    num_rows,
+                    result_type,
+                );
+            }
+            // Result-column type drives the value domain: Decimal sums must
+            // stay Decimal, and empty MIN/MAX frames need a typed NULL.
+            let arg_type = window_result_type(
+                &WindowFuncKind::Aggregate {
+                    func: *func,
+                    arg: arg.clone(),
+                    distinct: false,
+                },
+                &batch.schema,
+            );
             let mut group_start = 0usize;
             while group_start < order.len() {
                 let group_end = partition_end(&order, group_start, &partition_cols);
@@ -282,7 +306,7 @@ fn compute_func(
                             .collect(),
                     };
                     let row = order[pos_in_group] as usize;
-                    values[row] = aggregate_frame(func, &frame);
+                    values[row] = aggregate_frame(func, &frame, arg_type);
                 }
                 group_start = group_end;
             }
@@ -290,6 +314,10 @@ fn compute_func(
     }
 
     Ok(values)
+}
+
+fn null_of(dt: DataType) -> ScalarValue {
+    ScalarValue::null_for_type(dt)
 }
 
 fn compare(a: &ScalarValue, b: &ScalarValue) -> Ordering {
@@ -465,13 +493,14 @@ fn range_bound_pos(
         // DESC, start: earlier sort positions carry larger values.
         (true, true, true) => Box::new(move |v| v.is_some_and(|v| v <= cur + n)),
         (true, true, false) => Box::new(move |v| v.is_some_and(|v| v <= cur - n)),
-        // ASC, end: frame ends at `cur + n` (inclusive) / `cur - n` (the
-        // PRECEDING end bound is exclusive in SQL).
+        // ASC, end: both offset end bounds are INCLUSIVE per the SQL
+        // standard (RANGE BETWEEN ... AND n PRECEDING keeps values down to
+        // cur - n, mirroring PostgreSQL).
         (false, false, false) => Box::new(move |v| v.is_some_and(|v| v <= cur + n)),
-        (false, false, true) => Box::new(move |v| v.is_some_and(|v| v < cur - n)),
+        (false, false, true) => Box::new(move |v| v.is_some_and(|v| v <= cur - n)),
         // DESC, end.
         (true, false, false) => Box::new(move |v| v.is_some_and(|v| v >= cur - n)),
-        (true, false, true) => Box::new(move |v| v.is_some_and(|v| v > cur + n)),
+        (true, false, true) => Box::new(move |v| v.is_some_and(|v| v >= cur + n)),
     };
     if start_bound {
         (group_start..group_end).find(|&p| keep(range_key_at(order_cols, order, p)))
@@ -513,9 +542,192 @@ fn peer_end(
     end
 }
 
+
+/// True for frames equivalent to "unbounded start through the current row"
+/// (the SQL default when no frame clause is given): a running prefix
+/// aggregate per partition answers them exactly.
+fn is_running_prefix_frame(plan: &WindowFuncPlan) -> bool {
+    match &plan.frame {
+        None => true,
+        Some(frame) => {
+            matches!(
+                frame.start,
+                crate::sql::parser::ast::FrameBound::UnboundedPreceding
+            ) && matches!(frame.end, crate::sql::parser::ast::FrameBound::CurrentRow)
+        }
+    }
+}
+
+/// Running prefix aggregate over each partition. RANGE semantics include
+/// ORDER BY peers, so the prefix flushes at peer-group boundaries; every row
+/// inside a peer group reports the value including the whole group.
+fn compute_running_aggregate(
+    func: &AggFunc,
+    arg_values: Option<&[ScalarValue]>,
+    order: &[u32],
+    order_cols: &[(Vec<ScalarValue>, bool)],
+    partition_cols: &[Vec<ScalarValue>],
+    num_rows: usize,
+    result_type: DataType,
+) -> Result<Vec<ScalarValue>> {
+    let mut values = vec![ScalarValue::Int64(None); num_rows];
+    // Running state mirrors aggregate_frame's domains; initialized in the
+    // partition loop (reset at every partition boundary).
+    let mut count: i64;
+    let mut sum_i: i64;
+    let mut sum_decimal: i64;
+    let mut sum_f: f64;
+    let mut has_float: bool;
+    let mut any: bool;
+    let mut best: Option<ScalarValue>;
+
+    let mut group_start = 0usize;
+    while group_start < order.len() {
+        let group_end = partition_end(order, group_start, partition_cols);
+        // Running state is per-partition: reset at every boundary.
+        count = 0;
+        sum_i = 0;
+        sum_decimal = 0;
+        sum_f = 0.0;
+        has_float = false;
+        any = false;
+        best = None;
+        // Peer groups inside the partition: rows with equal ORDER BY keys.
+        let mut pos = group_start;
+        while pos < group_end {
+            let mut peer_end = pos + 1;
+            while peer_end < group_end
+                && order_key_equal(order_cols, order[pos] as usize, order[peer_end] as usize)
+            {
+                peer_end += 1;
+            }
+            for &row in &order[pos..peer_end] {
+                let row = row as usize;
+                let value = match arg_values {
+                    Some(values) => &values[row],
+                    None => &COUNT_ONE,
+                };
+                if value.is_null() {
+                    continue;
+                }
+                any = true;
+                match func {
+                    AggFunc::Count => count += 1,
+                    AggFunc::Sum | AggFunc::Avg => {
+                        if result_type == DataType::Decimal
+                            && matches!(value, ScalarValue::Decimal(_))
+                        {
+                            sum_decimal = sum_decimal.saturating_add(
+                                value
+                                    .integer_i128()
+                                    .unwrap_or(0)
+                                    .clamp(i64::MIN as i128, i64::MAX as i128)
+                                    as i64,
+                            );
+                        } else if let Some(i) = value.integer_i128() {
+                            sum_i = sum_i.saturating_add(
+                                i.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+                            );
+                        } else {
+                            has_float = true;
+                            sum_f += value.numeric_f64().unwrap_or(0.0);
+                        }
+                    }
+                    AggFunc::Min | AggFunc::Max => {
+                        let take = match &best {
+                            None => true,
+                            Some(current) => {
+                                let ord = crate::storage::index::sort_key::compare_scalars_for_sort(
+                                    value, current,
+                                );
+                                if func == &AggFunc::Min {
+                                    ord == std::cmp::Ordering::Less
+                                } else {
+                                    ord == std::cmp::Ordering::Greater
+                                }
+                            }
+                        };
+                        if take {
+                            best = Some(value.clone());
+                        }
+                    }
+                }
+            }
+            let current = running_value(
+                func, any, count, sum_i, sum_decimal, sum_f, has_float, &best, result_type,
+            );
+            for &row in &order[pos..peer_end] {
+                values[row as usize] = current.clone();
+            }
+            pos = peer_end;
+        }
+        group_start = group_end;
+    }
+    Ok(values)
+}
+
+const COUNT_ONE: ScalarValue = ScalarValue::Int64(Some(1));
+
+fn running_value(
+    func: &AggFunc,
+    any: bool,
+    count: i64,
+    sum_i: i64,
+    sum_decimal: i64,
+    sum_f: f64,
+    has_float: bool,
+    best: &Option<ScalarValue>,
+    result_type: DataType,
+) -> ScalarValue {
+    match func {
+        AggFunc::Count => ScalarValue::Int64(Some(count)),
+        AggFunc::Sum => {
+            if !any {
+                ScalarValue::null_for_type(result_type)
+            } else if result_type == DataType::Decimal {
+                ScalarValue::Decimal(Some(sum_decimal))
+            } else if has_float {
+                ScalarValue::Float64(Some(sum_f))
+            } else {
+                ScalarValue::Int64(Some(sum_i))
+            }
+        }
+        AggFunc::Avg => {
+            if !any || count == 0 {
+                ScalarValue::Float64(None)
+            } else {
+                let total = if result_type == DataType::Decimal {
+                    sum_decimal as f64
+                } else if has_float {
+                    sum_f
+                } else {
+                    sum_i as f64
+                };
+                ScalarValue::Float64(Some(total / count as f64))
+            }
+        }
+        AggFunc::Min | AggFunc::Max => best
+            .clone()
+            .unwrap_or_else(|| ScalarValue::null_for_type(result_type)),
+    }
+}
+
+fn order_key_equal(
+    order_cols: &[(Vec<ScalarValue>, bool)],
+    left_row: usize,
+    right_row: usize,
+) -> bool {
+    order_cols.iter().all(|(values, _)| {
+        crate::storage::index::sort_key::compare_scalars_for_sort(
+            &values[left_row],
+            &values[right_row],
+        ) == std::cmp::Ordering::Equal
+    })
+}
+
 /// Aggregate one frame's values with plain (non-distinct) semantics matching
 /// the hash aggregate operator's finalize behavior.
-fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue]) -> ScalarValue {
+fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue], arg_type: DataType) -> ScalarValue {
     match func {
         AggFunc::Count => {
             let count = frame.iter().filter(|v| !v.is_null()).count();
@@ -523,6 +735,7 @@ fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue]) -> ScalarValue {
         }
         AggFunc::Sum => {
             let mut int_sum: i64 = 0;
+            let mut decimal_sum: i64 = 0;
             let mut float_sum: f64 = 0.0;
             let mut has_float = false;
             let mut any = false;
@@ -534,6 +747,18 @@ fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue]) -> ScalarValue {
                 if matches!(value, ScalarValue::Float32(_) | ScalarValue::Float64(_)) {
                     has_float = true;
                     float_sum += value.numeric_f64().unwrap_or(0.0);
+                } else if arg_type == DataType::Decimal
+                    && matches!(value, ScalarValue::Decimal(_))
+                {
+                    // Decimal sums stay in the raw scaled domain so the
+                    // result column (also Decimal) accepts them; the old
+                    // Int64 coercion failed the strict column push.
+                    decimal_sum = decimal_sum.saturating_add(
+                        value
+                            .integer_i128()
+                            .unwrap_or(0)
+                            .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+                    );
                 } else if let Some(i) = value.integer_i128() {
                     int_sum = int_sum.saturating_add(i.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
                 } else if let Some(f) = value.numeric_f64() {
@@ -541,7 +766,9 @@ fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue]) -> ScalarValue {
                 }
             }
             if !any {
-                ScalarValue::Int64(None)
+                null_of(arg_type)
+            } else if arg_type == DataType::Decimal {
+                ScalarValue::Decimal(Some(decimal_sum))
             } else if has_float {
                 ScalarValue::Float64(Some(float_sum))
             } else {
@@ -560,12 +787,12 @@ fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue]) -> ScalarValue {
                 ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64))
             }
         }
-        AggFunc::Min => extremum(frame, Ordering::Less),
-        AggFunc::Max => extremum(frame, Ordering::Greater),
+        AggFunc::Min => extremum(frame, Ordering::Less, arg_type),
+        AggFunc::Max => extremum(frame, Ordering::Greater, arg_type),
     }
 }
 
-fn extremum(frame: &[ScalarValue], wanted: Ordering) -> ScalarValue {
+fn extremum(frame: &[ScalarValue], wanted: Ordering, arg_type: DataType) -> ScalarValue {
     let mut best: Option<&ScalarValue> = None;
     for value in frame {
         if value.is_null() {
@@ -582,5 +809,7 @@ fn extremum(frame: &[ScalarValue], wanted: Ordering) -> ScalarValue {
             }
         });
     }
-    best.cloned().unwrap_or(ScalarValue::Int64(None))
+    // Empty (or all-NULL) frames yield NULL of the ARGUMENT's type: the
+    // result column inherits the argument type and rejects a foreign null.
+    best.cloned().unwrap_or_else(|| null_of(arg_type))
 }

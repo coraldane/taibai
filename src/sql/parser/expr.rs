@@ -618,10 +618,18 @@ impl Parser {
     fn parse_frame_bound(&mut self) -> Result<FrameBound> {
         if self.peek() == &Token::Unbounded {
             self.advance();
-            if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING") {
+            // The lexer may emit dedicated keyword tokens (Token::Preceding)
+            // or plain identifiers depending on context; accept both, like
+            // the numeric-bound branch does. `BETWEEN UNBOUNDED PRECEDING`
+            // used to be unparseable.
+            let is_preceding = self.peek() == &Token::Preceding
+                || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "PRECEDING");
+            let is_following = self.peek() == &Token::Following
+                || matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "FOLLOWING");
+            if is_preceding {
                 self.advance();
                 Ok(FrameBound::UnboundedPreceding)
-            } else if matches!(self.peek(), Token::Ident(s) if s.to_uppercase() == "FOLLOWING") {
+            } else if is_following {
                 self.advance();
                 Ok(FrameBound::UnboundedFollowing)
             } else {

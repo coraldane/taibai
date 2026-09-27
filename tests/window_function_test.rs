@@ -320,3 +320,94 @@ fn range_offset_frames_use_value_semantics() {
         ]
     );
 }
+
+fn wc_create_engine() -> (tempfile::TempDir, Engine, Session) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let engine = Engine::new(temp_dir.path(), "main").unwrap();
+    let session = Session::new("root".to_string(), "main".to_string());
+    (temp_dir, engine, session)
+}
+
+#[test]
+fn window_sum_decimal_and_empty_min_frame_do_not_error() {
+    let (_temp_dir, engine, mut session) = wc_create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE tw (id INT64, px DECIMAL(9,2), ts INT64)",
+        )
+        .expect("create");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO tw (id, px, ts) VALUES (1, 10.50, 1), (2, 20.25, 2), (3, 5.75, 3)",
+        )
+        .expect("insert");
+
+    // SUM(DECIMAL) OVER used to coerce to Int64 and fail the strict column
+    // push with an Internal "type mismatch" error.
+    let result = engine
+        .execute(&mut session, "SELECT SUM(px) OVER () FROM tw")
+        .expect("decimal window sum");
+    let rows = collect_first_column(result);
+    assert_eq!(rows.len(), 3);
+
+    // MIN over a frame that is empty for the first rows (end bound 2
+    // PRECEDING while only 1 row exists) used to emit Int64(None) into a
+    // non-Int64 column.
+    let result = engine
+        .execute(
+            &mut session,
+            "SELECT MIN(ts) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) FROM tw",
+        )
+        .expect("empty-frame min");
+    assert_eq!(collect_first_column(result).len(), 3);
+    engine.segment_mgr().shutdown();
+}
+
+#[test]
+fn range_frame_preceding_end_bound_is_inclusive() {
+    let (_temp_dir, engine, mut session) = wc_create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE tr (v INT64)")
+        .expect("create");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO tr (v) VALUES (1), (2), (3)",
+        )
+        .expect("insert");
+
+    // SQL standard / PostgreSQL: RANGE BETWEEN UNBOUNDED PRECEDING AND 1
+    // PRECEDING for v=3 covers {1, 2} (v <= 3-1), not just {1}.
+    let result = engine
+        .execute(
+            &mut session,
+            "SELECT SUM(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM tr ORDER BY v",
+        )
+        .expect("range frame");
+    let sums = collect_first_column(result);
+    // v=1: empty frame -> NULL; v=2: {1}; v=3: {1,2}
+    assert_eq!(sums.len(), 3);
+    assert_eq!(sums[2], "3", "inclusive PRECEDING end bound sums 1+2");
+    engine.segment_mgr().shutdown();
+}
+
+fn collect_first_column(result: taibai::sql::execution::engine::ExecResult) -> Vec<String> {
+    use taibai::sql::execution::engine::ExecResult;
+    let ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    let mut values = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            values.push(
+                batch
+                    .scalar(row, 0)
+                    .map(|v| v.to_text().unwrap_or_else(|| "NULL".to_string()))
+                    .unwrap_or_else(|| "NULL".to_string()),
+            );
+        }
+    }
+    values
+}

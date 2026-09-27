@@ -35,13 +35,17 @@ fn materialize_predicate_dictionaries(
     range_predicates: &[crate::storage::partition::pruning::RangeClause],
     in_predicates: &[InPredicate],
 ) -> crate::common::error::Result<RecordBatch> {
-    let targets = predicate_dictionary_targets(eq_predicates, range_predicates, in_predicates);
+    // Materialize EVERY dictionary column, not just the predicate targets:
+    // apply_predicates re-invokes itself when any dictionary column remains,
+    // and a non-target dictionary column used to survive the "materialize
+    // targets" pass, recursing forever (stack overflow) on batches whose
+    // non-predicate columns were dictionary encoded.
+    let _ = predicate_dictionary_targets(eq_predicates, range_predicates, in_predicates);
     let columns: crate::common::error::Result<Vec<ColumnArray>> = batch
         .columns
         .iter()
-        .enumerate()
-        .map(|(idx, c)| {
-            if targets.contains(&idx) && matches!(c, ColumnArray::Dictionary { .. }) {
+        .map(|c| {
+            if matches!(c, ColumnArray::Dictionary { .. }) {
                 Ok(c.materialize_varchar())
             } else {
                 Ok(c.clone())

@@ -185,6 +185,11 @@ fn sort_batches(
     let mut rows = (0..total_rows as u32).collect::<Vec<_>>();
     let compare = |left: &u32, right: &u32| {
         compare_key_rows(&evaluated_keys, *left as usize, *right as usize, sort_exprs)
+            // Deterministic total order for tied keys: the original row
+            // position. `select_nth_unstable_by` shuffles ties, so without
+            // this tie-break ORDER BY + LIMIT picked arbitrary peers between
+            // executions (unstable pagination).
+            .then(left.cmp(right))
     };
     if let Some(limit) = limit {
         if limit > 0 && rows.len() > limit {

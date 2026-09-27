@@ -608,11 +608,18 @@ impl<'a> ScanExecutor<'a> {
                     let rg_outcomes: Vec<ReadOutcome> = if max_parallel == 1
                         || candidate_indices.len() < min_parallel
                     {
-                        candidate_indices
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(pos, rg_idx)| read_one(pos, rg_idx))
-                            .collect()
+                        // Serial fallback: the parallel path checks
+                        // cancellation at every chunk boundary; without the
+                        // same check here, a KILL QUERY mid-scan looked like
+                        // end-of-stream and returned a partial result.
+                        let mut serial = Vec::new();
+                        for (pos, rg_idx) in candidate_indices.iter().enumerate() {
+                            crate::common::query_cancel::check()?;
+                            if let Some(outcome) = read_one(pos, rg_idx) {
+                                serial.push(outcome);
+                            }
+                        }
+                        serial
                     } else {
                         let mut batches = Vec::new();
                         for (chunk_idx, chunk) in candidate_indices.chunks(max_parallel).enumerate()

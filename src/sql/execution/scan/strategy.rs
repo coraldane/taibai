@@ -95,6 +95,7 @@ impl<'a> ScanPlanner<'a> {
         if self.spec.has_aggregate
             || self.spec.has_group_by
             || self.spec.has_join
+            || self.spec.has_distinct_or_window
             || self.spec.remaining_predicate.is_some()
         {
             return None;
@@ -110,6 +111,7 @@ impl<'a> ScanPlanner<'a> {
             || self.spec.has_aggregate
             || self.spec.has_group_by
             || self.spec.has_join
+            || self.spec.has_distinct_or_window
             || self.spec.remaining_predicate.is_some()
             || self.spec.order_by.is_empty()
         {
@@ -689,7 +691,12 @@ fn default_column_for_missing_schema_col(
     let value = match &col_def.default_value {
         Some(crate::types::batch::ColumnDefaultValue::Literal(value)) => value.clone(),
         Some(crate::types::batch::ColumnDefaultValue::CurrentTimestamp) => {
-            ScalarValue::Timestamp(Some(now_micros()))
+            // Rows that predate an ALTER ADD COLUMN read the value pinned at
+            // ALTER time (col.added_at_micros); reading "now" made repeated
+            // queries return different values for the same row.
+            ScalarValue::Timestamp(Some(
+                col_def.added_at_micros.unwrap_or_else(now_micros),
+            ))
         }
         None => ScalarValue::null_for_type(col_def.data_type),
     };
