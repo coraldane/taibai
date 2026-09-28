@@ -174,9 +174,9 @@ impl Handler {
 
             MSG_TYPE_AUTH_FAIL => Ok(vec![build_error("authentication failed")]),
 
+            // 0x40 is a query-execution alias (see message.rs); there are no
+            // cursor semantics to open, so the payload runs as a plain query.
             MSG_TYPE_CURSOR => self.handle_cursor_open(&msg.payload),
-            MSG_TYPE_CURSOR_FETCH => self.handle_cursor_fetch(&msg.payload),
-            MSG_TYPE_CURSOR_CLOSE => self.handle_cursor_close(&msg.payload),
 
             MSG_TYPE_SUBSCRIBE => self.handle_subscribe(&msg.payload),
             MSG_TYPE_UNSUBSCRIBE => self.handle_unsubscribe(&msg.payload),
@@ -1251,16 +1251,6 @@ impl Handler {
 
     fn handle_cursor_open(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
         self.handle_query(payload)
-    }
-
-    fn handle_cursor_fetch(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
-        let _ = payload;
-        Ok(vec![build_error("cursors not fully implemented")])
-    }
-
-    fn handle_cursor_close(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
-        let _ = payload;
-        Ok(vec![build_ok(0)])
     }
 
     fn handle_flush(&mut self) -> Result<Vec<Message>> {

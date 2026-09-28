@@ -52,7 +52,7 @@ Taibai 可以读取 YAML 配置并启动数据库服务，主要配置包括监�
 - Ping/Pong。
 - Flush。
 - 事务消息。
-- Cursor 打开、拉取和关闭。
+- 0x40 查询别名（历史兼容：等同执行一条查询；游标语义从未实现，旧 0x41/0x42 已取消预留，发送方收到标准的"unsupported message type"错误）。
 - Prepare / Execute / Close Statement。
 - Batch Execute。
 - 列式批量导入消息。

@@ -562,9 +562,9 @@ struct Session {
 | `MsgTypeBeginTxn` | 0x30 | C→S | 开启事务(保留) |
 | `MsgTypeCommitTxn` | 0x31 | C→S | 提交事务(保留) |
 | `MsgTypeRollbackTxn` | 0x32 | C→S | 回滚事务(保留) |
-| `MsgTypeCursor` | 0x40 | C→S | 打开游标(保留) |
-| `MsgTypeCursorFetch` | 0x41 | C→S | 游标获取(保留) |
-| `MsgTypeCursorClose` | 0x42 | C→S | 关闭游标(保留) |
+| `MsgTypeCursor` | 0x40 | C→S | 查询执行别名（历史兼容；游标语义从未实现） |
+| `MsgTypeCursorFetch` | 0x41 | C→S | 已取消预留：发送方收到 unsupported message type 错误 |
+| `MsgTypeCursorClose` | 0x42 | C→S | 已取消预留：发送方收到 unsupported message type 错误 |
 | `MsgTypePrepare` | 0x50 | C→S | 预编译语句 |
 | `MsgTypeExecute` | 0x51 | C→S | 执行预编译 |
 | `MsgTypeCloseStmt` | 0x52 | C→S | 关闭预编译 |
@@ -572,7 +572,8 @@ struct Session {
 Phase 1 实现: Login/AuthOK/AuthFail, Ping/Pong, Query/Result/Error/OK, Logout
 Phase 2 实现: BulkInsert 系列
 Phase 4 实现: Prepare/Execute/CloseStmt, BinaryQueryResult
-后续: Transaction/Cursor 系列
+Phase 5 实现: Transaction 系列
+0x40 为查询执行别名;0x41/0x42 游标消息已取消预留(2026-09)
 
 ### 关键消息 Wire Format（与 taibai-go 精确对齐）
 

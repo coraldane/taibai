@@ -108,7 +108,8 @@
 | 相关子查询内使用 `?` 占位符 | `parameter markers (?) are not supported inside correlated subqueries` |
 | JOIN ON 条件中的子查询 | join 上下文不支持的表达式错误 |
 | UPDATE / DELETE 中的相关子查询 | 保持既有相关错误 |
-| 窗口函数 | 明确报不支持(有专门测试守护) |
+
+> 注：本表曾列"窗口函数不支持"，已过时——`ROW_NUMBER/RANK/DENSE_RANK/LEAD/LAG` 与窗口聚合已实现（`src/sql/execution/operators/window.rs`，见 `window_function_test`）。
 
 ## 四、已确认的设计行为(非缺陷)
 
@@ -127,3 +128,14 @@
 
 1. 去相关查询在确认右侧表均含于本次扫描集合后,可重新开放物理管线路径( pseudo 表需在 PhysicalContext 中补齐元数据映射)。
 2. `eval_filter` 仍是 WHERE 谓词在物化路径的唯一权威实现;`apply_remaining_mask` 现已传播求值错误,新增表达式类型不再有静默放行风险。
+
+## 七、2026-09 兼容性批次更新
+
+SQL 方言在本报告之后新增了以下能力（`sql-compat` 分支）：
+
+- 词法：`--` 行注释、`/* */` 块注释、双引号 `"col"` 与反引号 `` `col` `` 引用标识符。
+- 表达式：`CAST(expr AS type[(p[,s])])`；参数占位符在 `?` 之外新增 `$1/$2/...`（两者可混用）。
+- DML：`INSERT INTO t [(cols)] SELECT ...`（此前仅 `REPLACE INTO ... SELECT` 支持）。
+- 查询：非递归 CTE `WITH name AS (query) [, ...] query`（解析期脱糖为派生表）。
+- 集合：`INTERSECT`、`EXCEPT`；`INTERSECT` 优先级更高、`UNION/EXCEPT` 左结合；尾部 `ORDER BY/LIMIT/OFFSET` 现在正确作用于整个集合结果（此前挂在内层 SELECT 上被执行器忽略，属既有缺陷）。
+- 协议：游标消息 0x41/0x42 取消预留（从未实现），0x40 保留为查询执行别名；认证凭据改用 Argon2id 存储，旧 SipHash 哈希在下次成功登录时自动迁移。

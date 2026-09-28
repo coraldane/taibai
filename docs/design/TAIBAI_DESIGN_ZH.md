@@ -102,8 +102,8 @@ UPDATE t AS a SET a.salary = 60000.0 WHERE a.id = 1;
 DELETE FROM t WHERE id = 1;
 DELETE FROM t AS a WHERE a.id = 1;
 
--- 批量插入（高性能）
-INSERT_BATCH t VALUES (...);
+-- 插入查询结果（库内 ETL）
+INSERT INTO archive SELECT * FROM t WHERE ts < '2026-01-01';
 ```
 
 ### DQL (数据查询)
@@ -170,7 +170,6 @@ EXPLAIN SELECT ...;
 EXPLAIN ANALYZE SELECT ...;
 USE db_name;
 SHOW TABLES;
-SHOW TABLE STATUS;
 SHOW COLUMNS FROM t;
 FLUSH;
 ```
