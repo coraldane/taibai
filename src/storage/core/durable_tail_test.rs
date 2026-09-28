@@ -420,7 +420,11 @@ fn garbage_frame_length_is_treated_as_torn_frame() -> Result<()> {
     let path = live_tail_path(temp.path(), id)?.expect("tail should exist");
     let mut bytes = fs::read(&path)?;
     let first_payload_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-    let second_frame = 8 + 16 + first_payload_len + 4;
+    let frame_header_len = tail_frame_header_len(
+        u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+    )
+    .expect("current tail format");
+    let second_frame = 8 + frame_header_len + first_payload_len + 4;
     bytes[second_frame..second_frame + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     fs::write(&path, &bytes)?;
 
@@ -551,4 +555,131 @@ fn recovered_tail_preserves_null_values_in_mixed_columns() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn v3_frames_carry_monotonic_lsn_and_commit_timestamp() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    append(temp.path(), id, "2026", &test_batch(&schema, &[1])?)?;
+    append(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
+
+    let path = live_tail_path(temp.path(), id)?.expect("tail should exist");
+    let bytes = fs::read(&path)?;
+    let (partition, batch, frames) = decode_tail_with_meta(&bytes, &schema)?;
+    assert_eq!(partition, "2026");
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].rows, 1);
+    assert_eq!(frames[1].rows, 2);
+    assert!(frames[0].lsn < frames[1].lsn, "LSNs must be monotonic");
+    // Timestamps are wall-clock micros: after 2023-11-01 and not in the future.
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+    for frame in &frames {
+        assert!(frame.commit_ts_micros > 1_699_000_000_000_000);
+        assert!(frame.commit_ts_micros <= now_micros);
+    }
+    // The row-count scan still answers from headers alone.
+    assert_eq!(tail_log_rows(&path)?, Some(3));
+    Ok(())
+}
+
+#[test]
+fn v2_tail_log_still_decodes_with_zero_metadata() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let batch = test_batch(&schema, &[7, 8])?;
+    // Hand-build a V2-format tail log: 16-byte frame header.
+    let payload = serialize_batch_for_wal(&batch)?;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame.extend_from_slice(&2u64.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&frame);
+    frame.extend_from_slice(&hasher.finalize().to_le_bytes());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TAIL_LOG_MAGIC_V2.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&frame);
+    let (partition, decoded, frames) = decode_tail_with_meta(&bytes, &schema)?;
+    assert_eq!(partition, "");
+    assert_eq!(decoded.num_rows(), 2);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].lsn, 0);
+    assert_eq!(frames[0].commit_ts_micros, 0);
+    assert_eq!(frames[0].rows, 2);
+    Ok(())
+}
+
+#[test]
+fn dispose_tail_file_archives_only_when_enabled() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    // Proper <data>/<db>/<table> nesting so the archive root derives to
+    // <data>/wal/<db>/<table>/memtable_tail.
+    let table_dir = temp.path().join("data").join("main").join("t");
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(&table_dir, id, "", &test_batch(&schema, &[1])?)?;
+    let tail_dir = table_dir.join(TAIL_DIR);
+    let tail_file = live_tail_path(&table_dir, id)?.expect("tail should exist");
+
+    // Disabled: the tail is deleted (historic behavior).
+    dispose_tail_file(&tail_dir, &tail_file, false);
+    assert!(!tail_file.exists());
+
+    // Re-create and dispose with archive enabled: the file moves under
+    // <data>/wal/<db>/<table>/memtable_tail/.
+    persist(&table_dir, id, "", &test_batch(&schema, &[2])?)?;
+    let tail_file = live_tail_path(&table_dir, id)?.expect("tail should exist");
+    dispose_tail_file(&tail_dir, &tail_file, true);
+    assert!(!tail_file.exists(), "moved out of the tail dir");
+    // db dir inside tempdir = temp/<db>; persist created temp path directly,
+    // so the archive layout derives the db name from the parent chain.
+    let archived = find_archived_tail(temp.path());
+    if archived.is_none() {
+        let wal = temp.path().join("data").join("wal");
+        eprintln!("wal tree: {}", wal.display());
+        for entry in walk(&wal) {
+            eprintln!("  {}", entry.display());
+        }
+        panic!("archived copy must exist");
+    }
+    Ok(())
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn find_archived_tail(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let wal = root.join("data").join("wal");
+    for db in fs::read_dir(&wal).ok()? {
+        let db = db.ok()?.path();
+        for table in fs::read_dir(&db).ok()? {
+            let table = table.ok()?.path().join(TAIL_DIR);
+            for entry in fs::read_dir(&table).ok()? {
+                let entry = entry.ok()?.path();
+                if entry.extension().and_then(|e| e.to_str()) == Some("tail") {
+                    return Some(entry);
+                }
+            }
+        }
+    }
+    None
 }

@@ -197,6 +197,7 @@ where
     if !config.compression.enabled {
         pubsub_settings.compress_threshold = usize::MAX;
     }
+    crate::common::config::set_tail_archive_enabled(config.storage.tail_archive);
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
@@ -207,6 +208,7 @@ where
             .hot_store_memory_limit_mb
             .saturating_mul(1024 * 1024),
         config.storage.tail_async_fsync,
+
         pubsub_settings,
         config.storage.hot_warmup_enabled,
     ) {

@@ -32,6 +32,9 @@ storage:
   # true=ACK_ON_WAL（写入 page cache 即应答，延迟最低，但机器掉电可能丢失
   # 最近一批已应答数据）。测试/导入环境可用 true 换取吞吐，生产保持 false
   tail_async_fsync: false
+  # 清理 memtable tail 日志时归档而非删除（存放在 <data>/wal_archive/<db>/<table>/，
+  # 作为 PITR 与复制引导的增量日志源）。默认 false 保持原有删除行为（不增加磁盘占用）
+  tail_archive: false
 
 buffer:
   query_memory_limit_mb: 4096

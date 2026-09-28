@@ -141,6 +141,18 @@ pub fn insert_profile_enabled() -> bool {
     *INSERT_PROFILE_ENABLED.get().unwrap_or(&false)
 }
 
+static TAIL_ARCHIVE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Install the tail-archive switch sourced from `storage.tail_archive`.
+/// Called once during server startup; defaults to off.
+pub fn set_tail_archive_enabled(enabled: bool) {
+    let _ = TAIL_ARCHIVE_ENABLED.set(enabled);
+}
+
+pub fn tail_archive_enabled() -> bool {
+    *TAIL_ARCHIVE_ENABLED.get().unwrap_or(&false)
+}
+
 /// Install storage runtime tunables sourced from `compression.bulk_zstd_level`
 /// and `storage.reader_cache_capacity` in the config file. Called once during
 /// server startup, before any storage component reads them.
@@ -595,6 +607,12 @@ pub struct StorageSettings {
     /// fsync-bound disks. Default false keeps fsync-before-ack semantics.
     #[serde(default)]
     pub tail_async_fsync: bool,
+    /// Archive cleared durable-tail files under `<data>/wal_archive/<db>/<table>/`
+    /// instead of deleting them. The archive is the incremental-log source for
+    /// point-in-time recovery and future replication bootstrap. Default false
+    /// keeps the previous delete behavior (and the disk usage).
+    #[serde(default)]
+    pub tail_archive: bool,
     /// Number of segments kept in the reader and segment-metadata caches.
     #[serde(default = "default_reader_cache_capacity")]
     pub reader_cache_capacity: usize,
@@ -902,6 +920,7 @@ fn default_storage_settings() -> StorageSettings {
         row_group_target_rows: default_row_group_target_rows(),
         reader_cache_capacity: default_reader_cache_capacity(),
         tail_async_fsync: false,
+        tail_archive: false,
         mutation_lock_timeout_ms: default_mutation_lock_timeout_ms(),
         mutation_lock_warn_ms: default_mutation_lock_warn_ms(),
         tail_commit_timeout_ms: default_tail_commit_timeout_ms(),

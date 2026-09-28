@@ -21,6 +21,14 @@ const TAIL_MAGIC: u32 = 0x5441_494C;
 /// V2 tail log frames carry the row count in the frame header so recovery can
 /// index a tail without decompressing any payload.
 const TAIL_LOG_MAGIC_V2: u32 = 0x544C_4F48;
+/// V3 tail log frames extend the V2 header with a globally allocated LSN and
+/// a commit timestamp (micros since the Unix epoch), which replication site
+/// tracking and point-in-time recovery replay both need. The file header
+/// magic distinguishes the frame layouts; V2 files stay decodable.
+const TAIL_LOG_MAGIC_V3: u32 = 0x544C_4F56;
+/// Monotonic high-water for tail LSNs, seeded from the wall clock at thread
+/// start and never allowed to regress within the process.
+static TAIL_LSN_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 const FLUSH_MAGIC: u32 = 0x464C_5553;
 const TAIL_DIR: &str = "memtable_tail";
 static TAIL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -88,11 +96,16 @@ impl PreparedTailAppend {
             .unwrap_or(self.wal_payload.len())
     }
 
-    fn finish(&mut self, compressor: &mut zstd::bulk::Compressor<'_>) -> Result<()> {
+    fn finish(
+        &mut self,
+        compressor: &mut zstd::bulk::Compressor<'_>,
+        lsn: u64,
+        commit_ts_micros: i64,
+    ) -> Result<()> {
         if self.frame.is_none() {
             let raw = std::mem::take(&mut self.wal_payload);
             let payload = compress_prepared_batch_for_wal_with(compressor, raw)?;
-            self.frame = Some(encode_tail_frame_payload(&payload, self.rows));
+            self.frame = Some(encode_tail_frame_payload(&payload, self.rows, lsn, commit_ts_micros));
         }
         Ok(())
     }
@@ -390,8 +403,10 @@ fn open_tail_for_group_append(command: &AppendCommand) -> Result<OpenTailResult>
     let tail_dir = command.table_dir.join(TAIL_DIR);
     fs::create_dir_all(&tail_dir)?;
     if let Some(path) = newest_live_tail_path(&tail_dir, command.id)? {
-        let is_v2 = read_tail_log_version(&path)? == Some(TAIL_LOG_MAGIC_V2);
-        if is_v2 && read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key) {
+        let is_current_format = read_tail_log_version(&path)?.is_some();
+        if is_current_format
+            && read_tail_log_partition_key(&path)?.as_deref() == Some(&command.partition_key)
+        {
             let file = fs::OpenOptions::new().append(true).open(&path)?;
             return Ok(OpenTailResult::Ready(OpenTail {
                 file,
@@ -444,6 +459,13 @@ fn tail_commit_loop(
     let mut last_sync = Instant::now();
     let mut last_activity = Instant::now();
     let mut sync_cost = Duration::ZERO;
+    let mut next_lsn = {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        TAIL_LSN_HIGH_WATER.fetch_max(now, Ordering::AcqRel).max(now)
+    };
     loop {
         if async_fsync && !dirty_tails.is_empty() {
             let quiesced = last_activity.elapsed() >= async_quiesce_delay(sync_cost);
@@ -550,7 +572,8 @@ fn tail_commit_loop(
                 }
                 last_group_size = group.len();
 
-                let written = write_append_group(&mut files, &mut compressor, group);
+                let written = write_append_group(&mut files, &mut compressor, group, &mut next_lsn);
+                TAIL_LSN_HIGH_WATER.fetch_max(next_lsn, Ordering::AcqRel);
 
                 if async_fsync {
                     // Frames are in the page cache: release the
@@ -607,6 +630,7 @@ fn write_append_group(
     files: &mut TailFileSet,
     compressor: &mut zstd::bulk::Compressor<'_>,
     group: Vec<AppendCommand>,
+    next_lsn: &mut u64,
 ) -> Vec<WrittenTailGroup> {
     if crate::common::config::insert_profile_enabled() {
         let bytes = group
@@ -619,13 +643,22 @@ fn write_append_group(
             bytes
         );
     }
+    // Frames of one group commit together, so they share the commit
+    // timestamp (taken at write time, the durable-commit moment); the LSN
+    // is per frame and densely allocated on the single commit thread.
+    let commit_ts_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
     let mut by_tail = HashMap::<TailKey, (Vec<Arc<CommitCompletion>>, usize)>::new();
     for mut command in group {
         let frame_bytes = command.prepared.encoded_len();
         // Frame-encoding failure (payload beyond the WAL u32 length field)
         // fails this request like a write error instead of poisoning the
         // committer thread.
-        if let Err(error) = command.prepared.finish(compressor) {
+        let lsn = *next_lsn;
+        *next_lsn = next_lsn.saturating_add(1);
+        if let Err(error) = command.prepared.finish(compressor, lsn, commit_ts_micros) {
             command.completion.finish(Err(error.to_string()));
             continue;
         }
@@ -975,7 +1008,7 @@ pub fn finish_flush_batch(table_dir: &Path, intents: Vec<FlushIntent>) -> Result
             continue;
         };
         if ids.contains(&id) && !keep.contains(&path) {
-            remove_file_if_exists(&path)?;
+            archive_or_remove(&tail_dir, &path);
         }
     }
     for intent in intents {
@@ -1144,7 +1177,7 @@ fn encode_tail_log(partition_key: &str, batch: &RecordBatch) -> Result<Vec<u8>> 
 
 fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(8 + partition_key.len());
-    bytes.extend_from_slice(&TAIL_LOG_MAGIC_V2.to_le_bytes());
+    bytes.extend_from_slice(&TAIL_LOG_MAGIC_V3.to_le_bytes());
     bytes.extend_from_slice(&(partition_key.len() as u32).to_le_bytes());
     bytes.extend_from_slice(partition_key.as_bytes());
     bytes
@@ -1152,21 +1185,49 @@ fn encode_tail_log_header(partition_key: &str) -> Vec<u8> {
 
 fn encode_tail_frame(batch: &RecordBatch) -> Result<Vec<u8>> {
     let payload = serialize_batch_for_wal(batch)?;
-    Ok(encode_tail_frame_payload(&payload, batch.num_rows() as u64))
+    // Direct-write helpers (persist/append) allocate from the same
+    // monotonic counter as the commit thread, so every durable frame
+    // carries a unique, increasing LSN.
+    let lsn = TAIL_LSN_HIGH_WATER.fetch_add(1, Ordering::AcqRel) + 1;
+    let commit_ts_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    Ok(encode_tail_frame_payload(&payload, batch.num_rows() as u64, lsn, commit_ts_micros))
 }
 
-/// V2 frame layout: `[u64 payload_len][u64 rows][payload][crc32]`, with the
-/// CRC covering both header fields and the payload. V1 frames lacked the
-/// `rows` field; both versions remain decodable.
-fn encode_tail_frame_payload(payload: &[u8], rows: u64) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(20 + payload.len());
+/// V3 frame layout: `[u64 payload_len][u64 rows][u64 lsn][i64 commit_ts_micros]
+/// [payload][crc32]`, the CRC covering the four header fields and the payload.
+/// V2 frames (`[u64 payload_len][u64 rows][payload][crc32]`) and V1 frames
+/// (no `rows` field) remain decodable via the file-header magic.
+fn encode_tail_frame_payload(payload: &[u8], rows: u64, lsn: u64, commit_ts_micros: i64) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(32 + payload.len());
     frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     frame.extend_from_slice(&rows.to_le_bytes());
+    frame.extend_from_slice(&lsn.to_le_bytes());
+    frame.extend_from_slice(&commit_ts_micros.to_le_bytes());
     frame.extend_from_slice(payload);
     let mut hasher = Hasher::new();
     hasher.update(&frame);
     frame.extend_from_slice(&hasher.finalize().to_le_bytes());
     frame
+}
+
+/// Per-frame metadata surfaced to recovery, replication and PITR consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailFrameMeta {
+    pub lsn: u64,
+    pub commit_ts_micros: i64,
+    pub rows: u64,
+}
+
+/// Frame header length by file magic; `None` for unsupported versions.
+fn tail_frame_header_len(magic: u32) -> Option<usize> {
+    match magic {
+        TAIL_LOG_MAGIC_V3 => Some(32),
+        TAIL_LOG_MAGIC_V2 => Some(16),
+        _ => None,
+    }
 }
 
 fn encode_flush_target(segment_file_name: &str, expected_rows: u64) -> Vec<u8> {
@@ -1204,24 +1265,39 @@ fn verify_crc(bytes: &[u8]) -> Result<&[u8]> {
 }
 
 fn decode_tail(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
-    if bytes.len() < 4 || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
+    decode_tail_with_meta(bytes, schema).map(|(partition, batch, _)| (partition, batch))
+}
+
+/// Decode a tail log and surface per-frame metadata (LSN, commit timestamp).
+/// V2 files decode with zero LSNs/timestamps.
+fn decode_tail_with_meta(
+    bytes: &[u8],
+    schema: &Schema,
+) -> Result<(String, RecordBatch, Vec<TailFrameMeta>)> {
+    if bytes.len() < 4 {
         return Err(TaibaiError::Storage(
             "unsupported durable tail version".into(),
         ));
     }
-    decode_tail_log(bytes, schema)
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let frame_header_len = tail_frame_header_len(magic).ok_or_else(|| {
+        TaibaiError::Storage("unsupported durable tail version".into())
+    })?;
+    decode_tail_log_inner(bytes, schema, frame_header_len)
 }
 
 fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
+    decode_tail_with_meta(bytes, schema).map(|(partition, batch, _)| (partition, batch))
+}
+
+fn decode_tail_log_inner(
+    bytes: &[u8],
+    schema: &Schema,
+    frame_header_len: usize,
+) -> Result<(String, RecordBatch, Vec<TailFrameMeta>)> {
     if bytes.len() < 8 {
         return Err(TaibaiError::Storage("durable tail log is truncated".into()));
     }
-    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
-        return Err(TaibaiError::Storage(
-            "unsupported durable tail version".into(),
-        ));
-    }
-    let frame_header_len = 16usize;
     let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let mut offset = 8usize.saturating_add(partition_len);
     if offset > bytes.len() {
@@ -1233,6 +1309,7 @@ fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch
         .map_err(|_| TaibaiError::Storage("invalid durable tail partition key".into()))?
         .to_string();
     let mut recovered = RecordBatch::new(schema.clone());
+    let mut frames = Vec::new();
     let mut complete_frames = 0usize;
     while offset < bytes.len() {
         // A crash may leave the final append incomplete. All preceding frames
@@ -1258,6 +1335,20 @@ fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch
         }
         let batch = deserialize_batch_from_wal(&bytes[payload_start..payload_end], schema)?;
         append_batch(&mut recovered, &batch)?;
+        // V2 frames have no LSN/timestamp fields; report zeros there.
+        let (lsn, commit_ts_micros) = if frame_header_len >= 32 {
+            (
+                u64::from_le_bytes(bytes[offset + 16..offset + 24].try_into().unwrap()),
+                i64::from_le_bytes(bytes[offset + 24..offset + 32].try_into().unwrap()),
+            )
+        } else {
+            (0, 0)
+        };
+        frames.push(TailFrameMeta {
+            lsn,
+            commit_ts_micros,
+            rows: batch_rows_hint(&bytes[offset..payload_start]),
+        });
         complete_frames += 1;
         offset = frame_end;
     }
@@ -1266,7 +1357,16 @@ fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch
             "durable tail log contains no complete frame".into(),
         ));
     }
-    Ok((partition_key, recovered))
+    Ok((partition_key, recovered, frames))
+}
+
+/// The `rows` field of a frame header (V2 and V3 share its position).
+fn batch_rows_hint(frame_head: &[u8]) -> u64 {
+    if frame_head.len() >= 16 {
+        u64::from_le_bytes(frame_head[8..16].try_into().unwrap())
+    } else {
+        0
+    }
 }
 
 fn append_batch(target: &mut RecordBatch, batch: &RecordBatch) -> Result<()> {
@@ -1292,7 +1392,7 @@ fn read_tail_log_version(path: &Path) -> Result<Option<u32>> {
         return Err(error.into());
     }
     let magic = u32::from_le_bytes(header);
-    Ok((magic == TAIL_LOG_MAGIC_V2).then_some(magic))
+    Ok(tail_frame_header_len(magic).map(|_| magic))
 }
 
 /// Row count of a current-format tail log obtained by walking frame headers
@@ -1301,9 +1401,9 @@ fn scan_tail_log_rows(bytes: &[u8]) -> Option<u64> {
     if bytes.len() < 8 {
         return None;
     }
-    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
-        return None;
-    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let frame_header_len = tail_frame_header_len(magic)?;
+    let frame_min_len = frame_header_len + 4;
     let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let mut offset = 8usize.saturating_add(partition_len);
     if offset > bytes.len() {
@@ -1313,13 +1413,13 @@ fn scan_tail_log_rows(bytes: &[u8]) -> Option<u64> {
     while offset < bytes.len() {
         // Mirror decode_tail_log: a crash-truncated final frame ends the
         // valid prefix without failing the scan.
-        if bytes.len().saturating_sub(offset) < 20 {
+        if bytes.len().saturating_sub(offset) < frame_min_len {
             break;
         }
         let payload_len =
             u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
         let frame_rows = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
-        let payload_start = offset + 16;
+        let payload_start = offset + frame_header_len;
         let payload_end = payload_start.saturating_add(payload_len);
         let frame_end = payload_end.saturating_add(4);
         if frame_end > bytes.len() {
@@ -1347,7 +1447,7 @@ fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
         return Err(error.into());
     }
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
-    if magic != TAIL_LOG_MAGIC_V2 {
+    if tail_frame_header_len(magic).is_none() {
         return Ok(None);
     }
     let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
@@ -1450,7 +1550,8 @@ fn tail_file_has_header(path: &Path) -> bool {
     if file.read_exact(&mut header).is_err() {
         return false;
     }
-    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != TAIL_LOG_MAGIC_V2 {
+    let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    if tail_frame_header_len(magic).is_none() {
         return false;
     }
     let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
@@ -1552,7 +1653,11 @@ fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
 fn remove_other_generations(tail_dir: &Path, id: Uuid, keep_path: &Path) -> Result<()> {
     for generation in generations_for_id(tail_dir, id)? {
         if generation.path != keep_path {
-            remove_file_if_exists(&generation.path)?;
+            if matches!(generation.kind, GenerationKind::Tail) {
+                archive_or_remove(tail_dir, &generation.path);
+            } else {
+                remove_file_if_exists(&generation.path)?;
+            }
         }
     }
     Ok(())
@@ -1564,6 +1669,69 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Dispose of a durable-tail generation file after its rows became durable
+/// in a segment. With `storage.tail_archive` enabled, `.tail` files are
+/// MOVED into `<data>/wal/<db>/<table>/memtable_tail/` instead of deleted:
+/// the archive is the incremental-log source for point-in-time recovery and
+/// replication bootstrap. The top-level `wal` directory is reserved (never
+/// scanned as a database), so archived logs stay invisible to SQL. Archive
+/// failures degrade to deletion with a warning - losing an archive copy is
+/// recoverable from a fresh backup, while failing the clear would resurrect
+/// rows.
+fn archive_or_remove(tail_dir: &Path, path: &Path) {
+    dispose_tail_file(tail_dir, path, crate::common::config::tail_archive_enabled());
+}
+
+/// Testable core of [`archive_or_remove`]: `archive` selects between the
+/// move-to-archive and delete behaviors.
+fn dispose_tail_file(tail_dir: &Path, path: &Path, archive: bool) {
+    let is_tail = path.extension().and_then(|value| value.to_str()) == Some("tail");
+    if !is_tail || !archive {
+        if let Err(error) = remove_file_if_exists(path) {
+            tracing::warn!(file = %path.display(), error = %error, "tail cleanup failed");
+        }
+        return;
+    }
+    if let Some(archive_dir) = archive_dir_for(tail_dir) {
+        if fs::create_dir_all(&archive_dir).is_ok() {
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_os_string())
+                .unwrap_or_default();
+            let destination = archive_dir.join(file_name);
+            match fs::rename(path, &destination) {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        file = %path.display(),
+                        error = %error,
+                        "tail archive move failed; deleting instead"
+                    );
+                }
+            }
+        }
+    }
+    let _ = remove_file_if_exists(path);
+}
+
+/// `<data>/wal/<db>/<table>/memtable_tail` for a tail dir of
+/// `<data>/<db>/<table>/memtable_tail`. `None` when the layout is
+/// unexpected (custom data roots in tests).
+fn archive_dir_for(tail_dir: &Path) -> Option<std::path::PathBuf> {
+    let table_dir = tail_dir.parent()?;
+    let table_name = table_dir.file_name()?;
+    let db_dir = table_dir.parent()?;
+    let db_name = db_dir.file_name()?;
+    let data_dir = db_dir.parent()?;
+    Some(
+        data_dir
+            .join("wal")
+            .join(db_name)
+            .join(table_name)
+            .join(TAIL_DIR),
+    )
 }
 
 fn remove_empty_dir(path: &Path) {
