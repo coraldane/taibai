@@ -96,6 +96,18 @@ pub struct Engine {
     hot_partition_segments: Mutex<HashMap<std::path::PathBuf, HashSet<String>>>,
     /// Running queries as seen by `SHOW PROCESSLIST` / `KILL QUERY`.
     query_registry: Arc<crate::sql::execution::query_registry::QueryRegistry>,
+    /// Deferred DELETE/UPDATE mutations of explicit transactions. Shared
+    /// with the segment manager (scan overlay) and memtable manager
+    /// (flush pin); statements and commit/rollback reach it via this handle.
+    txn_mutations: Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>,
+}
+
+impl Engine {
+    pub fn txn_mutations(
+        &self,
+    ) -> &Arc<crate::storage::core::txn_mutations::TxnMutationRegistry> {
+        &self.txn_mutations
+    }
 }
 
 enum HotResidentMark {

@@ -111,7 +111,14 @@ pub fn compute_simple_aggregate(
     let needs_data_fold = has_sum || has_avg;
 
     for segment_path in &segment_files {
-        let meta = segment_mgr.segment_meta(segment_path)?;
+        // Footer sums/counts cannot see this transaction's deferred
+        // tombstones; treating the metadata as absent routes the segment
+        // through the overlay-aware reader below.
+        let meta = if segment_mgr.txn_has_segment_overlay(segment_path, spec.reader_txn_id) {
+            None
+        } else {
+            segment_mgr.segment_meta(segment_path)?
+        };
         let meta_deleted = meta
             .as_ref()
             .map(|m| m.deleted_row_count)
@@ -131,7 +138,7 @@ pub fn compute_simple_aggregate(
         // The sidecar meta decides without touching the segment file; when
         // it has not been written yet (first query after restart), the
         // cached reader's already-parsed footer answers the same question.
-        let reader = segment_mgr.open_reader_cached(segment_path)?;
+        let reader = segment_mgr.open_scan_reader(segment_path, spec.reader_txn_id)?;
         let footer_sums = if let Some(first) = meta
             .as_ref()
             .and_then(|m| m.row_groups.first())
@@ -1233,7 +1240,7 @@ pub fn compute_distinct_column(
     };
 
     for segment_path in &segment_files {
-        let reader = segment_mgr.open_reader_cached(segment_path)?;
+        let reader = segment_mgr.open_scan_reader(segment_path, spec.reader_txn_id)?;
         let Some(col_idx) = reader.schema().index_of(column_name) else {
             return Ok(None);
         };

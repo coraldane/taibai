@@ -72,6 +72,10 @@ name = "concurrency_stability_test"
 path = "tests/concurrency_stability_test.rs"
 
 [[test]]
+name = "transaction_dml_test"
+path = "tests/transaction_dml_test.rs"
+
+[[test]]
 name = "constraints_test"
 path = "tests/constraints_test.rs"
 

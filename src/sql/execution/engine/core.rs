@@ -160,6 +160,11 @@ impl Engine {
         let recovered_tail_tables =
             recover_durable_memtable_tails(data_dir, &catalogs, &batch_writer)?;
 
+        let txn_mutations =
+            Arc::new(crate::storage::core::txn_mutations::TxnMutationRegistry::new());
+        segment_mgr.set_txn_mutations(Arc::clone(&txn_mutations));
+        batch_writer.memtable_manager().set_txn_mutations(Arc::clone(&txn_mutations));
+
         let auth_manager = Arc::new(AuthManager::new(data_dir)?);
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
         for (db_name, catalog) in &mut catalogs {
@@ -218,6 +223,7 @@ impl Engine {
             performance_baselines,
             hot_partition_segments: Mutex::new(HashMap::new()),
             query_registry: Arc::new(crate::sql::execution::query_registry::QueryRegistry::new()),
+            txn_mutations,
         };
         if hot_warmup_enabled {
             engine.warmup_hot_stores();
@@ -466,8 +472,70 @@ impl Engine {
     }
 
 
-    fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
+    /// DDL and segment-rewriting maintenance statements have no transactional
+/// undo path: the catalog is rewritten in place and segment rewrites are
+/// immediately durable. They must not run inside an explicit transaction,
+/// otherwise ROLLBACK would silently keep their effects. Returns the SQL
+/// verb to name in the error message.
+fn transaction_forbidden_verb(stmt: &Statement) -> Option<&'static str> {
+    match stmt {
+        Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::DropIndex { .. }
+        | Statement::DropTable { .. }
+        | Statement::AlterTable { .. }
+        | Statement::Truncate { .. }
+        | Statement::CreateDatabase { .. }
+        | Statement::DropDatabase { .. }
+        | Statement::CreateUser { .. }
+        | Statement::AlterUser { .. }
+        | Statement::DropUser { .. }
+        | Statement::CreateRole { .. }
+        | Statement::DropRole { .. }
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. }
+        | Statement::RebuildUniqueIndex { .. }
+        | Statement::OptimizeTable { .. }
+        | Statement::FlushTable { .. }
+        | Statement::AnalyzeTable { .. } => Some(Self::stmt_name(stmt)),
+        _ => None,
+    }
+}
+
+fn stmt_name(stmt: &Statement) -> &'static str {
+    match stmt {
+        Statement::CreateTable { .. } => "CREATE TABLE",
+        Statement::CreateIndex { .. } => "CREATE INDEX",
+        Statement::DropIndex { .. } => "DROP INDEX",
+        Statement::DropTable { .. } => "DROP TABLE",
+        Statement::AlterTable { .. } => "ALTER TABLE",
+        Statement::Truncate { .. } => "TRUNCATE",
+        Statement::CreateDatabase { .. } => "CREATE DATABASE",
+        Statement::DropDatabase { .. } => "DROP DATABASE",
+        Statement::CreateUser { .. } => "CREATE USER",
+        Statement::AlterUser { .. } => "ALTER USER",
+        Statement::DropUser { .. } => "DROP USER",
+        Statement::CreateRole { .. } => "CREATE ROLE",
+        Statement::DropRole { .. } => "DROP ROLE",
+        Statement::Grant { .. } => "GRANT",
+        Statement::Revoke { .. } => "REVOKE",
+        Statement::RebuildUniqueIndex { .. } => "REBUILD UNIQUE INDEX",
+        Statement::OptimizeTable { .. } => "OPTIMIZE",
+        Statement::FlushTable { .. } => "FLUSH",
+        Statement::AnalyzeTable { .. } => "ANALYZE",
+        _ => "this statement",
+    }
+}
+
+fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecResult> {
         self.ensure_permissions(session, stmt)?;
+        if session.in_txn() {
+            if let Some(verb) = Self::transaction_forbidden_verb(stmt) {
+                return Err(TaibaiError::Sql(format!(
+                    "{verb} is not supported inside an explicit transaction; COMMIT or ROLLBACK first"
+                )));
+            }
+        }
         match stmt {
             Statement::CreateTable {
                 name,
@@ -784,15 +852,20 @@ impl Engine {
                     return Err(TaibaiError::Sql("no active transaction".into()));
                 }
                 let txn_id = session.active_txn_id();
+                // Deferred DML plans are dropped first: no durable state was
+                // written at statement time, so discarding them restores the
+                // pre-statement state.
+                let discarded_dml =
+                    super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
                 let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
                 tracing::debug!(
                     txn_id,
-                    rows_rolled_back = rolled_back,
+                    rows_rolled_back = rolled_back + discarded_dml,
                     "transaction rolled back"
                 );
                 session.rollback_txn();
                 Ok(ExecResult::Ok {
-                    rows_affected: rolled_back,
+                    rows_affected: rolled_back + discarded_dml,
                 })
             }
             Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),

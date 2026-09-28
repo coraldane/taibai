@@ -352,7 +352,7 @@ impl ScanCursor {
                 // a normal end-of-stream: catch it and fail the query instead.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     for (segment, precomputed) in segments.iter().zip(per_segment_candidates) {
-                        let reader = match runtime.segment_mgr().open_reader_cached(segment) {
+                        let reader = match runtime.segment_mgr().open_scan_reader(segment, spec.reader_txn_id) {
                             Ok(r) => r,
                             Err(e) => {
                                 if segment.exists() {
@@ -474,7 +474,7 @@ impl ScanCursor {
             self.current_reader = None;
             return;
         }
-        let reader = match self.runtime.segment_mgr().open_reader_cached(segment) {
+        let reader = match self.runtime.segment_mgr().open_scan_reader(segment, self.spec.reader_txn_id) {
             Ok(r) => r,
             Err(_) => {
                 self.current_reader = None;

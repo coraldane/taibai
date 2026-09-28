@@ -476,7 +476,7 @@ impl<'a> ScanExecutor<'a> {
                         continue;
                     }
 
-                    let reader = match mgr.open_reader_cached(seg_path) {
+                    let reader = match mgr.open_scan_reader(seg_path, self.spec.reader_txn_id) {
                         Ok(r) => r,
                         Err(error) => {
                             // A concurrent compaction may legitimately remove
@@ -748,7 +748,7 @@ impl<'a> ScanExecutor<'a> {
                     }
                     let reader = {
                         let _io = crate::common::work_limiter::acquire_io();
-                        match manager.open_reader_cached(path) {
+                        match manager.open_scan_reader(path, self.spec.reader_txn_id) {
                             Ok(reader) => reader,
                             // A segment removed by concurrent compaction is
                             // skipped; any other open failure fails the query.

@@ -384,6 +384,10 @@ impl Engine {
             .unwrap_or(false);
 
         if had_writes {
+            // Deferred in-transaction DELETE/UPDATE must be durable (footer
+            // rewrites, memtable tail rewrites) before the visibility flip
+            // inside commit_txn exposes the transaction's new rows.
+            super::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
             self.batch_writer().commit_txn(txn_id)?;
         }
 

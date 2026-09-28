@@ -547,6 +547,10 @@ pub struct MemTableManager {
     /// mirrored, which is what lets a resident-partition scan answer from
     /// the hot store alone even after the memtable has been flushed.
     hot_unfed_rows: Mutex<HashMap<(String, String, String), u64>>,
+    /// Deferred-DML registry (see `txn_mutations`). Set once by the engine
+    /// after construction; flush selection consults it to skip memtables
+    /// pinned by live transactions.
+    txn_mutations: RwLock<Option<Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>>>,
 }
 
 impl MemTableManager {
@@ -565,7 +569,21 @@ impl MemTableManager {
             low_rate_max_age_secs: low_rate_max_age_secs.max(max_age_secs),
             replace_key_indexes: RwLock::new(HashMap::new()),
             hot_unfed_rows: Mutex::new(HashMap::new()),
+            txn_mutations: RwLock::new(None),
         }
+    }
+
+    pub fn set_txn_mutations(
+        &self,
+        registry: Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>,
+    ) {
+        *self.txn_mutations.write().unwrap() = Some(registry);
+    }
+
+    pub fn txn_mutations(
+        &self,
+    ) -> Option<Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>> {
+        self.txn_mutations.read().unwrap().clone()
     }
 
     /// Record rows appended through a path that skipped the hot-store mirror.
@@ -980,6 +998,17 @@ impl MemTableManager {
                 if mt.state() != MemTableState::Pending || mt.is_transactional() {
                     return false;
                 }
+                // A transaction with deferred DELETE/UPDATE plans still needs
+                // this memtable's batch positions stable until COMMIT.
+                if self
+                    .txn_mutations
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|registry| registry.is_memtable_pinned(mt.id()))
+                {
+                    return false;
+                }
                 let rows = mt.row_count();
                 // A spilled memtable holds no resident rows, so the extended
                 // low-rate age brings no memory benefit — it only keeps tail
@@ -999,7 +1028,12 @@ impl MemTableManager {
         let memtables = self.memtables.read().unwrap();
         memtables
             .iter()
-            .filter(|mt| mt.state() == MemTableState::Pending)
+            .filter(|mt| {
+                // FLUSH ALL (and shutdown) must never materialize another
+                // session's uncommitted rows into segments: transactional
+                // memtables only reach segments through COMMIT.
+                mt.state() == MemTableState::Pending && !mt.is_transactional()
+            })
             .cloned()
             .collect()
     }

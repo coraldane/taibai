@@ -660,7 +660,15 @@ impl BatchWriter {
 
     pub fn flush_table(&self, db: &str, table: &str) -> Result<()> {
         self.wait_out_table_flush_io(db, table);
-        let mts = self.memtable_mgr.get_by_table(db, table);
+        // Transactional memtables reach segments only through COMMIT
+        // (see get_all_pending); flushing them here would publish
+        // another session's uncommitted rows.
+        let mts = self
+            .memtable_mgr
+            .get_by_table(db, table)
+            .into_iter()
+            .filter(|mt| !mt.is_transactional())
+            .collect::<Vec<_>>();
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(
                 &self.segment_mgr,
@@ -680,6 +688,7 @@ impl BatchWriter {
             .get_by_table(db, table)
             .into_iter()
             .filter(|memtable| memtable.partition_key() == partition_key)
+            .filter(|memtable| !memtable.is_transactional())
             .collect::<Vec<_>>();
         for group in Self::group_memtables_for_flush(mts) {
             Self::flush_memtable_group(

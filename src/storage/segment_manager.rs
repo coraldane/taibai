@@ -116,6 +116,11 @@ pub struct SegmentManager {
     /// startup after construction; `None` (unset) keeps the write path free
     /// of pub/sub work.
     pubsub: std::sync::OnceLock<std::sync::Arc<crate::pubsub::PubSubHub>>,
+    /// Deferred-DML registry. Set once at engine startup; scan-side reader
+    /// opens consult it to overlay a transaction's uncommitted tombstones,
+    /// and compaction/TTL consult it to leave pinned segments alone.
+    txn_mutations:
+        std::sync::OnceLock<std::sync::Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>>,
 }
 
 include!("segment_manager/manager_core.rs");

@@ -1,0 +1,397 @@
+//! Per-transaction registry of deferred segment/memtable mutations.
+//!
+//! DELETE and UPDATE inside an explicit transaction must not touch durable
+//! state at statement time (ROLLBACK would be unable to undo them, and
+//! uncommitted tombstones would leak to other sessions). Instead the
+//! statement plans its hits and records them here; the transaction's own
+//! readers consult the registry to hide the doomed rows, other sessions see
+//! the pre-statement state, and COMMIT materializes everything under the
+//! table mutation locks right before the visibility flip. A crash discards
+//! the registry, which is exactly ROLLBACK semantics.
+//!
+//! The registry also acts as a pin set: segments and memtables referenced by
+//! a live entry are off limits to compaction and background flush (row ids
+//! and batch positions must stay stable until COMMIT).
+
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use uuid::Uuid;
+
+use crate::storage::core::memtable::MemTable;
+use crate::types::batch::RecordBatch;
+
+/// Tombstoned rows of one segment, deferred to COMMIT.
+pub struct SegmentTombstones {
+    pub path: PathBuf,
+    /// Absolute row ids this transaction deleted (union across statements).
+    pub row_ids: BTreeSet<u64>,
+    /// Footer bitmap ∪ `row_ids`, snapshot for scan readers. Short bitmaps
+    /// are fine: `is_deleted` treats out-of-range rows as alive, so segments
+    /// that grew after composition stay correct.
+    pub composed: Arc<Vec<u8>>,
+}
+
+/// Rows of one committed memtable hidden from this transaction's readers and
+/// physically removed at COMMIT. Batch positions are prefix-stable: appends
+/// only extend the batch, so planned indices stay valid across the
+/// transaction's lifetime (the memtable is pinned against flush).
+pub struct MemtableTombstones {
+    pub memtable: Arc<MemTable>,
+    pub positions: Arc<BTreeSet<u32>>,
+}
+
+/// Deferred mutations of one (db, table).
+pub struct TableTxnMutations {
+    pub db: String,
+    pub table: String,
+    /// Partition keys the statements were narrowed to (`None` = table-wide).
+    /// Reused as the mutation-lock scope at COMMIT.
+    pub partitions: Option<Vec<String>>,
+    pub segments: Vec<SegmentTombstones>,
+    pub memtables: Vec<MemtableTombstones>,
+    /// Rows this transaction deleted or replaced; the catalog `row_count`
+    /// decrement is deferred to COMMIT with this value.
+    pub deleted_rows: u64,
+    /// Change-feed Delete events (pre-delete row images), published at COMMIT.
+    pub deferred_delete_batches: Vec<RecordBatch>,
+    /// Change-feed Update events (post-update row images), published at COMMIT.
+    pub deferred_update_batches: Vec<RecordBatch>,
+}
+
+impl TableTxnMutations {
+    fn new(db: &str, table: &str, partitions: Option<Vec<String>>) -> Self {
+        Self {
+            db: db.to_string(),
+            table: table.to_string(),
+            partitions,
+            segments: Vec::new(),
+            memtables: Vec::new(),
+            deleted_rows: 0,
+            deferred_delete_batches: Vec::new(),
+            deferred_update_batches: Vec::new(),
+        }
+    }
+
+    fn segment_entry_mut(&mut self, path: &Path) -> Option<&mut SegmentTombstones> {
+        self.segments.iter_mut().find(|entry| entry.path == path)
+    }
+
+    fn memtable_entry_mut(&mut self, memtable_id: Uuid) -> Option<&mut MemtableTombstones> {
+        self.memtables
+            .iter_mut()
+            .find(|entry| entry.memtable.id() == memtable_id)
+    }
+
+    fn is_pinned(&self) -> bool {
+        !self.segments.is_empty() || !self.memtables.is_empty()
+    }
+}
+
+/// All deferred mutations of one explicit transaction, across tables.
+#[derive(Default)]
+pub struct TxnMutations {
+    tables: Vec<TableTxnMutations>,
+}
+
+impl TxnMutations {
+    fn table_mut(&mut self, db: &str, table: &str) -> &mut TableTxnMutations {
+        if let Some(index) = self
+            .tables
+            .iter()
+            .position(|entry| entry.db == db && entry.table == table)
+        {
+            return &mut self.tables[index];
+        }
+        self.tables.push(TableTxnMutations::new(db, table, None));
+        self.tables.last_mut().expect("just pushed")
+    }
+}
+
+/// Shared registry hanging off the engine, segment manager (scan lookup) and
+/// memtable manager (flush pin). All methods take the single lock; entries
+/// are created by rare DML statements and probed per scan only by readers of
+/// transactions that actually ran DML.
+#[derive(Default)]
+pub struct TxnMutationRegistry {
+    inner: Mutex<HashMap<u64, TxnMutations>>,
+}
+
+impl TxnMutationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn table_entry<'a>(
+        inner: &'a mut HashMap<u64, TxnMutations>,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        partitions: Option<&[String]>,
+    ) -> &'a mut TableTxnMutations {
+        let txn = inner.entry(txn_id).or_default();
+        if let Some(index) = txn
+            .tables
+            .iter()
+            .position(|entry| entry.db == db && entry.table == table)
+        {
+            return &mut txn.tables[index];
+        }
+        let mut entry = TableTxnMutations::new(db, table, None);
+        if let Some(parts) = partitions {
+            entry.partitions = Some(parts.to_vec());
+        }
+        txn.tables.push(entry);
+        txn.tables.last_mut().expect("just pushed")
+    }
+
+    /// Record newly deleted segment rows for `txn_id`. `footer_bitmap` is the
+    /// segment's current footer bitmap; the composed reader bitmap is
+    /// recomputed as footer ∪ existing entry ∪ `newly_deleted`.
+    pub fn register_segment_tombstones(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        partitions: Option<&[String]>,
+        path: &Path,
+        footer_bitmap: &[u8],
+        newly_deleted: impl IntoIterator<Item = u64>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = Self::table_entry(&mut inner, txn_id, db, table, partitions);
+        let entry = if let Some(existing) = entry.segment_entry_mut(path) {
+            existing
+        } else {
+            entry.segments.push(SegmentTombstones {
+                path: path.to_path_buf(),
+                row_ids: BTreeSet::new(),
+                composed: Arc::new(Vec::new()),
+            });
+            entry.segments.last_mut().expect("just pushed")
+        };
+        for row_id in newly_deleted {
+            entry.row_ids.insert(row_id);
+        }
+        let mut composed = footer_bitmap.to_vec();
+        for &row_id in &entry.row_ids {
+            let byte = (row_id / 8) as usize;
+            let bit = (row_id % 8) as u8;
+            if byte >= composed.len() {
+                composed.resize(byte + 1, 0);
+            }
+            composed[byte] |= 1u8 << bit;
+        }
+        entry.composed = Arc::new(composed);
+    }
+
+    /// Record matched rows of a committed memtable for deferred removal.
+    pub fn register_memtable_tombstones(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        partitions: Option<&[String]>,
+        memtable: Arc<MemTable>,
+        positions: impl IntoIterator<Item = u32>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = Self::table_entry(&mut inner, txn_id, db, table, partitions);
+        let memtable_id = memtable.id();
+        let entry = if let Some(existing) = entry.memtable_entry_mut(memtable_id) {
+            existing
+        } else {
+            entry.memtables.push(MemtableTombstones {
+                memtable,
+                positions: Arc::new(BTreeSet::new()),
+            });
+            entry.memtables.last_mut().expect("just pushed")
+        };
+        let mut merged = (*Arc::clone(&entry.positions)).clone();
+        merged.extend(positions);
+        entry.positions = Arc::new(merged);
+    }
+
+    pub fn add_deleted_rows(&self, txn_id: u64, db: &str, table: &str, count: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(txn) = inner.get_mut(&txn_id) {
+            if let Some(entry) = txn
+                .tables
+                .iter_mut()
+                .find(|entry| entry.db == db && entry.table == table)
+            {
+                entry.deleted_rows += count;
+            }
+        }
+    }
+
+    pub fn defer_delete_event(&self, txn_id: u64, db: &str, table: &str, batch: RecordBatch) {
+        let mut inner = self.inner.lock().unwrap();
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_delete_batches
+            .push(batch);
+    }
+
+    pub fn defer_update_event(&self, txn_id: u64, db: &str, table: &str, batch: RecordBatch) {
+        let mut inner = self.inner.lock().unwrap();
+        Self::table_entry(&mut inner, txn_id, db, table, None)
+            .deferred_update_batches
+            .push(batch);
+    }
+
+    /// Composed delete bitmap for one of the transaction's pinned segments.
+    pub fn segment_overlay(&self, txn_id: u64, path: &Path) -> Option<Arc<Vec<u8>>> {
+        let inner = self.inner.lock().unwrap();
+        let txn = inner.get(&txn_id)?;
+        txn.tables
+            .iter()
+            .flat_map(|entry| entry.segments.iter())
+            .find(|segment| segment.path == path)
+            .map(|segment| Arc::clone(&segment.composed))
+    }
+
+    /// Existing tombstone row ids recorded for a segment by earlier
+    /// statements of this transaction, so a later statement can seed its
+    /// match bitmap and not double-count rows it already deleted.
+    pub fn segment_row_ids(&self, txn_id: u64, path: &Path) -> Vec<u64> {
+        let inner = self.inner.lock().unwrap();
+        let Some(txn) = inner.get(&txn_id) else {
+            return Vec::new();
+        };
+        txn.tables
+            .iter()
+            .flat_map(|entry| entry.segments.iter())
+            .find(|segment| segment.path == path)
+            .map(|segment| segment.row_ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Positions to hide in one of the transaction's pinned memtables.
+    pub fn memtable_positions(&self, txn_id: u64, memtable_id: Uuid) -> Option<Arc<BTreeSet<u32>>> {
+        let inner = self.inner.lock().unwrap();
+        let txn = inner.get(&txn_id)?;
+        txn.tables
+            .iter()
+            .flat_map(|entry| entry.memtables.iter())
+            .find(|entry| entry.memtable.id() == memtable_id)
+            .map(|entry| Arc::clone(&entry.positions))
+    }
+
+    /// True when any live transaction holds deferred mutations (pins) on the
+    /// table: compaction and TTL must leave its segments alone.
+    pub fn table_has_pins(&self, db: &str, table: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.values().any(|txn| {
+            txn.tables
+                .iter()
+                .any(|entry| entry.db == db && entry.table == table && entry.is_pinned())
+        })
+    }
+
+    /// True when a background flush must skip this memtable: a transaction
+    /// still needs its batch positions stable for the deferred removal.
+    pub fn is_memtable_pinned(&self, memtable_id: Uuid) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.values().any(|txn| {
+            txn.tables.iter().any(|entry| {
+                entry
+                    .memtables
+                    .iter()
+                    .any(|pinned| pinned.memtable.id() == memtable_id)
+            })
+        })
+    }
+
+    /// Detach the transaction's mutations for materialization at COMMIT.
+    /// On materialization failure the caller puts them back with
+    /// [`Self::put_back`] so the transaction can retry or roll back.
+    pub fn take(&self, txn_id: u64) -> Option<TxnMutations> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.remove(&txn_id)
+    }
+
+    pub fn put_back(&self, txn_id: u64, mutations: TxnMutations) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.insert(txn_id, mutations);
+    }
+
+    /// Drop the transaction's mutations (ROLLBACK or cleanup). Returns the
+    /// deferred deleted-row count for the rollback report.
+    pub fn remove(&self, txn_id: u64) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .remove(&txn_id)
+            .map(|txn| txn.tables.iter().map(|entry| entry.deleted_rows).sum())
+            .unwrap_or(0)
+    }
+}
+
+impl TxnMutations {
+    pub fn tables(&self) -> &[TableTxnMutations] {
+        &self.tables
+    }
+}
+
+/// Remove the given batch positions (deferred memtable tombstones) from a
+/// snapshot. Positions are prefix-stable indices recorded at statement time;
+/// appends only grow a memtable batch, so they stay valid until COMMIT.
+pub fn filter_batch_excluding_positions(
+    batch: &RecordBatch,
+    positions: &BTreeSet<u32>,
+) -> crate::common::error::Result<RecordBatch> {
+    if positions.is_empty() {
+        return Ok(batch.clone());
+    }
+    let keep: Vec<u32> = (0..batch.num_rows() as u32)
+        .filter(|row| !positions.contains(row))
+        .collect();
+    if keep.len() == batch.num_rows() {
+        return Ok(batch.clone());
+    }
+    let columns = batch
+        .columns
+        .iter()
+        .map(|column| column.take(&keep))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_tombstones_merge_and_compose() {
+        let registry = TxnMutationRegistry::new();
+        registry.register_segment_tombstones(7, "db", "t", None, Path::new("s1"), &[], [3, 9]);
+        registry.register_segment_tombstones(7, "db", "t", None, Path::new("s1"), &[], [3, 20]);
+        let composed = registry.segment_overlay(7, Path::new("s1")).unwrap();
+        assert!(composed.len() >= 3);
+        let is_set = |row: u64| {
+            composed[(row / 8) as usize] & (1u8 << (row % 8)) != 0
+        };
+        for row in [3u64, 9, 20] {
+            assert!(is_set(row), "row {row} must be set");
+        }
+        assert!(!is_set(4));
+        assert_eq!(registry.segment_row_ids(7, Path::new("s1")), vec![3, 9, 20]);
+    }
+
+    #[test]
+    fn take_remove_and_pins() {
+        let registry = TxnMutationRegistry::new();
+        registry.register_segment_tombstones(1, "db", "t", None, Path::new("s"), &[], [0]);
+        assert!(registry.table_has_pins("db", "t"));
+        assert!(!registry.table_has_pins("db", "other"));
+        let taken = registry.take(1).unwrap();
+        assert!(!registry.table_has_pins("db", "t"));
+        registry.put_back(1, taken);
+        assert!(registry.table_has_pins("db", "t"));
+        registry.register_segment_tombstones(2, "db", "t", None, Path::new("s2"), &[], [1]);
+        assert_eq!(registry.remove(1), 0);
+        assert!(registry.table_has_pins("db", "t"), "txn 2 still pins");
+        registry.remove(2);
+        assert!(!registry.table_has_pins("db", "t"));
+    }
+}

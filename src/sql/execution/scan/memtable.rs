@@ -266,10 +266,32 @@ pub fn scan_memtables(
     let mut batches = Vec::new();
 
     for mt in &memtables {
+        // Deferred in-transaction DELETE/UPDATE tombstones for this memtable:
+        // the transaction's own readers must not see the doomed rows.
+        let txn_positions = if spec.reader_txn_id != 0 {
+            memtable_mgr
+                .txn_mutations()
+                .and_then(|registry| registry.memtable_positions(spec.reader_txn_id, mt.id()))
+        } else {
+            None
+        };
         if let Some(mt_batch) = mt.read_with(|source| {
                 if source.num_rows() == 0 {
                     return None;
                 }
+
+                let source = match &txn_positions {
+                    Some(positions) => {
+                        match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+                            source, positions,
+                        ) {
+                            Ok(filtered) => filtered,
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    None => source.clone(),
+                };
+                let source = &source;
 
                 let filtered = if spec.has_predicates() {
                     match super::row_filter::apply_predicates(
@@ -480,10 +502,33 @@ pub fn count_memtable_rows(
     let mut total: u64 = 0;
 
     for mt in &memtables {
+        let txn_positions = if spec.reader_txn_id != 0 {
+            memtable_mgr
+                .txn_mutations()
+                .and_then(|registry| registry.memtable_positions(spec.reader_txn_id, mt.id()))
+        } else {
+            None
+        };
         if let Some(count) = mt.read_with(|mt_batch| {
             if mt_batch.num_rows() == 0 {
                 return 0;
             }
+
+            let mt_batch = match &txn_positions {
+                Some(positions) => {
+                    match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+                        mt_batch, positions,
+                    ) {
+                        Ok(filtered) => filtered,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "memtable overlay filter failed");
+                            return 0;
+                        }
+                    }
+                }
+                None => mt_batch.clone(),
+            };
+            let mt_batch = &mt_batch;
 
             if spec.eq_predicates.len() == 1
                 && spec.range_predicates.is_empty()

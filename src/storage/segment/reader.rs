@@ -55,6 +55,16 @@ pub struct SegmentReader {
     /// `row_group_start_row` used to re-sum per call (O(row_groups^2) per
     /// scan segment during delete-bitmap filtering).
     row_group_starts: Vec<u64>,
+    /// Uncommitted-transaction delete view, set only on scan-side reader
+    /// instances opened for a transaction that ran deferred DML (never on
+    /// the shared cached readers). When present, every delete lookup answers
+    /// from this composed bitmap instead of the footer.
+    txn_delete_overlay: Option<TxnDeleteOverlay>,
+}
+
+struct TxnDeleteOverlay {
+    bitmap: std::sync::Arc<Vec<u8>>,
+    deleted_count: u64,
 }
 
 struct FooterSource {
@@ -160,6 +170,7 @@ impl SegmentReader {
             footer,
             data_end: footer_source.data_end,
             row_group_starts,
+            txn_delete_overlay: None,
         })
     }
 
@@ -223,16 +234,39 @@ impl SegmentReader {
         self.footer.row_groups[row_group].row_count
     }
 
+    /// Attach a transaction's composed delete bitmap (footer ∪ deferred
+    /// tombstones of the owning transaction). Only fresh per-scan instances
+    /// receive this — the cached readers are shared across sessions.
+    pub fn set_txn_delete_overlay(&mut self, bitmap: std::sync::Arc<Vec<u8>>) {
+        let deleted_count = bitmap
+            .iter()
+            .map(|byte| byte.count_ones() as u64)
+            .sum();
+        self.txn_delete_overlay = Some(TxnDeleteOverlay {
+            bitmap,
+            deleted_count,
+        });
+    }
+
     pub fn deleted_row_count(&self) -> u64 {
-        self.footer.deleted_row_count
+        match &self.txn_delete_overlay {
+            Some(overlay) => overlay.deleted_count,
+            None => self.footer.deleted_row_count,
+        }
     }
 
     pub fn delete_bitmap(&self) -> &[u8] {
-        &self.footer.delete_bitmap
+        match &self.txn_delete_overlay {
+            Some(overlay) => &overlay.bitmap,
+            None => &self.footer.delete_bitmap,
+        }
     }
 
     pub fn is_row_deleted(&self, row_id: u64) -> bool {
-        let bm = &self.footer.delete_bitmap;
+        let bm = match &self.txn_delete_overlay {
+            Some(overlay) => &overlay.bitmap,
+            None => &self.footer.delete_bitmap,
+        };
         if bm.is_empty() {
             return false;
         }

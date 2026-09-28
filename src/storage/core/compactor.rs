@@ -200,6 +200,19 @@ impl Compactor {
             return Ok(CompactStats::default());
         }
 
+        // A live transaction holding deferred DELETE/UPDATE tombstones needs
+        // its pinned segments' row ids stable until COMMIT; rewriting them
+        // would strand the plans. The next run after the transaction ends
+        // picks the table up again.
+        if self
+            .segment_mgr
+            .txn_mutations()
+            .is_some_and(|registry| registry.table_has_pins(db, table))
+        {
+            tracing::debug!(db, table, "table pinned by an open transaction, skipping compaction");
+            return Ok(CompactStats::default());
+        }
+
         let schema = Schema::new(table_meta.columns.clone());
         let cluster_key_indices = self.get_cluster_key_indices(table_meta, &schema)?;
         let ttl = table_meta.ttl.as_ref().and_then(|info| {

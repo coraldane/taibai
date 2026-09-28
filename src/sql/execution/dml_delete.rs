@@ -53,10 +53,10 @@ impl ReplaceDeleteUndo {
 /// apply). Positions let the apply step compact the REPLACE key index instead
 /// of invalidating it.
 pub(crate) struct ReplaceMemtableConflictPlan {
-    memtable: Arc<MemTable>,
-    original: Arc<RecordBatch>,
-    filtered: Arc<RecordBatch>,
-    removed_positions: Vec<u32>,
+    pub(crate) memtable: Arc<MemTable>,
+    pub(crate) original: Arc<RecordBatch>,
+    pub(crate) filtered: Arc<RecordBatch>,
+    pub(crate) removed_positions: Vec<u32>,
 }
 
 fn filter_batch_keep(batch: &RecordBatch, keep: &[bool], keep_count: usize) -> Result<RecordBatch> {
@@ -125,7 +125,7 @@ pub(crate) fn plan_replace_memtable_conflicts(
 /// matching the DELETE predicate. Reuses the REPLACE two-phase plan/apply
 /// machinery so the physical removal and durable-tail rewrite are identical.
 /// The caller holds the table mutation lock.
-fn plan_delete_memtable_rows(
+pub(crate) fn plan_delete_memtable_rows(
     engine: &Engine,
     db: &str,
     table: &str,
@@ -978,6 +978,12 @@ pub fn exec_delete(
         (Schema::new(meta.columns.clone()), meta)
     };
 
+    if reader_txn_id > 0 {
+        return super::txn_dml::exec_delete_in_txn(
+            engine, db, table, where_clause, reader_txn_id, username,
+        );
+    }
+
     // Resolve subqueries through the permission-gated wrapper (a bare
     // resolve_in_subqueries here would let WHERE IN (SELECT ...) read tables
     // the user cannot SELECT).
@@ -1771,7 +1777,7 @@ fn first_column_values(
     values
 }
 
-fn segment_may_match(
+pub(crate) fn segment_may_match(
     reader: &SegmentReader,
     predicate: &crate::storage::segment::RowGroupPredicate,
 ) -> bool {
@@ -1819,7 +1825,7 @@ struct ClusterKeyBounds {
     upper: Option<(ScalarValue, bool)>,
 }
 
-fn prune_segments_by_cluster_key(
+pub(crate) fn prune_segments_by_cluster_key(
     segment_files: Vec<PathBuf>,
     mgr: &SegmentManager,
     schema: &Schema,

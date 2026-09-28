@@ -98,6 +98,7 @@ impl SegmentManager {
             next_txn_id: AtomicU64::new(1),
             config,
             pubsub: std::sync::OnceLock::new(),
+            txn_mutations: std::sync::OnceLock::new(),
         })
     }
 
@@ -106,6 +107,56 @@ impl SegmentManager {
     /// makes their rows visible.
     pub fn set_pubsub(&self, hub: std::sync::Arc<crate::pubsub::PubSubHub>) {
         let _ = self.pubsub.set(hub);
+    }
+
+    /// Wire the deferred-DML registry once at engine startup.
+    pub fn set_txn_mutations(
+        &self,
+        registry: std::sync::Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>,
+    ) {
+        let _ = self.txn_mutations.set(registry);
+    }
+
+    pub fn txn_mutations(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>> {
+        self.txn_mutations.get()
+    }
+
+    /// Open a reader for a query. Transactions that ran deferred DELETE or
+    /// UPDATE read through a fresh instance carrying their composed
+    /// tombstone overlay; every other reader takes the shared cache. The
+    /// overlay composition is the single choke point that makes all scan
+    /// paths (strategy, row filter, count, metadata aggregates) honor the
+    /// transaction's uncommitted DML.
+    pub fn open_scan_reader(
+        &self,
+        path: &Path,
+        reader_txn_id: u64,
+    ) -> Result<std::sync::Arc<SegmentReader>> {
+        let cached = self.open_reader_cached(path)?;
+        if reader_txn_id == 0 {
+            return Ok(cached);
+        }
+        let Some(registry) = self.txn_mutations() else {
+            return Ok(cached);
+        };
+        let Some(overlay) = registry.segment_overlay(reader_txn_id, path) else {
+            return Ok(cached);
+        };
+        let mut reader = SegmentReader::open(path)?;
+        reader.set_txn_delete_overlay(overlay);
+        Ok(std::sync::Arc::new(reader))
+    }
+
+    /// True when this transaction carries deferred tombstones for the
+    /// segment. Metadata fast paths that answer from footer counts or sums
+    /// must fall back to the overlay-aware reader for such segments.
+    pub fn txn_has_segment_overlay(&self, path: &Path, reader_txn_id: u64) -> bool {
+        reader_txn_id != 0
+            && self
+                .txn_mutations()
+                .is_some_and(|registry| registry.segment_overlay(reader_txn_id, path).is_some())
     }
 
     fn pubsub(&self) -> Option<std::sync::Arc<crate::pubsub::PubSubHub>> {

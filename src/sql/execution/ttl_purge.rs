@@ -36,6 +36,11 @@ pub fn purge_expired_partitions(engine: &Engine) -> Result<u64> {
 
     let mut rows_reclaimed = 0u64;
     for (db, table) in candidates {
+        // A live transaction with deferred DML pins this table's segments;
+        // removing whole partition directories would strand its plans.
+        if engine.txn_mutations().table_has_pins(&db, &table) {
+            continue;
+        }
         rows_reclaimed += purge_table(engine, &db, &table)?;
     }
     Ok(rows_reclaimed)

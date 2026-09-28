@@ -23,6 +23,11 @@ pub fn exec_update(
     reader_txn_id: u64,
     username: &str,
 ) -> Result<ExecResult> {
+    if reader_txn_id > 0 {
+        return super::txn_dml::exec_update_in_txn(
+            engine, db, table, assignments, where_clause, reader_txn_id, username,
+        );
+    }
     let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs
@@ -549,7 +554,7 @@ fn indexes_touched_by_assignments(
     indexes
 }
 
-fn update_memtable_batch(
+pub(crate) fn update_memtable_batch(
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
     table_schema: &Schema,
@@ -592,7 +597,7 @@ fn update_memtable_batch(
 
 /// Rebuild one column for the surviving rows of an UPDATE: untouched rows
 /// keep their value, matched survivors receive the (constant) assigned value.
-fn rebuild_update_column(
+pub(crate) fn rebuild_update_column(
     column: &ColumnArray,
     assigned: Option<&ScalarValue>,
     kept: &[u32],
@@ -620,7 +625,7 @@ fn rebuild_update_column(
 /// without row context), so resolve every assigned column index and value
 /// once instead of per row. Evaluation errors abort the statement (matching
 /// the pre-optimization behavior) instead of silently writing NULL.
-fn precompute_assigned_values(
+pub(crate) fn precompute_assigned_values(
     assignments: &[Assignment],
     table_schema: &Schema,
 ) -> Result<HashMap<usize, ScalarValue>> {
@@ -641,7 +646,7 @@ fn precompute_assigned_values(
     Ok(assigned)
 }
 
-fn build_update_mask(
+pub(crate) fn build_update_mask(
     reader: &crate::storage::segment::SegmentReader,
     row_group_idx: usize,
     where_clause: &Option<Expr>,
@@ -673,7 +678,7 @@ fn build_update_mask(
     Ok(mask)
 }
 
-fn segment_may_match(
+pub(crate) fn segment_may_match(
     reader: &crate::storage::segment::SegmentReader,
     predicate: Option<&crate::storage::segment::RowGroupPredicate>,
 ) -> bool {

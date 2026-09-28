@@ -66,15 +66,28 @@ Taibai 的可见性以 **memtable 为粒度**，不是行级多版本（MVCC）�
 - UPDATE 拒绝修改分区键，避免行在分区之间"移动"造成不一致。
 - 删除后的可见性（memtable 内、flush 后、混合状态）由 `delete_visibility_regression_test` 覆盖。
 
+## 显式事务内的 DELETE 与 UPDATE（延迟物化）
+
+显式事务（`BEGIN` 后）中的 DELETE / UPDATE 走**延迟物化**路径，与自动提交 DML 立即改段不同：
+
+- **语句执行时只登记计划**：段级命中记为墓碑 row id、已提交 memtable 命中记为 batch 位置，UPDATE 的新行写入本事务的 memtable。段文件与已提交数据在语句阶段**零写入**。
+- **本事务读自己的写**：事务内查询通过删除覆盖层（overlay）看到被删/被更新前的行已消失、新值已生效；**其他会话完全看不到未提交的 DML 效果**（与 ReadCommitted 一致）。
+- **COMMIT 时统一物化**：在表/分区互斥锁内，用与自动提交相同的幂等 journal 重写把墓碑落入段 footer、物理移除 memtable 行，随后才翻转 memtable 可见性。
+- **ROLLBACK = 丢弃计划**：因为语句阶段没有产生任何持久化状态，回滚只是丢弃登记；**崩溃同样等价于回滚**（旧行全部恢复）。
+- **互斥**：持有计划的事务会 pin 涉及的段与 memtable，后台 compaction、TTL 清理、flush 会跳过被 pin 的对象，直到事务结束。
+- **范围裁剪**：带 PRIMARY KEY、UNIQUE 索引、二级索引、HOT 或 TTL 的表在显式事务内执行 DELETE / UPDATE 会被明确拒绝（这些路径的延迟化尚未实现）；REPLACE 在事务内同样被拒绝。
+
+相关行为由 `tests/transaction_dml_test.rs` 覆盖（回滚恢复、提交持久化、跨会话隔离、多次语句累积、索引表拒绝）。
+
 ## 当前边界与不保证
 
 以下是当前版本**不提供**的行为，使用时应显式规避：
 
 0. **bulk / RELAXED 模式的持久性窗口**：`START BULK IMPORT` 会话与 RELAXED 写入走直写段路径（deferred flush），已确认（ACK）的行在会话结束或缓冲刷盘前**只驻留页缓存，不执行 fsync，也没有 durable tail 兜底**。此窗口内进程崩溃会丢失整批已确认数据；掉电风险场景请使用普通 INSERT（组提交 + fsync）或显式事务。作为交换，bulk 模式换来了批量导入吞吐（延迟 catalog 落盘、合并 fsync）。
-1. **DELETE 的事务语义**：对已刷盘数据，DELETE 是**物理 tombstone，不参与事务回滚**——事务内 DELETE 后执行 `ROLLBACK`，段上已标记的删除不会恢复。事务内未提交 memtable 行（本事务先 INSERT 的行）的删除在 ROLLBACK 时可以恢复。UPDATE 同理：段重写不可回滚。
+1. **自动提交 DELETE/UPDATE 的原子性**：自动提交（无 BEGIN）的 DELETE/UPDATE 立即物化，语句中途失败可能留下部分应用的效果。显式事务内的 DELETE/UPDATE 走延迟物化路径，可完整回滚（见上文）。
 1. **RepeatableRead / Serializable**：未实现。需要稳定快照的应用应在单条查询内完成读取，或自行在应用层加版本戳。
 2. **行级多版本（MVCC）**：不存在版本链；写冲突靠表级串行 + 约束检查解决。
-3. **事务内 DDL**：DDL 语句不检查活动事务，在事务内执行会**立即生效，且 `ROLLBACK` 不会回滚它**。事务应只包含 DML。
+3. **事务内 DDL**：DDL 与段重写类维护语句（CREATE/DROP/ALTER/TRUNCATE、OPTIMIZE、FLUSH、ANALYZE 等）在显式事务内会被**拒绝执行**（catalog 没有回滚能力），需先 COMMIT/ROLLBACK。
 4. **跨语句快照**：ReadCommitted 语义下，事务内每条语句都读取最新已提交数据。
 
 ## 代码索引
@@ -88,6 +101,7 @@ Taibai 的可见性以 **memtable 为粒度**，不是行级多版本（MVCC）�
 | 写入与提交流程 | `src/storage/core/batch_writer.rs`（`write_columns_with_txn` / `commit_txn` / `rollback_txn`） |
 | 读路径可见性过滤 | `src/sql/execution/scan/memtable.rs` |
 | 事务端到端行为 | `tests/transaction_integration_test.rs` |
+| 事务内 DELETE/UPDATE 延迟物化与隔离 | `src/sql/execution/txn_dml.rs`、`src/storage/core/txn_mutations.rs`、`tests/transaction_dml_test.rs` |
 | flush 期间读写一致性 | `tests/concurrency_stability_test.rs` |
 | 约束与冲突原子性 | `tests/constraints_test.rs` |
 | durable tail 组提交与惰性刷盘 | `src/storage/core/durable_tail.rs`（`tail_commit_loop` / 自适应窗口 / `sync_dirty_tails_for_table`） |

@@ -19,6 +19,7 @@ pub mod scan;
 pub mod spill;
 pub mod subquery_runtime;
 pub mod ttl_purge;
+pub mod txn_dml;
 pub mod wal_helper;
 
 pub use engine::{AutoCompactConfig, Engine, ExecResult};
