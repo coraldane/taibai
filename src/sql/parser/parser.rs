@@ -57,6 +57,14 @@ impl Parser {
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
             Token::Select => self.parse_select(),
+            Token::With => self.parse_with(),
+            // A statement may start with a parenthesized query expression
+            // (`(SELECT ...) UNION ...`); continue set-operation folding
+            // after the closing parenthesis.
+            Token::LeftParen => {
+                let first = self.parse_parenthesized_query()?;
+                self.finish_query(first)
+            }
             Token::Show => self.parse_show(),
             Token::Describe => self.parse_describe(),
             Token::Use => self.parse_use(),

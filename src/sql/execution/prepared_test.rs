@@ -111,12 +111,10 @@ fn test_bind_where_clause_regression() {
 }
 
 #[test]
-fn test_bind_union_trailing_clauses_on_right_select() {
-    // NOTE: in this parser, trailing ORDER BY / LIMIT / OFFSET after
-    // `... UNION SELECT ...` are consumed by the right-hand parse_select()
-    // and attached to the right Select, NOT to the Union node itself.
-    // So placeholder binding for them flows through the Select branch,
-    // which we verify here by descending into the right child.
+fn test_bind_union_trailing_clauses_on_union_node() {
+    // Trailing ORDER BY / LIMIT / OFFSET belong to the whole set operation,
+    // so the parser attaches them to the Union node itself (the executor
+    // sorts/limits the combined rows there).
     let mut stmt = parse_one("SELECT * FROM t1 UNION SELECT * FROM t2 ORDER BY ? LIMIT ? OFFSET ?");
     let params = [
         ScalarValue::Int64(Some(2)),
@@ -125,32 +123,42 @@ fn test_bind_union_trailing_clauses_on_right_select() {
     ];
     bind_params(&mut stmt, &params).expect("bind failed");
 
-    match stmt {
-        Statement::Union { right, .. } => match &*right {
-            Statement::Select {
-                order_by,
-                limit,
-                offset,
-                ..
-            } => {
-                assert_eq!(order_by.len(), 1);
-                assert!(matches!(
-                    &order_by[0].expr,
-                    Expr::Literal(ScalarValue::Int64(Some(2)))
-                ));
-                assert!(matches!(
-                    limit,
-                    Some(Expr::Literal(ScalarValue::Int64(Some(50))))
-                ));
-                assert!(matches!(
-                    offset,
-                    Some(Expr::Literal(ScalarValue::Int64(Some(5))))
-                ));
-            }
-            _ => panic!("expected right child to be Select"),
-        },
-        _ => panic!("expected Union"),
+    let Statement::Union {
+        right,
+        order_by,
+        limit,
+        offset,
+        ..
+    } = stmt
+    else {
+        panic!("expected Union");
+    };
+    match *right {
+        Statement::Select {
+            order_by: right_order,
+            limit: right_limit,
+            offset: right_offset,
+            ..
+        } => {
+            assert!(right_order.is_empty(), "right select must not carry ORDER BY");
+            assert!(right_limit.is_none(), "right select must not carry LIMIT");
+            assert!(right_offset.is_none(), "right select must not carry OFFSET");
+        }
+        _ => panic!("expected right child to be Select"),
     }
+    assert_eq!(order_by.len(), 1);
+    assert!(matches!(
+        &order_by[0].expr,
+        Expr::Literal(ScalarValue::Int64(Some(2)))
+    ));
+    assert!(matches!(
+        limit,
+        Some(Expr::Literal(ScalarValue::Int64(Some(50))))
+    ));
+    assert!(matches!(
+        offset,
+        Some(Expr::Literal(ScalarValue::Int64(Some(5))))
+    ));
 }
 
 #[test]

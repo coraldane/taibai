@@ -76,6 +76,10 @@ name = "constraints_test"
 path = "tests/constraints_test.rs"
 
 [[test]]
+name = "cte_set_operations_test"
+path = "tests/cte_set_operations_test.rs"
+
+[[test]]
 name = "data_types_test"
 path = "tests/data_types_test.rs"
 

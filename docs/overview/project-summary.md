@@ -72,7 +72,8 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - 词法：`--` 行注释、`/* */` 块注释、双引号 `"col"` 与反引号 `` `col` `` 引用标识符（可为保留字或含空格的列名）。
 - Join：Inner、Left、Right、Full、Cross、Semi、Anti,以及 ASOF JOIN / LEFT ASOF JOIN（按等值键分区、时间键二分的行情最近匹配连接）。
 - 子查询：`IN`、`EXISTS`、标量子查询等。
-- 集合查询：`UNION` / `UNION ALL`。
+- CTE：`WITH name AS (query) [, name AS (query)] query`（非递归，CTE 名可被后续 CTE 与主查询引用，支持 JOIN 与子查询内引用）。
+- 集合查询：`UNION / UNION ALL`、`INTERSECT`、`EXCEPT`；`INTERSECT` 优先级高于 `UNION`/`EXCEPT`，尾部 `ORDER BY / LIMIT / OFFSET` 作用于整个集合结果，支持括号包裹的查询表达式作为操作数。
 - 窗口函数：`ROW_NUMBER`、`RANK`、`DENSE_RANK`、`LEAD`、`LAG`，以及窗口聚合。
 - 管理语句：`USE`、`SHOW TABLES/DATABASES/COLUMNS/INDEXES/CREATE TABLE/USERS/ROLES/GRANTS/PARTITIONS/STATS/ENGINES/PROCESSLIST`、`KILL QUERY`（终止运行中的查询）。
 - 诊断语句：`EXPLAIN`、`EXPLAIN ANALYZE`。

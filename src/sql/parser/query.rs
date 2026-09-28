@@ -1,13 +1,218 @@
 use crate::common::error::{Result, TaibaiError};
 
 use crate::sql::parser::ast::{
-    FromClause, JoinClause, JoinExpr, JoinType, OrderByItem, SelectItem, Statement, TableRef,
+    Expr, FromClause, JoinClause, JoinExpr, JoinType, OrderByItem, SelectItem, SetOp, Statement,
+    TableRef,
 };
 use crate::sql::parser::lexer::Token;
 use crate::sql::parser::parser::Parser;
 
 impl Parser {
     pub fn parse_select(&mut self) -> Result<Statement> {
+        let first = if self.peek() == &Token::LeftParen {
+            self.parse_parenthesized_query()?
+        } else {
+            self.parse_select_core()?
+        };
+        self.finish_query(first)
+    }
+
+    /// `(...)`: a parenthesized query expression. Valid as a set-operation
+    /// operand and at statement level; trailing ORDER BY / LIMIT / OFFSET
+    /// inside the parentheses belong to the parenthesized query itself.
+    pub fn parse_parenthesized_query(&mut self) -> Result<Statement> {
+        self.expect(&Token::LeftParen)?;
+        let inner = if self.peek() == &Token::LeftParen {
+            self.parse_parenthesized_query()?
+        } else {
+            self.parse_select()?
+        };
+        self.expect(&Token::RightParen)?;
+        Ok(inner)
+    }
+
+    /// Fold set operations over an already-parsed first operand.
+    /// INTERSECT binds tighter than UNION/EXCEPT; UNION and EXCEPT share one
+    /// precedence level and fold left-associatively, as in PostgreSQL.
+    pub(crate) fn finish_query(&mut self, first: Statement) -> Result<Statement> {
+        let mut node = first;
+        while self.peek() == &Token::Intersect {
+            self.advance();
+            self.reject_set_op_all("INTERSECT")?;
+            let right = self.parse_set_operand()?;
+            node = Statement::Union {
+                left: Box::new(node),
+                right: Box::new(right),
+                op: SetOp::Intersect,
+                all: false,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+        }
+        while matches!(self.peek(), Token::Union | Token::Except) {
+            let (op, all) = if self.peek() == &Token::Union {
+                self.advance();
+                let all = if self.peek() == &Token::All {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                (SetOp::Union, all)
+            } else {
+                self.advance();
+                self.reject_set_op_all("EXCEPT")?;
+                (SetOp::Except, false)
+            };
+            let right = self.parse_set_operand()?;
+            node = Statement::Union {
+                left: Box::new(node),
+                right: Box::new(right),
+                op,
+                all,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+        }
+        self.parse_query_trailing_clauses(node)
+    }
+
+    /// One operand of a set operation: a bare SELECT (whose own INTERSECT
+    /// tail folds tighter) or a parenthesized query.
+    fn parse_set_operand(&mut self) -> Result<Statement> {
+        if self.peek() == &Token::LeftParen {
+            return self.parse_parenthesized_query();
+        }
+        let first = self.parse_select_core()?;
+        while self.peek() == &Token::Intersect {
+            self.advance();
+            self.reject_set_op_all("INTERSECT")?;
+            let right = self.parse_select_core()?;
+            return Ok(Statement::Union {
+                left: Box::new(first),
+                right: Box::new(right),
+                op: SetOp::Intersect,
+                all: false,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            });
+        }
+        Ok(first)
+    }
+
+    fn reject_set_op_all(&mut self, name: &str) -> Result<()> {
+        if self.peek() == &Token::All {
+            return Err(TaibaiError::Sql(format!(
+                "{} ALL is not supported (plain {} applies set semantics already)",
+                name, name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Attach trailing ORDER BY / LIMIT / OFFSET to the finished query. They
+    /// always belong to the whole query: the top SELECT, or the outermost
+    /// set-operation node (whose executor sorts/limits the combined rows).
+    fn parse_query_trailing_clauses(&mut self, mut node: Statement) -> Result<Statement> {
+        let mut order_by = Vec::new();
+        let mut limit = None;
+        let mut offset = None;
+        if self.peek() == &Token::Order {
+            self.advance();
+            self.expect(&Token::By)?;
+            loop {
+                let expr = self.parse_expr()?;
+                let desc = if self.peek() == &Token::Desc {
+                    self.advance();
+                    true
+                } else {
+                    if self.peek() == &Token::Asc {
+                        self.advance();
+                    }
+                    false
+                };
+                order_by.push(OrderByItem { expr, desc });
+                if self.peek() == &Token::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        if self.peek() == &Token::Limit {
+            self.advance();
+            limit = Some(self.parse_expr()?);
+        }
+        if self.peek() == &Token::Offset {
+            self.advance();
+            offset = Some(self.parse_expr()?);
+        }
+        if order_by.is_empty() && limit.is_none() && offset.is_none() {
+            return Ok(node);
+        }
+        match &mut node {
+            Statement::Select {
+                order_by: node_order,
+                limit: node_limit,
+                offset: node_offset,
+                ..
+            }
+            | Statement::Union {
+                order_by: node_order,
+                limit: node_limit,
+                offset: node_offset,
+                ..
+            } => {
+                *node_order = order_by;
+                *node_limit = limit;
+                *node_offset = offset;
+            }
+            _ => {}
+        }
+        Ok(node)
+    }
+
+    /// Parse `WITH name AS (query) [, name AS (query)]* query` by desugaring
+    /// the CTEs into derived tables: every reference to a CTE name in FROM /
+    /// JOIN / subquery positions of the main query (and of later CTE bodies)
+    /// is replaced with a subquery table ref. Non-recursive only.
+    pub fn parse_with(&mut self) -> Result<Statement> {
+        self.expect(&Token::With)?;
+        if self.peek() == &Token::Recursive {
+            return Err(TaibaiError::Sql(
+                "RECURSIVE CTEs are not supported".into(),
+            ));
+        }
+        let mut ctes: Vec<(String, Statement)> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            self.expect(&Token::As)?;
+            self.expect(&Token::LeftParen)?;
+            let mut body = self.parse_select()?;
+            self.expect(&Token::RightParen)?;
+            // A later CTE may reference earlier ones: desugar against the
+            // already-registered names before pushing, so self-reference
+            // stays an unknown-table error instead of silent recursion.
+            Self::substitute_cte_refs(&mut body, &ctes);
+            ctes.push((name, body));
+            if self.peek() == &Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let mut main = self.parse_select()?;
+        Self::substitute_cte_refs(&mut main, &ctes);
+        Ok(main)
+    }
+
+    /// A single SELECT without set operations and without trailing
+    /// ORDER BY / LIMIT / OFFSET (those belong to the enclosing chain; see
+    /// `parse_query_trailing_clauses`).
+    fn parse_select_core(&mut self) -> Result<Statement> {
         self.expect(&Token::Select)?;
 
         let distinct = if self.peek() == &Token::Distinct {
@@ -57,125 +262,167 @@ impl Parser {
             None
         };
 
-        let order_by = if self.peek() == &Token::Order {
-            self.advance();
-            self.expect(&Token::By)?;
-            let mut items = Vec::new();
-            loop {
-                let expr = self.parse_expr()?;
-                let desc = if self.peek() == &Token::Desc {
-                    self.advance();
-                    true
-                } else {
-                    if self.peek() == &Token::Asc {
-                        self.advance();
-                    }
-                    false
-                };
-                items.push(OrderByItem { expr, desc });
-                if self.peek() == &Token::Comma {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            items
-        } else {
-            Vec::new()
-        };
-
-        let limit = if self.peek() == &Token::Limit {
-            self.advance();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        let offset = if self.peek() == &Token::Offset {
-            self.advance();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        let select_stmt = Statement::Select {
+        Ok(Statement::Select {
             select_list,
             from,
             where_clause,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
             distinct,
-        };
-
-        self.parse_union_after_select(select_stmt)
+        })
     }
 
-    fn parse_union_after_select(&mut self, left: Statement) -> Result<Statement> {
-        if self.peek() != &Token::Union {
-            return Ok(left);
-        }
-        self.advance();
-        let all = if self.peek() == &Token::All {
-            self.advance();
-            true
-        } else {
-            false
-        };
-        let right_raw = self.parse_select()?;
-        let right = self.parse_union_after_select(right_raw)?;
-
-        let order_by = if self.peek() == &Token::Order {
-            self.advance();
-            self.expect(&Token::By)?;
-            let mut items = Vec::new();
-            loop {
-                let expr = self.parse_expr()?;
-                let desc = if self.peek() == &Token::Desc {
-                    self.advance();
-                    true
-                } else {
-                    if self.peek() == &Token::Asc {
-                        self.advance();
+    /// Rewrite every `TableRef::Table` whose bare name matches a CTE into a
+    /// subquery table ref, recursing through joins, derived tables and
+    /// expression-level subqueries. Unqualified names only: `db.cte` is left
+    /// untouched, matching PostgreSQL's scoped-name rule.
+    fn substitute_cte_refs(stmt: &mut Statement, ctes: &[(String, Statement)]) {
+        match stmt {
+            Statement::Select {
+                select_list,
+                from,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                ..
+            } => {
+                if let Some(from_clause) = from {
+                    Self::substitute_cte_from(from_clause, ctes);
+                }
+                for item in select_list.iter_mut() {
+                    if let crate::sql::parser::ast::SelectItem::Expr(e, _) = item {
+                        Self::substitute_cte_expr(e, ctes);
                     }
-                    false
-                };
-                items.push(OrderByItem { expr, desc });
-                if self.peek() == &Token::Comma {
-                    self.advance();
-                } else {
-                    break;
+                }
+                if let Some(e) = where_clause {
+                    Self::substitute_cte_expr(e, ctes);
+                }
+                for e in group_by.iter_mut() {
+                    Self::substitute_cte_expr(e, ctes);
+                }
+                if let Some(e) = having {
+                    Self::substitute_cte_expr(e, ctes);
+                }
+                for item in order_by.iter_mut() {
+                    Self::substitute_cte_expr(&mut item.expr, ctes);
+                }
+                if let Some(e) = limit {
+                    Self::substitute_cte_expr(e, ctes);
+                }
+                if let Some(e) = offset {
+                    Self::substitute_cte_expr(e, ctes);
                 }
             }
-            items
-        } else {
-            Vec::new()
-        };
+            Statement::Union { left, right, .. } => {
+                Self::substitute_cte_refs(left, ctes);
+                Self::substitute_cte_refs(right, ctes);
+            }
+            _ => {}
+        }
+    }
 
-        let limit = if self.peek() == &Token::Limit {
-            self.advance();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+    fn substitute_cte_from(from: &mut FromClause, ctes: &[(String, Statement)]) {
+        match from {
+            FromClause::Table(t) => Self::substitute_cte_table_ref(t, ctes),
+            FromClause::Join(JoinExpr { left, joins }) => {
+                Self::substitute_cte_from(left, ctes);
+                for join in joins.iter_mut() {
+                    Self::substitute_cte_table_ref(&mut join.right, ctes);
+                    if let Some(cond) = join.condition.as_mut() {
+                        Self::substitute_cte_expr(cond, ctes);
+                    }
+                }
+            }
+        }
+    }
 
-        let offset = if self.peek() == &Token::Offset {
-            self.advance();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+    fn substitute_cte_table_ref(t: &mut TableRef, ctes: &[(String, Statement)]) {
+        match t {
+            TableRef::Table { name, alias } if name.database.is_none() => {
+                if let Some((cte_name, body)) = ctes
+                    .iter()
+                    .find(|(cte_name, _)| cte_name.eq_ignore_ascii_case(&name.name))
+                {
+                    *t = TableRef::Subquery {
+                        query: Box::new(body.clone()),
+                        alias: alias.take().unwrap_or_else(|| cte_name.clone()),
+                    };
+                }
+            }
+            TableRef::Subquery { query, .. } => Self::substitute_cte_refs(query, ctes),
+            TableRef::Table { .. } => {}
+        }
+    }
 
-        Ok(Statement::Union {
-            left: Box::new(left),
-            right: Box::new(right),
-            all,
-            order_by,
-            limit,
-            offset,
-        })
+    fn substitute_cte_expr(expr: &mut Expr, ctes: &[(String, Statement)]) {
+        match expr {
+            Expr::Subquery(stmt) => Self::substitute_cte_refs(stmt, ctes),
+            Expr::Exists(inner) => Self::substitute_cte_expr(inner, ctes),
+            Expr::In { expr: inner, values, .. } => {
+                Self::substitute_cte_expr(inner, ctes);
+                for v in values.iter_mut() {
+                    Self::substitute_cte_expr(v, ctes);
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::substitute_cte_expr(left, ctes);
+                Self::substitute_cte_expr(right, ctes);
+            }
+            Expr::UnaryNot(inner) | Expr::UnaryMinus(inner) | Expr::IsNull(inner)
+            | Expr::IsNotNull(inner) => Self::substitute_cte_expr(inner, ctes),
+            Expr::Between { expr: inner, low, high, .. } => {
+                Self::substitute_cte_expr(inner, ctes);
+                Self::substitute_cte_expr(low, ctes);
+                Self::substitute_cte_expr(high, ctes);
+            }
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                if let Some(op) = operand {
+                    Self::substitute_cte_expr(op, ctes);
+                }
+                for (when, then) in when_clauses.iter_mut() {
+                    Self::substitute_cte_expr(when, ctes);
+                    Self::substitute_cte_expr(then, ctes);
+                }
+                if let Some(el) = else_clause {
+                    Self::substitute_cte_expr(el, ctes);
+                }
+            }
+            Expr::Like { expr: inner, pattern, .. } => {
+                Self::substitute_cte_expr(inner, ctes);
+                Self::substitute_cte_expr(pattern, ctes);
+            }
+            Expr::Function { args, .. } => {
+                for arg in args.iter_mut() {
+                    Self::substitute_cte_expr(arg, ctes);
+                }
+            }
+            Expr::WindowFunction {
+                func: _,
+                partition_by,
+                order_by,
+                frame: _,
+            } => {
+                for e in partition_by.iter_mut() {
+                    Self::substitute_cte_expr(e, ctes);
+                }
+                for item in order_by.iter_mut() {
+                    Self::substitute_cte_expr(&mut item.expr, ctes);
+                }
+            }
+            // Literal / Column / QualifiedColumn / Placeholder / Correlated
+            // carry no subqueries (Correlated is created after parsing).
+            _ => {}
+        }
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>> {

@@ -212,6 +212,7 @@ pub enum Statement {
     Union {
         left: Box<Statement>,
         right: Box<Statement>,
+        op: SetOp,
         all: bool,
         order_by: Vec<OrderByItem>,
         limit: Option<Expr>,
@@ -275,6 +276,16 @@ pub enum Statement {
     KillQuery {
         query_id: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    /// `UNION` / `UNION ALL`.
+    Union,
+    /// `INTERSECT`: distinct rows present in both operands.
+    Intersect,
+    /// `EXCEPT`: distinct rows of the left operand missing from the right.
+    Except,
 }
 
 #[derive(Debug, Clone, PartialEq)]
