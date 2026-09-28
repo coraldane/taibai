@@ -201,6 +201,10 @@ pub struct PubSubHub {
     /// fan-out thread) so dropped events consume a seq and stay detectable.
     topic_seqs: Mutex<HashMap<String, u64>>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Reliable pub/sub manager mirroring every committed insert into its
+    /// per-table retention log. Set once at engine construction; without it
+    /// the hub is the whole pub/sub feature.
+    mirror: std::sync::OnceLock<Arc<crate::storage::core::pubsub::PubSubManager>>,
 }
 
 impl PubSubHub {
@@ -235,6 +239,7 @@ impl PubSubHub {
             dropped_events: AtomicU64::new(0),
             topic_seqs: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
+            mirror: std::sync::OnceLock::new(),
         });
         hub.start_worker();
         hub
@@ -262,6 +267,31 @@ impl PubSubHub {
         self.settings.enabled && self.subs.subscriber_count.load(Ordering::Relaxed) > 0
     }
 
+    /// Attach the reliable-subscription manager. Every committed insert that
+    /// passes the publish gate is mirrored into its retention log.
+    pub fn set_mirror(&self, manager: Arc<crate::storage::core::pubsub::PubSubManager>) {
+        let _ = self.mirror.set(manager);
+    }
+
+    /// Gate for the insert capture path: true when either this hub or the
+    /// mirrored reliable-subscription manager can deliver the change. The
+    /// mirror counts active channels, not just live subscribers, so commits
+    /// keep flowing into the retention log between a disconnect and the
+    /// reconnect (that window is exactly what makes resume possible). The
+    /// idle reaper retires unused channels and closes the cost window.
+    pub fn has_any_subscribers(&self) -> bool {
+        if !self.settings.enabled {
+            return false;
+        }
+        if self.subs.subscriber_count.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        self.mirror
+            .get()
+            .map(|m| m.has_active_channels())
+            .unwrap_or(false)
+    }
+
     pub fn subscriber_count(&self) -> u64 {
         self.subs.subscriber_count.load(Ordering::Relaxed)
     }
@@ -281,13 +311,7 @@ impl PubSubHub {
     /// Publish a non-insert change event (deleted rows / post-update rows).
     /// Payload layout matches insert notifications; only the message type
     /// differs so existing subscribers can distinguish the kind.
-    pub fn publish_change(
-        &self,
-        kind: ChangeKind,
-        db: &str,
-        table: &str,
-        batch: RecordBatch,
-    ) {
+    pub fn publish_change(&self, kind: ChangeKind, db: &str, table: &str, batch: RecordBatch) {
         if !self.has_subscribers() || batch.num_rows() == 0 {
             return;
         }
@@ -312,7 +336,15 @@ impl PubSubHub {
     /// Same as [`publish`](Self::publish) for a batch that is already shared
     /// (e.g. a memtable snapshot), avoiding a column copy on the caller.
     pub fn publish_shared(&self, db: &str, table: &str, batch: Arc<RecordBatch>) {
-        if !self.has_subscribers() || batch.num_rows() == 0 {
+        if !self.has_any_subscribers() || batch.num_rows() == 0 {
+            return;
+        }
+        // Mirror into the reliable-subscription retention log first: it is a
+        // non-blocking try_send and keeps its own sequence space.
+        if let Some(mirror) = self.mirror.get() {
+            mirror.try_notify_committed_arc(db, table, Arc::clone(&batch));
+        }
+        if !self.has_subscribers() {
             return;
         }
         // Assign the sequence here, before the channel accepts the event: an

@@ -80,6 +80,7 @@ pub struct Engine {
     segment_mgr: Arc<SegmentManager>,
     batch_writer: BatchWriter,
     pubsub: Arc<crate::pubsub::PubSubHub>,
+    pubsub_manager: Arc<crate::storage::core::pubsub::PubSubManager>,
     bulk_mode_sessions: AtomicUsize,
     bulk_dirty_tables: Mutex<HashSet<(String, String)>>,
     in_flight_operations: AtomicUsize,

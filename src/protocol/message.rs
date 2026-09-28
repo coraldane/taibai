@@ -47,6 +47,27 @@ pub const MSG_TYPE_NOTIFICATION_DELETE: u8 = 0x64;
 /// Row-update change event: the payload carries the post-update rows.
 pub const MSG_TYPE_NOTIFICATION_UPDATE: u8 = 0x65;
 
+/// Reliable-subscription request (client -> server). Payload:
+/// `[string db][string table][u8 mode][u64 from_seq][string named]
+///  [u8 has_filter][...]`
+pub const MSG_TYPE_SUBSCRIBE_V2: u8 = 0x66;
+/// Reliable-subscription confirmation (server -> client). Payload:
+/// `[u64 sub_id][u64 epoch][u64 granted_from][u64 floor]`
+pub const MSG_TYPE_SUB_CONFIRMED: u8 = 0x67;
+/// Reliable-subscription data push (server -> client). Payload:
+/// `[u64 sub_id][u64 seq_start][u64 seq_end][u32 batch_count]
+///  [u32 len][bulk batch]...`
+pub const MSG_TYPE_SUB_DATA: u8 = 0x68;
+/// Reliable-subscription error / resync notice. Payload:
+/// `[u64 sub_id][u8 code][u64 aux][string message]`
+pub const MSG_TYPE_SUB_ERROR: u8 = 0x69;
+/// Reliable-subscription acknowledgement (client -> server). Payload:
+/// `[string db][string table][u64 sub_id][u64 seq]`
+pub const MSG_TYPE_SUB_ACK: u8 = 0x6A;
+/// Reliable-subscription removal (client -> server). Payload:
+/// `[string db][string table][u64 sub_id]`
+pub const MSG_TYPE_UNSUBSCRIBE_V2: u8 = 0x6B;
+
 #[derive(Debug, Clone)]
 pub struct MessageHeader {
     pub msg_type: u8,

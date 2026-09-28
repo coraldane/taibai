@@ -5,7 +5,7 @@ impl SegmentManager {
         table: &str,
         batch: RecordBatch,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true)
+        self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true, false)
     }
 
     pub fn bulk_insert_batch_ref(
@@ -14,7 +14,7 @@ impl SegmentManager {
         table: &str,
         batch: &RecordBatch,
     ) -> Result<u64> {
-        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true)
+        self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true, false)
     }
 
     pub fn bulk_insert_batch_with_partition(
@@ -30,6 +30,7 @@ impl SegmentManager {
             partition_key,
             batch,
             true,
+            false,
         )
     }
 
@@ -40,6 +41,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
@@ -60,6 +62,7 @@ impl SegmentManager {
             partition_key,
             batch,
             flush_immediately,
+            pubsub_deferred,
         )?;
         self.note_direct_segment_append(db, table);
         Ok(row_count)
@@ -72,6 +75,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: &RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<u64> {
         let row_count = batch.num_rows() as u64;
         if row_count == 0 {
@@ -92,6 +96,7 @@ impl SegmentManager {
             partition_key,
             batch,
             flush_immediately,
+            pubsub_deferred,
         )?;
 
         self.note_direct_segment_append(db, table);
@@ -240,7 +245,14 @@ impl SegmentManager {
         let table_dir = self.data_dir.join(db).join(table);
         std::fs::create_dir_all(&table_dir)?;
         let _visibility = state.flush_visibility.write().unwrap();
-        self.append_batch_with_partition_locked(&table_dir, state, partition_key, batch, true)?;
+        self.append_batch_with_partition_locked(
+            &table_dir,
+            state,
+            partition_key,
+            batch,
+            true,
+            false,
+        )?;
         Self::sleep_flush_transition_delay();
         on_written();
         Ok(true)
@@ -253,6 +265,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: &RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<()> {
         {
             let mut active_guard = state.active_segments.lock().unwrap();
@@ -264,7 +277,7 @@ impl SegmentManager {
             )?;
 
             let seg = active_guard.get_mut(partition_key).unwrap();
-            seg.append_batch(batch, &|path| self.invalidate_reader(path))?;
+            seg.append_batch(batch, pubsub_deferred, &|path| self.invalidate_reader(path))?;
 
             if seg.current_size >= self.max_segment_size() {
                 seg.seal(&|path| self.invalidate_reader(path))?;
@@ -375,6 +388,7 @@ impl SegmentManager {
             row_group_target_rows: self.config.row_group_target_rows.max(1),
             pubsub: self.pubsub(),
             pending_publish: Vec::new(),
+            pubsub_deferred_ranges: Vec::new(),
             compression_level: self.table_compression_level_for_path(table_dir)?,
         })
     }
@@ -409,12 +423,15 @@ impl SegmentManager {
             data_end: SEGMENT_HEADER_SIZE as u64,
             pubsub: None,
             pending_publish: Vec::new(),
+            pubsub_deferred_ranges: Vec::new(),
             sidecar_row_groups_flushed: 0,
             last_write_at: Instant::now(),
             row_group_target_rows: self.config.row_group_target_rows.max(1),
             compression_level: self.table_compression_level_for_path(path)?,
         };
-        writer.append_batch(batch, &|segment_path| self.invalidate_reader(segment_path))?;
+        writer.append_batch(batch, false, &|segment_path| {
+            self.invalidate_reader(segment_path)
+        })?;
         writer.seal(&|segment_path| self.invalidate_reader(segment_path))?;
         Ok(())
     }
@@ -426,6 +443,7 @@ impl SegmentManager {
         partition_key: &str,
         batch: RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<()> {
         let schema = batch.schema.clone();
         let mut active_guard = state.active_segments.lock().unwrap();
@@ -437,7 +455,7 @@ impl SegmentManager {
         )?;
 
         let seg = active_guard.get_mut(partition_key).unwrap();
-        seg.append_batch_owned(batch, &|path| self.invalidate_reader(path))?;
+        seg.append_batch_owned(batch, pubsub_deferred, &|path| self.invalidate_reader(path))?;
 
         if seg.current_size >= self.max_segment_size() {
             seg.seal(&|path| self.invalidate_reader(path))?;
@@ -556,6 +574,7 @@ impl SegmentManager {
             row_group_target_rows: self.config.row_group_target_rows.max(1),
             pubsub: self.pubsub(),
             pending_publish: Vec::new(),
+            pubsub_deferred_ranges: Vec::new(),
             compression_level: self.table_compression_level_for_path(seg_path)?,
         }))
     }

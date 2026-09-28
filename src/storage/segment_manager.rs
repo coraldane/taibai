@@ -1,7 +1,7 @@
 mod active_writer;
 mod cluster_meta_cache;
 mod config;
-mod helpers;
+pub(crate) mod helpers;
 mod reader_cache;
 mod segment_meta_cache;
 mod state;

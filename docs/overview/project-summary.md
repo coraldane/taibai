@@ -177,7 +177,7 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - 最近事件保存在内存队列中。
 - 事务内插入在提交后才发布变更事件。
 - 可按数据库和表过滤最近变更。
-- 变更订阅（Pub/Sub）：客户端通过 `SUBSCRIBE` 协议消息订阅表的插入变更，服务端带序号异步推送，主题支持通配符；详见[变更订阅文档](../user-guide/pubsub.md)。
+- 变更订阅（Pub/Sub）：客户端通过 `SUBSCRIBE` 协议消息订阅表的插入变更，服务端带序号异步推送，主题支持通配符；另有可靠订阅（`SUBSCRIBE_V2`，支持序列回放、ack 确认、具名书签续传与列过滤）；详见[变更订阅文档](../user-guide/pubsub.md)。
 
 ## 批量导入与性能方向
 

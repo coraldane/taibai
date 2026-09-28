@@ -80,3 +80,40 @@ fn test_decode_invalid_zlib_prefix_payload_left_untouched() {
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(&decoded.payload[..], &payload[..]);
 }
+
+#[test]
+fn test_change_event_notifications_are_not_recompressed() {
+    // The fan-out thread compresses delete/update notification payloads once
+    // before pushing; the codec must not compress them again or a client's
+    // single decompress pass leaves zlib bytes that parse as garbage.
+    for msg_type in [
+        MSG_TYPE_NOTIFICATION,
+        MSG_TYPE_NOTIFICATION_INSERT,
+        MSG_TYPE_NOTIFICATION_DELETE,
+        MSG_TYPE_NOTIFICATION_UPDATE,
+    ] {
+        let mut codec = MessageCodec::new(1024 * 1024).with_compression(64);
+        // Compress once, as the fan-out thread does. The inner payload is
+        // pseudo-random so the compressed form still exceeds the threshold.
+        let inner: Vec<u8> = (0..8192u64)
+            .map(|i| ((i.wrapping_mul(6364136223846793005).wrapping_shr(33)) & 0xFF) as u8)
+            .collect();
+        let once = crate::protocol::compress::zlib_compress(&inner).expect("compress");
+        assert!(once.len() > 64, "test payload must exceed the threshold");
+
+        let msg = Message::new(msg_type, Bytes::from(once.clone()));
+        let mut buf = BytesMut::new();
+        codec.encode(msg, &mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            HEADER_SIZE + once.len(),
+            "payload was recompressed for {msg_type:#04X}"
+        );
+
+        // The wire carries exactly the fan-out bytes (checked above), so one
+        // client-side decode pass restores the original payload.
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.msg_type, msg_type);
+        assert_eq!(decoded.payload, Bytes::from(inner));
+    }
+}

@@ -82,3 +82,70 @@ pubsub:
 - DELETE/UPDATE 事件只在存在订阅者时才产生（否则零开销，DELETE 保持纯 tombstone 路径）。
 - 有订阅者时，DELETE 需要读取被删行的全部列来构造事件（无订阅者时仍使用仅键列投影的优化路径）。
 - 旧版本客户端会把 0x64/0x65 当作未知消息类型；客户端与服务端需一同升级。
+
+## 可靠订阅（SUBSCRIBE_V2）
+
+在一的通知模型之上，taibai 还提供**可恢复**的表级订阅：服务端把已提交的插入批次写入每表的有界保留日志，客户端按连续序号接收、确认（ack），断线后可以从上次处理到的序号继续，也可以用**具名书签**跨连接续传。
+
+### 协议消息
+
+| 消息类型 | 值 | 方向 | 载荷 |
+| --- | --- | --- | --- |
+| `SUBSCRIBE_V2` | `0x66` | 客户端 → 服务端 | `[string db][string table][u8 mode][u64 from_seq][string named][u8 has_filter][过滤]` |
+| `SUB_CONFIRMED` | `0x67` | 服务端 → 客户端 | `[u64 sub_id][u64 epoch][u64 granted_from][u64 floor]` |
+| `SUB_DATA` | `0x68` | 服务端 → 客户端（推送） | `[u64 sub_id][u64 seq_start][u64 seq_end][u32 batch_count][u32 len][批量插入编码]...` |
+| `SUB_ERROR` | `0x69` | 服务端 → 客户端（推送） | `[u64 sub_id][u8 code][u64 aux][string message]` |
+| `SUB_ACK` | `0x6A` | 客户端 → 服务端 | `[string db][string table][u64 sub_id][u64 seq]` |
+| `UNSUBSCRIBE_V2` | `0x6B` | 客户端 → 服务端 | `[string db][string table][u64 sub_id]` |
+
+- `mode`：`0` = 从当前头部开始；`1` = 从 `from_seq` 之后开始（服务端回放保留窗口内的历史，`granted_from` 会被钳制到当前头部）。
+- `named`：具名订阅。每次 ack 定期把序号写入 `<数据目录>/pubsub/` 下的书签文件，之后用同名订阅自动从书签处续传。
+- `has_filter`：列过滤。只投递该列文本值命中的行（NULL 不匹配）；订阅时校验列存在。
+- 订阅失败（无权限、表/列不存在、pubsub 关闭）以普通 `ERROR` 应答；`SUB_ERROR` 只用于异步推送，`code = 1` 表示**需要重新同步**（`aux` 为保留下限 `floor`）：保留窗口已覆盖不到该订阅，客户端应从 `floor` 重新订阅并自行补齐缺口。
+- `SUB_DATA` 的载荷与 `BULK_INSERT_COLUMNAR` 的批次编码一致，客户端无需访问目录即可解码。
+
+### 投递与保留语义
+
+- 每表通道维护单调序号；`seq_start..=seq_end` 在单帧内连续，服务端会把多个批次合并进一帧。
+- 保留日志按 `log_max_batches` / `log_max_bytes_mb` 有界；被逐出的序号会让落后订阅者收到重同步通知。
+- 断开连接（或显式退订）期间的提交仍会进入保留日志，所以重连后能补齐——这正是书签续传的前提。
+- 通道在无订阅者且空闲超过 60 秒后被**退役**：保留日志释放、写入路径停止镜像；再次订阅会自动重新激活。序号永不重置（`epoch` 仅在服务重启后变化）。
+- 事务提交、autocommit 插入、批量导入可见化都会进日志；`UPDATE` / `DELETE` 变更仍只走一代通知。
+
+### 配置
+
+```yaml
+pubsub:
+  # ... 一代配置之外，新增：
+  commit_ring_capacity: 65536   # 写入 -> publisher 线程的提交环形队列
+  poll_interval_ms: 50          # 投递任务无唤醒时的兜底轮询间隔
+  log_max_batches: 1024         # 每表保留日志的批次数上限
+  log_max_bytes_mb: 64          # 每表保留日志的字节数上限
+  max_batches_per_frame: 32     # 单个 SUB_DATA 帧合并的批次上限
+```
+
+### 客户端 API（Rust）
+
+```rust
+let grant = client
+    .subscribe_v2("main", "ticks", None, Some("worker-a"), Some(("symbol", &["AAPL"][..])))
+    .await?;
+
+loop {
+    match client.recv_sub_event_timeout(Duration::from_secs(5)).await? {
+        Some(SubEvent::Data(frame)) => {
+            // frame.seq_start..=frame.seq_end, frame.batches
+            client
+                .ack_subscription("main", "ticks", grant.sub_id, frame.seq_end)
+                .await?;
+        }
+        Some(SubEvent::ResyncRequired { sub_id, floor }) => {
+            // 保留窗口覆盖不到了：从 floor 重新订阅并重查表数据
+            break;
+        }
+        None => { /* 暂无事件 */ }
+    }
+}
+
+client.unsubscribe_v2("main", "ticks", grant.sub_id).await?;
+```

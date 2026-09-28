@@ -1,12 +1,12 @@
 use std::time::Duration;
 
+use super::ChangeKind;
 use super::{PubSubHub, TopicPattern};
 use crate::common::config::PubSubSettings;
 use crate::protocol::message::{
     read_len_prefixed_string, MSG_TYPE_NOTIFICATION, MSG_TYPE_NOTIFICATION_DELETE,
     MSG_TYPE_NOTIFICATION_UPDATE,
 };
-use super::ChangeKind;
 use crate::protocol::types::DataType;
 use crate::types::array::ColumnArray;
 use crate::types::batch::{ColumnDef, RecordBatch, Schema};
@@ -19,6 +19,7 @@ fn test_settings(event_capacity: usize, notification_capacity: usize) -> PubSubS
         max_subscriptions: 16,
         notification_channel_capacity: notification_capacity,
         compress_threshold: usize::MAX,
+        ..crate::common::config::PubSubSettings::default()
     }
 }
 

@@ -54,6 +54,13 @@ impl Engine {
         &self.pubsub
     }
 
+    /// Reliable-subscription manager backing the SUBSCRIBE_V2 protocol
+    /// messages (resumable sequences, acks, named bookmarks, column
+    /// filters). Mirrored through [`Self::pubsub`] on every committed insert.
+    pub fn pubsub_manager(&self) -> &Arc<crate::storage::core::pubsub::PubSubManager> {
+        &self.pubsub_manager
+    }
+
     pub fn memtable_manager(&self) -> &Arc<MemTableManager> {
         self.batch_writer.memtable_manager()
     }

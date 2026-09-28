@@ -6,7 +6,7 @@ impl SegmentManager {
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: RecordBatch,
     ) -> Result<u64> {
-        self.bulk_insert_batch_partitioned_inner(db, table, table_meta, batch, true)
+        self.bulk_insert_batch_partitioned_inner(db, table, table_meta, batch, true, false)
     }
 
     pub fn bulk_insert_batch_partitioned_deferred(
@@ -16,7 +16,7 @@ impl SegmentManager {
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: RecordBatch,
     ) -> Result<u64> {
-        self.bulk_insert_batch_partitioned_inner(db, table, table_meta, batch, false)
+        self.bulk_insert_batch_partitioned_inner(db, table, table_meta, batch, false, true)
     }
 
     fn bulk_insert_batch_partitioned_inner(
@@ -26,6 +26,7 @@ impl SegmentManager {
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: RecordBatch,
         flush_immediately: bool,
+        pubsub_deferred: bool,
     ) -> Result<u64> {
         if !table_meta.is_partitioned() {
             return self.bulk_insert_batch_with_partition_owned_inner(
@@ -34,6 +35,7 @@ impl SegmentManager {
                 "",
                 batch,
                 flush_immediately,
+                pubsub_deferred,
             );
         }
 
@@ -46,6 +48,7 @@ impl SegmentManager {
                     "",
                     batch,
                     flush_immediately,
+                    pubsub_deferred,
                 )
             }
         };
@@ -76,6 +79,7 @@ impl SegmentManager {
                 &first_key,
                 batch,
                 flush_immediately,
+                pubsub_deferred,
             );
         }
 
@@ -109,6 +113,7 @@ impl SegmentManager {
                     &partition_key,
                     part_batch,
                     flush_immediately,
+                    pubsub_deferred,
                 )?;
             }
             return Ok(written);
@@ -139,6 +144,7 @@ impl SegmentManager {
                 &partition_key,
                 part_batch,
                 flush_immediately,
+                pubsub_deferred,
             )?;
         }
         Ok(written)

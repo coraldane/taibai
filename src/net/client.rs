@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
 use crate::common::error::{Result, TaibaiError};
+use crate::net::pubsub_session::decode_sub_confirmed;
 use crate::protocol::codec::MessageCodec;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;
@@ -22,6 +23,13 @@ pub struct BulkImportConfig;
 /// Upper bound on server notifications buffered while request replies are
 /// being consumed (mirrors the server's bounded per-connection push queue).
 const MAX_BUFFERED_NOTIFICATIONS: usize = 8_192;
+/// Decode guards for server results: a frame that fails these is corrupt or
+/// hostile, and must surface as a protocol error instead of a giant
+/// allocation that aborts the client process.
+const MAX_BINARY_RESULT_COLUMNS: usize = 4_096;
+/// A column of N rows needs at least one byte per row somewhere in the
+/// payload; anything denser is malformed.
+const MAX_BINARY_RESULT_ROWS_PER_BYTE: u64 = 1;
 
 pub struct Client {
     framed: Framed<tokio::net::TcpStream, MessageCodec>,
@@ -38,6 +46,9 @@ pub struct Client {
     /// Bounded: a subscriber that never drains them must not grow memory
     /// without limit (mirrors the server's bounded push queue).
     pending_notifications: std::collections::VecDeque<Message>,
+    /// Reliable-subscription events (SUB_DATA / SUB_ERROR) diverted the same
+    /// way; drained via `recv_sub_event`. Bounded for the same reason.
+    pending_sub_events: std::collections::VecDeque<Message>,
     /// A response frame that was read while waiting for a notification and
     /// could not be consumed yet; replayed by `next_frame`.
     pending_response: Option<Message>,
@@ -85,6 +96,9 @@ pub enum QueryResult {
 impl Client {
     pub async fn connect<A: tokio::net::ToSocketAddrs>(addr: A) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
+        // The protocol is request/response heavy: disable Nagle so small
+        // queries are not stalled by delayed-ACK interaction.
+        let _ = stream.set_nodelay(true);
         let framed = Framed::new(
             stream,
             MessageCodec::new(MAX_MESSAGE_SIZE).with_compression(4096),
@@ -100,6 +114,7 @@ impl Client {
             response_handled: Arc::new(AtomicI64::new(0)),
             bulk_import_mode: false,
             pending_notifications: std::collections::VecDeque::new(),
+            pending_sub_events: std::collections::VecDeque::new(),
             pending_response: None,
         })
     }
@@ -676,14 +691,19 @@ impl Client {
             // gap still tells the subscriber what happened.
             if matches!(
                 msg.msg_type,
-                MSG_TYPE_NOTIFICATION
-                    | MSG_TYPE_NOTIFICATION_DELETE
-                    | MSG_TYPE_NOTIFICATION_UPDATE
+                MSG_TYPE_NOTIFICATION | MSG_TYPE_NOTIFICATION_DELETE | MSG_TYPE_NOTIFICATION_UPDATE
             ) {
                 if self.pending_notifications.len() >= MAX_BUFFERED_NOTIFICATIONS {
                     self.pending_notifications.pop_front();
                 }
                 self.pending_notifications.push_back(msg);
+                continue;
+            }
+            if matches!(msg.msg_type, MSG_TYPE_SUB_DATA | MSG_TYPE_SUB_ERROR) {
+                if self.pending_sub_events.len() >= MAX_BUFFERED_NOTIFICATIONS {
+                    self.pending_sub_events.pop_front();
+                }
+                self.pending_sub_events.push_back(msg);
                 continue;
             }
             return Ok(msg);
@@ -788,6 +808,144 @@ impl Client {
             Some(parse_notification(msg_type, &msg.payload))
         }
     }
+
+    /// Register a reliable, resumable subscription on the exact table
+    /// `db.table`. With `from_seq` the server replays every committed batch
+    /// after that sequence (subject to its retention window); with `named`
+    /// the server persists an ack bookmark so a later subscribe with the
+    /// same name resumes where this one left off. `filter` restricts
+    /// delivery to rows whose text-rendered `column` value is one of the
+    /// given values.
+    ///
+    /// Data arrives as SUB_DATA pushes; consume them with
+    /// [`recv_sub_event`](Self::recv_sub_event) and acknowledge processed
+    /// sequences with [`ack_subscription`](Self::ack_subscription).
+    pub async fn subscribe_v2(
+        &mut self,
+        db: &str,
+        table: &str,
+        from_seq: Option<u64>,
+        named: Option<&str>,
+        filter: Option<(&str, &[&str])>,
+    ) -> Result<SubscriptionGrant> {
+        let filter_values: Option<std::collections::HashSet<String>> =
+            filter.map(|(_, values)| values.iter().map(|v| (*v).to_string()).collect());
+        let payload = crate::net::pubsub_session::encode_subscribe(
+            db,
+            table,
+            from_seq,
+            named,
+            filter.map(|(column, _)| column),
+            filter_values.as_ref(),
+        );
+        self.send(Message::new(MSG_TYPE_SUBSCRIBE_V2, payload))
+            .await?;
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_SUB_CONFIRMED => {
+                let grant = decode_sub_confirmed(&resp.payload)?;
+                Ok(SubscriptionGrant {
+                    sub_id: grant.sub_id,
+                    epoch: grant.epoch,
+                    granted_from: grant.granted_from,
+                    floor: grant.floor,
+                })
+            }
+            MSG_TYPE_SUB_ERROR => {
+                let err = crate::net::pubsub_session::decode_sub_error(&resp.payload)?;
+                Err(TaibaiError::Sql(format!(
+                    "subscribe failed: {}",
+                    err.message
+                )))
+            }
+            MSG_TYPE_ERROR => Err(TaibaiError::Sql(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            )),
+            other => Err(TaibaiError::Protocol(format!(
+                "unexpected subscribe_v2 reply type: {other:#04X}"
+            ))),
+        }
+    }
+
+    /// Remove a reliable subscription.
+    pub async fn unsubscribe_v2(&mut self, db: &str, table: &str, sub_id: u64) -> Result<()> {
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, db);
+        write_len_prefixed_string(&mut payload, table);
+        payload.extend_from_slice(&sub_id.to_le_bytes());
+        self.send(Message::new(MSG_TYPE_UNSUBSCRIBE_V2, Bytes::from(payload)))
+            .await?;
+        self.expect_ok("unsubscribe_v2").await
+    }
+
+    /// Acknowledge every sequence up to `seq` as processed, advancing the
+    /// subscription's resumable bookmark (flushed periodically for named
+    /// subscriptions).
+    pub async fn ack_subscription(
+        &mut self,
+        db: &str,
+        table: &str,
+        sub_id: u64,
+        seq: u64,
+    ) -> Result<()> {
+        let mut payload = Vec::new();
+        write_len_prefixed_string(&mut payload, db);
+        write_len_prefixed_string(&mut payload, table);
+        payload.extend_from_slice(&sub_id.to_le_bytes());
+        payload.extend_from_slice(&seq.to_le_bytes());
+        self.send(Message::new(MSG_TYPE_SUB_ACK, Bytes::from(payload)))
+            .await?;
+        self.expect_ok("ack_subscription").await
+    }
+
+    /// Wait for the next reliable-subscription event: a data push or a
+    /// resync notice (the retained window no longer covers this
+    /// subscription; resubscribe from the reported floor). Buffered events
+    /// that arrived while awaiting request replies are returned first.
+    pub async fn recv_sub_event(&mut self) -> Result<SubEvent> {
+        if let Some(event) = self.pop_buffered_sub_event() {
+            return event;
+        }
+        let msg = self.next_frame().await?;
+        if matches!(msg.msg_type, MSG_TYPE_SUB_DATA | MSG_TYPE_SUB_ERROR) {
+            let msg_type = msg.msg_type;
+            return sub_event_from_message(msg_type, &msg.payload);
+        }
+        // Not a subscription event: park it so the following `recv` gets
+        // the response intact instead of losing the frame.
+        self.pending_response = Some(msg);
+        Err(TaibaiError::Protocol(
+            "no subscription event pending; a response frame arrived first".into(),
+        ))
+    }
+
+    /// [`recv_sub_event`](Self::recv_sub_event) bounded by a timeout;
+    /// `None` means no event arrived in time.
+    pub async fn recv_sub_event_timeout(&mut self, dur: Duration) -> Result<Option<SubEvent>> {
+        match timeout(dur, self.recv_sub_event()).await {
+            Ok(result) => result.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn pop_buffered_sub_event(&mut self) -> Option<Result<SubEvent>> {
+        let msg = self.pending_sub_events.pop_front()?;
+        let msg_type = msg.msg_type;
+        Some(sub_event_from_message(msg_type, &msg.payload))
+    }
+
+    async fn expect_ok(&mut self, what: &str) -> Result<()> {
+        let resp = self.recv().await?;
+        match resp.msg_type {
+            MSG_TYPE_OK => Ok(()),
+            MSG_TYPE_ERROR => Err(TaibaiError::Sql(
+                String::from_utf8_lossy(&resp.payload).to_string(),
+            )),
+            other => Err(TaibaiError::Protocol(format!(
+                "unexpected {what} response type: {other:#04X}"
+            ))),
+        }
+    }
 }
 
 fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
@@ -799,6 +957,13 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
     let mut offset = 0usize;
     let col_count = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
     offset += 4;
+    // A corrupt or hostile frame must surface as a protocol error, not as a
+    // multi-gigabyte allocation that aborts the client process.
+    if col_count > MAX_BINARY_RESULT_COLUMNS {
+        return Err(TaibaiError::Protocol(format!(
+            "binary result column count {col_count} exceeds the maximum of {MAX_BINARY_RESULT_COLUMNS}"
+        )));
+    }
 
     let mut columns = Vec::with_capacity(col_count);
     for _ in 0..col_count {
@@ -834,6 +999,12 @@ fn parse_binary_result(payload: &[u8]) -> Result<QueryResult> {
     }
     let row_count = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
     offset += 4;
+    if row_count as u64 > (payload.len() as u64).saturating_mul(MAX_BINARY_RESULT_ROWS_PER_BYTE) {
+        return Err(TaibaiError::Protocol(format!(
+            "binary result row count {row_count} is inconsistent with payload size {}",
+            payload.len()
+        )));
+    }
 
     let schema = Schema::new(columns);
     let mut arrays = Vec::with_capacity(schema.num_columns());
@@ -1460,6 +1631,20 @@ fn parse_notification(msg_type: u8, payload: &[u8]) -> Result<Notification> {
     let sub_id = u64::from_le_bytes(payload[..8].try_into().unwrap());
     let seq = u64::from_le_bytes(payload[8..16].try_into().unwrap());
     let (topic, rest) = read_len_prefixed_string(&payload[16..])?;
+    // The fan-out thread compresses the encoded result section (only the
+    // section, never the outer payload) once it exceeds the compression
+    // threshold. The outer payload starts with sub_id bytes, so the codec's
+    // zlib sniff never fires; decompress the section here. A section that
+    // merely starts with 0x78 by coincidence fails decompression and is
+    // parsed as-is.
+    let rest_section: Option<Bytes> = match rest.first() {
+        Some(&0x78) => crate::protocol::compress::zlib_decompress_complete(rest).map(Bytes::from),
+        _ => None,
+    };
+    let rest: &[u8] = match &rest_section {
+        Some(bytes) => bytes.as_ref(),
+        None => rest,
+    };
     let QueryResult::Rows {
         schema, batches, ..
     } = parse_binary_result(rest)?
@@ -1481,4 +1666,58 @@ fn parse_notification(msg_type: u8, payload: &[u8]) -> Result<Notification> {
         schema,
         batches,
     })
+}
+
+/// Server confirmation for a reliable subscription
+/// ([`Client::subscribe_v2`](Client::subscribe_v2)).
+#[derive(Debug, Clone)]
+pub struct SubscriptionGrant {
+    pub sub_id: u64,
+    /// Server pub/sub epoch; a changed epoch means the server restarted and
+    /// sequence numbers reset.
+    pub epoch: u64,
+    /// Last sequence already covered by this subscription (the requested
+    /// `from_seq`, the current head for a from-now subscribe, or the named
+    /// bookmark). Delivery starts at `granted_from + 1`.
+    pub granted_from: u64,
+    /// Oldest sequence still retained; resume requests below it are refused.
+    pub floor: u64,
+}
+
+/// One reliable-subscription event.
+#[derive(Debug)]
+pub enum SubEvent {
+    /// Committed batches, carrying contiguous sequences
+    /// `seq_start..=seq_end`. Acknowledge processed sequences with
+    /// [`Client::ack_subscription`](Client::ack_subscription).
+    Data(crate::net::pubsub_session::SubDataFrame),
+    /// The retained window no longer covers this subscription; resubscribe
+    /// with `from_seq = floor - 1` (or later) and re-read the table for the
+    /// missing range.
+    ResyncRequired { sub_id: u64, floor: u64 },
+}
+
+fn sub_event_from_message(msg_type: u8, payload: &[u8]) -> Result<SubEvent> {
+    match msg_type {
+        MSG_TYPE_SUB_DATA => Ok(SubEvent::Data(crate::net::pubsub_session::decode_sub_data(
+            payload,
+        )?)),
+        MSG_TYPE_SUB_ERROR => {
+            let err = crate::net::pubsub_session::decode_sub_error(payload)?;
+            if err.code == crate::net::pubsub_session::SUB_ERROR_RESYNC_REQUIRED {
+                Ok(SubEvent::ResyncRequired {
+                    sub_id: err.sub_id,
+                    floor: err.aux,
+                })
+            } else {
+                Err(TaibaiError::Protocol(format!(
+                    "subscription {} error {}: {}",
+                    err.sub_id, err.code, err.message
+                )))
+            }
+        }
+        other => Err(TaibaiError::Protocol(format!(
+            "not a subscription event frame: {other:#04X}"
+        ))),
+    }
 }

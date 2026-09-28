@@ -4,7 +4,8 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::message::{
     Message, MessageHeader, HEADER_SIZE, MSG_TYPE_BATCH_EXECUTE, MSG_TYPE_CLOSE_STMT,
-    MSG_TYPE_EXECUTE, MSG_TYPE_NOTIFICATION, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
+    MSG_TYPE_EXECUTE, MSG_TYPE_NOTIFICATION, MSG_TYPE_NOTIFICATION_DELETE,
+    MSG_TYPE_NOTIFICATION_INSERT, MSG_TYPE_NOTIFICATION_UPDATE, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
 };
 
 pub struct MessageCodec {
@@ -90,8 +91,15 @@ impl Encoder<Message> for MessageCodec {
         );
         // Notification payloads were compressed once by the pubsub fan-out
         // thread; compressing here again would force clients to decompress
-        // twice and pay double CPU per subscriber.
-        let is_pubsub_push = msg.msg_type == MSG_TYPE_NOTIFICATION;
+        // twice and pay double CPU per subscriber. The delete/update event
+        // types share the fan-out path, so they are exempt too.
+        let is_pubsub_push = matches!(
+            msg.msg_type,
+            MSG_TYPE_NOTIFICATION
+                | MSG_TYPE_NOTIFICATION_INSERT
+                | MSG_TYPE_NOTIFICATION_DELETE
+                | MSG_TYPE_NOTIFICATION_UPDATE
+        );
         let should_compress = !is_bulk
             && !is_query
             && !is_prepared

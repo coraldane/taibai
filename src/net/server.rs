@@ -68,6 +68,9 @@ impl Server {
                     let (stream, addr) = match result {
                         Ok(accepted) => {
                             accept_error_delay = Duration::from_millis(50);
+                            // Request/response protocol: small replies must
+                            // not wait on Nagle/delayed-ACK interaction.
+                            let _ = accepted.0.set_nodelay(true);
                             accepted
                         }
                         Err(error) => {

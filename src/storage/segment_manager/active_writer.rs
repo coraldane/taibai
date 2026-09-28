@@ -17,8 +17,8 @@ use crate::storage::segment_manager::config::{
     FLUSH_META_AFTER_ROW_GROUP, SIDECAR_COMPACT_MIN_BYTES, SIDECAR_COMPACT_MIN_RECORDS,
 };
 use crate::storage::segment_manager::helpers::{
-    col_sums_from_bulk_columns, compute_value_sets_from_bulk_columns,
-    compute_zone_map_from_column, compute_zone_maps_from_bulk_columns,
+    col_sums_from_bulk_columns, compute_value_sets_from_bulk_columns, compute_zone_map_from_column,
+    compute_zone_maps_from_bulk_columns,
 };
 use crate::types::array::ColumnArray;
 use crate::types::batch::{RecordBatch, Schema};
@@ -46,6 +46,10 @@ pub(super) struct ActiveSegmentWriter {
     /// Row groups persisted to the data file but not yet visible (their
     /// footer has not been written). Published when the footer lands.
     pub(super) pending_publish: Vec<RecordBatch>,
+    /// Buffer-local row ranges whose change notifications are deferred to
+    /// footer visibility (bulk/RELAXED writes). Rows published by the write
+    /// path at statement time are never re-published here.
+    pub(super) pubsub_deferred_ranges: Vec<(usize, usize)>,
     /// zstd level for row groups written by this writer: the table's
     /// `COMPRESSION_LEVEL` override, or the global configured level.
     pub(super) compression_level: i32,
@@ -72,8 +76,10 @@ impl ActiveSegmentWriter {
     pub(super) fn append_batch(
         &mut self,
         batch: &RecordBatch,
+        pubsub_deferred: bool,
         invalidate_reader: &dyn Fn(&Path),
     ) -> Result<()> {
+        let defer_from = self.buffered_rows;
         if let Some(ref mut buffered) = self.buffered_batch {
             for col_idx in 0..batch.num_columns() {
                 let src = batch.column(col_idx).unwrap();
@@ -84,6 +90,9 @@ impl ActiveSegmentWriter {
         } else {
             self.buffered_batch = Some(batch.clone());
             self.buffered_rows = batch.num_rows();
+        }
+        if pubsub_deferred && self.buffered_rows > defer_from {
+            self.pubsub_deferred_ranges.push((defer_from, self.buffered_rows));
         }
 
         while self.buffered_rows >= self.row_group_target_rows {
@@ -100,8 +109,10 @@ impl ActiveSegmentWriter {
     pub(super) fn append_batch_owned(
         &mut self,
         batch: RecordBatch,
+        pubsub_deferred: bool,
         invalidate_reader: &dyn Fn(&Path),
     ) -> Result<()> {
+        let defer_from = self.buffered_rows;
         let added = batch.num_rows();
         if batch.num_columns() != self.schema.num_columns() {
             return Err(TaibaiError::Internal(format!(
@@ -128,6 +139,9 @@ impl ActiveSegmentWriter {
         } else {
             self.buffered_batch = Some(batch);
             self.buffered_rows = added;
+        }
+        if pubsub_deferred && self.buffered_rows > defer_from {
+            self.pubsub_deferred_ranges.push((defer_from, self.buffered_rows));
         }
 
         while self.buffered_rows >= self.row_group_target_rows {
@@ -335,11 +349,20 @@ impl ActiveSegmentWriter {
         self.last_write_at = Instant::now();
 
         // Rows persisted but not yet visible: stash them until the footer
-        // write makes them visible (see `publish_pending`).
+        // write makes them visible (see `publish_pending`). Only rows whose
+        // notification was deferred (bulk/RELAXED writes) are stashed; rows
+        // published by the write path at statement time must not repeat.
         if rows_to_flush > 0 {
             if let Some(pubsub) = self.pubsub.as_ref() {
-                if pubsub.has_subscribers() && self.topic().is_some() {
-                    let indices: Vec<u32> = (0..rows_to_flush as u32).collect();
+                if pubsub.has_any_subscribers() && self.topic().is_some() {
+                    let mut indices: Vec<u32> = Vec::new();
+                    for (start, end) in &self.pubsub_deferred_ranges {
+                        let lo = (*start).min(rows_to_flush);
+                        let hi = (*end).min(rows_to_flush);
+                        for row in lo..hi {
+                            indices.push(row as u32);
+                        }
+                    }
                     let mut cols = Vec::with_capacity(num_cols);
                     let mut ok = true;
                     for col_idx in 0..num_cols {
@@ -351,7 +374,7 @@ impl ActiveSegmentWriter {
                             }
                         }
                     }
-                    if ok {
+                    if ok && !indices.is_empty() {
                         if let Ok(batch) = RecordBatch::try_new(buffered.schema.clone(), cols) {
                             self.pending_publish.push(batch);
                         }
@@ -359,6 +382,13 @@ impl ActiveSegmentWriter {
                 }
             }
         }
+        // The flushed rows leave the front of the buffer; shift the ranges
+        // that (partially) survive and drop the consumed ones.
+        for (start, end) in self.pubsub_deferred_ranges.iter_mut() {
+            *start = start.saturating_sub(rows_to_flush);
+            *end = end.saturating_sub(rows_to_flush);
+        }
+        self.pubsub_deferred_ranges.retain(|(start, end)| end > start);
 
         if FLUSH_META_AFTER_ROW_GROUP {
             self.flush_meta(invalidate_reader)?;

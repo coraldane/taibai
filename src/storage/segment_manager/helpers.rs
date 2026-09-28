@@ -226,7 +226,10 @@ pub(crate) fn direct_bulk_request_to_batch(
 /// element-wise without `ScalarValue` boxing, VarChar bytes are pushed
 /// straight into the UTF-8 buffer (no per-row `String` allocation), and only
 /// columns that actually carry NULLs pay for per-row bitmap work.
-fn direct_bulk_column_to_array(col: &DirectBulkColumn<'_>, rows: usize) -> Result<ColumnArray> {
+pub(crate) fn direct_bulk_column_to_array(
+    col: &DirectBulkColumn<'_>,
+    rows: usize,
+) -> Result<ColumnArray> {
     let has_nulls = !col.nulls.is_empty() && (0..rows).any(|r| null_bit_is_set(col.nulls, r));
     if has_nulls {
         // Rare path: per-row decode honouring the NULL bitmap.
@@ -431,7 +434,6 @@ fn direct_bulk_variable_range_at(
     )))
 }
 
-
 pub(super) fn slice_batch_fast(
     batch: &RecordBatch,
     offset: usize,
@@ -564,7 +566,8 @@ pub(super) fn col_sums_from_bulk_columns(
     col_sums
 }
 
-pub(super) fn compute_value_sets_from_bulk_columns(    columns: &[DirectBulkColumn<'_>],
+pub(super) fn compute_value_sets_from_bulk_columns(
+    columns: &[DirectBulkColumn<'_>],
     row_count: u64,
 ) -> Result<Vec<Option<Vec<ScalarValue>>>> {
     let mut result = Vec::with_capacity(columns.len());

@@ -40,10 +40,11 @@ fn first_owned_batch_keeps_variable_buffer_allocation() {
         row_group_target_rows: 1024,
         pubsub: None,
         pending_publish: Vec::new(),
+        pubsub_deferred_ranges: Vec::new(),
         compression_level: 3,
     };
 
-    writer.append_batch_owned(batch, &|_| {}).unwrap();
+    writer.append_batch_owned(batch, false, &|_| {}).unwrap();
     let buffered_ptr = match writer.buffered_batch.as_ref().unwrap().column(0).unwrap() {
         ColumnArray::VarChar { data, .. } => data.values().as_ptr(),
         _ => unreachable!(),

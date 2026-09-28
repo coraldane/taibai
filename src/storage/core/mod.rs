@@ -3,3 +3,4 @@ pub mod compactor;
 pub mod durable_tail;
 pub mod hot_store;
 pub mod memtable;
+pub mod pubsub;

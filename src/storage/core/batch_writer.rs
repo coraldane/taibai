@@ -556,7 +556,7 @@ impl BatchWriter {
         // `commit_txn`. Sharing the memtable's batch via `Arc` keeps this off
         // the copy path; the fan-out thread does the encoding work.
         if let Some(pubsub) = &self.pubsub {
-            if pubsub.has_subscribers() {
+            if pubsub.has_any_subscribers() {
                 for memtable in &committed_mts {
                     if memtable.row_count() == 0 {
                         continue;

@@ -586,7 +586,7 @@ fn exec_materialized_insert_batch(
     let pubsub_batch = if txn_id == 0
         && !bulk_import_mode
         && !relaxed_direct_insert
-        && engine.pubsub().has_subscribers()
+        && engine.pubsub().has_any_subscribers()
     {
         Some(batch.clone())
     } else {

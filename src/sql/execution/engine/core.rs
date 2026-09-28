@@ -120,8 +120,22 @@ impl Engine {
             }
         }
 
-        let pubsub = crate::pubsub::PubSubHub::new(pubsub_settings);
+        let pubsub = crate::pubsub::PubSubHub::new(pubsub_settings.clone());
         segment_mgr.set_pubsub(Arc::clone(&pubsub));
+
+        // Reliable-subscription layer. Disabled engines get an inert manager
+        // so callers never need to branch; the hub mirrors committed inserts
+        // into its per-table retention logs when subscriptions exist.
+        let pubsub_manager =
+            if pubsub_settings.enabled {
+                crate::storage::core::pubsub::PubSubManager::start(
+                    pubsub_settings,
+                    data_dir.join("pubsub"),
+                )
+            } else {
+                crate::storage::core::pubsub::PubSubManager::disabled()
+            };
+        pubsub.set_mirror(Arc::clone(&pubsub_manager));
 
         let batch_writer = BatchWriter::new(
             BatchWriterConfig {
@@ -193,6 +207,7 @@ impl Engine {
             segment_mgr,
             batch_writer,
             pubsub,
+            pubsub_manager,
             bulk_mode_sessions: AtomicUsize::new(0),
             bulk_dirty_tables: Mutex::new(HashSet::new()),
             in_flight_operations: AtomicUsize::new(0),

@@ -694,6 +694,27 @@ pub struct PubSubSettings {
     /// notification compression. Follows `compression.enabled` at startup.
     #[serde(default = "default_pubsub_compress_threshold")]
     pub compress_threshold: usize,
+    /// Capacity of the commit ring between the write path and the reliable
+    /// pub/sub publisher thread (per-table retention log, resumable
+    /// subscriptions). Overflow marks a gap and asks subscribers to resync
+    /// instead of blocking writers.
+    #[serde(default = "default_pubsub_commit_ring_capacity")]
+    pub commit_ring_capacity: usize,
+    /// Fallback poll interval (ms) for reliable-subscription delivery tasks
+    /// when no change-notification wake-up arrives.
+    #[serde(default = "default_pubsub_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// Per-table retention log capacity, in committed batches. Subscribers
+    /// resuming from a sequence below the retained floor are asked to resync.
+    #[serde(default = "default_pubsub_log_max_batches")]
+    pub log_max_batches: usize,
+    /// Per-table retention log capacity, in MiB (approximate batch bytes).
+    #[serde(default = "default_pubsub_log_max_bytes_mb")]
+    pub log_max_bytes_mb: u64,
+    /// Maximum number of committed batches coalesced into one reliable
+    /// data push frame.
+    #[serde(default = "default_pubsub_max_batches_per_frame")]
+    pub max_batches_per_frame: usize,
 }
 
 impl Default for PubSubSettings {
@@ -704,6 +725,11 @@ impl Default for PubSubSettings {
             max_subscriptions: default_pubsub_max_subscriptions(),
             notification_channel_capacity: default_pubsub_notification_channel_capacity(),
             compress_threshold: default_pubsub_compress_threshold(),
+            commit_ring_capacity: default_pubsub_commit_ring_capacity(),
+            poll_interval_ms: default_pubsub_poll_interval_ms(),
+            log_max_batches: default_pubsub_log_max_batches(),
+            log_max_bytes_mb: default_pubsub_log_max_bytes_mb(),
+            max_batches_per_frame: default_pubsub_max_batches_per_frame(),
         }
     }
 }
@@ -726,6 +752,26 @@ fn default_pubsub_notification_channel_capacity() -> usize {
 
 fn default_pubsub_compress_threshold() -> usize {
     4096
+}
+
+fn default_pubsub_commit_ring_capacity() -> usize {
+    65_536
+}
+
+fn default_pubsub_poll_interval_ms() -> u64 {
+    50
+}
+
+fn default_pubsub_log_max_batches() -> usize {
+    1024
+}
+
+fn default_pubsub_log_max_bytes_mb() -> u64 {
+    64
+}
+
+fn default_pubsub_max_batches_per_frame() -> usize {
+    32
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::types::array::ColumnArray;
-use crate::types::batch::RecordBatch;
+use crate::types::batch::{ColumnDef, RecordBatch, Schema};
 
 pub fn encode_columnar_bulk_insert(table_name: &str, batch: &RecordBatch) -> Result<Bytes> {
     let mut buf = Vec::new();
@@ -57,6 +57,35 @@ fn encode_column_data(col: &ColumnArray) -> Result<(Vec<u8>, Vec<u8>)> {
         col.bitmap().to_bytes()
     };
     Ok((data, nulls))
+}
+
+/// Decode a payload produced by [`encode_columnar_bulk_insert`] back into a
+/// batch. Used by reliable-subscription clients to materialize pushed data
+/// frames; the returned schema is derived from the wire column metadata, so
+/// it does not require catalog access.
+pub fn decode_columnar_bulk_insert(payload: &[u8]) -> Result<RecordBatch> {
+    let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
+    let columns: Vec<ColumnDef> = req
+        .columns
+        .iter()
+        .map(|col| {
+            let mut def = ColumnDef::new(col.name, col.data_type);
+            def.scale = col.scale;
+            def.precision = col.precision;
+            def
+        })
+        .collect();
+    let arrays: Vec<ColumnArray> = req
+        .columns
+        .iter()
+        .map(|col| {
+            crate::storage::segment_manager::helpers::direct_bulk_column_to_array(
+                col,
+                req.row_count,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(Schema::new(columns), arrays)
 }
 
 #[cfg(test)]

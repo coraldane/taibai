@@ -222,6 +222,18 @@ name = "pubsub_test"
 path = "tests/pubsub_test.rs"
 
 [[test]]
+name = "pubsub_v2_test"
+path = "tests/pubsub_v2_test.rs"
+
+[[test]]
+name = "pubsub_overhead_bench_test"
+path = "tests/pubsub_overhead_bench_test.rs"
+
+[[test]]
+name = "pubsub_delivery_test"
+path = "tests/pubsub_delivery_test.rs"
+
+[[test]]
 name = "run_intersection_aggregate_test"
 path = "tests/run_intersection_aggregate_test.rs"
 

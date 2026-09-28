@@ -4,6 +4,10 @@ use std::time::{Duration, Instant};
 
 use crate::common::config::ServerConfig;
 use crate::common::error::{Result, TaibaiError};
+use crate::net::pubsub_session::{
+    confirmed_message, decode_subscribe, decode_table_and_sub, decode_table_sub_and_seq,
+    frame_to_message, spawn_delivery,
+};
 use crate::net::session::Session;
 use crate::protocol::message::*;
 use crate::protocol::types::DataType;
@@ -12,6 +16,7 @@ use crate::sql::execution::{Engine, ExecResult};
 use crate::sql::parser::ast::Statement;
 use crate::sql::parser::parser::Parser;
 use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
+use crate::storage::core::pubsub::{PublishedFrame, SubscribeMode, SubscribeRequest};
 use crate::types::scalar::ScalarValue;
 
 pub struct Handler {
@@ -47,6 +52,19 @@ impl Drop for Handler {
                 "pubsub subscriptions released on handler drop"
             );
         }
+        if let Some(session) = &self.session {
+            let removed = self
+                .engine
+                .pubsub_manager()
+                .unsubscribe_session(&session.id);
+            if removed > 0 {
+                tracing::debug!(
+                    session_id = %session.id,
+                    removed,
+                    "reliable pubsub subscriptions released on handler drop"
+                );
+            }
+        }
     }
 }
 
@@ -72,6 +90,19 @@ impl Handler {
     pub fn flush_on_disconnect(&mut self) {
         if let Some(conn) = self.pubsub_conn.take() {
             self.engine.pubsub().drop_connection(&conn);
+        }
+        if let Some(ref session) = self.session {
+            let removed = self
+                .engine
+                .pubsub_manager()
+                .unsubscribe_session(&session.id);
+            if removed > 0 {
+                tracing::debug!(
+                    session_id = %session.id,
+                    removed,
+                    "reliable pubsub subscriptions released on disconnect"
+                );
+            }
         }
         if let Some(ref mut session) = self.session {
             let mut remaining_bulk_sessions = self.engine.bulk_mode_session_count();
@@ -149,6 +180,10 @@ impl Handler {
 
             MSG_TYPE_SUBSCRIBE => self.handle_subscribe(&msg.payload),
             MSG_TYPE_UNSUBSCRIBE => self.handle_unsubscribe(&msg.payload),
+
+            MSG_TYPE_SUBSCRIBE_V2 => self.handle_subscribe_v2(&msg.payload),
+            MSG_TYPE_UNSUBSCRIBE_V2 => self.handle_unsubscribe_v2(&msg.payload),
+            MSG_TYPE_SUB_ACK => self.handle_sub_ack(&msg.payload),
 
             MSG_TYPE_BINARY_QUERY_RESULT => {
                 Ok(vec![build_error("unexpected binary result message")])
@@ -1390,6 +1425,171 @@ impl Handler {
             Ok(vec![build_error(&format!(
                 "subscription {sub_id} not found"
             ))])
+        }
+    }
+
+    /// MSG_TYPE_SUBSCRIBE_V2: resumable single-table subscription with an
+    /// optional start sequence, named bookmark and column filter. Replies
+    /// SUB_CONFIRMED (or SUB_ERROR); data arrives later as SUB_DATA pushes.
+    fn handle_subscribe_v2(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let (username, session_id) = match &mut self.session {
+            Some(session) => {
+                session.touch();
+                (session.username.clone(), session.id)
+            }
+            None => return Ok(vec![build_error("not logged in")]),
+        };
+
+        let request = match decode_subscribe(payload) {
+            Ok(request) => request,
+            Err(err) => {
+                return Ok(vec![build_error(&err.to_string())]);
+            }
+        };
+
+        // The reliable stream is per exact table: retention, acks and
+        // bookmarks are all keyed on (db, table), so wildcards make no sense.
+        if request.db.is_empty()
+            || request.table.is_empty()
+            || request.table.contains('*')
+            || request.table.contains('>')
+        {
+            return Ok(vec![build_error(
+                "reliable subscriptions require an exact 'database.table' topic",
+            )]);
+        }
+        let manager = Arc::clone(self.engine.pubsub_manager());
+        if !manager.is_enabled() {
+            return Ok(vec![build_error("pubsub is disabled on this server")]);
+        }
+        let Some(table_meta) = self.engine.get_table_meta(&request.db, &request.table) else {
+            return Ok(vec![build_error(&format!(
+                "table '{}.{}' does not exist",
+                request.db, request.table
+            ))]);
+        };
+        if let Some(column) = &request.filter_column {
+            if !table_meta.columns.iter().any(|c| &c.name == column) {
+                return Ok(vec![build_error(&format!(
+                    "filter column '{column}' does not exist on '{}.{}'",
+                    request.db, request.table
+                ))]);
+            }
+        }
+        if !self.engine.auth_manager().check_permission(
+            &username,
+            PermissionType::Subscribe,
+            PermissionObjectType::Table,
+            &format!("{}.{}", request.db, request.table),
+        ) {
+            tracing::warn!(
+                username,
+                db = %request.db,
+                table = %request.table,
+                "reliable subscribe rejected: missing SUBSCRIBE permission"
+            );
+            return Ok(vec![build_error(&format!(
+                "access denied for user '{username}' to SUBSCRIBE on '{}.{}'",
+                request.db, request.table
+            ))]);
+        }
+        let Some(push_tx) = self.push_channel.clone() else {
+            return Ok(vec![build_error(
+                "subscriptions are not available on this connection",
+            )]);
+        };
+
+        // Frames from the delivery task are re-encoded as protocol messages
+        // and funneled into the shared per-connection push queue, so the
+        // connection loop forwards them exactly like hub notifications.
+        let frame_capacity = self.config.pubsub.notification_channel_capacity.max(1);
+        let max_frame_batches = self.config.pubsub.max_batches_per_frame.max(1);
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<PublishedFrame>(frame_capacity);
+        tokio::spawn(async move {
+            while let Some(frame) = frame_rx.recv().await {
+                match frame_to_message(frame) {
+                    Ok(msg) => {
+                        if push_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "reliable pubsub frame encode failed; frame dropped"
+                    ),
+                }
+            }
+        });
+
+        let subscribe_request = SubscribeRequest {
+            db: request.db.clone(),
+            table: request.table.clone(),
+            mode: match request.from_seq {
+                Some(seq) => SubscribeMode::FromSeq(seq),
+                None => SubscribeMode::FromNow,
+            },
+            filter_column: request.filter_column,
+            filter_values: request.filter_values,
+            named: request.named,
+            session_id,
+            frame_tx: frame_tx.clone(),
+        };
+        match manager.subscribe(subscribe_request) {
+            Ok((grant, handle)) => {
+                spawn_delivery(handle, max_frame_batches, frame_tx);
+                tracing::info!(
+                    username,
+                    db = %request.db,
+                    table = %request.table,
+                    sub_id = grant.sub_id,
+                    granted_from = grant.granted_from,
+                    "reliable subscription registered"
+                );
+                Ok(vec![confirmed_message(&grant)])
+            }
+            Err(reason) => Ok(vec![build_error(&reason.to_string())]),
+        }
+    }
+
+    /// MSG_TYPE_UNSUBSCRIBE_V2: payload is `[string db][string table][u64 sub_id]`.
+    fn handle_unsubscribe_v2(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let Some(session) = &mut self.session else {
+            return Ok(vec![build_error("not logged in")]);
+        };
+        session.touch();
+        match decode_table_and_sub(payload) {
+            Ok((db, table, sub_id)) => {
+                if self
+                    .engine
+                    .pubsub_manager()
+                    .unsubscribe(&db, &table, sub_id)
+                {
+                    tracing::info!(username = %session.username, db, table, sub_id, "reliable subscription removed");
+                    Ok(vec![build_ok(0)])
+                } else {
+                    Ok(vec![build_error(&format!(
+                        "subscription {sub_id} not found"
+                    ))])
+                }
+            }
+            Err(err) => Ok(vec![build_error(&err.to_string())]),
+        }
+    }
+
+    /// MSG_TYPE_SUB_ACK: payload is `[string db][string table][u64 sub_id][u64 seq]`.
+    fn handle_sub_ack(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let Some(session) = &mut self.session else {
+            return Ok(vec![build_error("not logged in")]);
+        };
+        session.touch();
+        match decode_table_sub_and_seq(payload) {
+            Ok((db, table, sub_id, seq)) => {
+                match self.engine.pubsub_manager().ack(&db, &table, sub_id, seq) {
+                    Ok(()) => Ok(vec![build_ok(0)]),
+                    Err(err) => Ok(vec![build_error(&err.to_string())]),
+                }
+            }
+            Err(err) => Ok(vec![build_error(&err.to_string())]),
         }
     }
 }
