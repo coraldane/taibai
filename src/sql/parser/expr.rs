@@ -340,6 +340,7 @@ impl Parser {
                 match name.to_ascii_uppercase().as_str() {
                     "TRUE" => return Ok(Expr::Literal(ScalarValue::Bool(Some(true)))),
                     "FALSE" => return Ok(Expr::Literal(ScalarValue::Bool(Some(false)))),
+                    "CAST" if self.peek() == &Token::LeftParen => return self.parse_cast(),
                     _ => {}
                 }
                 if self.peek() == &Token::Dot {
@@ -459,9 +460,85 @@ impl Parser {
                 self.placeholder_count += 1;
                 Ok(Expr::Placeholder(idx))
             }
+            Token::NumberedPlaceholder(n) => {
+                self.advance();
+                // `$1` is the first parameter; a later `?` continues after the
+                // highest explicit index so the two styles can coexist.
+                self.placeholder_count = self.placeholder_count.max(n);
+                Ok(Expr::Placeholder(n - 1))
+            }
             ref other => Err(TaibaiError::Sql(format!(
                 "unexpected token in expression: {}",
                 other
+            ))),
+        }
+    }
+
+    /// Parse `CAST(expr AS type[(p[, s])])`. Desugared to a `cast` scalar
+    /// function call carrying the normalized type name and decimal scale, so
+    /// no planner or evaluator changes are needed.
+    fn parse_cast(&mut self) -> Result<Expr> {
+        self.expect(&Token::LeftParen)?;
+        let expr = self.parse_expr()?;
+        match self.peek() {
+            Token::As => {
+                self.advance();
+            }
+            other => {
+                return Err(TaibaiError::Sql(format!(
+                    "expected AS in CAST, got {}",
+                    other
+                )))
+            }
+        }
+        let type_name = self.expect_ident()?;
+        // Optional precision/scale, e.g. VARCHAR(100) or DECIMAL(10, 2).
+        // Only DECIMAL's scale is meaningful to the executor; VARCHAR's length
+        // is accepted and ignored for compatibility.
+        let mut scale: i64 = 0;
+        if self.peek() == &Token::LeftParen {
+            self.advance();
+            let p1 = self.parse_cast_number("CAST type parameters")?;
+            if self.peek() == &Token::Comma {
+                self.advance();
+                let p2 = self.parse_cast_number("CAST type parameters")?;
+                scale = p2;
+            } else if type_name.eq_ignore_ascii_case("DECIMAL") {
+                // DECIMAL(p) keeps scale 0 (the PG convention for precision-only).
+            } else if !type_name.eq_ignore_ascii_case("VARCHAR") {
+                return Err(TaibaiError::Sql(format!(
+                    "type parameters are only allowed for VARCHAR or DECIMAL in CAST, got {}({})",
+                    type_name, p1
+                )));
+            }
+            self.expect(&Token::RightParen)?;
+        }
+        let target = crate::sql::parser::parser::parse_data_type(&type_name)?;
+        self.expect(&Token::RightParen)?;
+        // Desugared shape: cast(value, NULL::<target>, scale). The second
+        // argument is a NULL literal of the target type, so both result-type
+        // inference (infer_scalar_function_type) and the runtime handler read
+        // the target from the argument's own DataType.
+        Ok(Expr::Function {
+            name: "cast".to_string(),
+            args: vec![
+                expr,
+                Expr::Literal(ScalarValue::null_for_type(target)),
+                Expr::Literal(ScalarValue::Int64(Some(scale))),
+            ],
+            distinct: false,
+        })
+    }
+
+    fn parse_cast_number(&mut self, context: &str) -> Result<i64> {
+        match self.peek().clone() {
+            Token::Integer(v) => {
+                self.advance();
+                Ok(v)
+            }
+            other => Err(TaibaiError::Sql(format!(
+                "expected integer in {}, got {}",
+                context, other
             ))),
         }
     }

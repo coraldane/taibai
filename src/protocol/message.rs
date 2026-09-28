@@ -25,9 +25,12 @@ pub const MSG_TYPE_BEGIN_TXN: u8 = 0x30;
 pub const MSG_TYPE_COMMIT_TXN: u8 = 0x31;
 pub const MSG_TYPE_ROLLBACK_TXN: u8 = 0x32;
 
+/// Query-execution alias kept for wire compatibility with older clients:
+/// the payload is a normal query and the server returns the full result.
+/// Cursor semantics (partial FETCH / cursor CLOSE) were never implemented
+/// and the former 0x41/0x42 types are no longer reserved; senders receive
+/// the standard "unsupported message type" error.
 pub const MSG_TYPE_CURSOR: u8 = 0x40;
-pub const MSG_TYPE_CURSOR_FETCH: u8 = 0x41;
-pub const MSG_TYPE_CURSOR_CLOSE: u8 = 0x42;
 
 pub const MSG_TYPE_PREPARE: u8 = 0x50;
 pub const MSG_TYPE_EXECUTE: u8 = 0x51;

@@ -789,3 +789,181 @@ fn collect_one_ts(result: crate::sql::execution::engine::ExecResult) -> Option<i
             _ => None,
         })
 }
+
+#[test]
+fn insert_select_copies_rows_with_filter() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE src (id INT64, name VARCHAR)")?;
+    engine.execute(&mut session, "CREATE TABLE dst (id INT64, name VARCHAR)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO src (id, name) VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
+    )?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO dst (id, name) SELECT id, name FROM src WHERE id >= 2",
+    )?;
+
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM dst")?, 0, 0),
+        2
+    );
+    assert_eq!(
+        first_text(
+            engine.execute(&mut session, "SELECT name FROM dst WHERE id = 3")?,
+            0,
+            0
+        ),
+        "gamma"
+    );
+    Ok(())
+}
+
+#[test]
+fn insert_select_supports_expressions_aggregates_and_defaults() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE orders (id INT64, amount INT64)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO orders (id, amount) VALUES (1, 100), (2, 250), (3, 50)",
+    )?;
+    engine.execute(
+        &mut session,
+        "CREATE TABLE summary (bucket VARCHAR, total INT64)",
+    )?;
+    // Aggregating source + expression columns + column-list projection.
+    engine.execute(
+        &mut session,
+        "INSERT INTO summary (bucket, total) SELECT 'all', SUM(amount) FROM orders",
+    )?;
+
+    assert_eq!(
+        first_i64(
+            engine.execute(&mut session, "SELECT total FROM summary WHERE bucket = 'all'")?,
+            0,
+            0
+        ),
+        400
+    );
+    Ok(())
+}
+
+#[test]
+fn insert_select_converts_source_types_via_cast() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE raw (id INT64, price VARCHAR)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO raw (id, price) VALUES (1, '12.5'), (2, '7.25')",
+    )?;
+    engine.execute(&mut session, "CREATE TABLE priced (id INT64, price FLOAT64)")?;
+    // Text sources convert explicitly with CAST, like a VALUES insert of the
+    // same text would require.
+    engine.execute(
+        &mut session,
+        "INSERT INTO priced (id, price) SELECT id, CAST(price AS DOUBLE) FROM raw",
+    )?;
+
+    let result = engine.execute(&mut session, "SELECT price FROM priced WHERE id = 1")?;
+    let crate::sql::execution::engine::ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    match batches[0].scalar(0, 0).unwrap() {
+        crate::types::scalar::ScalarValue::Float64(Some(v)) => assert!((v - 12.5).abs() < 1e-9),
+        other => panic!("expected FLOAT64 12.5, got {:?}", other),
+    }
+    Ok(())
+}
+
+#[test]
+fn cast_works_in_select_list_and_where() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, price VARCHAR)",
+    )?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, price) VALUES (1, '12.9'), (2, '3.2')",
+    )?;
+
+    // CAST in the select list truncates like to_int.
+    let result = engine.execute(
+        &mut session,
+        "SELECT CAST(price AS BIGINT) FROM t WHERE id = 1",
+    )?;
+    let crate::sql::execution::engine::ExecResult::Query { batches, .. } = result else {
+        panic!("expected query result");
+    };
+    match batches[0].scalar(0, 0).unwrap() {
+        crate::types::scalar::ScalarValue::Int64(Some(v)) => assert_eq!(v, 12),
+        other => panic!("expected INT64 12, got {:?}", other),
+    }
+
+    // CAST in WHERE + alias-agnostic type names + arithmetic.
+    assert_eq!(
+        first_i64(
+            engine.execute(
+                &mut session,
+                "SELECT COUNT(*) FROM t WHERE CAST(price AS DOUBLE) > 5.0"
+            )?,
+            0,
+            0
+        ),
+        1
+    );
+    // CAST of a NULL stays NULL for the target type.
+    assert_eq!(
+        first_i64(
+            engine.execute(
+                &mut session,
+                "SELECT COUNT(*) FROM t WHERE CAST(NULL AS INT64) IS NULL"
+            )?,
+            0,
+            0
+        ),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn comments_and_quoted_identifiers_parse_end_to_end() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    // Copy-pasted-from-a-tutorial shape: comments, quoted idents, trailing semicolon.
+    engine
+        .execute(
+            &mut session,
+            "-- create the table\nCREATE TABLE t (\"select\" INT64, `order` INT64); /* block\ntoo */",
+        )
+        .expect("CREATE failed");
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO t (\"select\", `order`) VALUES (1, 2) -- values\n, (3, 4);",
+        )
+        .expect("INSERT failed");
+    let r = engine
+        .execute(
+            &mut session,
+            "SELECT COUNT(*) FROM t WHERE \"select\" = 1 AND `order` = 2",
+        )
+        .expect("SELECT failed");
+    assert_eq!(first_i64(r, 0, 0), 1);
+    Ok(())
+}

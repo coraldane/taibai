@@ -122,6 +122,7 @@ pub fn exec_union_with_txn(
     let Statement::Union {
         left,
         right,
+        op,
         all,
         order_by,
         limit,
@@ -134,8 +135,8 @@ pub fn exec_union_with_txn(
     };
 
     let (left_result, right_result) = (
-        exec_select_with_txn(engine, db, left, reader_txn_id)?,
-        exec_select_with_txn(engine, db, right, reader_txn_id)?,
+        exec_set_operand(engine, db, left, reader_txn_id)?,
+        exec_set_operand(engine, db, right, reader_txn_id)?,
     );
     let (
         ExecResult::Query {
@@ -180,11 +181,39 @@ pub fn exec_union_with_txn(
         }
     }
 
-    if !*all {
-        // Typed keys: the old to_string-joined key could collide when a
-        // value contained the separator, silently dropping distinct rows.
-        let mut seen = std::collections::HashSet::new();
-        rows.retain(|row| seen.insert(row.clone()));
+    match op {
+        crate::sql::parser::ast::SetOp::Union => {
+            if !*all {
+                // Typed keys: the old to_string-joined key could collide when a
+                // value contained the separator, silently dropping distinct rows.
+                let mut seen = std::collections::HashSet::new();
+                rows.retain(|row| seen.insert(row.clone()));
+            }
+        }
+        // INTERSECT / EXCEPT apply set semantics: both operands are
+        // deduplicated and the result keeps first-appearance order of the
+        // (deduplicated) left rows.
+        crate::sql::parser::ast::SetOp::Intersect | crate::sql::parser::ast::SetOp::Except => {
+            let mut right_keys = std::collections::HashSet::new();
+            let right_row_start = left_rows_count(&left_batches);
+            for row in rows.iter().skip(right_row_start) {
+                right_keys.insert(row.clone());
+            }
+            rows.truncate(right_row_start);
+            let mut seen = std::collections::HashSet::new();
+            let keep = matches!(
+                op,
+                crate::sql::parser::ast::SetOp::Intersect
+            );
+            rows.retain(|row| {
+                seen.insert(row.clone())
+                    && if keep {
+                        right_keys.contains(row)
+                    } else {
+                        !right_keys.contains(row)
+                    }
+            });
+        }
     }
 
     if !order_by.is_empty() {
@@ -258,11 +287,32 @@ pub fn exec_union_with_txn(
     })
 }
 
+/// Execute one operand of a set operation. Operands may themselves be set
+/// operations (e.g. `(a UNION b) EXCEPT c` folds left-associatively), so a
+/// nested Union recurses instead of hitting the SELECT-only path.
+fn exec_set_operand(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+    reader_txn_id: u64,
+) -> Result<ExecResult> {
+    match stmt {
+        Statement::Union { .. } => exec_union_with_txn(engine, db, stmt, reader_txn_id),
+        _ => exec_select_with_txn(engine, db, stmt, reader_txn_id),
+    }
+}
+
 fn right_schema_col_count(result: &ExecResult) -> usize {
     match result {
         ExecResult::Query { schema, .. } => schema.columns.len(),
         ExecResult::Ok { .. } => 0,
     }
+}
+
+/// Number of rows the left operand contributed to `rows` (they were appended
+/// first, so this is also the index where the right operand's rows start).
+fn left_rows_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 fn union_scalar_cmp(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {

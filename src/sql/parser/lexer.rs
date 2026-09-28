@@ -100,6 +100,10 @@ pub enum Token {
     CurrentTimestamp,
     // New keywords for extended SQL commands
     Union,
+    Intersect,
+    Except,
+    With,
+    Recursive,
     Flush,
     Kill,
     Optimize,
@@ -139,6 +143,8 @@ pub enum Token {
     Plus,
     // Parameter placeholder
     Placeholder,
+    /// `$n` numbered parameter placeholder (1-based), e.g. `$1`.
+    NumberedPlaceholder(usize),
     // Special
     Eof,
 }
@@ -236,6 +242,10 @@ impl std::fmt::Display for Token {
             Token::Default => write!(f, "DEFAULT"),
             Token::CurrentTimestamp => write!(f, "CURRENT_TIMESTAMP"),
             Token::Union => write!(f, "UNION"),
+            Token::Intersect => write!(f, "INTERSECT"),
+            Token::Except => write!(f, "EXCEPT"),
+            Token::With => write!(f, "WITH"),
+            Token::Recursive => write!(f, "RECURSIVE"),
             Token::Flush => write!(f, "FLUSH"),
             Token::Kill => write!(f, "KILL"),
             Token::Optimize => write!(f, "OPTIMIZE"),
@@ -258,6 +268,7 @@ impl std::fmt::Display for Token {
             Token::Ident(v) => write!(f, "{}", v),
             Token::Star => write!(f, "*"),
             Token::Placeholder => write!(f, "?"),
+            Token::NumberedPlaceholder(n) => write!(f, "${}", n),
             Token::Comma => write!(f, ","),
             Token::LeftParen => write!(f, "("),
             Token::RightParen => write!(f, ")"),
@@ -371,6 +382,11 @@ impl<'a> Lexer<'a> {
                 }
                 b'/' => {
                     self.pos += 1;
+                    if self.peek_byte() == Some(b'*') {
+                        self.pos += 1;
+                        self.skip_block_comment()?;
+                        continue;
+                    }
                     Token::Ident("/".into())
                 }
                 b'%' => {
@@ -379,6 +395,17 @@ impl<'a> Lexer<'a> {
                 }
                 b'-' => {
                     self.pos += 1;
+                    if self.peek_byte() == Some(b'-') {
+                        // Line comment: skip to end of line.
+                        self.pos += 1;
+                        while let Some(c) = self.peek_byte() {
+                            if c == b'\n' {
+                                break;
+                            }
+                            self.pos += 1;
+                        }
+                        continue;
+                    }
                     if self
                         .peek_byte()
                         .map(|c| c.is_ascii_digit())
@@ -390,6 +417,40 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'\'' => self.read_string()?,
+                b'"' | b'`' => self.read_quoted_ident(ch)?,
+                b'$' => {
+                    self.pos += 1;
+                    match self.peek_byte() {
+                        Some(c) if c.is_ascii_digit() => {
+                            let start = self.pos;
+                            while self
+                                .peek_byte()
+                                .map(|c| c.is_ascii_digit())
+                                .unwrap_or(false)
+                            {
+                                self.pos += 1;
+                            }
+                            let n: usize = self.input[start..self.pos]
+                                .parse()
+                                .map_err(|e| {
+                                    TaibaiError::Sql(format!("invalid placeholder: {}", e))
+                                })?;
+                            if n == 0 {
+                                return Err(TaibaiError::Sql(
+                                    "placeholder index must be >= 1 ($1 is the first parameter)"
+                                        .into(),
+                                ));
+                            }
+                            Token::NumberedPlaceholder(n)
+                        }
+                        _ => {
+                            return Err(TaibaiError::Sql(
+                                "unexpected character '$' (numbered placeholders look like $1)"
+                                    .into(),
+                            ))
+                        }
+                    }
+                }
                 c if c.is_ascii_digit() => self.read_number()?,
                 c if c.is_ascii_alphabetic() || c == b'_' => self.read_ident_or_keyword()?,
                 c => {
@@ -463,6 +524,50 @@ impl<'a> Lexer<'a> {
         };
         self.pos = end + 1;
         Ok(Token::StringLit(s))
+    }
+
+    /// Read a double-quoted or backtick-quoted identifier. Unlike bare words,
+    /// the contents are never matched against keywords, so `"select"` or
+    /// `` `group` `` can name columns and tables. A doubled quote character
+    /// inside escapes to a single quote.
+    fn read_quoted_ident(&mut self, quote: u8) -> Result<Token> {
+        self.pos += 1; // opening quote
+        let mut result = String::new();
+        loop {
+            let Some(&c) = self.bytes.get(self.pos) else {
+                return Err(TaibaiError::Sql("unterminated quoted identifier".into()));
+            };
+            if c == quote {
+                if self.bytes.get(self.pos + 1) == Some(&quote) {
+                    result.push(quote as char);
+                    self.pos += 2;
+                } else {
+                    self.pos += 1;
+                    return Ok(Token::Ident(result));
+                }
+            } else if c < 128 {
+                result.push(c as char);
+                self.pos += 1;
+            } else {
+                let ch = self.input[self.pos..].chars().next().unwrap();
+                result.push(ch);
+                self.pos += ch.len_utf8();
+            }
+        }
+    }
+
+    /// Skip a `/* ... */` block comment; called with `self.pos` on the `*`.
+    fn skip_block_comment(&mut self) -> Result<()> {
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] == b'*'
+                && self.bytes.get(self.pos + 1) == Some(&b'/')
+            {
+                self.pos += 2;
+                return Ok(());
+            }
+            self.pos += 1;
+        }
+        Err(TaibaiError::Sql("unterminated block comment".into()))
     }
 
     fn read_number(&mut self) -> Result<Token> {
@@ -621,6 +726,10 @@ impl<'a> Lexer<'a> {
             "DEFAULT" => Token::Default,
             "CURRENT_TIMESTAMP" => Token::CurrentTimestamp,
             "UNION" => Token::Union,
+            "INTERSECT" => Token::Intersect,
+            "EXCEPT" => Token::Except,
+            "WITH" => Token::With,
+            "RECURSIVE" => Token::Recursive,
             "FLUSH" => Token::Flush,
             "KILL" => Token::Kill,
             "OPTIMIZE" => Token::Optimize,

@@ -68,6 +68,8 @@ pub fn infer_scalar_function_type(name: &str, arg_types: &[DataType]) -> DataTyp
         "current_date" | "last_day" => DataType::Date,
         "current_time" => DataType::Time,
         "to_float" => DataType::Float64,
+        // cast(value, NULL::<target>, scale): the target is the second arg.
+        "cast" => arg_types.get(1).copied().unwrap_or(DataType::Int64),
         "to_bool" => DataType::Bool,
         "vector_normalize" | "vector_add" | "vector_sub" | "vector_scale" => DataType::Vector,
         "coalesce" | "ifnull" | "isnull" => common_function_type(arg_types),

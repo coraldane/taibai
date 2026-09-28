@@ -52,7 +52,7 @@ Taibai 可以读取 YAML 配置并启动数据库服务，主要配置包括监�
 - Ping/Pong。
 - Flush。
 - 事务消息。
-- Cursor 打开、拉取和关闭。
+- 0x40 查询别名（历史兼容：等同执行一条查询；游标语义从未实现，旧 0x41/0x42 已取消预留，发送方收到标准的"unsupported message type"错误）。
 - Prepare / Execute / Close Statement。
 - Batch Execute。
 - 列式批量导入消息。
@@ -66,11 +66,14 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - DDL：`CREATE/DROP DATABASE`、`CREATE/DROP/ALTER/TRUNCATE TABLE`。
 - 表结构能力：主键、默认值、`AUTO_INCREMENT`、`CLUSTER BY`、`PARTITION BY`、`TTL`、`COMPRESSION_LEVEL`（按表设置 zstd 级别 1..=22）。
 - 分区策略：`VALUE`、`DAY`、`MONTH`、`YEAR`、`HASH`、`MOD`。
-- DML：`INSERT`、多行插入、`REPLACE INTO`、`UPDATE`、`DELETE`；`UPDATE` / `DELETE` 支持 MySQL 风格的表别名（`DELETE FROM t AS a WHERE a.x = 1`）。
+- DML：`INSERT`、多行插入、`INSERT INTO ... SELECT`（库内 ETL：过滤、聚合、投影后落表）、`REPLACE INTO`（含 `REPLACE INTO ... SELECT`）、`UPDATE`、`DELETE`；`UPDATE` / `DELETE` 支持 MySQL 风格的表别名（`DELETE FROM t AS a WHERE a.x = 1`）。
 - 查询：`SELECT`、`WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT/OFFSET`、`DISTINCT`。
+- 表达式：`CASE`、`BETWEEN`、`[NOT] IN/LIKE`、`CAST(expr AS type)`（支持 `DECIMAL(p,s)` 精度）、参数占位符 `?` 与 `$1/$2/...`。
+- 词法：`--` 行注释、`/* */` 块注释、双引号 `"col"` 与反引号 `` `col` `` 引用标识符（可为保留字或含空格的列名）。
 - Join：Inner、Left、Right、Full、Cross、Semi、Anti,以及 ASOF JOIN / LEFT ASOF JOIN（按等值键分区、时间键二分的行情最近匹配连接）。
 - 子查询：`IN`、`EXISTS`、标量子查询等。
-- 集合查询：`UNION` / `UNION ALL`。
+- CTE：`WITH name AS (query) [, name AS (query)] query`（非递归，CTE 名可被后续 CTE 与主查询引用，支持 JOIN 与子查询内引用）。
+- 集合查询：`UNION / UNION ALL`、`INTERSECT`、`EXCEPT`；`INTERSECT` 优先级高于 `UNION`/`EXCEPT`，尾部 `ORDER BY / LIMIT / OFFSET` 作用于整个集合结果，支持括号包裹的查询表达式作为操作数。
 - 窗口函数：`ROW_NUMBER`、`RANK`、`DENSE_RANK`、`LEAD`、`LAG`，以及窗口聚合。
 - 管理语句：`USE`、`SHOW TABLES/DATABASES/COLUMNS/INDEXES/CREATE TABLE/USERS/ROLES/GRANTS/PARTITIONS/STATS/ENGINES/PROCESSLIST`、`KILL QUERY`（终止运行中的查询）。
 - 诊断语句：`EXPLAIN`、`EXPLAIN ANALYZE`。

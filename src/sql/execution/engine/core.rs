@@ -726,6 +726,55 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     session.bulk_import_mode,
                 )
             }
+            Statement::InsertSelect {
+                table,
+                columns,
+                query,
+            } => {
+                // Rows are read from the current snapshot and then routed
+                // through the regular INSERT path (constraint validation,
+                // partition routing, catalog accounting), mirroring
+                // REPLACE SELECT. Like REPLACE SELECT this materializes the
+                // whole result before writing; the SELECT's LIMIT/OFFSET
+                // clauses are the knob for oversized sources.
+                let txn_id = session.active_txn_id();
+                let query_result =
+                    super::query::exec_select_with_txn(self, &session.database, query, txn_id)?;
+                let ExecResult::Query { batches, .. } = query_result else {
+                    return Err(TaibaiError::Internal(
+                        "INSERT SELECT source did not return rows".to_string(),
+                    ));
+                };
+                let mut values = Vec::new();
+                for batch in batches {
+                    for row_idx in 0..batch.num_rows() {
+                        let mut row = Vec::with_capacity(batch.num_columns());
+                        for col_idx in 0..batch.num_columns() {
+                            let value = batch.scalar(row_idx, col_idx).ok_or_else(|| {
+                                TaibaiError::Internal(
+                                    "INSERT SELECT result column is missing".to_string(),
+                                )
+                            })?;
+                            row.push(crate::sql::parser::ast::Expr::Literal(value));
+                        }
+                        values.push(row);
+                    }
+                }
+                let result = super::dml_insert::exec_insert(
+                    self,
+                    table.effective_database(&session.database),
+                    &table.name,
+                    columns,
+                    &values,
+                    session.timezone_offset_hours,
+                    txn_id,
+                    session.bulk_import_mode,
+                );
+                if result.is_ok() && txn_id > 0 {
+                    session.mark_txn_write();
+                }
+                result
+            }
             Statement::Update {
                 table,
                 assignments,
@@ -1004,6 +1053,15 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 self.require_table_permission(
                     session,
                     PermissionType::Delete,
+                    table.effective_database(&session.database),
+                    &table.name,
+                )?;
+                self.ensure_permissions(session, query)
+            }
+            Statement::InsertSelect { table, query, .. } => {
+                self.require_table_permission(
+                    session,
+                    PermissionType::Insert,
                     table.effective_database(&session.database),
                     &table.name,
                 )?;

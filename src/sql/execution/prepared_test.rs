@@ -111,12 +111,10 @@ fn test_bind_where_clause_regression() {
 }
 
 #[test]
-fn test_bind_union_trailing_clauses_on_right_select() {
-    // NOTE: in this parser, trailing ORDER BY / LIMIT / OFFSET after
-    // `... UNION SELECT ...` are consumed by the right-hand parse_select()
-    // and attached to the right Select, NOT to the Union node itself.
-    // So placeholder binding for them flows through the Select branch,
-    // which we verify here by descending into the right child.
+fn test_bind_union_trailing_clauses_on_union_node() {
+    // Trailing ORDER BY / LIMIT / OFFSET belong to the whole set operation,
+    // so the parser attaches them to the Union node itself (the executor
+    // sorts/limits the combined rows there).
     let mut stmt = parse_one("SELECT * FROM t1 UNION SELECT * FROM t2 ORDER BY ? LIMIT ? OFFSET ?");
     let params = [
         ScalarValue::Int64(Some(2)),
@@ -125,32 +123,42 @@ fn test_bind_union_trailing_clauses_on_right_select() {
     ];
     bind_params(&mut stmt, &params).expect("bind failed");
 
-    match stmt {
-        Statement::Union { right, .. } => match &*right {
-            Statement::Select {
-                order_by,
-                limit,
-                offset,
-                ..
-            } => {
-                assert_eq!(order_by.len(), 1);
-                assert!(matches!(
-                    &order_by[0].expr,
-                    Expr::Literal(ScalarValue::Int64(Some(2)))
-                ));
-                assert!(matches!(
-                    limit,
-                    Some(Expr::Literal(ScalarValue::Int64(Some(50))))
-                ));
-                assert!(matches!(
-                    offset,
-                    Some(Expr::Literal(ScalarValue::Int64(Some(5))))
-                ));
-            }
-            _ => panic!("expected right child to be Select"),
-        },
-        _ => panic!("expected Union"),
+    let Statement::Union {
+        right,
+        order_by,
+        limit,
+        offset,
+        ..
+    } = stmt
+    else {
+        panic!("expected Union");
+    };
+    match *right {
+        Statement::Select {
+            order_by: right_order,
+            limit: right_limit,
+            offset: right_offset,
+            ..
+        } => {
+            assert!(right_order.is_empty(), "right select must not carry ORDER BY");
+            assert!(right_limit.is_none(), "right select must not carry LIMIT");
+            assert!(right_offset.is_none(), "right select must not carry OFFSET");
+        }
+        _ => panic!("expected right child to be Select"),
     }
+    assert_eq!(order_by.len(), 1);
+    assert!(matches!(
+        &order_by[0].expr,
+        Expr::Literal(ScalarValue::Int64(Some(2)))
+    ));
+    assert!(matches!(
+        limit,
+        Some(Expr::Literal(ScalarValue::Int64(Some(50))))
+    ));
+    assert!(matches!(
+        offset,
+        Some(Expr::Literal(ScalarValue::Int64(Some(5))))
+    ));
 }
 
 #[test]
@@ -260,6 +268,73 @@ fn test_bind_explain_wrapped() {
 }
 
 #[test]
+fn test_bind_numbered_placeholders() {
+    // `$n` binds positionally: $2 -> the first supplied param is unused by it;
+    // here $2 receives the Int64 and $1 the VarChar, regardless of order.
+    let mut stmt = parse_one("SELECT * FROM t WHERE id = $2 AND name = $1");
+    let params = [
+        ScalarValue::VarChar(Some("beta".into())),
+        ScalarValue::Int64(Some(42)),
+    ];
+    bind_params(&mut stmt, &params).expect("bind failed");
+    assert!(!has_placeholders(&stmt));
+    match stmt {
+        Statement::Select {
+            where_clause: Some(Expr::BinaryOp { left, right, .. }),
+            ..
+        } => {
+            // left: id = 42 ($2), right: name = 'beta' ($1).
+            assert!(matches!(
+                &*left,
+                Expr::BinaryOp {
+                    right: boxed,
+                    ..
+                } if matches!(&**boxed, Expr::Literal(ScalarValue::Int64(Some(42))))
+            ));
+            assert!(matches!(
+                &*right,
+                Expr::BinaryOp {
+                    right: boxed,
+                    ..
+                } if matches!(&**boxed, Expr::Literal(ScalarValue::VarChar(Some(s))) if s == "beta")
+            ));
+        }
+        _ => panic!("expected Select with where"),
+    }
+}
+
+#[test]
+fn test_mixed_numbered_and_sequential_placeholders() {
+    // A `?` after `$2` continues at index 2 (the third parameter). Node count
+    // stays 2 (two placeholder expressions), but binding requires 3 params.
+    let mut stmt = parse_one("SELECT * FROM t WHERE a = $2 OR b = ?");
+    assert_eq!(count_placeholders(&stmt), 2);
+    let params = [
+        ScalarValue::Int64(Some(0)),
+        ScalarValue::Int64(Some(2)),
+        ScalarValue::Int64(Some(3)),
+    ];
+    bind_params(&mut stmt, &params).expect("bind failed");
+    assert!(!has_placeholders(&stmt));
+}
+
+#[test]
+fn test_bind_insert_select_query() {
+    // Placeholders inside INSERT ... SELECT's source query must bind.
+    let mut stmt = parse_one("INSERT INTO t (a, b) SELECT a, b FROM s WHERE id = ?");
+    let params = [ScalarValue::Int64(Some(7))];
+    bind_params(&mut stmt, &params).expect("bind failed");
+    assert!(!has_placeholders(&stmt), "insert-select placeholder not bound");
+    match stmt {
+        Statement::InsertSelect { table, query, .. } => {
+            assert_eq!(table.name, "t");
+            assert!(matches!(&*query, Statement::Select { .. }));
+        }
+        _ => panic!("expected InsertSelect"),
+    }
+}
+
+#[test]
 fn test_count_and_has_placeholders_consistent() {
     // For every top-level statement shape, count_placeholders and
     // has_placeholders must agree (both see placeholders, or neither does).
@@ -281,6 +356,8 @@ fn test_count_and_has_placeholders_consistent() {
         "INSERT INTO t (a) VALUES (?)",
         "REPLACE INTO t (a) VALUES (?)",
         "REPLACE INTO t (a) SELECT a FROM s WHERE id = ?",
+        "INSERT INTO t (a, b) SELECT a, b FROM s WHERE id = ?",
+        "INSERT INTO t (a) SELECT a FROM s WHERE id = $1",
         "UPDATE t SET a = ? WHERE id = ?",
         "DELETE FROM t WHERE id = ?",
     ];

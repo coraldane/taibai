@@ -68,6 +68,10 @@ rayon = "1.10"
 chrono = "0.4"
 windows-service = "0.7"
 csv = "1"
+# Password credential hashing (Argon2id, PHC string format).
+argon2 = "0.5"
+# Salt generation for argon2 (OsRng needs the getrandom feature).
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -86,6 +90,10 @@ path = "tests/transaction_dml_test.rs"
 [[test]]
 name = "constraints_test"
 path = "tests/constraints_test.rs"
+
+[[test]]
+name = "cte_set_operations_test"
+path = "tests/cte_set_operations_test.rs"
 
 [[test]]
 name = "data_types_test"

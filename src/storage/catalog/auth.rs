@@ -84,9 +84,36 @@ impl UserInfo {
         }
     }
 
+    /// Verify a candidate password against the stored hash. Both the current
+    /// Argon2id format and the legacy unsalted SipHash format (auth.json
+    /// files written before the upgrade) are accepted; legacy hashes are
+    /// transparently rehashed by `AuthManager::authenticate` on the next
+    /// successful login.
     pub fn verify_password(&self, password: &str) -> bool {
-        let hash = hash_password(password);
-        self.password_hash == hash
+        if self.password_hash_is_legacy() {
+            // Legacy: unsalted 64-bit SipHash — fast by design, so the
+            // comparison is not secret-dependent in any meaningful window.
+            self.password_hash == legacy_hash_password(password)
+        } else {
+            use argon2::password_hash::PasswordVerifier;
+            use argon2::Argon2;
+            match argon2::password_hash::PasswordHash::new(&self.password_hash) {
+                Ok(parsed) => Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok(),
+                Err(_) => false,
+            }
+        }
+    }
+
+    /// True when the stored hash predates the Argon2id upgrade and should be
+    /// rehashed after the next successful verification.
+    pub fn password_hash_is_legacy(&self) -> bool {
+        !self.password_hash.starts_with("$argon2")
+    }
+
+    pub fn upgrade_password_hash(&mut self, password: &str) {
+        self.password_hash = hash_password(password);
     }
 
     pub fn has_permission(
@@ -170,7 +197,22 @@ impl RoleInfo {
     }
 }
 
+/// Hash a password with Argon2id (random salt, PHC string format), the only
+/// format new credentials get. A hashing failure is a hard bug (parameters or
+/// RNG broken) and fails loudly instead of silently storing something weaker.
 fn hash_password(password: &str) -> String {
+    use argon2::password_hash::SaltString;
+    use argon2::{Argon2, PasswordHasher};
+    let salt = SaltString::generate(&mut rand_core::OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .expect("argon2 password hashing failed")
+}
+
+/// The pre-upgrade scheme: unsalted 64-bit SipHash. Only used to verify
+/// legacy credentials during migration; never used for new hashes.
+fn legacy_hash_password(password: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -322,6 +364,10 @@ impl AuthStore {
 
     pub fn get_user(&self, name: &str) -> Option<&UserInfo> {
         self.users.get(name)
+    }
+
+    pub fn get_user_mut(&mut self, name: &str) -> Option<&mut UserInfo> {
+        self.users.get_mut(name)
     }
 
     pub fn is_admin_user(&self, name: &str) -> bool {
@@ -488,20 +534,41 @@ impl AuthManager {
         Ok(())
     }
 
+    /// Verify a login. A successful login against a legacy (pre-Argon2id)
+    /// credential transparently rehashes the password with the current scheme
+    /// and persists the upgraded hash, so existing auth.json files migrate
+    /// without a reset.
     pub fn authenticate(&self, username: &str, password: &str) -> Result<bool> {
-        let store = self.store.read().unwrap();
-        if store.users.is_empty() {
-            return Ok(true);
-        }
-        match store.get_user(username) {
-            Some(user) => {
-                if user.account_locked {
-                    return Ok(false);
-                }
-                Ok(user.verify_password(password))
+        {
+            let store = self.store.read().unwrap();
+            if store.users.is_empty() {
+                return Ok(true);
             }
-            None => Ok(false),
+            match store.get_user(username) {
+                Some(user) => {
+                    if user.account_locked {
+                        return Ok(false);
+                    }
+                    if !user.password_hash_is_legacy() {
+                        return Ok(user.verify_password(password));
+                    }
+                }
+                None => return Ok(false),
+            }
         }
+        // Legacy credential: re-verify under the write lock, then upgrade.
+        let mut store = self.store.write().unwrap();
+        let Some(user) = store.get_user_mut(username) else {
+            return Ok(false);
+        };
+        if user.account_locked || !user.verify_password(password) {
+            return Ok(false);
+        }
+        if user.password_hash_is_legacy() {
+            user.upgrade_password_hash(password);
+            store.save(&self.path)?;
+        }
+        Ok(true)
     }
 
     pub fn check_permission(
