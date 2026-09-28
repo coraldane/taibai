@@ -102,6 +102,7 @@ impl FunctionRegistry {
         self.register_scalar("isnull", super::control::isnull_func);
 
         // Conversion functions
+        self.register_scalar("cast", super::conversion::cast);
         self.register_scalar("to_int", super::conversion::to_int);
         self.register_scalar("to_float", super::conversion::to_float);
         self.register_scalar("to_string", super::conversion::to_string);

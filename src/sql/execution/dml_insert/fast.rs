@@ -288,16 +288,49 @@ fn parse_insert_column_list(sql: &str, bytes: &[u8], pos: &mut usize) -> Option<
     let mut columns = Vec::new();
     loop {
         skip_spaces(bytes, pos);
-        let start = *pos;
-        while *pos < bytes.len()
-            && !matches!(bytes[*pos], b',' | b')' | b' ' | b'\t' | b'\r' | b'\n')
-        {
-            *pos += 1;
-        }
-        if *pos == start {
+        if *pos >= bytes.len() {
             return None;
         }
-        columns.push(sql[start..*pos].to_string());
+        // Quoted identifier ("col" or `col`): the real lexer strips the
+        // quotes, so the fast path must too — otherwise the plan resolves
+        // against a name that still carries them.
+        let quote = bytes[*pos];
+        if quote == b'"' || quote == b'`' {
+            *pos += 1;
+            let mut name = String::new();
+            let mut seg_start = *pos;
+            loop {
+                let Some(&c) = bytes.get(*pos) else {
+                    return None;
+                };
+                if c == quote {
+                    if bytes.get(*pos + 1) == Some(&quote) {
+                        name.push_str(&sql[seg_start..*pos]);
+                        name.push(quote as char);
+                        *pos += 2;
+                        seg_start = *pos;
+                    } else {
+                        name.push_str(&sql[seg_start..*pos]);
+                        *pos += 1;
+                        break;
+                    }
+                } else {
+                    *pos += 1;
+                }
+            }
+            columns.push(name);
+        } else {
+            let start = *pos;
+            while *pos < bytes.len()
+                && !matches!(bytes[*pos], b',' | b')' | b' ' | b'\t' | b'\r' | b'\n')
+            {
+                *pos += 1;
+            }
+            if *pos == start {
+                return None;
+            }
+            columns.push(sql[start..*pos].to_string());
+        }
         skip_spaces(bytes, pos);
         if *pos >= bytes.len() {
             return None;

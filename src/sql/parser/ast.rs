@@ -176,6 +176,13 @@ pub enum Statement {
         columns: Vec<String>,
         query: Box<Statement>,
     },
+    /// `INSERT INTO t [(cols)] SELECT ...`: rows come from a SELECT executed
+    /// against the current snapshot, then go through the normal INSERT path.
+    InsertSelect {
+        table: ObjectName,
+        columns: Vec<String>,
+        query: Box<Statement>,
+    },
     Update {
         table: ObjectName,
         /// Optional `UPDATE t [AS] alias` table alias; usable as the column

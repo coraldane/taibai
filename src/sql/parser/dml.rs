@@ -44,11 +44,20 @@ impl Parser {
             Vec::new()
         };
 
-        if replace && self.peek() == &Token::Select {
-            return Ok(Statement::ReplaceSelect {
-                table,
-                columns,
-                query: Box::new(self.parse_select()?),
+        if self.peek() == &Token::Select {
+            let query = Box::new(self.parse_select()?);
+            return Ok(if replace {
+                Statement::ReplaceSelect {
+                    table,
+                    columns,
+                    query,
+                }
+            } else {
+                Statement::InsertSelect {
+                    table,
+                    columns,
+                    query,
+                }
             });
         }
 

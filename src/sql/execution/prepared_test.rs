@@ -260,6 +260,73 @@ fn test_bind_explain_wrapped() {
 }
 
 #[test]
+fn test_bind_numbered_placeholders() {
+    // `$n` binds positionally: $2 -> the first supplied param is unused by it;
+    // here $2 receives the Int64 and $1 the VarChar, regardless of order.
+    let mut stmt = parse_one("SELECT * FROM t WHERE id = $2 AND name = $1");
+    let params = [
+        ScalarValue::VarChar(Some("beta".into())),
+        ScalarValue::Int64(Some(42)),
+    ];
+    bind_params(&mut stmt, &params).expect("bind failed");
+    assert!(!has_placeholders(&stmt));
+    match stmt {
+        Statement::Select {
+            where_clause: Some(Expr::BinaryOp { left, right, .. }),
+            ..
+        } => {
+            // left: id = 42 ($2), right: name = 'beta' ($1).
+            assert!(matches!(
+                &*left,
+                Expr::BinaryOp {
+                    right: boxed,
+                    ..
+                } if matches!(&**boxed, Expr::Literal(ScalarValue::Int64(Some(42))))
+            ));
+            assert!(matches!(
+                &*right,
+                Expr::BinaryOp {
+                    right: boxed,
+                    ..
+                } if matches!(&**boxed, Expr::Literal(ScalarValue::VarChar(Some(s))) if s == "beta")
+            ));
+        }
+        _ => panic!("expected Select with where"),
+    }
+}
+
+#[test]
+fn test_mixed_numbered_and_sequential_placeholders() {
+    // A `?` after `$2` continues at index 2 (the third parameter). Node count
+    // stays 2 (two placeholder expressions), but binding requires 3 params.
+    let mut stmt = parse_one("SELECT * FROM t WHERE a = $2 OR b = ?");
+    assert_eq!(count_placeholders(&stmt), 2);
+    let params = [
+        ScalarValue::Int64(Some(0)),
+        ScalarValue::Int64(Some(2)),
+        ScalarValue::Int64(Some(3)),
+    ];
+    bind_params(&mut stmt, &params).expect("bind failed");
+    assert!(!has_placeholders(&stmt));
+}
+
+#[test]
+fn test_bind_insert_select_query() {
+    // Placeholders inside INSERT ... SELECT's source query must bind.
+    let mut stmt = parse_one("INSERT INTO t (a, b) SELECT a, b FROM s WHERE id = ?");
+    let params = [ScalarValue::Int64(Some(7))];
+    bind_params(&mut stmt, &params).expect("bind failed");
+    assert!(!has_placeholders(&stmt), "insert-select placeholder not bound");
+    match stmt {
+        Statement::InsertSelect { table, query, .. } => {
+            assert_eq!(table.name, "t");
+            assert!(matches!(&*query, Statement::Select { .. }));
+        }
+        _ => panic!("expected InsertSelect"),
+    }
+}
+
+#[test]
 fn test_count_and_has_placeholders_consistent() {
     // For every top-level statement shape, count_placeholders and
     // has_placeholders must agree (both see placeholders, or neither does).
@@ -281,6 +348,8 @@ fn test_count_and_has_placeholders_consistent() {
         "INSERT INTO t (a) VALUES (?)",
         "REPLACE INTO t (a) VALUES (?)",
         "REPLACE INTO t (a) SELECT a FROM s WHERE id = ?",
+        "INSERT INTO t (a, b) SELECT a, b FROM s WHERE id = ?",
+        "INSERT INTO t (a) SELECT a FROM s WHERE id = $1",
         "UPDATE t SET a = ? WHERE id = ?",
         "DELETE FROM t WHERE id = ?",
     ];

@@ -209,6 +209,7 @@ pub fn bind_params(stmt: &mut Statement, params: &[ScalarValue]) -> Result<()> {
             }
         }
         Statement::ReplaceSelect { query, .. } => bind_params(query, params)?,
+        Statement::InsertSelect { query, .. } => bind_params(query, params)?,
         Statement::Update {
             where_clause,
             assignments,
@@ -459,6 +460,9 @@ pub fn count_placeholders(stmt: &Statement) -> usize {
         Statement::ReplaceSelect { query, .. } => {
             count += count_placeholders(query);
         }
+        Statement::InsertSelect { query, .. } => {
+            count += count_placeholders(query);
+        }
         Statement::Update {
             where_clause,
             assignments,
@@ -691,6 +695,9 @@ pub fn has_placeholders(stmt: &Statement) -> bool {
             }
         }
         Statement::ReplaceSelect { query, .. } => {
+            found |= has_placeholders(query);
+        }
+        Statement::InsertSelect { query, .. } => {
             found |= has_placeholders(query);
         }
         Statement::Update {

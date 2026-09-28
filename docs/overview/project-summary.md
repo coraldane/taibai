@@ -66,8 +66,10 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - DDL：`CREATE/DROP DATABASE`、`CREATE/DROP/ALTER/TRUNCATE TABLE`。
 - 表结构能力：主键、默认值、`AUTO_INCREMENT`、`CLUSTER BY`、`PARTITION BY`、`TTL`、`COMPRESSION_LEVEL`（按表设置 zstd 级别 1..=22）。
 - 分区策略：`VALUE`、`DAY`、`MONTH`、`YEAR`、`HASH`、`MOD`。
-- DML：`INSERT`、多行插入、`REPLACE INTO`、`UPDATE`、`DELETE`；`UPDATE` / `DELETE` 支持 MySQL 风格的表别名（`DELETE FROM t AS a WHERE a.x = 1`）。
+- DML：`INSERT`、多行插入、`INSERT INTO ... SELECT`（库内 ETL：过滤、聚合、投影后落表）、`REPLACE INTO`（含 `REPLACE INTO ... SELECT`）、`UPDATE`、`DELETE`；`UPDATE` / `DELETE` 支持 MySQL 风格的表别名（`DELETE FROM t AS a WHERE a.x = 1`）。
 - 查询：`SELECT`、`WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT/OFFSET`、`DISTINCT`。
+- 表达式：`CASE`、`BETWEEN`、`[NOT] IN/LIKE`、`CAST(expr AS type)`（支持 `DECIMAL(p,s)` 精度）、参数占位符 `?` 与 `$1/$2/...`。
+- 词法：`--` 行注释、`/* */` 块注释、双引号 `"col"` 与反引号 `` `col` `` 引用标识符（可为保留字或含空格的列名）。
 - Join：Inner、Left、Right、Full、Cross、Semi、Anti,以及 ASOF JOIN / LEFT ASOF JOIN（按等值键分区、时间键二分的行情最近匹配连接）。
 - 子查询：`IN`、`EXISTS`、标量子查询等。
 - 集合查询：`UNION` / `UNION ALL`。
