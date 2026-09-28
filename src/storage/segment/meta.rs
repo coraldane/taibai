@@ -8,7 +8,9 @@ use crate::common::error::{Result, TaibaiError};
 use crate::storage::partition::pruning::{compute_segment_zone_maps_from_row_groups, ZoneMap};
 use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::writer::encode_segment_footer;
-use crate::storage::segment::{RowGroupMeta, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use crate::storage::segment::{
+    is_supported_segment_version, RowGroupMeta, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC,
+};
 use crate::types::batch::Schema;
 
 const SIDECAR_MAGIC: u32 = 0x4D58_4D54;
@@ -62,7 +64,7 @@ pub fn read_embedded_footer(segment_path: &Path) -> Result<SidecarFooter> {
     file.read_exact(&mut header)?;
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    if magic != SEGMENT_MAGIC || version != SEGMENT_VERSION {
+    if magic != SEGMENT_MAGIC || !is_supported_segment_version(version) {
         return Err(TaibaiError::Storage(format!(
             "invalid segment header for {}",
             segment_path.display()
@@ -351,7 +353,7 @@ fn valid_record_count(path: &Path) -> Result<usize> {
 }
 
 #[cfg(windows)]
-fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
@@ -381,7 +383,7 @@ fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn atomic_replace(src: &Path, dst: &Path) -> Result<()> {
     fs::rename(src, dst)?;
     Ok(())
 }

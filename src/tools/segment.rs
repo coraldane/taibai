@@ -4,13 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::error::{Result, TaibaiError};
-use crate::protocol::types::DataType;
+use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::meta::{read_embedded_footer, read_latest_sidecar_footer};
-use crate::storage::segment::writer::VALUE_SET_EXTENSION_MAGIC;
-use crate::storage::segment::{
-    decode_scalar_with_tag, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION,
-};
-use crate::types::batch::{ColumnDef, Schema};
+use crate::storage::segment::{is_supported_segment_version, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC};
+use crate::types::batch::Schema;
 #[allow(unused_imports)]
 use crate::types::scalar::ScalarValue;
 
@@ -84,10 +81,12 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             header_magic, SEGMENT_MAGIC
         )));
     }
-    if header_version != SEGMENT_VERSION {
+    if !is_supported_segment_version(header_version) {
         return Err(TaibaiError::Storage(format!(
-            "unsupported segment header version: {} (expected {})",
-            header_version, SEGMENT_VERSION
+            "unsupported segment header version: {} (supported: {:?}) - \r
+             run the migrate tool after upgrading",
+            header_version,
+            crate::storage::segment::SUPPORTED_SEGMENT_VERSIONS
         )));
     }
 
@@ -97,126 +96,32 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
     };
     let footer_data = footer_source.footer;
 
-    let mut cursor = Cursor::new(footer_data.as_slice());
+    let parsed = parse_segment_footer(footer_data.as_slice())?;
+    let version = parsed.version;
+    let generation = parsed.generation;
+    let header_row_count = parsed.row_count;
+    let row_group_count = parsed.row_groups.len() as u32;
+    let created_at = parsed.created_at;
+    let modified_at = parsed.modified_at;
 
-    let magic = read_u32_le(&mut cursor)?;
-    if magic != crate::storage::segment::SEGMENT_MAGIC {
-        return Err(TaibaiError::Storage(format!(
-            "invalid segment magic: {:08X}, expected {:08X}",
-            magic,
-            crate::storage::segment::SEGMENT_MAGIC
-        )));
-    }
-
-    let version = read_u32_le(&mut cursor)?;
-    let generation = read_u64_le(&mut cursor)?;
-    let header_row_count = read_u64_le(&mut cursor)?;
-    let row_group_count = read_u32_le(&mut cursor)?;
-    let created_at = read_u64_le(&mut cursor)?;
-    let modified_at = read_u64_le(&mut cursor)?;
-
-    let _table_name = read_len_prefixed_str(&mut cursor)?;
-    let col_count = read_u32_le(&mut cursor)? as usize;
-    let mut columns = Vec::with_capacity(col_count);
-    for _ in 0..col_count {
-        let name = read_len_prefixed_str(&mut cursor)?;
-        let dtype_byte = read_u8(&mut cursor)?;
-        let nullable = read_u8(&mut cursor)? != 0;
-        let scale = read_u8(&mut cursor)? as i32;
-        let precision = read_u8(&mut cursor)? as i32;
-        let column_id = read_u32_le(&mut cursor)?;
-        columns.push(ColumnDef {
-            name,
-            data_type: DataType::from_u8(dtype_byte)?,
-            nullable,
-            scale,
-            precision,
-            auto_increment: false,
-            primary_key: false,
-            default_value: None,
-            column_id,
-            previous_names: Vec::new(),
-            added_at_micros: None,
-        });
-    }
-    let schema = Schema::new(columns);
-
-    let col_count = schema.num_columns();
-    let has_segment_zone_maps = read_u8(&mut cursor).unwrap_or(0);
-    if has_segment_zone_maps != 0 {
-        let segment_zone_map_count = read_u32_le(&mut cursor).unwrap_or(0) as usize;
-        for _ in 0..segment_zone_map_count {
-            let _min_v = decode_scalar_with_tag(&mut cursor)?;
-            let _max_v = decode_scalar_with_tag(&mut cursor)?;
-            let _null_count = read_u64_le(&mut cursor)?;
-            let _row_count = read_u64_le(&mut cursor)?;
-        }
-    }
-
-    let mut row_groups = Vec::with_capacity(row_group_count as usize);
     let mut footer_row_count: u64 = 0;
     let mut compressed_size: u64 = 0;
     let mut uncompressed_size: u64 = 0;
-
-    for _ in 0..row_group_count {
-        let rg_offset = read_u64_le(&mut cursor)?;
-        let rg_length = read_u64_le(&mut cursor)?;
-        let rg_row_count = read_u64_le(&mut cursor)?;
-        footer_row_count += rg_row_count;
-
-        let mut _column_sizes = Vec::with_capacity(col_count);
-        for _ in 0..col_count {
-            _column_sizes.push(read_u64_le(&mut cursor)?);
-        }
-
-        let mut comp_sizes = Vec::with_capacity(col_count);
-        for _ in 0..col_count {
-            let s = read_u64_le(&mut cursor)?;
-            compressed_size += s;
-            comp_sizes.push(s);
-        }
-
-        let mut uncomp_sizes = Vec::with_capacity(col_count);
-        for _ in 0..col_count {
-            let s = read_u64_le(&mut cursor)?;
-            uncompressed_size += s;
-            uncomp_sizes.push(s);
-        }
-
-        let mut zone_maps = Vec::with_capacity(col_count);
-        for _ in 0..col_count {
-            let min_v = decode_scalar_with_tag(&mut cursor)?;
-            let max_v = decode_scalar_with_tag(&mut cursor)?;
-            let null_count = read_u64_le(&mut cursor)?;
-            let zm_row_count = read_u64_le(&mut cursor)?;
-            zone_maps.push(ZoneMap {
-                min_value: min_v,
-                max_value: max_v,
-                null_count,
-                row_count: zm_row_count,
-            });
-        }
-
-        // Footer v5 stores one bloom-filter slot per column after ZoneMaps.
-        // The inspector does not print these, but it must advance past them
-        // before reading the next row group or the delete-bitmap section.
-        skip_bloom_filters(&mut cursor, footer_data.as_slice(), col_count)?;
-        skip_value_sets_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
-        skip_col_sums_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
-        skip_column_crcs_if_present(&mut cursor, footer_data.as_slice(), col_count)?;
-
+    let mut row_groups = Vec::with_capacity(parsed.row_groups.len());
+    for rg in &parsed.row_groups {
+        footer_row_count += rg.row_count;
+        compressed_size += rg.compressed_sizes.iter().sum::<u64>();
+        uncompressed_size += rg.uncompressed_sizes.iter().sum::<u64>();
         row_groups.push(RowGroupInfo {
-            offset: rg_offset,
-            length: rg_length,
-            row_count: rg_row_count,
-            compressed_sizes: comp_sizes,
-            uncompressed_sizes: uncomp_sizes,
-            zone_maps,
+            offset: rg.offset,
+            length: rg.length,
+            row_count: rg.row_count,
+            compressed_sizes: rg.compressed_sizes.clone(),
+            uncompressed_sizes: rg.uncompressed_sizes.clone(),
+            zone_maps: rg.zone_maps.clone(),
         });
     }
 
-    let deleted_row_count = read_u64_le(&mut cursor).unwrap_or(0);
-    let delete_bitmap_len = read_u32_le(&mut cursor).unwrap_or(0);
 
     let row_count = if footer_row_count > 0 {
         footer_row_count
@@ -250,12 +155,12 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
         modified_at,
         file_created,
         file_modified,
-        schema,
+        schema: parsed.schema.clone(),
         row_groups,
         partition_key,
         sequence,
-        deleted_row_count,
-        delete_bitmap_len,
+        deleted_row_count: parsed.deleted_row_count,
+        delete_bitmap_len: parsed.delete_bitmap.len() as u32,
     })
 }
 
@@ -421,90 +326,8 @@ fn read_u32_le(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-fn skip_value_sets_if_present(
-    cursor: &mut Cursor<&[u8]>,
-    data: &[u8],
-    col_count: usize,
-) -> Result<()> {
-    let pos = cursor.position() as usize;
-    if pos + 4 > data.len() {
-        return Ok(());
-    }
-    let marker = u32::from_le_bytes(
-        data[pos..pos + 4]
-            .try_into()
-            .map_err(|_| TaibaiError::Storage("invalid value set extension marker".to_string()))?,
-    );
-    if marker != VALUE_SET_EXTENSION_MAGIC {
-        return Ok(());
-    }
-    cursor.set_position((pos + 4) as u64);
-    for _ in 0..col_count {
-        let has_set = read_u8(cursor)?;
-        if has_set != 0 {
-            let value_count = read_u32_le(cursor)? as usize;
-            for _ in 0..value_count {
-                let _ = decode_scalar_with_tag(cursor)?;
-            }
-        }
-    }
-    Ok(())
-}
 
-/// Footer v6 stores per-row-group pre-aggregated sums (`[magic][col_count
-/// u32][col_count × i64]`) after the value-set extension. The inspector does
-/// not print them, but must advance past them like the other extensions.
-fn skip_column_crcs_if_present(
-    cursor: &mut Cursor<&[u8]>,
-    data: &[u8],
-    col_count: usize,
-) -> Result<()> {
-    let pos = cursor.position() as usize;
-    if pos + 4 > data.len() {
-        return Ok(());
-    }
-    let marker = u32::from_le_bytes(
-        data[pos..pos + 4]
-            .try_into()
-            .map_err(|_| TaibaiError::Storage("invalid column crc extension marker".to_string()))?,
-    );
-    if marker != crate::storage::segment::writer::COLUMN_CRC_EXTENSION_MAGIC {
-        return Ok(());
-    }
-    cursor.set_position((pos + 4) as u64);
-    let stored_count = read_u32_le(cursor)? as usize;
-    if stored_count != col_count {
-        // Pathological; keep the parser loud instead of misaligning.
-        return Err(TaibaiError::Storage(format!(
-            "column crc extension count mismatch: {stored_count} stored, {col_count} expected"
-        )));
-    }
-    cursor.set_position(cursor.position() + stored_count as u64 * 4);
-    Ok(())
-}
 
-fn skip_col_sums_if_present(
-    cursor: &mut Cursor<&[u8]>,
-    data: &[u8],
-    _col_count: usize,
-) -> Result<()> {
-    let pos = cursor.position() as usize;
-    if pos + 4 > data.len() {
-        return Ok(());
-    }
-    let marker = u32::from_le_bytes(
-        data[pos..pos + 4]
-            .try_into()
-            .map_err(|_| TaibaiError::Storage("invalid col sum extension marker".to_string()))?,
-    );
-    if marker != crate::storage::segment::writer::COL_SUM_EXTENSION_MAGIC {
-        return Ok(());
-    }
-    cursor.set_position((pos + 4) as u64);
-    let _stored_count = read_u32_le(cursor)? as usize;
-    cursor.set_position(cursor.position() + _stored_count as u64 * 8);
-    Ok(())
-}
 
 fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     let mut buf = [0u8; 8];
@@ -514,28 +337,6 @@ fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
-fn skip_bloom_filters(cursor: &mut Cursor<&[u8]>, data: &[u8], col_count: usize) -> Result<()> {
-    for _ in 0..col_count {
-        let has_bf = read_u8(cursor)?;
-        if has_bf != 0 {
-            let bf_len = read_u32_le(cursor)? as usize;
-            let start = cursor.position() as usize;
-            let end = start
-                .checked_add(bf_len)
-                .ok_or_else(|| TaibaiError::Storage("invalid bloom filter length".to_string()))?;
-            if end > data.len() {
-                return Err(TaibaiError::Storage(format!(
-                    "invalid bloom filter length: {} at footer offset {} (footer size {})",
-                    bf_len,
-                    start,
-                    data.len()
-                )));
-            }
-            cursor.set_position(end as u64);
-        }
-    }
-    Ok(())
-}
 
 fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     let len = read_u32_le(cursor)? as usize;

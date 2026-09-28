@@ -32,6 +32,10 @@ path = "src/main.rs"
 name = "segment"
 path = "src/bin/segment_checker.rs"
 
+[[bin]]
+name = "migrate"
+path = "src/bin/migrate.rs"
+
 
 
 [dependencies]

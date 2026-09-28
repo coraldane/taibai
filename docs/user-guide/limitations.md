@@ -7,6 +7,14 @@ Taibai 是用 Rust 编写的偏分析场景的列式数据库服务端：适合�
 - SQL 语法是项目自有实现，不代表完整兼容 MySQL、PostgreSQL、ClickHouse 或其他数据库。
 - 升级前应备份数据，并在隔离环境验证读取、写入和恢复流程。
 - 配置项、命令行参数、SQL 行为或公共接口的不兼容变更会在 Pull Request 描述中突出说明。
+## 段格式版本
+
+数据目录中的 segment 文件带格式版本号。升级二进制时：
+
+- **新二进制读旧数据**：读取端支持版本区间（当前 `{1, 2}`），直接启动即可，无需迁移。
+- **旧二进制读新数据**：会在 header 版本门处**明确报错**（不会静默错解），错误信息会提示运行 `migrate` 工具。
+- **升级流程**：停止服务（优雅关闭会 seal 全部 active writer）→ 备份数据目录 → `migrate --data <dir>`（dry run 校验）→ `migrate --data <dir> --write`（原地升级，tmp+rename 原子替换）→ 启动新二进制。带 `.meta` sidecar 的 active 段会被拒绝迁移，先正常关服再执行。
+- footer 扩展块（value sets / column sums / column CRCs / TLV 尾块 / 整体校验和）的编解码统一在 `src/storage/segment/footer_ext.rs` 一处维护；新增扩展不再需要同步修改多个解析点。
 
 ## 功能边界
 

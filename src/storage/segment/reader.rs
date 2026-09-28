@@ -16,9 +16,9 @@ use crate::types::array::ColumnArray;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 
-use super::constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+use super::constants::{is_supported_segment_version, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC};
 use super::footer::{parse_segment_footer, reserved_section_offset, ParsedSegmentFooter};
-use super::writer::FOOTER_CRC_EXTENSION_MAGIC;
+use super::footer_ext::{append_footer_crc, encode_footer_tail};
 use super::meta::{read_embedded_footer, read_latest_sidecar_footer};
 use super::RowGroupMeta;
 
@@ -120,11 +120,11 @@ impl SegmentReader {
                 path.display(),
             )));
         }
-        if hdr_version != SEGMENT_VERSION {
+        if !is_supported_segment_version(hdr_version) {
             return Err(TaibaiError::Storage(format!(
-                "unsupported segment version: {} (expected {}, file: {})",
+                "unsupported segment version: {} (supported: {:?}, file: {}) - run the migrate tool after upgrading",
                 hdr_version,
-                SEGMENT_VERSION,
+                super::constants::SUPPORTED_SEGMENT_VERSIONS,
                 path.display(),
             )));
         }
@@ -291,7 +291,7 @@ impl SegmentReader {
         // extension structure) before copying any of it: a locally corrupt
         // footer used to be copied verbatim and "laundered" by the freshly
         // recomputed checksum.
-        parse_segment_footer(&source.footer)?;
+        let parsed = parse_segment_footer(&source.footer)?;
         let res_offset = reserved_section_offset(&source.footer)?;
 
         // The rebuilt footer keeps the row-group prefix (including the
@@ -305,9 +305,10 @@ impl SegmentReader {
         if !delete_bitmap.is_empty() {
             new_footer.extend_from_slice(delete_bitmap);
         }
-        let footer_crc = crc32fast::hash(&new_footer);
-        new_footer.extend_from_slice(&FOOTER_CRC_EXTENSION_MAGIC.to_le_bytes());
-        new_footer.extend_from_slice(&footer_crc.to_le_bytes());
+        // Preserve footer tail TLV entries across the rewrite, then
+        // close with a fresh whole-footer checksum (always last).
+        new_footer.extend_from_slice(&encode_footer_tail(&parsed.tail));
+        append_footer_crc(&mut new_footer);
 
         // The in-place truncate-and-rewrite below is not atomic: a crash
         // between `set_len` and the new footer reaching disk would leave the

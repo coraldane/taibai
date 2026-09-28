@@ -18,14 +18,13 @@ use crate::types::scalar::ScalarValue;
 use super::constants::{FOOTER_SIZE, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
 use super::meta::remove_sidecar_meta;
 
-pub(crate) const VALUE_SET_EXTENSION_MAGIC: u32 = 0x5354_4958; // STIX
 pub(crate) const VALUE_SET_MAX_DISTINCT: usize = 1024;
-/// Per-row-group pre-aggregated sums extension: `[magic][col_count u32][col_count × i64 LE]`.
-/// Present per row group only when sums were computed (segments written
-/// before the extension keep omitting it).
-pub(crate) const COL_SUM_EXTENSION_MAGIC: u32 = 0x4353_554D; // CSUM
-pub(crate) const COLUMN_CRC_EXTENSION_MAGIC: u32 = 0x4343_5233; // CCR3
-pub(crate) const FOOTER_CRC_EXTENSION_MAGIC: u32 = 0x4643_5233; // FCR3
+// Extension-block magics live in `footer_ext`, the single source of
+// truth for every optional footer block.
+pub(crate) use super::footer_ext::{
+    COL_SUM_EXTENSION_MAGIC, COLUMN_CRC_EXTENSION_MAGIC, FOOTER_CRC_EXTENSION_MAGIC,
+    VALUE_SET_EXTENSION_MAGIC,
+};
 
 struct BuildingRowGroup {
     columns: Vec<Vec<u8>>,

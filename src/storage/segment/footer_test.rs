@@ -206,3 +206,49 @@ fn old_footers_without_checksum_extension_still_parse() {
     let parsed = parse_segment_footer(&legacy).unwrap();
     assert_eq!(parsed.row_groups.len(), 2);
 }
+
+#[test]
+fn footer_tail_tlv_round_trips_and_keeps_reserved_offset() {
+    use crate::storage::segment::footer_ext::{
+        append_footer_crc, encode_footer_tail, FooterTailEntry,
+    };
+    let footer = encode_segment_footer(
+        &checksum_test_schema(),
+        1,
+        &[checksum_test_row_group()],
+        &[],
+        0,
+        "t",
+        &[],
+    );
+    // Rebuild with a TLV block between the delete bitmap and the checksum.
+    let body = footer[..footer.len() - 8].to_vec();
+    let entries = vec![
+        FooterTailEntry {
+            tag: 7,
+            payload: vec![1, 2, 3],
+        },
+        FooterTailEntry {
+            tag: 9,
+            payload: b"feature".to_vec(),
+        },
+    ];
+    let mut rebuilt = body.clone();
+    rebuilt.extend_from_slice(&encode_footer_tail(&entries));
+    append_footer_crc(&mut rebuilt);
+
+    let parsed = parse_segment_footer(&rebuilt).unwrap();
+    assert_eq!(parsed.tail, entries);
+    // The reserved section ends before the delete bitmap, so appending tail
+    // entries must not move it (footer rewrites keep their boundary).
+    assert_eq!(
+        reserved_section_offset(&rebuilt).unwrap(),
+        reserved_section_offset(&body).unwrap()
+    );
+}
+
+#[test]
+fn empty_footer_tail_encodes_to_nothing() {
+    use crate::storage::segment::footer_ext::encode_footer_tail;
+    assert!(encode_footer_tail(&[]).is_empty());
+}

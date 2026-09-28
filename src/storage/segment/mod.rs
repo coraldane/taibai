@@ -3,7 +3,9 @@ use crate::storage::index::bloomfilter::BloomFilter;
 pub mod constants;
 pub mod delete_bitmap;
 pub mod footer;
+pub mod footer_ext;
 pub mod meta;
+pub mod migrate;
 pub mod reader;
 pub mod store;
 pub mod writer;
@@ -55,7 +57,10 @@ pub fn column_sum_supported(dt: crate::protocol::types::DataType) -> bool {
 }
 
 #[allow(unused_imports)]
-pub use constants::{SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION};
+pub use constants::{
+    is_supported_segment_version, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SEGMENT_VERSION,
+    SUPPORTED_SEGMENT_VERSIONS,
+};
 pub use reader::SegmentReader;
 pub use writer::{encode_segment_footer, encode_segment_header, SegmentWriter};
 
