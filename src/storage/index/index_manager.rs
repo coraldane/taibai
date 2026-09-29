@@ -400,19 +400,22 @@ impl IndexManager {
         self.invalidate_unique_index_snapshot_if_present(db, table, PRIMARY_LOCATION_INDEX_NAME);
     }
 
-    pub fn unique_key_exists(
+    /// Load the index state for a probe, incrementally refreshing it first
+    /// when it went stale against the table's memtable-flush epoch (a flush
+    /// after the snapshot was built may have moved rows into segments
+    /// without index entries). `Ok(None)` — no state, or the incremental
+    /// refresh could not run — makes the caller fall back to its
+    /// no-snapshot behavior. See `unique_keys_exist_if_current` for the
+    /// deliberately refresh-free variant used by the bulk write path.
+    fn fresh_unique_index_state(
         &self,
         db: &str,
         table: &str,
         index_name: &str,
-        key: &[ScalarValue],
-    ) -> Result<Option<bool>> {
+    ) -> Result<Option<Arc<UniqueIndexState>>> {
         let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        // Same staleness guard as unique_key_locations: a snapshot built
-        // before rows reached segments (memtable flush or direct append)
-        // misses live keys, so refresh it before probing.
         if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
             let Some(refreshed) =
                 self.refresh_stale_unique_index_state(db, table, index_name, &state)?
@@ -421,6 +424,19 @@ impl IndexManager {
             };
             state = refreshed;
         }
+        Ok(Some(state))
+    }
+
+    pub fn unique_key_exists(
+        &self,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        key: &[ScalarValue],
+    ) -> Result<Option<bool>> {
+        let Some(state) = self.fresh_unique_index_state(db, table, index_name)? else {
+            return Ok(None);
+        };
         let encoded = encode_unique_key(key)?;
         Ok(Some(unique_index_state_contains_key(
             &self.segment_mgr,
@@ -669,22 +685,9 @@ impl IndexManager {
         I: IntoIterator,
         I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
     {
-        let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
+        let Some(state) = self.fresh_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        // A memtable flush after this snapshot was built may have moved rows
-        // into segments without index entries. Incrementally refresh the
-        // snapshot (scanning only rows appended past its per-segment
-        // watermarks) instead of forcing a full rebuild; fall back to the
-        // rebuild path only when the incremental refresh is not possible.
-        if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
-            let Some(refreshed) =
-                self.refresh_stale_unique_index_state(db, table, index_name, &state)?
-            else {
-                return Ok(None);
-            };
-            state = refreshed;
-        }
         let encoded_keys = keys
             .into_iter()
             .map(|key| encode_unique_key(key.borrow()))
@@ -759,20 +762,9 @@ impl IndexManager {
         I: IntoIterator,
         I::Item: std::borrow::Borrow<Vec<ScalarValue>>,
     {
-        let Some(mut state) = self.load_unique_index_state(db, table, index_name)? else {
+        let Some(state) = self.fresh_unique_index_state(db, table, index_name)? else {
             return Ok(None);
         };
-        // Same staleness guard as unique_key_locations, resolved by the same
-        // incremental refresh; a full rebuild is only needed when the refresh
-        // cannot run.
-        if state.progress_epoch() != Some(self.segment_mgr.memtable_flush_epoch(db, table)) {
-            let Some(refreshed) =
-                self.refresh_stale_unique_index_state(db, table, index_name, &state)?
-            else {
-                return Ok(None);
-            };
-            state = refreshed;
-        }
         Self::state_contains_any_encoded_key(&self.segment_mgr, state, keys)
     }
 

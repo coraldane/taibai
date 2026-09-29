@@ -671,22 +671,8 @@ impl ExecutionOp for HashAggregateExec {
             .max(1);
         let mut fast_tables: Vec<Option<FastGroups>> = Vec::new();
         let mut fast_unsupported = false;
-        // Env-gated phase probe: wall time split between waiting on the scan
-        // and everything else (aggregate compute). Diagnosis only.
-        let probe = std::env::var("TAIBAI_AGG_PHASE").as_deref() == Ok("1");
-        let probe_started = std::time::Instant::now();
-        let mut probe_wait_ns: u128 = 0;
-        let mut probe_batches: usize = 0;
 
-        while let Some(batch) = {
-            let started = std::time::Instant::now();
-            let batch = self.input.next_batch()?;
-            if probe {
-                probe_wait_ns += started.elapsed().as_nanos();
-                probe_batches += 1;
-            }
-            batch
-        } {
+        while let Some(batch) = self.input.next_batch()? {
             crate::common::query_cancel::check()?;
             if physical_schema.is_none() {
                 physical_schema = Some(batch.schema.clone());
@@ -855,20 +841,9 @@ impl ExecutionOp for HashAggregateExec {
             }
         }
 
-        if probe {
-            let total_ns = probe_started.elapsed().as_nanos();
-            eprintln!(
-                "AGGPHASE batches={} wait_ms={:.1} compute_ms={:.1} fast={}",
-                probe_batches,
-                probe_wait_ns as f64 / 1e6,
-                total_ns.saturating_sub(probe_wait_ns) as f64 / 1e6,
-                !fast_unsupported,
-            );
-        }
-
         let physical_schema = physical_schema.unwrap_or_else(|| self.input_schema.clone());
         let (groups, group_keys) = if !fast_unsupported {
-            let (groups, group_keys) = merge_slot_tables(&mut fast_tables).into_maps();
+            let (groups, group_keys) = merge_slot_tables(&mut fast_tables)?.into_maps();
             // The per-slot budget only bounds each lane's table; the merged
             // total is what the configured limit means (the generic path
             // errors at the same total).
@@ -1818,163 +1793,6 @@ pub fn aggregate_result_type(agg: &AggregateExpr, schema: &Schema) -> DataType {
             _ => DataType::Int64,
         },
     }
-}
-
-pub fn compute_aggregate(
-    agg: &AggregateExpr,
-    rows: &[Vec<ScalarValue>],
-    schema: &Schema,
-) -> ScalarValue {
-    let col_idx = match &*agg.arg {
-        LogicalExpr::Column(idx) => Some(*idx),
-        LogicalExpr::Wildcard => None,
-        _ => None,
-    };
-
-    // Handle DISTINCT
-    let values: Vec<&ScalarValue> = if agg.distinct {
-        if let Some(idx) = col_idx {
-            let mut seen: Vec<String> = Vec::new();
-            rows.iter()
-                .filter_map(|r| r.get(idx))
-                .filter(|v| {
-                    let s = v.to_string();
-                    if seen.contains(&s) {
-                        false
-                    } else {
-                        seen.push(s);
-                        true
-                    }
-                })
-                .collect()
-        } else {
-            rows.iter()
-                .map(|r| r.first().unwrap_or(&ScalarValue::Int64(None)))
-                .collect()
-        }
-    } else {
-        if let Some(idx) = col_idx {
-            rows.iter().filter_map(|r| r.get(idx)).collect()
-        } else {
-            rows.iter()
-                .map(|r| r.first().unwrap_or(&ScalarValue::Int64(None)))
-                .collect()
-        }
-    };
-
-    match agg.func {
-        AggFunc::Count => {
-            if agg.distinct {
-                ScalarValue::Int64(Some(values.len() as i64))
-            } else if col_idx.is_some() {
-                let non_null = values.iter().filter(|v| !v.is_null()).count();
-                ScalarValue::Int64(Some(non_null as i64))
-            } else {
-                ScalarValue::Int64(Some(rows.len() as i64))
-            }
-        }
-        AggFunc::Sum => {
-            let input_type = col_idx
-                .and_then(|idx| schema.columns.get(idx))
-                .map(|c| c.data_type)
-                .unwrap_or(DataType::Int64);
-
-            let has_non_null = values.iter().any(|v| !v.is_null());
-            if !has_non_null {
-                match input_type {
-                    DataType::Float32 | DataType::Float64 => ScalarValue::Float64(None),
-                    DataType::Decimal => ScalarValue::Decimal(None),
-                    _ => ScalarValue::Int64(None),
-                }
-            } else {
-                match input_type {
-                    DataType::Float32 | DataType::Float64 => {
-                        let sum: f64 = values.iter().filter_map(|v| scalar_to_f64(v)).sum();
-                        ScalarValue::Float64(Some(sum))
-                    }
-                    DataType::Decimal => {
-                        let sum: i64 = values
-                            .iter()
-                            .filter_map(|v| match v {
-                                ScalarValue::Decimal(Some(n)) => Some(*n),
-                                _ => None,
-                            })
-                            .sum();
-                        ScalarValue::Decimal(Some(sum))
-                    }
-                    _ => {
-                        let sum: i64 = values
-                            .iter()
-                            .filter_map(|v| match v {
-                                ScalarValue::Int8(Some(n)) => Some(*n as i64),
-                                ScalarValue::Int16(Some(n)) => Some(*n as i64),
-                                ScalarValue::Int32(Some(n)) => Some(*n as i64),
-                                ScalarValue::Int64(Some(n)) => Some(*n),
-                                ScalarValue::UInt8(Some(n)) => Some(*n as i64),
-                                ScalarValue::UInt16(Some(n)) => Some(*n as i64),
-                                ScalarValue::UInt32(Some(n)) => Some(*n as i64),
-                                ScalarValue::UInt64(Some(n)) => i64::try_from(*n).ok(),
-                                _ => None,
-                            })
-                            .sum();
-                        ScalarValue::Int64(Some(sum))
-                    }
-                }
-            }
-        }
-        AggFunc::Avg => {
-            let vals: Vec<f64> = values.iter().filter_map(|v| scalar_to_f64(v)).collect();
-            if vals.is_empty() {
-                ScalarValue::Float64(None)
-            } else {
-                ScalarValue::Float64(Some(vals.iter().sum::<f64>() / vals.len() as f64))
-            }
-        }
-        AggFunc::Min => {
-            match values
-                .iter()
-                .filter(|v| !v.is_null())
-                .min_by(|a, b| compare_scalars(a, b))
-            {
-                Some(v) => (*v).clone(),
-                None => {
-                    if let LogicalExpr::Column(idx) = &*agg.arg {
-                        if let Some(col) = schema.columns.get(*idx) {
-                            null_scalar_of_type(col.data_type)
-                        } else {
-                            ScalarValue::Int64(None)
-                        }
-                    } else {
-                        ScalarValue::Int64(None)
-                    }
-                }
-            }
-        }
-        AggFunc::Max => {
-            match values
-                .iter()
-                .filter(|v| !v.is_null())
-                .max_by(|a, b| compare_scalars(a, b))
-            {
-                Some(v) => (*v).clone(),
-                None => {
-                    if let LogicalExpr::Column(idx) = &*agg.arg {
-                        if let Some(col) = schema.columns.get(*idx) {
-                            null_scalar_of_type(col.data_type)
-                        } else {
-                            ScalarValue::Int64(None)
-                        }
-                    } else {
-                        ScalarValue::Int64(None)
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
-    v.numeric_f64()
 }
 
 pub fn compare_scalars(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {

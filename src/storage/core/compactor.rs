@@ -30,6 +30,36 @@ struct SourceRowGroup {
     row_group_idx: usize,
 }
 
+/// One row-group read source of the clustered path: its reader plus the
+/// row-id bases needed to address rows both segment-locally (delete
+/// bitmaps) and partition-globally (the sorted index space).
+struct ClusterReadSource {
+    reader: Arc<crate::storage::segment::SegmentReader>,
+    row_group_idx: usize,
+    segment_row_base: u64,
+    global_row_base: usize,
+    row_count: usize,
+}
+
+/// Surviving rows of an unsorted partition as (row group, row) references,
+/// with deleted and TTL-expired rows already purged.
+struct UnsortedRowRefs {
+    row_refs: Vec<RowRef>,
+    source_row_groups: Vec<SourceRowGroup>,
+    deleted_rows: u64,
+    ttl_dropped: u64,
+}
+
+/// Decoded in-memory partition state for the clustered path: every source
+/// column concatenated into one contiguous batch plus the cluster-key
+/// sorted index of the surviving rows.
+struct ClusteredPartition {
+    batch: RecordBatch,
+    sorted_indices: Vec<u32>,
+    deleted_rows: u64,
+    ttl_dropped: u64,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CompactStats {
     pub segments_read: usize,
@@ -109,9 +139,9 @@ enum PreparedCompaction {
     },
 }
 
-/// TEST-INSTRUMENTATION (temporary): stalls the unlocked heavy phase so
-/// tests can prove that INSERTs into the compacted partition proceed while
-/// the decode/sort/write runs. Production value is 0.
+/// Test seam: stalls the unlocked heavy phase so tests can prove that
+/// INSERTs into the compacted partition proceed while the decode/sort/write
+/// runs. Production value stays 0.
 static COMPACTION_HEAVY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 fn compaction_input_identity(
@@ -134,6 +164,20 @@ fn compaction_inputs_unchanged(
         .all(|(path, expected)| compaction_input_identity(segment_mgr, path) == Some(*expected))
 }
 
+/// True when a row is still visible under the table's TTL: the read-time
+/// filter hides rows whose TTL timestamp satisfies `ts + duration <= now`
+/// (and rows whose TTL column is NULL or not a timestamp), so every
+/// rewrite strategy must physically drop exactly the same rows to keep
+/// compaction output in sync with query visibility.
+#[inline]
+fn ttl_row_visible(value: &crate::types::scalar::ScalarValue, duration_us: i64, now_us: i64) -> bool {
+    matches!(
+        value,
+        crate::types::scalar::ScalarValue::Timestamp(Some(ts))
+            if ts.saturating_add(duration_us) > now_us
+    )
+}
+
 pub struct Compactor {
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
@@ -147,7 +191,7 @@ impl Compactor {
         }
     }
 
-    /// TEST-INSTRUMENTATION (temporary): see `COMPACTION_HEAVY_DELAY_MS`.
+    /// See [`COMPACTION_HEAVY_DELAY_MS`].
     pub fn set_heavy_phase_delay_for_tests(ms: u64) {
         COMPACTION_HEAVY_DELAY_MS.store(ms, AtomicOrdering::Release);
     }
@@ -470,6 +514,188 @@ impl Compactor {
         Ok(stats)
     }
 
+    /// Collect the surviving rows of an unsorted partition as (row group,
+    /// row) references, purging deleted and TTL-expired rows.
+    fn collect_unsorted_row_refs(
+        &self,
+        segment_files: &[PathBuf],
+        ttl: Option<(usize, i64)>,
+        now_us: i64,
+    ) -> Result<UnsortedRowRefs> {
+        let mut row_refs = Vec::new();
+        let mut source_row_groups = Vec::new();
+        let mut deleted_rows = 0u64;
+        let mut ttl_dropped = 0u64;
+        let duration = ttl.map(|(_, secs)| secs.saturating_mul(1_000_000));
+        for seg_path in segment_files {
+            let reader = self.segment_mgr.open_reader(seg_path)?;
+            let mut segment_row_base = 0u64;
+            for rg_idx in 0..reader.num_row_groups() {
+                let batch_idx = source_row_groups.len();
+                let row_count = reader.row_group_rows(rg_idx) as usize;
+                // TTL purge: read just the TTL column and drop rows the
+                // read-time filter would hide.
+                let ttl_col = ttl.and_then(|(idx, _)| reader.read_column(rg_idx, idx).ok());
+                for row_idx in 0..row_count {
+                    let row_id = segment_row_base + row_idx as u64;
+                    if reader.is_row_deleted(row_id) {
+                        deleted_rows += 1;
+                        continue;
+                    }
+                    if let (Some(col), Some(duration)) = (&ttl_col, duration) {
+                        if !ttl_row_visible(&col.scalar(row_idx), duration, now_us) {
+                            deleted_rows += 1;
+                            ttl_dropped += 1;
+                            continue;
+                        }
+                    }
+                    row_refs.push(RowRef { batch_idx, row_idx });
+                }
+                segment_row_base += row_count as u64;
+                source_row_groups.push(SourceRowGroup {
+                    segment_path: seg_path.clone(),
+                    row_group_idx: rg_idx,
+                });
+            }
+        }
+        Ok(UnsortedRowRefs {
+            row_refs,
+            source_row_groups,
+            deleted_rows,
+            ttl_dropped,
+        })
+    }
+
+    /// Build the per-row-group read sources of the clustered path and the
+    /// global row count they cover (the partition's row space for the sort).
+    fn collect_clustered_sources(
+        &self,
+        segment_files: &[PathBuf],
+    ) -> Result<(Vec<ClusterReadSource>, usize)> {
+        let mut sources = Vec::new();
+        let mut global_row_base = 0usize;
+        for seg_path in segment_files {
+            let reader = Arc::new(self.segment_mgr.open_reader(seg_path)?);
+            let mut segment_row_base = 0u64;
+            for rg_idx in 0..reader.num_row_groups() {
+                let row_count = reader.row_group_rows(rg_idx) as usize;
+                sources.push(ClusterReadSource {
+                    reader: Arc::clone(&reader),
+                    row_group_idx: rg_idx,
+                    segment_row_base,
+                    global_row_base,
+                    row_count,
+                });
+                segment_row_base += row_count as u64;
+                global_row_base = global_row_base.checked_add(row_count).ok_or_else(|| {
+                    TaibaiError::Storage("row count overflow during optimization".to_string())
+                })?;
+            }
+        }
+        Ok((sources, global_row_base))
+    }
+
+    /// Decode every source column into one contiguous partition batch,
+    /// purge deleted and TTL-expired rows from the global index, and sort it
+    /// by the cluster key. In-memory only: the caller has already checked
+    /// the memory budget and the u32 row-count bound.
+    fn decode_clustered_partition(
+        &self,
+        db: &str,
+        table: &str,
+        partition_label: &str,
+        schema: &Schema,
+        sources: &[ClusterReadSource],
+        global_row_base: usize,
+        sort_key_indices: &[usize],
+        ttl: Option<(usize, i64)>,
+        decode_started: Instant,
+    ) -> Result<ClusteredPartition> {
+        let mut sorted_indices = Vec::with_capacity(global_row_base);
+        let mut deleted_rows = 0u64;
+        let mut ttl_dropped = 0u64;
+        for source in sources {
+            for local_row_idx in 0..source.row_count {
+                let segment_row_id = source.segment_row_base + local_row_idx as u64;
+                if source.reader.is_row_deleted(segment_row_id) {
+                    deleted_rows += 1;
+                } else {
+                    sorted_indices.push((source.global_row_base + local_row_idx) as u32);
+                }
+            }
+        }
+
+        // Parallelize by column, like the Go ReadColumnsDirect path. Each
+        // worker builds one contiguous destination column and moves decoded
+        // variable-width buffers into it without cloning strings.
+        let columns = schema
+            .columns
+            .par_iter()
+            .enumerate()
+            .map(|(column_idx, column_def)| -> Result<ColumnArray> {
+                let mut destination =
+                    ColumnArray::with_capacity(column_def.data_type, global_row_base);
+                for source in sources {
+                    let decoded = source
+                        .reader
+                        .read_column(source.row_group_idx, column_idx)?;
+                    destination.append_owned(decoded)?;
+                }
+                Ok(destination)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+
+        // TTL purge: physically drop rows the read-time TTL filter would
+        // hide anyway (ts + duration <= now, or a non-timestamp TTL value),
+        // keeping compaction output and query visibility in sync.
+        if let Some((ttl_col_idx, duration_secs)) = ttl {
+            if let Some(ttl_col) = batch.column(ttl_col_idx) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as i64;
+                let duration = duration_secs.saturating_mul(1_000_000);
+                let before = sorted_indices.len();
+                sorted_indices.retain(|&global_row| {
+                    ttl_row_visible(&ttl_col.scalar(global_row as usize), duration, now)
+                });
+                let ttl_removed = (before - sorted_indices.len()) as u64;
+                deleted_rows += ttl_removed;
+                ttl_dropped += ttl_removed;
+            }
+        }
+
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key = partition_label,
+            source_row_groups = sources.len(),
+            rows_to_sort = sorted_indices.len(),
+            elapsed_ms = decode_started.elapsed().as_millis(),
+            "compact partition decoded contiguous columns"
+        );
+        let sort_started = Instant::now();
+        sort_clustered_row_indices(&mut sorted_indices, &batch, sort_key_indices);
+        tracing::info!(
+            db,
+            table,
+            table_full_name = %format!("{}.{}", db, table),
+            partition_key = partition_label,
+            rows_sorted = sorted_indices.len(),
+            elapsed_ms = sort_started.elapsed().as_millis(),
+            "compact partition sorted cluster keys"
+        );
+
+        Ok(ClusteredPartition {
+            batch,
+            sorted_indices,
+            deleted_rows,
+            ttl_dropped,
+        })
+    }
+
     /// Heavy phase of one partition compaction, run WITHOUT the partition
     /// mutation lock: decode every source row group, purge TTL/deleted rows,
     /// optionally cluster-sort, and write the replacement segment to a tmp
@@ -556,82 +782,24 @@ impl Compactor {
         let mut row_refs = Vec::new();
         let mut sorted_indices = Vec::new();
         let source_row_group_count;
-        let mut deleted_rows = 0u64;
-        let mut ttl_dropped = 0u64;
+        // Both collection strategies assign these before any use below.
+        let deleted_rows: u64;
+        let ttl_dropped: u64;
 
         if sort_key_indices.is_empty() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_micros() as i64;
-            for seg_path in &segment_files {
-                let reader = self.segment_mgr.open_reader(seg_path)?;
-                let mut segment_row_base = 0u64;
-                for rg_idx in 0..reader.num_row_groups() {
-                    let batch_idx = source_row_groups.len();
-                    let row_count = reader.row_group_rows(rg_idx) as usize;
-                    // TTL purge for the unsorted path: read just the TTL
-                    // column and drop rows the read-time filter would hide.
-                    let ttl_col = ttl.and_then(|(idx, _)| reader.read_column(rg_idx, idx).ok());
-                    let duration = ttl.map(|(_, secs)| secs.saturating_mul(1_000_000));
-                    for row_idx in 0..row_count {
-                        let row_id = segment_row_base + row_idx as u64;
-                        if reader.is_row_deleted(row_id) {
-                            deleted_rows += 1;
-                            continue;
-                        }
-                        if let (Some(col), Some(duration)) = (&ttl_col, duration) {
-                            let visible = matches!(
-                                col.scalar(row_idx),
-                                crate::types::scalar::ScalarValue::Timestamp(Some(ts))
-                                    if ts.saturating_add(duration) > now
-                            );
-                            if !visible {
-                                deleted_rows += 1;
-                                ttl_dropped += 1;
-                                continue;
-                            }
-                        }
-                        row_refs.push(RowRef { batch_idx, row_idx });
-                    }
-                    segment_row_base += row_count as u64;
-                    source_row_groups.push(SourceRowGroup {
-                        segment_path: seg_path.clone(),
-                        row_group_idx: rg_idx,
-                    });
-                }
-            }
+            let unsorted = self.collect_unsorted_row_refs(&segment_files, ttl, now)?;
+            row_refs = unsorted.row_refs;
+            source_row_groups = unsorted.source_row_groups;
+            deleted_rows = unsorted.deleted_rows;
+            ttl_dropped = unsorted.ttl_dropped;
             source_row_group_count = source_row_groups.len();
         } else {
             let decode_started = Instant::now();
-            struct ColumnReadSource {
-                reader: Arc<crate::storage::segment::SegmentReader>,
-                row_group_idx: usize,
-                segment_row_base: u64,
-                global_row_base: usize,
-                row_count: usize,
-            }
-
-            let mut sources = Vec::new();
-            let mut global_row_base = 0usize;
-            for seg_path in &segment_files {
-                let reader = Arc::new(self.segment_mgr.open_reader(seg_path)?);
-                let mut segment_row_base = 0u64;
-                for rg_idx in 0..reader.num_row_groups() {
-                    let row_count = reader.row_group_rows(rg_idx) as usize;
-                    sources.push(ColumnReadSource {
-                        reader: Arc::clone(&reader),
-                        row_group_idx: rg_idx,
-                        segment_row_base,
-                        global_row_base,
-                        row_count,
-                    });
-                    segment_row_base += row_count as u64;
-                    global_row_base = global_row_base.checked_add(row_count).ok_or_else(|| {
-                        TaibaiError::Storage("row count overflow during optimization".to_string())
-                    })?;
-                }
-            }
+            let (sources, global_row_base) = self.collect_clustered_sources(&segment_files)?;
             source_row_group_count = sources.len();
 
             let estimated_width = estimated_row_width_bytes(schema);
@@ -698,90 +866,21 @@ impl Compactor {
                 )));
             }
 
-            sorted_indices.reserve(global_row_base);
-            for source in &sources {
-                for local_row_idx in 0..source.row_count {
-                    let segment_row_id = source.segment_row_base + local_row_idx as u64;
-                    if source.reader.is_row_deleted(segment_row_id) {
-                        deleted_rows += 1;
-                    } else {
-                        sorted_indices.push((source.global_row_base + local_row_idx) as u32);
-                    }
-                }
-            }
-
-            // Parallelize by column, like the Go ReadColumnsDirect path. Each
-            // worker builds one contiguous destination column and moves decoded
-            // variable-width buffers into it without cloning strings.
-            let columns = schema
-                .columns
-                .par_iter()
-                .enumerate()
-                .map(|(column_idx, column_def)| -> Result<ColumnArray> {
-                    let mut destination =
-                        ColumnArray::with_capacity(column_def.data_type, global_row_base);
-                    for source in &sources {
-                        let decoded = source
-                            .reader
-                            .read_column(source.row_group_idx, column_idx)?;
-                        destination.append_owned(decoded)?;
-                    }
-                    Ok(destination)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            preloaded_batch = Some(RecordBatch::try_new(schema.clone(), columns)?);
-
-            // TTL purge: physically drop rows the read-time TTL filter would
-            // hide anyway (ts + duration <= now, or a non-timestamp TTL
-            // value), keeping compaction output and query visibility in sync.
-            if let (Some((ttl_col_idx, duration_secs)), Some(batch)) =
-                (ttl, preloaded_batch.as_ref())
-            {
-                if let Some(ttl_col) = batch.column(ttl_col_idx) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros() as i64;
-                    let duration = duration_secs.saturating_mul(1_000_000);
-                    let before = sorted_indices.len();
-                    sorted_indices.retain(|&global_row| {
-                        matches!(
-                            ttl_col.scalar(global_row as usize),
-                            crate::types::scalar::ScalarValue::Timestamp(Some(ts))
-                                if ts.saturating_add(duration) > now
-                        )
-                    });
-                    let ttl_removed = (before - sorted_indices.len()) as u64;
-                    deleted_rows += ttl_removed;
-                    ttl_dropped += ttl_removed;
-                }
-            }
-
-            tracing::info!(
+            let clustered = self.decode_clustered_partition(
                 db,
                 table,
-                table_full_name = %format!("{}.{}", db, table),
-                partition_key = partition_label,
-                source_row_groups = source_row_group_count,
-                rows_to_sort = sorted_indices.len(),
-                elapsed_ms = decode_started.elapsed().as_millis(),
-                "compact partition decoded contiguous columns"
-            );
-            let sort_started = Instant::now();
-            sort_clustered_row_indices(
-                &mut sorted_indices,
-                preloaded_batch.as_ref().unwrap(),
+                partition_label,
+                schema,
+                &sources,
+                global_row_base,
                 sort_key_indices,
-            );
-            tracing::info!(
-                db,
-                table,
-                table_full_name = %format!("{}.{}", db, table),
-                partition_key = partition_label,
-                rows_sorted = sorted_indices.len(),
-                elapsed_ms = sort_started.elapsed().as_millis(),
-                "compact partition sorted cluster keys"
-            );
+                ttl,
+                decode_started,
+            )?;
+            preloaded_batch = Some(clustered.batch);
+            sorted_indices = clustered.sorted_indices;
+            deleted_rows = clustered.deleted_rows;
+            ttl_dropped = clustered.ttl_dropped;
         }
 
         let rows_to_write = if sort_key_indices.is_empty() {
@@ -1261,12 +1360,7 @@ impl Compactor {
                     continue;
                 }
                 if let (Some(col), Some(duration)) = (&ttl_col, duration) {
-                    let visible = matches!(
-                        col.scalar(row_idx),
-                        crate::types::scalar::ScalarValue::Timestamp(Some(ts))
-                            if ts.saturating_add(duration) > now
-                    );
-                    if !visible {
+                    if !ttl_row_visible(&col.scalar(row_idx), duration, now) {
                         dropped += 1;
                         dropped_ttl += 1;
                         continue;

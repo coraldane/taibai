@@ -586,11 +586,23 @@ pub struct MemTableManager {
     /// Zero/absent means every segment row of the partition is provably
     /// mirrored, which is what lets a resident-partition scan answer from
     /// the hot store alone even after the memtable has been flushed.
-    hot_unfed_rows: Mutex<HashMap<(String, String, String), u64>>,
+    hot_unfed_rows: Mutex<HashMap<(String, String, HotUnfedScope), u64>>,
     /// Deferred-DML registry (see `txn_mutations`). Set once by the engine
     /// after construction; flush selection consults it to skip memtables
     /// pinned by live transactions.
     txn_mutations: RwLock<Option<Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>>>,
+}
+
+/// What one hot-unfed accounting entry scopes to. `Table` marks bypasses
+/// whose partitions could not be derived (e.g. raw bulk payloads) and
+/// disables the resident fast path for the whole table; `Partition`
+/// disables it for one partition only. (The previous encoding used a
+/// NUL-prefixed partition string as the table marker, which made the file
+/// read as binary to tooling.)
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum HotUnfedScope {
+    Table,
+    Partition(String),
 }
 
 impl MemTableManager {
@@ -654,19 +666,25 @@ impl MemTableManager {
         }
         let mut unfed = self.hot_unfed_rows.lock().unwrap();
         *unfed
-            .entry((db.to_string(), table.to_string(), partition.to_string()))
+            .entry((
+                db.to_string(),
+                table.to_string(),
+                HotUnfedScope::Partition(partition.to_string()),
+            ))
             .or_insert(0) += rows;
     }
 
     /// Zero means every segment row of the partition is provably mirrored in
     /// the hot store, so a resident-partition scan may answer from the store
-    /// alone. The table-level sentinel key marks bypasses whose partitions
-    /// could not be derived (e.g. raw bulk payloads), disabling the fast path
-    /// for the whole table.
+    /// alone. See [`HotUnfedScope`] for the table-level bypass marker.
     pub fn hot_unfed_rows(&self, db: &str, table: &str, partition: &str) -> u64 {
         let unfed = self.hot_unfed_rows.lock().unwrap();
         unfed
-            .get(&(db.to_string(), table.to_string(), partition.to_string()))
+            .get(&(
+                db.to_string(),
+                table.to_string(),
+                HotUnfedScope::Partition(partition.to_string()),
+            ))
             .copied()
             .unwrap_or(0)
     }
@@ -675,7 +693,13 @@ impl MemTableManager {
     /// (e.g. raw bulk payloads), so the whole table loses the resident fast
     /// path. Sticky until the table's hot store is invalidated.
     pub fn note_hot_unfed_table(&self, db: &str, table: &str, rows: u64) {
-        self.note_hot_unfed_rows(db, table, " table", rows);
+        if rows == 0 {
+            return;
+        }
+        let mut unfed = self.hot_unfed_rows.lock().unwrap();
+        *unfed
+            .entry((db.to_string(), table.to_string(), HotUnfedScope::Table))
+            .or_insert(0) += rows;
     }
 
     /// True when a resident-partition scan may answer from the hot store
@@ -683,12 +707,11 @@ impl MemTableManager {
     /// unmirrored rows.
     pub fn hot_partition_mirrored(&self, db: &str, table: &str, partition: &str) -> bool {
         let unfed = self.hot_unfed_rows.lock().unwrap();
-        let table_key = (db.to_string(), table.to_string());
         if unfed
             .get(&(
-                table_key.0.clone(),
-                table_key.1.clone(),
-                " table".to_string(),
+                db.to_string(),
+                table.to_string(),
+                HotUnfedScope::Table,
             ))
             .copied()
             .unwrap_or(0)
@@ -697,7 +720,11 @@ impl MemTableManager {
             return false;
         }
         unfed
-            .get(&(table_key.0, table_key.1, partition.to_string()))
+            .get(&(
+                db.to_string(),
+                table.to_string(),
+                HotUnfedScope::Partition(partition.to_string()),
+            ))
             .copied()
             .unwrap_or(0)
             == 0

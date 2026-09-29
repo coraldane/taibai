@@ -4,9 +4,10 @@ use crate::storage::segment_manager::SegmentManager;
 use crate::types::array::ColumnArray;
 use crate::types::batch::RecordBatch;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
+use super::cluster_prune;
 use super::count;
 use super::memtable;
 use super::partition;
@@ -110,7 +111,44 @@ impl<'a> ScanExecutor<'a> {
         self.execute_scan()
     }
 
+    /// Wrap a row count as the single-batch COUNT(*) reply.
+    fn count_star_batches(count: u64) -> Result<Vec<RecordBatch>> {
+        let result = count::build_count_star_result(count);
+        Ok(match result {
+            crate::sql::execution::engine::ExecResult::Query { batches, .. } => batches,
+            _ => Vec::new(),
+        })
+    }
+
+    /// Rows visible in live memtables, preferring the hot-mirror-aware count
+    /// (`None` means the hot store cannot prove coverage for this shape, so
+    /// the plain memtable count answers).
+    fn live_memtable_rows(&self) -> u64 {
+        memtable::count_hot_memtable_rows(
+            self.runtime.memtable_manager(),
+            self.runtime.hot_store_manager(),
+            self.db,
+            &self.spec.table_name,
+            &self.spec,
+        )
+        .unwrap_or_else(|| {
+            memtable::count_memtable_rows(
+                self.runtime.memtable_manager(),
+                self.db,
+                &self.spec.table_name,
+                &self.spec,
+            )
+        })
+    }
+
+    /// COUNT(*) resolves through a chain of increasingly general strategies;
+    /// the first that applies answers. Each is guarded by its own
+    /// eligibility, so a later strategy never runs when an earlier one
+    /// engaged.
     fn execute_count_star(&mut self) -> Result<Vec<RecordBatch>> {
+        // 1. Hybrid partial residency: the hot mirror covers rows above its
+        //    coverage bound; the complementary range is counted through
+        //    segments and memtables.
         if let Some((mirror_count, pk_idx, covers)) = memtable::hybrid_hot_mirror_count(
             self.runtime.hot_store_manager(),
             self.runtime.memtable_manager(),
@@ -121,14 +159,13 @@ impl<'a> ScanExecutor<'a> {
             return self.execute_hybrid_count_star(mirror_count, pk_idx, covers);
         }
 
+        // 2. Fully resident: the hot store answers alone.
         if let Some(count) = self.try_resident_hot_count()? {
-            let result = count::build_count_star_result(count);
-            return match result {
-                crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
-                _ => Ok(Vec::new()),
-            };
+            return Self::count_star_batches(count);
         }
 
+        // 3. Active TTL: visibility is row-dependent, so COUNT(*) must scan
+        //    (only) the TTL column and count the rows that survive it.
         if self.table_meta.ttl.is_some() {
             let mut ttl_spec = self.spec.clone();
             ttl_spec.is_count_star = false;
@@ -148,40 +185,20 @@ impl<'a> ScanExecutor<'a> {
                 .iter()
                 .map(|batch| batch.num_rows() as u64)
                 .sum();
-            let result = count::build_count_star_result(count);
-            return match result {
-                crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
-                _ => Ok(Vec::new()),
-            };
+            return Self::count_star_batches(count);
         }
 
+        // 4. No segment directory yet: only live memtable rows exist.
         let table_dir = self
             .runtime
             .data_dir()
             .join(self.db)
             .join(&self.spec.table_name);
         if !table_dir.exists() {
-            let count = memtable::count_hot_memtable_rows(
-                self.runtime.memtable_manager(),
-                self.runtime.hot_store_manager(),
-                self.db,
-                &self.spec.table_name,
-                &self.spec,
-            )
-            .unwrap_or_else(|| {
-                memtable::count_memtable_rows(
-                    self.runtime.memtable_manager(),
-                    self.db,
-                    &self.spec.table_name,
-                    &self.spec,
-                )
-            });
-            let result = count::build_count_star_result(count);
-            return match result {
-                crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
-                _ => Ok(Vec::new()),
-            };
+            return Self::count_star_batches(self.live_memtable_rows());
         }
+
+        // 5. General: segments plus live memtables.
         let count = count::count_star(
             &self.spec,
             &self.table_meta,
@@ -191,11 +208,7 @@ impl<'a> ScanExecutor<'a> {
             self.db,
             self.stats.as_deref_mut(),
         )?;
-        let result = count::build_count_star_result(count);
-        match result {
-            crate::sql::execution::engine::ExecResult::Query { batches, .. } => Ok(batches),
-            _ => Ok(Vec::new()),
-        }
+        Self::count_star_batches(count)
     }
 
     /// Hybrid partial-residency count: the mirror answered the rows above the
@@ -222,21 +235,7 @@ impl<'a> ScanExecutor<'a> {
             .join(self.db)
             .join(&self.spec.table_name);
         let count = if !table_dir.exists() {
-            memtable::count_hot_memtable_rows(
-                self.runtime.memtable_manager(),
-                self.runtime.hot_store_manager(),
-                self.db,
-                &self.spec.table_name,
-                &self.spec,
-            )
-            .unwrap_or_else(|| {
-                memtable::count_memtable_rows(
-                    self.runtime.memtable_manager(),
-                    self.db,
-                    &self.spec.table_name,
-                    &self.spec,
-                )
-            })
+            self.live_memtable_rows()
         } else {
             count::count_star(
                 &self.spec,
@@ -249,11 +248,7 @@ impl<'a> ScanExecutor<'a> {
             )?
         };
         let total = mirror_count.saturating_add(count);
-        let result = count::build_count_star_result(total);
-        Ok(match result {
-            crate::sql::execution::engine::ExecResult::Query { batches, .. } => batches,
-            _ => Vec::new(),
-        })
+        Self::count_star_batches(total)
     }
 
     /// Metadata-driven fast path for simple aggregate queries (no GROUP BY,
@@ -860,7 +855,12 @@ impl<'a> ScanExecutor<'a> {
     }
 
     fn ordered_cluster_segments_are_monotonic(&self, segments: &[PathBuf], col_idx: usize) -> bool {
-        segments.len() <= 1 || self.cluster_segment_zone_maps_are_monotonic(segments, col_idx)
+        segments.len() <= 1
+            || cluster_prune::cluster_segment_zone_maps_are_monotonic(
+                segments,
+                self.runtime.segment_mgr(),
+                col_idx,
+            )
     }
 
     fn prune_segments_by_cluster_key(
@@ -875,7 +875,9 @@ impl<'a> ScanExecutor<'a> {
             return segments;
         };
 
-        let Some((start, end)) = self.cluster_segment_range(&segments, bounds) else {
+        let Some((start, end)) =
+            cluster_prune::cluster_segment_range(&segments, self.runtime.segment_mgr(), bounds)
+        else {
             return segments;
         };
         if start > end {
@@ -888,206 +890,6 @@ impl<'a> ScanExecutor<'a> {
             self.record_cluster_key_segments_pruned(pruned as u64);
         }
         segments[start..=end].to_vec()
-    }
-
-    fn cluster_segment_range(
-        &self,
-        segments: &[PathBuf],
-        bounds: &row_filter::ClusterKeyBounds,
-    ) -> Option<(usize, usize)> {
-        let key_cols = bounds.key_column_indices();
-        if !self.cluster_segment_tuple_zone_maps_are_monotonic(segments, &key_cols) {
-            return None;
-        }
-
-        // Per-column zone-map extrema underestimate/overestimate the true
-        // composite tuple, so the tuple searches below prune conservatively:
-        // a segment is skipped only when it provably cannot contribute rows.
-        let lower_tuple = search_tuple_for_bounds(&bounds.prefix_eq, bounds.lower.as_ref());
-        let upper_tuple = search_tuple_for_bounds(&bounds.prefix_eq, bounds.upper.as_ref());
-
-        let start = match (&bounds.lower, &bounds.upper) {
-            (Some(_), _) => {
-                self.first_segment_with_max_tuple_at_least(segments, &key_cols, &lower_tuple)?
-            }
-            // No lower bound: only the equality prefix may narrow the start
-            // (compared without the range value — every prefix row still
-            // qualifies). With an empty prefix, scanning starts at 0.
-            (None, Some(_)) if !bounds.prefix_eq.is_empty() => {
-                let prefix_tuple: Vec<crate::types::scalar::ScalarValue> = bounds
-                    .prefix_eq
-                    .iter()
-                    .map(|(_, value)| value.clone())
-                    .collect();
-                let prefix_cols = &key_cols[..bounds.prefix_eq.len()];
-                self.first_segment_with_max_tuple_at_least(segments, prefix_cols, &prefix_tuple)?
-            }
-            _ => 0,
-        };
-        let end = match &bounds.upper {
-            Some(_) => {
-                let end =
-                    self.last_segment_with_min_tuple_at_most(segments, &key_cols, &upper_tuple)?;
-                if end < 0 {
-                    return Some((1, 0));
-                }
-                end as usize
-            }
-            None => segments.len().saturating_sub(1),
-        };
-        Some((start, end))
-    }
-
-    fn cluster_segment_zone_maps_are_monotonic(
-        &self,
-        segments: &[PathBuf],
-        col_idx: usize,
-    ) -> bool {
-        let mut prev_min: Option<crate::types::scalar::ScalarValue> = None;
-        let mut prev_max: Option<crate::types::scalar::ScalarValue> = None;
-
-        for segment in segments {
-            let Some(zm) = self.segment_cluster_zone_map(segment, col_idx) else {
-                return false;
-            };
-            if let Some(prev) = &prev_min {
-                if crate::storage::index::sort_key::compare_scalars_for_sort(&zm.min_value, prev)
-                    == std::cmp::Ordering::Less
-                {
-                    return false;
-                }
-            }
-            if let Some(prev) = &prev_max {
-                if crate::storage::index::sort_key::compare_scalars_for_sort(&zm.max_value, prev)
-                    == std::cmp::Ordering::Less
-                {
-                    return false;
-                }
-            }
-            prev_min = Some(zm.min_value);
-            prev_max = Some(zm.max_value);
-        }
-
-        true
-    }
-
-    /// Binary search for the first segment whose composite max tuple (per
-    /// column zone-map maxima) is not less than the search tuple.
-    fn first_segment_with_max_tuple_at_least(
-        &self,
-        segments: &[PathBuf],
-        key_cols: &[usize],
-        tuple: &[crate::types::scalar::ScalarValue],
-    ) -> Option<usize> {
-        let mut lo = 0usize;
-        let mut hi = segments.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let cmp = self.compare_segment_zone_tuple(&segments[mid], key_cols, tuple, true)?;
-            if cmp == std::cmp::Ordering::Less {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        Some(lo)
-    }
-
-    /// Binary search for the last segment whose composite min tuple (per
-    /// column zone-map minima) is not greater than the search tuple.
-    fn last_segment_with_min_tuple_at_most(
-        &self,
-        segments: &[PathBuf],
-        key_cols: &[usize],
-        tuple: &[crate::types::scalar::ScalarValue],
-    ) -> Option<isize> {
-        let mut lo = 0usize;
-        let mut hi = segments.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let cmp = self.compare_segment_zone_tuple(&segments[mid], key_cols, tuple, false)?;
-            if cmp != std::cmp::Ordering::Greater {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        Some(lo as isize - 1)
-    }
-
-    /// Lexicographic comparison of a segment's zone-map tuple (max side or
-    /// min side) against the search tuple. Returns `None` when a zone map is
-    /// missing.
-    fn compare_segment_zone_tuple(
-        &self,
-        segment: &Path,
-        key_cols: &[usize],
-        tuple: &[crate::types::scalar::ScalarValue],
-        use_max: bool,
-    ) -> Option<std::cmp::Ordering> {
-        for (&col_idx, value) in key_cols.iter().zip(tuple.iter()) {
-            let zm = self.segment_cluster_zone_map(segment, col_idx)?;
-            let side = if use_max {
-                &zm.max_value
-            } else {
-                &zm.min_value
-            };
-            let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(side, value);
-            if cmp != std::cmp::Ordering::Equal {
-                return Some(cmp);
-            }
-        }
-        Some(std::cmp::Ordering::Equal)
-    }
-
-    /// Consecutive segments must be non-decreasing in the composite key
-    /// tuple (checked on both the min and max zone tuples).
-    fn cluster_segment_tuple_zone_maps_are_monotonic(
-        &self,
-        segments: &[PathBuf],
-        key_cols: &[usize],
-    ) -> bool {
-        if segments.len() <= 1 {
-            return true;
-        }
-        let mut prev_min: Option<Vec<crate::types::scalar::ScalarValue>> = None;
-        let mut prev_max: Option<Vec<crate::types::scalar::ScalarValue>> = None;
-
-        for segment in segments {
-            let mut min_tuple = Vec::with_capacity(key_cols.len());
-            let mut max_tuple = Vec::with_capacity(key_cols.len());
-            for &col_idx in key_cols {
-                let Some(zm) = self.segment_cluster_zone_map(segment, col_idx) else {
-                    return false;
-                };
-                min_tuple.push(zm.min_value);
-                max_tuple.push(zm.max_value);
-            }
-            if let Some(prev) = &prev_min {
-                if compare_scalar_tuples(&min_tuple, prev) == std::cmp::Ordering::Less {
-                    return false;
-                }
-            }
-            if let Some(prev) = &prev_max {
-                if compare_scalar_tuples(&max_tuple, prev) == std::cmp::Ordering::Less {
-                    return false;
-                }
-            }
-            prev_min = Some(min_tuple);
-            prev_max = Some(max_tuple);
-        }
-
-        true
-    }
-
-    fn segment_cluster_zone_map(
-        &self,
-        segment: &Path,
-        col_idx: usize,
-    ) -> Option<crate::storage::partition::pruning::ZoneMap> {
-        self.runtime
-            .segment_mgr()
-            .cluster_zone_map_cached(segment, col_idx)
     }
 
     fn record_row_group_read(
@@ -1200,32 +1002,6 @@ impl BatchSink for LimitedBatchSink {
         self.batches.push(batch);
         self.rows_emitted < limit
     }
-}
-
-/// Prefix equality values plus the range bound value (if any).
-fn search_tuple_for_bounds(
-    prefix_eq: &[(usize, crate::types::scalar::ScalarValue)],
-    bound: Option<&(crate::types::scalar::ScalarValue, bool)>,
-) -> Vec<crate::types::scalar::ScalarValue> {
-    let mut tuple: Vec<crate::types::scalar::ScalarValue> =
-        prefix_eq.iter().map(|(_, value)| value.clone()).collect();
-    if let Some((value, _inclusive)) = bound {
-        tuple.push(value.clone());
-    }
-    tuple
-}
-
-fn compare_scalar_tuples(
-    left: &[crate::types::scalar::ScalarValue],
-    right: &[crate::types::scalar::ScalarValue],
-) -> std::cmp::Ordering {
-    for (l, r) in left.iter().zip(right.iter()) {
-        let cmp = crate::storage::index::sort_key::compare_scalars_for_sort(l, r);
-        if cmp != std::cmp::Ordering::Equal {
-            return cmp;
-        }
-    }
-    std::cmp::Ordering::Equal
 }
 
 fn reverse_batch(batch: &RecordBatch) -> Result<RecordBatch> {

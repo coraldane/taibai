@@ -1030,12 +1030,7 @@ impl SegmentManager {
         state.partition_gate.store(true, Ordering::Release);
         let _gate_reset = PartitionGateReset(Arc::clone(state));
         let registry = state.partition_locks.write().unwrap();
-        let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
-        partition_keys.sort();
-        let partition_locks = partition_keys
-            .iter()
-            .map(|partition| Arc::clone(&registry[partition]))
-            .collect::<Vec<_>>();
+        let (partition_keys, partition_locks) = sorted_partition_locks(&registry);
         drop(registry);
         let timeouts = crate::common::config::storage_timeouts();
         let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
@@ -1077,12 +1072,7 @@ impl SegmentManager {
         let mut partition_key_sets = Vec::with_capacity(states.len());
         for state in &states {
             let registry = state.partition_locks.write().unwrap();
-            let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
-            partition_keys.sort();
-            let mut arcs = Vec::with_capacity(partition_keys.len());
-            for partition in &partition_keys {
-                arcs.push(Arc::clone(&registry[partition]));
-            }
+            let (partition_keys, arcs) = sorted_partition_locks(&registry);
             partition_arc_sets.push(arcs);
             partition_key_sets.push(partition_keys);
             registries.push(registry);
@@ -1180,18 +1170,20 @@ impl SegmentManager {
             Some(lock) => lock,
             None => partition_mutation_lock_arc(&state, partition_key),
         };
-        let _guard = match lock.try_lock() {
-            Ok(guard) if !state.partition_gate.load(Ordering::Acquire) => guard,
-            Ok(_) => return Ok(None),
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("partition mutation lock poisoned: {}", poisoned)
-            }
+        let _guard = match try_lock_or_none(&lock, "partition mutation lock") {
+            Some(guard) if !state.partition_gate.load(Ordering::Acquire) => guard,
+            Some(_) => return Ok(None),
+            None => return Ok(None),
         };
         ensure_state_not_retired(&state, db, table)?;
         f().map(Some)
     }
 
+    /// Lock-free counterpart of [`Self::with_table_mutation_lock`]. The
+    /// freeze protocol differs from the blocking variant on purpose: the
+    /// wide gate flag is not set; instead the registry write guard stays
+    /// held through `f`, which blocks new partition creation for its
+    /// duration.
     pub fn try_with_table_mutation_lock<T>(
         &self,
         db: &str,
@@ -1200,33 +1192,22 @@ impl SegmentManager {
     ) -> Result<Option<T>> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard = match state.mutation_lock.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("table mutation lock poisoned: {}", poisoned)
-            }
-        };
+        let _mutation_guard =
+            match try_lock_or_none(&state.mutation_lock, "table mutation lock") {
+                Some(guard) => guard,
+                None => return Ok(None),
+            };
         let registry = match state.partition_locks.try_write() {
             Ok(registry) => registry,
             Err(_) => return Ok(None),
         };
-        let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
-        partition_keys.sort();
-        let partition_locks = partition_keys
-            .iter()
-            .map(|partition| Arc::clone(&registry[partition]))
-            .collect::<Vec<_>>();
+        let (_partition_keys, partition_locks) = sorted_partition_locks(&registry);
         let mut partition_guards = Vec::with_capacity(partition_locks.len());
-        for (_partition, lock) in partition_keys.iter().zip(&partition_locks) {
-            let guard = match lock.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    panic!("partition mutation lock poisoned: {}", poisoned)
-                }
-            };
-            partition_guards.push(guard);
+        for lock in &partition_locks {
+            match try_lock_or_none(lock, "partition mutation lock") {
+                Some(guard) => partition_guards.push(guard),
+                None => return Ok(None),
+            }
         }
         ensure_state_not_retired(&state, db, table)?;
         let result = f().map(Some);
@@ -1236,6 +1217,9 @@ impl SegmentManager {
         result
     }
 
+    /// Lock-free counterpart of [`Self::with_database_mutation_locks`],
+    /// with the same registry-held freeze protocol as
+    /// [`Self::try_with_table_mutation_lock`].
     pub fn try_with_database_mutation_locks<T>(
         &self,
         db: &str,
@@ -1256,23 +1240,16 @@ impl SegmentManager {
         let mut registries = Vec::with_capacity(states.len());
         let mut partition_arc_sets = Vec::with_capacity(states.len());
         for (_key, state) in keys.iter().zip(states.iter()) {
-            let mutation_guard = match state.mutation_lock.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    panic!("table mutation lock poisoned: {}", poisoned)
-                }
-            };
+            let mutation_guard =
+                match try_lock_or_none(&state.mutation_lock, "table mutation lock") {
+                    Some(guard) => guard,
+                    None => return Ok(None),
+                };
             let registry = match state.partition_locks.try_write() {
                 Ok(registry) => registry,
                 Err(_) => return Ok(None),
             };
-            let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
-            partition_keys.sort();
-            let mut arcs = Vec::with_capacity(partition_keys.len());
-            for partition in &partition_keys {
-                arcs.push(Arc::clone(&registry[partition]));
-            }
+            let (_partition_keys, arcs) = sorted_partition_locks(&registry);
             mutation_guards.push(mutation_guard);
             partition_arc_sets.push(arcs);
             registries.push(registry);
@@ -1281,14 +1258,10 @@ impl SegmentManager {
         for partition_locks in &partition_arc_sets {
             let mut guards = Vec::new();
             for lock in partition_locks {
-                let guard = match lock.try_lock() {
-                    Ok(guard) => guard,
-                    Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                        panic!("partition mutation lock poisoned: {}", poisoned)
-                    }
-                };
-                guards.push(guard);
+                match try_lock_or_none(lock, "partition mutation lock") {
+                    Some(guard) => guards.push(guard),
+                    None => return Ok(None),
+                }
             }
             partition_guard_sets.push(guards);
         }
@@ -1488,6 +1461,39 @@ impl Drop for DatabaseGatesReset {
     fn drop(&mut self) {
         for state in &self.0 {
             state.partition_gate.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Snapshot a state's partition locks as (sorted key, arc) pairs under a
+/// registry write guard the caller already holds. How long that guard is
+/// kept is the caller's freeze strategy: the blocking wide gate drops it
+/// before running `f` (the gate flag freezes new partitions instead),
+/// while the try variants keep it held through `f`.
+fn sorted_partition_locks(
+    registry: &std::sync::RwLockWriteGuard<'_, std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>>,
+) -> (Vec<String>, Vec<Arc<std::sync::Mutex<()>>>) {
+    let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
+    partition_keys.sort();
+    let partition_locks = partition_keys
+        .iter()
+        .map(|partition| Arc::clone(&registry[partition]))
+        .collect::<Vec<_>>();
+    (partition_keys, partition_locks)
+}
+
+/// Try-lock for the lock-free mutation attempts: `None` means busy (the
+/// caller reports "not now" and retries later); a poisoned lock still
+/// panics so the failure stays loud instead of being silently skipped.
+fn try_lock_or_none<'a, T>(
+    lock: &'a std::sync::Mutex<T>,
+    what: &str,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            panic!("{} poisoned: {}", what, poisoned)
         }
     }
 }

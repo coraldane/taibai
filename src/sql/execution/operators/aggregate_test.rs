@@ -419,3 +419,40 @@ fn grouped_spill_keeps_nan_and_null_group_keys_distinct() -> Result<()> {
     assert!(saw_null && saw_nan, "both special keys must be present");
     Ok(())
 }
+
+#[test]
+fn grouped_sum_overflow_errors_instead_of_wrapping() {
+    // 8192 rows x 2e15 overflow i64 in total while each lane's slice (at
+    // most 4096 rows) stays below the limit, so the overflow surfaces
+    // either in the per-lane checked adds or — the case this guards — in
+    // the slot-table merge, which used to wrap silently instead of erroring
+    // like the generic path does.
+    let schema = Schema::new(vec![
+        ColumnDef::new("g", DataType::VarChar),
+        ColumnDef::new("v", DataType::Int64),
+    ]);
+    let mut groups = ColumnArray::empty(DataType::VarChar);
+    let mut values = ColumnArray::empty(DataType::Int64);
+    for _ in 0..8192 {
+        groups
+            .push(&ScalarValue::VarChar(Some("a".to_string())))
+            .unwrap();
+        values
+            .push(&ScalarValue::Int64(Some(2_000_000_000_000_000)))
+            .unwrap();
+    }
+    let batch = RecordBatch::try_new(schema.clone(), vec![groups, values]).unwrap();
+    let aggregates = vec![AggregateExpr {
+        func: AggFunc::Sum,
+        arg: Box::new(LogicalExpr::Column(1)),
+        distinct: false,
+    }];
+    let mut exec = HashAggregateExec::new(
+        vec![LogicalExpr::Column(0)],
+        aggregates,
+        Box::new(OneBatchExec { batch: Some(batch) }),
+        schema,
+    );
+    let error = exec.next_batch().unwrap_err().to_string();
+    assert!(error.contains("SUM overflow"), "got: {error}");
+}

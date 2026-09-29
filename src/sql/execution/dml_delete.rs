@@ -22,6 +22,8 @@ use super::helpers::{
     build_row_group_predicate, collect_expr_column_indices, eval_expr_to_scalar,
     eval_where_clause_batch,
 };
+use super::scan::cluster_prune;
+use super::scan::row_filter::ClusterKeyBounds;
 use crate::sql::parser::ast::{BinOp, Expr};
 
 #[derive(Default)]
@@ -1649,14 +1651,6 @@ pub(super) fn require_subquery_select_permissions_for_expr(
     }
 }
 
-pub(super) fn resolve_expr_in_subqueries_pub(
-    engine: &Engine,
-    db: &str,
-    expr: &Expr,
-) -> Result<Expr> {
-    resolve_expr_in_subqueries(engine, db, expr)
-}
-
 fn resolve_in_subqueries(
     engine: &Engine,
     db: &str,
@@ -1664,274 +1658,8 @@ fn resolve_in_subqueries(
 ) -> Result<Option<Expr>> {
     where_clause
         .as_ref()
-        .map(|expr| resolve_expr_in_subqueries(engine, db, expr))
+        .map(|expr| super::query::resolve_expr_in_subqueries_clone(engine, db, expr))
         .transpose()
-}
-
-fn resolve_expr_in_subqueries(engine: &Engine, db: &str, expr: &Expr) -> Result<Expr> {
-    Ok(match expr {
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(resolve_expr_in_subqueries(engine, db, left)?),
-            op: *op,
-            right: Box::new(resolve_expr_in_subqueries(engine, db, right)?),
-        },
-        Expr::UnaryNot(inner) => {
-            Expr::UnaryNot(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-        }
-        Expr::UnaryMinus(inner) => {
-            Expr::UnaryMinus(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-        }
-        Expr::IsNull(inner) => {
-            Expr::IsNull(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-        }
-        Expr::IsNotNull(inner) => {
-            Expr::IsNotNull(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-        }
-        Expr::Exists(inner) => {
-            if let Expr::Subquery(subquery) = inner.as_ref() {
-                let exists = super::query::execute_exists_subquery(engine, db, subquery)?;
-                Expr::Literal(ScalarValue::Bool(Some(exists)))
-            } else {
-                Expr::Exists(Box::new(resolve_expr_in_subqueries(engine, db, inner)?))
-            }
-        }
-        Expr::In {
-            expr: inner,
-            values,
-            negated,
-        } => {
-            let resolved_inner = resolve_expr_in_subqueries(engine, db, inner)?;
-            let resolved_values = if let [Expr::Subquery(subquery)] = values.as_slice() {
-                execute_in_subquery(engine, db, subquery)?
-                    .into_iter()
-                    .map(Expr::Literal)
-                    .collect()
-            } else {
-                values
-                    .iter()
-                    .map(|value| resolve_expr_in_subqueries(engine, db, value))
-                    .collect::<Result<Vec<_>>>()?
-            };
-            Expr::In {
-                expr: Box::new(resolved_inner),
-                values: resolved_values,
-                negated: *negated,
-            }
-        }
-        Expr::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => Expr::Between {
-            expr: Box::new(resolve_expr_in_subqueries(engine, db, inner)?),
-            low: Box::new(resolve_expr_in_subqueries(engine, db, low)?),
-            high: Box::new(resolve_expr_in_subqueries(engine, db, high)?),
-            negated: *negated,
-        },
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => Expr::Case {
-            operand: operand
-                .as_ref()
-                .map(|expr| resolve_expr_in_subqueries(engine, db, expr).map(Box::new))
-                .transpose()?,
-            when_clauses: when_clauses
-                .iter()
-                .map(|(when_expr, then_expr)| {
-                    Ok((
-                        resolve_expr_in_subqueries(engine, db, when_expr)?,
-                        resolve_expr_in_subqueries(engine, db, then_expr)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
-            else_clause: else_clause
-                .as_ref()
-                .map(|expr| resolve_expr_in_subqueries(engine, db, expr).map(Box::new))
-                .transpose()?,
-        },
-        Expr::Like {
-            expr: inner,
-            pattern,
-            negated,
-        } => Expr::Like {
-            expr: Box::new(resolve_expr_in_subqueries(engine, db, inner)?),
-            pattern: Box::new(resolve_expr_in_subqueries(engine, db, pattern)?),
-            negated: *negated,
-        },
-        Expr::Function {
-            name,
-            args,
-            distinct,
-        } => Expr::Function {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|arg| resolve_expr_in_subqueries(engine, db, arg))
-                .collect::<Result<Vec<_>>>()?,
-            distinct: *distinct,
-        },
-        Expr::Subquery(subquery) => {
-            let value = super::query::execute_scalar_subquery(engine, db, subquery)?;
-            Expr::Literal(value)
-        }
-        Expr::WindowFunction {
-            func,
-            partition_by,
-            order_by,
-            frame,
-        } => Expr::WindowFunction {
-            func: func.clone(),
-            partition_by: partition_by
-                .iter()
-                .map(|arg| resolve_expr_in_subqueries(engine, db, arg))
-                .collect::<Result<Vec<_>>>()?,
-            order_by: order_by
-                .iter()
-                .map(|item| {
-                    Ok(crate::sql::parser::ast::OrderByItem {
-                        expr: resolve_expr_in_subqueries(engine, db, &item.expr)?,
-                        desc: item.desc,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            frame: frame.clone(),
-        },
-        Expr::Correlated(_) => expr.clone(),
-        Expr::Literal(_)
-        | Expr::Placeholder(_)
-        | Expr::Column(_)
-        | Expr::QualifiedColumn { .. } => expr.clone(),
-    })
-}
-
-fn resolve_stmt_in_subqueries(
-    engine: &Engine,
-    db: &str,
-    stmt: &crate::sql::parser::ast::Statement,
-) -> Result<crate::sql::parser::ast::Statement> {
-    let mut stmt = stmt.clone();
-    if let crate::sql::parser::ast::Statement::Select {
-        select_list,
-        where_clause,
-        group_by,
-        having,
-        order_by,
-        limit,
-        offset,
-        ..
-    } = &mut stmt
-    {
-        for item in select_list {
-            if let crate::sql::parser::ast::SelectItem::Expr(expr, _) = item {
-                *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-            }
-        }
-        if let Some(expr) = where_clause {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-        for expr in group_by {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-        if let Some(expr) = having {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-        for item in order_by {
-            item.expr = resolve_expr_in_subqueries(engine, db, &item.expr)?;
-        }
-        if let Some(expr) = limit {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-        if let Some(expr) = offset {
-            *expr = resolve_expr_in_subqueries(engine, db, expr)?;
-        }
-    }
-    Ok(stmt)
-}
-
-fn execute_in_subquery(
-    engine: &Engine,
-    db: &str,
-    subquery: &crate::sql::parser::ast::Statement,
-) -> Result<Vec<ScalarValue>> {
-    let subquery = resolve_stmt_in_subqueries(engine, db, subquery)?;
-    if let Some(values) = execute_simple_derived_subquery(engine, db, &subquery)? {
-        return Ok(values);
-    }
-    let ExecResult::Query { batches, .. } = super::query::exec_select(engine, db, &subquery)?
-    else {
-        return Err(TaibaiError::Sql("IN subquery must be a SELECT".into()));
-    };
-    Ok(first_column_values(&batches, 0))
-}
-
-fn execute_simple_derived_subquery(
-    engine: &Engine,
-    db: &str,
-    stmt: &crate::sql::parser::ast::Statement,
-) -> Result<Option<Vec<ScalarValue>>> {
-    use crate::sql::parser::ast::{FromClause, SelectItem, Statement, TableRef};
-
-    let Statement::Select {
-        select_list,
-        from: Some(FromClause::Table(TableRef::Subquery { query, alias })),
-        where_clause: None,
-        group_by,
-        having: None,
-        order_by: _,
-        limit: None,
-        offset: None,
-        ..
-    } = stmt
-    else {
-        return Ok(None);
-    };
-
-    if !group_by.is_empty() || select_list.len() != 1 {
-        return Ok(None);
-    }
-
-    let inner = resolve_stmt_in_subqueries(engine, db, query)?;
-    let ExecResult::Query { schema, batches } = super::query::exec_select(engine, db, &inner)?
-    else {
-        return Err(TaibaiError::Sql(
-            "derived IN subquery must be a SELECT".into(),
-        ));
-    };
-
-    let col_idx = match &select_list[0] {
-        SelectItem::Star => 0,
-        SelectItem::Expr(Expr::Column(name), _) => schema.index_of(name).unwrap_or(0),
-        SelectItem::Expr(Expr::QualifiedColumn { table, column }, _)
-            if table.eq_ignore_ascii_case(alias) =>
-        {
-            schema.index_of(column).unwrap_or(0)
-        }
-        SelectItem::Expr(_, _) => 0,
-    };
-    Ok(Some(first_column_values(&batches, col_idx)))
-}
-
-fn first_column_values(
-    batches: &[crate::types::batch::RecordBatch],
-    col_idx: usize,
-) -> Vec<ScalarValue> {
-    let mut values = Vec::new();
-    for batch in batches {
-        if batch.num_columns() <= col_idx {
-            continue;
-        }
-        for row_idx in 0..batch.num_rows() {
-            values.push(
-                batch
-                    .scalar(row_idx, col_idx)
-                    .unwrap_or(ScalarValue::Int64(None)),
-            );
-        }
-    }
-    values
 }
 
 pub(crate) fn segment_may_match(
@@ -1975,13 +1703,6 @@ pub(crate) fn prune_segments_by_partition(
         .collect()
 }
 
-#[derive(Debug, Clone)]
-struct ClusterKeyBounds {
-    column_index: usize,
-    lower: Option<(ScalarValue, bool)>,
-    upper: Option<(ScalarValue, bool)>,
-}
-
 pub(crate) fn prune_segments_by_cluster_key(
     segment_files: Vec<PathBuf>,
     mgr: &SegmentManager,
@@ -1995,7 +1716,8 @@ pub(crate) fn prune_segments_by_cluster_key(
     let Some(bounds) = cluster_key_bounds(schema, table_meta, predicate) else {
         return Ok(segment_files);
     };
-    let Some((start, end)) = cluster_segment_range(&segment_files, mgr, &bounds)? else {
+    let Some((start, end)) = cluster_prune::cluster_segment_range(&segment_files, mgr, &bounds)
+    else {
         return Ok(segment_files);
     };
     if start > end {
@@ -2020,11 +1742,11 @@ fn cluster_key_bounds(
         }
         match clause.op {
             RangeOp::Eq => {
-                return Some(ClusterKeyBounds {
-                    column_index: key_col_idx,
-                    lower: Some((clause.value.clone(), true)),
-                    upper: Some((clause.value.clone(), true)),
-                });
+                return Some(ClusterKeyBounds::single(
+                    key_col_idx,
+                    Some((clause.value.clone(), true)),
+                    Some((clause.value.clone(), true)),
+                ));
             }
             RangeOp::Gt => set_tighter_lower(&mut lower, clause.value.clone(), false),
             RangeOp::Ge => set_tighter_lower(&mut lower, clause.value.clone(), true),
@@ -2034,156 +1756,10 @@ fn cluster_key_bounds(
     }
 
     if lower.is_some() || upper.is_some() {
-        Some(ClusterKeyBounds {
-            column_index: key_col_idx,
-            lower,
-            upper,
-        })
+        Some(ClusterKeyBounds::single(key_col_idx, lower, upper))
     } else {
         None
     }
-}
-
-fn cluster_segment_range(
-    segments: &[PathBuf],
-    mgr: &SegmentManager,
-    bounds: &ClusterKeyBounds,
-) -> Result<Option<(usize, usize)>> {
-    if !cluster_segment_zone_maps_are_ordered(segments, mgr, bounds.column_index)? {
-        return Ok(None);
-    }
-    let start = match &bounds.lower {
-        Some((value, inclusive)) => {
-            let Some(start) = first_segment_with_max_at_least(
-                segments,
-                mgr,
-                bounds.column_index,
-                value,
-                *inclusive,
-            )?
-            else {
-                return Ok(None);
-            };
-            start
-        }
-        None => 0,
-    };
-    let end = match &bounds.upper {
-        Some((value, inclusive)) => {
-            let Some(end) = last_segment_with_min_at_most(
-                segments,
-                mgr,
-                bounds.column_index,
-                value,
-                *inclusive,
-            )?
-            else {
-                return Ok(None);
-            };
-            if end < 0 {
-                return Ok(Some((1, 0)));
-            }
-            end as usize
-        }
-        None => segments.len().saturating_sub(1),
-    };
-    Ok(Some((start, end)))
-}
-
-fn cluster_segment_zone_maps_are_ordered(
-    segments: &[PathBuf],
-    mgr: &SegmentManager,
-    col_idx: usize,
-) -> Result<bool> {
-    let mut previous_max: Option<ScalarValue> = None;
-    for segment in segments {
-        let Some(zm) = segment_cluster_zone_map(mgr, segment, col_idx)? else {
-            return Ok(false);
-        };
-        if compare_scalars_for_sort(&zm.min_value, &zm.max_value) == std::cmp::Ordering::Greater {
-            return Ok(false);
-        }
-        if let Some(prev) = &previous_max {
-            if compare_scalars_for_sort(prev, &zm.min_value) == std::cmp::Ordering::Greater {
-                return Ok(false);
-            }
-        }
-        previous_max = Some(zm.max_value);
-    }
-    Ok(true)
-}
-
-fn first_segment_with_max_at_least(
-    segments: &[PathBuf],
-    mgr: &SegmentManager,
-    col_idx: usize,
-    value: &ScalarValue,
-    inclusive: bool,
-) -> Result<Option<usize>> {
-    let mut lo = 0usize;
-    let mut hi = segments.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let Some(zm) = segment_cluster_zone_map(mgr, &segments[mid], col_idx)? else {
-            return Ok(None);
-        };
-        let cmp = compare_scalars_for_sort(&zm.max_value, value);
-        let before = if inclusive {
-            cmp == std::cmp::Ordering::Less
-        } else {
-            cmp != std::cmp::Ordering::Greater
-        };
-        if before {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(Some(lo))
-}
-
-fn last_segment_with_min_at_most(
-    segments: &[PathBuf],
-    mgr: &SegmentManager,
-    col_idx: usize,
-    value: &ScalarValue,
-    inclusive: bool,
-) -> Result<Option<isize>> {
-    let mut lo = 0usize;
-    let mut hi = segments.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let Some(zm) = segment_cluster_zone_map(mgr, &segments[mid], col_idx)? else {
-            return Ok(None);
-        };
-        let cmp = compare_scalars_for_sort(&zm.min_value, value);
-        let at_or_before = if inclusive {
-            cmp != std::cmp::Ordering::Greater
-        } else {
-            cmp == std::cmp::Ordering::Less
-        };
-        if at_or_before {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(Some(lo as isize - 1))
-}
-
-fn segment_cluster_zone_map(
-    mgr: &SegmentManager,
-    segment: &std::path::Path,
-    col_idx: usize,
-) -> Result<Option<ZoneMap>> {
-    let reader = mgr.open_reader_cached(segment)?;
-    let Some(zm) = reader.segment_zone_maps().get(col_idx) else {
-        return Ok(None);
-    };
-    if zm.row_count == 0 || zm.min_value.is_null() || zm.max_value.is_null() {
-        return Ok(None);
-    }
-    Ok(Some(zm.clone()))
 }
 
 fn set_tighter_lower(

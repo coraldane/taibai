@@ -103,7 +103,11 @@ impl Utf8Buffer {
         let old_data_len = self.data.len();
         self.offsets.reserve(end - start);
         self.data.extend_from_slice(&other.data[src_base..src_end]);
-        let adjust = (old_data_len - src_base) as u32;
+        // Rebased offset = old_data_len + (o - src_base), computed modulo
+        // 2^32: appending a middle slice into a shorter destination makes
+        // `o - src_base` dominate `old_data_len`, so plain subtraction of
+        // the usize lengths would underflow before the u32 wrap rescues it.
+        let adjust = (old_data_len as u32).wrapping_sub(other.offsets[start]);
         self.offsets.extend(
             other.offsets[start + 1..=end]
                 .iter()

@@ -85,22 +85,25 @@ impl Parser {
         if self.peek() == &Token::LeftParen {
             return self.parse_parenthesized_query();
         }
-        let first = self.parse_select_core()?;
+        // Left-fold every INTERSECT tail into the operand: the loop used to
+        // return after the first one, leaving `a INTERSECT b INTERSECT c`
+        // with an unconsumed tail that failed to parse.
+        let mut left = self.parse_select_core()?;
         while self.peek() == &Token::Intersect {
             self.advance();
             self.reject_set_op_all("INTERSECT")?;
             let right = self.parse_select_core()?;
-            return Ok(Statement::Union {
-                left: Box::new(first),
+            left = Statement::Union {
+                left: Box::new(left),
                 right: Box::new(right),
                 op: SetOp::Intersect,
                 all: false,
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
-            });
+            };
         }
-        Ok(first)
+        Ok(left)
     }
 
     fn reject_set_op_all(&mut self, name: &str) -> Result<()> {

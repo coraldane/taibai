@@ -964,20 +964,102 @@ fn execute_in_subquery(
     db: &str,
     subquery: &Statement,
 ) -> Result<Vec<ScalarValue>> {
-    let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
+    // Resolve nested subqueries up front: `exec_select` would resolve them
+    // again and find nothing left, so the total work is unchanged.
+    let mut resolved = subquery.clone();
+    resolve_stmt_in_subqueries(engine, db, &mut resolved)?;
+    if let Some(values) = execute_simple_derived_subquery(engine, db, &resolved)? {
+        return Ok(values);
+    }
+    let ExecResult::Query { batches, .. } = exec_select(engine, db, &resolved)? else {
         return Err(TaibaiError::Sql("IN subquery must be a SELECT".into()));
     };
+    Ok(first_column_values(&batches, 0))
+}
 
+/// Fast path for `IN (SELECT c FROM (SELECT ...) AS alias)`: the derived
+/// table is executed directly and the single projected column picked out of
+/// its result, skipping the outer select pipeline. Only shapes whose
+/// projection is provably a pass-through of one inner column take the fast
+/// path — anything else returns `None` for the general pipeline.
+fn execute_simple_derived_subquery(
+    engine: &Engine,
+    db: &str,
+    stmt: &Statement,
+) -> Result<Option<Vec<ScalarValue>>> {
+    let Statement::Select {
+        select_list,
+        from: Some(FromClause::Table(TableRef::Subquery { query, alias })),
+        where_clause: None,
+        group_by,
+        having: None,
+        order_by: _,
+        limit: None,
+        offset: None,
+        ..
+    } = stmt
+    else {
+        return Ok(None);
+    };
+
+    if !group_by.is_empty() || select_list.len() != 1 {
+        return Ok(None);
+    }
+
+    let mut inner = query.clone();
+    resolve_stmt_in_subqueries(engine, db, &mut inner)?;
+    let ExecResult::Query { schema, batches } = exec_select(engine, db, &inner)? else {
+        return Err(TaibaiError::Sql(
+            "derived IN subquery must be a SELECT".into(),
+        ));
+    };
+
+    let col_idx = match &select_list[0] {
+        SelectItem::Star => Some(0),
+        SelectItem::Expr(Expr::Column(name), _) => schema.index_of(name),
+        SelectItem::Expr(Expr::QualifiedColumn { table, column }, _)
+            if table.eq_ignore_ascii_case(alias) =>
+        {
+            schema.index_of(column)
+        }
+        // A computed projection (e.g. `alias.col + 1`) — or a column the
+        // inner query does not expose — is not a pass-through; the general
+        // pipeline must evaluate (or reject) it.
+        SelectItem::Expr(_, _) => None,
+    };
+    let Some(col_idx) = col_idx else {
+        return Ok(None);
+    };
+    Ok(Some(first_column_values(&batches, col_idx)))
+}
+
+fn first_column_values(batches: &[RecordBatch], col_idx: usize) -> Vec<ScalarValue> {
     let mut values = Vec::new();
     for batch in batches {
-        if batch.num_columns() == 0 {
+        if batch.num_columns() <= col_idx {
             continue;
         }
         for row_idx in 0..batch.num_rows() {
-            values.push(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
+            values.push(
+                batch
+                    .scalar(row_idx, col_idx)
+                    .unwrap_or(ScalarValue::Int64(None)),
+            );
         }
     }
-    Ok(values)
+    values
+}
+
+/// Clone-and-resolve form used by the DML paths, which keep the original
+/// expression for permission checks and undo and need a rewritten copy.
+pub(crate) fn resolve_expr_in_subqueries_clone(
+    engine: &Engine,
+    db: &str,
+    expr: &Expr,
+) -> Result<Expr> {
+    let mut resolved = expr.clone();
+    resolve_expr_in_subqueries(engine, db, &mut resolved)?;
+    Ok(resolved)
 }
 
 pub(crate) fn execute_scalar_subquery(

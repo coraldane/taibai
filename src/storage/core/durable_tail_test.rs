@@ -421,8 +421,9 @@ fn garbage_frame_length_is_treated_as_torn_frame() -> Result<()> {
     let mut bytes = fs::read(&path)?;
     let first_payload_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
     let frame_header_len =
-        tail_frame_header_len(u32::from_le_bytes(bytes[0..4].try_into().unwrap()))
-            .expect("current tail format");
+        TailFormat::from_magic(u32::from_le_bytes(bytes[0..4].try_into().unwrap()))
+            .expect("current tail format")
+            .frame_header_len;
     let second_frame = 8 + frame_header_len + first_payload_len + 4;
     bytes[second_frame..second_frame + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     fs::write(&path, &bytes)?;

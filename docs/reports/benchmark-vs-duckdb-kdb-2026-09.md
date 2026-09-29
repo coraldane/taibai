@@ -217,10 +217,17 @@ python E:/workspace/bench/duckdb_bench.py load|query|appender
 
 append 的逐行成本 ~60-70ns,分解:**键派生(位图判空 + arena 取值 + 字符串哈希 + dedup 探测 + scratch 入表)≈ 44-50ns**,列拷贝 ≈ 10ns,索引应用 ≈ 5.5ns,seal 摊销 ≈ 少量。键派生的 44ns 由 2-3 次**依赖性随机内存访问**(dedup 哈希表探测、scratch 哈希表探测、postings 随机写)构成——在本机内存延迟与安全软件开销下已贴近下限,数据结构微优化(融合/去重/缓冲复用/缓存扩容)均已实测到顶。
 
-**结论:逐行哈希式倒排索引维护的算法下限就是当前速度;要接近 kdb+ 必须改变架构,三条路线:**
+**结论:每行两次哈希表探测(批内字符串 dedup + ValueKey 分组)是逐行成本主体,而 intern id 本身是稠密 u32 —— 第二次探测可以用计数排序消除。已实现并落地:**
 
-1. **seal 时并行建索引**:append 退化为纯列拷贝(~10ns/行 ≈ 8000 万-1 亿行/s);索引在 seal 时用 rayon 并行分组构建(每 64K 行一次,几 ms,8 线程摊薄后 ≈ 6-8ns/行)。代价:open chunk 在建好前点查退化为线性扫(≤64K 行,~0.1-0.3ms),或引入"indexed-prefix + 未索引尾"双段查询。
-2. **上游字典化**:INSERT 管线直接产出 intern id(复用 bulk 编码的符号池),逐行成本从"字符串哈希+探测"降为"数组下标"(~2-4ns/行)。改动面在 SQL VALUES/二进制协议一侧。
-3. **行域分片并行 append**:8-16 分片各建局部分组再有序合并,预计 2500 万-3500 万行/s(受合并与内存带宽限制,收益低于 1/2)。
+- **稠密 id 计数排序分组**:逐行只剩一次 pool intern(字符串哈希 + 池探测,批内高命中),(id, offset) 对推入平面数组,批末按 id 计数排序(零探测,O(rows + distinct)),每组一次 chunk-index entry + 连续 extend。NULL 键走哨兵 id。
+- 分区表与定宽键列回退原 scratch 路径(行为不变)。
 
-推荐顺序:2(与 bulk 字典化协同)→ 1(kdb+ 语义最接近)。本轮全部改动以 hot_store 14 项单测、fast_path 18 项、hybrid mirror 5 项与全量 617+ 用例验证,并顺带修复 `extend_range` 的定宽列元素/字节偏移错误(跨 chunk 边界定宽列追加 panic,单测抓住)。
+**结果:append 1550 → 1890-1930 万行/s(+22%,10M 规模 1935 万),点查 0.85µs、gather 3400 万行/s 无回退。** 过程中踩到并修复一个自锁:pool 写锁作用域被提升到 seal 之外,`recompute_memory_bytes` 同线程取 `string_pool.read()` 自死锁——已把锁收回分组段内。
+
+**剩余路线(按预期收益排序):**
+
+1. **上游字典化**:INSERT 管线直接产出 intern id(复用 bulk 编码的符号池),逐行成本从"字符串哈希+池探测"降为"数组下标"(~2-4ns/行),预计 3000 万-4000 万行/s。改动面在 SQL VALUES/二进制协议一侧。
+2. **行域分片并行 append**:计数排序天然可分片(各分片局部 (id, offset) 对 + 局部计数排序,按分片序依次 apply,postings 升序保持),8-16 分片预计 4000 万-8000 万行/s。
+3. **seal 时并行建索引 + open chunk 线性回退**:append 退化为纯 memcpy(8000 万-1 亿行/s),代价是最新数据点查短暂退化,需要产品级取舍。
+
+本轮全部改动以 hot_store 14 项单测、fast_path 18 项、hybrid mirror 5 项与全量 617+ 用例验证,并顺带修复 `extend_range` 的定宽列元素/字节偏移错误(跨 chunk 边界定宽列追加 panic,单测抓住)。

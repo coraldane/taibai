@@ -72,7 +72,7 @@ fn cluster_key_eq_predicate_builds_exact_bounds() {
     let bounds = cluster_key_bounds(&schema, &meta, &predicate).expect("bounds");
 
     assert_eq!(
-        bounds.column_index,
+        bounds.range_column_index,
         schema.index_of("partition_key").unwrap()
     );
     assert_eq!(

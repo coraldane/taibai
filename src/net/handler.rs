@@ -366,27 +366,6 @@ impl Handler {
         if !is_insert && !is_heartbeat_query(sql) {
             tracing::info!(sql, "query received");
         }
-        // TEST-INSTRUMENTATION (temporary): INSERT statements are otherwise
-        // invisible in logs, which made the 2026-09-24 15:42 write stall
-        // impossible to attribute. Log begin/end per INSERT with a row hint.
-        let insert_probe = if is_insert {
-            let table = sql
-                .split_at_checked("INSERT ".len())
-                .and_then(|(_, rest)| rest.strip_prefix("INTO "))
-                .map(|rest| {
-                    rest.split(|c: char| c.is_whitespace() || c == '(')
-                        .next()
-                        .unwrap_or("?")
-                        .to_string()
-                })
-                .unwrap_or_else(|| "?".to_string());
-            let rows_hint = 1 + sql.matches("),(").count();
-            let bytes = sql.len();
-            tracing::info!(table = %table, rows_hint, bytes, "insert begin");
-            Some((table, rows_hint, std::time::Instant::now()))
-        } else {
-            None
-        };
 
         let session = match &mut self.session {
             Some(s) => s,
@@ -484,15 +463,6 @@ impl Handler {
 
         match result {
             Ok(ExecResult::Ok { rows_affected }) => {
-                if let Some((table, rows_hint, begin_at)) = &insert_probe {
-                    tracing::info!(
-                        table = %table,
-                        rows_hint,
-                        rows_affected,
-                        elapsed_ms = begin_at.elapsed().as_millis() as u64,
-                        "insert done"
-                    );
-                }
                 if is_insert && rows_affected > 0 {
                     if let Some(s) = self.session.as_mut() {
                         s.had_writes = true;
@@ -537,15 +507,6 @@ impl Handler {
                 Ok(vec![msg])
             }
             Err(e) => {
-                if let Some((table, rows_hint, begin_at)) = &insert_probe {
-                    tracing::warn!(
-                        table = %table,
-                        rows_hint,
-                        elapsed_ms = begin_at.elapsed().as_millis() as u64,
-                        error = %e,
-                        "insert error"
-                    );
-                }
                 if !is_insert {
                     tracing::warn!(error = %e, sql, "query error");
                 }
@@ -1333,6 +1294,33 @@ impl Handler {
     /// MSG_TYPE_SUBSCRIBE: payload is one length-prefixed topic string, either
     /// `table` (session database), `database.table`, `database.*` or `>`.
     /// Replies MSG_TYPE_OK carrying the subscription id, or an error.
+    /// SUBSCRIBE permission gate shared by the hub (v1, wildcard topics)
+    /// and reliable (v2, exact table) subscription paths. `Err(messages)` is
+    /// the ready-to-send rejection reply.
+    fn require_subscribe_permission(
+        engine: &Engine,
+        username: &str,
+        topic_display: &str,
+        object_type: PermissionObjectType,
+        object: &str,
+    ) -> std::result::Result<(), Vec<Message>> {
+        if engine
+            .auth_manager()
+            .check_permission(username, PermissionType::Subscribe, object_type, object)
+        {
+            Ok(())
+        } else {
+            tracing::warn!(
+                username,
+                topic = topic_display,
+                "subscribe rejected: missing SUBSCRIBE permission"
+            );
+            Err(vec![build_error(&format!(
+                "access denied for user '{username}' to SUBSCRIBE on '{topic_display}'"
+            ))])
+        }
+    }
+
     fn handle_subscribe(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
         let (topic, _) = match read_len_prefixed_string(payload) {
             Ok(v) => v,
@@ -1406,21 +1394,15 @@ impl Handler {
                 ))]);
             }
         }
-        if !self.engine.auth_manager().check_permission(
-            &session.username,
-            PermissionType::Subscribe,
+        let subscriber = session.username.clone();
+        if let Err(messages) = Self::require_subscribe_permission(
+            &self.engine,
+            &subscriber,
+            topic,
             permission_object.0.clone(),
             &permission_object.1,
         ) {
-            tracing::warn!(
-                username = %session.username,
-                topic,
-                "subscribe rejected: missing SUBSCRIBE permission"
-            );
-            return Ok(vec![build_error(&format!(
-                "access denied for user '{}' to SUBSCRIBE on '{}'",
-                session.username, topic
-            ))]);
+            return Ok(messages);
         }
 
         let conn = match &self.pubsub_conn {
@@ -1528,22 +1510,15 @@ impl Handler {
                 ))]);
             }
         }
-        if !self.engine.auth_manager().check_permission(
+        let topic_display = format!("{}.{}", request.db, request.table);
+        if let Err(messages) = Self::require_subscribe_permission(
+            &self.engine,
             &username,
-            PermissionType::Subscribe,
+            &topic_display,
             PermissionObjectType::Table,
-            &format!("{}.{}", request.db, request.table),
+            &topic_display,
         ) {
-            tracing::warn!(
-                username,
-                db = %request.db,
-                table = %request.table,
-                "reliable subscribe rejected: missing SUBSCRIBE permission"
-            );
-            return Ok(vec![build_error(&format!(
-                "access denied for user '{username}' to SUBSCRIBE on '{}.{}'",
-                request.db, request.table
-            ))]);
+            return Ok(messages);
         }
         let Some(push_tx) = self.push_channel.clone() else {
             return Ok(vec![build_error(

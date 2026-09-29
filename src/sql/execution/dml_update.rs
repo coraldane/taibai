@@ -103,7 +103,7 @@ pub fn exec_update(
                         db,
                         &assignment.value,
                     )?;
-                    super::dml_delete::resolve_expr_in_subqueries_pub(
+                    super::query::resolve_expr_in_subqueries_clone(
                         engine,
                         db,
                         &assignment.value,

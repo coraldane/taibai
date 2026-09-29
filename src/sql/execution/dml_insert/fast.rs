@@ -13,6 +13,16 @@ fn log_insert_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     }
 }
 
+/// Test seam: force INSERTs down the standard parse/materialize path so
+/// differential tests can compare both routes' outcomes on the same SQL.
+/// Production value stays false.
+static FAST_INSERT_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fast_insert_disabled_for_tests(disabled: bool) {
+    FAST_INSERT_DISABLED.store(disabled, std::sync::atomic::Ordering::Release);
+}
+
 pub fn try_exec_fast_insert_sql(
     engine: &Engine,
     default_db: &str,
@@ -22,6 +32,9 @@ pub fn try_exec_fast_insert_sql(
     bulk_import_mode: bool,
     username: &str,
 ) -> Option<Result<ExecResult>> {
+    if FAST_INSERT_DISABLED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     match try_exec_fast_insert_sql_inner(
         engine,
         default_db,

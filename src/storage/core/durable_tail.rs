@@ -1077,6 +1077,75 @@ fn decode_delete_positions(bytes: &[u8]) -> Result<Vec<u32>> {
 /// The sidecar generation (`<id>.<seq>.del`) applies to the tail below it:
 /// recovery loads the tail, then removes the recorded positions oldest
 /// sidecar first. Appends to the tail only extend it, so positions recorded
+/// Why a generation walk stopped without finding a live tail.
+enum Suppression {
+    /// A clear tombstone: the tail was explicitly dropped.
+    Clear,
+    /// A satisfied flush intent: the tail's rows are durable in a segment.
+    Flush(PathBuf),
+}
+
+/// Result of walking one id's generations under the shared arbitration: the
+/// newest usable tail wins, clear tombstones and satisfied flush intents
+/// suppress everything below, delete sidecars are transparent.
+enum LiveTail {
+    Found(PathBuf),
+    Suppressed(Suppression),
+    Absent,
+}
+
+/// Walk `generations` (must be pre-sorted newest→oldest) applying the
+/// generation arbitration shared by every live-tail resolution.
+///
+/// * `validate_tails` discards tail files without a usable header and keeps
+///   walking (the mutation paths); read-only views skip the check.
+/// * `prune_intents` removes unsatisfied flush intents encountered along
+///   the walk (they prove nothing about the tail below); read-only views
+///   leave them for the mutation paths.
+/// * `deletions` collects the delete sidecar paths seen above the live
+///   tail, newest-first.
+fn resolve_live_tail(
+    table_dir: &Path,
+    generations: &[Generation],
+    validate_tails: bool,
+    prune_intents: bool,
+    mut deletions: Option<&mut Vec<PathBuf>>,
+) -> LiveTail {
+    for generation in generations {
+        match generation.kind {
+            GenerationKind::Tail => {
+                if validate_tails && !tail_file_has_header(&generation.path) {
+                    discard_unusable_tail(&generation.path);
+                    continue;
+                }
+                return LiveTail::Found(generation.path.clone());
+            }
+            GenerationKind::Clear => return LiveTail::Suppressed(Suppression::Clear),
+            GenerationKind::Delete => {
+                if let Some(list) = deletions.as_deref_mut() {
+                    list.push(generation.path.clone());
+                }
+            }
+            GenerationKind::Flush => {
+                // A torn or corrupt intent marker proves nothing about the
+                // tail: treat it as unsatisfied so the preceding tail stays
+                // authoritative.
+                let satisfied = fs::read(&generation.path)
+                    .ok()
+                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
+                    .unwrap_or(false);
+                if satisfied {
+                    return LiveTail::Suppressed(Suppression::Flush(generation.path.clone()));
+                }
+                if prune_intents {
+                    let _ = fs::remove_file(&generation.path);
+                }
+            }
+        }
+    }
+    LiveTail::Absent
+}
+
 /// against an earlier prefix stay valid. Returns `false` when the memtable
 /// has no live tail (caller falls back to a full `persist`).
 pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool> {
@@ -1090,36 +1159,12 @@ pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool
     if !tail_dir.exists() {
         return Ok(false);
     }
-    // Same walk as `newest_live_tail_path`: a live tail must exist below any
-    // flush intents / clear tombstones, with delete sidecars transparent.
     let mut generations = generations_for_id(&tail_dir, id)?;
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-    let mut live_tail = None;
-    for generation in generations {
-        match generation.kind {
-            GenerationKind::Tail => {
-                if !tail_file_has_header(&generation.path) {
-                    discard_unusable_tail(&generation.path);
-                    continue;
-                }
-                live_tail = Some(generation.path);
-                break;
-            }
-            GenerationKind::Clear => break,
-            GenerationKind::Flush => {
-                let satisfied = fs::read(&generation.path)
-                    .ok()
-                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
-                    .unwrap_or(false);
-                if satisfied {
-                    break;
-                }
-                let _ = fs::remove_file(&generation.path);
-            }
-            GenerationKind::Delete => {}
-        }
-    }
-    if live_tail.is_none() {
+    if !matches!(
+        resolve_live_tail(table_dir, &generations, true, true, None),
+        LiveTail::Found(_)
+    ) {
         return Ok(false);
     }
     let sequence = next_sequence();
@@ -1136,6 +1181,9 @@ pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool
 /// True when no delete sidecars pend above the memtable's live tail. A spill
 /// (which writes a fresh full tail under the existing generation sequence)
 /// must not run while sidecars pend: they would re-apply to unrelated rows.
+///
+/// Not expressed through [`resolve_live_tail`]: a delete sidecar is terminal
+/// here (answers "plain?"), not transparent as in the live-tail searches.
 pub fn tail_is_plain(table_dir: &Path, id: Uuid) -> Result<bool> {
     let tail_dir = table_dir.join(TAIL_DIR);
     if !tail_dir.exists() {
@@ -1185,24 +1233,11 @@ pub fn has_tail(table_dir: &Path, id: Uuid) -> bool {
         return false;
     };
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-    for generation in generations {
-        match generation.kind {
-            GenerationKind::Tail => return true,
-            GenerationKind::Clear => return false,
-            // Sidecars do not change whether rows exist; the tail below
-            // decides. A corrupt sidecar surfaces when the tail is loaded.
-            GenerationKind::Delete => {}
-            GenerationKind::Flush => {
-                let Ok(bytes) = fs::read(&generation.path) else {
-                    continue;
-                };
-                if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
-                    return false;
-                }
-            }
-        }
-    }
-    false
+    // Read-only view: no header validation, no intent pruning.
+    matches!(
+        resolve_live_tail(table_dir, &generations, false, false, None),
+        LiveTail::Found(_)
+    )
 }
 
 pub fn generation_file_count(table_dir: &Path) -> Result<usize> {
@@ -1233,25 +1268,11 @@ pub fn has_tail_batch(table_dir: &Path, ids: &[Uuid]) -> Result<HashMap<Uuid, bo
             continue;
         };
         generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-        let mut has = false;
-        for generation in generations {
-            match generation.kind {
-                GenerationKind::Tail => {
-                    has = true;
-                    break;
-                }
-                GenerationKind::Clear => break,
-                GenerationKind::Delete => {}
-                GenerationKind::Flush => {
-                    let Ok(bytes) = fs::read(&generation.path) else {
-                        continue;
-                    };
-                    if flush_intent_satisfied(table_dir, &bytes).unwrap_or(false) {
-                        break;
-                    }
-                }
-            }
-        }
+        // Read-only view, same arbitration as `has_tail`.
+        let has = matches!(
+            resolve_live_tail(table_dir, &generations, false, false, None),
+            LiveTail::Found(_)
+        );
         answers.insert(*id, has);
     }
     Ok(answers)
@@ -1265,7 +1286,6 @@ pub fn live_tail_paths_batch(
 ) -> Result<HashMap<Uuid, Option<PathBuf>>> {
     let tail_dir = table_dir.join(TAIL_DIR);
     let mut by_id = generations_by_id(&tail_dir)?;
-    let parent_dir = tail_dir.parent().unwrap_or(&tail_dir);
     let mut answers = HashMap::with_capacity(ids.len());
     for id in ids {
         let Some(mut generations) = by_id.remove(id) else {
@@ -1273,25 +1293,11 @@ pub fn live_tail_paths_batch(
             continue;
         };
         generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-        let mut live = None;
-        for generation in generations {
-            match generation.kind {
-                GenerationKind::Tail => {
-                    live = Some(generation.path);
-                    break;
-                }
-                GenerationKind::Clear => break,
-                GenerationKind::Delete => {}
-                GenerationKind::Flush => {
-                    let Ok(bytes) = fs::read(&generation.path) else {
-                        continue;
-                    };
-                    if flush_intent_satisfied(parent_dir, &bytes).unwrap_or(false) {
-                        break;
-                    }
-                }
-            }
-        }
+        // Read-only view, same arbitration as `live_tail_path`.
+        let live = match resolve_live_tail(table_dir, &generations, false, false, None) {
+            LiveTail::Found(path) => Some(path),
+            _ => None,
+        };
         answers.insert(*id, live);
     }
     Ok(answers)
@@ -1381,41 +1387,24 @@ fn live_tail_with_deletions(
 ) -> Result<Option<(PathBuf, Vec<Vec<u32>>)>> {
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
     let mut deletions_rev = Vec::new();
-    for generation in generations.iter() {
-        match generation.kind {
-            GenerationKind::Tail => {
-                if !tail_file_has_header(&generation.path) {
-                    discard_unusable_tail(&generation.path);
-                    continue;
-                }
-                let mut applied = Vec::with_capacity(deletions_rev.len());
-                for sidecar in deletions_rev.iter().rev() {
-                    applied.push(decode_delete_positions(&fs::read(sidecar)?)?);
-                }
-                return Ok(Some((generation.path.clone(), applied)));
+    match resolve_live_tail(table_dir, generations, true, true, Some(&mut deletions_rev)) {
+        LiveTail::Found(path) => {
+            let mut applied = Vec::with_capacity(deletions_rev.len());
+            for sidecar in deletions_rev.iter().rev() {
+                applied.push(decode_delete_positions(&fs::read(sidecar)?)?);
             }
-            GenerationKind::Clear => return Ok(None),
-            GenerationKind::Delete => deletions_rev.push(generation.path.clone()),
-            GenerationKind::Flush => {
-                // A torn or corrupt intent marker proves nothing about the
-                // tail: treat it as unsatisfied so the preceding tail stays
-                // authoritative instead of failing table recovery.
-                let satisfied = fs::read(&generation.path)
-                    .ok()
-                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
-                    .unwrap_or(false);
-                if satisfied {
-                    remove_other_generations_ex(tail_dir, id, &generation.path, true)?;
-                    remove_file_if_exists(&generation.path)?;
-                    return Ok(None);
-                }
-                // The rows never became durable in the target segment.
-                // Ignore this intent and continue to the preceding tail.
-                let _ = remove_file_if_exists(&generation.path);
-            }
+            Ok(Some((path, applied)))
         }
+        // The tail's rows are durable in the target segment: retire the
+        // id's remaining generations (delete sidecars preserved — see
+        // `remove_other_generations_ex`) and the satisfied intent itself.
+        LiveTail::Suppressed(Suppression::Flush(intent)) => {
+            remove_other_generations_ex(tail_dir, id, &intent, true)?;
+            remove_file_if_exists(&intent)?;
+            Ok(None)
+        }
+        LiveTail::Suppressed(Suppression::Clear) | LiveTail::Absent => Ok(None),
     }
-    Ok(None)
 }
 
 fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf, Vec<Vec<u32>>)>> {
@@ -1667,12 +1656,31 @@ pub struct TailFrameMeta {
     pub rows: u64,
 }
 
-/// Frame header length by file magic; `None` for unsupported versions.
-fn tail_frame_header_len(magic: u32) -> Option<usize> {
-    match magic {
-        TAIL_LOG_MAGIC_V3 => Some(32),
-        TAIL_LOG_MAGIC_V2 => Some(16),
-        _ => None,
+/// A tail log's frame layout, resolved once from the file-header magic.
+/// V3 frames carry LSN/commit-timestamp fields; V2 files decode with zeros
+/// there; V1 frames (no `rows` field) stay decodable through the same
+/// header-length arithmetic. All version dispatch lives here.
+#[derive(Debug, Clone, Copy)]
+struct TailFormat {
+    frame_header_len: usize,
+}
+
+impl TailFormat {
+    fn from_magic(magic: u32) -> Option<Self> {
+        match magic {
+            TAIL_LOG_MAGIC_V3 => Some(Self {
+                frame_header_len: 32,
+            }),
+            TAIL_LOG_MAGIC_V2 => Some(Self {
+                frame_header_len: 16,
+            }),
+            _ => None,
+        }
+    }
+
+    /// V3+ frames carry the LSN and commit timestamp in the header.
+    fn has_commit_metadata(self) -> bool {
+        self.frame_header_len >= 32
     }
 }
 
@@ -1726,15 +1734,15 @@ fn decode_tail_with_meta(
         ));
     }
     let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    let frame_header_len = tail_frame_header_len(magic)
+    let format = TailFormat::from_magic(magic)
         .ok_or_else(|| TaibaiError::Storage("unsupported durable tail version".into()))?;
-    decode_tail_log_inner(bytes, schema, frame_header_len)
+    decode_tail_log_inner(bytes, schema, format)
 }
 
 fn decode_tail_log_inner(
     bytes: &[u8],
     schema: &Schema,
-    frame_header_len: usize,
+    format: TailFormat,
 ) -> Result<(String, RecordBatch, Vec<TailFrameMeta>)> {
     if bytes.len() < 8 {
         return Err(TaibaiError::Storage("durable tail log is truncated".into()));
@@ -1755,12 +1763,12 @@ fn decode_tail_log_inner(
     while offset < bytes.len() {
         // A crash may leave the final append incomplete. All preceding frames
         // were individually synced and remain a valid recovery prefix.
-        if bytes.len().saturating_sub(offset) < frame_header_len + 4 {
+        if bytes.len().saturating_sub(offset) < format.frame_header_len + 4 {
             break;
         }
         let payload_len =
             u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
-        let payload_start = offset + frame_header_len;
+        let payload_start = offset + format.frame_header_len;
         let payload_end = payload_start.saturating_add(payload_len);
         let frame_end = payload_end.saturating_add(4);
         if frame_end > bytes.len() {
@@ -1777,7 +1785,7 @@ fn decode_tail_log_inner(
         let batch = deserialize_batch_from_wal(&bytes[payload_start..payload_end], schema)?;
         append_batch(&mut recovered, &batch)?;
         // V2 frames have no LSN/timestamp fields; report zeros there.
-        let (lsn, commit_ts_micros) = if frame_header_len >= 32 {
+        let (lsn, commit_ts_micros) = if format.has_commit_metadata() {
             (
                 u64::from_le_bytes(bytes[offset + 16..offset + 24].try_into().unwrap()),
                 i64::from_le_bytes(bytes[offset + 24..offset + 32].try_into().unwrap()),
@@ -1865,7 +1873,7 @@ fn read_tail_log_version(path: &Path) -> Result<Option<u32>> {
         return Err(error.into());
     }
     let magic = u32::from_le_bytes(header);
-    Ok(tail_frame_header_len(magic).map(|_| magic))
+    Ok(TailFormat::from_magic(magic).map(|_| magic))
 }
 
 /// Row count of a current-format tail log obtained by walking frame headers
@@ -1875,8 +1883,8 @@ fn scan_tail_log_rows(bytes: &[u8]) -> Option<u64> {
         return None;
     }
     let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    let frame_header_len = tail_frame_header_len(magic)?;
-    let frame_min_len = frame_header_len + 4;
+    let format = TailFormat::from_magic(magic)?;
+    let frame_min_len = format.frame_header_len + 4;
     let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let mut offset = 8usize.saturating_add(partition_len);
     if offset > bytes.len() {
@@ -1892,7 +1900,7 @@ fn scan_tail_log_rows(bytes: &[u8]) -> Option<u64> {
         let payload_len =
             u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
         let frame_rows = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
-        let payload_start = offset + frame_header_len;
+        let payload_start = offset + format.frame_header_len;
         let payload_end = payload_start.saturating_add(payload_len);
         let frame_end = payload_end.saturating_add(4);
         if frame_end > bytes.len() {
@@ -1920,7 +1928,7 @@ fn read_tail_log_partition_key(path: &Path) -> Result<Option<String>> {
         return Err(error.into());
     }
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
-    if tail_frame_header_len(magic).is_none() {
+    if TailFormat::from_magic(magic).is_none() {
         return Ok(None);
     }
     let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
@@ -2024,7 +2032,7 @@ fn tail_file_has_header(path: &Path) -> bool {
         return false;
     }
     let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
-    if tail_frame_header_len(magic).is_none() {
+    if TailFormat::from_magic(magic).is_none() {
         return false;
     }
     let partition_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
@@ -2098,34 +2106,14 @@ fn generations_by_id(tail_dir: &Path) -> Result<HashMap<Uuid, Vec<Generation>>> 
 fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     let mut generations = generations_for_id(tail_dir, id)?;
     generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-    for generation in generations {
-        match generation.kind {
-            GenerationKind::Tail => {
-                if !tail_file_has_header(&generation.path) {
-                    discard_unusable_tail(&generation.path);
-                    continue;
-                }
-                return Ok(Some(generation.path));
-            }
-            GenerationKind::Clear => return Ok(None),
-            // Appending insert deltas below a delete sidecar is safe:
-            // appends only extend the batch, so recorded positions keep
-            // referring to the same prefix.
-            GenerationKind::Delete => {}
-            GenerationKind::Flush => {
-                let table_dir = tail_dir.parent().unwrap_or(tail_dir);
-                let satisfied = fs::read(&generation.path)
-                    .ok()
-                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
-                    .unwrap_or(false);
-                if satisfied {
-                    return Ok(None);
-                }
-                let _ = fs::remove_file(&generation.path);
-            }
-        }
-    }
-    Ok(None)
+    let table_dir = tail_dir.parent().unwrap_or(tail_dir);
+    // Appending insert deltas below a delete sidecar is safe: appends only
+    // extend the batch, so recorded positions keep referring to the same
+    // prefix — hence deletions are not collected here.
+    Ok(match resolve_live_tail(table_dir, &generations, true, true, None) {
+        LiveTail::Found(path) => Some(path),
+        _ => None,
+    })
 }
 
 fn remove_other_generations(tail_dir: &Path, id: Uuid, keep_path: &Path) -> Result<()> {

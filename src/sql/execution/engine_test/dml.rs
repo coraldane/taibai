@@ -1170,3 +1170,161 @@ fn composite_pk_update_validates_against_the_full_key() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn chained_intersect_parses_and_folds_left() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (v INT64)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (v) VALUES (1), (2), (3), (4)",
+    )?;
+
+    // `a INTERSECT b INTERSECT c` used to fold only the first pair and
+    // then fail on the leftover INTERSECT token.
+    let result = engine.execute(
+        &mut session,
+        "SELECT v FROM t WHERE v > 1 INTERSECT SELECT v FROM t WHERE v < 4 INTERSECT SELECT v FROM t WHERE v <> 3",
+    )?;
+    let mut rows = 0usize;
+    let mut values: Vec<i64> = Vec::new();
+    if let ExecResult::Query { batches, .. } = result {
+        for batch in &batches {
+            rows += batch.num_rows();
+            for row in 0..batch.num_rows() {
+                if let ScalarValue::Int64(Some(v)) = batch.scalar(row, 0).unwrap() {
+                    values.push(v);
+                }
+            }
+        }
+    } else {
+        panic!("expected query result");
+    }
+    assert_eq!(rows, 1, "intersection is {{2}}, got {values:?}");
+    assert_eq!(values, vec![2]);
+    Ok(())
+}
+
+#[test]
+fn fast_insert_path_matches_standard_path() -> Result<()> {
+    // Differential rail: the fast INSERT path hand-parses the SQL text while
+    // the standard path goes through the real parser and expression
+    // evaluator. Both must produce byte-identical rows for the same
+    // statements, including NULLs, escaped quotes, boundary integers and
+    // negative decimals.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+    let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
+
+    let mut statements = Vec::new();
+    let mut next_id: i64 = 0;
+    for _ in 0..40 {
+        let rows = 1 + (rng.next() % 4) as usize;
+        let mut values = Vec::new();
+        for _ in 0..rows {
+            next_id += 1;
+            let name = match rng.next() % 6 {
+                0 => "NULL".to_string(),
+                1 => "'plain'".to_string(),
+                2 => "'it''s'".to_string(),
+                3 => "''".to_string(),
+                4 => format!("'name-{}'", rng.next() % 1000),
+                _ => "'dq\"inside'".to_string(),
+            };
+            let amount = match rng.next() % 4 {
+                0 => "NULL".to_string(),
+                1 => format!("{:.2}", (rng.next() % 1_000_000) as i64 as f64 / 100.0),
+                2 => format!("-{:.2}", (rng.next() % 50_000) as i64 as f64 / 100.0),
+                _ => format!("{}", rng.next() % 100_000),
+            };
+            let active = if rng.next() % 2 == 0 { "true" } else { "false" };
+            let small = match rng.next() % 4 {
+                0 => "NULL".to_string(),
+                1 => i32::MIN.to_string(),
+                2 => i32::MAX.to_string(),
+                _ => format!("{}", (rng.next() % 1_000_000) as i32),
+            };
+            let score = if rng.next() % 5 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("{:.3}", (rng.next() % 100_000) as i64 as f64 / 8.0)
+            };
+            let ts = if rng.next() % 4 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'2026-{:02}-{:02} {:02}:{:02}:00'", 1 + rng.next() % 12, 1 + rng.next() % 28, rng.next() % 24, rng.next() % 60)
+            };
+            values.push(format!(
+                "({}, {}, {}, {}, {}, {}, {})",
+                next_id, name, amount, active, small, score, ts
+            ));
+        }
+        statements.push(format!(
+            "INSERT INTO t (id, name, amount, active, small, score, ts) VALUES {}",
+            values.join(", ")
+        ));
+    }
+
+    let run = |fast_disabled: bool| -> Result<Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path(), "main")?;
+        let mut session = session();
+        engine.execute(
+            &mut session,
+            "CREATE TABLE t (id INT64, name VARCHAR, amount DECIMAL(9,2), active BOOL, small INT32, score FLOAT64, ts TIMESTAMP)",
+        )?;
+        crate::sql::execution::dml_insert::set_fast_insert_disabled_for_tests(fast_disabled);
+        let mut outcome = Ok(());
+        for stmt in &statements {
+            if let Err(error) = engine.execute(&mut session, stmt) {
+                outcome = Err(error);
+                break;
+            }
+        }
+        crate::sql::execution::dml_insert::set_fast_insert_disabled_for_tests(false);
+        outcome?;
+        let result = engine.execute(&mut session, "SELECT * FROM t ORDER BY id")?;
+        let mut rows = Vec::new();
+        if let ExecResult::Query { batches, .. } = result {
+            for batch in &batches {
+                for row in 0..batch.num_rows() {
+                    let cells: Vec<String> = (0..batch.num_columns())
+                        .map(|col| {
+                            batch
+                                .scalar(row, col)
+                                .and_then(|v| v.to_text())
+                                .unwrap_or_else(|| "NULL".to_string())
+                        })
+                        .collect();
+                    rows.push(cells.join("|"));
+                }
+            }
+        }
+        Ok(rows)
+    };
+
+    let via_fast = run(false)?;
+    let via_standard = run(true)?;
+    assert!(!via_fast.is_empty());
+    assert_eq!(
+        via_fast.len(),
+        via_standard.len(),
+        "row counts differ between insert paths"
+    );
+    assert_eq!(
+        via_fast, via_standard,
+        "fast INSERT path diverged from the standard path"
+    );
+    Ok(())
+}

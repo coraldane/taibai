@@ -14,6 +14,199 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::bitmap::NullBitmap;
 use crate::types::scalar::ScalarValue;
 
+/// Fixed-width little-endian payload layout of one bulk type. This table is
+/// the single authority for "which raw slot type backs this DataType":
+/// scalar decode (`read_fixed_scalar`), whole-column bulk decode
+/// (`SlotKind::bulk_column`), typed zone maps (`fixed_zone_map_typed`) and
+/// column sums (`col_sums_from_bulk_columns`) all dispatch through it, so a
+/// new fixed-width type is registered in one place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    Bool,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+    /// Shares the i64 slot; the scale lives in the schema, not the payload.
+    Decimal,
+    /// Shares the i32 slot (days since the epoch).
+    Date,
+    /// Time, Timestamp and Interval share the i64 slot.
+    Time,
+    Timestamp,
+    Interval,
+}
+
+fn slot_kind(dtype: DataType) -> Option<SlotKind> {
+    use DataType as D;
+    Some(match dtype {
+        D::Bool => SlotKind::Bool,
+        D::Int8 => SlotKind::I8,
+        D::Int16 => SlotKind::I16,
+        D::Int32 => SlotKind::I32,
+        D::Int64 => SlotKind::I64,
+        D::UInt8 => SlotKind::U8,
+        D::UInt16 => SlotKind::U16,
+        D::UInt32 => SlotKind::U32,
+        D::UInt64 => SlotKind::U64,
+        D::Float32 => SlotKind::F32,
+        D::Float64 => SlotKind::F64,
+        D::Decimal => SlotKind::Decimal,
+        D::Date => SlotKind::Date,
+        D::Time => SlotKind::Time,
+        D::Timestamp => SlotKind::Timestamp,
+        D::Interval => SlotKind::Interval,
+        D::VarChar | D::Blob | D::Vector => return None,
+    })
+}
+
+impl SlotKind {
+    fn width(self) -> usize {
+        match self {
+            Self::Bool | Self::I8 | Self::U8 => 1,
+            Self::I16 | Self::U16 | Self::F32 => 2,
+            Self::I32 | Self::U32 | Self::Date => 4,
+            Self::I64 | Self::U64 | Self::F64 | Self::Decimal | Self::Time | Self::Timestamp
+            | Self::Interval => 8,
+        }
+    }
+
+    /// Bounds-checked decode of the slot at `offset` into a ScalarValue.
+    fn read_scalar(self, data: &[u8], offset: usize) -> Option<ScalarValue> {
+        macro_rules! le {
+            ($t:ty, $variant:ident) => {{
+                let end = offset + std::mem::size_of::<$t>();
+                if end > data.len() {
+                    return None;
+                }
+                let raw = <$t>::from_le_bytes(data[offset..end].try_into().ok()?);
+                Some(ScalarValue::$variant(Some(raw)))
+            }};
+        }
+        match self {
+            Self::Bool => {
+                if offset >= data.len() {
+                    return None;
+                }
+                Some(ScalarValue::Bool(Some(data[offset] != 0)))
+            }
+            Self::I8 => le!(i8, Int8),
+            Self::I16 => le!(i16, Int16),
+            Self::I32 => le!(i32, Int32),
+            Self::I64 => le!(i64, Int64),
+            Self::U8 => le!(u8, UInt8),
+            Self::U16 => le!(u16, UInt16),
+            Self::U32 => le!(u32, UInt32),
+            Self::U64 => le!(u64, UInt64),
+            Self::F32 => le!(f32, Float32),
+            Self::F64 => le!(f64, Float64),
+            Self::Decimal => le!(i64, Decimal),
+            Self::Date => le!(i32, Date),
+            Self::Time => le!(i64, Time),
+            Self::Timestamp => le!(i64, Timestamp),
+            Self::Interval => le!(i64, Interval),
+        }
+    }
+
+    /// i64-domain projection of the slot, used by column sums and typed
+    /// zone maps. `None` for Bool/UInt64/Float32/Float64, whose order or
+    /// range an i64 projection does not preserve — those keep the per-row
+    /// `ZoneMap::update` / `ScalarValue` paths. The type set matches
+    /// `crate::storage::segment::column_sum_supported`.
+    fn read_i64(self, data: &[u8], offset: usize) -> Option<i64> {
+        macro_rules! le {
+            ($t:ty) => {{
+                let end = offset + std::mem::size_of::<$t>();
+                if end > data.len() {
+                    return None;
+                }
+                Some(<$t>::from_le_bytes(data[offset..end].try_into().ok()?) as i64)
+            }};
+        }
+        match self {
+            Self::I8 => le!(i8),
+            Self::U8 => le!(u8),
+            Self::I16 => le!(i16),
+            Self::U16 => le!(u16),
+            Self::I32 | Self::Date => le!(i32),
+            Self::U32 => le!(u32),
+            Self::I64 | Self::Decimal | Self::Time | Self::Timestamp | Self::Interval => le!(i64),
+            _ => None,
+        }
+    }
+
+    /// ScalarValue for an i64-domain value (`read_i64`'s inverse). Other
+    /// kinds have no i64 projection; the placeholder they return is never
+    /// reached because callers only feed kinds accepted by `read_i64`.
+    fn scalar_from_i64(self, v: i64) -> ScalarValue {
+        match self {
+            Self::I8 => ScalarValue::Int8(Some(v as i8)),
+            Self::U8 => ScalarValue::UInt8(Some(v as u8)),
+            Self::I16 => ScalarValue::Int16(Some(v as i16)),
+            Self::U16 => ScalarValue::UInt16(Some(v as u16)),
+            Self::I32 => ScalarValue::Int32(Some(v as i32)),
+            Self::U32 => ScalarValue::UInt32(Some(v as u32)),
+            Self::Date => ScalarValue::Date(Some(v as i32)),
+            Self::I64 => ScalarValue::Int64(Some(v)),
+            Self::Decimal => ScalarValue::Decimal(Some(v)),
+            Self::Time => ScalarValue::Time(Some(v)),
+            Self::Timestamp => ScalarValue::Timestamp(Some(v)),
+            Self::Interval => ScalarValue::Interval(Some(v)),
+            _ => ScalarValue::Int64(None),
+        }
+    }
+
+    /// Decode a NULL-free payload of exactly `rows` slots into the typed
+    /// column (the bulk import fast path).
+    fn bulk_column(self, data: &[u8], rows: usize) -> ColumnArray {
+        macro_rules! slots {
+            ($variant:ident, $t:ty) => {{
+                let mut vals = Vec::with_capacity(rows);
+                for chunk in data.chunks_exact(std::mem::size_of::<$t>()) {
+                    vals.push(<$t>::from_le_bytes(chunk.try_into().expect("width match")));
+                }
+                ColumnArray::$variant {
+                    data: vals,
+                    bitmap: NullBitmap::new_valid(rows),
+                }
+            }};
+        }
+        match self {
+            Self::Bool => ColumnArray::Bool {
+                data: data.to_vec(),
+                bitmap: NullBitmap::new_valid(rows),
+            },
+            Self::I8 => ColumnArray::Int8 {
+                data: data.iter().map(|&b| b as i8).collect(),
+                bitmap: NullBitmap::new_valid(rows),
+            },
+            Self::U8 => ColumnArray::UInt8 {
+                data: data.to_vec(),
+                bitmap: NullBitmap::new_valid(rows),
+            },
+            Self::I16 => slots!(Int16, i16),
+            Self::U16 => slots!(UInt16, u16),
+            Self::I32 => slots!(Int32, i32),
+            Self::U32 => slots!(UInt32, u32),
+            Self::F32 => slots!(Float32, f32),
+            Self::Date => slots!(Date, i32),
+            Self::I64 => slots!(Int64, i64),
+            Self::U64 => slots!(UInt64, u64),
+            Self::F64 => slots!(Float64, f64),
+            Self::Decimal => slots!(Decimal, i64),
+            Self::Time => slots!(Time, i64),
+            Self::Timestamp => slots!(Timestamp, i64),
+            Self::Interval => slots!(Interval, i64),
+        }
+    }
+}
+
 pub fn table_key(db: &str, table: &str) -> String {
     format!("{}:{}", db, table)
 }
@@ -230,6 +423,7 @@ pub(crate) fn direct_bulk_column_to_array(
     col: &DirectBulkColumn<'_>,
     rows: usize,
 ) -> Result<ColumnArray> {
+    let loop_ranges = loop_variable_ranges(col, rows)?;
     let has_nulls = !col.nulls.is_empty() && (0..rows).any(|r| null_bit_is_set(&col.nulls, r));
     if has_nulls {
         // Rare path: per-row decode honouring the NULL bitmap.
@@ -238,66 +432,26 @@ pub(crate) fn direct_bulk_column_to_array(
             if null_bit_is_set(&col.nulls, row_idx) {
                 array.push_null_value();
             } else {
-                array.push(&direct_bulk_column_scalar_at(col, row_idx)?)?;
+                array.push(&bulk_column_scalar_at(
+                    col,
+                    row_idx,
+                    loop_ranges.as_deref(),
+                )?)?;
             }
         }
         return Ok(array);
     }
 
-    macro_rules! bulk_fixed {
-        ($variant:ident, $ty:ty, $width:expr) => {{
-            if col.data.len() == rows * $width {
-                let mut vals = Vec::with_capacity(rows);
-                for chunk in col.data.chunks_exact($width) {
-                    vals.push(<$ty>::from_le_bytes(chunk.try_into().expect("width match")));
-                }
-                return Ok(ColumnArray::$variant {
-                    data: vals,
-                    bitmap: NullBitmap::new_valid(rows),
-                });
-            }
-        }};
+    // Fixed-width types: the payload must be exactly `rows` little-endian
+    // slots (SlotKind is the shared decode table); a size mismatch falls
+    // through to the per-row fallback below.
+    if let Some(kind) = slot_kind(col.data_type) {
+        if rows.checked_mul(kind.width()) == Some(col.data.len()) {
+            return Ok(kind.bulk_column(col.data, rows));
+        }
     }
 
-    match col.data_type {
-        DataType::Bool => {
-            if col.data.len() == rows {
-                return Ok(ColumnArray::Bool {
-                    data: col.data.to_vec(),
-                    bitmap: NullBitmap::new_valid(rows),
-                });
-            }
-        }
-        DataType::Int8 => {
-            if col.data.len() == rows {
-                return Ok(ColumnArray::Int8 {
-                    data: col.data.iter().map(|&b| b as i8).collect(),
-                    bitmap: NullBitmap::new_valid(rows),
-                });
-            }
-        }
-        DataType::UInt8 => {
-            if col.data.len() == rows {
-                return Ok(ColumnArray::UInt8 {
-                    data: col.data.to_vec(),
-                    bitmap: NullBitmap::new_valid(rows),
-                });
-            }
-        }
-        DataType::Int16 => bulk_fixed!(Int16, i16, 2),
-        DataType::UInt16 => bulk_fixed!(UInt16, u16, 2),
-        DataType::Int32 => bulk_fixed!(Int32, i32, 4),
-        DataType::UInt32 => bulk_fixed!(UInt32, u32, 4),
-        DataType::Float32 => bulk_fixed!(Float32, f32, 4),
-        DataType::Date => bulk_fixed!(Date, i32, 4),
-        DataType::Int64 => bulk_fixed!(Int64, i64, 8),
-        DataType::UInt64 => bulk_fixed!(UInt64, u64, 8),
-        DataType::Float64 => bulk_fixed!(Float64, f64, 8),
-        DataType::Decimal => bulk_fixed!(Decimal, i64, 8),
-        DataType::Time => bulk_fixed!(Time, i64, 8),
-        DataType::Timestamp => bulk_fixed!(Timestamp, i64, 8),
-        DataType::Interval => bulk_fixed!(Interval, i64, 8),
-        DataType::VarChar => {
+    if col.data_type == DataType::VarChar {
             if let Some(ranges) = &col.variable_ranges {
                 if ranges.len() == rows {
                     // Protocol-supplied offsets: validate before slicing so a
@@ -329,15 +483,17 @@ pub(crate) fn direct_bulk_column_to_array(
                     });
                 }
             }
-        }
-        DataType::Blob | DataType::Vector => {}
     }
 
     // Fallback for unexpected payload sizes and variable-width types without
     // prebuilt ranges: per-row decode (still NULL-free).
     let mut array = ColumnArray::with_capacity(col.data_type, rows);
     for row_idx in 0..rows {
-        array.push(&direct_bulk_column_scalar_at(col, row_idx)?)?;
+        array.push(&bulk_column_scalar_at(
+            col,
+            row_idx,
+            loop_ranges.as_deref(),
+        )?)?;
     }
     Ok(array)
 }
@@ -345,6 +501,18 @@ pub(crate) fn direct_bulk_column_to_array(
 pub(crate) fn direct_bulk_column_scalar_at(
     col: &DirectBulkColumn<'_>,
     row_idx: usize,
+) -> Result<ScalarValue> {
+    bulk_column_scalar_at(col, row_idx, None)
+}
+
+/// Row decode with precomputed variable-width ranges. Loop callers hoist
+/// the range walk with [`loop_variable_ranges`] — re-walking the
+/// length-prefixed payload per row made such loops quadratic in the
+/// payload size.
+pub(crate) fn bulk_column_scalar_at(
+    col: &DirectBulkColumn<'_>,
+    row_idx: usize,
+    ranges: Option<&[(usize, usize)]>,
 ) -> Result<ScalarValue> {
     if is_null_at(&col.nulls, row_idx) {
         return Ok(ScalarValue::null_for_type(col.data_type));
@@ -362,7 +530,15 @@ pub(crate) fn direct_bulk_column_scalar_at(
         });
     }
 
-    let (offset, len) = direct_bulk_variable_range_at(col, row_idx)?;
+    let (offset, len) = match ranges {
+        Some(ranges) => ranges.get(row_idx).copied().ok_or_else(|| {
+            TaibaiError::Protocol(format!(
+                "bulk column '{}' row {} not found",
+                col.name, row_idx
+            ))
+        })?,
+        None => walk_variable_range_at(col, row_idx)?,
+    };
     match col.data_type {
         DataType::VarChar => {
             let s = std::str::from_utf8(&col.data[offset..offset + len])
@@ -391,7 +567,10 @@ pub(crate) fn direct_bulk_column_scalar_at(
     }
 }
 
-fn direct_bulk_variable_range_at(
+/// (offset, len) of one length-prefixed variable-width value, walked from
+/// the payload start. Single-row callers only; loop callers precompute the
+/// whole range vector with [`loop_variable_ranges`].
+fn walk_variable_range_at(
     col: &DirectBulkColumn<'_>,
     target_row: usize,
 ) -> Result<(usize, usize)> {
@@ -432,6 +611,48 @@ fn direct_bulk_variable_range_at(
         "bulk column '{}' row {} not found",
         col.name, target_row
     )))
+}
+
+/// Ranges for one per-row loop over `col`: the protocol-supplied ranges
+/// when present, otherwise one linear walk of the length-prefixed payload.
+/// `None` for fixed-width columns (per-row ranges are not consulted).
+pub(crate) fn loop_variable_ranges(
+    col: &DirectBulkColumn<'_>,
+    rows: usize,
+) -> Result<Option<Vec<(usize, usize)>>> {
+    if col.data_type.fixed_size().is_some() {
+        return Ok(None);
+    }
+    if let Some(ranges) = col.variable_ranges.as_ref() {
+        return Ok(Some(ranges.clone()));
+    }
+    let mut out = Vec::with_capacity(rows);
+    let mut offset = 0usize;
+    for row in 0..rows {
+        if is_null_at(&col.nulls, row) {
+            // Placeholder keeps row indexing aligned; null rows never
+            // consult their range.
+            out.push((0, 0));
+            continue;
+        }
+        if offset + 4 > col.data.len() {
+            return Err(TaibaiError::Protocol(format!(
+                "bulk column '{}' variable length prefix truncated",
+                col.name
+            )));
+        }
+        let len = u32::from_le_bytes(col.data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + len > col.data.len() {
+            return Err(TaibaiError::Protocol(format!(
+                "bulk column '{}' variable data truncated",
+                col.name
+            )));
+        }
+        out.push((offset, len));
+        offset += len;
+    }
+    Ok(Some(out))
 }
 
 pub(super) fn slice_batch_fast(
@@ -590,7 +811,6 @@ fn fixed_zone_map_typed(
     null_count: &mut u64,
     zm: &mut ZoneMap,
 ) -> bool {
-    use DataType as D;
     let Some(width) = dtype.fixed_size() else {
         return false;
     };
@@ -664,38 +884,25 @@ fn fixed_zone_map_typed(
         }};
     }
 
-    let (min, max) = match dtype {
-        D::Int8 => minmax!(i8, |v: i8| v as i64),
-        D::UInt8 => minmax!(u8, |v: u8| v as i64),
-        D::Int16 => minmax!(i16, |v: i16| v as i64),
-        D::UInt16 => minmax!(u16, |v: u16| v as i64),
-        D::Int32 | D::Date => minmax!(i32, |v: i32| v as i64),
-        D::UInt32 => minmax!(u32, |v: u32| v as i64),
-        D::Int64 | D::Decimal | D::Time | D::Timestamp | D::Interval => {
-            minmax!(i64, |v: i64| v)
-        }
+    let Some(kind) = slot_kind(dtype) else {
+        return false;
+    };
+    let (min, max) = match kind {
+        SlotKind::I8 => minmax!(i8, |v: i8| v as i64),
+        SlotKind::U8 => minmax!(u8, |v: u8| v as i64),
+        SlotKind::I16 => minmax!(i16, |v: i16| v as i64),
+        SlotKind::U16 => minmax!(u16, |v: u16| v as i64),
+        SlotKind::I32 | SlotKind::Date => minmax!(i32, |v: i32| v as i64),
+        SlotKind::U32 => minmax!(u32, |v: u32| v as i64),
+        SlotKind::I64 | SlotKind::Decimal | SlotKind::Time | SlotKind::Timestamp
+        | SlotKind::Interval => minmax!(i64, |v: i64| v),
+        // Bool/UInt64/Float orders are not preserved by an i64 projection;
+        // the caller's per-row ZoneMap::update path handles them.
         _ => return false,
     };
-    let scalar = |v: i64| -> ScalarValue {
-        match dtype {
-            D::Int8 => ScalarValue::Int8(Some(v as i8)),
-            D::UInt8 => ScalarValue::UInt8(Some(v as u8)),
-            D::Int16 => ScalarValue::Int16(Some(v as i16)),
-            D::UInt16 => ScalarValue::UInt16(Some(v as u16)),
-            D::Int32 => ScalarValue::Int32(Some(v as i32)),
-            D::UInt32 => ScalarValue::UInt32(Some(v as u32)),
-            D::Date => ScalarValue::Date(Some(v as i32)),
-            D::Int64 => ScalarValue::Int64(Some(v)),
-            D::Decimal => ScalarValue::Decimal(Some(v)),
-            D::Time => ScalarValue::Time(Some(v)),
-            D::Timestamp => ScalarValue::Timestamp(Some(v)),
-            D::Interval => ScalarValue::Interval(Some(v)),
-            _ => ScalarValue::Int64(None),
-        }
-    };
     if null_free || *null_count < elem_count as u64 {
-        zm.min_value = scalar(min);
-        zm.max_value = scalar(max);
+        zm.min_value = kind.scalar_from_i64(min);
+        zm.max_value = kind.scalar_from_i64(max);
     }
     true
 }
@@ -707,9 +914,6 @@ pub(super) fn col_sums_from_bulk_columns(
     columns: &[DirectBulkColumn<'_>],
     row_count: u64,
 ) -> Vec<i64> {
-    use DataType::{
-        Date, Decimal, Int16, Int32, Int64, Int8, Interval, Time, Timestamp, UInt16, UInt32, UInt8,
-    };
     let elem_count = row_count as usize;
     columns
         .par_iter()
@@ -735,45 +939,35 @@ pub(super) fn col_sums_from_bulk_columns(
                 // Row order + wrapping i64 keep this bit-exact with the
                 // bitmap path below.
                 return unsafe {
-                    match dtype {
-                        Int8 => sum_fixed_le::<i8>(data, elem_count),
-                        UInt8 => sum_fixed_le::<u8>(data, elem_count),
-                        Int16 => sum_fixed_le::<i16>(data, elem_count),
-                        UInt16 => sum_fixed_le::<u16>(data, elem_count),
-                        Int32 | Date => sum_fixed_le::<i32>(data, elem_count),
-                        UInt32 => sum_fixed_le::<u32>(data, elem_count),
-                        Int64 | Decimal | Time | Timestamp | Interval => {
-                            sum_fixed_le::<i64>(data, elem_count)
+                    match slot_kind(dtype) {
+                        Some(SlotKind::I8) => sum_fixed_le::<i8>(data, elem_count),
+                        Some(SlotKind::U8) => sum_fixed_le::<u8>(data, elem_count),
+                        Some(SlotKind::I16) => sum_fixed_le::<i16>(data, elem_count),
+                        Some(SlotKind::U16) => sum_fixed_le::<u16>(data, elem_count),
+                        Some(SlotKind::I32 | SlotKind::Date) => {
+                            sum_fixed_le::<i32>(data, elem_count)
                         }
+                        Some(SlotKind::U32) => sum_fixed_le::<u32>(data, elem_count),
+                        Some(
+                            SlotKind::I64
+                            | SlotKind::Decimal
+                            | SlotKind::Time
+                            | SlotKind::Timestamp
+                            | SlotKind::Interval,
+                        ) => sum_fixed_le::<i64>(data, elem_count),
                         _ => 0,
                     }
                 };
             }
-            let mut sum = 0i64;
-            // (type, width, signed) read of one LE scalar as i64.
-            let read = |offset: usize| -> Option<i64> {
-                if width == 0 || offset + width > data.len() {
-                    return None;
-                }
-                let bytes = &data[offset..offset + width];
-                Some(match dtype {
-                    Int8 => bytes[0] as i8 as i64,
-                    UInt8 => bytes[0] as i64,
-                    Int16 => i16::from_le_bytes(bytes.try_into().unwrap()) as i64,
-                    UInt16 => u16::from_le_bytes(bytes.try_into().unwrap()) as i64,
-                    Int32 | Date => i32::from_le_bytes(bytes.try_into().unwrap()) as i64,
-                    UInt32 => u32::from_le_bytes(bytes.try_into().unwrap()) as i64,
-                    Int64 | Decimal | Time | Timestamp | Interval => {
-                        i64::from_le_bytes(bytes.try_into().unwrap())
-                    }
-                    _ => 0,
-                })
+            let Some(kind) = slot_kind(dtype) else {
+                return 0i64;
             };
+            let mut sum = 0i64;
             for row in 0..elem_count {
                 if col.is_null(row) {
                     continue;
                 }
-                if let Some(raw) = read(row * width) {
+                if let Some(raw) = kind.read_i64(data, row * width) {
                     sum = sum.wrapping_add(raw);
                 }
             }
@@ -802,10 +996,11 @@ pub(super) fn compute_value_sets_from_bulk_columns(
 ) -> Result<Vec<Option<Vec<ScalarValue>>>> {
     let mut result = Vec::with_capacity(columns.len());
     for col in columns {
+        let loop_ranges = loop_variable_ranges(col, row_count as usize)?;
         let mut values = HashSet::new();
         let mut complete = true;
         for row_idx in 0..row_count as usize {
-            let value = direct_bulk_column_scalar_at(col, row_idx)?;
+            let value = bulk_column_scalar_at(col, row_idx, loop_ranges.as_deref())?;
             if value.is_null() {
                 continue;
             }
@@ -831,131 +1026,7 @@ fn is_null_at(nulls: &[u8], idx: usize) -> bool {
 }
 
 fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<ScalarValue> {
-    match dtype {
-        DataType::Bool => {
-            if offset >= data.len() {
-                return None;
-            }
-            Some(ScalarValue::Bool(Some(data[offset] != 0)))
-        }
-        DataType::Int8 => {
-            if offset >= data.len() {
-                return None;
-            }
-            Some(ScalarValue::Int8(Some(data[offset] as i8)))
-        }
-        DataType::Int16 => {
-            if offset + 2 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Int16(Some(i16::from_le_bytes(
-                data[offset..offset + 2].try_into().ok()?,
-            ))))
-        }
-        DataType::Int32 => {
-            if offset + 4 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Int32(Some(i32::from_le_bytes(
-                data[offset..offset + 4].try_into().ok()?,
-            ))))
-        }
-        DataType::Int64 => {
-            if offset + 8 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Int64(Some(i64::from_le_bytes(
-                data[offset..offset + 8].try_into().ok()?,
-            ))))
-        }
-        DataType::UInt8 => {
-            if offset >= data.len() {
-                return None;
-            }
-            Some(ScalarValue::UInt8(Some(data[offset])))
-        }
-        DataType::UInt16 => {
-            if offset + 2 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::UInt16(Some(u16::from_le_bytes(
-                data[offset..offset + 2].try_into().ok()?,
-            ))))
-        }
-        DataType::UInt32 => {
-            if offset + 4 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::UInt32(Some(u32::from_le_bytes(
-                data[offset..offset + 4].try_into().ok()?,
-            ))))
-        }
-        DataType::UInt64 => {
-            if offset + 8 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::UInt64(Some(u64::from_le_bytes(
-                data[offset..offset + 8].try_into().ok()?,
-            ))))
-        }
-        DataType::Float32 => {
-            if offset + 4 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Float32(Some(f32::from_le_bytes(
-                data[offset..offset + 4].try_into().ok()?,
-            ))))
-        }
-        DataType::Float64 => {
-            if offset + 8 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Float64(Some(f64::from_le_bytes(
-                data[offset..offset + 8].try_into().ok()?,
-            ))))
-        }
-        DataType::Decimal => {
-            if offset + 8 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Decimal(Some(i64::from_le_bytes(
-                data[offset..offset + 8].try_into().ok()?,
-            ))))
-        }
-        DataType::Date => {
-            if offset + 4 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Date(Some(i32::from_le_bytes(
-                data[offset..offset + 4].try_into().ok()?,
-            ))))
-        }
-        DataType::Time => {
-            if offset + 8 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Time(Some(i64::from_le_bytes(
-                data[offset..offset + 8].try_into().ok()?,
-            ))))
-        }
-        DataType::Timestamp => {
-            if offset + 8 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Timestamp(Some(i64::from_le_bytes(
-                data[offset..offset + 8].try_into().ok()?,
-            ))))
-        }
-        DataType::Interval => {
-            if offset + 8 > data.len() {
-                return None;
-            }
-            Some(ScalarValue::Interval(Some(i64::from_le_bytes(
-                data[offset..offset + 8].try_into().ok()?,
-            ))))
-        }
-        _ => None,
-    }
+    slot_kind(dtype)?.read_scalar(data, offset)
 }
 
 #[cfg(test)]
@@ -963,101 +1034,5 @@ fn read_fixed_scalar(data: &[u8], offset: usize, dtype: DataType) -> Option<Scal
 mod zone_map_tests;
 
 #[cfg(test)]
-mod bulk_decode_bench {
-    //! Diagnostic comparison of the per-row ScalarValue decode (legacy
-    //! algorithm) against the direct typed decode, on a synthetic tick
-    //! payload. Run with:
-    //! `cargo test --lib direct_bulk -- --ignored --nocapture`
-    use super::*;
-    use crate::protocol::types::DataType;
-    use crate::storage::bulk_payload::DirectBulkColumn;
-    use std::time::Instant;
-
-    fn tick_request(rows: usize) -> (DirectBulkRequest<'static>, Vec<Vec<u8>>) {
-        // Leak payloads to keep 'static references for DirectBulkRequest.
-        let mut symbol_bytes: Vec<u8> = Vec::new();
-        let mut symbol_ranges: Vec<(usize, usize)> = Vec::with_capacity(rows);
-        let mut fixed: [Vec<u8>; 4] = [const { Vec::new() }; 4];
-        for seq in 0..rows {
-            let symbol = format!("SH{:06}", seq % 5000);
-            symbol_ranges.push((symbol_bytes.len(), symbol.len()));
-            symbol_bytes.extend_from_slice(symbol.as_bytes());
-            fixed[0].extend_from_slice(&20260911i32.to_le_bytes());
-            fixed[1].extend_from_slice(&(1_000 + (seq % 90_000) as i64).to_le_bytes());
-            fixed[2].extend_from_slice(&100i64.to_le_bytes());
-            fixed[3].extend_from_slice(&(1_783_700_000_000_000u64 as i64).to_le_bytes());
-        }
-        let symbol_bytes: &'static [u8] = Box::leak(symbol_bytes.into_boxed_slice());
-        let symbol_ranges: &'static [(usize, usize)] = Box::leak(symbol_ranges.into_boxed_slice());
-        let fixed_static: Vec<&'static [u8]> = fixed
-            .into_iter()
-            .map(|v| Box::leak(v.into_boxed_slice()) as &'static [u8])
-            .collect();
-        let mk = |name: &'static str,
-                  dtype: DataType,
-                  data: &'static [u8],
-                  ranges: Option<&'static [(usize, usize)]>| DirectBulkColumn {
-            name,
-            data_type: dtype,
-            scale: 0,
-            precision: 0,
-            data,
-            nulls: std::borrow::Cow::Borrowed(&[]),
-            variable_ranges: ranges.map(|r| r.to_vec()),
-        };
-        let columns = vec![
-            mk(
-                "security_id",
-                DataType::VarChar,
-                symbol_bytes,
-                Some(symbol_ranges),
-            ),
-            mk("deal_date", DataType::Int32, fixed_static[0], None),
-            mk("price", DataType::Decimal, fixed_static[1], None),
-            mk("trans_volume", DataType::Int64, fixed_static[2], None),
-            mk("local_time", DataType::Timestamp, fixed_static[3], None),
-        ];
-        (
-            DirectBulkRequest {
-                table_name: "t",
-                row_count: rows,
-                columns,
-            },
-            Vec::new(),
-        )
-    }
-
-    #[test]
-    #[ignore = "diagnostic benchmark: run with --ignored --nocapture"]
-    fn direct_decode_vs_per_row_scalar() {
-        let rows = 100_000;
-        let (req, _) = tick_request(rows);
-
-        let start = Instant::now();
-        let mut legacy_rows = 0usize;
-        for col in &req.columns {
-            let mut array = ColumnArray::empty(col.data_type);
-            for row_idx in 0..req.row_count {
-                let scalar = direct_bulk_column_scalar_at(col, row_idx).unwrap();
-                array.push(&scalar).unwrap();
-                legacy_rows += 1;
-            }
-        }
-        let legacy = start.elapsed();
-
-        let start = Instant::now();
-        let mut direct_rows = 0usize;
-        for col in &req.columns {
-            let array = direct_bulk_column_to_array(col, req.row_count).unwrap();
-            direct_rows += array.len();
-        }
-        let direct = start.elapsed();
-
-        assert_eq!(legacy_rows, direct_rows);
-        println!(
-            "decode {rows} rows x {} cols: legacy per-row Scalar = {legacy:?}, direct typed = {direct:?} ({:.1}x faster)",
-            req.columns.len(),
-            legacy.as_secs_f64() / direct.as_secs_f64()
-        );
-    }
-}
+#[path = "bulk_decode_bench.rs"]
+mod bulk_decode_bench;

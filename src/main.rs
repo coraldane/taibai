@@ -64,6 +64,7 @@ fn init_tracing(level: &str) {
         Ok(async_writer) => {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(env_filter(level))
+                .with_ansi(false)
                 .with_writer(move || async_writer.clone())
                 .try_init();
         }
@@ -71,6 +72,7 @@ fn init_tracing(level: &str) {
             eprintln!("failed to start asynchronous console logger: {error}");
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(env_filter(level))
+                .with_ansi(false)
                 .try_init();
         }
     }
