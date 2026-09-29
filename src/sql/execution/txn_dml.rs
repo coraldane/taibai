@@ -116,6 +116,23 @@ pub(crate) fn exec_delete_in_txn(
     let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
 
     let delete_body = || -> Result<u64> {
+        // Write-write conflict control: the first open transaction to mutate
+        // a table pins it; another transaction's DML on the same table is
+        // refused instead of planning against the same rows and double-
+        // applying at COMMIT (two new images of one row, or an image past a
+        // tombstone). The check runs inside the mutation lock — the same
+        // critical section the tombstone registration below uses — so two
+        // transactions cannot interleave check and register.
+        if engine
+            .txn_mutations()
+            .table_pinned_by_other(reader_txn_id, db, table)
+        {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "table '{}.{}' is being modified by another open transaction; \
+                 retry after it commits or rolls back",
+                db, table
+            )));
+        }
         let mut statement_deleted: u64 = 0;
 
         // Rows the transaction itself inserted live in transactional
@@ -369,6 +386,19 @@ pub(crate) fn exec_update_in_txn(
     let narrowed_partition = target_partition_key.as_deref().filter(|key| !key.is_empty());
 
     let update_body = || -> Result<u64> {
+        // Write-write conflict control, mirroring delete_body: refuse when
+        // another open transaction already mutates this table. Check and
+        // tombstone registration share the mutation lock critical section.
+        if engine
+            .txn_mutations()
+            .table_pinned_by_other(reader_txn_id, db, table)
+        {
+            return Err(TaibaiError::ResourceBusy(format!(
+                "table '{}.{}' is being modified by another open transaction; \
+                 retry after it commits or rolls back",
+                db, table
+            )));
+        }
         let publish_updates = engine.pubsub().has_subscribers();
         let mut statement_updated: u64 = 0;
         // New row images per target partition, appended to the transaction's

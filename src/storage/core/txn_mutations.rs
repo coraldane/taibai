@@ -232,6 +232,26 @@ impl TxnMutationRegistry {
         Ok(())
     }
 
+    /// Charge a transactional INSERT's buffered memtable bytes against the
+    /// transaction's in-memory budget. Transactional memtables are invisible
+    /// to every background relief valve (spill, pressure flush, close-of-day
+    /// flush) until COMMIT, so an uncharged transaction could grow memory
+    /// without bound; an over-budget statement fails like oversized deferred
+    /// DML does, and the entry created here is dropped by the usual
+    /// COMMIT/ROLLBACK registry cleanup.
+    pub fn charge_txn_insert_bytes(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        bytes: u64,
+    ) -> crate::common::error::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let _table = Self::table_entry(&mut inner, txn_id, db, table, None);
+        let txn = inner.get_mut(&txn_id).expect("table_entry just ensured it");
+        txn.charge_insert(bytes)
+    }
+
     pub fn add_deleted_rows(&self, txn_id: u64, db: &str, table: &str, count: u64) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(txn) = inner.get_mut(&txn_id) {
@@ -383,12 +403,19 @@ impl TxnMutations {
         &self.tables
     }
 
+    /// Charge bytes a transactional INSERT buffered into its transactional
+    /// memtables. Same budget as deferred DML: both are memory the transaction
+    /// holds that no background relief valve may reclaim before COMMIT.
+    pub fn charge_insert(&mut self, bytes: u64) -> crate::common::error::Result<()> {
+        self.charge(bytes)
+    }
+
     fn charge(&mut self, bytes: u64) -> crate::common::error::Result<()> {
         self.mutation_bytes = self.mutation_bytes.saturating_add(bytes);
         let budget = txn_mutation_budget_bytes();
         if self.mutation_bytes > budget {
             return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
-                "transaction deferred-mutation budget exceeded: {} bytes charged against a {} byte limit; the transaction is too large to keep in memory - commit or roll back and split the work",
+                "transaction in-memory mutation budget exceeded: {} bytes charged against a {} byte limit (deferred DML plans plus buffered transactional inserts); the transaction is too large to keep in memory - commit or roll back and split the work",
                 self.mutation_bytes, budget
             )));
         }
@@ -423,6 +450,36 @@ pub fn filter_batch_excluding_positions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Transactional INSERT memtable bytes count against the same per-
+    /// transaction in-memory budget as deferred DML, and the charged entry
+    /// disappears on the usual rollback cleanup.
+    #[test]
+    fn txn_insert_bytes_count_against_mutation_budget() {
+        let registry = TxnMutationRegistry::new();
+        let budget = txn_mutation_budget_bytes();
+
+        // Exactly at budget is fine; one more byte trips it.
+        registry
+            .charge_txn_insert_bytes(9, "db", "t", budget)
+            .expect("at-budget charge must pass");
+        let err = registry
+            .charge_txn_insert_bytes(9, "db", "t", 1)
+            .expect_err("over-budget charge must fail");
+        assert!(err.to_string().contains("budget exceeded"), "{err}");
+
+        // Other transactions are unaffected.
+        registry
+            .charge_txn_insert_bytes(10, "db", "t", 1024)
+            .expect("other txn unaffected");
+
+        // Rollback cleanup drops the charged entry; the next transaction
+        // with the same id starts from a fresh budget.
+        registry.remove(9);
+        registry
+            .charge_txn_insert_bytes(9, "db", "t", 1)
+            .expect("cleaned entry starts fresh");
+    }
 
     #[test]
     fn segment_tombstones_merge_and_compose() {

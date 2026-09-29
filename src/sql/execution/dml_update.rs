@@ -39,6 +39,18 @@ pub fn exec_update(
             db, table
         )));
     }
+    // Join the INSERT/REPLACE writer protocol. UPDATE is the mutator the
+    // existing guards missed: INSERT probes unique keys under this striped
+    // lock, but an UPDATE that introduces a key under only the table mutation
+    // lock can interleave between the probe and the publish, and the INSERT
+    // then commits a duplicate the post-hoc index rebuild bakes in
+    // permanently. Held across the whole statement and taken before the
+    // mutation lock so the global order constraint_insert_lock → mutation
+    // lock matches the INSERT path.
+    let _constraint_guard = super::dml_insert::constraint_insert_lock(db, table)
+        .lock()
+        .unwrap();
+
     let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
         let catalog = catalogs
@@ -115,6 +127,8 @@ pub fn exec_update(
         // for memtable rows, which are entirely in memory).
         let publish_updates = engine.pubsub().has_subscribers();
         let mut updated_row_batches: Vec<RecordBatch> = Vec::new();
+        let mut event_buffer_bytes = 0usize;
+        let mut event_budget_warned = false;
         let mut updated_count = 0u64;
         let mut memtable_updates: Vec<(
             Arc<crate::storage::core::memtable::MemTable>,
@@ -148,7 +162,20 @@ pub fn exec_update(
                         .map(|col| col.take(&matched_rows))
                         .collect();
                     match RecordBatch::try_new(new_batch.schema.clone(), columns) {
-                        Ok(updated) => updated_row_batches.push(updated),
+                        Ok(updated) => {
+                            let bytes = updated.estimated_size_bytes();
+                            if super::helpers::change_event_budget_allows(
+                                event_buffer_bytes,
+                                bytes,
+                                &mut event_budget_warned,
+                                "update",
+                                db,
+                                table,
+                            ) {
+                                event_buffer_bytes += bytes;
+                                updated_row_batches.push(updated);
+                            }
+                        }
                         Err(error) => tracing::warn!(
                             db,
                             table,
@@ -258,7 +285,20 @@ pub fn exec_update(
                             .map(|col| col.take(&matched))
                             .collect();
                         match RecordBatch::try_new(new_batch.schema.clone(), columns) {
-                            Ok(updated) => updated_row_batches.push(updated),
+                            Ok(updated) => {
+                            let bytes = updated.estimated_size_bytes();
+                            if super::helpers::change_event_budget_allows(
+                                event_buffer_bytes,
+                                bytes,
+                                &mut event_budget_warned,
+                                "update",
+                                db,
+                                table,
+                            ) {
+                                event_buffer_bytes += bytes;
+                                updated_row_batches.push(updated);
+                            }
+                        }
                             Err(error) => tracing::warn!(
                                 db,
                                 table,

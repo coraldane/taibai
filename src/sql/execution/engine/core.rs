@@ -837,8 +837,39 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                         "INSERT SELECT source did not return rows".to_string(),
                     ));
                 };
-                let mut values = Vec::new();
-                for batch in batches {
+                // Stream the source in row chunks instead of materializing
+                // the whole result as boxed Expr literals first (peak memory
+                // used to be 2-3x the source). Every chunk goes through the
+                // regular INSERT path, so constraint validation, partition
+                // routing and catalog accounting are unchanged; a failing
+                // chunk leaves earlier chunks inserted, matching the
+                // multi-partition INSERT path's existing partial-failure
+                // semantics. The SELECT's LIMIT/OFFSET remain the knob for
+                // one-shot bulk loads.
+                const INSERT_SELECT_CHUNK_ROWS: usize = 4096;
+                let db = table.effective_database(&session.database);
+                let mut chunk: Vec<Vec<crate::sql::parser::ast::Expr>> = Vec::new();
+                let mut rows_affected_total = 0u64;
+                let flush_chunk = |chunk: &mut Vec<Vec<crate::sql::parser::ast::Expr>>| {
+                    if chunk.is_empty() {
+                        return Ok(ExecResult::Ok { rows_affected: 0 });
+                    }
+                    let result = super::dml_insert::exec_insert(
+                        self,
+                        &db,
+                        &table.name,
+                        columns,
+                        chunk.as_slice(),
+                        session.timezone_offset_hours,
+                        txn_id,
+                        session.bulk_import_mode,
+                    );
+                    if result.is_ok() {
+                        chunk.clear();
+                    }
+                    result
+                };
+                for batch in &batches {
                     for row_idx in 0..batch.num_rows() {
                         let mut row = Vec::with_capacity(batch.num_columns());
                         for col_idx in 0..batch.num_columns() {
@@ -849,23 +880,22 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                             })?;
                             row.push(crate::sql::parser::ast::Expr::Literal(value));
                         }
-                        values.push(row);
+                        chunk.push(row);
+                        if chunk.len() >= INSERT_SELECT_CHUNK_ROWS {
+                            let inserted = flush_chunk(&mut chunk)?;
+                            if let ExecResult::Ok { rows_affected } = inserted {
+                                rows_affected_total += rows_affected;
+                            }
+                        }
                     }
                 }
-                let result = super::dml_insert::exec_insert(
-                    self,
-                    table.effective_database(&session.database),
-                    &table.name,
-                    columns,
-                    &values,
-                    session.timezone_offset_hours,
-                    txn_id,
-                    session.bulk_import_mode,
-                );
-                if result.is_ok() && txn_id > 0 {
+                let last_result = flush_chunk(&mut chunk);
+                if last_result.is_ok() && txn_id > 0 {
                     session.mark_txn_write();
                 }
-                result
+                last_result.map(|_| ExecResult::Ok {
+                    rows_affected: rows_affected_total,
+                })
             }
             Statement::Update {
                 table,

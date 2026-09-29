@@ -418,8 +418,16 @@ fn get_or_build_fast_insert_plan(
         missing_auto_inc,
     });
     let mut cache = FAST_INSERT_PLAN_CACHE.lock().unwrap();
-    if cache.len() > 1024 {
-        cache.clear();
+    if cache.len() >= 1024 {
+        // Evict a few oldest entries instead of clearing the whole table:
+        // clear-all threw every hot plan out at once, collapsing the hit
+        // rate whenever 1024 cold keys had cycled through. Vec insertion
+        // order = HashMap iteration is unspecified, but evicting arbitrary
+        // entries still keeps the working set warm, which clear() did not.
+        let victims: Vec<String> = cache.keys().take(64).cloned().collect();
+        for key in victims {
+            cache.remove(&key);
+        }
     }
     cache.insert(plan_key.to_string(), Arc::clone(&plan));
     Ok(plan)

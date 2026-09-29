@@ -629,35 +629,24 @@ fn tail_commit_loop(
 
                 let written = write_append_group(&mut files, &mut compressor, group, &mut next_lsn);
                 TAIL_LSN_HIGH_WATER.fetch_max(next_lsn, Ordering::AcqRel);
-                // Tail-append replication events are published INLINE on this
-                // thread: seq order then equals the frame-write order. (They
-                // must not re-enter the bounded channel - this thread is its
-                // only drainer, and a full queue would deadlock.)
-                if let Some(log) = rep_log.get() {
-                    for group in &written {
-                        if let Some(payload) = &group.rep_payload {
-                            log.publish(
-                                crate::storage::replication::ReplicationEvent::TailAppend {
-                                    db: payload.db.clone(),
-                                    table: payload.table.clone(),
-                                    partition: payload.partition.clone(),
-                                    memtable_id: payload.memtable_id,
-                                    first_lsn: payload.first_lsn,
-                                    last_lsn: payload.last_lsn,
-                                    frames: payload.frames.clone(),
-                                },
-                            );
-                        }
-                    }
-                }
 
                 if async_fsync {
-                    // Frames are in the page cache: release the
+                    // Tail-append replication events are published INLINE on
+                    // this thread: seq order then equals the frame-write
+                    // order. (They must not re-enter the bounded channel -
+                    // this thread is its only drainer, and a full queue would
+                    // deadlock.) Frames are in the page cache: release the
                     // acknowledgements now and keep the storage barrier off
                     // the INSERT latency path. The dirty tails are synced on
                     // quiescence, byte, or time bounds above; ordering with
                     // later commands (barriers, flush intents) is preserved
                     // because this thread processes the channel serially.
+                    let events = build_tail_append_events(rep_log.get(), &written);
+                    if let Some(log) = rep_log.get() {
+                        for event in events {
+                            log.publish(event);
+                        }
+                    }
                     for group in written {
                         dirty_tails.insert(group.key);
                         dirty_bytes = dirty_bytes.saturating_add(group.bytes);
@@ -666,7 +655,21 @@ fn tail_commit_loop(
                         }
                     }
                 } else {
+                    // Sync mode publishes only after the frames are durable:
+                    // an fsync failure poisons the tail and errors every
+                    // completion, so the primary reports the INSERT as
+                    // failed — a standby that had already applied a
+                    // publish-before-fsync event would hold rows the primary
+                    // may not have. Publishing here keeps seq order (this
+                    // thread is the only publisher) and keeps the replicated
+                    // set a subset of the durable set.
+                    let events = build_tail_append_events(rep_log.get(), &written);
                     sync_append_group(&mut files, written);
+                    if let Some(log) = rep_log.get() {
+                        for event in events {
+                            log.publish(event);
+                        }
+                    }
                 }
             }
             CommitCommand::Barrier {
@@ -720,6 +723,35 @@ struct TailAppendPayload {
     first_lsn: u64,
     last_lsn: u64,
     frames: Vec<u8>,
+}
+
+/// Build the tail-append replication events for a written group batch.
+/// Called only from the tail-commit thread; the events are prebuilt so the
+/// sync-mode branch can construct them before the group is consumed by the
+/// fsync and publish them once durability is confirmed.
+fn build_tail_append_events(
+    rep_log: Option<&std::sync::Arc<crate::storage::replication::RepLog>>,
+    written: &[WrittenTailGroup],
+) -> Vec<crate::storage::replication::ReplicationEvent> {
+    if rep_log.is_none() {
+        return Vec::new();
+    }
+    written
+        .iter()
+        .filter_map(|group| {
+            group.rep_payload.as_ref().map(|payload| {
+                crate::storage::replication::ReplicationEvent::TailAppend {
+                    db: payload.db.clone(),
+                    table: payload.table.clone(),
+                    partition: payload.partition.clone(),
+                    memtable_id: payload.memtable_id,
+                    first_lsn: payload.first_lsn,
+                    last_lsn: payload.last_lsn,
+                    frames: payload.frames.clone(),
+                }
+            })
+        })
+        .collect()
 }
 
 fn write_append_group(

@@ -890,6 +890,30 @@ impl Compactor {
                         ..CompactStats::default()
                     });
                 }
+                // Re-check transaction pins at commit time. A BEGIN...DELETE/
+                // UPDATE that started after the heavy phase registered pins
+                // without touching segment files, so the identity validation
+                // above cannot see it. Committing under a pin makes the
+                // transaction's later COMMIT fail on a vanished path and the
+                // retry fail forever on the same stale plan; this check runs
+                // under the same partition mutation lock the registration
+                // uses, so it cannot race.
+                if self
+                    .segment_mgr
+                    .txn_mutations()
+                    .is_some_and(|registry| registry.table_has_pins(db, table))
+                {
+                    tracing::info!(
+                        db,
+                        table,
+                        partition_key = partition_label,
+                        "transaction pinned the table during compaction; deferring empty-input cleanup"
+                    );
+                    return Ok(CompactStats {
+                        segments_read,
+                        ..CompactStats::default()
+                    });
+                }
                 for old_seg in &segment_files {
                     self.segment_mgr.remove_segment_file(old_seg)?;
                 }
@@ -932,6 +956,28 @@ impl Compactor {
                         table,
                         partition_key = partition_label,
                         "compact inputs changed while rewriting; discarding prepared replacement"
+                    );
+                    return Ok(CompactStats {
+                        segments_read,
+                        ..CompactStats::default()
+                    });
+                }
+                // Same commit-time pin re-check as the AllDropped arm: a pin
+                // registered after the heavy phase references the segments
+                // this replacement is about to remove, and committing would
+                // deadlock the transaction's COMMIT on a missing file.
+                if self
+                    .segment_mgr
+                    .txn_mutations()
+                    .is_some_and(|registry| registry.table_has_pins(db, table))
+                {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
+                    tracing::info!(
+                        db,
+                        table,
+                        partition_key = partition_label,
+                        "transaction pinned the table during compaction; discarding prepared replacement"
                     );
                     return Ok(CompactStats {
                         segments_read,

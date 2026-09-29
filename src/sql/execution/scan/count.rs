@@ -152,10 +152,14 @@ fn count_with_predicates(
     let filter_columns = spec.all_predicate_columns();
 
     for seg_path in segment_files {
-        let meta = segment_mgr.segment_meta(seg_path)?;
-        if let Some(meta) = &meta {
+        // Meta-based row-group pruning is authoritative when the sidecar meta
+        // exists; re-running the same pruning through the reader footer (the
+        // old behavior) doubled the metadata walk for every segment. Keep the
+        // reader fallback only for segments without meta.
+        let meta_candidates = (|| {
+            let meta = segment_mgr.segment_meta(seg_path).ok()??;
             if !row_group::prune_segment_by_zone_map(pred, &meta.segment_zone_maps) {
-                continue;
+                return Some(Vec::new());
             }
             let prune_result = row_group::prune_row_group_meta(
                 &meta.row_groups,
@@ -165,22 +169,31 @@ fn count_with_predicates(
                 set_checks,
                 set_in_checks,
             );
-            if prune_result.candidate_indices.is_empty() {
+            Some(prune_result.candidate_indices)
+        })();
+
+        if let Some(candidates) = &meta_candidates {
+            if candidates.is_empty() {
                 continue;
             }
         }
 
         let reader = segment_mgr.open_scan_reader(seg_path, spec.reader_txn_id)?;
 
-        let prune_result = row_group::prune_row_groups(
-            &reader,
-            pred,
-            bloom_checks,
-            in_checks,
-            set_checks,
-            set_in_checks,
-            reader.segment_zone_maps(),
-        );
+        let prune_result = match meta_candidates {
+            Some(candidates) => super::row_group::RowGroupPruneResult {
+                candidate_indices: candidates,
+            },
+            None => row_group::prune_row_groups(
+                &reader,
+                pred,
+                bloom_checks,
+                in_checks,
+                set_checks,
+                set_in_checks,
+                reader.segment_zone_maps(),
+            ),
+        };
 
         for rg_idx in &prune_result.candidate_indices {
             let mut batch = if filter_columns.is_empty() {

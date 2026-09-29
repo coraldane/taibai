@@ -401,3 +401,50 @@ fn spilled_memtable_serves_reads_and_new_inserts() -> Result<()> {
     writer.stop();
     Ok(())
 }
+
+/// Regression: `commit_txn` flips visibility (clearing each memtable's
+/// txn_id) before the durable-tail wait. A failed first attempt therefore
+/// made a plain `commit_txn(txn_id)` retry a no-op that reported success
+/// with the rows still only in memory. `redrive_commit_durability` must
+/// flush the committed memtables instead, and must leave uncommitted
+/// transactional memtables strictly alone.
+#[test]
+fn redrive_commit_durability_flushes_committed_txn_memtables() -> Result<()> {
+    let temp = tempfile::tempdir().unwrap();
+    let table_dir = temp.path().join(TEST_DB).join(TEST_TABLE);
+    std::fs::create_dir_all(&table_dir)?;
+    let schema = test_schema();
+    let segment_mgr = Arc::new(SegmentManager::new(temp.path())?);
+    let mut writer = BatchWriter::new(test_config(64), Arc::clone(&segment_mgr), None);
+
+    // Rows written inside a transaction stay invisible and unpersisted.
+    writer.write_columns_with_txn(
+        TEST_DB,
+        TEST_TABLE,
+        "20251231",
+        make_batch(&schema, 1, 3)?,
+        schema.clone(),
+        7,
+        true,
+    )?;
+
+    // Redrive before the commit flip: nothing may be published or flushed.
+    writer.redrive_commit_durability()?;
+    assert_eq!(
+        total_segment_rows(&table_dir),
+        0,
+        "redrive must not flush uncommitted transactional memtables"
+    );
+
+    // Simulate the post-first-attempt state of a failed commit_txn: the
+    // visibility flip happened (txn_id cleared) but no tail frames landed.
+    let committed = writer.memtable_mgr.commit_txn(7);
+    assert_eq!(committed.len(), 1, "the transaction memtable must flip");
+
+    // A plain retry would now find nothing; redrive must persist the rows.
+    writer.redrive_commit_durability()?;
+    assert_eq!(total_segment_rows(&table_dir), 3);
+
+    writer.stop();
+    Ok(())
+}

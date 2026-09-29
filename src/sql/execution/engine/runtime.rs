@@ -407,17 +407,21 @@ impl Engine {
             if let Err(first_error) = self.batch_writer().commit_txn(txn_id) {
                 // By the time commit_txn reports an error, the visibility flip
                 // has usually already happened (the failure comes from the
-                // durable-tail fsync wait). Retry once, then fail with an
-                // explicit "fate ambiguous" error — the old behavior returned
-                // a bare error, inviting a ROLLBACK that cannot actually undo
-                // the applied changes.
+                // durable-tail fsync wait) — and the flip clears each
+                // memtable's txn_id, so retrying commit_txn(txn_id) would find
+                // no memtables and report success with the rows still only in
+                // memory. Re-drive durability for the committed memtables
+                // directly instead: flushing them to segments persists the rows
+                // even when the tail lost its frames. If that also fails, fail
+                // with an explicit "fate ambiguous" error — the changes are
+                // visible and ROLLBACK cannot undo them.
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                if let Err(retry_error) = self.batch_writer().commit_txn(txn_id) {
+                if let Err(retry_error) = self.batch_writer().redrive_commit_durability() {
                     tracing::error!(
                         txn_id,
                         first_error = %first_error,
                         retry_error = %retry_error,
-                        "COMMIT durable-tail wait failed twice; transaction fate ambiguous"
+                        "COMMIT durable-tail wait failed and durability redrive failed; transaction fate ambiguous"
                     );
                     return Err(TaibaiError::Storage(format!(
                         "COMMIT applied but the durable-tail wait failed twice ({retry_error}); \

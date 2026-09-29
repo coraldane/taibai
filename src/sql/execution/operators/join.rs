@@ -66,6 +66,11 @@ struct ProbeState {
     buffer_pos: usize,
     build_done: bool,
     finalize_done: bool,
+    // --- CROSS JOIN streaming cursor ---
+    /// The left batch currently being multiplied (None: pull the next one).
+    cross_left: Option<RecordBatch>,
+    /// (left_row, right_batch, right_row) position within the product.
+    cross_pos: (usize, usize, usize),
     // --- fast probe path (pure-equality conditions) ---
     /// Enabled when the condition is a pure conjunction of column = column
     /// pairs and no spill path was taken; see `condition_is_pure_eq`.
@@ -151,6 +156,30 @@ impl HashJoinExec {
         if self.join_type == JoinType::Inner {
             return self.build_inner();
         }
+        // Non-inner builds have no spill path (the hash table must keep
+        // unmatched build rows until the end for outer semantics). They still
+        // reserve against the query memory manager like `build_inner`, and a
+        // build that exceeds the limit fails cleanly instead of growing
+        // without bound until OOM.
+        let mut memory = MemoryManager::reservation();
+        let mut estimated_bytes = 0usize;
+        let check_build_budget = |batch: &RecordBatch,
+                                      estimated_bytes: &mut usize,
+                                      memory: &mut MemoryReservation,
+                                      limit: usize|
+         -> Result<()> {
+            *estimated_bytes = estimated_bytes.saturating_add(
+                batch.estimated_size_bytes().saturating_mul(2),
+            );
+            super::profile::record_current_peak_memory(*estimated_bytes);
+            if *estimated_bytes >= limit || !memory.try_resize(*estimated_bytes) {
+                return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
+                    "join build side exceeds the query memory limit ({} of {} bytes);                      non-inner joins have no spill path - reduce the build side or raise                      the limit",
+                    *estimated_bytes, limit
+                )));
+            }
+            Ok(())
+        };
         match self.join_type {
             JoinType::Right | JoinType::Full => {
                 // For RIGHT/FULL join, build hash table from right side
@@ -158,6 +187,12 @@ impl HashJoinExec {
                 let mut ht = JoinHashTable::new(right_key_cols);
                 while let Some(batch) = self.right.next_batch()? {
                     crate::common::query_cancel::check()?;
+                    check_build_budget(
+                        &batch,
+                        &mut estimated_bytes,
+                        &mut memory,
+                        self.memory_limit_bytes,
+                    )?;
                     ht.insert_batch(batch);
                 }
                 ht.finalize();
@@ -171,6 +206,12 @@ impl HashJoinExec {
                 let mut batches = Vec::new();
                 while let Some(batch) = self.right.next_batch()? {
                     crate::common::query_cancel::check()?;
+                    check_build_budget(
+                        &batch,
+                        &mut estimated_bytes,
+                        &mut memory,
+                        self.memory_limit_bytes,
+                    )?;
                     batches.push(batch);
                 }
                 let mut asof_idx = AsofJoinIndex::new();
@@ -186,6 +227,12 @@ impl HashJoinExec {
                 let mut ht = JoinHashTable::new(self.left_key_cols.clone());
                 while let Some(batch) = self.left.next_batch()? {
                     crate::common::query_cancel::check()?;
+                    check_build_budget(
+                        &batch,
+                        &mut estimated_bytes,
+                        &mut memory,
+                        self.memory_limit_bytes,
+                    )?;
                     ht.insert_batch(batch);
                 }
                 ht.finalize();
@@ -194,6 +241,9 @@ impl HashJoinExec {
                 self.hash_table = Some(ht);
             }
         }
+        // Hold the reservation until the join finishes so concurrent queries
+        // still see this build's footprint.
+        self.memory_reservation = Some(memory);
         self.probe_state.build_done = true;
         Ok(())
     }
@@ -607,39 +657,92 @@ impl HashJoinExec {
     }
 
     /// Cross join: Cartesian product of left and right.
+    ///
+    /// Streams the product through a cursor instead of materializing it: the
+    /// old implementation pushed every N×M combination as a heap-allocated
+    /// row pair into `output_buffer` before the first batch was emitted, so
+    /// two 10k-row inputs built 100M boxed rows (tens of GB) before anything
+    /// could be drained. Each call now advances the cursor by at most one
+    /// output batch.
     fn probe_cross(&mut self) -> Result<Option<RecordBatch>> {
-        if !self.probe_state.right_collected {
-            let mut left_rows = Vec::new();
-            while let Some(batch) = self.left.next_batch()? {
-                for row in 0..batch.num_rows() {
-                    let vals: Vec<ScalarValue> = (0..batch.num_columns())
-                        .map(|c| batch.scalar(row, c).unwrap_or(ScalarValue::Int64(None)))
-                        .collect();
-                    left_rows.push(vals);
-                }
-            }
-            while let Some(batch) = self.right.next_batch()? {
-                self.probe_state.right_batches.push(batch);
-            }
-            self.probe_state.right_collected = true;
-            for left_row in &left_rows {
-                for right_batch in &self.probe_state.right_batches {
-                    for right_row_idx in 0..right_batch.num_rows() {
-                        let right_row: Vec<ScalarValue> = (0..right_batch.num_columns())
-                            .map(|c| {
-                                right_batch
-                                    .scalar(right_row_idx, c)
-                                    .unwrap_or(ScalarValue::Int64(None))
-                            })
-                            .collect();
-                        self.probe_state
-                            .output_buffer
-                            .push((left_row.clone(), Some(right_row)));
+        loop {
+            if self.probe_state.cross_left.is_none() {
+                match self.left.next_batch()? {
+                    Some(batch) if batch.num_rows() > 0 => {
+                        self.probe_state.cross_left = Some(batch);
                     }
+                    Some(_) => continue, // skip empty left batches
+                    None => return Ok(None), // left exhausted: product complete
                 }
+                if !self.probe_state.right_collected {
+                    while let Some(batch) = self.right.next_batch()? {
+                        if batch.num_rows() > 0 {
+                            self.probe_state.right_batches.push(batch);
+                        }
+                    }
+                    self.probe_state.right_collected = true;
+                }
+                self.probe_state.cross_pos = (0, 0, 0);
             }
+
+            let left_batch = self.probe_state.cross_left.as_ref().expect("just loaded");
+            let left_ncols = self.left_schema.columns.len();
+            let right_ncols = self.right_schema.columns.len();
+            let mut columns: Vec<ColumnArray> = Vec::with_capacity(left_ncols + right_ncols);
+            for i in 0..(left_ncols + right_ncols) {
+                let dt = if i < left_ncols {
+                    self.left_schema.columns[i].data_type
+                } else {
+                    self.right_schema.columns[i - left_ncols].data_type
+                };
+                columns.push(ColumnArray::empty(dt));
+            }
+
+            let (mut l, mut rb, mut rr) = self.probe_state.cross_pos;
+            let mut produced = 0usize;
+            while produced < Self::BATCH_SIZE {
+                if rb >= self.probe_state.right_batches.len() {
+                    l += 1;
+                    rb = 0;
+                    rr = 0;
+                    if l >= left_batch.num_rows() {
+                        break;
+                    }
+                    continue;
+                }
+                let right_batch = &self.probe_state.right_batches[rb];
+                if rr >= right_batch.num_rows() {
+                    rb += 1;
+                    rr = 0;
+                    continue;
+                }
+                for i in 0..left_ncols {
+                    let v = left_batch.scalar(l, i).unwrap_or(ScalarValue::Int64(None));
+                    columns[i].push(&v)?;
+                }
+                for i in 0..right_ncols {
+                    let v = right_batch.scalar(rr, i).unwrap_or(ScalarValue::Int64(None));
+                    columns[left_ncols + i].push(&v)?;
+                }
+                produced += 1;
+                rr += 1;
+            }
+
+            if l >= left_batch.num_rows() {
+                self.probe_state.cross_left = None;
+            } else {
+                self.probe_state.cross_pos = (l, rb, rr);
+            }
+
+            if produced == 0 {
+                if self.probe_state.cross_left.is_none() {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let schema = self.output_schema.clone();
+            return Ok(Some(RecordBatch::try_new(schema, columns)?));
         }
-        self.drain_buffer()
     }
 
     /// Semi join: emit left rows that have at least one match in right.
@@ -1178,17 +1281,29 @@ impl HashJoinExec {
     // --- Helper methods ---
 
     fn get_next_right_row(&mut self) -> Result<Option<Vec<ScalarValue>>> {
-        if !self.probe_state.right_collected {
-            // Errors propagate: a probe side failing mid-scan used to look
-            // like end-of-input, silently truncating the join result.
-            while let Some(batch) = self.right.next_batch()? {
-                if batch.num_rows() > 0 {
-                    self.probe_state.right_batches.push(batch);
+        // Stream the probe side one batch at a time: only the active batch is
+        // retained. The old probe-side collection pulled the entire right
+        // input into `right_batches` before the first row was emitted and
+        // kept it for the whole join, outside every memory budget — the
+        // spill protection on the build side never covered it.
+        loop {
+            if self.probe_state.right_batch_idx >= self.probe_state.right_batches.len() {
+                // Errors propagate: a probe side failing mid-scan used to
+                // look like end-of-input, silently truncating the result.
+                match self.right.next_batch()? {
+                    Some(batch) if batch.num_rows() > 0 => {
+                        self.probe_state.right_batches.clear();
+                        self.probe_state.right_batches.push(batch);
+                        self.probe_state.right_batch_idx = 0;
+                        self.probe_state.right_row_idx = 0;
+                    }
+                    Some(_) => continue,
+                    None => {
+                        self.probe_state.right_collected = true;
+                        return Ok(None);
+                    }
                 }
             }
-            self.probe_state.right_collected = true;
-        }
-        if self.probe_state.right_batch_idx < self.probe_state.right_batches.len() {
             let batch = &self.probe_state.right_batches[self.probe_state.right_batch_idx];
             if self.probe_state.right_row_idx < batch.num_rows() {
                 let row: Vec<ScalarValue> = (0..batch.num_columns())
@@ -1202,11 +1317,14 @@ impl HashJoinExec {
                 if self.probe_state.right_row_idx >= batch.num_rows() {
                     self.probe_state.right_batch_idx += 1;
                     self.probe_state.right_row_idx = 0;
+                    // The batch is fully consumed; drop it before pulling the
+                    // next one so only one probe batch is ever resident.
+                    self.probe_state.right_batches.clear();
+                    self.probe_state.right_batch_idx = 0;
                 }
                 return Ok(Some(row));
             }
         }
-        Ok(None)
     }
 
     fn get_next_left_row(&mut self) -> Result<Option<Vec<ScalarValue>>> {

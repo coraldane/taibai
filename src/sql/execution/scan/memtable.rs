@@ -531,21 +531,28 @@ pub fn count_memtable_rows(
                 return 0;
             }
 
-            let mt_batch = match &txn_positions {
+            // Counting is read-only: work through a reference. The old
+            // committed-read branch deep-cloned the whole batch (all
+            // columns of every memtable, every count query) only to then
+            // use it by reference.
+            let filtered_holder;
+            let mt_batch: &RecordBatch = match &txn_positions {
                 Some(positions) => {
                     match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
                         mt_batch, positions,
                     ) {
-                        Ok(filtered) => filtered,
+                        Ok(filtered) => {
+                            filtered_holder = filtered;
+                            &filtered_holder
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "memtable overlay filter failed");
                             return 0;
                         }
                     }
                 }
-                None => mt_batch.clone(),
+                None => mt_batch,
             };
-            let mt_batch = &mt_batch;
 
             if spec.eq_predicates.len() == 1
                 && spec.range_predicates.is_empty()

@@ -1330,6 +1330,42 @@ fn extract_range_clauses(
     }
 }
 
+/// Byte budget for buffered change-event row images (UPDATE post-images /
+/// DELETE pre-images). These batches are held until every segment rewrite
+/// has committed; without a cap, a no-WHERE UPDATE/DELETE on a big table
+/// buffered the whole table inside the mutation-lock critical section.
+/// Beyond the budget the remaining images are not published — the pubsub
+/// channel already has drop-on-overflow semantics and subscribers resync
+/// from the change log.
+pub const CHANGE_EVENT_BUFFER_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Budget gate for one buffered change-event batch: returns true while
+/// `buffered + incoming` fits, otherwise warns once per statement (via
+/// `*warned`) and returns false so the caller skips buffering.
+pub fn change_event_budget_allows(
+    buffered_bytes: usize,
+    incoming: usize,
+    warned: &mut bool,
+    what: &str,
+    db: &str,
+    table: &str,
+) -> bool {
+    if buffered_bytes.saturating_add(incoming) <= CHANGE_EVENT_BUFFER_BUDGET_BYTES {
+        return true;
+    }
+    if !*warned {
+        *warned = true;
+        tracing::warn!(
+            db,
+            table,
+            what,
+            budget = CHANGE_EVENT_BUFFER_BUDGET_BYTES,
+            "change-event buffer budget exceeded; remaining row images are not published (subscribers re-sync from the change log)"
+        );
+    }
+    false
+}
+
 #[cfg(test)]
 #[path = "helpers_test.rs"]
 mod tests;

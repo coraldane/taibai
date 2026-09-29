@@ -1047,6 +1047,18 @@ pub fn exec_delete(
         )));
     }
 
+    // Join the INSERT/REPLACE writer protocol: the probe→publish window on
+    // the INSERT side is guarded by this striped lock, so row-rewriting
+    // statements must hold it too (index maintenance, footer rewrites, and
+    // snapshot invalidation below are invisible to a concurrent INSERT probe
+    // otherwise). Acquired before any table/partition mutation lock to keep
+    // the global order constraint_insert_lock → mutation lock identical to
+    // the INSERT path; REPLACE holds the same lock across its own body and
+    // never re-enters exec_delete, so the mutex stays acquirable.
+    let _constraint_guard = super::dml_insert::constraint_insert_lock(db, table)
+        .lock()
+        .unwrap();
+
     // Resolve subqueries through the permission-gated wrapper (a bare
     // resolve_in_subqueries here would let WHERE IN (SELECT ...) read tables
     // the user cannot SELECT).
@@ -1058,6 +1070,9 @@ pub fn exec_delete(
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
     let mut total_deleted: u64 = 0;
+    // Segments whose delete footer was successfully rewritten by this
+    // statement (0 for memtable-only deletes).
+    let mut footers_rewritten: u64 = 0;
     let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
     let predicate_projection = resolved_where_clause
         .as_ref()
@@ -1077,6 +1092,8 @@ pub fn exec_delete(
     let mut delete_body = || -> Result<bool> {
         // Deleted-row batches for the change feed (segments + memtables).
         let mut deleted_row_batches: Vec<RecordBatch> = Vec::new();
+        let mut event_buffer_bytes = 0usize;
+        let mut event_budget_warned = false;
         // Memtable-resident rows are removed in place (no forced flush),
         // mirroring the REPLACE conflict path; durable tails are rewritten
         // so crash recovery cannot resurrect deleted rows.
@@ -1107,7 +1124,20 @@ pub fn exec_delete(
                         .map(|col| col.take(&plan.removed_positions))
                         .collect();
                     match RecordBatch::try_new(plan.original.schema.clone(), columns) {
-                        Ok(deleted) => deleted_row_batches.push(deleted),
+                        Ok(deleted) => {
+                            let bytes = deleted.estimated_size_bytes();
+                            if super::helpers::change_event_budget_allows(
+                                event_buffer_bytes,
+                                bytes,
+                                &mut event_budget_warned,
+                                "delete",
+                                db,
+                                table,
+                            ) {
+                                event_buffer_bytes += bytes;
+                                deleted_row_batches.push(deleted);
+                            }
+                        }
                         Err(error) => tracing::warn!(
                             db,
                             table,
@@ -1232,7 +1262,20 @@ pub fn exec_delete(
                                 .map(|col| col.take(&deleted_rows))
                                 .collect();
                             match RecordBatch::try_new(batch.schema.clone(), columns) {
-                                Ok(deleted) => deleted_row_batches.push(deleted),
+                                Ok(deleted) => {
+                            let bytes = deleted.estimated_size_bytes();
+                            if super::helpers::change_event_budget_allows(
+                                event_buffer_bytes,
+                                bytes,
+                                &mut event_budget_warned,
+                                "delete",
+                                db,
+                                table,
+                            ) {
+                                event_buffer_bytes += bytes;
+                                deleted_row_batches.push(deleted);
+                            }
+                        }
                                 Err(error) => tracing::warn!(
                                     db,
                                     table,
@@ -1277,7 +1320,20 @@ pub fn exec_delete(
                                 .map(|col| col.take(&deleted_rows))
                                 .collect();
                             match RecordBatch::try_new(batch.schema.clone(), columns) {
-                                Ok(deleted) => deleted_row_batches.push(deleted),
+                                Ok(deleted) => {
+                            let bytes = deleted.estimated_size_bytes();
+                            if super::helpers::change_event_budget_allows(
+                                event_buffer_bytes,
+                                bytes,
+                                &mut event_budget_warned,
+                                "delete",
+                                db,
+                                table,
+                            ) {
+                                event_buffer_bytes += bytes;
+                                deleted_row_batches.push(deleted);
+                            }
+                        }
                                 Err(error) => tracing::warn!(
                                     db,
                                     table,
@@ -1320,6 +1376,8 @@ pub fn exec_delete(
                 // This segment's rows were not tombstoned after all.
                 total_deleted -= new_deleted_count - prev_deleted;
                 first_rewrite_error = first_rewrite_error.or(Some(error));
+            } else {
+                footers_rewritten += 1;
             }
         }
 
@@ -1387,6 +1445,17 @@ pub fn exec_delete(
     };
 
     if total_deleted > 0 {
+        if footers_rewritten > 0 {
+            // Footer rewrites changed row locations on disk, but only flush
+            // and compaction used to bump the content epoch — the persisted
+            // unique-index snapshots kept looking fresh, so a crash between
+            // a footer rewrite and the tombstone append left deleted keys
+            // "present" until the next unrelated flush, and legal re-inserts
+            // of those keys were rejected as duplicates. Bump the epoch like
+            // compaction does (memtable-only deletes never touch footers and
+            // keep skipping the bump — see the no-forced-flush invariant).
+            mgr.note_memtable_flush(db, table);
+        }
         if !indexes_maintained {
             tracing::warn!(
                 db,

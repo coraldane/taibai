@@ -372,12 +372,17 @@ impl BatchWriter {
                         hot_fed,
                     )
                 })?;
-        tracing::info!(
-            table = %table,
-            rows,
-            lock_ms = lock_start.elapsed().as_millis() as u64,
-            "insert lock timing"
-        );
+        // Profile-gated like the other per-statement instrumentation: this
+        // used to be an unconditional info!, spamming the log and paying the
+        // elapsed/formatting cost on every single-row INSERT.
+        if crate::common::config::insert_profile_enabled() {
+            tracing::info!(
+                table = %table,
+                rows,
+                lock_ms = lock_start.elapsed().as_millis() as u64,
+                "insert lock timing"
+            );
+        }
         if let Some((ticket, memtable)) = pending {
             if let Err(error) = ticket.wait() {
                 tracing::warn!(
@@ -422,6 +427,7 @@ impl BatchWriter {
                 .get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
         log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
         let append_start = Instant::now();
+        let insert_bytes = (txn_id > 0).then(|| batch.estimated_size_bytes() as u64);
         let pending = if txn_id == 0 {
             // `PreparedTailAppend` already owns the durable representation of
             // this delta, so the materialized column buffers can move into the
@@ -441,6 +447,9 @@ impl BatchWriter {
             mt.append_owned(batch)?;
             None
         };
+        if let Some(insert_bytes) = insert_bytes {
+            self.charge_txn_insert_bytes(txn_id, db, table, insert_bytes)?;
+        }
         log_insert_profile(
             "memtable_append",
             row_count as usize,
@@ -491,6 +500,7 @@ impl BatchWriter {
                 .get_or_create_with_txn(db, table, partition_key, &schema, txn_id);
         log_insert_profile("memtable_get", row_count as usize, get_start.elapsed());
         let append_start = Instant::now();
+        let insert_bytes = (txn_id > 0).then(|| batch.estimated_size_bytes() as u64);
         if txn_id == 0 {
             // Keep the input batch alive so only this INSERT's delta is added
             // to the durable tail. Rewriting mt.read_snapshot() here made a
@@ -513,6 +523,9 @@ impl BatchWriter {
             }
         } else {
             mt.append_owned(batch)?;
+        }
+        if let Some(insert_bytes) = insert_bytes {
+            self.charge_txn_insert_bytes(txn_id, db, table, insert_bytes)?;
         }
         log_insert_profile(
             "memtable_append",
@@ -539,9 +552,44 @@ impl BatchWriter {
         self.tail_committer.set_rep_log(log);
     }
 
+    /// Charge a transactional INSERT's buffered bytes against the
+    /// transaction's in-memory budget (no-op when the registry is not wired,
+    /// e.g. unit-test writers). Transactional memtables are invisible to the
+    /// background relief valves until COMMIT, so this is the only bound on
+    /// how much memory one open transaction can accumulate.
+    fn charge_txn_insert_bytes(&self, txn_id: u64, db: &str, table: &str, bytes: u64) -> Result<()> {
+        match self.memtable_mgr.txn_mutations() {
+            Some(registry) => registry
+                .charge_txn_insert_bytes(txn_id, db, table, bytes)
+                .map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
     pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
         let pending = self.commit_txn_submit_inner(txn_id, false)?;
         self.wait_pending_tail_commits(pending)
+    }
+
+    /// Re-drive durability for memtables a failed `commit_txn` left committed
+    /// but unpersisted. The visibility flip inside `commit_txn` clears each
+    /// memtable's txn_id, so retrying `commit_txn(txn_id)` finds no memtables
+    /// and would report success with the rows still only in memory. Flushing
+    /// the memtables to segments makes the rows durable even when the durable
+    /// tail lost its frames. Ordinary auto-commit memtables in the same state
+    /// are flushed too — harmless, the background flusher does the same.
+    pub fn redrive_commit_durability(&self) -> Result<()> {
+        let mts = self.memtable_mgr.committed_pending_memtables();
+        for group in Self::group_memtables_for_flush(mts) {
+            Self::flush_memtable_group(
+                &self.segment_mgr,
+                &group,
+                false,
+                &self.tail_committer,
+                &self.flush_gate,
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn commit_txn_submit_under_table_lock(

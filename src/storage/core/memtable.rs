@@ -837,6 +837,12 @@ impl MemTableManager {
         }
 
         let mut writable = self.writable.write().unwrap();
+        // Evict entries whose memtable is gone (flushed / removed / rolled
+        // back): the map had no removal path, so every flushed (db, table,
+        // partition, txn_id) combination left a dead entry forever — a slow
+        // leak under high-cardinality partitions and short transactions.
+        // Sweeping here (insertion path) keeps the map at roughly the live set.
+        writable.retain(|_, weak| weak.upgrade().is_some());
         if let Some(memtable) = writable.get(&key).and_then(Weak::upgrade) {
             if memtable.state() == MemTableState::Pending
                 && memtable.txn_id() == txn_id
@@ -1227,6 +1233,26 @@ impl MemTableManager {
             mt.mark_committed();
         }
         committed
+    }
+
+    /// Memtables that are already visible (`Committed`) and still awaiting
+    /// persistence. `commit_txn` flips visibility before the durable-tail
+    /// wait and the flip clears each memtable's txn_id, so a retried
+    /// `commit_txn(txn_id)` finds nothing; the COMMIT retry path drives
+    /// durability from this set instead. Uncommitted transactional
+    /// memtables (visibility `Uncommitted`) are never included — flushing
+    /// one would publish another session's rows.
+    pub fn committed_pending_memtables(&self) -> Vec<Arc<MemTable>> {
+        let memtables = self.memtables.read().unwrap();
+        memtables
+            .iter()
+            .filter(|mt| {
+                mt.txn_id() == 0
+                    && mt.state() == MemTableState::Pending
+                    && mt.visibility() == TxnVisibility::Committed
+            })
+            .cloned()
+            .collect()
     }
 
     /// Approximate resident bytes owned by pending memtables. Spilled

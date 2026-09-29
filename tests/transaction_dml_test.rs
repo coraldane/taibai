@@ -418,3 +418,44 @@ fn filter_batch_excluding_positions_removes_rows() {
     let untouched = filter_batch_excluding_positions(&batch, &BTreeSet::new()).unwrap();
     assert_eq!(untouched.num_rows(), batch.num_rows());
 }
+
+/// Regression: two open transactions could plan mutations against the same
+/// rows and both commit, leaving two new images of one row (or an image past
+/// a tombstone). The first transaction's DML pins the table; another open
+/// transaction's DML on the same table is refused until it commits or rolls
+/// back, while the pinning transaction itself keeps access.
+#[test]
+fn concurrent_txn_dml_on_same_table_is_refused() {
+    let (_dir, engine) = create_test_engine();
+    let mut a = session();
+    let mut b = session();
+    setup(&engine, &mut a, DDL, &[1, 2, 3, 4]);
+
+    engine.execute(&mut a, "BEGIN").unwrap();
+    let deleted = ok_rows_affected(
+        engine
+            .execute(&mut a, "DELETE FROM t WHERE id <= 2")
+            .unwrap(),
+    );
+    assert_eq!(deleted, 2);
+
+    // Another open transaction must not plan mutations on the pinned table.
+    engine.execute(&mut b, "BEGIN").unwrap();
+    let err = engine
+        .execute(&mut b, "UPDATE t SET value = 99 WHERE id = 3")
+        .expect_err("concurrent transaction DML must be refused");
+    assert!(
+        err.to_string().contains("another open transaction"),
+        "unexpected error: {err}"
+    );
+
+    // The pinning transaction itself can keep mutating the table.
+    let deleted = ok_rows_affected(
+        engine.execute(&mut a, "DELETE FROM t WHERE id = 3").unwrap(),
+    );
+    assert_eq!(deleted, 1);
+
+    engine.execute(&mut b, "ROLLBACK").unwrap();
+    engine.execute(&mut a, "COMMIT").unwrap();
+    assert_eq!(query_i64(&engine, &mut a, "SELECT id FROM t"), vec![4]);
+}

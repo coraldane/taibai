@@ -1816,6 +1816,13 @@ impl Handler {
             Err(error) => return Ok(vec![build_error(&error.to_string())]),
         };
 
+        // A (re)connecting standby proved it durably applied `last_seq`.
+        // Fast-forward the seq file before handing out any new events: the
+        // primary may have crashed and restarted with the file lagging behind
+        // this seq, and re-stamping consumed seqs would make the standby skip
+        // everything up to its old position.
+        rep_log.note_standby_applied(last_seq);
+
         let Some(push_tx) = self.push_channel.clone() else {
             return Ok(vec![build_error(
                 "replication pushes are not available on this connection",
@@ -1959,10 +1966,15 @@ impl Handler {
         }])
     }
 
-    /// REPL_ACK (standby -> primary): progress report; v1 logs it.
+    /// REPL_ACK (standby -> primary): progress report. The ack doubles as the
+    /// durability driver for the primary's seq file — without it the file
+    /// lags `persist_every` events behind and a crash reuses consumed seqs.
     fn handle_repl_ack(&self, payload: &[u8]) -> Result<Vec<Message>> {
         if payload.len() >= 8 {
             let applied = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            if let Some(rep_log) = self.engine.rep_log() {
+                rep_log.note_standby_applied(applied);
+            }
             tracing::debug!(applied_seq = applied, "standby replication ack");
         }
         Ok(Vec::new())

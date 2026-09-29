@@ -34,6 +34,9 @@ use super::SegmentUpdateKind;
 
 const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 const ACK_EVERY: u64 = 256;
+
+/// Byte cap on replication events deferred while a segment fetch is in flight.
+const DEFERRED_EVENT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
@@ -153,7 +156,21 @@ async fn connect_and_stream(
         "replication stream connected"
     );
 
-    let mut deferred: VecDeque<(u64, ReplicationEvent)> = VecDeque::new();
+    // Deferred events buffered while a segment fetch is in flight, bounded
+    // by DEFERRED_EVENT_BUDGET_BYTES: a GB-scale fetch under heavy write
+    // traffic used to buffer every incoming TailAppend (up to ~16MB of
+    // frames each) without limit. Blowing the budget fails the applier on
+    // purpose — it reconnects and resumes from the persisted applied seq,
+    // losing nothing.
+    let mut deferred: VecDeque<(u64, ReplicationEvent, u64)> = VecDeque::new();
+    let mut deferred_bytes: u64 = 0;
+    // Cumulative live-row counts per tail path. Tails are append-only, so
+    // each event adds exactly its own frames' rows; re-reading the whole
+    // tail file per event (the old behavior) cost O(N²) bytes of I/O over
+    // a replication session. Entries are re-seeded from the file whenever
+    // a path is first seen (or after the conservative clear below).
+    let mut tail_rows_cache: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     // Delete tombstones for segments the standby has not received yet: the
     // primary can tombstone an ACTIVE segment before any SegmentUpdate
     // shipped it. Queued rewrites are applied when the segment materializes.
@@ -164,7 +181,8 @@ async fn connect_and_stream(
         if stop.load(std::sync::atomic::Ordering::Acquire) {
             return Err(TaibaiError::Storage("applier stopped".into()));
         }
-        if let Some((seq, event)) = deferred.pop_front() {
+        if let Some((seq, event, event_bytes)) = deferred.pop_front() {
+            deferred_bytes -= event_bytes;
             apply(
                 engine,
                 &applied,
@@ -172,6 +190,8 @@ async fn connect_and_stream(
                 event,
                 &mut framed,
                 &mut deferred,
+                &mut deferred_bytes,
+ &mut tail_rows_cache,
                 &mut pending_rewrites,
             )
             .await?;
@@ -221,6 +241,8 @@ async fn connect_and_stream(
                     event,
                     &mut framed,
                     &mut deferred,
+                    &mut deferred_bytes,
+ &mut tail_rows_cache,
                     &mut pending_rewrites,
                 )
                 .await?;
@@ -243,7 +265,9 @@ async fn apply(
     seq: u64,
     event: ReplicationEvent,
     framed: &mut Framed<tokio::net::TcpStream, MessageCodec>,
-    deferred: &mut VecDeque<(u64, ReplicationEvent)>,
+    deferred: &mut VecDeque<(u64, ReplicationEvent, u64)>,
+    deferred_bytes: &mut u64,
+    tail_rows_cache: &mut std::collections::HashMap<String, u64>,
     pending_rewrites: &mut std::collections::HashMap<String, Vec<(Vec<u8>, u64)>>,
 ) -> Result<()> {
     match event {
@@ -262,7 +286,23 @@ async fn apply(
             let live_path =
                 crate::storage::core::durable_tail::live_tail_path(&table_dir, memtable_id)?;
             let rows = match &live_path {
-                Some(path) => crate::storage::core::durable_tail::tail_log_rows(path)?.unwrap_or(0),
+                Some(path) => {
+                    if tail_rows_cache.len() > 1024 {
+                        // Conservative bound on paths from tails that were
+                        // replaced by compaction; the next event re-seeds.
+                        tail_rows_cache.clear();
+                    }
+                    let key = path.to_string_lossy().into_owned();
+                    let rows = match tail_rows_cache.get(&key) {
+                        // Append-only tail: previous total plus this event's
+                        // frames. The first sight reads the file once (it
+                        // already contains this event's frames).
+                        Some(cached) => cached.saturating_add(count_v3_frame_rows(&frames)),
+                        None => crate::storage::core::durable_tail::tail_log_rows(path)?.unwrap_or(0),
+                    };
+                    tail_rows_cache.insert(key, rows);
+                    rows
+                }
                 None => count_v3_frame_rows(&frames),
             };
             match table_schema(engine, &db, &table) {
@@ -304,7 +344,7 @@ async fn apply(
             kind,
             memtable_ids,
         } => {
-            let bytes = match fetch_segment(engine, framed, deferred, &db, &table, &segment).await?
+            let bytes = match fetch_segment(engine, framed, deferred, deferred_bytes, &db, &table, &segment).await?
             {
                 Some(bytes) => bytes,
                 None => {
@@ -380,7 +420,7 @@ async fn apply(
             retired,
         } => {
             for segment in &new_segments {
-                let bytes = match fetch_segment(engine, framed, deferred, &db, &table, segment).await?
+                let bytes = match fetch_segment(engine, framed, deferred, deferred_bytes, &db, &table, segment).await?
                 {
                     Some(bytes) => bytes,
                     None => {
@@ -497,7 +537,8 @@ fn table_schema(
 async fn fetch_segment(
     engine: &crate::sql::execution::Engine,
     framed: &mut Framed<tokio::net::TcpStream, MessageCodec>,
-    deferred: &mut VecDeque<(u64, ReplicationEvent)>,
+    deferred: &mut VecDeque<(u64, ReplicationEvent, u64)>,
+    deferred_bytes: &mut u64,
     db: &str,
     table: &str,
     segment: &str,
@@ -566,7 +607,15 @@ async fn fetch_segment(
                     return Err(TaibaiError::Storage("REPL_EVENT payload truncated".into()));
                 }
                 let event = ReplicationEvent::decode(&message.payload[12..12 + len])?;
-                deferred.push_back((seq, event));
+                let event_bytes = len as u64;
+                if *deferred_bytes + event_bytes > DEFERRED_EVENT_BUDGET_BYTES {
+                    return Err(TaibaiError::Storage(format!(
+                        "deferred replication events exceeded the {} byte budget                          during a segment fetch; reconnecting to resume from the                          applied sequence",
+                        DEFERRED_EVENT_BUDGET_BYTES
+                    )));
+                }
+                *deferred_bytes += event_bytes;
+                deferred.push_back((seq, event, event_bytes));
             }
             MSG_TYPE_ERROR => {
                 return Err(TaibaiError::Storage(format!(

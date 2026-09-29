@@ -375,6 +375,13 @@ fn materialize_insert_values(
         None
     };
 
+    // Everything below works on the Arc-shared table_meta snapshot and the
+    // engine handles; release the catalogs read guard before the per-row
+    // materialization. Holding it here serialized every INSERT against DDL,
+    // catalog saves and other databases' inserts for the whole (potentially
+    // huge) row loop — the fast path already released before this point.
+    drop(catalogs);
+
     let mut batch = RecordBatch::with_capacity(schema.clone(), values.len());
 
     if can_direct_materialize(&schema, &provided_by_col, &is_missing_auto_inc, values) {
@@ -423,8 +430,6 @@ fn materialize_insert_values(
             )?;
         }
     }
-
-    drop(catalogs);
 
     Ok(MaterializedInsert {
         table_meta,
@@ -615,7 +620,7 @@ fn exec_materialized_insert_batch(
         // Same condition as the hot-store feed above: when it holds, every
         // row of the batch is mirrored into the hot store.
         let hot_fed = txn_id == 0;
-        write_batch_by_partition(
+        if let Err(error) = write_batch_by_partition(
             engine,
             db,
             table,
@@ -625,7 +630,20 @@ fn exec_materialized_insert_batch(
             txn_id,
             table_lock_held,
             hot_fed,
-        )?;
+        ) {
+            if hot_fed {
+                // The hot mirror already holds this batch but the
+                // memtable/durable-tail write failed: the watermark
+                // arithmetic would treat the unfed rows as committed
+                // prefix-adjacent rows and the resident fast path would
+                // serve ghosts the client was told were never inserted.
+                // Drop the mirror entirely — it is a rebuildable
+                // optimization, and UPDATE/DELETE already disable its
+                // rebuild on invalidation.
+                engine.invalidate_hot_store(db, table);
+            }
+            return Err(error);
+        }
     }
     if let Some(batch) = pubsub_batch {
         engine.pubsub().publish(db, table, batch);

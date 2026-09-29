@@ -961,3 +961,135 @@ fn decode_selected_adaptive_gather_matches_reference() {
         assert_eq!(gathered.scalar(out_row), varchar.scalar(src_row));
     }
 }
+
+/// Regression: `count_eq_from_raw` (the single-equality COUNT fast path)
+/// must answer every stored adaptive encoding. DeltaRle and BitPacked were
+/// missing from the dispatch and failed the whole query with a storage
+/// error instead of counting.
+#[test]
+fn count_eq_from_raw_supports_delta_rle_and_bitpacked() {
+    use crate::types::scalar::ScalarValue;
+    use crate::storage::codec::column_codec::stored_encoding_tag;
+    use crate::storage::codec::predicate_scan::count_eq_from_raw;
+
+    fn count_matches(encoded: &[u8], n: usize, dt: DataType, value: ScalarValue) -> u64 {
+        count_eq_from_raw(encoded, n, &col_def(dt), &value).unwrap()
+    }
+
+    // DeltaRle shape: long repeated runs.
+    let mut runs: Vec<i64> = Vec::new();
+    for &(v, len) in &[(7i64, 300usize), (42, 400), (-9, 250), (1000, 50)] {
+        runs.extend(std::iter::repeat_n(v, len));
+    }
+    let run_col = ColumnArray::Int64 {
+        data: runs.clone(),
+        bitmap: NullBitmap::new_valid(runs.len()),
+    };
+    let (encoded, _) = encode_column_ex(&run_col, 0, runs.len()).unwrap();
+    assert_eq!(stored_encoding_tag(&encoded), Some(EncodingType::DeltaRle));
+    assert_eq!(
+        count_matches(&encoded, runs.len(), DataType::Int64, ScalarValue::Int64(Some(42))),
+        400
+    );
+    assert_eq!(
+        count_matches(&encoded, runs.len(), DataType::Int64, ScalarValue::Int64(Some(1000))),
+        50
+    );
+    assert_eq!(
+        count_matches(&encoded, runs.len(), DataType::Int64, ScalarValue::Int64(Some(43))),
+        0
+    );
+
+    // BitPacked shape: fixed-interval timestamps.
+    let n = 512;
+    let stamps = fixed_interval_timestamps(n);
+    let ts_col = ColumnArray::Timestamp {
+        data: stamps.clone(),
+        bitmap: NullBitmap::new_valid(n),
+    };
+    let (encoded, _) = encode_column_ex(&ts_col, 0, n).unwrap();
+    assert_eq!(stored_encoding_tag(&encoded), Some(EncodingType::BitPacked));
+    assert_eq!(
+        count_matches(&encoded, n, DataType::Timestamp, ScalarValue::Timestamp(Some(stamps[7]))),
+        1
+    );
+    assert_eq!(
+        count_matches(&encoded, n, DataType::Timestamp, ScalarValue::Timestamp(Some(1i64))),
+        0
+    );
+
+    // Null slots are excluded from the encoded payload: null rows never match.
+    // The column buffer itself still holds an entry for every row. Force both
+    // new encodings so the null handling of each branch is exercised.
+    let mut flags: Vec<bool> = vec![false; 950];
+    let mut all_rows: Vec<i64> = Vec::with_capacity(950);
+    for &(v, len) in &[(7i64, 300usize), (42, 400), (-9, 250)] {
+        for _ in 0..len {
+            all_rows.push(v);
+        }
+    }
+    for i in (0..950).step_by(50) {
+        flags[i] = true;
+    }
+    let bitmap = NullBitmap::from_bools(&flags);
+    let null_col = ColumnArray::Int64 {
+        data: all_rows.clone(),
+        bitmap,
+    };
+    let (encoded, _) = encode_column_ex(&null_col, 0, all_rows.len()).unwrap();
+    assert_eq!(
+        stored_encoding_tag(&encoded),
+        Some(EncodingType::DeltaRle),
+        "fixture must stay DeltaRle-encoded with nulls"
+    );
+    let counted = count_eq_from_raw(
+        &encoded,
+        all_rows.len(),
+        &col_def(DataType::Int64),
+        &ScalarValue::Int64(Some(42)),
+    )
+    .unwrap();
+    let reference = all_rows
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| **v == 42 && !flags[*i])
+        .count() as u64;
+    assert_eq!(counted, reference, "DeltaRle must exclude null rows");
+
+    // BitPacked with nulls: same exclusion guarantee. Moderate-entropy
+    // deltas (smooth decimal walk) keep the BitPacked choice under nulls.
+    let mut flags: Vec<bool> = vec![false; n];
+    let mut d = 1_000_000i64;
+    let all_rows: Vec<i64> = (0..n)
+        .map(|i| {
+            d += ((i % 5) as i64 - 2) * 100;
+            d
+        })
+        .collect();
+    for i in (0..n).step_by(11) {
+        flags[i] = true;
+    }
+    let ts_col = ColumnArray::Decimal {
+        data: all_rows.clone(),
+        bitmap: NullBitmap::from_bools(&flags),
+    };
+    let (encoded, _) = encode_column_ex(&ts_col, 0, n).unwrap();
+    assert_eq!(
+        stored_encoding_tag(&encoded),
+        Some(EncodingType::BitPacked),
+        "fixture must stay BitPacked-encoded with nulls"
+    );
+    let counted = count_eq_from_raw(
+        &encoded,
+        n,
+        &col_def(DataType::Decimal),
+        &ScalarValue::Decimal(Some(all_rows[13])),
+    )
+    .unwrap();
+    let reference = all_rows
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| **v == all_rows[13] && !flags[*i])
+        .count() as u64;
+    assert_eq!(counted, reference, "BitPacked must exclude null rows");
+}

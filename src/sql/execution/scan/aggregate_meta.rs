@@ -139,6 +139,15 @@ pub fn compute_simple_aggregate(
         // it has not been written yet (first query after restart), the
         // cached reader's already-parsed footer answers the same question.
         let reader = segment_mgr.open_scan_reader(segment_path, spec.reader_txn_id)?;
+        // Everything below folds zone maps positionally with table-schema
+        // column indices. A segment written before an ALTER ADD/DROP COLUMN
+        // has a different column layout, and a mis-indexed zone map would
+        // silently skip the segment (COUNT/SUM under-count, MIN/MAX miss the
+        // pinned default) or read the wrong column after a DROP. Decline the
+        // fast path; the regular pipeline remaps columns by name.
+        if super::strategy::reader_schema_differs(reader.schema(), table_schema) {
+            return Ok(None);
+        }
         let footer_sums = if let Some(first) = meta
             .as_ref()
             .and_then(|m| m.row_groups.first())
@@ -161,7 +170,14 @@ pub fn compute_simple_aggregate(
         // streams below with sums folded from data. Folding metadata for a
         // streaming segment would skip SUM and then cache a zero delta, so
         // the two paths are mutually exclusive.
+        //
+        // AVG is excluded from the cache-hit fold: the cache stores SUM only,
+        // and AVG needs both the sum and a non-null row count. Folding an Avg
+        // accumulator with empty col_sums would leave avg_count at zero and
+        // finalize to NULL, so a SUM+AVG query must stream whenever the
+        // footer's per-row-group sums cannot answer both.
         let sum_cache = if has_sum
+            && !has_avg
             && !sums_answerable_from_footer
             && !spec.has_predicates()
             && meta_deleted == 0

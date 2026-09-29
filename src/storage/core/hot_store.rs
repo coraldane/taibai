@@ -1821,29 +1821,16 @@ fn estimate_batch_memory(batch: &RecordBatch) -> u64 {
     let mut total: u64 = 0;
     for i in 0..batch.num_columns() {
         if let Some(col) = batch.column(i) {
-            total += (col.len() as u64) * approx_type_width(&col.data_type());
+            // Capacity-exact accounting per column. The old fixed-width table
+            // (VarChar 24 / Blob 32 / Vector 64 bytes per row) undercounted
+            // wide strings and vector columns by 10-50x, so the soft/hard
+            // memory gates let those tables blow far past their limits before
+            // the next seal-time recount noticed.
+            total += col.estimated_size_bytes() as u64;
         }
     }
     total += (batch.num_rows() as u64) * 4; // inverted-index row offsets
     total
-}
-
-fn approx_type_width(dt: &DataType) -> u64 {
-    match dt {
-        DataType::Bool | DataType::Int8 | DataType::UInt8 => 1,
-        DataType::Int16 | DataType::UInt16 => 2,
-        DataType::Int32 | DataType::UInt32 | DataType::Date | DataType::Float32 => 4,
-        DataType::Int64
-        | DataType::UInt64
-        | DataType::Float64
-        | DataType::Decimal
-        | DataType::Time
-        | DataType::Timestamp
-        | DataType::Interval => 8,
-        DataType::VarChar => 24,
-        DataType::Blob => 32,
-        DataType::Vector => 64,
-    }
 }
 
 /// Registry of resident hot stores, keyed by `(db, table)`.

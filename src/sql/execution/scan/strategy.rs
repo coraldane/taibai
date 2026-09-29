@@ -661,7 +661,7 @@ fn read_row_group_with_schema_mapping(
     RecordBatch::try_new(Schema::new(col_defs), columns)
 }
 
-fn reader_schema_differs(reader_schema: &Schema, table_schema: &Schema) -> bool {
+pub(super) fn reader_schema_differs(reader_schema: &Schema, table_schema: &Schema) -> bool {
     if reader_schema.num_columns() != table_schema.num_columns() {
         return true;
     }

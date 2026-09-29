@@ -507,12 +507,15 @@ impl RepLog {
         while state.ring.len() > self.capacity {
             state.ring.pop_front();
         }
-        // Fan out. A session that cannot keep up within the timeout is
-        // dropped: it will reconnect, find its applied seq behind the ring
-        // start, and go through re-bootstrap. Losing the session is better
-        // than stalling every write on the primary.
+        // Fan out. A session that cannot keep up is dropped: it will
+        // reconnect, resume from its persisted applied seq, and re-pull the
+        // ring history. Losing the session is far better than stalling the
+        // commit thread — this runs on the only group-commit/fsync thread,
+        // so a slow standby used to freeze every table's writes for up to
+        // the full timeout per event. The bounded per-session queue absorbs
+        // normal jitter; only a genuinely wedged consumer trips the drop.
         state.sessions.retain(|sink| {
-            match sink.send_timeout((seq, Arc::clone(&event)), std::time::Duration::from_secs(5)) {
+            match sink.send_timeout((seq, Arc::clone(&event)), std::time::Duration::from_millis(500)) {
                 Ok(()) => true,
                 Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
                     tracing::warn!("replication session fell behind and was dropped");
@@ -532,6 +535,14 @@ impl RepLog {
 
     /// Durable seq high-water (tmp + rename). Called from the commit thread.
     fn persist_seq(&self, seq: u64) {
+        // A stale caller (a late ack for a seq another session already drove
+        // past) must not downgrade the durable high-water: a primary restart
+        // resumes from this file, and resuming below a seq a standby already
+        // applied re-stamps consumed seqs — the standby then skips the
+        // re-delivered events as stale and silently loses them.
+        if seq <= self.persisted_seq.load(Ordering::Acquire) {
+            return;
+        }
         let guard = self.seq_file.lock().unwrap();
         let Some(path) = guard.as_ref() else {
             return;
@@ -566,6 +577,19 @@ impl RepLog {
     /// Flush the seq file on shutdown.
     pub fn flush_seq(&self) {
         self.persist_seq(self.current_seq());
+    }
+
+    /// A standby reported `seq` durably applied (REPL_ACK, or its last_seq at
+    /// REPL_HELLO). Advance the persisted high-water to it: the periodic
+    /// `persist_every` cadence alone leaves the seq file up to 255 events
+    /// behind, and a primary crash then reuses seqs the standby already
+    /// consumed — the standby skips the re-delivered events as stale and
+    /// silently loses them. Monotonic; acks for already-persisted seqs are
+    /// no-ops, so the steady state adds no writes.
+    pub fn note_standby_applied(&self, seq: u64) {
+        if seq > self.persisted_seq.load(Ordering::Acquire) {
+            self.persist_seq(seq);
+        }
     }
 
     pub fn current_seq(&self) -> u64 {

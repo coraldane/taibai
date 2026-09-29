@@ -467,6 +467,17 @@ fn count_eq_adaptive(
             let values = crate::storage::codec::column_codec::decode_i64_delta_payload(payload)?;
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
+        crate::storage::codec::encoding::EncodingType::DeltaRle => {
+            let values = crate::storage::codec::column_codec::decode_i64_delta_rle_payload(
+                payload,
+                row_count,
+            )?;
+            count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
+        }
+        crate::storage::codec::encoding::EncodingType::BitPacked => {
+            let values = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload)?;
+            count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
+        }
         crate::storage::codec::encoding::EncodingType::Dictionary
             if col_def.data_type == DataType::VarChar =>
         {
