@@ -61,6 +61,36 @@ pub enum ReplicationEvent {
         kind: SegmentUpdateKind,
         memtable_ids: Vec<Uuid>,
     },
+    /// DELETE tombstones materialized into a segment footer. The bitmap is
+    /// the segment's ABSOLUTE delete state (not a delta), so standby apply
+    /// is idempotent.
+    DeleteFooterRewrite {
+        db: String,
+        table: String,
+        segment: String,
+        bitmap: Vec<u8>,
+        deleted_count: u64,
+    },
+    /// Compaction / UPDATE segment replacement: `new_segments` replace
+    /// `retired`. Standby fetches each new segment, writes it, removes the
+    /// retired files.
+    SegmentsReplaced {
+        db: String,
+        table: String,
+        new_segments: Vec<String>,
+        retired: Vec<String>,
+    },
+    /// Whole segment files removed (TTL partition purge, DROP cleanup).
+    SegmentsRemoved {
+        db: String,
+        table: String,
+        segments: Vec<String>,
+    },
+    /// Full catalog snapshot for one database (DDL replication). Standby
+    /// replaces its `<data>/meta/catalogs/<db>.json` and reloads.
+    CatalogSnapshot { db: String, json: Vec<u8> },
+    /// Full auth store snapshot (user/role/GRANT statements).
+    AuthSnapshot { json: Vec<u8> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +120,11 @@ impl SegmentUpdateKind {
 
 const TAG_TAIL_APPEND: u16 = 1;
 const TAG_SEGMENT_UPDATE: u16 = 2;
+const TAG_DELETE_FOOTER_REWRITE: u16 = 3;
+const TAG_SEGMENTS_REPLACED: u16 = 4;
+const TAG_SEGMENTS_REMOVED: u16 = 5;
+const TAG_CATALOG_SNAPSHOT: u16 = 6;
+const TAG_AUTH_SNAPSHOT: u16 = 7;
 
 impl ReplicationEvent {
     pub fn encode(&self) -> Vec<u8> {
@@ -130,6 +165,63 @@ impl ReplicationEvent {
                 for id in memtable_ids {
                     buf.extend_from_slice(id.as_bytes());
                 }
+            }
+            Self::DeleteFooterRewrite {
+                db,
+                table,
+                segment,
+                bitmap,
+                deleted_count,
+            } => {
+                buf.extend_from_slice(&TAG_DELETE_FOOTER_REWRITE.to_le_bytes());
+                put_str(&mut buf, db);
+                put_str(&mut buf, table);
+                put_str(&mut buf, segment);
+                buf.extend_from_slice(deleted_count.to_le_bytes().as_slice());
+                buf.extend_from_slice(&(bitmap.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bitmap);
+            }
+            Self::SegmentsReplaced {
+                db,
+                table,
+                new_segments,
+                retired,
+            } => {
+                buf.extend_from_slice(&TAG_SEGMENTS_REPLACED.to_le_bytes());
+                put_str(&mut buf, db);
+                put_str(&mut buf, table);
+                buf.extend_from_slice(&(new_segments.len() as u32).to_le_bytes());
+                for name in new_segments {
+                    put_str(&mut buf, name);
+                }
+                buf.extend_from_slice(&(retired.len() as u32).to_le_bytes());
+                for name in retired {
+                    put_str(&mut buf, name);
+                }
+            }
+            Self::SegmentsRemoved {
+                db,
+                table,
+                segments,
+            } => {
+                buf.extend_from_slice(&TAG_SEGMENTS_REMOVED.to_le_bytes());
+                put_str(&mut buf, db);
+                put_str(&mut buf, table);
+                buf.extend_from_slice(&(segments.len() as u32).to_le_bytes());
+                for name in segments {
+                    put_str(&mut buf, name);
+                }
+            }
+            Self::CatalogSnapshot { db, json } => {
+                buf.extend_from_slice(&TAG_CATALOG_SNAPSHOT.to_le_bytes());
+                put_str(&mut buf, db);
+                buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+                buf.extend_from_slice(json);
+            }
+            Self::AuthSnapshot { json } => {
+                buf.extend_from_slice(&TAG_AUTH_SNAPSHOT.to_le_bytes());
+                buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+                buf.extend_from_slice(json);
             }
         }
         buf
@@ -182,6 +274,50 @@ impl ReplicationEvent {
                     memtable_ids,
                 })
             }
+            TAG_DELETE_FOOTER_REWRITE => {
+                let db = decoder.read_str("db")?;
+                let table = decoder.read_str("table")?;
+                let segment = decoder.read_str("segment")?;
+                let deleted_count = decoder.read_u64()?;
+                let bitmap_len = decoder.read_u32()? as usize;
+                let bitmap = decoder.take(bitmap_len, "bitmap")?.to_vec();
+                Ok(Self::DeleteFooterRewrite {
+                    db,
+                    table,
+                    segment,
+                    bitmap,
+                    deleted_count,
+                })
+            }
+            TAG_SEGMENTS_REPLACED => {
+                let db = decoder.read_str("db")?;
+                let table = decoder.read_str("table")?;
+                let new_segments = decode_str_vec(&mut decoder)?;
+                let retired = decode_str_vec(&mut decoder)?;
+                Ok(Self::SegmentsReplaced {
+                    db,
+                    table,
+                    new_segments,
+                    retired,
+                })
+            }
+            TAG_SEGMENTS_REMOVED => {
+                let db = decoder.read_str("db")?;
+                let table = decoder.read_str("table")?;
+                let segments = decode_str_vec(&mut decoder)?;
+                Ok(Self::SegmentsRemoved { db, table, segments })
+            }
+            TAG_CATALOG_SNAPSHOT => {
+                let db = decoder.read_str("db")?;
+                let json_len = decoder.read_u32()? as usize;
+                let json = decoder.take(json_len, "catalog json")?.to_vec();
+                Ok(Self::CatalogSnapshot { db, json })
+            }
+            TAG_AUTH_SNAPSHOT => {
+                let json_len = decoder.read_u32()? as usize;
+                let json = decoder.take(json_len, "auth json")?.to_vec();
+                Ok(Self::AuthSnapshot { json })
+            }
             tag => Err(TaibaiError::Storage(format!(
                 "unknown replication event tag {tag}"
             ))),
@@ -189,11 +325,14 @@ impl ReplicationEvent {
     }
 
     /// `(db, table)` the event touches; used for standby-side routing.
-    pub fn topic(&self) -> (&str, &str) {
+    pub fn topic(&self) -> Option<(&str, &str)> {
         match self {
-            Self::TailAppend { db, table, .. } | Self::SegmentUpdate { db, table, .. } => {
-                (db, table)
-            }
+            Self::TailAppend { db, table, .. }
+            | Self::SegmentUpdate { db, table, .. }
+            | Self::DeleteFooterRewrite { db, table, .. }
+            | Self::SegmentsReplaced { db, table, .. }
+            | Self::SegmentsRemoved { db, table, .. } => Some((db, table)),
+            Self::CatalogSnapshot { .. } | Self::AuthSnapshot { .. } => None,
         }
     }
 }
@@ -238,6 +377,19 @@ impl<'a> Decoder<'a> {
         String::from_utf8(raw.to_vec())
             .map_err(|_| TaibaiError::Storage(format!("invalid UTF-8 in {what}")))
     }
+
+    fn read_str_vec(&mut self, what: &str) -> Result<Vec<String>> {
+        let count = self.read_u32()? as usize;
+        let mut out = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            out.push(self.read_str(what)?);
+        }
+        Ok(out)
+    }
+}
+
+fn decode_str_vec(decoder: &mut Decoder<'_>) -> Result<Vec<String>> {
+    decoder.read_str_vec("names")
 }
 
 

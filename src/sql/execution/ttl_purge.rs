@@ -234,6 +234,7 @@ fn remove_partition_files(
     mgr: &crate::storage::segment_manager::SegmentManager,
 ) -> Result<i64> {
     let mut file_rows: i64 = 0;
+    let mut removed: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(table_dir)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -266,11 +267,13 @@ fn remove_partition_files(
             tracing::warn!(path = %path.display(), error = %error, "ttl purge: failed to remove segment file");
             continue;
         }
+        removed.push(name.to_string());
         file_rows += live_rows;
         if sidecar.exists() {
             let _ = std::fs::remove_file(&sidecar);
         }
     }
+    mgr.emit_segments_removed(table_dir, &removed);
     Ok(file_rows)
 }
 

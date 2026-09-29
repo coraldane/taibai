@@ -372,6 +372,22 @@ impl Engine {
         &self.index_manager
     }
 
+    /// Standby replication apply: replace an in-memory catalog from its
+    /// on-disk JSON (the snapshot was written by the applier).
+    pub fn reload_catalog(&self, db: &str) -> Result<()> {
+        let meta_dir = self.data_dir.join("meta");
+        let catalog = crate::storage::catalog::schema::DatabaseCatalog::load_or_create(
+            &meta_dir, db,
+        )?;
+        self.catalogs.write().unwrap().insert(db.to_string(), catalog);
+        Ok(())
+    }
+
+    /// Standby replication apply: DROP DATABASE.
+    pub fn remove_catalog(&self, db: &str) {
+        self.catalogs.write().unwrap().remove(db);
+    }
+
     pub fn commit_session_txn(&self, session: &mut Session) -> Result<()> {
         if !session.in_txn() {
             return Err(TaibaiError::Sql("no active transaction".into()));

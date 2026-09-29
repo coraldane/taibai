@@ -154,13 +154,27 @@ async fn connect_and_stream(
     );
 
     let mut deferred: VecDeque<(u64, ReplicationEvent)> = VecDeque::new();
+    // Delete tombstones for segments the standby has not received yet: the
+    // primary can tombstone an ACTIVE segment before any SegmentUpdate
+    // shipped it. Queued rewrites are applied when the segment materializes.
+    let mut pending_rewrites: std::collections::HashMap<String, Vec<(Vec<u8>, u64)>> =
+        std::collections::HashMap::new();
     let mut since_ack = 0u64;
     loop {
         if stop.load(std::sync::atomic::Ordering::Acquire) {
             return Err(TaibaiError::Storage("applier stopped".into()));
         }
         if let Some((seq, event)) = deferred.pop_front() {
-            apply(engine, &applied, seq, event, &mut framed, &mut deferred).await?;
+            apply(
+                engine,
+                &applied,
+                seq,
+                event,
+                &mut framed,
+                &mut deferred,
+                &mut pending_rewrites,
+            )
+            .await?;
             since_ack += 1;
             if since_ack >= ACK_EVERY {
                 send_ack(&mut framed, applied.applied()).await?;
@@ -200,7 +214,16 @@ async fn connect_and_stream(
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     return Err(TaibaiError::Storage("applier stopped".into()));
                 }
-                apply(engine, &applied, seq, event, &mut framed, &mut deferred).await?;
+                apply(
+                    engine,
+                    &applied,
+                    seq,
+                    event,
+                    &mut framed,
+                    &mut deferred,
+                    &mut pending_rewrites,
+                )
+                .await?;
                 since_ack += 1;
                 if since_ack >= ACK_EVERY {
                     send_ack(&mut framed, applied.applied()).await?;
@@ -219,11 +242,9 @@ async fn apply(
     applied: &AppliedSeqState,
     seq: u64,
     event: ReplicationEvent,
-    framed: &mut Framed<
-        tokio::net::TcpStream,
-        MessageCodec,
-    >,
+    framed: &mut Framed<tokio::net::TcpStream, MessageCodec>,
     deferred: &mut VecDeque<(u64, ReplicationEvent)>,
+    pending_rewrites: &mut std::collections::HashMap<String, Vec<(Vec<u8>, u64)>>,
 ) -> Result<()> {
     match event {
         ReplicationEvent::TailAppend {
@@ -308,6 +329,124 @@ async fn apply(
             if kind == SegmentUpdateKind::Final || !memtable_ids.is_empty() {
                 engine.memtable_manager().retire_replicated_memtables(&memtable_ids);
             }
+            // The fetched bytes carry the primary's CURRENT tombstone state,
+            // which includes any queued rewrites for this segment.
+            pending_rewrites.remove(&segment);
+            applied.advance(seq, true)?;
+        }
+        ReplicationEvent::DeleteFooterRewrite {
+            db,
+            table,
+            segment,
+            bitmap,
+            deleted_count,
+        } => {
+            let path = engine.data_dir().join(&db).join(&table).join(&segment);
+            if path.exists() {
+                crate::storage::segment::SegmentReader::rewrite_footer_with_deletes(
+                    &path, &bitmap, deleted_count,
+                )?;
+            } else {
+                // Segment not shipped yet: queue; applied when it materializes.
+                pending_rewrites
+                    .entry(segment)
+                    .or_default()
+                    .push((bitmap, deleted_count));
+            }
+            applied.advance(seq, true)?;
+        }
+        ReplicationEvent::SegmentsReplaced {
+            db,
+            table,
+            new_segments,
+            retired,
+        } => {
+            for segment in &new_segments {
+                let bytes = fetch_segment(engine, framed, deferred, &db, &table, segment).await?;
+                let dest = engine.data_dir().join(&db).join(&table).join(segment);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let tmp = dest.with_extension("repl_tmp");
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::File::create(&tmp)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                }
+                crate::storage::segment::meta::atomic_replace(&tmp, &dest)?;
+            }
+            for segment in retired.iter().chain(new_segments.iter()) {
+                pending_rewrites.remove(segment);
+            }
+            for segment in &retired {
+                let path = engine.data_dir().join(&db).join(&table).join(segment);
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_file(
+                        crate::storage::segment::meta::sidecar_meta_path(&path),
+                    );
+                }
+            }
+            applied.advance(seq, true)?;
+        }
+        ReplicationEvent::SegmentsRemoved {
+            db,
+            table,
+            segments,
+        } => {
+            for segment in &segments {
+                pending_rewrites.remove(segment);
+                let path = engine.data_dir().join(&db).join(&table).join(segment);
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_file(
+                        crate::storage::segment::meta::sidecar_meta_path(&path),
+                    );
+                }
+            }
+            applied.advance(seq, true)?;
+        }
+        ReplicationEvent::CatalogSnapshot { db, json } => {
+            let dest = engine
+                .data_dir()
+                .join("meta")
+                .join("catalogs")
+                .join(format!("{db}.json"));
+            if json.is_empty() {
+                // DROP DATABASE: the snapshot is absent on the primary.
+                let _ = std::fs::remove_file(&dest);
+                engine.remove_catalog(&db);
+            } else {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let tmp = dest.with_extension("repl_tmp");
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::File::create(&tmp)?;
+                    file.write_all(&json)?;
+                    file.sync_all()?;
+                }
+                crate::storage::segment::meta::atomic_replace(&tmp, &dest)?;
+                engine.reload_catalog(&db)?;
+            }
+            applied.advance(seq, true)?;
+        }
+        ReplicationEvent::AuthSnapshot { json } => {
+            let dest = engine.data_dir().join("meta").join("auth.json");
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = dest.with_extension("repl_tmp");
+            {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(&json)?;
+                file.sync_all()?;
+            }
+            crate::storage::segment::meta::atomic_replace(&tmp, &dest)?;
+            engine.auth_manager().reload()?;
             applied.advance(seq, true)?;
         }
     }

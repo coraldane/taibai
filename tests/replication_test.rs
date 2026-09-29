@@ -347,6 +347,8 @@ async fn standby_converges_and_survives_restart() {
         let mut client = client(&primary.addr).await;
         execute_ok(&mut client, "INSERT INTO t VALUES (1000, 1000)").await;
     }
+    // R2 phases continue against the resumed standby engine.
+    let standby_engine = Arc::clone(&reopened);
     wait_for(
         &reopened,
         "row after standby restart",
@@ -354,6 +356,63 @@ async fn standby_converges_and_survives_restart() {
         |engine| count_rows(engine, "SELECT COUNT(v) FROM t") == 502,
     )
     .await;
+
+    // ---- R2: DELETE / UPDATE / compaction / DDL replication ----
+    // Recreate the standby from the primary's state snapshot: simplest R2
+    // bootstrap here is a fresh standby dir replaying from seq 0 is NOT
+    // possible (the ring may have evicted); instead keep the SAME standby
+    // that already converged and continue the stream.
+    {
+        let mut client = client(&primary.addr).await;
+        // UPDATE through segment rewrite (replaces a segment on the primary).
+        execute_ok(&mut client, "UPDATE t SET v = 5000 WHERE id = 499").await;
+        // DELETE with flushed rows (tombstone rewrite).
+        execute_ok(&mut client, "DELETE FROM t WHERE id <= 2").await;
+        // Compaction (segment replacement event).
+        execute_ok(&mut client, "OPTIMIZE TABLE t").await;
+        // DDL replication: a NEW table becomes queryable on the standby.
+        execute_ok(&mut client, "CREATE TABLE r2 (id INT32, v INT64)").await;
+        execute_ok(&mut client, "INSERT INTO r2 VALUES (7, 77)").await;
+    }
+    // wait for DELETE effect: rows 0,1,2 gone (was 502 rows: 0..500 + 999 + 1000)
+    wait_for(
+        &standby_engine,
+        "DELETE replicated",
+        Duration::from_secs(20),
+        |engine| count_rows(engine, "SELECT COUNT(v) FROM t") == 499,
+    );
+    // UPDATE effect visible.
+    wait_for(
+        &standby_engine,
+        "UPDATE replicated",
+        Duration::from_secs(20),
+        |engine| count_rows(engine, "SELECT v FROM t WHERE id = 499") == 0,
+    );
+    {
+        let mut session = taibai::net::session::Session::new("root".into(), "main".into());
+        match standby_engine.execute(&mut session, "SELECT v FROM t WHERE id = 499") {
+            Ok(ExecResult::Query { batches, .. }) => {
+                let mut values = Vec::new();
+                for b in &batches {
+                    for r in 0..b.num_rows() {
+                        values.push(b.scalar(r, 0));
+                    }
+                }
+                assert!(
+                    values.contains(&Some(taibai::types::scalar::ScalarValue::Int64(Some(5000)))),
+                    "updated value must be visible on standby: {values:?}"
+                );
+            }
+            other => panic!("probe failed: {other:?}"),
+        }
+    }
+    // DDL + new-table rows replicated.
+    wait_for(
+        &standby_engine,
+        "DDL + rows replicated",
+        Duration::from_secs(20),
+        |engine| count_rows(engine, "SELECT COUNT(v) FROM r2") == 1,
+    );
 
     let _ = primary.shutdown_tx.send(());
 }

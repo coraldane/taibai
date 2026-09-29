@@ -112,8 +112,84 @@ impl SegmentManager {
         self.rep_log.get()
     }
 
+    /// Emit a `DeleteFooterRewrite` (derive db/table from the segment path).
+    pub(crate) fn emit_delete_footer_rewrite(
+        &self,
+        path: &Path,
+        bitmap: &[u8],
+        deleted_count: u64,
+    ) {
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let Some((db, table)) = db_table_from_segment_path(path) else {
+            return;
+        };
+        let Some(segment) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        log.enqueue(crate::storage::replication::ReplicationEvent::DeleteFooterRewrite {
+            db,
+            table,
+            segment: segment.to_string(),
+            bitmap: bitmap.to_vec(),
+            deleted_count,
+        });
+    }
 
-/// Current active segment file name for `(db, table, partition)`.
+    /// Emit a `SegmentsReplaced` after a compaction/UPDATE replacement commit
+    /// (derive db/table from the final segment path).
+    pub(crate) fn emit_segments_replaced(&self, final_path: &Path, old_segments: &[PathBuf]) {
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let Some((db, table)) = db_table_from_segment_path(final_path) else {
+            return;
+        };
+        let Some(new_name) = final_path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let retired = old_segments
+            .iter()
+            .filter(|old| old.as_path() != final_path)
+            .filter_map(|old| old.file_name().and_then(|name| name.to_str()))
+            .map(str::to_string)
+            .collect();
+        log.enqueue(crate::storage::replication::ReplicationEvent::SegmentsReplaced {
+            db,
+            table,
+            new_segments: vec![new_name.to_string()],
+            retired,
+        });
+    }
+
+    /// Emit a `SegmentsRemoved` for a TTL/DROP purge batch (db/table derived
+    /// from the table dir).
+    pub(crate) fn emit_segments_removed(&self, table_dir: &Path, segments: &[String]) {
+        if segments.is_empty() {
+            return;
+        }
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let Some(table) = table_dir.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let Some(db) = table_dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+        else {
+            return;
+        };
+        log.enqueue(crate::storage::replication::ReplicationEvent::SegmentsRemoved {
+            db: db.to_string(),
+            table: table.to_string(),
+            segments: segments.to_vec(),
+        });
+    }
+
+    /// Current active segment file name for `(db, table, partition)`.
     pub(crate) fn active_segment_name_for(
         &self,
         db: &str,
@@ -852,10 +928,24 @@ impl SegmentManager {
 
         remove_sidecar_meta(tmp_path)?;
         let _ = self.open_reader_cached(final_path);
+        self.emit_segments_replaced(final_path, old_segments);
         Ok(())
     }
 
     pub fn rewrite_delete_footer(
+        &self,
+        path: &Path,
+        bitmap: &[u8],
+        deleted_count: u64,
+    ) -> Result<()> {
+        let result = self.rewrite_delete_footer_inner(path, bitmap, deleted_count);
+        if result.is_ok() {
+            self.emit_delete_footer_rewrite(path, bitmap, deleted_count);
+        }
+        result
+    }
+
+    fn rewrite_delete_footer_inner(
         &self,
         path: &Path,
         bitmap: &[u8],
@@ -1681,4 +1771,16 @@ pub mod manager_core_test_support {
         replace_journal_path as replace_journal_path_for_test,
         write_replace_journal as write_replace_journal_for_test,
     };
+}
+
+/// `<data>/<db>/<table>/<segment>` path -> `(db, table)`.
+fn db_table_from_segment_path(path: &Path) -> Option<(String, String)> {
+    let table = path.parent()?.file_name()?.to_string_lossy().to_string();
+    let db = path
+        .parent()?
+        .parent()?
+        .file_name()?
+        .to_string_lossy()
+        .to_string();
+    Some((db, table))
 }

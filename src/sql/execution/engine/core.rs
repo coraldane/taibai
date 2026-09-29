@@ -279,7 +279,42 @@ impl Engine {
         if stmts.is_empty() {
             return Err(TaibaiError::Sql("empty query".into()));
         }
-        self.execute_stmt(session, &stmts[0])
+        let result = self.execute_stmt(session, &stmts[0]);
+        // DDL/auth statements mutate the catalog or auth store in place; a
+        // replication primary ships a full snapshot so standbys reload.
+        if result.is_ok() {
+            if let Some((kind, db)) = Self::replication_snapshot_target(&stmts[0], &session.database) {
+                let (path, event) = match kind {
+                    "catalog" => {
+                        let path = self
+                            .data_dir()
+                            .join("meta")
+                            .join("catalogs")
+                            .join(format!("{db}.json"));
+                        // A missing file means the database was dropped; the
+                        // standby apply treats an empty payload as removal.
+                        let json = std::fs::read(&path).unwrap_or_default();
+                        let event = crate::storage::replication::ReplicationEvent::CatalogSnapshot {
+                            db,
+                            json,
+                        };
+                        (path, event)
+                    }
+                    _ => {
+                        let path = self.data_dir().join("meta").join("auth.json");
+                        let json = std::fs::read(&path).unwrap_or_default();
+                        let event =
+                            crate::storage::replication::ReplicationEvent::AuthSnapshot { json };
+                        (path, event)
+                    }
+                };
+                let _ = &path;
+                if let Some(log) = self.rep_log() {
+                    log.enqueue(event);
+                }
+            }
+        }
+        result
     }
 
     pub fn execute_streaming_query<F>(
@@ -524,6 +559,40 @@ fn transaction_forbidden_verb(stmt: &Statement) -> Option<&'static str> {
         _ => None,
     }
 }
+
+    /// Which replication snapshot a successful DDL/auth statement implies:
+    /// `("catalog", db)` ships the database's catalog JSON, `("auth", _)`
+    /// ships the auth store JSON.
+    fn replication_snapshot_target(
+        stmt: &Statement,
+        default_db: &str,
+    ) -> Option<(&'static str, String)> {
+        let table_db = |name: &crate::sql::parser::ast::ObjectName| {
+            Some(("catalog", name.effective_database(default_db).to_string()))
+        };
+        match stmt {
+            Statement::CreateTable { name, .. }
+            | Statement::DropTable { name, .. }
+            | Statement::AlterTable { name, .. }
+            | Statement::Truncate { table: name }
+            | Statement::CreateIndex { table: name, .. }
+            | Statement::DropIndex { table: name, .. }
+            | Statement::RebuildUniqueIndex { table: name, .. }
+            | Statement::AnalyzeTable { table: name } => table_db(name),
+            Statement::CreateDatabase { name, .. }
+            | Statement::DropDatabase { name, .. } => {
+                Some(("catalog", name.clone()))
+            }
+            Statement::CreateUser { .. }
+            | Statement::AlterUser { .. }
+            | Statement::DropUser { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::Grant { .. }
+            | Statement::Revoke { .. } => Some(("auth", String::new())),
+            _ => None,
+        }
+    }
 
 fn stmt_name(stmt: &Statement) -> &'static str {
     match stmt {

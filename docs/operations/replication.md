@@ -38,6 +38,14 @@ replication:
 - `SegmentUpdate`（`Prefix`/`Final`）：flush 后活动段的可见前缀推进、seal 后
   段定稿。事件只带元数据；备机按需用 `REPL_SEGMENT_FETCH` 拉取段字节，
   tmp+rename 原子落盘，然后清理被覆盖的 tail 与 memtable。
+- `DeleteFooterRewrite`：DELETE/REPLACE 的段级墓碑。位图是段的绝对删除
+  状态（非增量），备机幂等重写本地 footer；段尚未送达时先排队，段到位后
+  补应用。
+- `SegmentsReplaced`：compaction/UPDATE 的段替换。备机拉取新段、删除退役段。
+- `SegmentsRemoved`：TTL 分区清理删除的段文件。
+- `CatalogSnapshot`：DDL 后整库 catalog JSON 快照（空载荷 = DROP DATABASE）。
+  备机原子替换并重载内存 catalog——**主库建表后备机立即可查询**。
+- `AuthSnapshot`：用户/角色/授权语句后的 auth.json 快照。
 
 seq 高水位持久化在 `<data>/wal/replication_seq`（主）与
 `<data>/wal/replication_applied`（备），崩溃/重启后从持久化位点续传。
@@ -68,17 +76,15 @@ seq 高水位持久化在 `<data>/wal/replication_seq`（主）与
 REPL_HELLO 要求登录会话与 hello 用户一致，且用户持有 `REPLICATION` 权限
 （`GRANT REPLICATION ON *.* TO ...`；root 的 ALL 覆盖）。
 
-## R1 已知边界
+## 已知边界
 
-- **DDL 不复制**：备机的 catalog 来自 bootstrap 备份；主库建表后需要重新
-  引导（R2 的 CatalogSnapshot 事件解决）。
-- **DELETE/UPDATE/compaction/TTL 事件未实现**（R2）：这些操作在主库执行后
-  备机不会看到效果；R1 的事件集覆盖 INSERT 主链路与 flush/seal。
 - **hot 表**：备机仅在启动时 warmup，无实时镜像。
 - **故障转移为手动**：停备机 applier、去掉 `replication.role` 配置、以普通
-  引擎重启即可提升；主库侧无 fencing（R1 假设单写者纪律）。
-- **TLS**：复制通道当前为明文 TCP，跨不可信网络部署请在 R2 前使用隧道或
-  等待 TLS 客户端支持。
+  引擎重启即可提升；主库侧无 fencing（假设单写者纪律）。
+- **TLS**：复制通道当前为明文 TCP，跨不可信网络部署请使用隧道。
+- **DROP TABLE 的段文件清理**：catalog 快照使表在备机立即不可见，遗留的
+  段文件待未来 GC 事件清理。
+- **引导仍需短暂停主库**：在线快照（不停机 bootstrap）是后续项。
 
 ## 代码索引
 

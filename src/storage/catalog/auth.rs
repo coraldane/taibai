@@ -490,6 +490,14 @@ impl AuthManager {
         })
     }
 
+    /// Standby replication apply: re-read the auth store from a snapshot
+    /// that the applier already wrote to `path`.
+    pub fn reload(&self) -> Result<()> {
+        let store = AuthStore::load_or_create(&self.path)?;
+        *self.store.write().unwrap() = store;
+        Ok(())
+    }
+
     pub fn create_user(&self, name: &str, password: &str) -> Result<()> {
         let mut store = self.store.write().unwrap();
         store.create_user(name, password)?;
