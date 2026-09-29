@@ -1065,11 +1065,16 @@ fn grouped_output_schema(
     Schema::new(columns)
 }
 
-fn aggregate_spill_schema() -> Schema {
-    Schema::new(vec![
-        ColumnDef::new("group_key", DataType::VarChar),
-        ColumnDef::new("aggregate_state", DataType::VarChar),
-    ])
+fn aggregate_spill_schema(key_types: &[DataType]) -> Schema {
+    // Typed key columns: the JSON string encoding used before collapsed NaN
+    // to null, so NULL and NaN group keys merged into one group on restore.
+    let mut columns: Vec<ColumnDef> = key_types
+        .iter()
+        .enumerate()
+        .map(|(idx, data_type)| ColumnDef::new(&format!("group_key_{idx}"), *data_type))
+        .collect();
+    columns.push(ColumnDef::new("aggregate_state", DataType::VarChar));
+    Schema::new(columns)
 }
 
 fn spill_group_run(
@@ -1077,30 +1082,41 @@ fn spill_group_run(
     group_keys: &[(Vec<u8>, Vec<ScalarValue>)],
     spill_rows: usize,
 ) -> Result<SpillFile> {
-    let mut entries = Vec::with_capacity(groups.len());
-    for (key, scalars) in group_keys {
-        if let Some(accumulators) = groups.get(key) {
-            let encoded_key = serde_json::to_string(scalars).map_err(|error| {
-                TaibaiError::Internal(format!("failed to encode aggregate spill key: {error}"))
-            })?;
-            entries.push((encoded_key, accumulators));
-        }
-    }
-    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    // Order by the in-memory byte key: the merge compares exactly these
+    // bytes, and unlike the old JSON-string ordering they keep NaN and NULL
+    // distinct. Keys spill as typed columns (lossless round-trip for output).
+    let mut entries = group_keys
+        .iter()
+        .filter_map(|(key, scalars)| {
+            groups.get(key).map(|accumulators| (key, scalars, accumulators))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
 
-    let schema = aggregate_spill_schema();
+    let key_types: Vec<DataType> = group_keys
+        .first()
+        .map(|(_, scalars)| scalars.iter().map(ScalarValue::data_type).collect())
+        .unwrap_or_default();
+    let schema = aggregate_spill_schema(&key_types);
     let batch_schema = schema.clone();
     let batches = entries.chunks(spill_rows.max(1)).map(move |chunk| {
-        let mut key_column = ColumnArray::empty(DataType::VarChar);
+        let mut key_columns: Vec<ColumnArray> = key_types
+            .iter()
+            .map(|data_type| ColumnArray::empty(*data_type))
+            .collect();
         let mut state_column = ColumnArray::empty(DataType::VarChar);
-        for (key, accumulators) in chunk {
+        for (_, scalars, accumulators) in chunk {
             let state = serde_json::to_string(accumulators).map_err(|error| {
                 TaibaiError::Internal(format!("failed to encode aggregate spill state: {error}"))
             })?;
-            key_column.push(&ScalarValue::VarChar(Some(key.clone())))?;
+            for (column, value) in key_columns.iter_mut().zip(scalars.iter()) {
+                column.push(value)?;
+            }
             state_column.push(&ScalarValue::VarChar(Some(state)))?;
         }
-        RecordBatch::try_new(batch_schema.clone(), vec![key_column, state_column])
+        let mut columns = key_columns;
+        columns.push(state_column);
+        RecordBatch::try_new(batch_schema.clone(), columns)
     });
     SpillFile::write_batches_from_iter(schema, batches, spill_rows)
 }
@@ -1141,18 +1157,26 @@ impl GroupSpillCursor {
         Ok(())
     }
 
-    fn current(&self) -> Result<(String, String)> {
+    /// Byte key (the merge identity, identical to the in-memory group-key
+    /// encoding), the scalar values for output reconstruction, and the JSON
+    /// accumulator state.
+    fn current(&self) -> Result<(Vec<u8>, Vec<ScalarValue>, String)> {
         let batch = self
             .batch
             .as_ref()
             .ok_or_else(|| TaibaiError::Internal("aggregate spill cursor exhausted".into()))?;
-        let key = match batch.scalar(self.row, 0) {
-            Some(ScalarValue::VarChar(Some(value))) => value,
-            _ => {
-                return Err(TaibaiError::Internal("invalid aggregate spill key".into()));
-            }
-        };
-        let state = match batch.scalar(self.row, 1) {
+        let key_columns = batch.num_columns() - 1; // trailing state column
+        let mut bytes = Vec::new();
+        let mut scalars = Vec::with_capacity(key_columns);
+        for column_idx in 0..key_columns {
+            batch.column(column_idx).ok_or_else(|| {
+                TaibaiError::Internal("invalid aggregate spill key column".into())
+            })?.encode_key_at(self.row, &mut bytes);
+            scalars.push(batch.scalar(self.row, column_idx).ok_or_else(|| {
+                TaibaiError::Internal("invalid aggregate spill key scalar".into())
+            })?);
+        }
+        let state = match batch.scalar(self.row, key_columns) {
             Some(ScalarValue::VarChar(Some(value))) => value,
             _ => {
                 return Err(TaibaiError::Internal(
@@ -1160,7 +1184,7 @@ impl GroupSpillCursor {
                 ));
             }
         };
-        Ok((key, state))
+        Ok((bytes, scalars, state))
     }
 
     fn advance(&mut self) -> Result<()> {
@@ -1184,7 +1208,7 @@ impl GroupSpillCursor {
 
 #[derive(Eq, PartialEq)]
 struct GroupHeapItem {
-    key: String,
+    key: Vec<u8>,
     cursor: usize,
 }
 
@@ -1254,13 +1278,13 @@ impl GroupSpillMerge {
         })
     }
 
-    fn pop_state(&mut self) -> Result<(String, Vec<Accumulator>)> {
+    fn pop_state(&mut self) -> Result<(Vec<u8>, Vec<ScalarValue>, Vec<Accumulator>)> {
         let item = self
             .heap
             .pop()
             .ok_or_else(|| TaibaiError::Internal("aggregate spill heap exhausted".into()))?;
         let cursor = &mut self.cursors[item.cursor];
-        let (key, encoded_state) = cursor.current()?;
+        let (key, key_scalars, encoded_state) = cursor.current()?;
         let state = serde_json::from_str(&encoded_state).map_err(|error| {
             TaibaiError::Internal(format!("failed to decode aggregate spill state: {error}"))
         })?;
@@ -1271,7 +1295,7 @@ impl GroupSpillMerge {
                 cursor: item.cursor,
             });
         }
-        Ok((key, state))
+        Ok((key, key_scalars, state))
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
@@ -1283,7 +1307,7 @@ impl GroupSpillMerge {
             let mut output =
                 RecordBatch::with_capacity(self.output_schema.clone(), self.batch_rows);
             while output.num_rows() < self.batch_rows && !self.heap.is_empty() {
-                let (key, mut accumulators) = self.pop_state()?;
+                let (key, key_scalars, mut accumulators) = self.pop_state()?;
                 let mut distinct_spills: Vec<Option<DistinctSpillAccumulator>> =
                     std::iter::repeat_with(|| None)
                         .take(accumulators.len())
@@ -1294,7 +1318,7 @@ impl GroupSpillMerge {
                     self.batch_rows,
                 )?;
                 while self.heap.peek().is_some_and(|item| item.key == key) {
-                    let (_, mut states) = self.pop_state()?;
+                    let (_, _, mut states) = self.pop_state()?;
                     if states.len() != accumulators.len() {
                         return Err(TaibaiError::Internal(
                             "aggregate spill state width mismatch".into(),
@@ -1317,12 +1341,6 @@ impl GroupSpillMerge {
                         self.max_groups
                     )));
                 }
-                let key_scalars: Vec<ScalarValue> =
-                    serde_json::from_str(&key).map_err(|error| {
-                        TaibaiError::Internal(format!(
-                            "failed to decode aggregate spill key: {error}"
-                        ))
-                    })?;
                 for (column, value) in key_scalars.iter().enumerate() {
                     output
                         .column_mut(column)

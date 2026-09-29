@@ -148,7 +148,7 @@ pub(crate) fn exec_delete_in_txn(
                 partitions.as_deref(),
                 Arc::clone(&plan.memtable),
                 plan.removed_positions.iter().copied(),
-            );
+            )?;
             if engine.pubsub().has_subscribers() {
                 let columns = plan
                     .original
@@ -160,7 +160,7 @@ pub(crate) fn exec_delete_in_txn(
                     Ok(deleted) => {
                         engine
                             .txn_mutations()
-                            .defer_delete_event(reader_txn_id, db, table, deleted);
+                            .defer_delete_event(reader_txn_id, db, table, deleted)?;
                     }
                     Err(error) => tracing::warn!(
                         db,
@@ -264,7 +264,7 @@ pub(crate) fn exec_delete_in_txn(
                             match RecordBatch::try_new(batch.schema.clone(), columns) {
                                 Ok(deleted) => engine
                                     .txn_mutations()
-                                    .defer_delete_event(reader_txn_id, db, table, deleted),
+                                    .defer_delete_event(reader_txn_id, db, table, deleted)?,
                                 Err(error) => tracing::warn!(
                                     db,
                                     table,
@@ -290,7 +290,7 @@ pub(crate) fn exec_delete_in_txn(
                 &seg_path,
                 &footer_bitmap,
                 newly_deleted,
-            );
+            )?;
         }
 
         Ok(statement_deleted)
@@ -446,7 +446,7 @@ pub(crate) fn exec_update_in_txn(
                 partitions.as_deref(),
                 Arc::clone(&memtable),
                 absolute_rows.iter().copied(),
-            );
+            )?;
             let columns = new_batch
                 .columns
                 .iter()
@@ -456,7 +456,7 @@ pub(crate) fn exec_update_in_txn(
             if publish_updates {
                 engine
                     .txn_mutations()
-                    .defer_update_event(reader_txn_id, db, table, updated_rows.clone());
+                    .defer_update_event(reader_txn_id, db, table, updated_rows.clone())?;
             }
             new_rows.push((memtable.partition_key().to_string(), updated_rows));
         }
@@ -555,7 +555,7 @@ pub(crate) fn exec_update_in_txn(
                 &seg_path,
                 &footer_bitmap,
                 newly_deleted,
-            );
+            )?;
             let partition_key = seg_path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -566,7 +566,7 @@ pub(crate) fn exec_update_in_txn(
                 if publish_updates {
                     engine
                         .txn_mutations()
-                        .defer_update_event(reader_txn_id, db, table, image.clone());
+                        .defer_update_event(reader_txn_id, db, table, image.clone())?;
                 }
                 new_rows.push((partition_key.clone(), image));
             }

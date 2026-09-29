@@ -296,6 +296,13 @@ impl Engine {
         let had_segments_before =
             resident_coverage_before_bulk.is_some()
                 && !Self::table_has_any_segment(&self.segment_mgr.table_dir(db, table));
+        // Load-bearing copy: the segment writers consume the batch by value
+        // (append_batch_owned moves columns into row-group buffers), and the
+        // hot mirror must only be fed AFTER the write commits — feeding first
+        // would expose rows to resident-path scans before the write they
+        // depend on exists, and a failed write would strand them. The regular
+        // INSERT path can feed first because its rows land in memtables under
+        // the same statement, not in segment files.
         let hot_batch = if resident_coverage_before_bulk.is_some() {
             Some(batch.clone())
         } else {
@@ -363,6 +370,15 @@ impl Engine {
         username: Option<&str>,
     ) -> Result<u64> {
         let _op_guard = self.begin_operation();
+        // Direct segment writes bypass the durable tail entirely, so a
+        // replication primary would stream standbys that never see these
+        // rows. Every replicated write must go through the WAL.
+        if crate::common::config::replication_settings().role_is_primary() {
+            return Err(TaibaiError::Sql(
+                "columnar bulk import is not allowed on a replication primary;                  use regular INSERTs (DURABLE)"
+                    .into(),
+            ));
+        }
         let total_start = std::time::Instant::now();
         let table_name = bulk_payload_table_name(payload)?.to_string();
         if let Some(username) = username {
@@ -394,6 +410,11 @@ impl Engine {
                 .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?
         };
 
+        // One zero-copy parse shared by the constraint scan, the auto-increment
+        // max and the post-write hot-store feed. The request borrows the
+        // payload, so keeping it alive is free; re-parsing the payload inside
+        // the hot feed used to decode the whole frame a second time.
+        let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
         let mut explicit_auto_increment_max = None;
         let mut unique_index_entries = Vec::new();
         let mut primary_keys = Vec::new();
@@ -418,7 +439,6 @@ impl Engine {
                 || table_meta.has_auto_increment()
                 || table_has_primary_key
             {
-                let req = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)?;
                 let schema = Schema::new(table_meta.columns.clone());
                 if !table_meta.unique_indexes.is_empty() || table_has_primary_key {
                     let constraint_start = std::time::Instant::now();
@@ -501,7 +521,7 @@ impl Engine {
                     db,
                     &table_name,
                     table_meta,
-                    payload,
+                    &req,
                     resident_coverage_before_bulk,
                     had_segments_before,
                 );
@@ -659,18 +679,19 @@ impl Engine {
         db: &str,
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
-        payload: &[u8],
+        req: &crate::storage::bulk_payload::DirectBulkRequest<'_>,
         resident_coverage_before_bulk: Option<
             crate::storage::core::hot_store::ResidentCoverageSnapshot,
         >,
         had_segments_before: bool,
     ) {
+        // The request was parsed once before the write; only the batch
+        // materialization for the mirror happens here.
         let hot_parse_start = std::time::Instant::now();
-        let parse_result = crate::storage::bulk_payload::parse_direct_bulk_payload(payload)
-            .and_then(|req| {
-                let schema = Schema::new(table_meta.columns.clone());
-                crate::storage::segment_manager::direct_bulk_request_to_batch(&req, &schema)
-            });
+        let parse_result = (|| {
+            let schema = Schema::new(table_meta.columns.clone());
+            crate::storage::segment_manager::direct_bulk_request_to_batch(req, &schema)
+        })();
         let mut feed_batch: Option<RecordBatch> = None;
         let feed = self.begin_hot_feed(db, table);
         let feed_result = match parse_result {

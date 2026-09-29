@@ -344,3 +344,78 @@ fn decode_key_scalar_round_trips_dictionary_varchar_like_plain() {
         );
     }
 }
+
+#[test]
+fn grouped_spill_keeps_nan_and_null_group_keys_distinct() -> Result<()> {
+    // The spill key used to be serialized through serde_json, which collapses
+    // NaN to null: a NULL group and a NaN group merged into one row after a
+    // spill round-trip. Typed spill keys keep them distinct.
+    let schema = Schema::new(vec![
+        ColumnDef::new("ratio", DataType::Float64),
+        ColumnDef::new("value", DataType::Int64),
+    ]);
+    let mut ratios = ColumnArray::empty(DataType::Float64);
+    let mut values = ColumnArray::empty(DataType::Int64);
+    // NULL, NaN, 1.0 in repeating patterns so both spill runs and the
+    // in-memory tail hold every key shape.
+    for (ratio, value) in [
+        (ScalarValue::Float64(None), 1),
+        (ScalarValue::Float64(Some(f64::NAN)), 2),
+        (ScalarValue::Float64(Some(1.0)), 3),
+        (ScalarValue::Float64(None), 4),
+        (ScalarValue::Float64(Some(f64::NAN)), 5),
+        (ScalarValue::Float64(Some(1.0)), 6),
+    ] {
+        ratios.push(&ratio).unwrap();
+        values.push(&ScalarValue::Int64(Some(value))).unwrap();
+    }
+    let batch = RecordBatch::try_new(schema.clone(), vec![ratios, values]).unwrap();
+    let aggregates = vec![AggregateExpr {
+        func: AggFunc::Count,
+        arg: Box::new(LogicalExpr::Wildcard),
+        distinct: false,
+    }];
+    let mut exec = HashAggregateExec::new(
+        vec![LogicalExpr::Column(0)],
+        aggregates,
+        Box::new(OneBatchExec { batch: Some(batch) }),
+        schema,
+    )
+    .with_memory_limit_bytes(1);
+
+    let mut counts: HashMap<Vec<u8>, (ScalarValue, u64)> = HashMap::new();
+    while let Some(batch) = exec.next_batch().unwrap() {
+        for row in 0..batch.num_rows() {
+            let mut key_bytes = Vec::new();
+            batch.column(0).unwrap().encode_key_at(row, &mut key_bytes);
+            let ScalarValue::Int64(Some(count)) = batch.scalar(row, 1).unwrap() else {
+                panic!("count must be an integer");
+            };
+            let entry = counts
+                .entry(key_bytes)
+                .or_insert((batch.scalar(row, 0).unwrap(), 0));
+            entry.1 += count as u64;
+        }
+    }
+
+    // Three distinct groups: NULL, NaN, 1.0 — never fewer.
+    assert_eq!(counts.len(), 3, "NULL and NaN keys must not merge");
+    let mut saw_null = false;
+    let mut saw_nan = false;
+    for (key, total) in counts.values() {
+        match key {
+            ScalarValue::Float64(None) => {
+                saw_null = true;
+                assert_eq!(*total, 2);
+            }
+            ScalarValue::Float64(Some(v)) if v.is_nan() => {
+                saw_nan = true;
+                assert_eq!(*total, 2);
+            }
+            ScalarValue::Float64(Some(v)) if *v == 1.0 => assert_eq!(*total, 2),
+            other => panic!("unexpected group key {other:?}"),
+        }
+    }
+    assert!(saw_null && saw_nan, "both special keys must be present");
+    Ok(())
+}

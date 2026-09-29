@@ -260,12 +260,24 @@ pub(crate) fn apply_replace_memtable_conflicts(
             // snapshot generation.
             crate::storage::core::durable_tail::clear(&table_dir, plan.memtable.id())
         } else {
-            crate::storage::core::durable_tail::persist(
+            // Incremental first: a delete sidecar costs O(affected rows)
+            // instead of rewriting the whole tail snapshot (quadratic for
+            // repeated small deletes on a large memtable). Falls back to a
+            // full persist when no live tail exists to hang the sidecar on.
+            match crate::storage::core::durable_tail::delete_rows(
                 &table_dir,
                 plan.memtable.id(),
-                plan.memtable.partition_key(),
-                &plan.filtered,
-            )
+                &plan.removed_positions,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => crate::storage::core::durable_tail::persist(
+                    &table_dir,
+                    plan.memtable.id(),
+                    plan.memtable.partition_key(),
+                    &plan.filtered,
+                ),
+                Err(error) => Err(error),
+            }
         };
         if let Err(error) = tail_result {
             let _ = plan.memtable.replace_pending_batch(plan.original.clone());
