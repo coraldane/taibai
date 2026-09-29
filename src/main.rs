@@ -198,11 +198,20 @@ where
         pubsub_settings.compress_threshold = usize::MAX;
     }
     crate::common::config::set_tail_archive_enabled(config.storage.tail_archive);
+    crate::common::config::set_replication_settings(config.replication.clone());
+    let replication_standby = config.replication.role_is_standby();
+    let mut auto_compact = auto_compact_config_from_server_config(&config);
+    if replication_standby {
+        // The standby's data comes from the primary's stream; local
+        // compaction would diverge the physical layout the events assume.
+        auto_compact.enabled = false;
+        auto_compact.fragmentation_enabled = false;
+    }
     let engine = match Engine::new_with_storage_config_and_auto_compact(
         std::path::Path::new(&config.storage.data_dir),
         &config.storage.default_database,
         segment_config_from_server_config(&config),
-        auto_compact_config_from_server_config(&config),
+        auto_compact,
         config
             .storage
             .hot_store_memory_limit_mb
@@ -241,8 +250,23 @@ where
         .num_threads(config.buffer.execution_threads.max(1))
         .thread_name(|idx| format!("taibai-exec-{idx}"))
         .build_global();
-    sql::execution::engine::start_close_of_day_scheduler(engine.clone());
-    tracing::info!("close-of-day scheduler started");
+    if replication_standby {
+        engine.set_read_only();
+        let standby_config = crate::storage::replication::standby::StandbyConfig {
+            primary_addr: config.replication.primary_addr.clone(),
+            user: config.replication.user.clone(),
+            password: config.replication.password.clone(),
+            database: config.storage.default_database.clone(),
+        };
+        crate::storage::replication::standby::spawn(engine.clone(), standby_config);
+        tracing::info!(
+            primary = %config.replication.primary_addr,
+            "standby replication applier started; local schedulers disabled"
+        );
+    } else {
+        sql::execution::engine::start_close_of_day_scheduler(engine.clone());
+        tracing::info!("close-of-day scheduler started");
+    }
 
     let server = Server::new(config, engine.clone());
 

@@ -203,7 +203,7 @@ impl Handler {
             context.enter_phase(crate::common::query_cancel::QueryPhase::Executing);
         }
         let _cancellation = crate::common::query_cancel::QueryCancellationGuard::enter(context);
-        let result = match msg.msg_type {
+let result = match msg.msg_type {
             MSG_TYPE_LOGIN => self.handle_login(&msg.payload),
             MSG_TYPE_PING => Ok(vec![build_pong()]),
             MSG_TYPE_LOGOUT => {
@@ -213,6 +213,9 @@ impl Handler {
             MSG_TYPE_QUERY => self.handle_query(&msg.payload),
             MSG_TYPE_BULK_INSERT_COLUMNAR => self.handle_bulk_insert(&msg.payload),
             MSG_TYPE_FLUSH => self.handle_flush(),
+            MSG_TYPE_REPL_HELLO => self.handle_repl_hello(&msg.payload),
+            MSG_TYPE_REPL_SEGMENT_FETCH => self.handle_repl_segment_fetch(&msg.payload),
+            MSG_TYPE_REPL_ACK => self.handle_repl_ack(&msg.payload),
 
             MSG_TYPE_PREPARE => self.handle_prepare(&msg.payload),
             MSG_TYPE_EXECUTE => self.handle_execute(&msg.payload),
@@ -1681,6 +1684,7 @@ pub(crate) fn is_heavy_request(msg_type: u8) -> bool {
             | MSG_TYPE_COMMIT_TXN
             | MSG_TYPE_ROLLBACK_TXN
             | MSG_TYPE_CURSOR
+            | MSG_TYPE_REPL_SEGMENT_FETCH
     )
 }
 
@@ -1756,6 +1760,198 @@ fn build_auth_ok(session_id: &str) -> Message {
 
 fn build_auth_fail(reason: &str) -> Message {
     Message::new(MSG_TYPE_AUTH_FAIL, Bytes::from(reason.to_string()))
+}
+
+impl Handler {
+// ===================== Replication (R1) =====================
+
+    /// REPL_HELLO (standby -> primary, after LOGIN): authenticate, then turn
+    /// this connection into a replication event stream. Live events flow
+    /// through the per-connection push queue; a resumed standby first
+    /// receives the ring history.
+    fn handle_repl_hello(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
+        let Some(session) = &self.session else {
+            return Ok(vec![build_error("REPL_HELLO requires LOGIN first")]);
+        };
+        let username = session.username.clone();
+        let Some(rep_log) = self.engine.rep_log().map(Arc::clone) else {
+            return Ok(vec![build_error("server is not a replication primary")]);
+        };
+
+        let (user, rest) = read_len_prefixed_string(payload)?;
+        let (password, rest) = read_len_prefixed_string(rest)?;
+        if rest.len() < 8 {
+            return Ok(vec![build_error("REPL_HELLO payload truncated")]);
+        }
+        let last_seq = u64::from_le_bytes(rest[..8].try_into().unwrap());
+
+        // The logged-in session must belong to the same user, and that user
+        // must hold the REPLICATION permission.
+        if user != username {
+            return Ok(vec![build_error(&format!(
+                "REPL_HELLO user '{user}' does not match the logged-in user '{username}'"
+            ))]);
+        }
+        match self.engine.auth_manager().authenticate(&username, password) {
+            Ok(true) => {}
+            _ => {
+                return Ok(vec![build_error(&format!(
+                    "REPL_HELLO credentials for user '{username}' are invalid"
+                ))]);
+            }
+        }
+        if !self.engine.auth_manager().check_permission(
+            &username,
+            crate::storage::catalog::auth::PermissionType::Replication,
+            crate::storage::catalog::auth::PermissionObjectType::Global,
+            "*",
+        ) {
+            return Ok(vec![build_error(&format!(
+                "access denied for user '{username}' to REPLICATION"
+            ))]);
+        }
+
+        let history = match rep_log.events_after(last_seq) {
+            Ok(history) => history,
+            Err(error) => return Ok(vec![build_error(&error.to_string())]),
+        };
+
+        let Some(push_tx) = self.push_channel.clone() else {
+            return Ok(vec![build_error(
+                "replication pushes are not available on this connection",
+            )]);
+        };
+
+        let (sink_tx, sink_rx) =
+            crossbeam_channel::bounded::<(u64, Arc<crate::storage::replication::ReplicationEvent>)>(
+                4096,
+            );
+        rep_log.register_session(&sink_tx);
+
+        // Bridge thread: ring history first, then live fan-out, both funneled
+        // into the connection push queue in strict seq order.
+        std::thread::Builder::new()
+            .name("taibai-repl-push".into())
+            .spawn(move || {
+                use std::collections::BTreeMap;
+                use std::sync::Arc as StdArc;
+                let push = |seq: u64, event: &crate::storage::replication::ReplicationEvent| {
+                    let mut payload_bytes =
+                        Vec::with_capacity(8 + 4 + 128);
+                    payload_bytes.extend_from_slice(&seq.to_le_bytes());
+                    let encoded = event.encode();
+                    payload_bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    payload_bytes.extend_from_slice(&encoded);
+                    push_tx.blocking_send(Message {
+                        msg_type: MSG_TYPE_REPL_EVENT,
+                        payload: bytes::Bytes::from(payload_bytes),
+                    })
+                };
+                let mut next = last_seq + 1;
+                let mut pending: BTreeMap<u64, StdArc<crate::storage::replication::ReplicationEvent>> =
+                    BTreeMap::new();
+                for (seq, event) in history {
+                    if seq < next {
+                        continue;
+                    }
+                    pending.insert(seq, event);
+                    while let Some(event) = pending.remove(&next) {
+                        if push(next, &event).is_err() {
+                            rep_log.remove_session(&sink_tx);
+                            return;
+                        }
+                        next += 1;
+                    }
+                }
+                loop {
+                    while let Some(event) = pending.remove(&next) {
+                        if push(next, &event).is_err() {
+                            rep_log.remove_session(&sink_tx);
+                            return;
+                        }
+                        next += 1;
+                    }
+                    match sink_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                        Ok((seq, event)) => {
+                            if seq < next {
+                                continue;
+                            }
+                            pending.insert(seq, event);
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                rep_log.remove_session(&sink_tx);
+            })
+            .expect("failed to spawn replication push thread");
+
+        Ok(vec![build_ok(0)])
+    }
+
+    /// REPL_SEGMENT_FETCH (standby -> primary): stream the requested segment
+    /// file back as one or more REPL_SEGMENT_CHUNK response frames.
+    fn handle_repl_segment_fetch(&self, payload: &[u8]) -> Result<Vec<Message>> {
+        let Some(_session) = &self.session else {
+            return Ok(vec![build_error("REPL_SEGMENT_FETCH requires LOGIN first")]);
+        };
+        if self.engine.rep_log().is_none() {
+            return Ok(vec![build_error("server is not a replication primary")]);
+        }
+        let (db, rest) = read_len_prefixed_string(payload)?;
+        let (table, rest) = read_len_prefixed_string(rest)?;
+        let (segment, rest) = read_len_prefixed_string(rest)?;
+        if rest.len() < 12 {
+            return Ok(vec![build_error("REPL_SEGMENT_FETCH payload truncated")]);
+        }
+        let offset = u64::from_le_bytes(rest[..8].try_into().unwrap());
+        let max_chunk = u32::from_le_bytes(rest[8..12].try_into().unwrap()).max(1);
+        // Path safety: bare file name only.
+        if segment.contains('/')
+            || segment.contains('\\')
+            || segment.contains("..")
+            || db.contains("..")
+            || table.contains("..")
+        {
+            return Ok(vec![build_error("REPL_SEGMENT_FETCH: unsafe path")]);
+        }
+        let path = self.engine.data_dir().join(&db).join(&table).join(&segment);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(vec![build_error(&format!(
+                    "segment fetch failed for {db}.{table}/{segment}: {error}"
+                ))]);
+            }
+        };
+        let total_len = file.metadata()?.len();
+        let mut file = file;
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset))?;
+        let chunk_len = (max_chunk as usize).min(4 * 1024 * 1024);
+        let mut chunk = vec![0u8; chunk_len];
+        let read = file.read(&mut chunk)?;
+        chunk.truncate(read);
+
+        let mut message_bytes = Vec::with_capacity(16 + read);
+        message_bytes.extend_from_slice(&total_len.to_le_bytes());
+        message_bytes.extend_from_slice(&offset.to_le_bytes());
+        message_bytes.extend_from_slice(&chunk);
+        Ok(vec![Message {
+            msg_type: MSG_TYPE_REPL_SEGMENT_CHUNK,
+            payload: bytes::Bytes::from(message_bytes),
+        }])
+    }
+
+    /// REPL_ACK (standby -> primary): progress report; v1 logs it.
+    fn handle_repl_ack(&self, payload: &[u8]) -> Result<Vec<Message>> {
+        if payload.len() >= 8 {
+            let applied = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            tracing::debug!(applied_seq = applied, "standby replication ack");
+        }
+        Ok(Vec::new())
+    }
+
 }
 
 fn build_pong() -> Message {

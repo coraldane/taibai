@@ -20,7 +20,8 @@
 
 - [示例工具使用指南](operations/examples-guide.md)：导入、导出、订阅与性能测试示例的用法。
 - [数据导入流程说明](operations/data-import-flow.md)
-- [备份、迁移与恢复](operations/backup-and-migrate.md)：backup/migrate 工具、tail 归档与恢复流程。
+- [备份、迁移与恢复](operations/backup-and-migrate.md)
+- [主备流复制](operations/replication.md)：primary/standby 配置、事件流与引导流程。：backup/migrate 工具、tail 归档与恢复流程。
 - [Windows 安装说明](operations/windows-installation.md)
 - [金融行情场景验证与测试清单](operations/financial-market-data-validation-checklist.md)
 

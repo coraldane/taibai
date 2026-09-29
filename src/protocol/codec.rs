@@ -6,6 +6,8 @@ use crate::protocol::message::{
     Message, MessageHeader, HEADER_SIZE, MSG_TYPE_BATCH_EXECUTE, MSG_TYPE_CLOSE_STMT,
     MSG_TYPE_EXECUTE, MSG_TYPE_NOTIFICATION, MSG_TYPE_NOTIFICATION_DELETE,
     MSG_TYPE_NOTIFICATION_INSERT, MSG_TYPE_NOTIFICATION_UPDATE, MSG_TYPE_PREPARE, MSG_TYPE_QUERY,
+    MSG_TYPE_REPL_ACK, MSG_TYPE_REPL_EVENT, MSG_TYPE_REPL_HELLO, MSG_TYPE_REPL_SEGMENT_CHUNK,
+    MSG_TYPE_REPL_SEGMENT_FETCH,
 };
 
 pub struct MessageCodec {
@@ -100,7 +102,14 @@ impl Encoder<Message> for MessageCodec {
                 | MSG_TYPE_NOTIFICATION_DELETE
                 | MSG_TYPE_NOTIFICATION_UPDATE
         );
+        // Replication pushes carry pre-compressed WAL frames and raw
+        // segment bytes: zlib on top would burn CPU for no size win.
+        let is_replication_push = matches!(
+            msg.msg_type,
+            MSG_TYPE_REPL_EVENT | MSG_TYPE_REPL_SEGMENT_CHUNK
+        );
         let should_compress = !is_bulk
+            && !is_replication_push
             && !is_query
             && !is_prepared
             && !is_pubsub_push

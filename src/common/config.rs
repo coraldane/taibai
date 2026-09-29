@@ -504,6 +504,72 @@ pub struct ServerConfig {
     pub performance: PerformanceBaselineSettings,
     #[serde(default)]
     pub pubsub: PubSubSettings,
+    #[serde(default)]
+    pub replication: ReplicationSettings,
+}
+
+/// Primary/standby replication (see `src/storage/replication`). `role` is
+/// one of `"none"` (default), `"primary"` (emit the replication event
+/// stream, reject bulk/RELAXED direct writes) or `"standby"` (read-only
+/// engine; a background applier replays the primary's stream; local
+/// schedulers and auto-compaction are disabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationSettings {
+    /// `"none" | "primary" | "standby"`.
+    #[serde(default)]
+    pub role: String,
+    /// Standby only: primary's `host:port`.
+    #[serde(default)]
+    pub primary_addr: String,
+    /// Standby only: credentials used for `REPL_HELLO`.
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: String,
+    /// Primary only: events retained for reconnecting standbys.
+    #[serde(default = "default_replication_ring_capacity")]
+    pub ring_capacity: usize,
+}
+
+impl Default for ReplicationSettings {
+    fn default() -> Self {
+        Self {
+            role: "none".to_string(),
+            primary_addr: String::new(),
+            user: String::new(),
+            password: String::new(),
+            ring_capacity: default_replication_ring_capacity(),
+        }
+    }
+}
+
+fn default_replication_ring_capacity() -> usize {
+    65_536
+}
+
+impl ReplicationSettings {
+    pub fn role_is_primary(&self) -> bool {
+        self.role.eq_ignore_ascii_case("primary")
+    }
+
+    pub fn role_is_standby(&self) -> bool {
+        self.role.eq_ignore_ascii_case("standby")
+    }
+}
+
+static REPLICATION_SETTINGS: OnceLock<ReplicationSettings> = OnceLock::new();
+
+/// Install the replication role at startup (main). Engines read it during
+/// construction; tests may install it once before creating engines.
+pub fn set_replication_settings(settings: ReplicationSettings) {
+    let _ = REPLICATION_SETTINGS.set(settings);
+}
+
+pub fn replication_settings() -> ReplicationSettings {
+    REPLICATION_SETTINGS
+        .get()
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -972,6 +1038,7 @@ impl Default for ServerConfig {
             log: default_log_settings(),
             performance: PerformanceBaselineSettings::default(),
             pubsub: PubSubSettings::default(),
+            replication: ReplicationSettings::default(),
         }
     }
 }

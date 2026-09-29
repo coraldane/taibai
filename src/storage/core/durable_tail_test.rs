@@ -683,3 +683,167 @@ fn find_archived_tail(root: &std::path::Path) -> Option<std::path::PathBuf> {
     }
     None
 }
+
+// ---------------------------------------------------------------------------
+// Delete sidecars (`<id>.<seq>.del`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delete_sidecar_round_trips_through_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?)?;
+
+    assert!(delete_rows(temp.path(), id, &mut [1, 3])?);
+    // A sidecar pend: rows still exist, but the tail is no longer "plain"
+    // (a spill must not run over it).
+    assert!(has_tail(temp.path(), id));
+    assert!(!tail_is_plain(temp.path(), id)?);
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].batch.num_rows(), 4);
+    let values: Vec<Option<ScalarValue>> =
+        (0..4).map(|row| recovered[0].batch.scalar(row, 0)).collect();
+    assert_eq!(
+        values,
+        vec![
+            Some(ScalarValue::Int64(Some(0))),
+            Some(ScalarValue::Int64(Some(2))),
+            Some(ScalarValue::Int64(Some(4))),
+            Some(ScalarValue::Int64(Some(5))),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn stacked_delete_sidecars_apply_oldest_first() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[10, 20, 30, 40])?)?;
+    // First delete speaks in the original batch's coordinates (removes 20)...
+    delete_rows(temp.path(), id, &mut [1])?;
+    // ...the second in the post-first-delete batch's coordinates:
+    // [10, 30, 40], position 0 removes 10.
+    delete_rows(temp.path(), id, &mut [0])?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(30)))
+    );
+    assert_eq!(
+        recovered[0].batch.scalar(1, 0),
+        Some(ScalarValue::Int64(Some(40)))
+    );
+    Ok(())
+}
+
+#[test]
+fn insert_delta_after_delete_keeps_positions_prefix_stable() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    delete_rows(temp.path(), id, &mut [1])?;
+    // New rows append at the end; recorded positions must keep referring to
+    // the original prefix.
+    append(temp.path(), id, "2026", &test_batch(&schema, &[4])?)?;
+
+    let recovered = recover(temp.path(), &schema)?;
+    let values: Vec<i64> = (0..recovered[0].batch.num_rows())
+        .filter_map(|row| match recovered[0].batch.scalar(row, 0) {
+            Some(ScalarValue::Int64(Some(v))) => Some(v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec![1, 3, 4]);
+    Ok(())
+}
+
+#[test]
+fn torn_delete_sidecar_fails_recovery_closed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    delete_rows(temp.path(), id, &mut [0])?;
+
+    // Simulate on-disk corruption: a truncated sidecar must fail the whole
+    // recovery instead of silently resurrecting the deleted row.
+    let tail_dir = temp.path().join(TAIL_DIR);
+    let sidecar = std::fs::read_dir(&tail_dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("del"))
+        .expect("sidecar exists");
+    let bytes = std::fs::read(&sidecar)?;
+    std::fs::write(&sidecar, &bytes[..bytes.len() - 3])?;
+
+    assert!(recover(temp.path(), &schema).is_err());
+    Ok(())
+}
+
+#[test]
+fn persist_supersedes_pending_sidecars() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    delete_rows(temp.path(), id, &mut [0])?;
+    // The DELETE statement's in-memory result, persisted as a fresh
+    // generation: sidecars below it are superseded and must not re-apply.
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[2, 3])?)?;
+
+    assert!(tail_is_plain(temp.path(), id)?);
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(2)))
+    );
+    Ok(())
+}
+
+#[test]
+fn clear_tombstone_removes_sidecars_too() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2])?)?;
+    delete_rows(temp.path(), id, &mut [0])?;
+    clear(temp.path(), id)?;
+    assert!(recover(temp.path(), &schema)?.is_empty());
+    assert!(!has_tail(temp.path(), id));
+    Ok(())
+}
+
+#[test]
+fn recover_index_folds_pending_sidecars_into_a_plain_tail() -> Result<()> {
+    // The engine's lazy recovery reads only the tail file, so recover_index
+    // must consolidate pending delete sidecars at startup: the deleted row
+    // must not resurrect when the memtable materializes later.
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1, 2, 3])?)?;
+    delete_rows(temp.path(), id, &mut [0])?;
+
+    let indexed = recover_index(temp.path(), &schema)?;
+    assert_eq!(indexed.len(), 1);
+    assert_eq!(indexed[0].rows, 2);
+
+    // After folding, the tail is plain and decodes to the filtered batch.
+    assert!(tail_is_plain(temp.path(), id)?);
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered[0].batch.num_rows(), 2);
+    assert_eq!(
+        recovered[0].batch.scalar(0, 0),
+        Some(ScalarValue::Int64(Some(2)))
+    );
+    Ok(())
+}

@@ -15,6 +15,7 @@ pub mod physical;
 pub mod prepared;
 pub mod query;
 pub mod query_registry;
+pub mod read_only_gate;
 pub mod scan;
 pub mod spill;
 pub mod subquery_runtime;

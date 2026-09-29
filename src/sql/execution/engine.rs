@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -100,6 +100,10 @@ pub struct Engine {
     /// with the segment manager (scan overlay) and memtable manager
     /// (flush pin); statements and commit/rollback reach it via this handle.
     txn_mutations: Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>,
+    /// Replication log when this engine runs as a replication primary.
+    rep_log: Option<Arc<crate::storage::replication::RepLog>>,
+    /// Standby engines reject every write (the applier is the only writer).
+    read_only: AtomicBool,
 }
 
 impl Engine {
@@ -107,6 +111,23 @@ impl Engine {
         &self,
     ) -> &Arc<crate::storage::core::txn_mutations::TxnMutationRegistry> {
         &self.txn_mutations
+    }
+
+    /// Replication log when running as a replication primary.
+    pub fn rep_log(&self) -> Option<&Arc<crate::storage::replication::RepLog>> {
+        self.rep_log.as_ref()
+    }
+
+    /// Mark the engine read-only (standby role). Writes fail with a clear
+    /// error; reads are unaffected.
+    pub fn set_read_only(&self) {
+        use std::sync::atomic::Ordering;
+        self.read_only.store(true, Ordering::Release);
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.read_only.load(Ordering::Acquire)
     }
 }
 

@@ -40,6 +40,10 @@ path = "src/bin/migrate.rs"
 name = "backup"
 path = "src/bin/backup.rs"
 
+[[test]]
+name = "replication_test"
+path = "tests/replication_test.rs"
+
 
 
 [dependencies]

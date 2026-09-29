@@ -165,6 +165,22 @@ impl Engine {
         segment_mgr.set_txn_mutations(Arc::clone(&txn_mutations));
         batch_writer.memtable_manager().set_txn_mutations(Arc::clone(&txn_mutations));
 
+        // Replication primary: create the event log and wire it into the
+        // commit thread (tail appends) and the segment manager (structural
+        // events). Standby/none engines run without one.
+        let replication_settings = crate::common::config::replication_settings();
+        let rep_log = if replication_settings.role_is_primary() {
+            let log = Arc::new(crate::storage::replication::RepLog::new(
+                replication_settings.ring_capacity,
+                data_dir,
+            ));
+            batch_writer.set_rep_log(Arc::clone(&log));
+            segment_mgr.set_rep_log(Arc::clone(&log));
+            Some(log)
+        } else {
+            None
+        };
+
         let auth_manager = Arc::new(AuthManager::new(data_dir)?);
         let auto_increment_mgr = Arc::new(AutoIncrementManager::new());
         for (db_name, catalog) in &mut catalogs {
@@ -224,6 +240,8 @@ impl Engine {
             hot_partition_segments: Mutex::new(HashMap::new()),
             query_registry: Arc::new(crate::sql::execution::query_registry::QueryRegistry::new()),
             txn_mutations,
+            rep_log,
+            read_only: AtomicBool::new(false),
         };
         if hot_warmup_enabled {
             engine.warmup_hot_stores();
@@ -236,6 +254,11 @@ impl Engine {
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecResult> {
         let _op_guard = self.begin_operation();
+        if self.is_read_only() && !super::read_only_gate::starts_read_keyword(sql) {
+            return Err(TaibaiError::Sql(
+                "server is running as a replication standby and is read-only".into(),
+            ));
+        }
         if sql.as_bytes().first().map(|b| b.to_ascii_uppercase()) == Some(b'I') {
             if let Some(result) = super::dml_insert::try_exec_fast_insert_sql(
                 self,

@@ -99,7 +99,98 @@ impl SegmentManager {
             config,
             pubsub: std::sync::OnceLock::new(),
             txn_mutations: std::sync::OnceLock::new(),
+            rep_log: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Wire the replication log once at engine startup (primaries only).
+    pub fn set_rep_log(&self, log: std::sync::Arc<crate::storage::replication::RepLog>) {
+        let _ = self.rep_log.set(log);
+    }
+
+    pub fn rep_log(&self) -> Option<&std::sync::Arc<crate::storage::replication::RepLog>> {
+        self.rep_log.get()
+    }
+
+
+/// Current active segment file name for `(db, table, partition)`.
+    pub(crate) fn active_segment_name_for(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+    ) -> Option<String> {
+        let key = table_key(db, table);
+        let state = self.tables.read().unwrap().get(&key).cloned()?;
+        let guard = state.active_segments.lock().unwrap();
+        let seg = guard.get(partition_key)?;
+        Self::active_segment_file_name(&seg.path).ok()
+    }
+
+    /// Enqueue a `SegmentUpdate` for replication (no-op without a log).
+    /// `new_segment = Some(name)` marks a freshly written sealed segment
+    /// (`Final`); `None` marks the active segment's published prefix.
+    pub(crate) fn emit_segment_update(
+        &self,
+        db: &str,
+        table: &str,
+        partition_key: &str,
+        memtable_ids: Vec<uuid::Uuid>,
+        new_segment: Option<&str>,
+    ) {
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        if new_segment.map_or(false, |name| name.starts_with('.')) {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+        }
+        let (segment, kind) = match new_segment {
+            Some(name) => (name.to_string(), crate::storage::replication::SegmentUpdateKind::Final),
+            None => {
+                let Some(segment) = self.active_segment_name_for(db, table, partition_key) else {
+                    return;
+                };
+                (segment, crate::storage::replication::SegmentUpdateKind::Prefix)
+            }
+        };
+        log.enqueue(crate::storage::replication::ReplicationEvent::SegmentUpdate {
+            db: db.to_string(),
+            table: table.to_string(),
+            segment,
+            kind,
+            memtable_ids,
+        });
+    }
+
+    /// Emit a `Final` update for a just-sealed active segment, deriving
+    /// db/table from the segment path (used by seal sites that only hold the
+    /// writer).
+    pub(crate) fn emit_segment_update_final_path(&self, segment_path: &std::path::Path) {
+        let Some(log) = self.rep_log() else {
+            return;
+        };
+        let Some(name) = segment_path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let Some(table_dir) = segment_path.parent() else {
+            return;
+        };
+        let (Some(table), Some(db)) = (
+            table_dir.file_name().and_then(|name| name.to_str()),
+            table_dir
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+        ) else {
+            return;
+        };
+        log.enqueue(crate::storage::replication::ReplicationEvent::SegmentUpdate {
+            db: db.to_string(),
+            table: table.to_string(),
+            segment: name.to_string(),
+            kind: crate::storage::replication::SegmentUpdateKind::Final,
+            memtable_ids: Vec::new(),
+        });
     }
 
     /// Wire the pub/sub hub once at engine startup. Deferred bulk/RELAXED

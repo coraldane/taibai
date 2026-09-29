@@ -36,6 +36,17 @@ storage:
   # 作为 PITR 与复制引导的增量日志源）。默认 false 保持原有删除行为（不增加磁盘占用）
   tail_archive: false
 
+# 主备复制（可选）：role = none | primary | standby。
+# primary 发布物理操作流（拒绝 bulk/RELAXED 写入）；standby 只读、
+# 从 primary_addr 拉取事件流，本地调度与自动压缩关闭。
+# 引导方式：停主库 → backup 工具备份 → 备库以备份目录启动 → 自动续传。
+replication:
+  role: none
+  primary_addr: 127.0.0.1:5151
+  user: root
+  password: taibai
+  ring_capacity: 65536
+
 buffer:
   query_memory_limit_mb: 4096
   execution_threads: 8

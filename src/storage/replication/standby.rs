@@ -1,0 +1,453 @@
+//! Standby replication applier: connects to the primary, replays the
+//! physical operation stream, and serves reads from the converged data.
+//!
+//! Apply model (R1):
+//! - `TailAppend` → fsync the V3 frames into the standby's local tail file
+//!   and register/refresh a spilled memtable (lazy decode on first read).
+//! - `SegmentUpdate` → fetch the segment bytes from the primary (atomic
+//!   tmp+rename locally), then retire the memtables the segment supersedes.
+//!
+//! Durability: every applied seq is persisted (`<data>/wal/replication_applied`,
+//! fsync + rename) at `ACK_EVERY` intervals; on restart the standby resumes
+//! from that seq. Events behind the primary's ring require re-bootstrap.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
+use tokio_util::codec::Framed;
+
+use crate::common::error::{Result, TaibaiError};
+use crate::net::handler::build_error;
+use crate::protocol::codec::MessageCodec;
+use crate::protocol::message::{
+    Message, MSG_TYPE_AUTH_FAIL, MSG_TYPE_AUTH_OK, MSG_TYPE_ERROR, MSG_TYPE_LOGIN,
+    MSG_TYPE_OK, MSG_TYPE_REPL_ACK, MSG_TYPE_REPL_EVENT, MSG_TYPE_REPL_HELLO,
+    MSG_TYPE_REPL_SEGMENT_CHUNK, MSG_TYPE_REPL_SEGMENT_FETCH,
+};
+use crate::storage::core::durable_tail::{append_raw_frames, count_v3_frame_rows};
+use crate::storage::replication::{AppliedSeqState, ReplicationEvent};
+
+use super::SegmentUpdateKind;
+
+const MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+const ACK_EVERY: u64 = 256;
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+pub struct StandbyConfig {
+    pub primary_addr: String,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+}
+
+/// Run the applier forever (reconnecting with exponential backoff). Spawned
+/// on a dedicated thread by the server startup.
+/// Handle for tests and graceful shutdown: `stop` ends the applier thread.
+#[derive(Clone)]
+pub struct ApplierHandle {
+    pub stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ApplierHandle {
+    pub fn stop(&self) {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+pub fn spawn(engine: Arc<crate::sql::execution::Engine>, config: StandbyConfig) -> ApplierHandle {
+    spawn_with_stop(engine, config, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+pub fn spawn_with_stop(
+    engine: Arc<crate::sql::execution::Engine>,
+    config: StandbyConfig,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> ApplierHandle {
+    let handle = ApplierHandle { stop: Arc::clone(&stop) };
+    std::thread::Builder::new()
+        .name("taibai-standby".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("standby tokio runtime must build");
+            runtime.block_on(run_forever(engine, config, stop));
+        })
+        .expect("failed to spawn standby replication thread");
+    handle
+}
+
+async fn run_forever(
+    engine: Arc<crate::sql::execution::Engine>,
+    config: StandbyConfig,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        match connect_and_stream(&engine, &config, &stop).await {
+            Ok(()) => unreachable!("replication stream only ends on error"),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "replication stream ended; reconnecting"
+                );
+            }
+        }
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        // A connection that lasted a while resets the backoff.
+        if started.elapsed() > MAX_BACKOFF {
+            backoff = Duration::from_secs(1);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+async fn connect_and_stream(
+    engine: &Arc<crate::sql::execution::Engine>,
+    config: &StandbyConfig,
+    stop: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let tcp = tokio::net::TcpStream::connect(&config.primary_addr)
+        .await
+        .map_err(|error| TaibaiError::Storage(format!("connect primary: {error}")))?;
+    let mut framed = Framed::new(tcp, MessageCodec::new(MAX_MESSAGE_SIZE));
+
+    // LOGIN (payload mirrors net/client.rs: user, password, database, tz, streaming flag).
+    let mut login = Vec::new();
+    put_str(&mut login, &config.user);
+    put_str(&mut login, &config.password);
+    put_str(&mut login, &config.database);
+    login.extend_from_slice(&0i32.to_le_bytes());
+    login.push(0);
+    framed
+        .send(Message::new(MSG_TYPE_LOGIN, Bytes::from(login)))
+        .await?;
+    expect(&mut framed, &[MSG_TYPE_AUTH_OK, MSG_TYPE_AUTH_FAIL]).await?;
+
+    let applied = AppliedSeqState::load(engine.data_dir());
+    let mut hello = Vec::new();
+    put_str(&mut hello, &config.user);
+    put_str(&mut hello, &config.password);
+    hello.extend_from_slice(&applied.applied().to_le_bytes());
+    framed
+        .send(Message::new(MSG_TYPE_REPL_HELLO, Bytes::from(hello)))
+        .await?;
+
+    tracing::info!(
+        primary = %config.primary_addr,
+        from_seq = applied.applied(),
+        "replication stream connected"
+    );
+
+    let mut deferred: VecDeque<(u64, ReplicationEvent)> = VecDeque::new();
+    let mut since_ack = 0u64;
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TaibaiError::Storage("applier stopped".into()));
+        }
+        if let Some((seq, event)) = deferred.pop_front() {
+            apply(engine, &applied, seq, event, &mut framed, &mut deferred).await?;
+            since_ack += 1;
+            if since_ack >= ACK_EVERY {
+                send_ack(&mut framed, applied.applied()).await?;
+                since_ack = 0;
+            }
+            continue;
+        }
+        let message = framed
+            .next()
+            .await
+            .ok_or_else(|| TaibaiError::Storage("primary closed the stream".into()))??;
+        match message.msg_type {
+            MSG_TYPE_OK => {}
+            MSG_TYPE_ERROR => {
+                return Err(TaibaiError::Storage(format!(
+                    "primary rejected the replication handshake: {}",
+                    String::from_utf8_lossy(&message.payload)
+                )));
+            }
+            MSG_TYPE_REPL_EVENT => {
+                if message.payload.len() < 12 {
+                    return Err(TaibaiError::Storage("REPL_EVENT truncated".into()));
+                }
+                let seq = u64::from_le_bytes(message.payload[..8].try_into().unwrap());
+                let len =
+                    u32::from_le_bytes(message.payload[8..12].try_into().unwrap()) as usize;
+                if message.payload.len() < 12 + len {
+                    return Err(TaibaiError::Storage("REPL_EVENT payload truncated".into()));
+                }
+                let event = ReplicationEvent::decode(&message.payload[12..12 + len])?;
+                if seq <= applied.applied() {
+                    continue;
+                }
+                // Stop check AFTER the frame arrives but BEFORE applying: a
+                // dropped event is replayed by the next applier from the
+                // persisted seq (exactly-once via the seq watermark).
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(TaibaiError::Storage("applier stopped".into()));
+                }
+                apply(engine, &applied, seq, event, &mut framed, &mut deferred).await?;
+                since_ack += 1;
+                if since_ack >= ACK_EVERY {
+                    send_ack(&mut framed, applied.applied()).await?;
+                    since_ack = 0;
+                }
+            }
+            other => {
+                tracing::debug!(msg_type = other, "ignoring frame on replication stream");
+            }
+        }
+    }
+}
+
+async fn apply(
+    engine: &Arc<crate::sql::execution::Engine>,
+    applied: &AppliedSeqState,
+    seq: u64,
+    event: ReplicationEvent,
+    framed: &mut Framed<
+        tokio::net::TcpStream,
+        MessageCodec,
+    >,
+    deferred: &mut VecDeque<(u64, ReplicationEvent)>,
+) -> Result<()> {
+    match event {
+        ReplicationEvent::TailAppend {
+            db,
+            table,
+            partition,
+            memtable_id,
+            frames,
+            ..
+        } => {
+            let table_dir = engine.data_dir().join(&db).join(&table);
+            append_raw_frames(&table_dir, memtable_id, &partition, &frames)?;
+            // The spilled row count must reflect the WHOLE tail file (delta
+            // frames from several events accumulate in one file).
+            let live_path =
+                crate::storage::core::durable_tail::live_tail_path(&table_dir, memtable_id)?;
+            let rows = match &live_path {
+                Some(path) => crate::storage::core::durable_tail::tail_log_rows(path)?.unwrap_or(0),
+                None => count_v3_frame_rows(&frames),
+            };
+            match table_schema(engine, &db, &table) {
+                Some(schema) => {
+                    // Register on first sight; refresh the count afterwards.
+                    let tail_path =
+                        crate::storage::core::durable_tail::live_tail_path(&table_dir, memtable_id)?
+                            .ok_or_else(|| {
+                                TaibaiError::Storage("tail vanished after append".into())
+                            })?;
+                    engine
+                        .memtable_manager()
+                        .restore_spilled_tail(
+                            memtable_id,
+                            &db,
+                            &table,
+                            &partition,
+                            schema,
+                            rows,
+                            tail_path,
+                        );
+                    engine.memtable_manager().set_tail_rows(memtable_id, rows);
+                }
+                None => {
+                    // DDL events are R2: the table must exist via bootstrap.
+                    return Err(TaibaiError::Storage(format!(
+                        "replicated table '{db}.{table}' is missing from the standby catalog; \
+                         re-bootstrap from a fresh backup"
+                    )));
+                }
+            }
+            tracing::info!(seq, db = %db, table = %table, rows, "standby applied tail append");
+            applied.advance(seq, true)?;
+        }
+        ReplicationEvent::SegmentUpdate {
+            db,
+            table,
+            segment,
+            kind,
+            memtable_ids,
+        } => {
+            let bytes =
+                fetch_segment(engine, framed, deferred, &db, &table, &segment).await?;
+            let dest = engine.data_dir().join(&db).join(&table).join(&segment);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = dest.with_extension("repl_tmp");
+            {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+            }
+            tracing::info!(seq, db = %db, table = %table, segment = %segment, bytes = bytes.len(), "standby fetched segment");
+            crate::storage::segment::meta::atomic_replace(&tmp, &dest)?;
+            // Retire the spilled memtables AND remove their tail files, so a
+            // standby restart cannot recover the same rows a second time
+            // (the segment now durably holds them).
+            let table_dir = engine.data_dir().join(&db).join(&table);
+            for id in &memtable_ids {
+                crate::storage::core::durable_tail::clear(&table_dir, *id)?;
+            }
+            if kind == SegmentUpdateKind::Final || !memtable_ids.is_empty() {
+                engine.memtable_manager().retire_replicated_memtables(&memtable_ids);
+            }
+            applied.advance(seq, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn table_schema(
+    engine: &crate::sql::execution::Engine,
+    db: &str,
+    table: &str,
+) -> Option<crate::types::batch::Schema> {
+    let meta = engine.get_table_meta(db, table)?;
+    Some(crate::types::batch::Schema::new(meta.columns.clone()))
+}
+
+/// Stream a segment file from the primary. Frames that arrive while the
+/// fetch is in flight (later replication events) are buffered in `deferred`
+/// so apply order is preserved.
+async fn fetch_segment(
+    engine: &crate::sql::execution::Engine,
+    framed: &mut Framed<tokio::net::TcpStream, MessageCodec>,
+    deferred: &mut VecDeque<(u64, ReplicationEvent)>,
+    db: &str,
+    table: &str,
+    segment: &str,
+) -> Result<Bytes> {
+    let _ = engine;
+    let mut request = Vec::new();
+    put_str(&mut request, db);
+    put_str(&mut request, table);
+    put_str(&mut request, segment);
+    request.extend_from_slice(&0u64.to_le_bytes());
+    request.extend_from_slice(&(4 * 1024 * 1024u32).to_le_bytes());
+    framed
+        .send(Message::new(MSG_TYPE_REPL_SEGMENT_FETCH, Bytes::from(request)))
+        .await?;
+
+    let mut bytes: Option<Bytes> = None;
+    loop {
+        let message = framed
+            .next()
+            .await
+            .ok_or_else(|| TaibaiError::Storage("primary closed the stream during fetch".into()))??;
+        match message.msg_type {
+            MSG_TYPE_REPL_SEGMENT_CHUNK => {
+                if message.payload.len() < 16 {
+                    return Err(TaibaiError::Storage("REPL_SEGMENT_CHUNK truncated".into()));
+                }
+                let total_len =
+                    u64::from_le_bytes(message.payload[..8].try_into().unwrap()) as usize;
+                let offset =
+                    u64::from_le_bytes(message.payload[8..16].try_into().unwrap()) as usize;
+                let chunk = message.payload.slice(16..);
+                let merged = match bytes.take() {
+                    Some(existing) => {
+                        let mut buf = Vec::with_capacity(total_len);
+                        buf.extend_from_slice(&existing);
+                        buf.extend_from_slice(&chunk);
+                        Bytes::from(buf)
+                    }
+                    None => {
+                        if offset != 0 {
+                            return Err(TaibaiError::Storage(
+                                "REPL_SEGMENT_CHUNK started at a non-zero offset".into(),
+                            ));
+                        }
+                        let mut buf = Vec::with_capacity(total_len);
+                        buf.extend_from_slice(&chunk);
+                        Bytes::from(buf)
+                    }
+                };
+                if merged.len() == total_len {
+                    return Ok(merged);
+                }
+                bytes = Some(merged);
+            }
+            MSG_TYPE_REPL_EVENT => {
+                if message.payload.len() < 12 {
+                    return Err(TaibaiError::Storage("REPL_EVENT truncated".into()));
+                }
+                let seq = u64::from_le_bytes(message.payload[..8].try_into().unwrap());
+                let len =
+                    u32::from_le_bytes(message.payload[8..12].try_into().unwrap()) as usize;
+                if message.payload.len() < 12 + len {
+                    return Err(TaibaiError::Storage("REPL_EVENT payload truncated".into()));
+                }
+                let event = ReplicationEvent::decode(&message.payload[12..12 + len])?;
+                deferred.push_back((seq, event));
+            }
+            MSG_TYPE_ERROR => {
+                return Err(TaibaiError::Storage(format!(
+                    "segment fetch rejected: {}",
+                    String::from_utf8_lossy(&message.payload)
+                )));
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn send_ack(
+    framed: &mut Framed<tokio::net::TcpStream, MessageCodec>,
+    applied_seq: u64,
+) -> Result<()> {
+    framed
+        .send(Message::new(
+            MSG_TYPE_REPL_ACK,
+            Bytes::from(applied_seq.to_le_bytes().to_vec()),
+        ))
+        .await
+}
+
+/// Read one frame and require it to be one of `ok_or_fail`: AUTH_OK/OK pass,
+/// AUTH_FAIL/ERROR fail with the message text.
+async fn expect(
+    framed: &mut Framed<tokio::net::TcpStream, MessageCodec>,
+    ok_or_fail: &[u8],
+) -> Result<()> {
+    let message = framed
+        .next()
+        .await
+        .ok_or_else(|| TaibaiError::Storage("connection closed during handshake".into()))??;
+    let text = String::from_utf8_lossy(&message.payload).to_string();
+    if ok_or_fail.contains(&message.msg_type) && message.msg_type != MSG_TYPE_AUTH_FAIL {
+        return Ok(());
+    }
+    Err(TaibaiError::Auth(if text.is_empty() {
+        format!("handshake failed (frame {:#04X})", message.msg_type)
+    } else {
+        text
+    }))
+}
+
+fn put_str(buf: &mut Vec<u8>, value: &str) {
+    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+}
+
+// Silence unused import when build_error is only used in future variants.
+#[allow(dead_code)]
+fn _assert_build_error_in_scope(_: fn(&str) -> Message) {
+    let _ = build_error;
+}

@@ -281,6 +281,7 @@ impl SegmentManager {
 
             if seg.current_size >= self.max_segment_size() {
                 seg.seal(&|path| self.invalidate_reader(path))?;
+                self.emit_segment_update_final_path(&seg.path);
                 active_guard.remove(partition_key);
             } else if flush_immediately && (seg.buffered_rows > 0 || seg.total_rows > 0) {
                 seg.flush_buffer(&|path| self.invalidate_reader(path))?;
@@ -432,6 +433,9 @@ impl SegmentManager {
         writer.append_batch(batch, false, &|segment_path| {
             self.invalidate_reader(segment_path)
         })?;
+        // NOTE: no replication emission here - this writer writes a TMP file
+        // that the caller renames; the flush sites emit the SegmentUpdate
+        // with the final name after the rename.
         writer.seal(&|segment_path| self.invalidate_reader(segment_path))?;
         Ok(())
     }

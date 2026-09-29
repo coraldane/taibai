@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher;
@@ -212,6 +212,7 @@ struct AppendCommand {
 
 enum CommitCommand {
     Append(AppendCommand),
+    Replicate(crate::storage::replication::ReplicationEvent),
     Barrier {
         table_dir: PathBuf,
         completion: Arc<CommitCompletion>,
@@ -235,6 +236,10 @@ pub(crate) struct TailCommitter {
     sender: crossbeam_channel::Sender<CommitCommand>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     queued: Arc<AtomicUsize>,
+    /// Replication log, wired after construction by the engine. Shared with
+    /// the commit loop through an `Arc<OnceLock<_>>` because the loop is
+    /// spawned in `start`, before the engine exists.
+    rep_log: Arc<OnceLock<Arc<crate::storage::replication::RepLog>>>,
 }
 
 impl TailCommitter {
@@ -248,15 +253,47 @@ impl TailCommitter {
         let (sender, receiver) = crossbeam_channel::bounded(TAIL_COMMIT_QUEUE_CAPACITY);
         let queued = Arc::new(AtomicUsize::new(0));
         let loop_queued = Arc::clone(&queued);
+        let rep_log: Arc<OnceLock<Arc<crate::storage::replication::RepLog>>> =
+            Arc::new(OnceLock::new());
+        let loop_rep_log = Arc::clone(&rep_log);
         let handle = std::thread::Builder::new()
             .name("taibai-tail-commit".into())
-            .spawn(move || tail_commit_loop(receiver, async_fsync, loop_queued))
+            .spawn(move || tail_commit_loop(receiver, async_fsync, loop_queued, loop_rep_log))
             .expect("failed to spawn durable tail commit thread");
         Arc::new(Self {
             sender,
             handle: Mutex::new(Some(handle)),
             queued,
+            rep_log,
         })
+    }
+
+    /// Attach the replication log. Called once by the engine after both
+    /// objects exist; events are silently dropped until then.
+    pub(crate) fn set_rep_log(&self, log: Arc<crate::storage::replication::RepLog>) {
+        let _ = self.rep_log.set(log);
+    }
+
+    /// Enqueue a structural replication event (segment updates and later
+    /// DML/DDL events). It is seq-stamped when the commit thread dequeues
+    /// it, after every tail append that causally precedes it (their flush
+    /// paths hold the tail barrier first). Bounded backpressure, same as
+    /// regular appends.
+    pub(crate) fn submit_event(&self, event: crate::storage::replication::ReplicationEvent) {
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        let (timeout, _warn) = tail_commit_timeouts();
+        match self.sender.send_timeout(CommitCommand::Replicate(event), timeout) {
+            Ok(()) => {}
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                tracing::error!(
+                    "replication event dropped: commit queue stayed full for the tail-commit timeout"
+                );
+            }
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
 
     pub(crate) fn submit(
@@ -465,6 +502,7 @@ fn tail_commit_loop(
     receiver: crossbeam_channel::Receiver<CommitCommand>,
     async_fsync: bool,
     queued: Arc<AtomicUsize>,
+    rep_log: Arc<OnceLock<Arc<crate::storage::replication::RepLog>>>,
 ) {
     let mut files = TailFileSet::default();
     let mut compressor = zstd::bulk::Compressor::new(3)
@@ -591,6 +629,27 @@ fn tail_commit_loop(
 
                 let written = write_append_group(&mut files, &mut compressor, group, &mut next_lsn);
                 TAIL_LSN_HIGH_WATER.fetch_max(next_lsn, Ordering::AcqRel);
+                // Tail-append replication events are published INLINE on this
+                // thread: seq order then equals the frame-write order. (They
+                // must not re-enter the bounded channel - this thread is its
+                // only drainer, and a full queue would deadlock.)
+                if let Some(log) = rep_log.get() {
+                    for group in &written {
+                        if let Some(payload) = &group.rep_payload {
+                            log.publish(
+                                crate::storage::replication::ReplicationEvent::TailAppend {
+                                    db: payload.db.clone(),
+                                    table: payload.table.clone(),
+                                    partition: payload.partition.clone(),
+                                    memtable_id: payload.memtable_id,
+                                    first_lsn: payload.first_lsn,
+                                    last_lsn: payload.last_lsn,
+                                    frames: payload.frames.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
 
                 if async_fsync {
                     // Frames are in the page cache: release the
@@ -622,6 +681,11 @@ fn tail_commit_loop(
                 files.evict_table(&table_dir);
                 completion.finish(Ok(()));
             }
+            CommitCommand::Replicate(event) => {
+                if let Some(log) = rep_log.get() {
+                    log.publish(event);
+                }
+            }
             CommitCommand::Shutdown { completion } => {
                 sync_dirty_tails(
                     &mut files,
@@ -641,6 +705,21 @@ struct WrittenTailGroup {
     key: TailKey,
     completions: Vec<Arc<CommitCompletion>>,
     bytes: usize,
+    /// Frames written for this tail in this group, for the replication
+    /// event. `None` when the group wrote nothing.
+    rep_payload: Option<TailAppendPayload>,
+}
+
+/// Everything the replication event needs about one group's appends to one
+/// tail. db/table are derived from the table dir (`<data>/<db>/<table>`).
+struct TailAppendPayload {
+    db: String,
+    table: String,
+    partition: String,
+    memtable_id: Uuid,
+    first_lsn: u64,
+    last_lsn: u64,
+    frames: Vec<u8>,
 }
 
 fn write_append_group(
@@ -667,7 +746,7 @@ fn write_append_group(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
-    let mut by_tail = HashMap::<TailKey, (Vec<Arc<CommitCompletion>>, usize)>::new();
+    let mut by_tail = HashMap::<TailKey, TailGroupAccumulator>::new();
     for mut command in group {
         let frame_bytes = command.prepared.encoded_len();
         // Frame-encoding failure (payload beyond the WAL u32 length field)
@@ -681,21 +760,70 @@ fn write_append_group(
         }
         match files.append(&command) {
             Ok(key) => {
-                let entry = by_tail.entry(key).or_insert_with(|| (Vec::new(), 0));
-                entry.0.push(command.completion);
-                entry.1 += frame_bytes;
+                let (db, table) = db_table_from_dir(&command.table_dir);
+                let entry = by_tail.entry(key).or_insert_with(|| TailGroupAccumulator {
+                    db,
+                    table,
+                    partition: command.partition_key.clone(),
+                    memtable_id: command.id,
+                    completions: Vec::new(),
+                    bytes: 0,
+                    frames: Vec::new(),
+                    first_lsn: lsn,
+                    last_lsn: lsn,
+                });
+                entry.completions.push(command.completion);
+                entry.bytes += frame_bytes;
+                entry.frames.extend_from_slice(command.prepared.frame());
+                entry.last_lsn = lsn;
             }
             Err(error) => command.completion.finish(Err(error.to_string())),
         }
     }
     by_tail
         .into_iter()
-        .map(|(key, (completions, bytes))| WrittenTailGroup {
+        .map(|(key, acc)| WrittenTailGroup {
+            rep_payload: (!acc.frames.is_empty()).then(|| TailAppendPayload {
+                db: acc.db,
+                table: acc.table,
+                partition: acc.partition,
+                memtable_id: acc.memtable_id,
+                first_lsn: acc.first_lsn,
+                last_lsn: acc.last_lsn,
+                frames: acc.frames,
+            }),
             key,
-            completions,
-            bytes,
+            completions: acc.completions,
+            bytes: acc.bytes,
         })
         .collect()
+}
+
+/// Accumulated state of one group's appends to one tail file.
+struct TailGroupAccumulator {
+    db: String,
+    table: String,
+    partition: String,
+    memtable_id: Uuid,
+    completions: Vec<Arc<CommitCompletion>>,
+    bytes: usize,
+    frames: Vec<u8>,
+    first_lsn: u64,
+    last_lsn: u64,
+}
+
+/// `<data>/<db>/<table>` tail dir -> `(db, table)`.
+fn db_table_from_dir(table_dir: &Path) -> (String, String) {
+    let table = table_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let db = table_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    (db, table)
 }
 
 fn sync_append_group(files: &mut TailFileSet, written: Vec<WrittenTailGroup>) {
@@ -783,6 +911,11 @@ enum GenerationKind {
     Tail,
     Clear,
     Flush,
+    /// Delete sidecar: positions to remove from the tail generations BELOW
+    /// it. Appended by DELETE/REPLACE so removing memtable rows costs
+    /// O(affected rows) instead of rewriting the whole tail snapshot (which
+    /// made repeated small deletes quadratic in the memtable size).
+    Delete,
 }
 
 #[derive(Clone)]
@@ -866,6 +999,128 @@ pub fn append(table_dir: &Path, id: Uuid, partition_key: &str, delta: &RecordBat
     Ok(())
 }
 
+const DELETE_GEN_MAGIC: u32 = 0x5441_4944; // "TAID"
+
+fn encode_delete_positions(positions: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + positions.len() * 4);
+    bytes.extend_from_slice(&DELETE_GEN_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&(positions.len() as u32).to_le_bytes());
+    for position in positions {
+        bytes.extend_from_slice(&position.to_le_bytes());
+    }
+    append_crc(bytes)
+}
+
+fn decode_delete_positions(bytes: &[u8]) -> Result<Vec<u32>> {
+    let body = verify_crc(bytes)?;
+    if body.len() < 8 || u32::from_le_bytes(body[0..4].try_into().unwrap()) != DELETE_GEN_MAGIC {
+        return Err(TaibaiError::Storage(
+            "durable tail delete sidecar is corrupt".into(),
+        ));
+    }
+    let count = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    if body.len() != 8 + count * 4 {
+        return Err(TaibaiError::Storage(
+            "durable tail delete sidecar length mismatch".into(),
+        ));
+    }
+    Ok(body[8..]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect())
+}
+
+/// Durably record row deletions for a memtable without rewriting its tail.
+///
+/// The sidecar generation (`<id>.<seq>.del`) applies to the tail below it:
+/// recovery loads the tail, then removes the recorded positions oldest
+/// sidecar first. Appends to the tail only extend it, so positions recorded
+/// against an earlier prefix stay valid. Returns `false` when the memtable
+/// has no live tail (caller falls back to a full `persist`).
+pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool> {
+    if positions.is_empty() {
+        return Ok(true);
+    }
+    let mut positions = positions.to_vec();
+    positions.sort_unstable();
+    positions.dedup();
+    let tail_dir = table_dir.join(TAIL_DIR);
+    if !tail_dir.exists() {
+        return Ok(false);
+    }
+    // Same walk as `newest_live_tail_path`: a live tail must exist below any
+    // flush intents / clear tombstones, with delete sidecars transparent.
+    let mut generations = generations_for_id(&tail_dir, id)?;
+    generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+    let mut live_tail = None;
+    for generation in generations {
+        match generation.kind {
+            GenerationKind::Tail => {
+                if !tail_file_has_header(&generation.path) {
+                    discard_unusable_tail(&generation.path);
+                    continue;
+                }
+                live_tail = Some(generation.path);
+                break;
+            }
+            GenerationKind::Clear => break,
+            GenerationKind::Flush => {
+                let satisfied = fs::read(&generation.path)
+                    .ok()
+                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
+                    .unwrap_or(false);
+                if satisfied {
+                    break;
+                }
+                let _ = fs::remove_file(&generation.path);
+            }
+            GenerationKind::Delete => {}
+        }
+    }
+    if live_tail.is_none() {
+        return Ok(false);
+    }
+    let sequence = next_sequence();
+    let tmp_path = tail_dir.join(format!(".{}.{}.del.tmp", id.simple(), sequence));
+    let final_path = tail_dir.join(format!("{}.{}.del", id.simple(), sequence));
+    write_new_synced(&tmp_path, &encode_delete_positions(&positions))?;
+    fs::rename(&tmp_path, &final_path)?;
+    // The sidecar must be durable before the statement acks the delete;
+    // otherwise a crash restores rows the caller believes are gone.
+    sync_dir_best_effort(&tail_dir);
+    Ok(true)
+}
+
+/// True when no delete sidecars pend above the memtable's live tail. A spill
+/// (which writes a fresh full tail under the existing generation sequence)
+/// must not run while sidecars pend: they would re-apply to unrelated rows.
+pub fn tail_is_plain(table_dir: &Path, id: Uuid) -> Result<bool> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    if !tail_dir.exists() {
+        return Ok(true);
+    }
+    let mut generations = generations_for_id(&tail_dir, id)?;
+    generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+    for generation in generations {
+        match generation.kind {
+            GenerationKind::Tail => return Ok(true),
+            GenerationKind::Clear => return Ok(true),
+            GenerationKind::Delete => return Ok(false),
+            GenerationKind::Flush => {
+                let satisfied = fs::read(&generation.path)
+                    .ok()
+                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
+                    .unwrap_or(false);
+                if satisfied {
+                    return Ok(true);
+                }
+                let _ = fs::remove_file(&generation.path);
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Persist a tombstone before removing a tail. Keeping the tombstone makes a
 /// failed cleanup fail closed: an older tail cannot be resurrected on restart.
 pub fn clear(table_dir: &Path, id: Uuid) -> Result<()> {
@@ -892,6 +1147,9 @@ pub fn has_tail(table_dir: &Path, id: Uuid) -> bool {
         match generation.kind {
             GenerationKind::Tail => return true,
             GenerationKind::Clear => return false,
+            // Sidecars do not change whether rows exist; the tail below
+            // decides. A corrupt sidecar surfaces when the tail is loaded.
+            GenerationKind::Delete => {}
             GenerationKind::Flush => {
                 let Ok(bytes) = fs::read(&generation.path) else {
                     continue;
@@ -941,6 +1199,7 @@ pub fn has_tail_batch(table_dir: &Path, ids: &[Uuid]) -> Result<HashMap<Uuid, bo
                     break;
                 }
                 GenerationKind::Clear => break,
+                GenerationKind::Delete => {}
                 GenerationKind::Flush => {
                     let Ok(bytes) = fs::read(&generation.path) else {
                         continue;
@@ -980,6 +1239,7 @@ pub fn live_tail_paths_batch(
                     break;
                 }
                 GenerationKind::Clear => break,
+                GenerationKind::Delete => {}
                 GenerationKind::Flush => {
                     let Ok(bytes) = fs::read(&generation.path) else {
                         continue;
@@ -1068,7 +1328,55 @@ pub fn cancel_flush(intent: FlushIntent) -> Result<()> {
 /// intents) and return the live tail file for every recoverable memtable id.
 /// Shared by `recover` (eager decode) and `recover_index` (metadata only);
 /// performs the same on-disk cleanup as before.
-fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf)>> {
+/// Resolve the live tail for one id, collecting the delete sidecars above it.
+/// Returns `(tail path, deletions oldest-first)`; a corrupt sidecar is an
+/// error (fail closed: applying a partial list would resurrect rows).
+fn live_tail_with_deletions(
+    tail_dir: &Path,
+    table_dir: &Path,
+    id: Uuid,
+    generations: &mut Vec<Generation>,
+) -> Result<Option<(PathBuf, Vec<Vec<u32>>)>> {
+    generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
+    let mut deletions_rev = Vec::new();
+    for generation in generations.iter() {
+        match generation.kind {
+            GenerationKind::Tail => {
+                if !tail_file_has_header(&generation.path) {
+                    discard_unusable_tail(&generation.path);
+                    continue;
+                }
+                let mut applied = Vec::with_capacity(deletions_rev.len());
+                for sidecar in deletions_rev.iter().rev() {
+                    applied.push(decode_delete_positions(&fs::read(sidecar)?)?);
+                }
+                return Ok(Some((generation.path.clone(), applied)));
+            }
+            GenerationKind::Clear => return Ok(None),
+            GenerationKind::Delete => deletions_rev.push(generation.path.clone()),
+            GenerationKind::Flush => {
+                // A torn or corrupt intent marker proves nothing about the
+                // tail: treat it as unsatisfied so the preceding tail stays
+                // authoritative instead of failing table recovery.
+                let satisfied = fs::read(&generation.path)
+                    .ok()
+                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
+                    .unwrap_or(false);
+                if satisfied {
+                    remove_other_generations_ex(tail_dir, id, &generation.path, true)?;
+                    remove_file_if_exists(&generation.path)?;
+                    return Ok(None);
+                }
+                // The rows never became durable in the target segment.
+                // Ignore this intent and continue to the preceding tail.
+                let _ = remove_file_if_exists(&generation.path);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf, Vec<Vec<u32>>)>> {
     let tail_dir = table_dir.join(TAIL_DIR);
     if !tail_dir.exists() {
         return Ok(Vec::new());
@@ -1092,42 +1400,16 @@ fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf)>> {
 
     let mut resolved = Vec::new();
     for (id, mut generations) in by_id {
-        generations.sort_by_key(|generation| std::cmp::Reverse(generation.sequence));
-        let mut live_path = None;
-        for generation in &generations {
-            match generation.kind {
-                GenerationKind::Tail => {
-                    if !tail_file_has_header(&generation.path) {
-                        discard_unusable_tail(&generation.path);
-                        continue;
-                    }
-                    live_path = Some(generation.path.clone());
-                    break;
-                }
-                GenerationKind::Clear => break,
-                GenerationKind::Flush => {
-                    // A torn or corrupt intent marker proves nothing about the
-                    // tail: treat it as unsatisfied so the preceding tail stays
-                    // authoritative instead of failing table recovery.
-                    let satisfied = fs::read(&generation.path)
-                        .ok()
-                        .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
-                        .unwrap_or(false);
-                    if satisfied {
-                        remove_other_generations(&tail_dir, id, &generation.path)?;
-                        remove_file_if_exists(&generation.path)?;
-                        break;
-                    }
-                    // The rows never became durable in the target segment.
-                    // Ignore this intent and continue to the preceding tail.
-                    let _ = remove_file_if_exists(&generation.path);
-                }
-            }
-        }
-        if let Some(path) = live_path {
-            remove_other_generations(&tail_dir, id, &path)?;
-            resolved.push((id, path));
-        }
+        let Some((path, deletions)) =
+            live_tail_with_deletions(&tail_dir, table_dir, id, &mut generations)?
+        else {
+            continue;
+        };
+        // Delete sidecars must survive this cleanup: they are only applied
+        // (and then superseded) by the caller, and a crash in between must
+        // find them again on the next recovery.
+        remove_other_generations_ex(&tail_dir, id, &path, true)?;
+        resolved.push((id, path, deletions));
     }
     remove_empty_dir(&tail_dir);
     Ok(resolved)
@@ -1135,8 +1417,13 @@ fn resolve_live_tail_paths(table_dir: &Path) -> Result<Vec<(Uuid, PathBuf)>> {
 
 pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> {
     let mut recovered = Vec::new();
-    for (id, path) in resolve_live_tail_paths(table_dir)? {
-        let (partition_key, batch) = decode_tail_file(&path, schema)?;
+    for (id, path, deletions) in resolve_live_tail_paths(table_dir)? {
+        let (partition_key, mut batch) = decode_tail_file(&path, schema)?;
+        // Apply delete sidecars oldest-first: each sidecar's positions refer
+        // to the batch state its DELETE statement observed.
+        for positions in &deletions {
+            batch = filter_out_positions(&batch, positions)?;
+        }
         recovered.push(RecoveredTail {
             id,
             partition_key,
@@ -1148,9 +1435,23 @@ pub fn recover(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTail>> 
 
 /// Recover tail metadata: current-format tails are indexed from frame
 /// headers without decoding their payloads.
-pub fn recover_index(table_dir: &Path, _schema: &Schema) -> Result<Vec<RecoveredTailIndex>> {
+pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredTailIndex>> {
     let mut recovered = Vec::new();
-    for (id, path) in resolve_live_tail_paths(table_dir)? {
+    for (id, mut path, deletions) in resolve_live_tail_paths(table_dir)? {
+        // The lazy materialization path reads only the tail file, so pending
+        // delete sidecars must be folded into a fresh full tail HERE. The
+        // decode cost is confined to memtables that restarted with unflushed
+        // DELETEs; plain tails stay lazy.
+        if !deletions.is_empty() {
+            let (partition_key, mut batch) = decode_tail_file(&path, schema)?;
+            for positions in &deletions {
+                batch = filter_out_positions(&batch, positions)?;
+            }
+            persist(table_dir, id, &partition_key, &batch)?;
+            path = newest_live_tail_path(&table_dir.join(TAIL_DIR), id)?.ok_or_else(|| {
+                TaibaiError::Storage("durable tail vanished after delete consolidation".into())
+            })?;
+        }
         let bytes = fs::read(&path)?;
         if bytes.len() < TAIL_LOG_HEADER_LEN as usize {
             continue;
@@ -1187,6 +1488,57 @@ pub fn recover_index(table_dir: &Path, _schema: &Schema) -> Result<Vec<Recovered
 
 /// Newest live tail file for a memtable, applying the same clear/flush-intent
 /// arbitration as crash recovery. Used by the spill path.
+/// Standby replication apply: append already-encoded V3 frames to the
+/// memtable's tail file, creating the generation on first append. Durable
+/// before returning (fsync), matching the standby's strict write semantics.
+pub fn append_raw_frames(
+    table_dir: &Path,
+    id: Uuid,
+    partition_key: &str,
+    frames: &[u8],
+) -> Result<()> {
+    let tail_dir = table_dir.join(TAIL_DIR);
+    fs::create_dir_all(&tail_dir)?;
+    if let Some(path) = live_tail_path(table_dir, id)? {
+        let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+        file.write_all(frames)?;
+        file.sync_all()?;
+        return Ok(());
+    }
+    let sequence = next_sequence();
+    let stem = format!("{}.{}", id.simple(), sequence);
+    let tmp_path = tail_dir.join(format!(".{stem}.tmp"));
+    let final_path = tail_dir.join(format!("{stem}.tail"));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(&tmp_path)?;
+    file.write_all(&encode_tail_log_header(partition_key))?;
+    file.write_all(frames)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp_path, &final_path)?;
+    Ok(())
+}
+
+/// Sum of the `rows` fields across V3 frames in a buffer (header walk only).
+pub fn count_v3_frame_rows(frames: &[u8]) -> u64 {
+    let mut rows = 0u64;
+    let mut offset = 0usize;
+    while offset + 32 <= frames.len() {
+        let payload_len =
+            u64::from_le_bytes(frames[offset..offset + 8].try_into().unwrap()) as usize;
+        let frame_rows = u64::from_le_bytes(frames[offset + 8..offset + 16].try_into().unwrap());
+        let frame_end = offset + 32 + payload_len + 4;
+        if frame_end > frames.len() {
+            break;
+        }
+        rows = rows.saturating_add(frame_rows);
+        offset = frame_end;
+    }
+    rows
+}
+
 pub fn live_tail_path(table_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     newest_live_tail_path(&table_dir.join(TAIL_DIR), id)
 }
@@ -1411,6 +1763,41 @@ fn batch_rows_hint(frame_head: &[u8]) -> u64 {
     }
 }
 
+/// Remove the given positions from a batch (columnar take, no per-cell
+/// scalar round-trip). Local copy of the deferred-tombstone filter so the
+/// tail codec does not depend on the transaction registry.
+fn filter_out_positions(
+    batch: &RecordBatch,
+    positions: &[u32],
+) -> Result<RecordBatch> {
+    let mut doomed = positions.to_vec();
+    doomed.sort_unstable();
+    doomed.dedup();
+    if doomed.is_empty() {
+        return Ok(batch.clone());
+    }
+    let mut keep = Vec::with_capacity(batch.num_rows().saturating_sub(doomed.len()));
+    let mut doomed_iter = doomed.iter();
+    let mut next = doomed_iter.next();
+    for row in 0..batch.num_rows() as u32 {
+        match next {
+            Some(&position) if position == row => {
+                next = doomed_iter.next();
+            }
+            _ => keep.push(row),
+        }
+    }
+    if keep.len() == batch.num_rows() {
+        return Ok(batch.clone());
+    }
+    let columns = batch
+        .columns
+        .iter()
+        .map(|column| column.take(&keep))
+        .collect();
+    RecordBatch::try_new(batch.schema.clone(), columns)
+}
+
 fn append_batch(target: &mut RecordBatch, batch: &RecordBatch) -> Result<()> {
     for col_idx in 0..batch.num_columns() {
         let source = batch
@@ -1615,6 +2002,7 @@ fn parse_generation(path: &Path) -> Option<(Uuid, Generation)> {
         "tail" => GenerationKind::Tail,
         "clear" => GenerationKind::Clear,
         "flush" => GenerationKind::Flush,
+        "del" => GenerationKind::Delete,
         _ => return None,
     };
     if parts.next().is_some() {
@@ -1676,6 +2064,10 @@ fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
                 return Ok(Some(generation.path));
             }
             GenerationKind::Clear => return Ok(None),
+            // Appending insert deltas below a delete sidecar is safe:
+            // appends only extend the batch, so recorded positions keep
+            // referring to the same prefix.
+            GenerationKind::Delete => {}
             GenerationKind::Flush => {
                 let table_dir = tail_dir.parent().unwrap_or(tail_dir);
                 let satisfied = fs::read(&generation.path)
@@ -1693,10 +2085,24 @@ fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
 }
 
 fn remove_other_generations(tail_dir: &Path, id: Uuid, keep_path: &Path) -> Result<()> {
+    remove_other_generations_ex(tail_dir, id, keep_path, false)
+}
+
+/// `preserve_deletes` keeps delete sidecars: callers that already collected
+/// their contents but have not applied them yet (or crashed before doing so)
+/// must find them again on the next recovery.
+fn remove_other_generations_ex(
+    tail_dir: &Path,
+    id: Uuid,
+    keep_path: &Path,
+    preserve_deletes: bool,
+) -> Result<()> {
     for generation in generations_for_id(tail_dir, id)? {
         if generation.path != keep_path {
             if matches!(generation.kind, GenerationKind::Tail) {
                 archive_or_remove(tail_dir, &generation.path);
+            } else if matches!(generation.kind, GenerationKind::Delete) && preserve_deletes {
+                continue;
             } else {
                 remove_file_if_exists(&generation.path)?;
             }

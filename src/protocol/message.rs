@@ -71,6 +71,26 @@ pub const MSG_TYPE_SUB_ACK: u8 = 0x6A;
 /// `[string db][string table][u64 sub_id]`
 pub const MSG_TYPE_UNSUBSCRIBE_V2: u8 = 0x6B;
 
+/// Replication handshake (standby -> primary, after LOGIN). Payload:
+/// `[string user][string password][u64 last_applied_seq]`. The primary
+/// replies with REPL events pushed on the connection (or an ERROR frame
+/// when auth fails or the standby is behind the event ring).
+pub const MSG_TYPE_REPL_HELLO: u8 = 0x70;
+/// Replication event push (primary -> standby). Payload:
+/// `[u64 rep_seq][u32 len][event bytes]`. Events are already binary; the
+/// codec must not re-compress them.
+pub const MSG_TYPE_REPL_EVENT: u8 = 0x71;
+/// Segment content fetch (standby -> primary). Payload:
+/// `[string db][string table][string segment][u64 offset][u32 max_chunk]`.
+pub const MSG_TYPE_REPL_SEGMENT_FETCH: u8 = 0x72;
+/// Segment content chunk (primary -> standby, via the push queue). Payload:
+/// `[u64 total_len][u64 offset][chunk bytes]`. The final chunk satisfies
+/// `offset + chunk_len == total_len`.
+pub const MSG_TYPE_REPL_SEGMENT_CHUNK: u8 = 0x73;
+/// Replication progress acknowledgement (standby -> primary). Payload:
+/// `[u64 applied_seq]`.
+pub const MSG_TYPE_REPL_ACK: u8 = 0x74;
+
 #[derive(Debug, Clone)]
 pub struct MessageHeader {
     pub msg_type: u8,

@@ -534,6 +534,11 @@ impl BatchWriter {
         Ok(row_count)
     }
 
+    pub(crate) fn set_rep_log(&self, log: Arc<crate::storage::replication::RepLog>) {
+        log.set_tail_committer(Arc::clone(&self.tail_committer));
+        self.tail_committer.set_rep_log(log);
+    }
+
     pub fn commit_txn(&self, txn_id: u64) -> Result<()> {
         let pending = self.commit_txn_submit_inner(txn_id, false)?;
         self.wait_pending_tail_commits(pending)
@@ -1249,6 +1254,19 @@ impl BatchWriter {
         let Some(path) = live_tail else {
             return false;
         };
+        // A pending delete sidecar makes the raw tail exceed the memtable's
+        // rows, and spilling a fresh tail under it would strand the
+        // deletions (they would re-apply to unrelated rows). Refuse; the
+        // normal flush path supersedes tail and sidecars together.
+        let table_dir = match path.parent().and_then(|tail_dir| tail_dir.parent()) {
+            Some(dir) => dir.to_path_buf(),
+            None => return false,
+        };
+        match crate::storage::core::durable_tail::tail_is_plain(&table_dir, mt.id()) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(_) => return false,
+        }
         // Current-format tails expose their row count without decoding.
         let Ok(Some(tail_rows)) = crate::storage::core::durable_tail::tail_log_rows(&path) else {
             return false;
@@ -1465,6 +1483,7 @@ impl BatchWriter {
         }
 
         crate::storage::core::durable_tail::clear(&segment_mgr.table_dir(&db, &table), mt.id())?;
+        segment_mgr.emit_segment_update(&db, &table, &partition_key, vec![mt.id()], None);
 
         tracing::info!(
             table = %table,
@@ -1683,6 +1702,8 @@ impl BatchWriter {
         for (mt, _) in frozen {
             crate::storage::core::durable_tail::clear(&table_dir, mt.id())?;
         }
+        let group_ids: Vec<uuid::Uuid> = frozen.iter().map(|(mt, _)| mt.id()).collect();
+        segment_mgr.emit_segment_update(&db, &table, &partition_key, group_ids, None);
         tracing::debug!(
             table = %table,
             rows = merged.num_rows(),
@@ -1838,6 +1859,14 @@ impl BatchWriter {
                 "durable tail group flush cleanup deferred to recovery"
             );
         }
+        let group_ids: Vec<uuid::Uuid> = locked.iter().map(|(mt, _)| mt.id()).collect();
+        segment_mgr.emit_segment_update(
+            db,
+            table,
+            partition_key,
+            group_ids,
+            Some(segment_file_name.as_str()),
+        );
         tracing::debug!(
             table,
             rows = merged.num_rows(),
@@ -1960,6 +1989,14 @@ impl BatchWriter {
                 "durable tail group flush cleanup deferred to recovery"
             );
         }
+        let group_ids: Vec<uuid::Uuid> = locked.iter().map(|(mt, _)| mt.id()).collect();
+        segment_mgr.emit_segment_update(
+            db,
+            table,
+            partition_key,
+            group_ids,
+            Some(segment_file_name.as_str()),
+        );
         tracing::debug!(
             table,
             rows = merged.num_rows(),
@@ -2056,6 +2093,7 @@ impl BatchWriter {
                 "durable tail flush cleanup deferred to recovery"
             );
         }
+        segment_mgr.emit_segment_update(&db, &table, partition_key, vec![mt.id()], None);
         tracing::info!(
             table,
             rows = batch.num_rows(),
@@ -2157,6 +2195,13 @@ impl BatchWriter {
                 "durable tail flush cleanup deferred to recovery"
             );
         }
+        segment_mgr.emit_segment_update(
+            db,
+            table,
+            partition_key,
+            vec![mt.id()],
+            Some(segment_file_name.as_str()),
+        );
         tracing::debug!(
             table,
             rows = batch.num_rows(),

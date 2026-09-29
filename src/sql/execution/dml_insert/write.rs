@@ -507,6 +507,12 @@ fn exec_materialized_insert_batch(
     // inside `exec_bulk_insert_partitioned`; probing the index here too
     // doubled the constraint cost of every bulk SQL insert.
     let bulk_branch = bulk_import_mode || relaxed_direct_insert;
+    if bulk_branch && crate::common::config::replication_settings().role_is_primary() {
+        return Err(TaibaiError::Sql(
+            "bulk/RELAXED inserts are not allowed on a replication primary;              use regular DURABLE INSERTs"
+                .into(),
+        ));
+    }
     if bulk_branch || !validate_existing_constraints {
         validate_unique_constraints_in_batch(table, &batch, &schema, &unique_constraints)?;
     } else {

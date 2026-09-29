@@ -19,6 +19,8 @@ pub enum PermissionType {
     Alter,
     Truncate,
     Subscribe,
+    /// Read the replication event stream (REPL_HELLO on a primary).
+    Replication,
 }
 
 #[cfg(test)]
@@ -38,6 +40,7 @@ impl PermissionType {
             PermissionType::Alter => "ALTER",
             PermissionType::Truncate => "TRUNCATE",
             PermissionType::Subscribe => "SUBSCRIBE",
+            PermissionType::Replication => "REPLICATION",
         }
     }
 }

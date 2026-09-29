@@ -45,6 +45,10 @@ pub struct MemTable {
     schema: Schema,
     batch: RwLock<Option<Arc<RecordBatch>>>,
     backing: RwLock<MemTableBacking>,
+    /// Tail file backing a spilled memtable (set by `MemTable::spilled`).
+    /// Kept outside `backing` so a resident memtable can be demoted back to
+    /// spilled when replication appends more frames to its tail.
+    tail_path: Mutex<Option<PathBuf>>,
     state: AtomicU8,
     row_count: AtomicU64,
     created_at: Instant,
@@ -67,6 +71,7 @@ impl MemTable {
             batch: RwLock::new(Some(Arc::new(RecordBatch::new(schema.clone())))),
             schema,
             backing: RwLock::new(MemTableBacking::Resident),
+            tail_path: Mutex::new(None),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(0),
             created_at: Instant::now(),
@@ -91,6 +96,7 @@ impl MemTable {
             batch: RwLock::new(Some(Arc::new(RecordBatch::new(schema.clone())))),
             schema,
             backing: RwLock::new(MemTableBacking::Resident),
+            tail_path: Mutex::new(None),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(0),
             created_at: Instant::now(),
@@ -128,6 +134,35 @@ impl MemTable {
 
     pub fn row_count(&self) -> u64 {
         self.row_count.load(Ordering::Acquire)
+    }
+
+    /// Standby replication apply: the tail now holds `total_rows` rows.
+    /// A spilled memtable just updates its count; a RESIDENT one (already
+    /// materialized before the append) is demoted back to spilled so the
+    /// next access re-materializes the whole tail - otherwise the newer
+    /// frames would stay invisible.
+    pub fn set_tail_rows(&self, total_rows: u64) {
+        let mut guard = self.backing.write().unwrap();
+        match &mut *guard {
+            MemTableBacking::Spilled { rows, .. } => {
+                *rows = total_rows;
+                drop(guard);
+                self.row_count.store(total_rows, Ordering::Release);
+            }
+            MemTableBacking::Resident => {
+                let tail_path = self.tail_path.lock().unwrap().clone();
+                drop(guard);
+                if let Some(tail_path) = tail_path {
+                    let mut guard = self.backing.write().unwrap();
+                    *guard = MemTableBacking::Spilled {
+                        tail_path,
+                        rows: total_rows,
+                    };
+                    self.batch.write().unwrap().take();
+                    self.row_count.store(total_rows, Ordering::Release);
+                }
+            }
+        }
     }
 
     pub fn txn_id(&self) -> u64 {
@@ -412,6 +447,7 @@ impl MemTable {
             schema: batch.schema.clone(),
             batch: RwLock::new(Some(Arc::new(batch))),
             backing: RwLock::new(MemTableBacking::Resident),
+            tail_path: Mutex::new(None),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(rows),
             created_at: Instant::now(),
@@ -439,7 +475,8 @@ impl MemTable {
             partition_key,
             schema,
             batch: RwLock::new(None),
-            backing: RwLock::new(MemTableBacking::Spilled { tail_path, rows }),
+            backing: RwLock::new(MemTableBacking::Spilled { tail_path: tail_path.clone(), rows }),
+            tail_path: Mutex::new(Some(tail_path)),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(rows),
             created_at: Instant::now(),
@@ -584,6 +621,27 @@ impl MemTableManager {
         &self,
     ) -> Option<Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>> {
         self.txn_mutations.read().unwrap().clone()
+    }
+
+    /// Standby replication: refresh a tail-backed memtable's total row count
+    /// after tail frames were appended (demotes a resident copy if needed).
+    pub fn set_tail_rows(&self, id: Uuid, rows: u64) {
+        let memtables = self.memtables.read().unwrap();
+        if let Some(mt) = memtables.iter().find(|mt| mt.id() == id) {
+            mt.set_tail_rows(rows);
+        }
+    }
+
+    /// Standby replication: the primary's segment now durably holds these
+    /// memtables' rows; retire the local spilled copies.
+    pub fn retire_replicated_memtables(&self, ids: &[Uuid]) {
+        let memtables = self.memtables.write().unwrap();
+        for mt in memtables.iter() {
+            if ids.contains(&mt.id()) {
+                mt.set_state(MemTableState::Flushed);
+                mt.clear_batch();
+            }
+        }
     }
 
     /// Record rows appended through a path that skipped the hot-store mirror.

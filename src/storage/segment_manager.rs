@@ -121,6 +121,9 @@ pub struct SegmentManager {
     /// and compaction/TTL consult it to leave pinned segments alone.
     txn_mutations:
         std::sync::OnceLock<std::sync::Arc<crate::storage::core::txn_mutations::TxnMutationRegistry>>,
+    /// Replication log on primaries: flush/seal emission sites enqueue
+    /// `SegmentUpdate` events through it. Set once at engine startup.
+    rep_log: std::sync::OnceLock<std::sync::Arc<crate::storage::replication::RepLog>>,
 }
 
 include!("segment_manager/manager_core.rs");

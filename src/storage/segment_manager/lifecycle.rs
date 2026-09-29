@@ -167,6 +167,7 @@ impl SegmentManager {
             for key in keys_to_seal {
                 if let Some(seg) = active_guard.get_mut(&key) {
                     seg.seal(&|path| self.invalidate_reader(path))?;
+                    self.emit_segment_update_final_path(&seg.path);
                     total += seg.total_rows;
                 }
                 active_guard.remove(&key);
@@ -201,6 +202,7 @@ impl SegmentManager {
             for partition_key in keys_to_seal {
                 if let Some(segment) = active_guard.get_mut(&partition_key) {
                     segment.seal(&|path| self.invalidate_reader(path))?;
+                    self.emit_segment_update_final_path(&segment.path);
                     total += segment.total_rows;
                     tracing::info!(
                         path = %segment.path.display(),
@@ -232,6 +234,7 @@ impl SegmentManager {
             if should_seal {
                 if let Some(segment) = active_guard.get_mut(partition_key) {
                     segment.seal(&|path| self.invalidate_reader(path))?;
+                    self.emit_segment_update_final_path(&segment.path);
                     total = total.saturating_add(segment.total_rows);
                 }
                 active_guard.remove(partition_key);
@@ -264,6 +267,7 @@ impl SegmentManager {
             for partition_key in keys_to_seal {
                 if let Some(segment) = active_guard.get_mut(&partition_key) {
                     segment.seal(&|path| self.invalidate_reader(path))?;
+                    self.emit_segment_update_final_path(&segment.path);
                     total += segment.total_rows;
                 }
                 active_guard.remove(&partition_key);
@@ -291,6 +295,7 @@ impl SegmentManager {
             return Ok(0);
         }
         segment.seal(&|path| self.invalidate_reader(path))?;
+        self.emit_segment_update_final_path(&segment.path);
         let rows = segment.total_rows;
         active_guard.remove(partition_key);
         Ok(rows)
@@ -313,6 +318,7 @@ impl SegmentManager {
             for key in keys_to_seal {
                 if let Some(seg) = active_guard.get_mut(&key) {
                     seg.seal(&|path| self.invalidate_reader(path))?;
+                    self.emit_segment_update_final_path(&seg.path);
                     tracing::info!(
                         path = %seg.path.display(),
                         size_mb = seg.current_size / (1024 * 1024),
