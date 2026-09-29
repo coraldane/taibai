@@ -219,7 +219,7 @@ log:
 - `docs/design/TAIBAI_DESIGN_ZH.md`：整体设计说明。
 - `docs/operations/data-import-flow.md`：数据导入流程。
 - `docs/operations/windows-installation.md`：Windows 图形安装包和系统服务安装说明。
-- `docs/reports/performance-verification-report.md`：性能验证报告。
+- `docs/reports/benchmark-vs-duckdb-kdb-2026-09.md`：性能对比报告（vs DuckDB/kdb+）。
 - `CONTRIBUTING.md`：开发环境、质量检查和贡献流程。
 - `SECURITY.md`：漏洞报告和部署安全注意事项。
 

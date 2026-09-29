@@ -90,6 +90,13 @@ pub const MSG_TYPE_REPL_SEGMENT_CHUNK: u8 = 0x73;
 /// Replication progress acknowledgement (standby -> primary). Payload:
 /// `[u64 applied_seq]`.
 pub const MSG_TYPE_REPL_ACK: u8 = 0x74;
+/// Segment fetch verdict (primary -> standby): the requested segment no
+/// longer exists on the primary because a compaction/TTL event in the ring
+/// retired it. The replacement (or removal) arrives later in the same
+/// stream, so the standby skips the triggering `SegmentUpdate` instead of
+/// failing the applier. Emitted only when the retirement is provable from
+/// the primary's event ring; unknown files still fail loudly.
+pub const MSG_TYPE_REPL_SEGMENT_GONE: u8 = 0x75;
 
 #[derive(Debug, Clone)]
 pub struct MessageHeader {

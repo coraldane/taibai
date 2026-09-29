@@ -138,13 +138,11 @@
 
 ## 6. 实施进度
 
-- **2026-09-11 M1（A1 + B1）已完成**：
-  - 服务端：`DirectBulkRequest` 增加 encoding 版本（v2 magic `0xFFFF` + encoding=2），变长列支持连续缓冲 + offsets 数组；新增 `column_array_from_direct_bulk` 快速构建（定宽列整段 memcpy 进 `ColumnArray`，v2 VarChar/Blob 直接落地为 `Utf8Buffer`/`BinaryBuffer`）；v1 路径原样保留。协议细节见 [Direct Bulk 列式载荷协议](../design/direct-bulk-binary-protocol.md)。
-  - taibai-cpp：`RecordBatch` 改为类型化 `ColumnBuffer`（`add_*_column` 整段 memcpy、原生 null 位图、Decimal 直传 unscaled int64、新增 `add_timestamp_column`），`RecordBatch` 路径发送 v2；`vector<Column>` 兼容重载保留 v1。
-  - 验收：`tests/bulk_encoding_bench_test.rs`（ignored 基准，5000 行 × 6 列 × 60 批）服务端 v1/v2 吞吐持平（≈5.6 万 rows/s）——服务端瓶颈在 zstd 压缩与每批元数据 flush（属 A2 范畴），v2 的收益主要在驱动侧消除 int→string→int 往返；lib 429 测试全绿，v1 回归全绿。
-- 待做：A2（realtime profile / TAIL_CODEC / zone map 延迟）、A3（symbol 字典）、C3（落盘旁路回放）、M2–M4。
-- **2026-09-11 B2 + C1 已完成**：
-  - taibai-cpp：新增 `include/taibai/batch_writer.hpp` 的 `ColumnarBatchWriter<Row>`（SPSC 环形队列 + 后台聚批线程，`try_push` 非阻塞、满则计数丢弃，`close()` 排空并等待全部批次服务端确认，管线生命周期由 writer 持有）；`RecordBatchBuilder` 新增 `append_decimal`；`Client::flush()` 文档明确为"有界检查点"语义（先 drain pipeline 再发 FLUSH）。
-  - tonglian-md：新增 `src/TaibaiConfig.h`、`src/TaibaiWriter.h/.cpp`（与 NatsWriter 同级的双写通道：MDL 回调线程内将记录规整为定长 POD 行——价格 llround×100 转 unscaled int64、量额 clamp int32/int64、`local_time` 解析为 epoch µs（按天缓存 mktime）——`try_push` 入队；每表一个后台聚批线程 + 独立连接，懒建表 `CREATE TABLE IF NOT EXISTS`，快照表镜像 hot_insert 的 34 列 HOT DDL）。`MessageReceiver::init` 增加 `TaibaiConfig` 参数，三个 Push*Record 入口在 `TONGLIAN_MD_TAIBAI` 宏下双写；`main.cpp` 解析 `[taibai]` 段；`conf/example.ini` 新增 `[taibai]` 配置块（默认 `enabled=false`）；`CMakeLists.txt` 新增 `TAIBAI_CPP_ROOT` 选项（add_subdirectory taibai-cpp、定义 `TONGLIAN_MD_TAIBAI`、链接 `taibai_cpp`、目标升 C++17）。
-  - 验证：taibai-cpp（batch.cpp/client.cpp）MSVC /W4 编译通过；TaibaiWriter.cpp 以 spdlog 桩头在 MSVC 下编译通过；tonglian-md 整链（mdl_api/spdlog 依赖）需在 Linux 构建机回归。
-  - 遗留语义：IndexL2Snapshot 暂不写 taibai；orderflow `data_type` 按原始 INT32 落库；taibai 连接失败则该写入通道整体禁用（计数丢弃、记录日志），需重启进程恢复。
+**已完成（2026-09-11）**：
+
+- **M1（A1 + B1，二进制列式端到端）**：服务端 `DirectBulkRequest` 支持 v2 二进制编码（定宽列整段 memcpy 进 `ColumnArray`，VarChar 走连续缓冲 + offsets），v1 路径原样保留；taibai-cpp `RecordBatch` 改为类型化 `ColumnBuffer`（整段 memcpy、原生 null 位图、Decimal 直传 unscaled int64）。协议细节见 [Direct Bulk 列式载荷协议](../design/direct-bulk-binary-protocol.md)。
+- **B2 + C1（微批直写通道）**：taibai-cpp 新增 `ColumnarBatchWriter<Row>`（SPSC 环形队列 + 后台聚批线程，`close()` 排空并等待全部批次确认）；tonglian-md 新增 `TaibaiWriter` 双写通道（MDL 回调线程内规整为定长 POD 行，每表一个后台聚批线程 + 独立连接，懒建表，与 NatsWriter 同级），由 `[taibai]` 配置段控制（默认 `enabled=false`）。
+
+**遗留语义**：IndexL2Snapshot 暂不写 taibai；orderflow `data_type` 按原始 INT32 落库；taibai 连接失败则该写入通道整体禁用（计数丢弃、记录日志），需重启进程恢复；tonglian-md 整链（mdl_api/spdlog 依赖）需在 Linux 构建机回归。
+
+**待做**：A2（realtime profile / TAIL_CODEC / zone map 延迟）、A3（symbol 字典）、C3（落盘旁路回放）、M2–M4。

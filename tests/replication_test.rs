@@ -380,14 +380,18 @@ async fn standby_converges_and_survives_restart() {
         "DELETE replicated",
         Duration::from_secs(20),
         |engine| count_rows(engine, "SELECT COUNT(v) FROM t") == 499,
-    );
+    )
+    .await;
     // UPDATE effect visible.
     wait_for(
         &standby_engine,
         "UPDATE replicated",
         Duration::from_secs(20),
-        |engine| count_rows(engine, "SELECT v FROM t WHERE id = 499") == 0,
-    );
+        |engine| {
+            count_rows(engine, "SELECT COUNT(v) FROM t WHERE id = 499 AND v = 5000") == 1
+        },
+    )
+    .await;
     {
         let mut session = taibai::net::session::Session::new("root".into(), "main".into());
         match standby_engine.execute(&mut session, "SELECT v FROM t WHERE id = 499") {
@@ -412,7 +416,8 @@ async fn standby_converges_and_survives_restart() {
         "DDL + rows replicated",
         Duration::from_secs(20),
         |engine| count_rows(engine, "SELECT COUNT(v) FROM r2") == 1,
-    );
+    )
+    .await;
 
     let _ = primary.shutdown_tx.send(());
 }

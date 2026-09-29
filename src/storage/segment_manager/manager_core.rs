@@ -217,9 +217,6 @@ impl SegmentManager {
         let Some(log) = self.rep_log() else {
             return;
         };
-        if new_segment.map_or(false, |name| name.starts_with('.')) {
-            let backtrace = std::backtrace::Backtrace::force_capture();
-        }
         let (segment, kind) = match new_segment {
             Some(name) => (name.to_string(), crate::storage::replication::SegmentUpdateKind::Final),
             None => {

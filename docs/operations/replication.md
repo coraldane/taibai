@@ -72,6 +72,7 @@ seq 高水位持久化在 `<data>/wal/replication_seq`（主）与
 | REPL_SEGMENT_FETCH | 0x72 | 备→主 | `[db][table][segment][offset u64][max_chunk u32]` |
 | REPL_SEGMENT_CHUNK | 0x73 | 主→备 | `[total_len u64][offset u64][chunk]` |
 | REPL_ACK | 0x74 | 备→主 | `[applied_seq u64]` |
+| REPL_SEGMENT_GONE | 0x75 | 主→备 | 空。请求的段已被 compaction/TTL 淘汰（事件环可证明）；备机跳过触发它的 `SegmentUpdate`，行数据由流中稍后的 `SegmentsReplaced`/`SegmentsRemoved` 交付。无退休记录的缺失文件仍返回 ERROR |
 
 REPL_HELLO 要求登录会话与 hello 用户一致，且用户持有 `REPLICATION` 权限
 （`GRANT REPLICATION ON *.* TO ...`；root 的 ALL 覆盖）。

@@ -21,7 +21,7 @@
 //! `replication.enabled` rejects bulk/RELAXED direct writes (the only WAL
 //! bypass) and a standby engine is read-only.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -451,7 +451,7 @@ impl RepLog {
 
     /// Wire the commit-thread handle (engine startup, after the batch writer
     /// exists).
-    pub fn set_tail_committer(
+    pub(crate) fn set_tail_committer(
         &self,
         committer: Arc<crate::storage::core::durable_tail::TailCommitter>,
     ) {
@@ -464,6 +464,29 @@ impl RepLog {
             Some(committer) => committer.submit_event(event),
             None => tracing::warn!("replication event dropped: no commit thread wired"),
         }
+    }
+
+    /// Whether the ring records a compaction/TTL retirement of `segment`.
+    /// The fetch path consults this to answer a standby racing a compaction:
+    /// the segment's rows live on in the replacement event later in the same
+    /// stream, so the stale `SegmentUpdate` can be skipped. A file missing
+    /// without a provable retirement still fails loudly (bootstrap drift).
+    pub fn segment_retired(&self, db: &str, table: &str, segment: &str) -> bool {
+        let state = self.state.lock().unwrap();
+        state.ring.iter().rev().any(|(_, event)| match event.as_ref() {
+            ReplicationEvent::SegmentsReplaced {
+                db: d,
+                table: t,
+                retired,
+                ..
+            } => d == db && t == table && retired.iter().any(|name| name == segment),
+            ReplicationEvent::SegmentsRemoved {
+                db: d,
+                table: t,
+                segments,
+            } => d == db && t == table && segments.iter().any(|name| name == segment),
+            _ => false,
+        })
     }
 
     /// Test-only injection of the seq file location.

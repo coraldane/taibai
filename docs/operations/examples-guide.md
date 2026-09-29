@@ -406,7 +406,7 @@ query_bench 127.0.0.1:5151 main "SELECT count(*) FROM stock_tick_multi" 5
 
 ### perf_verify
 
-**用途**: SQL INSERT 吞吐端到端实测工具，覆盖实时（100 行/批）、导入（10000 行/批）与 bulk 三种写入形态，是[性能验证报告](../reports/performance-verification-report.md)的数据来源。
+**用途**: SQL INSERT 吞吐端到端实测工具，覆盖实时（100 行/批）、导入（10000 行/批）与 bulk 三种写入形态，是[性能对比报告](../reports/benchmark-vs-duckdb-kdb-2026-09.md)的数据来源。
 
 **使用**: 该工具运行在 Windows + PowerShell 环境，通过 `examples/perf_verify/perf_verify.bat [行数]` 启动，服务端配置由脚本生成到临时目录。详细说明见 [perf_verify README](../../examples/perf_verify/README.md)。
 
@@ -433,7 +433,7 @@ query_bench 127.0.0.1:5151 main "SELECT count(*) FROM stock_tick_multi" 5
 | `prepare_test` | ~5,000 rows/sec | - |
 | `batch_import` | ~40,000 rows/sec | - |
 
-以上数字来自历史测量环境，仅作量级参考；当前版本的实测数据见[性能验证报告](../reports/performance-verification-report.md)。
+以上数字来自历史测量环境，仅作量级参考；当前版本的实测数据见[性能对比报告](../reports/benchmark-vs-duckdb-kdb-2026-09.md)。
 
 **选择建议**:
 

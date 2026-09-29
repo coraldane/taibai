@@ -68,7 +68,6 @@ fn main() {
     }
 
     let mut scanned = 0u64;
-    let mut ok = 0u64;
     let mut current = 0u64;
     let mut migrated = 0u64;
     let mut skipped = 0u64;
@@ -102,7 +101,6 @@ fn main() {
                         }
                     };
                     if !needs {
-                        ok += 1;
                         current += 1;
                         continue;
                     }

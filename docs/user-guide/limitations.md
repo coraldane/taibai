@@ -20,6 +20,14 @@ Taibai 是用 Rust 编写的偏分析场景的列式数据库服务端：适合�
 
 项目包含事务、权限、分区、TTL、索引、Join、子查询、窗口函数和查询优化等实现。使用具体能力前，建议阅读对应文档并针对业务数据做端到端验证；事务与并发的实际行为见 [事务与并发语义](transactions-and-concurrency.md)。
 
+子查询与语句覆盖的当前边界（不支持时均明确报错，不会静默出错）：
+
+- 相关引用仅支持**直接外层**查询块，更深层嵌套的相关子查询报 `nested correlated subqueries are not supported`。
+- 相关子查询内不支持参数占位符（`?` / `$1`）。
+- `JOIN ON` 条件中的子查询不支持。
+- `UPDATE` / `DELETE` 语句中的相关子查询不支持。
+- 窗口函数支持 `ROW_NUMBER` / `RANK` / `DENSE_RANK` / `LEAD` / `LAG` 与窗口聚合；窗口 + `GROUP BY`、嵌套窗口等形态明确报错。
+
 ## 安全边界
 
 - 默认 `root/taibai` 凭据只用于本地开发，部署前必须修改。

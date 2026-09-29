@@ -117,20 +117,6 @@ pub fn txn_mutation_budget_bytes() -> u64 {
 /// plus tree-node overhead).
 const POSITION_CHARGE_BYTES: u64 = 48;
 
-impl TxnMutations {
-    fn table_mut(&mut self, db: &str, table: &str) -> &mut TableTxnMutations {
-        if let Some(index) = self
-            .tables
-            .iter()
-            .position(|entry| entry.db == db && entry.table == table)
-        {
-            return &mut self.tables[index];
-        }
-        self.tables.push(TableTxnMutations::new(db, table, None));
-        self.tables.last_mut().expect("just pushed")
-    }
-}
-
 /// Shared registry hanging off the engine, segment manager (scan lookup) and
 /// memtable manager (flush pin). All methods take the single lock; entries
 /// are created by rare DML statements and probed per scan only by readers of

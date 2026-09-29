@@ -21,18 +21,15 @@
 - [示例工具使用指南](operations/examples-guide.md)：导入、导出、订阅与性能测试示例的用法。
 - [数据导入流程说明](operations/data-import-flow.md)
 - [备份、迁移与恢复](operations/backup-and-migrate.md)
-- [主备流复制](operations/replication.md)：primary/standby 配置、事件流与引导流程。：backup/migrate 工具、tail 归档与恢复流程。
+- [主备流复制](operations/replication.md)：primary/standby 配置、事件流与引导流程。
 - [Windows 安装说明](operations/windows-installation.md)
 - [金融行情场景验证与测试清单](operations/financial-market-data-validation-checklist.md)
 
 ## 架构与设计
 
 - [Taibai 列式数据库服务器](design/TAIBAI_DESIGN_ZH.md)：整体架构与各子系统设计。
-- [Rust 列式数据库架构方案](design/columnar-database-design.md)：最初的架构设计文档。
 - [分区级 mutation lock 设计](design/partition-mutation-locks.md)：写入互斥的锁粒度与锁序。
 - [Transaction State Model and Session Management](design/transaction-state-model.md)
-- [SQL Transaction Support Analysis](design/transaction-hooks-analysis.md)
-- [CLUSTER BY Binary Search Integration Design](design/cluster-by-binary-search-design.md)
 - [实时 tick 内存态设计](design/realtime-tick-inmemory-design.md)
 - [Direct Bulk 二进制协议](design/direct-bulk-binary-protocol.md)
 - [通用性能基础](general-performance-foundations.md)
@@ -43,17 +40,13 @@
 
 - [向量化执行 → Parquet/Arrow → 时序金融深化路线图](plans/vectorization-parquet-timeseries-roadmap.md)：当前主线路线图。
 - [行情数据实时落库改造方案](plans/realtime-market-data-ingestion-plan.md)：实时摄取链路（ingest profile、二进制列式直写）。
-- [ScalarValue 演进与聚合执行器路线图](plans/scalar-value-evolution-roadmap.md)
 - [普通 INSERT 持久化路径磁盘 I/O 优化方案](plans/ordinary-insert-disk-io-optimization-plan.md)
-- [Durable Tail 升级为可查询 spill 层](plans/memtable-tail-spill-layer-plan.md)：Phase 1+2 已实施，Phase 3 未实施。
 
 ## 报告
 
 报告中的数据只适用于文档记录的版本、配置和测试环境。
 
-- [Taibai vs DuckDB vs kdb+ 性能对比报告](reports/benchmark-vs-duckdb-kdb-2026-09.md)：当前版本的对照基准。
-- [性能测试与验证报告](reports/performance-verification-report.md)：写入路径性能与瓶颈分析。
-- [SQL 查询语义支持度审计报告](reports/sql-semantics-audit-report.md)
+- [Taibai vs DuckDB vs kdb+ 性能对比报告](reports/benchmark-vs-duckdb-kdb-2026-09.md)：当前版本的对照基准与后续优化方向。
 
 ## 项目治理
 

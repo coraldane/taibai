@@ -1,7 +1,7 @@
 //! Integration tests for FROM derived tables and correlated subqueries.
 //!
-//! Companion to `docs/reports/sql-semantics-audit-report.md`: these two
-//! features were the top gaps found by the audit.
+//! Covers the two subquery shapes documented as supported in
+//! `docs/user-guide/limitations.md` (功能边界).
 
 use tempfile::TempDir;
 

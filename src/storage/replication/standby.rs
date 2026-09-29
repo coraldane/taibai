@@ -23,9 +23,9 @@ use crate::common::error::{Result, TaibaiError};
 use crate::net::handler::build_error;
 use crate::protocol::codec::MessageCodec;
 use crate::protocol::message::{
-    Message, MSG_TYPE_AUTH_FAIL, MSG_TYPE_AUTH_OK, MSG_TYPE_ERROR, MSG_TYPE_LOGIN,
-    MSG_TYPE_OK, MSG_TYPE_REPL_ACK, MSG_TYPE_REPL_EVENT, MSG_TYPE_REPL_HELLO,
-    MSG_TYPE_REPL_SEGMENT_CHUNK, MSG_TYPE_REPL_SEGMENT_FETCH,
+    Message, MSG_TYPE_AUTH_FAIL, MSG_TYPE_AUTH_OK, MSG_TYPE_ERROR, MSG_TYPE_LOGIN, MSG_TYPE_OK,
+    MSG_TYPE_REPL_ACK, MSG_TYPE_REPL_EVENT, MSG_TYPE_REPL_HELLO, MSG_TYPE_REPL_SEGMENT_CHUNK,
+    MSG_TYPE_REPL_SEGMENT_FETCH, MSG_TYPE_REPL_SEGMENT_GONE,
 };
 use crate::storage::core::durable_tail::{append_raw_frames, count_v3_frame_rows};
 use crate::storage::replication::{AppliedSeqState, ReplicationEvent};
@@ -304,8 +304,26 @@ async fn apply(
             kind,
             memtable_ids,
         } => {
-            let bytes =
-                fetch_segment(engine, framed, deferred, &db, &table, &segment).await?;
+            let bytes = match fetch_segment(engine, framed, deferred, &db, &table, &segment).await?
+            {
+                Some(bytes) => bytes,
+                None => {
+                    // SEGMENT_GONE: the primary compacted/TTL-removed the
+                    // segment between this update's commit and the fetch.
+                    // The retirement event later in this same stream ships
+                    // the replacement (or deletes the local copy), so the
+                    // skipped update cannot lose rows.
+                    tracing::info!(
+                        seq,
+                        db = %db,
+                        table = %table,
+                        segment = %segment,
+                        "segment superseded on primary; skipping stale update"
+                    );
+                    applied.advance(seq, true)?;
+                    return Ok(());
+                }
+            };
             let dest = engine.data_dir().join(&db).join(&table).join(&segment);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -362,7 +380,15 @@ async fn apply(
             retired,
         } => {
             for segment in &new_segments {
-                let bytes = fetch_segment(engine, framed, deferred, &db, &table, segment).await?;
+                let bytes = match fetch_segment(engine, framed, deferred, &db, &table, segment).await?
+                {
+                    Some(bytes) => bytes,
+                    None => {
+                        return Err(TaibaiError::Storage(format!(
+                            "replacement segment {db}.{table}/{segment} vanished on the primary"
+                        )));
+                    }
+                };
                 let dest = engine.data_dir().join(&db).join(&table).join(segment);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -464,7 +490,10 @@ fn table_schema(
 
 /// Stream a segment file from the primary. Frames that arrive while the
 /// fetch is in flight (later replication events) are buffered in `deferred`
-/// so apply order is preserved.
+/// so apply order is preserved. `Ok(None)` means the primary answered
+/// SEGMENT_GONE: the segment was retired by a compaction/TTL event later in
+/// this stream, so the triggering update is stale and must be skipped.
+#[allow(clippy::type_complexity)]
 async fn fetch_segment(
     engine: &crate::sql::execution::Engine,
     framed: &mut Framed<tokio::net::TcpStream, MessageCodec>,
@@ -472,7 +501,7 @@ async fn fetch_segment(
     db: &str,
     table: &str,
     segment: &str,
-) -> Result<Bytes> {
+) -> Result<Option<Bytes>> {
     let _ = engine;
     let mut request = Vec::new();
     put_str(&mut request, db);
@@ -491,6 +520,9 @@ async fn fetch_segment(
             .await
             .ok_or_else(|| TaibaiError::Storage("primary closed the stream during fetch".into()))??;
         match message.msg_type {
+            MSG_TYPE_REPL_SEGMENT_GONE => {
+                return Ok(None);
+            }
             MSG_TYPE_REPL_SEGMENT_CHUNK => {
                 if message.payload.len() < 16 {
                     return Err(TaibaiError::Storage("REPL_SEGMENT_CHUNK truncated".into()));
@@ -519,7 +551,7 @@ async fn fetch_segment(
                     }
                 };
                 if merged.len() == total_len {
-                    return Ok(merged);
+                    return Ok(Some(merged));
                 }
                 bytes = Some(merged);
             }

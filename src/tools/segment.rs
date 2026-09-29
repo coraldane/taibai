@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -308,43 +308,6 @@ pub fn format_system_time(time: Option<SystemTime>) -> String {
 
 fn is_leap_year(year: u64) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
-}
-
-fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8> {
-    let mut buf = [0u8; 1];
-    cursor
-        .read_exact(&mut buf)
-        .map_err(|e| TaibaiError::Storage(format!("read_u8 error: {}", e)))?;
-    Ok(buf[0])
-}
-
-fn read_u32_le(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
-    let mut buf = [0u8; 4];
-    cursor
-        .read_exact(&mut buf)
-        .map_err(|e| TaibaiError::Storage(format!("read_u32 error: {}", e)))?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-
-
-
-fn read_u64_le(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
-    let mut buf = [0u8; 8];
-    cursor
-        .read_exact(&mut buf)
-        .map_err(|e| TaibaiError::Storage(format!("read_u64 error: {}", e)))?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-
-fn read_len_prefixed_str(cursor: &mut Cursor<&[u8]>) -> Result<String> {
-    let len = read_u32_le(cursor)? as usize;
-    let mut buf = vec![0u8; len];
-    cursor
-        .read_exact(&mut buf)
-        .map_err(|e| TaibaiError::Storage(format!("read_str error: {}", e)))?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[cfg(test)]

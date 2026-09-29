@@ -1,6 +1,6 @@
 # perf_verify — SQL INSERT 吞吐实测工具
 
-对运行中的 taibai 服务端做端到端 SQL INSERT 吞吐测量，覆盖三种写入形态。对应[性能验证报告](../../docs/reports/performance-verification-report.md)的数据来源。
+对运行中的 taibai 服务端做端到端 SQL INSERT 吞吐测量，覆盖三种写入形态。对应[性能对比报告](../../docs/reports/benchmark-vs-duckdb-kdb-2026-09.md)的数据来源。
 
 ## 前置
 

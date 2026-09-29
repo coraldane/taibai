@@ -590,7 +590,6 @@ fn v3_frames_carry_monotonic_lsn_and_commit_timestamp() -> Result<()> {
 
 #[test]
 fn v2_tail_log_still_decodes_with_zero_metadata() -> Result<()> {
-    let temp = tempfile::tempdir()?;
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let batch = test_batch(&schema, &[7, 8])?;
     // Hand-build a V2-format tail log: 16-byte frame header.

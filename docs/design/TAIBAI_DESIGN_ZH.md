@@ -225,6 +225,9 @@ OPTIMIZE TABLE t;
 - 写入首先进入内存表 (MemTable)
 - 查询时合并段数据与 MemTable 数据
 - 支持行级删除标记
+- 内存泄压首选 **spill** 而非提前刷盘：committed 且已有 durable tail 的 memtable 在内存高水位时切换为 Spilled 态（数据留在 tail，内存仅元数据），避免为泄压切成小 row group；spill 候选耗尽后才走 flush 兜底
+- 查询或写入扫到 Spilled memtable 时惰性物化回内存（冷分区变热自愈）；事务中未提交的 memtable 不参与 spill
+- 重启走**惰性恢复**：只登记 tail 索引不物化数据，启动内存占用 ≈ 0，启动时间不随未刷盘数据量线性增长
 
 ### 事务管理
 
@@ -531,13 +534,3 @@ src/
 - **TopN 堆排序**：避免全量排序
 - **并行压缩**：利用 Rayon 并行处理段合并
 - **Count(*) 优化**：直接统计行数
-
----
-
-## 最近完成的改进
-
-1. **窗口函数修复**：RANK / DENSE_RANK 正确处理平局排序，窗口输出列正确追加到结果
-2. **身份认证增强**：细粒度权限检查、角色支持
-3. **ALTER TABLE 支持**：ADD / DROP / RENAME / MODIFY COLUMN
-4. **VECTOR 类型**：向量存储与相似度计算函数
-5. **段压缩**：OPTIMIZE TABLE 命令，支持段合并与排序优化

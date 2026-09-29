@@ -1680,10 +1680,6 @@ fn decode_tail_with_meta(
     decode_tail_log_inner(bytes, schema, frame_header_len)
 }
 
-fn decode_tail_log(bytes: &[u8], schema: &Schema) -> Result<(String, RecordBatch)> {
-    decode_tail_with_meta(bytes, schema).map(|(partition, batch, _)| (partition, batch))
-}
-
 fn decode_tail_log_inner(
     bytes: &[u8],
     schema: &Schema,

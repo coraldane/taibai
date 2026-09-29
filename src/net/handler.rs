@@ -1918,6 +1918,22 @@ impl Handler {
         let path = self.engine.data_dir().join(&db).join(&table).join(&segment);
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A compaction/TTL may have retired the segment between the
+                // SegmentUpdate's commit and this fetch. When the ring proves
+                // the retirement, tell the standby to skip the stale update;
+                // the replacement event later in the stream carries the rows.
+                if self
+                    .engine
+                    .rep_log()
+                    .is_some_and(|log| log.segment_retired(&db, &table, &segment))
+                {
+                    return Ok(vec![Message::empty(MSG_TYPE_REPL_SEGMENT_GONE)]);
+                }
+                return Ok(vec![build_error(&format!(
+                    "segment fetch failed for {db}.{table}/{segment}: {error}"
+                ))]);
+            }
             Err(error) => {
                 return Ok(vec![build_error(&format!(
                     "segment fetch failed for {db}.{table}/{segment}: {error}"
