@@ -83,16 +83,35 @@ fn metadata_aggregates_match_after_add_and_drop_column() -> Result<()> {
     }
     engine.execute(&mut session, &sql)?;
     engine.flush_table_buffers("main", "t")?;
-    engine.execute(&mut session, "ALTER TABLE t ADD COLUMN score INT64 DEFAULT 7")?;
+    engine.execute(
+        &mut session,
+        "ALTER TABLE t ADD COLUMN score INT64 DEFAULT 7",
+    )?;
 
     let r = engine.execute(
         &mut session,
         "SELECT COUNT(score), MIN(score), MAX(score), SUM(score) FROM t",
     )?;
-    assert_eq!(first_i64_ref(&r, 0, 0), 50, "COUNT(score) must cover old rows");
-    assert_eq!(first_i64_ref(&r, 0, 1), 7, "MIN(score) must see the default");
-    assert_eq!(first_i64_ref(&r, 0, 2), 7, "MAX(score) must see the default");
-    assert_eq!(first_i64_ref(&r, 0, 3), 350, "SUM(score) must cover old rows");
+    assert_eq!(
+        first_i64_ref(&r, 0, 0),
+        50,
+        "COUNT(score) must cover old rows"
+    );
+    assert_eq!(
+        first_i64_ref(&r, 0, 1),
+        7,
+        "MIN(score) must see the default"
+    );
+    assert_eq!(
+        first_i64_ref(&r, 0, 2),
+        7,
+        "MAX(score) must see the default"
+    );
+    assert_eq!(
+        first_i64_ref(&r, 0, 3),
+        350,
+        "SUM(score) must cover old rows"
+    );
 
     // DROP COLUMN: the dropped column sat first, so every index shifts.
     engine.execute(&mut session, "CREATE TABLE u (a INT64, b INT64, c INT64)")?;
@@ -111,9 +130,17 @@ fn metadata_aggregates_match_after_add_and_drop_column() -> Result<()> {
         &mut session,
         "SELECT COUNT(b), MIN(b), MAX(b), SUM(b) FROM u",
     )?;
-    assert_eq!(first_i64_ref(&r, 0, 0), 40, "COUNT(b) must not read column a");
+    assert_eq!(
+        first_i64_ref(&r, 0, 0),
+        40,
+        "COUNT(b) must not read column a"
+    );
     assert_eq!(first_i64_ref(&r, 0, 1), 5, "MIN(b) must not read column a");
     assert_eq!(first_i64_ref(&r, 0, 2), 5, "MAX(b) must not read column a");
-    assert_eq!(first_i64_ref(&r, 0, 3), 200, "SUM(b) must not read column a");
+    assert_eq!(
+        first_i64_ref(&r, 0, 3),
+        200,
+        "SUM(b) must not read column a"
+    );
     Ok(())
 }

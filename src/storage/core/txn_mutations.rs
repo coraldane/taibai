@@ -492,9 +492,7 @@ mod tests {
             .unwrap();
         let composed = registry.segment_overlay(7, Path::new("s1")).unwrap();
         assert!(composed.len() >= 3);
-        let is_set = |row: u64| {
-            composed[(row / 8) as usize] & (1u8 << (row % 8)) != 0
-        };
+        let is_set = |row: u64| composed[(row / 8) as usize] & (1u8 << (row % 8)) != 0;
         for row in [3u64, 9, 20] {
             assert!(is_set(row), "row {row} must be set");
         }

@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::common::error::{Result, TaibaiError};
 use crate::storage::segment::footer::parse_segment_footer;
 use crate::storage::segment::meta::{read_embedded_footer, read_latest_sidecar_footer};
-use crate::storage::segment::{is_supported_segment_version, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC};
+use crate::storage::segment::{
+    is_supported_segment_version, ZoneMap, SEGMENT_HEADER_SIZE, SEGMENT_MAGIC,
+};
 use crate::types::batch::Schema;
 #[allow(unused_imports)]
 use crate::types::scalar::ScalarValue;
@@ -121,7 +123,6 @@ pub fn inspect_segment(path: &Path) -> Result<SegmentInspectInfo> {
             zone_maps: rg.zone_maps.clone(),
         });
     }
-
 
     let row_count = if footer_row_count > 0 {
         footer_row_count

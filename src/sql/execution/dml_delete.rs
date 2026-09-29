@@ -199,7 +199,10 @@ pub(crate) fn plan_delete_memtable_rows(
         }
         let removed = absolute_mask.iter().filter(|matches| **matches).count();
         if removed > 0 {
-            let keep = absolute_mask.iter().map(|matches| !matches).collect::<Vec<_>>();
+            let keep = absolute_mask
+                .iter()
+                .map(|matches| !matches)
+                .collect::<Vec<_>>();
             let filtered = filter_batch_keep(&original, &keep, original.num_rows() - removed)?;
             let removed_positions = absolute_mask
                 .iter()
@@ -1032,7 +1035,12 @@ pub fn exec_delete(
 
     if reader_txn_id > 0 {
         return super::txn_dml::exec_delete_in_txn(
-            engine, db, table, where_clause, reader_txn_id, username,
+            engine,
+            db,
+            table,
+            where_clause,
+            reader_txn_id,
+            username,
         );
     }
 
@@ -1062,8 +1070,7 @@ pub fn exec_delete(
     // Resolve subqueries through the permission-gated wrapper (a bare
     // resolve_in_subqueries here would let WHERE IN (SELECT ...) read tables
     // the user cannot SELECT).
-    let resolved_where_clause =
-        resolve_where_in_subqueries(engine, db, where_clause, username)?;
+    let resolved_where_clause = resolve_where_in_subqueries(engine, db, where_clause, username)?;
 
     let target_partition_key =
         delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
@@ -1180,13 +1187,12 @@ pub fn exec_delete(
         } else {
             index_maintenance.projection(&predicate_projection)
         };
-        let projected_key_positions = index_maintenance.projected_key_positions(
-            &if key_projection.is_empty() {
+        let projected_key_positions =
+            index_maintenance.projected_key_positions(&if key_projection.is_empty() {
                 (0..table_schema.columns.len()).collect::<Vec<_>>()
             } else {
                 key_projection.clone()
-            },
-        );
+            });
         let mut first_rewrite_error: Option<crate::common::error::TaibaiError> = None;
         for seg_path in segment_files {
             let (new_bitmap, new_deleted_count, prev_deleted) = {
@@ -1263,19 +1269,19 @@ pub fn exec_delete(
                                 .collect();
                             match RecordBatch::try_new(batch.schema.clone(), columns) {
                                 Ok(deleted) => {
-                            let bytes = deleted.estimated_size_bytes();
-                            if super::helpers::change_event_budget_allows(
-                                event_buffer_bytes,
-                                bytes,
-                                &mut event_budget_warned,
-                                "delete",
-                                db,
-                                table,
-                            ) {
-                                event_buffer_bytes += bytes;
-                                deleted_row_batches.push(deleted);
-                            }
-                        }
+                                    let bytes = deleted.estimated_size_bytes();
+                                    if super::helpers::change_event_budget_allows(
+                                        event_buffer_bytes,
+                                        bytes,
+                                        &mut event_budget_warned,
+                                        "delete",
+                                        db,
+                                        table,
+                                    ) {
+                                        event_buffer_bytes += bytes;
+                                        deleted_row_batches.push(deleted);
+                                    }
+                                }
                                 Err(error) => tracing::warn!(
                                     db,
                                     table,
@@ -1321,19 +1327,19 @@ pub fn exec_delete(
                                 .collect();
                             match RecordBatch::try_new(batch.schema.clone(), columns) {
                                 Ok(deleted) => {
-                            let bytes = deleted.estimated_size_bytes();
-                            if super::helpers::change_event_budget_allows(
-                                event_buffer_bytes,
-                                bytes,
-                                &mut event_budget_warned,
-                                "delete",
-                                db,
-                                table,
-                            ) {
-                                event_buffer_bytes += bytes;
-                                deleted_row_batches.push(deleted);
-                            }
-                        }
+                                    let bytes = deleted.estimated_size_bytes();
+                                    if super::helpers::change_event_budget_allows(
+                                        event_buffer_bytes,
+                                        bytes,
+                                        &mut event_budget_warned,
+                                        "delete",
+                                        db,
+                                        table,
+                                    ) {
+                                        event_buffer_bytes += bytes;
+                                        deleted_row_batches.push(deleted);
+                                    }
+                                }
                                 Err(error) => tracing::warn!(
                                     db,
                                     table,
@@ -1584,7 +1590,9 @@ pub(super) fn require_subquery_select_permissions_for_expr(
                 require_subquery_select_permissions_for_expr(engine, username, default_db, inner)
             }
         }
-        Expr::UnaryNot(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner)
+        Expr::UnaryNot(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
         | Expr::UnaryMinus(inner) => {
             require_subquery_select_permissions_for_expr(engine, username, default_db, inner)
         }
@@ -1599,7 +1607,9 @@ pub(super) fn require_subquery_select_permissions_for_expr(
             }
             Ok(())
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             require_subquery_select_permissions_for_expr(engine, username, default_db, expr)?;
             require_subquery_select_permissions_for_expr(engine, username, default_db, low)?;
             require_subquery_select_permissions_for_expr(engine, username, default_db, high)

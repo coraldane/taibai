@@ -4,12 +4,12 @@
 
 use tempfile::TempDir;
 
+use std::collections::BTreeSet;
 use taibai::net::session::Session;
 use taibai::sql::execution::engine::{Engine, ExecResult};
 use taibai::storage::core::txn_mutations::filter_batch_excluding_positions;
 use taibai::types::batch::RecordBatch;
 use taibai::types::scalar::ScalarValue;
-use std::collections::BTreeSet;
 
 fn create_test_engine() -> (TempDir, Engine) {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
@@ -59,9 +59,7 @@ fn setup(engine: &Engine, session: &mut Session, ddl: &str, rows: &[i64]) {
             .execute(session, &format!("INSERT INTO t VALUES {values}"))
             .expect("insert failed");
     }
-    engine
-        .execute(session, "FLUSH")
-        .expect("flush failed");
+    engine.execute(session, "FLUSH").expect("flush failed");
 }
 
 const DDL: &str = "CREATE TABLE t (id INT32, name VARCHAR, value INT64)";
@@ -106,7 +104,11 @@ fn commit_after_flushed_delete_is_durable() {
 
         engine.execute(&mut a, "BEGIN").unwrap();
         assert_eq!(
-            ok_rows_affected(engine.execute(&mut a, "DELETE FROM t WHERE id <= 2").unwrap()),
+            ok_rows_affected(
+                engine
+                    .execute(&mut a, "DELETE FROM t WHERE id <= 2")
+                    .unwrap()
+            ),
             2
         );
         engine.execute(&mut a, "COMMIT").unwrap();
@@ -126,7 +128,9 @@ fn uncommitted_delete_is_invisible_to_other_sessions() {
     setup(&engine, &mut a, DDL, &[1, 2, 3, 4]);
 
     engine.execute(&mut a, "BEGIN").unwrap();
-    engine.execute(&mut a, "DELETE FROM t WHERE id = 1").unwrap();
+    engine
+        .execute(&mut a, "DELETE FROM t WHERE id = 1")
+        .unwrap();
 
     // Another session still sees the full committed state.
     assert_eq!(
@@ -247,7 +251,9 @@ fn txn_delete_then_insert_then_rollback() {
     setup(&engine, &mut a, DDL, &[1, 2]);
 
     engine.execute(&mut a, "BEGIN").unwrap();
-    engine.execute(&mut a, "DELETE FROM t WHERE id = 1").unwrap();
+    engine
+        .execute(&mut a, "DELETE FROM t WHERE id = 1")
+        .unwrap();
     engine
         .execute(&mut a, "INSERT INTO t VALUES (9, 'n9', 9)")
         .unwrap();
@@ -271,11 +277,19 @@ fn multiple_deletes_in_one_txn_accumulate() {
 
         engine.execute(&mut a, "BEGIN").unwrap();
         assert_eq!(
-            ok_rows_affected(engine.execute(&mut a, "DELETE FROM t WHERE id <= 2").unwrap()),
+            ok_rows_affected(
+                engine
+                    .execute(&mut a, "DELETE FROM t WHERE id <= 2")
+                    .unwrap()
+            ),
             2
         );
         assert_eq!(
-            ok_rows_affected(engine.execute(&mut a, "DELETE FROM t WHERE id = 4").unwrap()),
+            ok_rows_affected(
+                engine
+                    .execute(&mut a, "DELETE FROM t WHERE id = 4")
+                    .unwrap()
+            ),
             1
         );
         let mut ids = query_i64(&engine, &mut a, "SELECT id FROM t");
@@ -317,7 +331,10 @@ fn update_of_row_inserted_in_same_txn() {
         vec![700]
     );
     // The untouched pre-existing row is intact exactly once.
-    assert_eq!(query_i64(&engine, &mut a, "SELECT id FROM t WHERE id = 1"), vec![1]);
+    assert_eq!(
+        query_i64(&engine, &mut a, "SELECT id FROM t WHERE id = 1"),
+        vec![1]
+    );
 }
 
 #[test]
@@ -336,7 +353,10 @@ fn ddl_is_rejected_inside_transaction() {
         "FLUSH",
     ] {
         let result = engine.execute(&mut a, sql);
-        assert!(result.is_err(), "{sql} must be rejected inside a transaction");
+        assert!(
+            result.is_err(),
+            "{sql} must be rejected inside a transaction"
+        );
     }
     engine.execute(&mut a, "ROLLBACK").unwrap();
     // The table is untouched.
@@ -380,7 +400,9 @@ fn unique_index_table_rejects_transactional_dml() {
             "CREATE TABLE u (id INT32, v INT64, UNIQUE KEY uk_v (v))",
         )
         .unwrap();
-    engine.execute(&mut a, "INSERT INTO u VALUES (1, 1)").unwrap();
+    engine
+        .execute(&mut a, "INSERT INTO u VALUES (1, 1)")
+        .unwrap();
     engine.execute(&mut a, "FLUSH").unwrap();
 
     engine.execute(&mut a, "BEGIN").unwrap();
@@ -396,9 +418,8 @@ fn filter_batch_excluding_positions_removes_rows() {
     let (_dir, engine) = create_test_engine();
     let mut a = session();
     setup(&engine, &mut a, DDL, &[1, 2, 3, 4]);
-    let ExecResult::Query { mut batches, .. } = engine
-        .execute(&mut a, "SELECT id, value FROM t")
-        .unwrap()
+    let ExecResult::Query { mut batches, .. } =
+        engine.execute(&mut a, "SELECT id, value FROM t").unwrap()
     else {
         panic!("expected query");
     };
@@ -451,7 +472,9 @@ fn concurrent_txn_dml_on_same_table_is_refused() {
 
     // The pinning transaction itself can keep mutating the table.
     let deleted = ok_rows_affected(
-        engine.execute(&mut a, "DELETE FROM t WHERE id = 3").unwrap(),
+        engine
+            .execute(&mut a, "DELETE FROM t WHERE id = 3")
+            .unwrap(),
     );
     assert_eq!(deleted, 1);
 

@@ -353,10 +353,7 @@ pub fn eval_filter_with(
                     *m = false;
                     continue;
                 }
-                let found = if fast_set
-                    .as_ref()
-                    .is_some_and(|set| set.contains(&vals[i]))
-                {
+                let found = if fast_set.as_ref().is_some_and(|set| set.contains(&vals[i])) {
                     true
                 } else {
                     values
@@ -393,8 +390,10 @@ pub fn eval_filter_with(
             let keep = match v {
                 ScalarValue::Bool(Some(value)) => *value,
                 other if other.is_null() => false,
-                other => other.integer_i128().is_some_and(|i| i != 0)
-                    || other.numeric_f64().is_some_and(|f| f != 0.0),
+                other => {
+                    other.integer_i128().is_some_and(|i| i != 0)
+                        || other.numeric_f64().is_some_and(|f| f != 0.0)
+                }
             };
             for m in mask.iter_mut().take(num_rows) {
                 *m = keep;

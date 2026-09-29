@@ -67,7 +67,9 @@ fn run_intersection_group_by_matches_per_row_reference() {
     }
     let sql = format!("INSERT INTO ticks VALUES {}", parts.join(", "));
     engine.execute(&mut session, &sql).expect("insert");
-    engine.execute(&mut session, "FLUSH TABLE ticks").expect("flush");
+    engine
+        .execute(&mut session, "FLUSH TABLE ticks")
+        .expect("flush");
     engine
         .execute(&mut session, "OPTIMIZE TABLE ticks")
         .expect("optimize");
@@ -110,9 +112,14 @@ fn run_intersection_handles_edge_shapes() {
         .execute(&mut session, "CREATE TABLE t (sym VARCHAR, px INT)")
         .expect("create");
     engine
-        .execute(&mut session, "INSERT INTO t VALUES ('a', 7), ('a', 7), ('b', 9)")
+        .execute(
+            &mut session,
+            "INSERT INTO t VALUES ('a', 7), ('a', 7), ('b', 9)",
+        )
         .expect("insert small");
-    engine.execute(&mut session, "FLUSH TABLE t").expect("flush");
+    engine
+        .execute(&mut session, "FLUSH TABLE t")
+        .expect("flush");
     let rows = collect_rows(
         engine
             .execute(
@@ -149,7 +156,9 @@ fn run_intersection_nulls_fall_back_correctly() {
     }
     let sql = format!("INSERT INTO t VALUES {}", parts.join(", "));
     engine.execute(&mut session, &sql).expect("insert");
-    engine.execute(&mut session, "FLUSH TABLE t").expect("flush");
+    engine
+        .execute(&mut session, "FLUSH TABLE t")
+        .expect("flush");
 
     let grouped = collect_rows(
         engine

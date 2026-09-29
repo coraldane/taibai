@@ -90,9 +90,14 @@ async fn wait_for(
         polls += 1;
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    println!("WAIT-FOR '{what}': TIMED OUT after {polls} polls, count={}", count_rows(engine, "SELECT COUNT(v) FROM t"));
+    println!(
+        "WAIT-FOR '{what}': TIMED OUT after {polls} polls, count={}",
+        count_rows(engine, "SELECT COUNT(v) FROM t")
+    );
     let mut session = taibai::net::session::Session::new("root".into(), "main".into());
-    if let Ok(ExecResult::Query { batches, .. }) = engine.execute(&mut session, "SELECT id, v FROM t") {
+    if let Ok(ExecResult::Query { batches, .. }) =
+        engine.execute(&mut session, "SELECT id, v FROM t")
+    {
         let mut rows = Vec::new();
         for b in &batches {
             for r in 0..b.num_rows() {
@@ -100,14 +105,22 @@ async fn wait_for(
             }
         }
         println!("WAIT-FOR dump rows({}): {rows:?}", rows.len());
-    let tail_root = engine.data_dir().join("main").join("t").join("memtable_tail");
-    for e in std::fs::read_dir(&tail_root).into_iter().flatten().flatten() {
-        println!(
-            "TAIL-FILE {} ({} bytes)",
-            e.file_name().to_string_lossy(),
-            e.metadata().map(|m| m.len()).unwrap_or(0)
-        );
-    }
+        let tail_root = engine
+            .data_dir()
+            .join("main")
+            .join("t")
+            .join("memtable_tail");
+        for e in std::fs::read_dir(&tail_root)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            println!(
+                "TAIL-FILE {} ({} bytes)",
+                e.file_name().to_string_lossy(),
+                e.metadata().map(|m| m.len()).unwrap_or(0)
+            );
+        }
     }
     panic!("standby did not converge within {timeout:?}: {what}");
 }
@@ -219,11 +232,7 @@ async fn standby_converges_and_survives_restart() {
                 let mut rows = Vec::new();
                 for batch in batches {
                     for r in 0..batch.num_rows() {
-                        rows.push(format!(
-                            "{:?} {:?}",
-                            batch.scalar(r, 0),
-                            batch.scalar(r, 1)
-                        ));
+                        rows.push(format!("{:?} {:?}", batch.scalar(r, 0), batch.scalar(r, 1)));
                     }
                 }
                 rows
@@ -233,10 +242,7 @@ async fn standby_converges_and_survives_restart() {
     };
     println!("PROBE rows: {probe:?}");
     {
-        let table_root = standby_engine
-            .data_dir()
-            .join("main")
-            .join("t");
+        let table_root = standby_engine.data_dir().join("main").join("t");
         if let Ok(entries) = std::fs::read_dir(&table_root) {
             for e in entries.flatten() {
                 println!(
@@ -283,7 +289,10 @@ async fn standby_converges_and_survives_restart() {
             }
         }
     }
-    assert_eq!(count_rows(&standby_engine, "SELECT SUM(v) FROM t"), expect_sum);
+    assert_eq!(
+        count_rows(&standby_engine, "SELECT SUM(v) FROM t"),
+        expect_sum
+    );
 
     // More writes converge without a flush.
     {
@@ -387,9 +396,7 @@ async fn standby_converges_and_survives_restart() {
         &standby_engine,
         "UPDATE replicated",
         Duration::from_secs(20),
-        |engine| {
-            count_rows(engine, "SELECT COUNT(v) FROM t WHERE id = 499 AND v = 5000") == 1
-        },
+        |engine| count_rows(engine, "SELECT COUNT(v) FROM t WHERE id = 499 AND v = 5000") == 1,
     )
     .await;
     {

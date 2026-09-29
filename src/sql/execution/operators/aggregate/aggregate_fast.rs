@@ -536,12 +536,10 @@ impl FastGroups {
                     Accumulator::SumI(value) => match &arg_views[k] {
                         FastArgCol::I64(data, bitmap) => {
                             if !bitmap.is_null(row) {
-                                *value = Some(
-                                    value
-                                        .unwrap_or(0)
-                                        .checked_add(data[row])
-                                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
-                                );
+                                *value =
+                                    Some(value.unwrap_or(0).checked_add(data[row]).ok_or_else(
+                                        || TaibaiError::Sql("SUM overflow".to_string()),
+                                    )?);
                             }
                         }
                         FastArgCol::I32(data, bitmap) => {
@@ -550,7 +548,9 @@ impl FastGroups {
                                     value
                                         .unwrap_or(0)
                                         .checked_add(data[row] as i64)
-                                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                                        .ok_or_else(|| {
+                                            TaibaiError::Sql("SUM overflow".to_string())
+                                        })?,
                                 );
                             }
                         }
@@ -579,7 +579,9 @@ impl FastGroups {
                         }
                         _ => {}
                     },
-                    Accumulator::Avg { sum, count, any, .. } => match &arg_views[k] {
+                    Accumulator::Avg {
+                        sum, count, any, ..
+                    } => match &arg_views[k] {
                         FastArgCol::I64(data, bitmap) => {
                             if !bitmap.is_null(row) {
                                 *sum += data[row] as f64;
@@ -644,14 +646,8 @@ impl FastGroups {
         let id = match self.dict_map.get(value).copied() {
             Some(id) => id,
             None => {
-                let id = self.new_group(
-                    batch,
-                    gb_col,
-                    row,
-                    aggregates,
-                    physical_schema,
-                    max_groups,
-                )?;
+                let id =
+                    self.new_group(batch, gb_col, row, aggregates, physical_schema, max_groups)?;
                 self.cached_bytes += value.len() + 24;
                 self.dict_map.insert(value.to_string(), id);
                 id
@@ -693,9 +689,7 @@ impl FastGroups {
         let mut cursors: Vec<(usize, usize)> = Vec::with_capacity(kinds.len());
         for kind in kinds {
             cursors.push(match kind {
-                RunAcc::SumI64(runs) | RunAcc::AvgI64(runs) => {
-                    locate_run(runs, start)
-                }
+                RunAcc::SumI64(runs) | RunAcc::AvgI64(runs) => locate_run(runs, start),
                 RunAcc::CountStar => (0, 0),
             });
         }
@@ -736,7 +730,9 @@ impl FastGroups {
                             let take = run_end.min(j) - pos;
                             if is_avg {
                                 match &mut accs[k] {
-                                    Accumulator::Avg { sum, count, any, .. } => {
+                                    Accumulator::Avg {
+                                        sum, count, any, ..
+                                    } => {
                                         *sum += (value.wrapping_mul(take as i64)) as f64;
                                         *count += take as u64;
                                         *any = true;
@@ -750,15 +746,16 @@ impl FastGroups {
                             } else {
                                 match &mut accs[k] {
                                     Accumulator::SumI(slot) => {
-                                        let contribution = value
-                                            .checked_mul(take as i64)
-                                            .ok_or_else(|| {
+                                        let contribution =
+                                            value.checked_mul(take as i64).ok_or_else(|| {
                                                 TaibaiError::Sql("SUM overflow".to_string())
                                             })?;
                                         *slot = Some(
-                                            slot.unwrap_or(0).checked_add(contribution).ok_or_else(
-                                                || TaibaiError::Sql("SUM overflow".to_string()),
-                                            )?,
+                                            slot.unwrap_or(0)
+                                                .checked_add(contribution)
+                                                .ok_or_else(|| {
+                                                    TaibaiError::Sql("SUM overflow".to_string())
+                                                })?,
                                         );
                                     }
                                     _ => {
@@ -840,23 +837,25 @@ impl FastGroups {
                             ))
                         }
                     },
-                    TypedAcc::SumI64(data) => match &mut accs[k] {
-                        Accumulator::SumI(value) => {
-                            *value = Some(
-                                value
-                                    .unwrap_or(0)
-                                    .checked_add(data[row])
-                                    .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
-                            );
+                    TypedAcc::SumI64(data) => {
+                        match &mut accs[k] {
+                            Accumulator::SumI(value) => {
+                                *value =
+                                    Some(value.unwrap_or(0).checked_add(data[row]).ok_or_else(
+                                        || TaibaiError::Sql("SUM overflow".to_string()),
+                                    )?);
+                            }
+                            _ => {
+                                return Err(TaibaiError::Internal(
+                                    "fast group: accumulator shape mismatch".into(),
+                                ))
+                            }
                         }
-                        _ => {
-                            return Err(TaibaiError::Internal(
-                                "fast group: accumulator shape mismatch".into(),
-                            ))
-                        }
-                    },
+                    }
                     TypedAcc::AvgI64(data) => match &mut accs[k] {
-                        Accumulator::Avg { sum, count, any, .. } => {
+                        Accumulator::Avg {
+                            sum, count, any, ..
+                        } => {
                             *sum += data[row] as f64;
                             *count += 1;
                             *any = true;
@@ -1097,8 +1096,7 @@ pub(super) fn fast_group_update(
     // Run views stay unflattened only when the whole shape classifies for
     // the run-intersection loop; mixed shapes flatten their Rle arguments so
     // the typed / generic per-row loops see plain slices.
-    let group_runs_ok =
-        matches!(&group_col, FastGroupCol::Dict(_, _, bm) if bm.null_count() == 0);
+    let group_runs_ok = matches!(&group_col, FastGroupCol::Dict(_, _, bm) if bm.null_count() == 0);
     let mut arg_views: Vec<FastArgCol> = Vec::with_capacity(aggregates.len());
     for (agg, col_idx) in aggregates.iter().zip(agg_col_indices) {
         let Some(idx) = col_idx else {

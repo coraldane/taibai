@@ -47,7 +47,9 @@ impl ExecutionOp for ProjectExec {
                         let exprs: Vec<LogicalExpr> = self
                             .expressions
                             .iter()
-                            .map(|expr| remap_expr_for_batch(expr, &self.input_schema, &batch.schema))
+                            .map(|expr| {
+                                remap_expr_for_batch(expr, &self.input_schema, &batch.schema)
+                            })
                             .collect();
                         self.remapped = Some((batch.schema.clone(), exprs));
                         self.remapped.as_ref().map(|(_, exprs)| exprs).unwrap()

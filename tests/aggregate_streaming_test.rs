@@ -569,7 +569,10 @@ fn run_fold_zero_match_avg_is_null_and_count_zero() {
 fn run_fold_decimal_avg_uses_raw_domain_threshold() {
     let (_temp_dir, engine, mut session) = create_engine();
     engine
-        .execute(&mut session, "CREATE TABLE dec_ticks (day INT, px DECIMAL(9,2))")
+        .execute(
+            &mut session,
+            "CREATE TABLE dec_ticks (day INT, px DECIMAL(9,2))",
+        )
         .expect("create dec_ticks");
     let mut parts = Vec::new();
     for &(px, len) in &[
@@ -583,7 +586,9 @@ fn run_fold_decimal_avg_uses_raw_domain_threshold() {
         }
     }
     let sql = format!("INSERT INTO dec_ticks VALUES {}", parts.join(", "));
-    engine.execute(&mut session, &sql).expect("insert dec_ticks");
+    engine
+        .execute(&mut session, &sql)
+        .expect("insert dec_ticks");
     engine
         .execute(&mut session, "FLUSH TABLE dec_ticks")
         .expect("flush dec_ticks");

@@ -144,7 +144,9 @@ pub(crate) fn exec_delete_in_txn(
             table,
             &resolved_where_clause,
             &table_schema,
-            target_partition_key.as_deref().filter(|key| !key.is_empty()),
+            target_partition_key
+                .as_deref()
+                .filter(|key| !key.is_empty()),
             reader_txn_id,
         )?;
         let (own_plans, committed_plans): (Vec<_>, Vec<_>) = memtable_plans
@@ -175,9 +177,12 @@ pub(crate) fn exec_delete_in_txn(
                     .collect();
                 match RecordBatch::try_new(plan.original.schema.clone(), columns) {
                     Ok(deleted) => {
-                        engine
-                            .txn_mutations()
-                            .defer_delete_event(reader_txn_id, db, table, deleted)?;
+                        engine.txn_mutations().defer_delete_event(
+                            reader_txn_id,
+                            db,
+                            table,
+                            deleted,
+                        )?;
                     }
                     Err(error) => tracing::warn!(
                         db,
@@ -261,8 +266,7 @@ pub(crate) fn exec_delete_in_txn(
                     }
                     Some(where_expr) => {
                         let batch = reader.read_row_group(rg_idx)?;
-                        let mask =
-                            eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
+                        let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
                         let mut deleted_in_rg: Vec<u32> = Vec::new();
                         for (i, matches) in mask.into_iter().enumerate() {
                             if matches
@@ -279,9 +283,12 @@ pub(crate) fn exec_delete_in_txn(
                                 .map(|col| col.take(&deleted_in_rg))
                                 .collect();
                             match RecordBatch::try_new(batch.schema.clone(), columns) {
-                                Ok(deleted) => engine
-                                    .txn_mutations()
-                                    .defer_delete_event(reader_txn_id, db, table, deleted)?,
+                                Ok(deleted) => engine.txn_mutations().defer_delete_event(
+                                    reader_txn_id,
+                                    db,
+                                    table,
+                                    deleted,
+                                )?,
                                 Err(error) => tracing::warn!(
                                     db,
                                     table,
@@ -320,7 +327,9 @@ pub(crate) fn exec_delete_in_txn(
             .txn_mutations()
             .add_deleted_rows(reader_txn_id, db, table, deleted);
     }
-    Ok(ExecResult::Ok { rows_affected: deleted })
+    Ok(ExecResult::Ok {
+        rows_affected: deleted,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -340,9 +349,11 @@ pub(crate) fn exec_update_in_txn(
     let (table_schema, table_meta) = load_table(engine, db, table)?;
     ensure_txn_dml_supported(&table_meta)?;
     if table_meta.is_partitioned()
-        && assignments
-            .iter()
-            .any(|assignment| assignment.column.eq_ignore_ascii_case(&table_meta.partition_key))
+        && assignments.iter().any(|assignment| {
+            assignment
+                .column
+                .eq_ignore_ascii_case(&table_meta.partition_key)
+        })
     {
         return Err(TaibaiError::Sql(format!(
             "updating partition key '{}' is not supported; use DELETE followed by INSERT",
@@ -359,7 +370,10 @@ pub(crate) fn exec_update_in_txn(
                 column: assignment.column.clone(),
                 value: {
                     super::dml_delete::require_subquery_select_permissions_for_expr(
-                        engine, username, db, &assignment.value,
+                        engine,
+                        username,
+                        db,
+                        &assignment.value,
                     )?;
                     super::dml_delete::resolve_expr_in_subqueries_pub(
                         engine,
@@ -383,7 +397,9 @@ pub(crate) fn exec_update_in_txn(
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
-    let narrowed_partition = target_partition_key.as_deref().filter(|key| !key.is_empty());
+    let narrowed_partition = target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty());
 
     let update_body = || -> Result<u64> {
         // Write-write conflict control, mirroring delete_body: refuse when
@@ -440,13 +456,12 @@ pub(crate) fn exec_update_in_txn(
                 }
                 _ => (Arc::clone(&raw_batch), None),
             };
-            let (new_batch, affected, matched_rows) =
-                super::dml_update::update_memtable_batch(
-                    assignments,
-                    &resolved_where_clause,
-                    &table_schema,
-                    &batch,
-                )?;
+            let (new_batch, affected, matched_rows) = super::dml_update::update_memtable_batch(
+                assignments,
+                &resolved_where_clause,
+                &table_schema,
+                &batch,
+            )?;
             let Some(new_batch) = new_batch else {
                 continue;
             };
@@ -463,10 +478,7 @@ pub(crate) fn exec_update_in_txn(
             // Map the filtered-batch positions back to absolute positions in
             // the committed memtable batch for the deferred removal.
             let absolute_rows: Vec<u32> = match &live_positions {
-                Some(map) => matched_rows
-                    .iter()
-                    .map(|&pos| map[pos as usize])
-                    .collect(),
+                Some(map) => matched_rows.iter().map(|&pos| map[pos as usize]).collect(),
                 None => matched_rows.clone(),
             };
             txn_mutations.register_memtable_tombstones(
@@ -484,9 +496,12 @@ pub(crate) fn exec_update_in_txn(
                 .collect();
             let updated_rows = RecordBatch::try_new(new_batch.schema.clone(), columns)?;
             if publish_updates {
-                engine
-                    .txn_mutations()
-                    .defer_update_event(reader_txn_id, db, table, updated_rows.clone())?;
+                engine.txn_mutations().defer_update_event(
+                    reader_txn_id,
+                    db,
+                    table,
+                    updated_rows.clone(),
+                )?;
             }
             new_rows.push((memtable.partition_key().to_string(), updated_rows));
         }
@@ -594,9 +609,12 @@ pub(crate) fn exec_update_in_txn(
             for image in updated_images {
                 statement_updated += image.num_rows() as u64;
                 if publish_updates {
-                    engine
-                        .txn_mutations()
-                        .defer_update_event(reader_txn_id, db, table, image.clone())?;
+                    engine.txn_mutations().defer_update_event(
+                        reader_txn_id,
+                        db,
+                        table,
+                        image.clone(),
+                    )?;
                 }
                 new_rows.push((partition_key.clone(), image));
             }
@@ -680,10 +698,7 @@ fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
                         delete_bitmap::mark_deleted(&mut bitmap, row_id);
                     }
                 }
-                let deleted_count: u64 = bitmap
-                    .iter()
-                    .map(|byte| byte.count_ones() as u64)
-                    .sum();
+                let deleted_count: u64 = bitmap.iter().map(|byte| byte.count_ones() as u64).sum();
                 drop(reader);
                 mgr.rewrite_delete_footer(&entry.path, &bitmap, deleted_count)?;
             }
@@ -711,8 +726,8 @@ fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
                 let mut catalogs = engine.catalogs().write().unwrap();
                 if let Some(catalog) = catalogs.get_mut(db) {
                     if let Some(meta) = catalog.get_table_mut(table) {
-                        meta.row_count = (meta.row_count - table_mutations.deleted_rows as i64)
-                            .max(0);
+                        meta.row_count =
+                            (meta.row_count - table_mutations.deleted_rows as i64).max(0);
                         let meta_dir = engine.data_dir().join("meta");
                         catalog.save(&meta_dir)?;
                     }
@@ -787,4 +802,3 @@ fn load_table(engine: &Engine, db: &str, table: &str) -> Result<(Schema, TableMe
         .clone();
     Ok((Schema::new(meta.columns.clone()), meta))
 }
-

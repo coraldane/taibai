@@ -687,9 +687,7 @@ fn default_column_for_missing_schema_col(
             // Rows that predate an ALTER ADD COLUMN read the value pinned at
             // ALTER time (col.added_at_micros); reading "now" made repeated
             // queries return different values for the same row.
-            ScalarValue::Timestamp(Some(
-                col_def.added_at_micros.unwrap_or_else(now_micros),
-            ))
+            ScalarValue::Timestamp(Some(col_def.added_at_micros.unwrap_or_else(now_micros)))
         }
         None => ScalarValue::null_for_type(col_def.data_type),
     };

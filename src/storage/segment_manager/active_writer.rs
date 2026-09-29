@@ -92,7 +92,8 @@ impl ActiveSegmentWriter {
             self.buffered_rows = batch.num_rows();
         }
         if pubsub_deferred && self.buffered_rows > defer_from {
-            self.pubsub_deferred_ranges.push((defer_from, self.buffered_rows));
+            self.pubsub_deferred_ranges
+                .push((defer_from, self.buffered_rows));
         }
 
         while self.buffered_rows >= self.row_group_target_rows {
@@ -141,7 +142,8 @@ impl ActiveSegmentWriter {
             self.buffered_rows = added;
         }
         if pubsub_deferred && self.buffered_rows > defer_from {
-            self.pubsub_deferred_ranges.push((defer_from, self.buffered_rows));
+            self.pubsub_deferred_ranges
+                .push((defer_from, self.buffered_rows));
         }
 
         while self.buffered_rows >= self.row_group_target_rows {
@@ -186,16 +188,13 @@ impl ActiveSegmentWriter {
             vec![None; self.schema.num_columns()]
         };
         let col_sums = col_sums_from_bulk_columns(columns, row_count);
-
+        let zone_maps =
+            self.compute_direct_row_group_zone_maps(columns, row_count, zone_map_columns);
         self.row_groups.push(RowGroupMeta {
             offset,
             length: total_length,
             row_count,
-            zone_maps: self.compute_direct_row_group_zone_maps(
-                columns,
-                row_count,
-                zone_map_columns,
-            ),
+            zone_maps,
             column_compressed_sizes,
             compressed_sizes,
             uncompressed_sizes,
@@ -238,7 +237,7 @@ impl ActiveSegmentWriter {
                         scale: col.scale,
                         precision: col.precision,
                         data: col.data,
-                        nulls: col.nulls,
+                        nulls: col.nulls.clone(),
                         variable_ranges: col.variable_ranges.clone(),
                     })
                     .collect();
@@ -388,7 +387,8 @@ impl ActiveSegmentWriter {
             *start = start.saturating_sub(rows_to_flush);
             *end = end.saturating_sub(rows_to_flush);
         }
-        self.pubsub_deferred_ranges.retain(|(start, end)| end > start);
+        self.pubsub_deferred_ranges
+            .retain(|(start, end)| end > start);
 
         if FLUSH_META_AFTER_ROW_GROUP {
             self.flush_meta(invalidate_reader)?;
@@ -409,10 +409,7 @@ impl ActiveSegmentWriter {
                         .slice_fast(rows_to_flush, total_buffered)
                 })
                 .collect();
-            self.buffered_batch = Some(RecordBatch::try_new(
-                buffered.schema.clone(),
-                columns,
-            )?);
+            self.buffered_batch = Some(RecordBatch::try_new(buffered.schema.clone(), columns)?);
             self.buffered_rows = remaining;
         }
 

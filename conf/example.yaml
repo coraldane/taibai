@@ -3,6 +3,9 @@ server:
   port: 5151
   max_connections: 1024
   max_concurrent_requests: 8
+  # 列式批量导入消息（0x23）的接收上限；批量导入的载荷随批次行数增长，
+  # 因此独立于通用 max_message_size
+  max_bulk_message_size: 134217728
   # 重请求等待执行槽位的最长时间，超时返回 overload 错误而不是静默排队
   request_queue_timeout_ms: 30000
 

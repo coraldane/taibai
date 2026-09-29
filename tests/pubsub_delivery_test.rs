@@ -54,7 +54,10 @@ async fn hub_subscriber_delivers_rows_exactly_once() {
     let mut sub = Client::connect(&addr).await.unwrap();
     sub.login("root", "taibai", "main").await.unwrap();
 
-    writer.query("CREATE TABLE r (id INT32, v FLOAT64)").await.unwrap();
+    writer
+        .query("CREATE TABLE r (id INT32, v FLOAT64)")
+        .await
+        .unwrap();
     sub.subscribe("main.r").await.unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -66,7 +69,10 @@ async fn hub_subscriber_delivers_rows_exactly_once() {
         let delivered_rows = Arc::clone(&delivered_rows);
         tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
-                match sub.recv_notification_timeout(Duration::from_millis(100)).await {
+                match sub
+                    .recv_notification_timeout(Duration::from_millis(100))
+                    .await
+                {
                     Ok(Some(n)) => {
                         count.fetch_add(1, Ordering::Relaxed);
                         delivered_rows.fetch_add(n.num_rows() as u64, Ordering::Relaxed);

@@ -580,7 +580,10 @@ impl<'a> ScanExecutor<'a> {
                     // context, so capture the flag here and let the closure
                     // stop starting new row-group reads once it is set.
                     let cancel_flag = crate::common::query_cancel::current_flag();
-                    type ReadOutcome = std::result::Result<(usize, RecordBatch), crate::common::error::TaibaiError>;
+                    type ReadOutcome = std::result::Result<
+                        (usize, RecordBatch),
+                        crate::common::error::TaibaiError,
+                    >;
                     let read_one = |pos: usize, rg_idx: &usize| -> Option<ReadOutcome> {
                         if cancel_flag
                             .as_ref()
@@ -833,8 +836,11 @@ impl<'a> ScanExecutor<'a> {
                     Some(Ok((base + position, batches)))
                 })
                 .collect();
-            scanned
-                .sort_by_key(|outcome| outcome.as_ref().map_or(usize::MAX, |(position, _)| *position));
+            scanned.sort_by_key(|outcome| {
+                outcome
+                    .as_ref()
+                    .map_or(usize::MAX, |(position, _)| *position)
+            });
             for outcome in scanned {
                 let (_, mut batches) = outcome?;
                 output.append(&mut batches);

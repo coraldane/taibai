@@ -504,9 +504,14 @@ fn delete_with_as_alias_filters_by_qualified_column() {
         )
         .expect("create table");
     engine
-        .execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .execute(
+            &mut session,
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+        )
         .expect("insert rows");
-    engine.execute(&mut session, "FLUSH TABLE t").expect("flush rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE t")
+        .expect("flush rows");
 
     let deleted = engine
         .execute(&mut session, "DELETE FROM t AS a WHERE a.value >= 20")
@@ -532,7 +537,9 @@ fn delete_with_implicit_alias_filters_matching_rows() {
     engine
         .execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")
         .expect("insert rows");
-    engine.execute(&mut session, "FLUSH TABLE t").expect("flush rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE t")
+        .expect("flush rows");
 
     let deleted = engine
         .execute(&mut session, "DELETE FROM t tgt WHERE tgt.id = 2")
@@ -558,7 +565,9 @@ fn delete_with_alias_without_where_removes_all_rows() {
     engine
         .execute(&mut session, "INSERT INTO t VALUES (1, 10), (2, 20)")
         .expect("insert rows");
-    engine.execute(&mut session, "FLUSH TABLE t").expect("flush rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE t")
+        .expect("flush rows");
 
     let deleted = engine
         .execute(&mut session, "DELETE FROM t AS a")
@@ -585,7 +594,10 @@ fn delete_with_alias_still_prunes_the_target_partition() {
         )
         .expect("create partitioned table");
     engine
-        .execute(&mut session, "INSERT INTO partitioned VALUES (1, 10), (2, 20)")
+        .execute(
+            &mut session,
+            "INSERT INTO partitioned VALUES (1, 10), (2, 20)",
+        )
         .expect("insert rows");
 
     let deleted = engine

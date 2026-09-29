@@ -191,8 +191,7 @@ fn build_operator_with_limit(
                     .cloned()
                     .unwrap_or_default();
                 Ok(Box::new(
-                    ScanExec::new_shared(batches, scan.projection)
-                        .with_table_schema(scan.schema),
+                    ScanExec::new_shared(batches, scan.projection).with_table_schema(scan.schema),
                 ))
             } else {
                 let (physical_table_name, database) = {
@@ -1895,9 +1894,7 @@ fn try_skip_sort_for_ordered_scan(plan: LogicalPlan, ctx: &PhysicalContext<'_>) 
                     .unwrap_or(false),
                 _ => false,
             });
-    if matches
-        && ordered_cluster_scan_is_safe(ctx, meta, schema, &meta.cluster_key[0])
-    {
+    if matches && ordered_cluster_scan_is_safe(ctx, meta, schema, &meta.cluster_key[0]) {
         *sort.input.clone()
     } else {
         plan

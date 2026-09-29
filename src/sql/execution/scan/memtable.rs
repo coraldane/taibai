@@ -275,7 +275,8 @@ pub fn scan_memtables(
         } else {
             None
         };
-        if let Some(mt_batch) = mt.read_with(|source| {
+        if let Some(mt_batch) = mt
+            .read_with(|source| {
                 if source.num_rows() == 0 {
                     return None;
                 }

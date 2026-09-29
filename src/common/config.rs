@@ -281,6 +281,10 @@ fn normalize_label(value: &str, fallback: &str) -> String {
     }
 }
 
+fn default_max_bulk_message_size() -> usize {
+    128 * 1024 * 1024
+}
+
 fn default_max_message_size() -> usize {
     64 * 1024 * 1024
 }
@@ -566,10 +570,7 @@ pub fn set_replication_settings(settings: ReplicationSettings) {
 }
 
 pub fn replication_settings() -> ReplicationSettings {
-    REPLICATION_SETTINGS
-        .get()
-        .cloned()
-        .unwrap_or_default()
+    REPLICATION_SETTINGS.get().cloned().unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -579,6 +580,11 @@ pub struct ServerSettings {
     pub port: u16,
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
+    /// Receive cap for columnar bulk-import messages (0x23). Bulk payloads are
+    /// proportional to batch rows, so they get their own ceiling instead of
+    /// inheriting the general per-message cap.
+    #[serde(default = "default_max_bulk_message_size")]
+    pub max_bulk_message_size: usize,
     /// Maximum number of established client sockets. Excess connections are
     /// accepted and closed immediately so the OS accept queue keeps draining.
     #[serde(default = "default_max_connections")]
@@ -950,6 +956,7 @@ fn default_server_settings() -> ServerSettings {
         host: "0.0.0.0".to_string(),
         port: 5151,
         max_message_size: 64 * 1024 * 1024,
+        max_bulk_message_size: default_max_bulk_message_size(),
         max_connections: default_max_connections(),
         max_concurrent_requests: default_max_concurrent_requests(),
         connection_idle_timeout_secs: default_connection_idle_timeout_secs(),

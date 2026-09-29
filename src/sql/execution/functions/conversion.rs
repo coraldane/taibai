@@ -27,9 +27,7 @@ pub fn cast(args: &[ScalarValue]) -> Result<ScalarValue> {
     // with unparseable text yielding NULL like to_int does.
     let from_text = if let ScalarValue::VarChar(Some(s)) = &value {
         match data_type {
-            DataType::Float32 | DataType::Float64 => {
-                Some(to_float(std::slice::from_ref(&value))?)
-            }
+            DataType::Float32 | DataType::Float64 => Some(to_float(std::slice::from_ref(&value))?),
             DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -87,10 +85,7 @@ pub fn cast(args: &[ScalarValue]) -> Result<ScalarValue> {
                     .checked_mul(multiplier as i128)
                     .and_then(|v| i64::try_from(v).ok())
                     .ok_or_else(|| {
-                        TaibaiError::Sql(format!(
-                            "decimal value '{}' overflows scale {}",
-                            i, scale
-                        ))
+                        TaibaiError::Sql(format!("decimal value '{}' overflows scale {}", i, scale))
                     })?;
                 Ok(ScalarValue::Decimal(Some(scaled)))
             } else if let Some(f) = as_f64 {
@@ -118,9 +113,11 @@ fn cast_unsupported(value: &ScalarValue, data_type: DataType) -> TaibaiError {
 /// Parse text as an integer, truncating a fractional part toward zero.
 fn parse_numeric_string(s: &str) -> Option<i64> {
     let s = s.trim();
-    s.parse::<i64>()
-        .ok()
-        .or_else(|| s.parse::<f64>().ok().and_then(|f| f.is_finite().then(|| f.trunc() as i64)))
+    s.parse::<i64>().ok().or_else(|| {
+        s.parse::<f64>()
+            .ok()
+            .and_then(|f| f.is_finite().then(|| f.trunc() as i64))
+    })
 }
 
 pub fn to_int(args: &[ScalarValue]) -> Result<ScalarValue> {

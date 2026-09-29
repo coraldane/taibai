@@ -299,7 +299,7 @@ fn compression_level_round_trips_and_defaults_to_none() {
     let legacy_json = serde_json::to_value(&restored).unwrap();
     let mut legacy = legacy_json.as_object().unwrap().clone();
     legacy.remove("compression_level");
-    let without_field: TableMeta = serde_json::from_value(serde_json::Value::Object(legacy))
-        .unwrap();
+    let without_field: TableMeta =
+        serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
     assert_eq!(without_field.compression_level, None);
 }

@@ -82,7 +82,11 @@ fn revoke_only_removes_matching_type_and_object() {
 #[test]
 fn new_credentials_use_argon2id_and_verify() {
     let user = UserInfo::new("bob", "s3cret");
-    assert!(user.password_hash.starts_with("$argon2"), "hash: {}", user.password_hash);
+    assert!(
+        user.password_hash.starts_with("$argon2"),
+        "hash: {}",
+        user.password_hash
+    );
     assert!(!user.password_hash_is_legacy());
     assert!(user.verify_password("s3cret"));
     assert!(!user.verify_password("wrong"));
@@ -127,15 +131,13 @@ fn authenticate_migrates_legacy_hash_and_persists() {
 
     // Wrong password must not migrate.
     assert!(!manager.authenticate("legacy", "nope").unwrap());
-    assert!(
-        manager
-            .store
-            .read()
-            .unwrap()
-            .get_user("legacy")
-            .unwrap()
-            .password_hash_is_legacy()
-    );
+    assert!(manager
+        .store
+        .read()
+        .unwrap()
+        .get_user("legacy")
+        .unwrap()
+        .password_hash_is_legacy());
 
     // Successful login upgrades the stored hash and persists it.
     assert!(manager.authenticate("legacy", "pw").unwrap());

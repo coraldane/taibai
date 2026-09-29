@@ -36,7 +36,9 @@ fn eval_col_lit_mask(
 /// Negated comparison kernel: `NOT (col <op> lit)` keeps only rows where the
 /// comparison is definitely false, which the direct kernels already express
 /// (NULL rows return false, i.e. SQL UNKNOWN is excluded).
-fn negated_kernel(op: BinOp) -> Option<fn(&crate::types::array::ColumnArray, &ScalarValue) -> Vec<bool>> {
+fn negated_kernel(
+    op: BinOp,
+) -> Option<fn(&crate::types::array::ColumnArray, &ScalarValue) -> Vec<bool>> {
     match op {
         BinOp::Eq => Some(crate::types::array::ColumnArray::neq_vec),
         BinOp::Neq => Some(crate::types::array::ColumnArray::eq_vec),
@@ -290,11 +292,7 @@ pub fn eval_where_clause_batch(
                             let high = coerce_scalar_for_dtype(high_val, dt)?;
                             let ge = col.ge_vec(&low);
                             let le = col.le_vec(&high);
-                            return Ok(ge
-                                .iter()
-                                .zip(le.iter())
-                                .map(|(a, b)| *a && *b)
-                                .collect());
+                            return Ok(ge.iter().zip(le.iter()).map(|(a, b)| *a && *b).collect());
                         }
                     }
                 }
@@ -332,7 +330,11 @@ pub fn eval_where_clause3(
                 if r == Some(false) {
                     return Ok(Some(false));
                 }
-                Ok(if l.is_none() || r.is_none() { None } else { Some(true) })
+                Ok(if l.is_none() || r.is_none() {
+                    None
+                } else {
+                    Some(true)
+                })
             }
             BinOp::Or => {
                 let l = eval_where_clause3(left, batch, row_idx, schema)?;
@@ -343,7 +345,11 @@ pub fn eval_where_clause3(
                 if r == Some(true) {
                     return Ok(Some(true));
                 }
-                Ok(if l.is_none() || r.is_none() { None } else { Some(false) })
+                Ok(if l.is_none() || r.is_none() {
+                    None
+                } else {
+                    Some(false)
+                })
             }
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte => {
                 let left_val = eval_expr_for_row(left, batch, row_idx, schema)?;
@@ -354,9 +360,9 @@ pub fn eval_where_clause3(
                 match op {
                     BinOp::Eq => Ok(Some(scalar_values_equal(&left_val, &right_val))),
                     BinOp::Neq => Ok(Some(!scalar_values_equal(&left_val, &right_val))),
-                    BinOp::Lt => {
-                        Ok(Some(compare_scalars(&left_val, &right_val) == Some(Ordering::Less)))
-                    }
+                    BinOp::Lt => Ok(Some(
+                        compare_scalars(&left_val, &right_val) == Some(Ordering::Less),
+                    )),
                     BinOp::Gt => Ok(Some(
                         compare_scalars(&left_val, &right_val) == Some(Ordering::Greater),
                     )),
@@ -387,9 +393,7 @@ pub fn eval_where_clause3(
             let val = eval_expr_for_row(inner, batch, row_idx, schema)?;
             Ok(Some(!val.is_null()))
         }
-        Expr::UnaryNot(inner) => {
-            Ok(eval_where_clause3(inner, batch, row_idx, schema)?.map(|b| !b))
-        }
+        Expr::UnaryNot(inner) => Ok(eval_where_clause3(inner, batch, row_idx, schema)?.map(|b| !b)),
         Expr::In {
             expr,
             values,
@@ -487,14 +491,11 @@ pub fn eval_where_clause3(
         Expr::Column(_) | Expr::QualifiedColumn { .. } => Err(TaibaiError::Sql(
             "column reference cannot be used as a boolean predicate".to_string(),
         )),
-        Expr::UnaryMinus(_) | Expr::WindowFunction { .. } | Expr::Placeholder(_) => {
-            Err(TaibaiError::Sql(
-                "unsupported predicate expression in DML statement".to_string(),
-            ))
-        }
+        Expr::UnaryMinus(_) | Expr::WindowFunction { .. } | Expr::Placeholder(_) => Err(
+            TaibaiError::Sql("unsupported predicate expression in DML statement".to_string()),
+        ),
         Expr::Exists(_) | Expr::Subquery(_) => Err(TaibaiError::Sql(
-            "subqueries are not supported in this DML statement's WHERE clause"
-                .to_string(),
+            "subqueries are not supported in this DML statement's WHERE clause".to_string(),
         )),
         Expr::Correlated(_) => Err(TaibaiError::Sql(
             "correlated subqueries are not supported in this context".to_string(),
@@ -515,9 +516,7 @@ fn truthiness(v: &ScalarValue) -> Result<Option<bool>> {
         // Numeric predicates follow MySQL truthiness: nonzero is TRUE.
         // `DELETE FROM t WHERE 1` used to work before the evaluator
         // rewrite and must keep working.
-        value if value.integer_i128().is_some() => {
-            Ok(Some(value.integer_i128() != Some(0)))
-        }
+        value if value.integer_i128().is_some() => Ok(Some(value.integer_i128() != Some(0))),
         value if value.numeric_f64().is_some() => Ok(Some(value.numeric_f64() != Some(0.0))),
         other => Err(TaibaiError::Sql(format!(
             "predicate must be boolean or numeric, got {:?}",
@@ -626,7 +625,11 @@ pub fn eval_expr_for_row(
                 Some(b) => b,
                 None => return Ok(ScalarValue::Bool(None)),
             };
-            Ok(ScalarValue::Bool(Some(if *negated { !holds } else { holds })))
+            Ok(ScalarValue::Bool(Some(if *negated {
+                !holds
+            } else {
+                holds
+            })))
         }
         Expr::Case {
             operand,

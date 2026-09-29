@@ -10,7 +10,9 @@ fn compressible_batch() -> RecordBatch {
         batch
             .column_mut(0)
             .unwrap()
-            .push(&ScalarValue::VarChar(Some("taibai-archive-row|".repeat(64))))
+            .push(&ScalarValue::VarChar(Some(
+                "taibai-archive-row|".repeat(64),
+            )))
             .unwrap();
     }
     batch

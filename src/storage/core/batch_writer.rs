@@ -557,7 +557,13 @@ impl BatchWriter {
     /// e.g. unit-test writers). Transactional memtables are invisible to the
     /// background relief valves until COMMIT, so this is the only bound on
     /// how much memory one open transaction can accumulate.
-    fn charge_txn_insert_bytes(&self, txn_id: u64, db: &str, table: &str, bytes: u64) -> Result<()> {
+    fn charge_txn_insert_bytes(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        bytes: u64,
+    ) -> Result<()> {
         match self.memtable_mgr.txn_mutations() {
             Some(registry) => registry
                 .charge_txn_insert_bytes(txn_id, db, table, bytes)

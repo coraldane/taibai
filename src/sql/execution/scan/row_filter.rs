@@ -296,7 +296,9 @@ fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut [bool]) {
         // data slot regardless of the bitmap.
         *m = *m
             && !col.bitmap().is_null(i)
-            && values.contains(&crate::sql::execution::join_hashtable::ScalarValueHashable::from_column(col, i));
+            && values.contains(
+                &crate::sql::execution::join_hashtable::ScalarValueHashable::from_column(col, i),
+            );
     }
 }
 
@@ -321,18 +323,16 @@ fn zone_map_proves_clause(
     op: crate::storage::partition::pruning::RangeOp,
     value: &ScalarValue,
 ) -> bool {
-    zone_maps
-        .get(column)
-        .is_some_and(|zone_map| {
-            crate::storage::partition::pruning::classify_clause(
-                &crate::storage::partition::pruning::RangeClause {
-                    column_index: column,
-                    op,
-                    value: value.clone(),
-                },
-                zone_map,
-            ) == crate::storage::partition::pruning::PredicateMatch::All
-        })
+    zone_maps.get(column).is_some_and(|zone_map| {
+        crate::storage::partition::pruning::classify_clause(
+            &crate::storage::partition::pruning::RangeClause {
+                column_index: column,
+                op,
+                value: value.clone(),
+            },
+            zone_map,
+        ) == crate::storage::partition::pruning::PredicateMatch::All
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -366,19 +366,13 @@ pub fn predicate_first_read(
                 )
         })
         .collect();
-    let range_predicates: Vec<&crate::storage::partition::pruning::RangeClause> =
-        range_predicates
-            .iter()
-            .filter(|clause| {
-                !can_eliminate
-                    || !zone_map_proves_clause(
-                        zone_maps,
-                        clause.column_index,
-                        clause.op,
-                        &clause.value,
-                    )
-            })
-            .collect();
+    let range_predicates: Vec<&crate::storage::partition::pruning::RangeClause> = range_predicates
+        .iter()
+        .filter(|clause| {
+            !can_eliminate
+                || !zone_map_proves_clause(zone_maps, clause.column_index, clause.op, &clause.value)
+        })
+        .collect();
 
     // Columns predicate evaluation still needs, in a stable order.
     let mut eval_cols: Vec<usize> = Vec::with_capacity(predicate_cols.len());
@@ -414,7 +408,9 @@ pub fn predicate_first_read(
         }
         let mut columns_by_idx: std::collections::HashMap<usize, ColumnArray> =
             std::collections::HashMap::with_capacity(projection_cols.len());
-        for (column, col) in reader.read_columns_filtered(rg_idx, projection_cols, &selected_rows)? {
+        for (column, col) in
+            reader.read_columns_filtered(rg_idx, projection_cols, &selected_rows)?
+        {
             columns_by_idx.insert(column, col);
         }
         let mut columns = Vec::with_capacity(projection_cols.len());

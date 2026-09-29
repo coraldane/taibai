@@ -201,10 +201,7 @@ pub fn exec_union_with_txn(
             }
             rows.truncate(right_row_start);
             let mut seen = std::collections::HashSet::new();
-            let keep = matches!(
-                op,
-                crate::sql::parser::ast::SetOp::Intersect
-            );
+            let keep = matches!(op, crate::sql::parser::ast::SetOp::Intersect);
             rows.retain(|row| {
                 seen.insert(row.clone())
                     && if keep {
@@ -462,7 +459,8 @@ fn exec_table_select(
     let resolved;
     let resolved_stmt;
     let derived_tables;
-    let mut decorrelated_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> = HashMap::new();
+    let mut decorrelated_batches: HashMap<String, Vec<std::sync::Arc<RecordBatch>>> =
+        HashMap::new();
     let subquery_registry;
     let has_correlated;
     let (stmt, from_clause) = if let Some(pre) = pre_resolved {
@@ -569,8 +567,7 @@ fn exec_table_select(
                 .get(&table_names[0])
                 .map(|meta| meta.cluster_key.clone())
                 .unwrap_or_default(),
-        )
-    {
+        ) {
         extract_simple_metadata_aggregates(
             &plan,
             table_schemas
@@ -1132,10 +1129,10 @@ fn expr_pins_column_eq(expr: &crate::sql::parser::ast::Expr, column: &str) -> bo
             left,
             op: BinOp::Eq,
             right,
-        } => bare_column_name(left)
-            .is_some_and(|name| name.eq_ignore_ascii_case(column))
-            || bare_column_name(right)
-                .is_some_and(|name| name.eq_ignore_ascii_case(column)),
+        } => {
+            bare_column_name(left).is_some_and(|name| name.eq_ignore_ascii_case(column))
+                || bare_column_name(right).is_some_and(|name| name.eq_ignore_ascii_case(column))
+        }
         _ => false,
     }
 }
@@ -1152,7 +1149,8 @@ fn bare_column_name(expr: &crate::sql::parser::ast::Expr) -> Option<&str> {
 /// Detect a "simple" aggregate query answerable from row-group metadata:
 /// single table, no GROUP BY/HAVING, and every select item is a non-distinct
 /// `COUNT(*)` / `COUNT(col)` / `MIN(col)` / `MAX(col)` / `SUM(col)` / `AVG(col)`.
-fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) -> bool {    let (select_list, group_by, having) = match stmt {
+fn detect_simple_metadata_aggregate(stmt: &Statement, table_names: &[String]) -> bool {
+    let (select_list, group_by, having) = match stmt {
         Statement::Select {
             select_list,
             group_by,

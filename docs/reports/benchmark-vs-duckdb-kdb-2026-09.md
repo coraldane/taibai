@@ -159,3 +159,40 @@ python E:/workspace/bench/duckdb_bench.py load|query|appender
 ```
 
 数据生成:`E:/workspace/bench/gen_ticks.py`(numpy+pandas,种子 42,可复现)。
+
+## 11. 批量导入端到端优化实录(2026-09-29)
+
+> 场景与 §3.1 相同(10M 行 × 34 列 CSV → 持久化)。本轮把测量口径修正为**端到端**(客户端发送 + 服务端 drain + STOP 刷盘全部完成),原 §3.1 的 6.05s/165 万行/s 止于最后一条 payload 写入 socket,漏计了约 1.9s 的服务端尾巴——按同一口径,优化前基线是 **8.64s / 116 万行/s**。
+
+### 11.1 基线画像(log.insert_profile 分阶段探针)
+
+| 阶段 | 每 200k 行请求 |
+|---|---|
+| 客户端 CSV 解析+编码(单线程) | 5.2s / 总 6.78s(第一瓶颈) |
+| 服务端 write=partition+prepare+append | 92ms(其中 select 逐值拷贝 16.7ms、zstd 16.8ms、行组写入+元数据 36.8ms、分区路由 13.9ms) |
+
+### 11.2 落地的优化
+
+| 项 | 内容 | 效果 |
+|---|---|---|
+| 客户端并行解析 | 单 reader 按行边界切 64MB 段 → 8 parser 线程解析+编码+发送,段完成哨兵恢复严格文件序 | 客户端 CPU 5.2s → 墙钟 ~0.9s |
+| reader 线性化 | 行界扫描只扫新块(原每 8MB 块全量重扫 pending,近似平方) | reader ~1s |
+| 服务端零拷贝行组 | Borrowed 路径从"整请求"泛化为"连续行 run":定宽列指针子切片、varchar arena 重基切片、NULL 位图按 u64 word 对齐平移;Owned 逐值 gather 路径整体删除 | select 16.7ms → 0 |
+| 分区路由均匀快路径 | 分区列原始槽位全等(memcmp)时一次键计算替代逐行 scalar+format! | partition 13.9ms → 1.3ms |
+| col_sums 特化+并行 | 无 NULL 定宽列按宽度类型化 wrapping 求和(unaligned load),34 列 rayon 并行 | append 内部求和减半 |
+| 定宽 zone map 特化 | 逐行 enum 匹配 → 类型化 min/max | append 36.8ms → 8-14ms |
+| bulk 消息独立上限 | `server.max_bulk_message_size`(默认 128MB),bulk 0x23 不再受 64MB 通用上限约束 | 为大批次留空间 |
+
+**结果(同机同数据,端到端口径):4.0-4.4s(228-248 万行/s),对比修正后基线 2.0-2.1x。** 服务端 per-request 92ms → 36ms。
+
+### 11.3 过程中发现并修复的正确性问题
+
+1. **零拷贝 varchar arena(自引入自修复)**:变长列 piece 最初把整个请求 arena 传给编码器,无 NULL 快路径逐字追加,导致每个行组重放第一片的值——partition_cluster_test 的 NULL/乱序用例抓住,round-trip 测试钉死。
+2. **NULL 位图 word 对齐**:切片位图按字节粒度生成,而 `NullBitmap::from_bytes` 按 u64 word 拷贝(短尾被丢弃);已按格式不变量改为 word 对齐+零尾位。
+3. **多轮导入 SUM=NULL(预先存在,本轮修复)**:bulk 直写只给键列算 zone map,非键列是默认值(min=NULL);SUM 元数据路由把"未计算"当"全 NULL 行组"跳过,多轮导入后 COUNT 正常而 SUM/AVG 返回 NULL。修复:SUM/AVG 参数列的 zone map 未计算(或真全空)时该行组走数据折叠;`tests/direct_bulk_multi_session_test.rs` 钉住(三轮导入后 SUM/AVG 精确)。
+
+### 11.4 剩余差距与下一步
+
+- 端到端 4.0-4.4s vs DuckDB 2.96s(337 万行/s):客户端单 socket 写(~800MB/s 回环)与串行 per-connection 处理是剩余约束。已验证无效的方向:双连接(客户端单 consumer 交替写,无收益且不稳)、500k 大批次(段对齐破坏批次结构,反而变慢)、线上 zstd-1(回环上解压成本超过传输收益;真实网络场景仍值得做,服务端入口已支持 0x28B52FFD magic 检测解压)。
+- 下一步优先级:① 双 consumer 各持一个连接(重叠 socket 写与服务端处理);② 线上压缩采用定长前缀精确分配解压缓冲;③ bulk 编码 v2(连续 varchar 缓冲 + offsets,协议文档已定义,服务端解析待实现)。
+- 全量回归 617+ 用例通过;新增 `direct_bulk_multi_session_test`(多轮导入 SUM/AVG 精确)与 partition_cluster 的 NULL/乱序用例共同钉住本轮改动。

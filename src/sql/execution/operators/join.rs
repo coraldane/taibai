@@ -164,13 +164,12 @@ impl HashJoinExec {
         let mut memory = MemoryManager::reservation();
         let mut estimated_bytes = 0usize;
         let check_build_budget = |batch: &RecordBatch,
-                                      estimated_bytes: &mut usize,
-                                      memory: &mut MemoryReservation,
-                                      limit: usize|
+                                  estimated_bytes: &mut usize,
+                                  memory: &mut MemoryReservation,
+                                  limit: usize|
          -> Result<()> {
-            *estimated_bytes = estimated_bytes.saturating_add(
-                batch.estimated_size_bytes().saturating_mul(2),
-            );
+            *estimated_bytes =
+                estimated_bytes.saturating_add(batch.estimated_size_bytes().saturating_mul(2));
             super::profile::record_current_peak_memory(*estimated_bytes);
             if *estimated_bytes >= limit || !memory.try_resize(*estimated_bytes) {
                 return Err(crate::common::error::TaibaiError::ResourceBusy(format!(
@@ -671,7 +670,7 @@ impl HashJoinExec {
                     Some(batch) if batch.num_rows() > 0 => {
                         self.probe_state.cross_left = Some(batch);
                     }
-                    Some(_) => continue, // skip empty left batches
+                    Some(_) => continue,     // skip empty left batches
                     None => return Ok(None), // left exhausted: product complete
                 }
                 if !self.probe_state.right_collected {
@@ -721,7 +720,9 @@ impl HashJoinExec {
                     columns[i].push(&v)?;
                 }
                 for i in 0..right_ncols {
-                    let v = right_batch.scalar(rr, i).unwrap_or(ScalarValue::Int64(None));
+                    let v = right_batch
+                        .scalar(rr, i)
+                        .unwrap_or(ScalarValue::Int64(None));
                     columns[left_ncols + i].push(&v)?;
                 }
                 produced += 1;

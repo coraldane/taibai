@@ -9,15 +9,24 @@ use crate::protocol::message::{
     MSG_TYPE_REPL_EVENT, MSG_TYPE_REPL_SEGMENT_CHUNK,
 };
 
+use crate::protocol::message::MSG_TYPE_BULK_INSERT_COLUMNAR;
+
 pub struct MessageCodec {
     max_message_size: usize,
+    bulk_max_message_size: usize,
     compress_threshold: usize,
 }
 
 impl MessageCodec {
+    pub fn with_bulk_max_message_size(mut self, bulk_max_message_size: usize) -> Self {
+        self.bulk_max_message_size = bulk_max_message_size.max(self.max_message_size);
+        self
+    }
+
     pub fn new(max_message_size: usize) -> Self {
         Self {
             max_message_size,
+            bulk_max_message_size: max_message_size,
             compress_threshold: 4096,
         }
     }
@@ -41,10 +50,16 @@ impl Decoder for MessageCodec {
         let header = MessageHeader::decode(&header_bytes)?;
 
         let payload_len = header.payload_len as usize;
-        if payload_len > self.max_message_size {
+        // Bulk imports carry batch-proportional payloads and get their own
+        // ceiling (see ServerSettings::max_bulk_message_size).
+        let limit = if header.msg_type == MSG_TYPE_BULK_INSERT_COLUMNAR {
+            self.bulk_max_message_size
+        } else {
+            self.max_message_size
+        };
+        if payload_len > limit {
             return Err(TaibaiError::Protocol(format!(
-                "payload length {payload_len} exceeds max {}",
-                self.max_message_size
+                "payload length {payload_len} exceeds max {limit}"
             )));
         }
 

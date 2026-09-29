@@ -34,7 +34,8 @@ pub struct IndexManager {
     /// COMMIT, so ROLLBACK must retract exactly these keys — otherwise the
     /// next INSERT of the same key sees a phantom duplicate until the next
     /// snapshot refresh. COMMIT only drops the record.
-    txn_published: Mutex<HashMap<u64, HashMap<(String, String), Vec<(String, Vec<Vec<ScalarValue>>)>>>>,
+    txn_published:
+        Mutex<HashMap<u64, HashMap<(String, String), Vec<(String, Vec<Vec<ScalarValue>>)>>>>,
 }
 
 #[derive(Default)]
@@ -77,10 +78,7 @@ impl IndexManager {
         let per_index = per_table
             .entry((db.to_string(), table.to_string()))
             .or_default();
-        if let Some(existing) = per_index
-            .iter_mut()
-            .find(|(name, _)| name == index_name)
-        {
+        if let Some(existing) = per_index.iter_mut().find(|(name, _)| name == index_name) {
             existing.1.extend(keys);
         } else {
             per_index.push((index_name.to_string(), keys));

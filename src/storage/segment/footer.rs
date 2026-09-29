@@ -222,9 +222,6 @@ pub fn parse_segment_footer(buf: &[u8]) -> Result<ParsedSegmentFooter> {
     })
 }
 
-
-
-
 pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
     let mut cursor = Cursor::new(buf);
     let _magic = read_u32_le(&mut cursor)?;
@@ -301,9 +298,6 @@ pub fn reserved_section_offset(buf: &[u8]) -> Result<usize> {
     // preserved prefix.
     Ok(cursor.position() as usize)
 }
-
-
-
 
 #[cfg(test)]
 #[path = "footer_test.rs"]

@@ -107,9 +107,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn txn_mutations(
-        &self,
-    ) -> &Arc<crate::storage::core::txn_mutations::TxnMutationRegistry> {
+    pub fn txn_mutations(&self) -> &Arc<crate::storage::core::txn_mutations::TxnMutationRegistry> {
         &self.txn_mutations
     }
 

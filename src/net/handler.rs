@@ -203,7 +203,7 @@ impl Handler {
             context.enter_phase(crate::common::query_cancel::QueryPhase::Executing);
         }
         let _cancellation = crate::common::query_cancel::QueryCancellationGuard::enter(context);
-let result = match msg.msg_type {
+        let result = match msg.msg_type {
             MSG_TYPE_LOGIN => self.handle_login(&msg.payload),
             MSG_TYPE_PING => Ok(vec![build_pong()]),
             MSG_TYPE_LOGOUT => {
@@ -1301,10 +1301,8 @@ let result = match msg.msg_type {
         // Same cleanup order as the SQL-text path (engine/core.rs): deferred
         // DML plans first, then the batch-writer rollback, then the unique/PK
         // index entries the transaction published at statement time.
-        let discarded_dml = crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(
-            &self.engine,
-            txn_id,
-        );
+        let discarded_dml =
+            crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(&self.engine, txn_id);
         let rolled_back = self.engine.batch_writer().rollback_txn(txn_id)?;
         self.engine
             .index_manager()
@@ -1763,7 +1761,7 @@ fn build_auth_fail(reason: &str) -> Message {
 }
 
 impl Handler {
-// ===================== Replication (R1) =====================
+    // ===================== Replication (R1) =====================
 
     /// REPL_HELLO (standby -> primary, after LOGIN): authenticate, then turn
     /// this connection into a replication event stream. Live events flow
@@ -1829,10 +1827,10 @@ impl Handler {
             )]);
         };
 
-        let (sink_tx, sink_rx) =
-            crossbeam_channel::bounded::<(u64, Arc<crate::storage::replication::ReplicationEvent>)>(
-                4096,
-            );
+        let (sink_tx, sink_rx) = crossbeam_channel::bounded::<(
+            u64,
+            Arc<crate::storage::replication::ReplicationEvent>,
+        )>(4096);
         rep_log.register_session(&sink_tx);
 
         // Bridge thread: ring history first, then live fan-out, both funneled
@@ -1843,8 +1841,7 @@ impl Handler {
                 use std::collections::BTreeMap;
                 use std::sync::Arc as StdArc;
                 let push = |seq: u64, event: &crate::storage::replication::ReplicationEvent| {
-                    let mut payload_bytes =
-                        Vec::with_capacity(8 + 4 + 128);
+                    let mut payload_bytes = Vec::with_capacity(8 + 4 + 128);
                     payload_bytes.extend_from_slice(&seq.to_le_bytes());
                     let encoded = event.encode();
                     payload_bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
@@ -1855,8 +1852,10 @@ impl Handler {
                     })
                 };
                 let mut next = last_seq + 1;
-                let mut pending: BTreeMap<u64, StdArc<crate::storage::replication::ReplicationEvent>> =
-                    BTreeMap::new();
+                let mut pending: BTreeMap<
+                    u64,
+                    StdArc<crate::storage::replication::ReplicationEvent>,
+                > = BTreeMap::new();
                 for (seq, event) in history {
                     if seq < next {
                         continue;
@@ -1979,7 +1978,6 @@ impl Handler {
         }
         Ok(Vec::new())
     }
-
 }
 
 fn build_pong() -> Message {

@@ -36,21 +36,46 @@ impl ObjectName {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterOperation {
-    AddColumn { column: ColumnDefAst },
-    DropColumn { name: String },
-    AddUniqueKey { key: UniqueKeyDef },
-    DropIndex { name: String },
-    RenameColumn { old_name: String, new_name: String },
-    ModifyColumn { column: ColumnDefAst },
-    RenameTable { new_name: String },
-    DropPartition { partition_key: String },
-    TruncatePartition { partition_key: String },
-    SetHot { hot: HotDef },
-    SetTtl { ttl: TtlDef },
+    AddColumn {
+        column: ColumnDefAst,
+    },
+    DropColumn {
+        name: String,
+    },
+    AddUniqueKey {
+        key: UniqueKeyDef,
+    },
+    DropIndex {
+        name: String,
+    },
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    ModifyColumn {
+        column: ColumnDefAst,
+    },
+    RenameTable {
+        new_name: String,
+    },
+    DropPartition {
+        partition_key: String,
+    },
+    TruncatePartition {
+        partition_key: String,
+    },
+    SetHot {
+        hot: HotDef,
+    },
+    SetTtl {
+        ttl: TtlDef,
+    },
     DropTtl,
     /// `SET COMPRESSION_LEVEL = n`; `None` means `DEFAULT`, resetting the
     /// table to follow the global compression level again.
-    SetCompressionLevel { level: Option<i32> },
+    SetCompressionLevel {
+        level: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

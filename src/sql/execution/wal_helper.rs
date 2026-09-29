@@ -4,9 +4,7 @@ use crate::common::error::{Result, TaibaiError};
 #[path = "wal_helper_test.rs"]
 mod tests;
 
-pub fn serialize_batch_for_wal(
-    batch: &crate::types::batch::RecordBatch,
-) -> Result<Vec<u8>> {
+pub fn serialize_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Result<Vec<u8>> {
     compress_prepared_batch_for_wal(prepare_batch_for_wal(batch)?)
 }
 
@@ -14,19 +12,17 @@ pub fn serialize_batch_for_wal(
 /// The durable-tail commit thread performs level-3 compression serially so
 /// concurrent INSERT workers do not saturate memory bandwidth and naturally
 /// accumulate into a larger fsync group.
-pub(crate) fn prepare_batch_for_wal(
-    batch: &crate::types::batch::RecordBatch,
-) -> Result<Vec<u8>> {
+pub(crate) fn prepare_batch_for_wal(batch: &crate::types::batch::RecordBatch) -> Result<Vec<u8>> {
     const WAL_BATCH_MAGIC: u32 = 0x4D4F4E58;
 
     let num_cols = batch.num_columns();
     let num_rows = batch.num_rows();
     // u32 frame fields: refuse instead of silently wrapping (a wrapped
     // length/row count corrupts recovery).
-    let num_cols_u32 =
-        u32::try_from(num_cols).map_err(|_| TaibaiError::Internal("WAL column count overflow".into()))?;
-    let num_rows_u32 =
-        u32::try_from(num_rows).map_err(|_| TaibaiError::Internal("WAL row count overflow".into()))?;
+    let num_cols_u32 = u32::try_from(num_cols)
+        .map_err(|_| TaibaiError::Internal("WAL column count overflow".into()))?;
+    let num_rows_u32 = u32::try_from(num_rows)
+        .map_err(|_| TaibaiError::Internal("WAL row count overflow".into()))?;
 
     let mut raw = Vec::with_capacity(64 + num_cols * 8 + num_rows * num_cols * 8);
     raw.extend_from_slice(&WAL_BATCH_MAGIC.to_le_bytes());

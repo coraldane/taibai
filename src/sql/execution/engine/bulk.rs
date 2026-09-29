@@ -1,3 +1,12 @@
+/// Upper bound for decompressing a bulk payload: the ratio cap mirrors the
+/// codec's message ceiling and bounds decompression-bomb amplification.
+fn max_bulk_decompressed_len(compressed_len: usize) -> usize {
+    compressed_len
+        .saturating_mul(8)
+        .saturating_add(64 * 1024 * 1024)
+        .min(usize::MAX / 2)
+}
+
 fn log_direct_bulk_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     if crate::common::config::insert_profile_enabled() {
         println!(
@@ -380,6 +389,19 @@ impl Engine {
             ));
         }
         let total_start = std::time::Instant::now();
+        // Bulk clients may ship the columnar payload zstd-compressed (level-1
+        // frames keep 40-90MB batches within loopback/LAN transfer budgets).
+        // The magic is unambiguous (0x28 B5 2F FD) and old uncompressed
+        // payloads — which start with the u16 table name length — never
+        // collide with it.
+        let decompressed;
+        let payload: &[u8] = if payload.len() >= 4 && payload[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+            decompressed = zstd::bulk::decompress(payload, max_bulk_decompressed_len(payload.len()))
+                .map_err(|e| TaibaiError::Protocol(format!("bulk payload zstd decompress failed: {}", e)))?;
+            &decompressed
+        } else {
+            payload
+        };
         let table_name = bulk_payload_table_name(payload)?.to_string();
         if let Some(username) = username {
             // The columnar bulk message bypasses the SQL layer entirely, so

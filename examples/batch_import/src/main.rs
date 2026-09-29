@@ -15,7 +15,7 @@ const TICK_TABLE: &str = "stock_tick_batch";
 const DEFAULT_BATCH_SIZE: usize = 200_000;
 const PIPELINE_DEPTH: usize = 8;
 const READ_BLOCK_SIZE: usize = 8 * 1024 * 1024;
-const CHANNEL_CAPACITY: usize = 8;
+const CHANNEL_CAPACITY: usize = 32;
 
 macro_rules! log_msg {
     ($($arg:tt)*) => {
@@ -117,44 +117,33 @@ async fn main() {
     log_msg!("Progress will be displayed every 5 seconds...");
 
     let start_time = Instant::now();
-    let result = import_tick_pipeline(csv_path, batch_size, skip_header, &mut client).await;
-
-    let elapsed = start_time.elapsed();
+    let result = import_tick_pipeline(csv_path, batch_size, skip_header, client).await;
 
     match result {
-        Ok(total_rows) => {
+        Ok((total_rows, producer_stats, consumer_stats)) => {
             log_msg!(
-                "Import completed: {} rows in {:.2}s ({:.0} rows/sec)",
+                "Client stages: parse={:.2}s encode={:.2}s send_wait={:.2}s consumer_send={:.2}s consumer_drain_wait={:.2}s (batches={})",
+                producer_stats.parse_us() as f64 / 1e6,
+                producer_stats.encode_us() as f64 / 1e6,
+                producer_stats.send_wait_us() as f64 / 1e6,
+                consumer_stats.send_us() as f64 / 1e6,
+                consumer_stats.drain_wait_us() as f64 / 1e6,
+                producer_stats.batches()
+            );
+
+            let end_to_end = start_time.elapsed();
+            log_msg!(
+                "END-TO-END (server drain incl.): {} rows in {:.2}s ({:.0} rows/sec)",
                 total_rows,
-                elapsed.as_secs_f64(),
-                total_rows as f64 / elapsed.as_secs_f64()
+                end_to_end.as_secs_f64(),
+                total_rows as f64 / end_to_end.as_secs_f64()
             );
         }
         Err(e) => {
             eprintln!("Import failed: {}", e);
-            let _ = client.logout().await;
-            let _ = client.close().await;
             std::process::exit(1);
         }
     }
-
-    log_msg!("Draining pipeline responses...");
-    match client.drain_pipeline().await {
-        Ok(()) => log_msg!("All pipeline responses received."),
-        Err(e) => eprintln!("Drain warning: {}", e),
-    }
-
-    log_msg!("Stopping pipeline...");
-    let _ = client.stop_pipeline().await;
-
-    log_msg!("Stopping bulk import...");
-    match client.stop_bulk_import().await {
-        Ok(rows) => log_msg!("Flushed {} buffered rows.", rows),
-        Err(e) => eprintln!("Stop bulk import warning: {}", e),
-    }
-
-    let _ = client.logout().await;
-    let _ = client.close().await;
     log_msg!("Done.");
 }
 
@@ -216,158 +205,455 @@ struct ParsedBatch {
     row_count: usize,
 }
 
+#[derive(Default)]
+struct ProducerStats {
+    /// File read + line scan + field parse (everything except encoding),
+    /// accumulated across all parser threads.
+    parse_us: std::sync::atomic::AtomicU64,
+    /// Columnar payload encoding for completed batches.
+    encode_us: std::sync::atomic::AtomicU64,
+    /// Time threads spent blocked pushing batches downstream.
+    send_wait_us: std::sync::atomic::AtomicU64,
+    batches: std::sync::atomic::AtomicU64,
+}
+
+impl ProducerStats {
+    fn parse_us(&self) -> u128 {
+        self.parse_us.load(std::sync::atomic::Ordering::Relaxed) as u128
+    }
+    fn encode_us(&self) -> u128 {
+        self.encode_us.load(std::sync::atomic::Ordering::Relaxed) as u128
+    }
+    fn send_wait_us(&self) -> u128 {
+        self.send_wait_us.load(std::sync::atomic::Ordering::Relaxed) as u128
+    }
+    fn batches(&self) -> u64 {
+        self.batches.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+struct ConsumerStats {
+    /// Time spent waiting for pipeline send capacity (drain_one_pipeline_response).
+    drain_wait_us: std::sync::atomic::AtomicU64,
+    /// Time spent inside the send call itself.
+    send_us: std::sync::atomic::AtomicU64,
+}
+
+impl ConsumerStats {
+    fn from_arc(stats: &std::sync::Arc<ConsumerStats>) -> Self {
+        Self {
+            drain_wait_us: std::sync::atomic::AtomicU64::new(
+                stats
+                    .drain_wait_us
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            send_us: std::sync::atomic::AtomicU64::new(
+                stats.send_us.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+    fn drain_wait_us(&self) -> u128 {
+        self.drain_wait_us
+            .load(std::sync::atomic::Ordering::Relaxed) as u128
+    }
+    fn send_us(&self) -> u128 {
+        self.send_us.load(std::sync::atomic::Ordering::Relaxed) as u128
+    }
+}
+
+/// One line-aligned chunk of the CSV handed to a parser thread. Lines are
+/// complete by construction; `skip_first_line` is set on segment 0 only.
+struct CsvSegment {
+    id: u64,
+    data: Vec<u8>,
+    skip_first_line: bool,
+}
+
+/// A parsed batch tagged with its (segment, batch-within-segment) position.
+/// A single worker processes a whole segment, so per-segment arrivals are
+/// strictly ordered; the sequencer restores the cross-segment order using the
+/// explicit `SegmentDone` marker (which also skips segments that produced
+/// zero batches).
+enum IngestMsg {
+    Batch {
+        seg: u64,
+        idx: u64,
+        batch: ParsedBatch,
+    },
+    SegmentDone {
+        seg: u64,
+    },
+}
+/// Parser threads (including this machine's usual over-subscription headroom).
+const PARSE_THREADS_MAX: usize = 8;
+/// Target bytes per line-aligned segment (~2 batches at default settings).
+const SEGMENT_TARGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// One ingest fan-out: batches arrive in file order and are split by parity
+/// across two connections. Each connection gets a strictly ordered sub-stream
+/// and its own consumer task, so both sockets drain concurrently while the
+/// server processes one request per connection at a time. Bulk rows have no
+/// arrival-order contract across batches (OPTIMIZE reclusters), so the
+/// interleave is acceptable for import throughput.
 async fn import_tick_pipeline(
     csv_path: &str,
     batch_size: usize,
     skip_header: bool,
-    client: &mut Client,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    mut client: Client,
+) -> Result<
+    (usize, std::sync::Arc<ProducerStats>, ConsumerStats),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let (tx, mut rx) = mpsc::channel::<ParsedBatch>(CHANNEL_CAPACITY);
 
     let csv_path_owned = csv_path.to_string();
-    let producer = tokio::spawn(async move {
-        if let Err(e) = produce_batches(&csv_path_owned, batch_size, skip_header, tx).await {
-            eprintln!("Producer error: {}", e);
-        }
-    });
+    let stats = std::sync::Arc::new(ProducerStats::default());
+    let producer = {
+        let stats = std::sync::Arc::clone(&stats);
+        tokio::task::spawn_blocking(move || {
+            run_parallel_ingest(&csv_path_owned, batch_size, skip_header, tx, &stats)
+        })
+    };
 
     let start_time = Instant::now();
     let mut total = 0usize;
     let mut last_progress_time = Instant::now();
-
-    while let Some(batch) = rx.recv().await {
-        while client.pipeline_in_flight() >= PIPELINE_DEPTH as i64 {
-            client.drain_one_pipeline_response().await?;
-        }
-        client
-            .pipeline_bulk_insert_columnar(Bytes::from(batch.payload))
-            .await?;
-
-        total += batch.row_count;
-
-        let now = Instant::now();
-        if now.duration_since(last_progress_time) >= Duration::from_secs(5) {
-            let elapsed = start_time.elapsed().as_secs_f64();
-            log_msg!(
-                "Progress: {} rows sent ({:.0} rows/sec)",
-                total,
-                total as f64 / elapsed
+    let stats_c = std::sync::Arc::new(ConsumerStats::default());
+    {
+        let c = &mut client;
+        while let Some(batch) = rx.recv().await {
+            let drain_start = Instant::now();
+            while c.pipeline_in_flight() >= PIPELINE_DEPTH as i64 {
+                c.drain_one_pipeline_response().await?;
+            }
+            stats_c.drain_wait_us.fetch_add(
+                drain_start.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
             );
-            last_progress_time = now;
+            let send_start = Instant::now();
+            c.pipeline_bulk_insert_columnar(Bytes::from(batch.payload))
+                .await?;
+            stats_c.send_us.fetch_add(
+                send_start.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            total += batch.row_count;
+
+            let now = Instant::now();
+            if now.duration_since(last_progress_time) >= Duration::from_secs(5) {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                log_msg!(
+                    "Progress: {} rows sent ({:.0} rows/sec)",
+                    total,
+                    total as f64 / elapsed
+                );
+                last_progress_time = now;
+            }
         }
     }
 
-    producer.await?;
+    // Surface producer failures instead of silently importing fewer rows.
+    producer
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??;
 
-    Ok(total)
+    let send_elapsed = start_time.elapsed();
+    log_msg!(
+        "Send loop done: {} rows in {:.2}s ({:.0} rows/sec)",
+        total,
+        send_elapsed.as_secs_f64(),
+        total as f64 / send_elapsed.as_secs_f64()
+    );
+
+    {
+        let c = &mut client;
+        log_msg!("Draining pipeline responses...");
+        if let Err(e) = c.drain_pipeline().await {
+            eprintln!("Drain warning: {}", e);
+        }
+        log_msg!("Stopping pipeline...");
+        let _ = c.stop_pipeline().await;
+        log_msg!("Stopping bulk import...");
+        if let Ok(rows) = c.stop_bulk_import().await {
+            log_msg!("Flushed {} buffered rows.", rows);
+        }
+    }
+
+    Ok((total, stats, ConsumerStats::from_arc(&stats_c)))
 }
 
-async fn produce_batches(
+type IngestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// Parallel ingest: one reader thread splits the file into line-aligned
+/// segments, N parser threads turn segments into encoded batches, and a
+/// sequencer forwards batches to the network pipeline strictly in file order
+/// (the server sees the same byte stream as the sequential importer).
+fn run_parallel_ingest(
     csv_path: &str,
     batch_size: usize,
     skip_header: bool,
     tx: mpsc::Sender<ParsedBatch>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stats: &ProducerStats,
+) -> IngestResult {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(PARSE_THREADS_MAX)
+        .max(1);
+
+    let (seg_tx, seg_rx) = std::sync::mpsc::sync_channel::<CsvSegment>(4);
+    let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<IngestMsg>(32);
+    let seg_rx = std::sync::Arc::new(std::sync::Mutex::new(seg_rx));
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    std::thread::scope(|scope| -> IngestResult {
+        // Reader: single thread, block reads + line-boundary splitting only.
+        let skip_header_reader = skip_header;
+        {
+            let failed = std::sync::Arc::clone(&failed);
+            scope.spawn(move || {
+                if let Err(e) = reader_loop(csv_path, skip_header_reader, seg_tx) {
+                    eprintln!("Reader error: {}", e);
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+
+        for _ in 0..workers {
+            let seg_rx = std::sync::Arc::clone(&seg_rx);
+            let batch_tx = batch_tx.clone();
+            let failed = std::sync::Arc::clone(&failed);
+            scope.spawn(move || {
+                if let Err(e) = worker_loop(seg_rx, batch_tx, batch_size, stats) {
+                    eprintln!("Parser error: {}", e);
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        drop(batch_tx);
+
+        // Sequencer: restore strict file order before handing batches over.
+        let mut pending: std::collections::BTreeMap<(u64, u64), ParsedBatch> =
+            std::collections::BTreeMap::new();
+        let mut done_segs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut cursor = (0u64, 0u64);
+        for msg in batch_rx {
+            match msg {
+                IngestMsg::Batch { seg, idx, batch } => {
+                    pending.insert((seg, idx), batch);
+                }
+                IngestMsg::SegmentDone { seg } => {
+                    done_segs.insert(seg);
+                }
+            }
+            // Forward everything contiguous at the cursor; a completed segment
+            // with no batch at the cursor is fully forwarded, so skip past it.
+            loop {
+                while let Some(batch) = pending.remove(&cursor) {
+                    let send_start = Instant::now();
+                    if tx.blocking_send(batch).is_err() {
+                        return Ok(());
+                    }
+                    stats.send_wait_us.fetch_add(
+                        send_start.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    cursor.1 += 1;
+                }
+                if done_segs.contains(&cursor.0) {
+                    done_segs.remove(&cursor.0);
+                    cursor.0 += 1;
+                    cursor.1 = 0;
+                    continue;
+                }
+                break;
+            }
+        }
+        if !pending.is_empty() || !done_segs.is_empty() {
+            return Err(format!(
+                "batch sequence gap: {} batch(es) and {} segment(s) never arrived",
+                pending.len(),
+                done_segs.len()
+            )
+            .into());
+        }
+        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("ingest thread failed".into());
+        }
+        Ok(())
+    })
+}
+
+fn reader_loop(
+    csv_path: &str,
+    skip_header: bool,
+    seg_tx: std::sync::mpsc::SyncSender<CsvSegment>,
+) -> std::io::Result<()> {
     let file = File::open(csv_path)?;
     let mut reader = BufReader::with_capacity(READ_BLOCK_SIZE, file);
 
-    let mut string_pool: HashMap<Vec<u8>, u32> = HashMap::new();
-    let mut pool_strings: Vec<String> = Vec::new();
-
-    let mut current_batch = ColumnarTickBatch::new(batch_size);
-    let mut line_num = 0usize;
-
+    let mut pending: Vec<u8> = Vec::with_capacity(SEGMENT_TARGET_BYTES + READ_BLOCK_SIZE);
     let mut read_buf = vec![0u8; READ_BLOCK_SIZE];
-    let mut carry_over = Vec::with_capacity(4096);
+    let mut segment_id = 0u64;
+    let mut first_segment = true;
 
     loop {
         let bytes_read = reader.read(&mut read_buf)?;
-        if bytes_read == 0 && carry_over.is_empty() {
+        if bytes_read == 0 {
             break;
         }
+        let block_start = pending.len();
+        pending.extend_from_slice(&read_buf[..bytes_read]);
 
-        let data = &read_buf[..bytes_read];
-
-        let mut search_start = 0usize;
-        let combined: Vec<u8>;
-        let work_slice: &[u8];
-
-        if carry_over.is_empty() {
-            work_slice = data;
-        } else {
-            combined = [carry_over.as_slice(), data].concat();
-            search_start = carry_over.len();
-            carry_over.clear();
-            work_slice = &combined;
-        }
-
-        let mut last_line_end = 0usize;
-
-        let mut i = search_start;
-        while i < work_slice.len() {
-            if work_slice[i] == b'\n' {
-                let line_bytes = &work_slice[last_line_end..i];
-                let trimmed = trim_ascii(line_bytes);
-
-                if !trimmed.is_empty() {
-                    line_num += 1;
-
-                    if skip_header && line_num == 1 {
-                        // skip
-                    } else {
-                        if parse_tick_csv_line_interned(
-                            trimmed,
-                            &mut current_batch,
-                            &mut string_pool,
-                            &mut pool_strings,
-                        ) && current_batch.len() >= batch_size
-                        {
-                            let row_count = current_batch.len();
-                            let payload = encode_columnar_tick_batch_precise(
-                                TICK_TABLE,
-                                &current_batch,
-                                &pool_strings,
-                            );
-
-                            if tx.send(ParsedBatch { payload, row_count }).await.is_err() {
-                                return Ok(());
-                            }
-                            current_batch.reset();
-                        }
-                    }
-                }
-
-                last_line_end = i + 1;
+        // Find the last complete line; everything up to it is segment
+        // material. Scanning only the new block keeps this linear — a full
+        // pending rescan per 8MB block made the reader quadratic.
+        let last_nl = read_buf[..bytes_read]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|rel| block_start + rel)
+            .or_else(|| pending.iter().rposition(|&b| b == b'\n'));
+        if let Some(last_nl) = last_nl {
+            if last_nl + 1 >= SEGMENT_TARGET_BYTES {
+                let data = pending.split_off(last_nl + 1);
+                let segment = std::mem::replace(&mut pending, data);
+                seg_tx
+                    .send(CsvSegment {
+                        id: segment_id,
+                        data: segment,
+                        skip_first_line: first_segment && skip_header,
+                    })
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "ingest shut down")
+                    })?;
+                segment_id += 1;
+                first_segment = false;
             }
-            i += 1;
-        }
-
-        if last_line_end < work_slice.len() {
-            carry_over.extend_from_slice(&work_slice[last_line_end..]);
         }
     }
 
-    if !carry_over.is_empty() {
-        let trimmed = trim_ascii(&carry_over);
-        if !trimmed.is_empty() {
-            line_num += 1;
-            if !(skip_header && line_num == 1)
-                && parse_tick_csv_line_interned(
-                    trimmed,
-                    &mut current_batch,
-                    &mut string_pool,
-                    &mut pool_strings,
-                )
-            {}
+    if !pending.is_empty() {
+        seg_tx
+            .send(CsvSegment {
+                id: segment_id,
+                data: pending,
+                skip_first_line: first_segment && skip_header,
+            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "ingest shut down"))?;
+    }
+    Ok(())
+}
+
+fn worker_loop(
+    seg_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<CsvSegment>>>,
+    batch_tx: std::sync::mpsc::SyncSender<IngestMsg>,
+    batch_size: usize,
+    stats: &ProducerStats,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        let segment = {
+            let rx = seg_rx.lock().map_err(|_| "reader thread panicked")?;
+            rx.recv()
+        };
+        let segment = match segment {
+            Ok(segment) => segment,
+            Err(_) => return Ok(()), // channel closed: all segments processed
+        };
+        parse_segment(segment, batch_size, &batch_tx, stats)?;
+    }
+}
+
+fn parse_segment(
+    segment: CsvSegment,
+    batch_size: usize,
+    batch_tx: &std::sync::mpsc::SyncSender<IngestMsg>,
+    stats: &ProducerStats,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let seg_start = Instant::now();
+    let mut string_pool: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut pool_strings: Vec<String> = Vec::new();
+    let mut current_batch = ColumnarTickBatch::new(batch_size);
+    let mut batch_index = 0u64;
+
+    let mut first_line = segment.skip_first_line;
+    for line_bytes in segment.data.split(|&b| b == b'\n') {
+        let trimmed = trim_ascii(line_bytes);
+        if trimmed.is_empty() {
+            continue;
+        }
+        if first_line {
+            first_line = false;
+            continue;
+        }
+        if parse_tick_csv_line_interned(
+            trimmed,
+            &mut current_batch,
+            &mut string_pool,
+            &mut pool_strings,
+        ) && current_batch.len() >= batch_size
+        {
+            flush_batch(
+                &current_batch,
+                &pool_strings,
+                segment.id,
+                batch_index,
+                batch_tx,
+                stats,
+            )?;
+            batch_index += 1;
+            current_batch.reset();
         }
     }
+    stats.parse_us.fetch_add(
+        seg_start.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     if !current_batch.is_empty() {
-        let row_count = current_batch.len();
-        let payload = encode_columnar_tick_batch_precise(TICK_TABLE, &current_batch, &pool_strings);
-        let _ = tx.send(ParsedBatch { payload, row_count }).await;
+        flush_batch(
+            &current_batch,
+            &pool_strings,
+            segment.id,
+            batch_index,
+            batch_tx,
+            stats,
+        )?;
     }
+    let _ = batch_tx.send(IngestMsg::SegmentDone { seg: segment.id });
+    Ok(())
+}
 
+fn flush_batch(
+    batch: &ColumnarTickBatch,
+    pool_strings: &[String],
+    seg: u64,
+    idx: u64,
+    batch_tx: &std::sync::mpsc::SyncSender<IngestMsg>,
+    stats: &ProducerStats,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let row_count = batch.len();
+    let encode_start = Instant::now();
+    let payload = encode_columnar_tick_batch_precise(TICK_TABLE, batch, pool_strings);
+    stats.encode_us.fetch_add(
+        encode_start.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    stats
+        .batches
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    if batch_tx
+        .send(IngestMsg::Batch {
+            seg,
+            idx,
+            batch: ParsedBatch { payload, row_count },
+        })
+        .is_err()
+    {
+        return Err("ingest shut down".into());
+    }
     Ok(())
 }
 

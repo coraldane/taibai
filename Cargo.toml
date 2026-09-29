@@ -261,6 +261,11 @@ path = "tests/pubsub_delivery_test.rs"
 name = "run_intersection_aggregate_test"
 path = "tests/run_intersection_aggregate_test.rs"
 
+
+[[test]]
+name = "direct_bulk_multi_session_test"
+path = "tests/direct_bulk_multi_session_test.rs"
+
 [[test]]
 name = "join_fast_path_test"
 path = "tests/join_fast_path_test.rs"

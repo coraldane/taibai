@@ -712,7 +712,8 @@ fn bitpacked_decimal_tick_prices_roundtrip_via_stored_choice() {
 fn delta_rle_roundtrip(values: &[i64]) {
     let payload = crate::storage::codec::column_codec::encode_i64_delta_rle_payload(values);
     let decoded =
-        crate::storage::codec::column_codec::decode_i64_delta_rle_payload(&payload, values.len()).unwrap();
+        crate::storage::codec::column_codec::decode_i64_delta_rle_payload(&payload, values.len())
+            .unwrap();
     assert_eq!(decoded, values);
 }
 
@@ -941,7 +942,13 @@ fn decode_selected_adaptive_gather_matches_reference() {
         "fixture must be DeltaRle-encoded"
     );
     let selected: Vec<usize> = (0..values.len()).step_by(7).collect();
-    check(&decimal, DataType::Decimal, &encoded, values.len(), &selected);
+    check(
+        &decimal,
+        DataType::Decimal,
+        &encoded,
+        values.len(),
+        &selected,
+    );
 
     // Dictionary varchar shape: dictionary passthrough decodes to plain.
     let mut strings: Vec<&str> = Vec::new();
@@ -955,7 +962,13 @@ fn decode_selected_adaptive_gather_matches_reference() {
     };
     let (encoded, _) = encode_column_ex(&varchar, 0, owned.len()).unwrap();
     let selected: Vec<usize> = (0..owned.len()).rev().step_by(3).collect();
-    let gathered = decode_column_selected(&encoded, owned.len(), &col_def(DataType::VarChar), &selected).unwrap();
+    let gathered = decode_column_selected(
+        &encoded,
+        owned.len(),
+        &col_def(DataType::VarChar),
+        &selected,
+    )
+    .unwrap();
     assert_eq!(gathered.len(), selected.len());
     for (out_row, &src_row) in selected.iter().enumerate() {
         assert_eq!(gathered.scalar(out_row), varchar.scalar(src_row));
@@ -968,9 +981,9 @@ fn decode_selected_adaptive_gather_matches_reference() {
 /// error instead of counting.
 #[test]
 fn count_eq_from_raw_supports_delta_rle_and_bitpacked() {
-    use crate::types::scalar::ScalarValue;
     use crate::storage::codec::column_codec::stored_encoding_tag;
     use crate::storage::codec::predicate_scan::count_eq_from_raw;
+    use crate::types::scalar::ScalarValue;
 
     fn count_matches(encoded: &[u8], n: usize, dt: DataType, value: ScalarValue) -> u64 {
         count_eq_from_raw(encoded, n, &col_def(dt), &value).unwrap()
@@ -988,15 +1001,30 @@ fn count_eq_from_raw_supports_delta_rle_and_bitpacked() {
     let (encoded, _) = encode_column_ex(&run_col, 0, runs.len()).unwrap();
     assert_eq!(stored_encoding_tag(&encoded), Some(EncodingType::DeltaRle));
     assert_eq!(
-        count_matches(&encoded, runs.len(), DataType::Int64, ScalarValue::Int64(Some(42))),
+        count_matches(
+            &encoded,
+            runs.len(),
+            DataType::Int64,
+            ScalarValue::Int64(Some(42))
+        ),
         400
     );
     assert_eq!(
-        count_matches(&encoded, runs.len(), DataType::Int64, ScalarValue::Int64(Some(1000))),
+        count_matches(
+            &encoded,
+            runs.len(),
+            DataType::Int64,
+            ScalarValue::Int64(Some(1000))
+        ),
         50
     );
     assert_eq!(
-        count_matches(&encoded, runs.len(), DataType::Int64, ScalarValue::Int64(Some(43))),
+        count_matches(
+            &encoded,
+            runs.len(),
+            DataType::Int64,
+            ScalarValue::Int64(Some(43))
+        ),
         0
     );
 
@@ -1010,11 +1038,21 @@ fn count_eq_from_raw_supports_delta_rle_and_bitpacked() {
     let (encoded, _) = encode_column_ex(&ts_col, 0, n).unwrap();
     assert_eq!(stored_encoding_tag(&encoded), Some(EncodingType::BitPacked));
     assert_eq!(
-        count_matches(&encoded, n, DataType::Timestamp, ScalarValue::Timestamp(Some(stamps[7]))),
+        count_matches(
+            &encoded,
+            n,
+            DataType::Timestamp,
+            ScalarValue::Timestamp(Some(stamps[7]))
+        ),
         1
     );
     assert_eq!(
-        count_matches(&encoded, n, DataType::Timestamp, ScalarValue::Timestamp(Some(1i64))),
+        count_matches(
+            &encoded,
+            n,
+            DataType::Timestamp,
+            ScalarValue::Timestamp(Some(1i64))
+        ),
         0
     );
 

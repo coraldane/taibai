@@ -604,7 +604,9 @@ fn update_with_as_alias_updates_through_qualified_set_and_where() {
             "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
         )
         .expect("insert rows");
-    engine.execute(&mut session, "FLUSH TABLE t").expect("flush rows");
+    engine
+        .execute(&mut session, "FLUSH TABLE t")
+        .expect("flush rows");
 
     let updated = engine
         .execute(
@@ -638,10 +640,7 @@ fn update_with_implicit_alias_updates_matching_rows() {
         .expect("insert rows");
 
     let updated = engine
-        .execute(
-            &mut session,
-            "UPDATE t tgt SET value = 50 WHERE tgt.id = 2",
-        )
+        .execute(&mut session, "UPDATE t tgt SET value = 50 WHERE tgt.id = 2")
         .expect("update row through implicit alias");
     match updated {
         ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),
@@ -669,10 +668,7 @@ fn update_set_column_qualified_by_table_name_still_works() {
         .expect("insert rows");
 
     let updated = engine
-        .execute(
-            &mut session,
-            "UPDATE t SET t.value = 70 WHERE t.id = 1",
-        )
+        .execute(&mut session, "UPDATE t SET t.value = 70 WHERE t.id = 1")
         .expect("update row with table-name-qualified column");
     match updated {
         ExecResult::Ok { rows_affected } => assert_eq!(rows_affected, 1),

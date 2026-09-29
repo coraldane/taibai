@@ -447,9 +447,9 @@ impl ColumnArray {
             };
         }
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
-                self.flattened().compare_at(left, right)
-            }
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => self.flattened().compare_at(left, right),
             ColumnArray::Bool { data, .. } | ColumnArray::UInt8 { data, .. } => cmp_ord!(data),
             ColumnArray::Int8 { data, .. } => cmp_ord!(data),
             ColumnArray::Int16 { data, .. } => cmp_ord!(data),
@@ -667,9 +667,7 @@ impl ColumnArray {
             ColumnArray::Dictionary { flat, .. } => {
                 flat.get_or_init(|| Box::new(Self::expand_dictionary(self)))
             }
-            ColumnArray::Rle { flat, .. } => {
-                flat.get_or_init(|| Box::new(Self::expand_runs(self)))
-            }
+            ColumnArray::Rle { flat, .. } => flat.get_or_init(|| Box::new(Self::expand_runs(self))),
             other => other,
         }
     }
@@ -713,10 +711,7 @@ impl ColumnArray {
             DataType::UInt16 => build!(UInt16, u16),
             DataType::UInt32 => build!(UInt32, u32),
             DataType::Date => build!(Date, i32),
-            other => unreachable!(
-                "run-length decode never produces {}",
-                other.display_name()
-            ),
+            other => unreachable!("run-length decode never produces {}", other.display_name()),
         }
     }
 
@@ -765,9 +760,7 @@ impl ColumnArray {
     pub fn flatten_in_place(&mut self) {
         if matches!(
             self,
-            ColumnArray::Selected { .. }
-                | ColumnArray::Dictionary { .. }
-                | ColumnArray::Rle { .. }
+            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. }
         ) {
             *self = self.flattened().clone();
         }
@@ -1129,7 +1122,9 @@ impl ColumnArray {
     pub fn bitmap_mut(&mut self) -> &mut NullBitmap {
         self.flatten_in_place();
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => {
                 unreachable!("flattened above")
             }
             ColumnArray::Bool { bitmap, .. } => bitmap,
@@ -1487,7 +1482,9 @@ impl ColumnArray {
     pub fn push_null_value(&mut self) {
         self.flatten_in_place();
         match self {
-            ColumnArray::Selected { .. } | ColumnArray::Dictionary { .. } | ColumnArray::Rle { .. } => {
+            ColumnArray::Selected { .. }
+            | ColumnArray::Dictionary { .. }
+            | ColumnArray::Rle { .. } => {
                 unreachable!("flattened above")
             }
             ColumnArray::Bool { data, bitmap } => {

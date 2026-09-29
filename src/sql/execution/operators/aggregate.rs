@@ -220,9 +220,9 @@ impl Accumulator {
                     if let Some(col_arr) = batch.column(c) {
                         if let Some(part) = col_arr.col_sum_i64() {
                             *acc = Some(match acc.take() {
-                                Some(prev) => prev.checked_add(part).ok_or_else(|| {
-                                    TaibaiError::Sql("SUM overflow".to_string())
-                                })?,
+                                Some(prev) => prev
+                                    .checked_add(part)
+                                    .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
                                 None => part,
                             });
                         }
@@ -246,7 +246,9 @@ impl Accumulator {
                     }
                 }
             }
-            Accumulator::Avg { sum, count, any, .. } => {
+            Accumulator::Avg {
+                sum, count, any, ..
+            } => {
                 if let Some(c) = col_idx_opt {
                     if let Some(col_arr) = batch.column(c) {
                         let n = col_arr.col_count_non_null();
@@ -319,8 +321,12 @@ impl Accumulator {
                     .and_then(|column| batch.column(column))
                     .and_then(|col| col.numeric_i64_at(row))
                 {
-                    *value = Some(value.unwrap_or(0).checked_add(part)
-                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?);
+                    *value = Some(
+                        value
+                            .unwrap_or(0)
+                            .checked_add(part)
+                            .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                    );
                 }
             }
             Accumulator::SumF(value) => {
@@ -331,7 +337,9 @@ impl Accumulator {
                     *value = Some(value.unwrap_or(0.0) + part);
                 }
             }
-            Accumulator::Avg { sum, count, any, .. } => {
+            Accumulator::Avg {
+                sum, count, any, ..
+            } => {
                 if let Some(part) = col_idx_opt
                     .and_then(|column| batch.column(column))
                     .and_then(|col| col.numeric_f64_at(row))
@@ -474,9 +482,11 @@ impl Accumulator {
             }
             (Accumulator::SumI(left), Accumulator::SumI(right)) => {
                 if let Some(right) = right {
-                    *left = Some(left.unwrap_or(0).checked_add(right).ok_or_else(|| {
-                        TaibaiError::Sql("SUM overflow".to_string())
-                    })?);
+                    *left = Some(
+                        left.unwrap_or(0)
+                            .checked_add(right)
+                            .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                    );
                 }
             }
             (Accumulator::SumF(left), Accumulator::SumF(right)) => {
@@ -1088,7 +1098,9 @@ fn spill_group_run(
     let mut entries = group_keys
         .iter()
         .filter_map(|(key, scalars)| {
-            groups.get(key).map(|accumulators| (key, scalars, accumulators))
+            groups
+                .get(key)
+                .map(|accumulators| (key, scalars, accumulators))
         })
         .collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
@@ -1169,9 +1181,10 @@ impl GroupSpillCursor {
         let mut bytes = Vec::new();
         let mut scalars = Vec::with_capacity(key_columns);
         for column_idx in 0..key_columns {
-            batch.column(column_idx).ok_or_else(|| {
-                TaibaiError::Internal("invalid aggregate spill key column".into())
-            })?.encode_key_at(self.row, &mut bytes);
+            batch
+                .column(column_idx)
+                .ok_or_else(|| TaibaiError::Internal("invalid aggregate spill key column".into()))?
+                .encode_key_at(self.row, &mut bytes);
             scalars.push(batch.scalar(self.row, column_idx).ok_or_else(|| {
                 TaibaiError::Internal("invalid aggregate spill key scalar".into())
             })?);
@@ -1534,10 +1547,12 @@ impl DistinctSummary {
             AggFunc::Sum if matches!(col_type, DataType::Float32 | DataType::Float64) => {
                 ScalarValue::Float64(Some(self.float_sum))
             }
-            AggFunc::Sum if col_type == DataType::Decimal => {
-                ScalarValue::Decimal(Some(self.integer_sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64))
-            }
-            AggFunc::Sum => ScalarValue::Int64(Some(self.integer_sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64)),
+            AggFunc::Sum if col_type == DataType::Decimal => ScalarValue::Decimal(Some(
+                self.integer_sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            )),
+            AggFunc::Sum => ScalarValue::Int64(Some(
+                self.integer_sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            )),
             AggFunc::Avg if self.count == 0 => ScalarValue::Float64(None),
             AggFunc::Avg => ScalarValue::Float64(Some(self.float_sum / self.count as f64)),
             AggFunc::Min => self.min.unwrap_or_else(|| null_scalar_of_type(col_type)),

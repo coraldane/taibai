@@ -140,7 +140,10 @@ fn test_bind_union_trailing_clauses_on_union_node() {
             offset: right_offset,
             ..
         } => {
-            assert!(right_order.is_empty(), "right select must not carry ORDER BY");
+            assert!(
+                right_order.is_empty(),
+                "right select must not carry ORDER BY"
+            );
             assert!(right_limit.is_none(), "right select must not carry LIMIT");
             assert!(right_offset.is_none(), "right select must not carry OFFSET");
         }
@@ -324,7 +327,10 @@ fn test_bind_insert_select_query() {
     let mut stmt = parse_one("INSERT INTO t (a, b) SELECT a, b FROM s WHERE id = ?");
     let params = [ScalarValue::Int64(Some(7))];
     bind_params(&mut stmt, &params).expect("bind failed");
-    assert!(!has_placeholders(&stmt), "insert-select placeholder not bound");
+    assert!(
+        !has_placeholders(&stmt),
+        "insert-select placeholder not bound"
+    );
     match stmt {
         Statement::InsertSelect { table, query, .. } => {
             assert_eq!(table.name, "t");

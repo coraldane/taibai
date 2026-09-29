@@ -160,7 +160,9 @@ where
     let notification_capacity = config.pubsub.notification_channel_capacity.max(1);
     let mut framed = Framed::new(
         stream,
-        MessageCodec::new(config.server.max_message_size).with_compression(compress_threshold),
+        MessageCodec::new(config.server.max_message_size)
+            .with_bulk_max_message_size(config.server.max_bulk_message_size)
+            .with_compression(compress_threshold),
     );
     let mut handler = Some(Handler::new(Arc::clone(&config), engine.clone()));
     // Per-connection push queue for pubsub notifications. The pubsub fan-out

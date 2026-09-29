@@ -105,7 +105,12 @@ impl PreparedTailAppend {
         if self.frame.is_none() {
             let raw = std::mem::take(&mut self.wal_payload);
             let payload = compress_prepared_batch_for_wal_with(compressor, raw)?;
-            self.frame = Some(encode_tail_frame_payload(&payload, self.rows, lsn, commit_ts_micros));
+            self.frame = Some(encode_tail_frame_payload(
+                &payload,
+                self.rows,
+                lsn,
+                commit_ts_micros,
+            ));
         }
         Ok(())
     }
@@ -282,7 +287,10 @@ impl TailCommitter {
     pub(crate) fn submit_event(&self, event: crate::storage::replication::ReplicationEvent) {
         self.queued.fetch_add(1, Ordering::Relaxed);
         let (timeout, _warn) = tail_commit_timeouts();
-        match self.sender.send_timeout(CommitCommand::Replicate(event), timeout) {
+        match self
+            .sender
+            .send_timeout(CommitCommand::Replicate(event), timeout)
+        {
             Ok(()) => {}
             Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
                 self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -519,7 +527,9 @@ fn tail_commit_loop(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        TAIL_LSN_HIGH_WATER.fetch_max(now, Ordering::AcqRel).max(now)
+        TAIL_LSN_HIGH_WATER
+            .fetch_max(now, Ordering::AcqRel)
+            .max(now)
     };
     loop {
         if async_fsync && !dirty_tails.is_empty() {
@@ -1619,14 +1629,24 @@ fn encode_tail_frame(batch: &RecordBatch) -> Result<Vec<u8>> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
-    Ok(encode_tail_frame_payload(&payload, batch.num_rows() as u64, lsn, commit_ts_micros))
+    Ok(encode_tail_frame_payload(
+        &payload,
+        batch.num_rows() as u64,
+        lsn,
+        commit_ts_micros,
+    ))
 }
 
 /// V3 frame layout: `[u64 payload_len][u64 rows][u64 lsn][i64 commit_ts_micros]
 /// [payload][crc32]`, the CRC covering the four header fields and the payload.
 /// V2 frames (`[u64 payload_len][u64 rows][payload][crc32]`) and V1 frames
 /// (no `rows` field) remain decodable via the file-header magic.
-fn encode_tail_frame_payload(payload: &[u8], rows: u64, lsn: u64, commit_ts_micros: i64) -> Vec<u8> {
+fn encode_tail_frame_payload(
+    payload: &[u8],
+    rows: u64,
+    lsn: u64,
+    commit_ts_micros: i64,
+) -> Vec<u8> {
     let mut frame = Vec::with_capacity(32 + payload.len());
     frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     frame.extend_from_slice(&rows.to_le_bytes());
@@ -1706,9 +1726,8 @@ fn decode_tail_with_meta(
         ));
     }
     let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    let frame_header_len = tail_frame_header_len(magic).ok_or_else(|| {
-        TaibaiError::Storage("unsupported durable tail version".into())
-    })?;
+    let frame_header_len = tail_frame_header_len(magic)
+        .ok_or_else(|| TaibaiError::Storage("unsupported durable tail version".into()))?;
     decode_tail_log_inner(bytes, schema, frame_header_len)
 }
 
@@ -1794,10 +1813,7 @@ fn batch_rows_hint(frame_head: &[u8]) -> u64 {
 /// Remove the given positions from a batch (columnar take, no per-cell
 /// scalar round-trip). Local copy of the deferred-tombstone filter so the
 /// tail codec does not depend on the transaction registry.
-fn filter_out_positions(
-    batch: &RecordBatch,
-    positions: &[u32],
-) -> Result<RecordBatch> {
+fn filter_out_positions(batch: &RecordBatch, positions: &[u32]) -> Result<RecordBatch> {
     let mut doomed = positions.to_vec();
     doomed.sort_unstable();
     doomed.dedup();
@@ -2157,7 +2173,11 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 /// recoverable from a fresh backup, while failing the clear would resurrect
 /// rows.
 fn archive_or_remove(tail_dir: &Path, path: &Path) {
-    dispose_tail_file(tail_dir, path, crate::common::config::tail_archive_enabled());
+    dispose_tail_file(
+        tail_dir,
+        path,
+        crate::common::config::tail_archive_enabled(),
+    );
 }
 
 /// Testable core of [`archive_or_remove`]: `archive` selects between the

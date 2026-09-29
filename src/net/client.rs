@@ -95,7 +95,28 @@ pub enum QueryResult {
 
 impl Client {
     pub async fn connect<A: tokio::net::ToSocketAddrs>(addr: A) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
+        // Bulk imports push 40-90MB frames over loopback; the OS default
+        // 64KB send buffer paces them at ~1GB/s. Larger buffers let big
+        // messages drain without ACK-per-chunk stalls (best-effort: the
+        // fallback path keeps platforms without TcpSocket working).
+        let resolved = tokio::net::lookup_host(&addr)
+            .await
+            .ok()
+            .and_then(|mut addrs| addrs.next());
+        let stream = match resolved {
+            Some(addr) => match tokio::net::TcpSocket::new_v4() {
+                Ok(socket) => {
+                    let _ = socket.set_send_buffer_size(8 * 1024 * 1024);
+                    let _ = socket.set_recv_buffer_size(8 * 1024 * 1024);
+                    match socket.connect(addr).await {
+                        Ok(s) => s,
+                        Err(_) => TcpStream::connect(addr).await?,
+                    }
+                }
+                Err(_) => TcpStream::connect(addr).await?,
+            },
+            None => TcpStream::connect(addr).await?,
+        };
         // The protocol is request/response heavy: disable Nagle so small
         // queries are not stalled by delayed-ACK interaction.
         let _ = stream.set_nodelay(true);

@@ -63,7 +63,11 @@ impl ApplierHandle {
 }
 
 pub fn spawn(engine: Arc<crate::sql::execution::Engine>, config: StandbyConfig) -> ApplierHandle {
-    spawn_with_stop(engine, config, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    spawn_with_stop(
+        engine,
+        config,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
 }
 
 pub fn spawn_with_stop(
@@ -71,7 +75,9 @@ pub fn spawn_with_stop(
     config: StandbyConfig,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> ApplierHandle {
-    let handle = ApplierHandle { stop: Arc::clone(&stop) };
+    let handle = ApplierHandle {
+        stop: Arc::clone(&stop),
+    };
     std::thread::Builder::new()
         .name("taibai-standby".into())
         .spawn(move || {
@@ -191,7 +197,7 @@ async fn connect_and_stream(
                 &mut framed,
                 &mut deferred,
                 &mut deferred_bytes,
- &mut tail_rows_cache,
+                &mut tail_rows_cache,
                 &mut pending_rewrites,
             )
             .await?;
@@ -219,8 +225,7 @@ async fn connect_and_stream(
                     return Err(TaibaiError::Storage("REPL_EVENT truncated".into()));
                 }
                 let seq = u64::from_le_bytes(message.payload[..8].try_into().unwrap());
-                let len =
-                    u32::from_le_bytes(message.payload[8..12].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(message.payload[8..12].try_into().unwrap()) as usize;
                 if message.payload.len() < 12 + len {
                     return Err(TaibaiError::Storage("REPL_EVENT payload truncated".into()));
                 }
@@ -242,7 +247,7 @@ async fn connect_and_stream(
                     &mut framed,
                     &mut deferred,
                     &mut deferred_bytes,
- &mut tail_rows_cache,
+                    &mut tail_rows_cache,
                     &mut pending_rewrites,
                 )
                 .await?;
@@ -298,7 +303,9 @@ async fn apply(
                         // frames. The first sight reads the file once (it
                         // already contains this event's frames).
                         Some(cached) => cached.saturating_add(count_v3_frame_rows(&frames)),
-                        None => crate::storage::core::durable_tail::tail_log_rows(path)?.unwrap_or(0),
+                        None => {
+                            crate::storage::core::durable_tail::tail_log_rows(path)?.unwrap_or(0)
+                        }
                     };
                     tail_rows_cache.insert(key, rows);
                     rows
@@ -308,22 +315,20 @@ async fn apply(
             match table_schema(engine, &db, &table) {
                 Some(schema) => {
                     // Register on first sight; refresh the count afterwards.
-                    let tail_path =
-                        crate::storage::core::durable_tail::live_tail_path(&table_dir, memtable_id)?
-                            .ok_or_else(|| {
-                                TaibaiError::Storage("tail vanished after append".into())
-                            })?;
-                    engine
-                        .memtable_manager()
-                        .restore_spilled_tail(
-                            memtable_id,
-                            &db,
-                            &table,
-                            &partition,
-                            schema,
-                            rows,
-                            tail_path,
-                        );
+                    let tail_path = crate::storage::core::durable_tail::live_tail_path(
+                        &table_dir,
+                        memtable_id,
+                    )?
+                    .ok_or_else(|| TaibaiError::Storage("tail vanished after append".into()))?;
+                    engine.memtable_manager().restore_spilled_tail(
+                        memtable_id,
+                        &db,
+                        &table,
+                        &partition,
+                        schema,
+                        rows,
+                        tail_path,
+                    );
                     engine.memtable_manager().set_tail_rows(memtable_id, rows);
                 }
                 None => {
@@ -344,7 +349,16 @@ async fn apply(
             kind,
             memtable_ids,
         } => {
-            let bytes = match fetch_segment(engine, framed, deferred, deferred_bytes, &db, &table, &segment).await?
+            let bytes = match fetch_segment(
+                engine,
+                framed,
+                deferred,
+                deferred_bytes,
+                &db,
+                &table,
+                &segment,
+            )
+            .await?
             {
                 Some(bytes) => bytes,
                 None => {
@@ -385,7 +399,9 @@ async fn apply(
                 crate::storage::core::durable_tail::clear(&table_dir, *id)?;
             }
             if kind == SegmentUpdateKind::Final || !memtable_ids.is_empty() {
-                engine.memtable_manager().retire_replicated_memtables(&memtable_ids);
+                engine
+                    .memtable_manager()
+                    .retire_replicated_memtables(&memtable_ids);
             }
             // The fetched bytes carry the primary's CURRENT tombstone state,
             // which includes any queued rewrites for this segment.
@@ -402,7 +418,9 @@ async fn apply(
             let path = engine.data_dir().join(&db).join(&table).join(&segment);
             if path.exists() {
                 crate::storage::segment::SegmentReader::rewrite_footer_with_deletes(
-                    &path, &bitmap, deleted_count,
+                    &path,
+                    &bitmap,
+                    deleted_count,
                 )?;
             } else {
                 // Segment not shipped yet: queue; applied when it materializes.
@@ -420,7 +438,16 @@ async fn apply(
             retired,
         } => {
             for segment in &new_segments {
-                let bytes = match fetch_segment(engine, framed, deferred, deferred_bytes, &db, &table, segment).await?
+                let bytes = match fetch_segment(
+                    engine,
+                    framed,
+                    deferred,
+                    deferred_bytes,
+                    &db,
+                    &table,
+                    segment,
+                )
+                .await?
                 {
                     Some(bytes) => bytes,
                     None => {
@@ -449,9 +476,9 @@ async fn apply(
                 let path = engine.data_dir().join(&db).join(&table).join(segment);
                 if path.exists() {
                     let _ = std::fs::remove_file(&path);
-                    let _ = std::fs::remove_file(
-                        crate::storage::segment::meta::sidecar_meta_path(&path),
-                    );
+                    let _ = std::fs::remove_file(crate::storage::segment::meta::sidecar_meta_path(
+                        &path,
+                    ));
                 }
             }
             applied.advance(seq, true)?;
@@ -466,9 +493,9 @@ async fn apply(
                 let path = engine.data_dir().join(&db).join(&table).join(segment);
                 if path.exists() {
                     let _ = std::fs::remove_file(&path);
-                    let _ = std::fs::remove_file(
-                        crate::storage::segment::meta::sidecar_meta_path(&path),
-                    );
+                    let _ = std::fs::remove_file(crate::storage::segment::meta::sidecar_meta_path(
+                        &path,
+                    ));
                 }
             }
             applied.advance(seq, true)?;
@@ -551,15 +578,17 @@ async fn fetch_segment(
     request.extend_from_slice(&0u64.to_le_bytes());
     request.extend_from_slice(&(4 * 1024 * 1024u32).to_le_bytes());
     framed
-        .send(Message::new(MSG_TYPE_REPL_SEGMENT_FETCH, Bytes::from(request)))
+        .send(Message::new(
+            MSG_TYPE_REPL_SEGMENT_FETCH,
+            Bytes::from(request),
+        ))
         .await?;
 
     let mut bytes: Option<Bytes> = None;
     loop {
-        let message = framed
-            .next()
-            .await
-            .ok_or_else(|| TaibaiError::Storage("primary closed the stream during fetch".into()))??;
+        let message = framed.next().await.ok_or_else(|| {
+            TaibaiError::Storage("primary closed the stream during fetch".into())
+        })??;
         match message.msg_type {
             MSG_TYPE_REPL_SEGMENT_GONE => {
                 return Ok(None);
@@ -601,8 +630,7 @@ async fn fetch_segment(
                     return Err(TaibaiError::Storage("REPL_EVENT truncated".into()));
                 }
                 let seq = u64::from_le_bytes(message.payload[..8].try_into().unwrap());
-                let len =
-                    u32::from_le_bytes(message.payload[8..12].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(message.payload[8..12].try_into().unwrap()) as usize;
                 if message.payload.len() < 12 + len {
                     return Err(TaibaiError::Storage("REPL_EVENT payload truncated".into()));
                 }

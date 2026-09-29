@@ -340,7 +340,11 @@ fn delete_with_neq_predicate_only_removes_matching_rows() -> Result<()> {
         other => panic!("unexpected result {:?}", other),
     }
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         2
     );
     engine.segment_mgr().shutdown();
@@ -358,7 +362,10 @@ fn update_with_between_predicate_only_touches_matching_rows() -> Result<()> {
         &mut session,
         "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)",
     )?;
-    engine.execute(&mut session, "UPDATE t SET v = 99 WHERE v BETWEEN 15 AND 25")?;
+    engine.execute(
+        &mut session,
+        "UPDATE t SET v = 99 WHERE v BETWEEN 15 AND 25",
+    )?;
     assert_eq!(
         first_i64(
             engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE v = 99")?,
@@ -392,7 +399,11 @@ fn update_assignment_with_column_reference_errors() -> Result<()> {
     assert!(result.is_err(), "SET a = b must error, got {:?}", result);
     // Data untouched.
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT a FROM t WHERE id = 1")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT a FROM t WHERE id = 1")?,
+            0,
+            0
+        ),
         5
     );
     engine.segment_mgr().shutdown();
@@ -410,7 +421,10 @@ fn update_rejects_duplicate_primary_key() -> Result<()> {
         &mut session,
         "CREATE TABLE t (id INT64 PRIMARY KEY, v INT64)",
     )?;
-    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)",
+    )?;
     let result = engine.execute(&mut session, "UPDATE t SET id = 2 WHERE id = 1");
     assert!(
         result.is_err(),
@@ -418,7 +432,11 @@ fn update_rejects_duplicate_primary_key() -> Result<()> {
         result
     );
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         2
     );
     engine.segment_mgr().shutdown();
@@ -432,10 +450,17 @@ fn delete_not_predicate_keeps_null_rows() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
     engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
-    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 5), (2, NULL)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v) VALUES (1, 5), (2, NULL)",
+    )?;
     engine.execute(&mut session, "DELETE FROM t WHERE NOT (v = 10)")?;
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         1
     );
     assert_eq!(
@@ -457,10 +482,17 @@ fn delete_not_in_predicate_keeps_null_rows() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
     engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
-    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 5), (2, NULL)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v) VALUES (1, 5), (2, NULL)",
+    )?;
     engine.execute(&mut session, "DELETE FROM t WHERE v NOT IN (1, 2)")?;
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         1
     );
     engine.segment_mgr().shutdown();
@@ -483,7 +515,11 @@ fn fast_insert_accepts_timestamp_and_date_string_literals() -> Result<()> {
         "INSERT INTO t (id, ts, d) VALUES (1, '2024-06-15 10:30:00', '2024-06-15')",
     )?;
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         1
     );
     assert_eq!(
@@ -510,7 +546,10 @@ fn update_where_in_subquery_only_touches_matching_rows() -> Result<()> {
     let mut session = session();
     engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
     engine.execute(&mut session, "CREATE TABLE sel (id INT64)")?;
-    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 1), (2, 2), (3, 3)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v) VALUES (1, 1), (2, 2), (3, 3)",
+    )?;
     engine.execute(&mut session, "INSERT INTO sel (id) VALUES (2)")?;
     engine.execute(
         &mut session,
@@ -537,21 +576,36 @@ fn delete_inside_transaction_removes_own_uncommitted_rows() -> Result<()> {
     let mut session = session();
     engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
     engine.execute(&mut session, "BEGIN")?;
-    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")?;
+    engine.execute(
+        &mut session,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)",
+    )?;
     // Visible inside the transaction...
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         2
     );
     engine.execute(&mut session, "DELETE FROM t WHERE id = 1")?;
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         1,
         "own uncommitted rows must be deletable inside the transaction"
     );
     engine.execute(&mut session, "COMMIT")?;
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         1,
         "deleted rows must stay deleted after COMMIT"
     );
@@ -577,7 +631,11 @@ fn committed_delete_of_own_insert_survives_restart() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         2
     );
     engine.segment_mgr().shutdown();
@@ -600,7 +658,11 @@ fn swapped_literal_comparison_predicates_delete_correct_rows() -> Result<()> {
 
     engine.execute(&mut session, "DELETE FROM t WHERE 15 <= v")?;
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         1,
         "15 <= v must keep only v=10"
     );
@@ -629,18 +691,26 @@ fn numeric_literal_predicate_follows_mysql_truthiness() -> Result<()> {
     engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
     engine.execute(
         &mut session,
-        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)"
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)",
     )?;
     engine.execute(&mut session, "DELETE FROM t WHERE 1")?;
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         0,
         "WHERE 1 deletes every row"
     );
     engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (3, 30)")?;
     engine.execute(&mut session, "DELETE FROM t WHERE 0")?;
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         1,
         "WHERE 0 matches nothing"
     );
@@ -656,14 +726,9 @@ fn distinct_with_limit_returns_expected_row_count() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
-    engine.execute(
-        &mut session,
-        "CREATE TABLE t (a INT64, b INT64)",
-    )?;
+    engine.execute(&mut session, "CREATE TABLE t (a INT64, b INT64)")?;
     // 12 rows collapsing to 6 distinct pairs.
-    let values: Vec<String> = (0..12)
-        .map(|i| format!("({}, {})", i % 3, i % 2))
-        .collect();
+    let values: Vec<String> = (0..12).map(|i| format!("({}, {})", i % 3, i % 2)).collect();
     engine.execute(
         &mut session,
         &format!("INSERT INTO t VALUES {}", values.join(", ")),
@@ -685,7 +750,10 @@ fn incomparable_column_comparison_matches_nothing() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
-    engine.execute(&mut session, "CREATE TABLE t (id INT64, s VARCHAR, n INT64)")?;
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, s VARCHAR, n INT64)",
+    )?;
     engine.execute(
         &mut session,
         "INSERT INTO t (id, s, n) VALUES (1, 'x', 5), (2, 'y', 10)",
@@ -698,11 +766,19 @@ fn incomparable_column_comparison_matches_nothing() -> Result<()> {
     assert_eq!(selected, 0, "SELECT: incomparable types never match");
     let result = engine.execute(&mut session, "DELETE FROM t WHERE s <= n");
     assert!(
-        result.is_err() || matches!(result, Ok(crate::sql::execution::engine::ExecResult::Ok { rows_affected: 0 })),
+        result.is_err()
+            || matches!(
+                result,
+                Ok(crate::sql::execution::engine::ExecResult::Ok { rows_affected: 0 })
+            ),
         "DML must not delete rows on incomparable comparison"
     );
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         2,
         "no rows lost"
     );
@@ -772,7 +848,10 @@ fn alter_add_column_current_timestamp_is_stable() -> Result<()> {
     let second = engine.execute(&mut session, "SELECT created FROM t WHERE id = 1")?;
     let v1 = collect_one_ts(first);
     let v2 = collect_one_ts(second);
-    assert_eq!(v1, v2, "backfilled CURRENT_TIMESTAMP must be stable across reads");
+    assert_eq!(
+        v1, v2,
+        "backfilled CURRENT_TIMESTAMP must be stable across reads"
+    );
     engine.segment_mgr().shutdown();
     Ok(())
 }
@@ -808,7 +887,11 @@ fn insert_select_copies_rows_with_filter() -> Result<()> {
     )?;
 
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM dst")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM dst")?,
+            0,
+            0
+        ),
         2
     );
     assert_eq!(
@@ -845,7 +928,10 @@ fn insert_select_supports_expressions_aggregates_and_defaults() -> Result<()> {
 
     assert_eq!(
         first_i64(
-            engine.execute(&mut session, "SELECT total FROM summary WHERE bucket = 'all'")?,
+            engine.execute(
+                &mut session,
+                "SELECT total FROM summary WHERE bucket = 'all'"
+            )?,
             0,
             0
         ),
@@ -865,7 +951,10 @@ fn insert_select_converts_source_types_via_cast() -> Result<()> {
         &mut session,
         "INSERT INTO raw (id, price) VALUES (1, '12.5'), (2, '7.25')",
     )?;
-    engine.execute(&mut session, "CREATE TABLE priced (id INT64, price FLOAT64)")?;
+    engine.execute(
+        &mut session,
+        "CREATE TABLE priced (id INT64, price FLOAT64)",
+    )?;
     // Text sources convert explicitly with CAST, like a VALUES insert of the
     // same text would require.
     engine.execute(
@@ -890,10 +979,7 @@ fn cast_works_in_select_list_and_where() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
 
-    engine.execute(
-        &mut session,
-        "CREATE TABLE t (id INT64, price VARCHAR)",
-    )?;
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, price VARCHAR)")?;
     engine.execute(
         &mut session,
         "INSERT INTO t (id, price) VALUES (1, '12.9'), (2, '3.2')",
@@ -978,18 +1064,29 @@ fn rollback_releases_published_primary_keys_for_reinsert() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
 
-    engine.execute(&mut session, "CREATE TABLE t (id INT64 PRIMARY KEY, v VARCHAR)")?;
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64 PRIMARY KEY, v VARCHAR)",
+    )?;
     engine.execute(&mut session, "BEGIN")?;
     engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 'a')")?;
     engine.execute(&mut session, "ROLLBACK")?;
     engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 'b')")?;
 
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t")?,
+            0,
+            0
+        ),
         1
     );
     assert_eq!(
-        first_text(engine.execute(&mut session, "SELECT v FROM t WHERE id = 1")?, 0, 0),
+        first_text(
+            engine.execute(&mut session, "SELECT v FROM t WHERE id = 1")?,
+            0,
+            0
+        ),
         "b"
     );
     Ok(())
@@ -1013,12 +1110,20 @@ fn transaction_updates_same_memtable_row_twice_without_duplicating() -> Result<(
     engine.execute(&mut session, "COMMIT")?;
 
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 5")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 5")?,
+            0,
+            0
+        ),
         1,
         "the row must exist exactly once after two in-transaction UPDATEs"
     );
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT v FROM t WHERE id = 5")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT v FROM t WHERE id = 5")?,
+            0,
+            0
+        ),
         2
     );
     Ok(())
@@ -1048,12 +1153,19 @@ fn composite_pk_update_validates_against_the_full_key() -> Result<()> {
     let engine = Engine::new(dir.path(), "main")?;
     let mut session = session();
 
-    engine.execute(&mut session, "CREATE TABLE t (id INT64, ts INT64, PRIMARY KEY (id, ts))")?;
+    engine.execute(
+        &mut session,
+        "CREATE TABLE t (id INT64, ts INT64, PRIMARY KEY (id, ts))",
+    )?;
     engine.execute(&mut session, "INSERT INTO t (id, ts) VALUES (1, 1), (1, 2)")?;
     engine.execute(&mut session, "UPDATE t SET id = 9 WHERE ts = 1")?;
 
     assert_eq!(
-        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 9")?, 0, 0),
+        first_i64(
+            engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 9")?,
+            0,
+            0
+        ),
         1
     );
     Ok(())

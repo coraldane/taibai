@@ -430,11 +430,9 @@ impl<'a> Lexer<'a> {
                             {
                                 self.pos += 1;
                             }
-                            let n: usize = self.input[start..self.pos]
-                                .parse()
-                                .map_err(|e| {
-                                    TaibaiError::Sql(format!("invalid placeholder: {}", e))
-                                })?;
+                            let n: usize = self.input[start..self.pos].parse().map_err(|e| {
+                                TaibaiError::Sql(format!("invalid placeholder: {}", e))
+                            })?;
                             if n == 0 {
                                 return Err(TaibaiError::Sql(
                                     "placeholder index must be >= 1 ($1 is the first parameter)"
@@ -559,9 +557,7 @@ impl<'a> Lexer<'a> {
     /// Skip a `/* ... */` block comment; called with `self.pos` on the `*`.
     fn skip_block_comment(&mut self) -> Result<()> {
         while self.pos < self.bytes.len() {
-            if self.bytes[self.pos] == b'*'
-                && self.bytes.get(self.pos + 1) == Some(&b'/')
-            {
+            if self.bytes[self.pos] == b'*' && self.bytes.get(self.pos + 1) == Some(&b'/') {
                 self.pos += 2;
                 return Ok(());
             }

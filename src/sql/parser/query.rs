@@ -182,9 +182,7 @@ impl Parser {
     pub fn parse_with(&mut self) -> Result<Statement> {
         self.expect(&Token::With)?;
         if self.peek() == &Token::Recursive {
-            return Err(TaibaiError::Sql(
-                "RECURSIVE CTEs are not supported".into(),
-            ));
+            return Err(TaibaiError::Sql("RECURSIVE CTEs are not supported".into()));
         }
         let mut ctes: Vec<(String, Statement)> = Vec::new();
         loop {
@@ -364,7 +362,11 @@ impl Parser {
         match expr {
             Expr::Subquery(stmt) => Self::substitute_cte_refs(stmt, ctes),
             Expr::Exists(inner) => Self::substitute_cte_expr(inner, ctes),
-            Expr::In { expr: inner, values, .. } => {
+            Expr::In {
+                expr: inner,
+                values,
+                ..
+            } => {
                 Self::substitute_cte_expr(inner, ctes);
                 for v in values.iter_mut() {
                     Self::substitute_cte_expr(v, ctes);
@@ -374,9 +376,16 @@ impl Parser {
                 Self::substitute_cte_expr(left, ctes);
                 Self::substitute_cte_expr(right, ctes);
             }
-            Expr::UnaryNot(inner) | Expr::UnaryMinus(inner) | Expr::IsNull(inner)
+            Expr::UnaryNot(inner)
+            | Expr::UnaryMinus(inner)
+            | Expr::IsNull(inner)
             | Expr::IsNotNull(inner) => Self::substitute_cte_expr(inner, ctes),
-            Expr::Between { expr: inner, low, high, .. } => {
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => {
                 Self::substitute_cte_expr(inner, ctes);
                 Self::substitute_cte_expr(low, ctes);
                 Self::substitute_cte_expr(high, ctes);
@@ -397,7 +406,11 @@ impl Parser {
                     Self::substitute_cte_expr(el, ctes);
                 }
             }
-            Expr::Like { expr: inner, pattern, .. } => {
+            Expr::Like {
+                expr: inner,
+                pattern,
+                ..
+            } => {
                 Self::substitute_cte_expr(inner, ctes);
                 Self::substitute_cte_expr(pattern, ctes);
             }

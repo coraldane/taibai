@@ -256,7 +256,9 @@ pub fn verify_footer_crc(buf: &[u8], cursor: &mut Cursor<&[u8]>) -> Result<()> {
     let stored = u32::from_le_bytes(crc_bytes);
     let computed = crc32fast::hash(&buf[..cursor.position() as usize - 8]);
     if stored != computed {
-        return Err(TaibaiError::Storage("segment footer checksum mismatch".to_string()));
+        return Err(TaibaiError::Storage(
+            "segment footer checksum mismatch".to_string(),
+        ));
     }
     Ok(())
 }

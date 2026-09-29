@@ -230,12 +230,12 @@ pub(crate) fn direct_bulk_column_to_array(
     col: &DirectBulkColumn<'_>,
     rows: usize,
 ) -> Result<ColumnArray> {
-    let has_nulls = !col.nulls.is_empty() && (0..rows).any(|r| null_bit_is_set(col.nulls, r));
+    let has_nulls = !col.nulls.is_empty() && (0..rows).any(|r| null_bit_is_set(&col.nulls, r));
     if has_nulls {
         // Rare path: per-row decode honouring the NULL bitmap.
         let mut array = ColumnArray::with_capacity(col.data_type, rows);
         for row_idx in 0..rows {
-            if null_bit_is_set(col.nulls, row_idx) {
+            if null_bit_is_set(&col.nulls, row_idx) {
                 array.push_null_value();
             } else {
                 array.push(&direct_bulk_column_scalar_at(col, row_idx)?)?;
@@ -346,7 +346,7 @@ pub(crate) fn direct_bulk_column_scalar_at(
     col: &DirectBulkColumn<'_>,
     row_idx: usize,
 ) -> Result<ScalarValue> {
-    if is_null_at(col.nulls, row_idx) {
+    if is_null_at(&col.nulls, row_idx) {
         return Ok(ScalarValue::null_for_type(col.data_type));
     }
 
@@ -406,7 +406,7 @@ fn direct_bulk_variable_range_at(
 
     let mut offset = 0usize;
     for row_idx in 0..=target_row {
-        if is_null_at(col.nulls, row_idx) {
+        if is_null_at(&col.nulls, row_idx) {
             continue;
         }
         if offset + 4 > col.data.len() {
@@ -458,6 +458,8 @@ pub(super) fn slice_batch_fast(
     RecordBatch::try_new(batch.schema.clone(), columns)
 }
 
+use rayon::prelude::*;
+
 pub(super) fn compute_zone_maps_from_bulk_columns(
     columns: &[DirectBulkColumn<'_>],
     _schema: &Schema,
@@ -468,42 +470,48 @@ pub(super) fn compute_zone_maps_from_bulk_columns(
         let mut zm = ZoneMap::default();
         let dtype = col.data_type;
         let data = col.data;
-        let nulls = col.nulls;
+        let nulls = &col.nulls;
         let elem_count = row_count as usize;
 
         let mut null_count = 0u64;
         if let Some(width) = dtype.fixed_size() {
-            for i in 0..elem_count {
-                if is_null_at(nulls, i) {
-                    null_count += 1;
-                    continue;
-                }
-                let offset = i * width;
-                if let Some(val) = read_fixed_scalar(data, offset, dtype) {
-                    zm.update(&val);
+            if !fixed_zone_map_typed(dtype, data, nulls, elem_count, &mut null_count, &mut zm) {
+                for i in 0..elem_count {
+                    if is_null_at(nulls, i) {
+                        null_count += 1;
+                        continue;
+                    }
+                    let offset = i * width;
+                    if let Some(val) = read_fixed_scalar(data, offset, dtype) {
+                        zm.update(&val);
+                    }
                 }
             }
-        } else {
-            for i in 0..elem_count {
-                if is_null_at(nulls, i) {
-                    null_count += 1;
-                    continue;
-                }
-                let Some((offset, len)) = col
-                    .variable_ranges
-                    .as_ref()
-                    .and_then(|ranges| ranges.get(i).copied())
-                else {
-                    break;
-                };
-                if offset + len > data.len() {
-                    break;
-                }
-                if dtype == DataType::VarChar {
-                    let s = std::str::from_utf8(&data[offset..offset + len])
+        } else if dtype == DataType::VarChar {
+            // UTF-8 String ordering is byte-wise, so min/max are found over
+            // raw value slices without allocating a String per row; only the
+            // two bounding values materialize. Invalid UTF-8 falls back to
+            // the legacy per-row pass (which read invalid values as "").
+            if !varchar_zone_map_bytes(col, nulls, elem_count, &mut null_count, &mut zm) {
+                for i in 0..elem_count {
+                    if is_null_at(nulls, i) {
+                        null_count += 1;
+                        continue;
+                    }
+                    let Some((offset, len)) = col
+                        .variable_ranges
+                        .as_ref()
+                        .and_then(|ranges| ranges.get(i).copied())
+                    else {
+                        break;
+                    };
+                    if offset + len > data.len() {
+                        break;
+                    }
+                    let value = std::str::from_utf8(&data[offset..offset + len])
                         .unwrap_or("")
                         .to_string();
-                    zm.update(&ScalarValue::VarChar(Some(s)));
+                    zm.update(&ScalarValue::VarChar(Some(value)));
                 }
             }
         }
@@ -513,6 +521,183 @@ pub(super) fn compute_zone_maps_from_bulk_columns(
         zone_maps.push(zm);
     }
     zone_maps
+}
+
+/// Byte-level min/max over the non-null VarChar values of one bulk row-group
+/// piece. Returns false when a scanned value is not valid UTF-8, in which case
+/// the caller reruns the legacy per-row semantics.
+fn varchar_zone_map_bytes(
+    col: &DirectBulkColumn<'_>,
+    nulls: &[u8],
+    elem_count: usize,
+    null_count: &mut u64,
+    zm: &mut ZoneMap,
+) -> bool {
+    let Some(ranges) = col.variable_ranges.as_ref() else {
+        return true;
+    };
+    let data = col.data;
+    let mut min_bytes: Option<&[u8]> = None;
+    let mut max_bytes: Option<&[u8]> = None;
+    for i in 0..elem_count {
+        if is_null_at(nulls, i) {
+            *null_count += 1;
+            continue;
+        }
+        let Some((offset, len)) = ranges.get(i).copied() else {
+            break;
+        };
+        if offset + len > data.len() {
+            break;
+        }
+        let value = &data[offset..offset + len];
+        if std::str::from_utf8(value).is_err() {
+            return false;
+        }
+        match min_bytes {
+            None => {
+                min_bytes = Some(value);
+                max_bytes = Some(value);
+            }
+            Some(cur_min) => {
+                if value < cur_min {
+                    min_bytes = Some(value);
+                }
+                if Some(value) > max_bytes {
+                    max_bytes = Some(value);
+                }
+            }
+        }
+    }
+    if let (Some(min), Some(max)) = (min_bytes, max_bytes) {
+        if let (Ok(min), Ok(max)) = (std::str::from_utf8(min), std::str::from_utf8(max)) {
+            zm.min_value = ScalarValue::VarChar(Some(min.to_string()));
+            zm.max_value = ScalarValue::VarChar(Some(max.to_string()));
+        }
+    }
+    true
+}
+
+/// Typed min/max over the non-null fixed-width values of one bulk row-group
+/// piece. Same ScalarValue variants and ordering as the `read_fixed_scalar`
+/// loop, without a per-row enum match; returns false for types (e.g. Bool)
+/// and layouts the generic path must handle.
+fn fixed_zone_map_typed(
+    dtype: DataType,
+    data: &[u8],
+    nulls: &[u8],
+    elem_count: usize,
+    null_count: &mut u64,
+    zm: &mut ZoneMap,
+) -> bool {
+    use DataType as D;
+    let Some(width) = dtype.fixed_size() else {
+        return false;
+    };
+    if width == 0 || elem_count == 0 {
+        return false;
+    }
+    let byte_len = match elem_count.checked_mul(width) {
+        Some(len) => len,
+        None => return false,
+    };
+    if data.len() < byte_len {
+        return false;
+    }
+    let null_free = nulls.is_empty();
+
+    // Signed and zero-extended unsigned orders both match their i64
+    // projections, so one i64 min/max pass serves every sum-supported type.
+    macro_rules! minmax {
+        ($t:ty, $to_i64:expr) => {{
+            let base = data.as_ptr() as *const $t;
+            if null_free {
+                let mut min = unsafe { base.read_unaligned() };
+                let mut max = min;
+                for i in 1..elem_count {
+                    let v = unsafe { base.add(i).read_unaligned() };
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                ($to_i64(min), $to_i64(max))
+            } else {
+                // Nulls present: seed from the first non-null row so NULL
+                // slots never contribute a value.
+                let mut seed = None;
+                for i in 0..elem_count {
+                    if is_null_at(nulls, i) {
+                        *null_count += 1;
+                        continue;
+                    }
+                    seed = Some(i);
+                    break;
+                }
+                match seed {
+                    None => {
+                        *null_count = elem_count as u64;
+                        (0i64, 0i64)
+                    }
+                    Some(first) => {
+                        let mut min = unsafe { base.add(first).read_unaligned() };
+                        let mut max = min;
+                        for i in (first + 1)..elem_count {
+                            if is_null_at(nulls, i) {
+                                *null_count += 1;
+                                continue;
+                            }
+                            let v = unsafe { base.add(i).read_unaligned() };
+                            if v < min {
+                                min = v;
+                            }
+                            if v > max {
+                                max = v;
+                            }
+                        }
+                        ($to_i64(min), $to_i64(max))
+                    }
+                }
+            }
+        }};
+    }
+
+    let (min, max) = match dtype {
+        D::Int8 => minmax!(i8, |v: i8| v as i64),
+        D::UInt8 => minmax!(u8, |v: u8| v as i64),
+        D::Int16 => minmax!(i16, |v: i16| v as i64),
+        D::UInt16 => minmax!(u16, |v: u16| v as i64),
+        D::Int32 | D::Date => minmax!(i32, |v: i32| v as i64),
+        D::UInt32 => minmax!(u32, |v: u32| v as i64),
+        D::Int64 | D::Decimal | D::Time | D::Timestamp | D::Interval => {
+            minmax!(i64, |v: i64| v)
+        }
+        _ => return false,
+    };
+    let scalar = |v: i64| -> ScalarValue {
+        match dtype {
+            D::Int8 => ScalarValue::Int8(Some(v as i8)),
+            D::UInt8 => ScalarValue::UInt8(Some(v as u8)),
+            D::Int16 => ScalarValue::Int16(Some(v as i16)),
+            D::UInt16 => ScalarValue::UInt16(Some(v as u16)),
+            D::Int32 => ScalarValue::Int32(Some(v as i32)),
+            D::UInt32 => ScalarValue::UInt32(Some(v as u32)),
+            D::Date => ScalarValue::Date(Some(v as i32)),
+            D::Int64 => ScalarValue::Int64(Some(v)),
+            D::Decimal => ScalarValue::Decimal(Some(v)),
+            D::Time => ScalarValue::Time(Some(v)),
+            D::Timestamp => ScalarValue::Timestamp(Some(v)),
+            D::Interval => ScalarValue::Interval(Some(v)),
+            _ => ScalarValue::Int64(None),
+        }
+    };
+    if null_free || *null_count < elem_count as u64 {
+        zm.min_value = scalar(min);
+        zm.max_value = scalar(max);
+    }
+    true
 }
 
 /// Footer-persisted running sums for one bulk-imported row group: wrapping
@@ -526,13 +711,45 @@ pub(super) fn col_sums_from_bulk_columns(
         Date, Decimal, Int16, Int32, Int64, Int8, Interval, Time, Timestamp, UInt16, UInt32, UInt8,
     };
     let elem_count = row_count as usize;
-    let mut col_sums = Vec::with_capacity(columns.len());
-    for col in columns {
-        let mut sum = 0i64;
-        let dtype = col.data_type;
-        if crate::storage::segment::column_sum_supported(dtype) {
-            let width = dtype.fixed_size().unwrap_or(0);
+    columns
+        .par_iter()
+        .map(|col| {
+            let dtype = col.data_type;
+            if !crate::storage::segment::column_sum_supported(dtype) {
+                return 0i64;
+            }
+            let Some(width) = dtype.fixed_size() else {
+                return 0i64;
+            };
+            if width == 0 {
+                return 0i64;
+            }
             let data = col.data;
+            let Some(byte_len) = elem_count.checked_mul(width) else {
+                return 0i64;
+            };
+            if col.nulls.is_empty() && data.len() >= byte_len {
+                // Null-free fast path (the common bulk case): the payload is
+                // exactly elem_count fixed-width LE slots, so fold raw words
+                // with unaligned loads instead of a per-row enum match.
+                // Row order + wrapping i64 keep this bit-exact with the
+                // bitmap path below.
+                return unsafe {
+                    match dtype {
+                        Int8 => sum_fixed_le::<i8>(data, elem_count),
+                        UInt8 => sum_fixed_le::<u8>(data, elem_count),
+                        Int16 => sum_fixed_le::<i16>(data, elem_count),
+                        UInt16 => sum_fixed_le::<u16>(data, elem_count),
+                        Int32 | Date => sum_fixed_le::<i32>(data, elem_count),
+                        UInt32 => sum_fixed_le::<u32>(data, elem_count),
+                        Int64 | Decimal | Time | Timestamp | Interval => {
+                            sum_fixed_le::<i64>(data, elem_count)
+                        }
+                        _ => 0,
+                    }
+                };
+            }
+            let mut sum = 0i64;
             // (type, width, signed) read of one LE scalar as i64.
             let read = |offset: usize| -> Option<i64> {
                 if width == 0 || offset + width > data.len() {
@@ -560,10 +777,23 @@ pub(super) fn col_sums_from_bulk_columns(
                     sum = sum.wrapping_add(raw);
                 }
             }
-        }
-        col_sums.push(sum);
+            sum
+        })
+        .collect()
+}
+
+/// Wrapping i64 sum over `rows` little-endian `T` slots of `data`, in row
+/// order. The bulk piece layout guarantees `data.len() >= rows * size_of::<T>()`.
+///
+/// # Safety
+/// `data` must contain at least `rows * size_of::<T>()` bytes.
+unsafe fn sum_fixed_le<T: Copy + Into<i64>>(data: &[u8], rows: usize) -> i64 {
+    let mut acc = 0i64;
+    let base = data.as_ptr() as *const T;
+    for i in 0..rows {
+        acc = acc.wrapping_add(base.add(i).read_unaligned().into());
     }
-    col_sums
+    acc
 }
 
 pub(super) fn compute_value_sets_from_bulk_columns(
@@ -772,7 +1002,7 @@ mod bulk_decode_bench {
             scale: 0,
             precision: 0,
             data,
-            nulls: &[],
+            nulls: std::borrow::Cow::Borrowed(&[]),
             variable_ranges: ranges.map(|r| r.to_vec()),
         };
         let columns = vec![

@@ -1261,7 +1261,12 @@ fn create_table_compression_level_round_trip() {
         .expect("create archive table");
     let meta = engine.get_table_meta("main", "archive_t").expect("meta");
     assert_eq!(meta.compression_level, Some(19));
-    assert_eq!(engine.segment_mgr().table_compression_level("main", "archive_t"), 19);
+    assert_eq!(
+        engine
+            .segment_mgr()
+            .table_compression_level("main", "archive_t"),
+        19
+    );
 
     match engine
         .execute(&mut session, "SHOW CREATE TABLE archive_t")
@@ -1287,7 +1292,9 @@ fn create_table_compression_level_round_trip() {
     let meta = engine.get_table_meta("main", "default_t").expect("meta");
     assert_eq!(meta.compression_level, None);
     assert_eq!(
-        engine.segment_mgr().table_compression_level("main", "default_t"),
+        engine
+            .segment_mgr()
+            .table_compression_level("main", "default_t"),
         crate::common::config::bulk_zstd_level()
     );
 
@@ -1343,7 +1350,12 @@ fn alter_table_compression_level_set_and_reset() {
         .expect("alter set compression level");
     let meta = engine.get_table_meta("main", "logs_t").expect("meta");
     assert_eq!(meta.compression_level, Some(22));
-    assert_eq!(engine.segment_mgr().table_compression_level("main", "logs_t"), 22);
+    assert_eq!(
+        engine
+            .segment_mgr()
+            .table_compression_level("main", "logs_t"),
+        22
+    );
 
     engine
         .execute(
@@ -1354,7 +1366,9 @@ fn alter_table_compression_level_set_and_reset() {
     let meta = engine.get_table_meta("main", "logs_t").expect("meta");
     assert_eq!(meta.compression_level, None);
     assert_eq!(
-        engine.segment_mgr().table_compression_level("main", "logs_t"),
+        engine
+            .segment_mgr()
+            .table_compression_level("main", "logs_t"),
         crate::common::config::bulk_zstd_level()
     );
 

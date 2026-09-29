@@ -148,10 +148,7 @@ pub fn compute_simple_aggregate(
         if super::strategy::reader_schema_differs(reader.schema(), table_schema) {
             return Ok(None);
         }
-        let footer_sums = if let Some(first) = meta
-            .as_ref()
-            .and_then(|m| m.row_groups.first())
-        {
+        let footer_sums = if let Some(first) = meta.as_ref().and_then(|m| m.row_groups.first()) {
             first.col_sums.len() == first.zone_maps.len()
         } else {
             reader
@@ -286,11 +283,8 @@ pub fn compute_simple_aggregate(
             /// every clause is zone-map vacuous for this row group).
             apply_mask: bool,
         }
-        let mut meta_folds: Vec<(
-            &[crate::storage::partition::pruning::ZoneMap],
-            u64,
-            &[i64],
-        )> = Vec::new();
+        let mut meta_folds: Vec<(&[crate::storage::partition::pruning::ZoneMap], u64, &[i64])> =
+            Vec::new();
         let mut data_folds: Vec<DataFold> = Vec::new();
 
         // Per-clause zone-map classification is only sound without IN /
@@ -320,13 +314,29 @@ pub fn compute_simple_aggregate(
             // footer's per-row-group sums answer them (this row group's
             // extension present; the argument types were checked above). A
             // streaming_sum segment folds every function from data instead.
-            let rg_sums_available =
-                sums_answerable_from_footer && row_group_meta.zone_maps.len() != 0
-                    && row_group_meta.col_sums.len() == row_group_meta.zone_maps.len();
+            let rg_sums_available = sums_answerable_from_footer
+                && !row_group_meta.zone_maps.is_empty()
+                && row_group_meta.col_sums.len() == row_group_meta.zone_maps.len();
+            // A SUM/AVG argument column whose zone map was never computed
+            // (bulk direct writes populate key columns only) has a NULL
+            // min_value indistinguishable from a genuinely all-null row
+            // group, so fold_metadata would skip the sum and finalize NULL.
+            // Such row groups must fold from data.
+            let sum_avg_columns_visible = aggregates
+                .iter()
+                .zip(&aggregate_columns)
+                .filter(|(a, _)| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
+                .all(|(_, column)| match column {
+                    Some(col) => row_group_meta.zone_maps.get(*col).is_some_and(|zone_map| {
+                        !zone_map.min_value.is_null()
+                            || zone_map.null_count >= row_group_meta.row_count
+                    }),
+                    None => true,
+                });
             if predicate_match == crate::storage::partition::pruning::PredicateMatch::All
                 && reader.delete_bitmap().is_empty()
                 && !streaming_sum
-                && ((!has_sum && !has_avg) || rg_sums_available)
+                && ((!has_sum && !has_avg) || (rg_sums_available && sum_avg_columns_visible))
             {
                 meta_folds.push((
                     &row_group_meta.zone_maps,
@@ -506,7 +516,11 @@ pub fn compute_simple_aggregate(
             }
         }
 
-        if has_sum && !sums_answerable_from_footer && !spec.has_predicates() && reader.deleted_row_count() == 0 {
+        if has_sum
+            && !sums_answerable_from_footer
+            && !spec.has_predicates()
+            && reader.deleted_row_count() == 0
+        {
             let needed = sum_needed_columns(aggregates, &aggregate_columns, table_schema);
             // Only SUM accumulators: `needed` (and the cache key order)
             // covers SUM aggregates exclusively, so zipping all accumulators
@@ -729,11 +743,7 @@ fn run_fold_type_ok(dt: DataType) -> bool {
 /// Fold one row group's run-level result into the accumulators. The shape
 /// checks in [`plan_run_fold`] guarantee every accumulator reads the fold
 /// column (or is COUNT(*)).
-fn fold_run_fold(
-    accumulators: &mut [AggAccum],
-    col_type: DataType,
-    out: &RunFold,
-) -> Result<()> {
+fn fold_run_fold(accumulators: &mut [AggAccum], col_type: DataType, out: &RunFold) -> Result<()> {
     for accumulator in accumulators.iter_mut() {
         match accumulator.func {
             AggFunc::Count => accumulator.count += out.matched_rows,
@@ -895,11 +905,11 @@ impl AggAccum {
             AggFunc::Sum if has_values => {
                 if let Some(&sum) = col_sums.get(column) {
                     self.sum_i = Some(
-                    self.sum_i
-                        .unwrap_or(0)
-                        .checked_add(sum)
-                        .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
-                );
+                        self.sum_i
+                            .unwrap_or(0)
+                            .checked_add(sum)
+                            .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+                    );
                 }
             }
             AggFunc::Avg if has_values => {

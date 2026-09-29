@@ -269,11 +269,7 @@ impl JoinHashTable {
     fn row_offset(&self, batch_idx: usize, row_idx: usize) -> usize {
         // `batch_offsets` holds the prefix sum (len = batches + 1); the old
         // re-sum over build batches ran once per matched row.
-        self.batch_offsets
-            .get(batch_idx)
-            .copied()
-            .unwrap_or(0)
-            + row_idx
+        self.batch_offsets.get(batch_idx).copied().unwrap_or(0) + row_idx
     }
 }
 

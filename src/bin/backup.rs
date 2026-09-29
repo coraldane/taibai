@@ -95,7 +95,9 @@ fn main() {
     }
 
     // 2. table data segments.
-    for (db, table, table_dir) in collect_table_dirs(&args.data, args.db.as_deref(), args.table.as_deref()) {
+    for (db, table, table_dir) in
+        collect_table_dirs(&args.data, args.db.as_deref(), args.table.as_deref())
+    {
         let segments = match segment::discover_segments(&table_dir) {
             Ok(files) => files,
             Err(error) => {
@@ -107,7 +109,12 @@ fn main() {
         let dest_table = args.dest.join(&db).join(&table);
         let mut copied = 0u64;
         for path in &segments {
-            match copy_segment(path, &dest_table, path.file_name().expect("file name").to_os_string(), args.verify) {
+            match copy_segment(
+                path,
+                &dest_table,
+                path.file_name().expect("file name").to_os_string(),
+                args.verify,
+            ) {
                 Ok(bytes) => {
                     copied += 1;
                     manifest_files.push(ManifestEntry {
@@ -136,9 +143,20 @@ fn main() {
         let archive_dir = table_dir
             .parent()
             .and_then(|db_dir| db_dir.parent())
-            .map(|data_dir| data_dir.join("wal").join(&db).join(&table).join("memtable_tail"));
+            .map(|data_dir| {
+                data_dir
+                    .join("wal")
+                    .join(&db)
+                    .join(&table)
+                    .join("memtable_tail")
+            });
         if let Some(archive_dir) = archive_dir.filter(|dir| dir.exists()) {
-            let dest_archive = args.dest.join("wal").join(&db).join(&table).join("memtable_tail");
+            let dest_archive = args
+                .dest
+                .join("wal")
+                .join(&db)
+                .join(&table)
+                .join("memtable_tail");
             match copy_tree(&archive_dir, &dest_archive, &mut manifest_files) {
                 Ok(count) if count > 0 => println!("{db}.{table}: archived {count} tail log files"),
                 Ok(_) => {}
@@ -262,7 +280,12 @@ fn copy_tree(
     Ok(count)
 }
 
-fn copy_segment(src: &Path, dest_dir: &Path, name: std::ffi::OsString, verify: bool) -> Result<u64, String> {
+fn copy_segment(
+    src: &Path,
+    dest_dir: &Path,
+    name: std::ffi::OsString,
+    verify: bool,
+) -> Result<u64, String> {
     fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
     let dest = dest_dir.join(&name);
     let bytes = fs::copy(src, &dest).map_err(|e| e.to_string())?;

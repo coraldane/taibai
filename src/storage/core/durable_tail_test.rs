@@ -420,10 +420,9 @@ fn garbage_frame_length_is_treated_as_torn_frame() -> Result<()> {
     let path = live_tail_path(temp.path(), id)?.expect("tail should exist");
     let mut bytes = fs::read(&path)?;
     let first_payload_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-    let frame_header_len = tail_frame_header_len(
-        u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-    )
-    .expect("current tail format");
+    let frame_header_len =
+        tail_frame_header_len(u32::from_le_bytes(bytes[0..4].try_into().unwrap()))
+            .expect("current tail format");
     let second_frame = 8 + frame_header_len + first_payload_len + 4;
     bytes[second_frame..second_frame + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     fs::write(&path, &bytes)?;
@@ -692,7 +691,12 @@ fn delete_sidecar_round_trips_through_recovery() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
-    persist(temp.path(), id, "2026", &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?)?;
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[0, 1, 2, 3, 4, 5])?,
+    )?;
 
     assert!(delete_rows(temp.path(), id, &mut [1, 3])?);
     // A sidecar pend: rows still exist, but the tail is no longer "plain"
@@ -703,8 +707,9 @@ fn delete_sidecar_round_trips_through_recovery() -> Result<()> {
     let recovered = recover(temp.path(), &schema)?;
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].batch.num_rows(), 4);
-    let values: Vec<Option<ScalarValue>> =
-        (0..4).map(|row| recovered[0].batch.scalar(row, 0)).collect();
+    let values: Vec<Option<ScalarValue>> = (0..4)
+        .map(|row| recovered[0].batch.scalar(row, 0))
+        .collect();
     assert_eq!(
         values,
         vec![
@@ -722,7 +727,12 @@ fn stacked_delete_sidecars_apply_oldest_first() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
     let id = Uuid::new_v4();
-    persist(temp.path(), id, "2026", &test_batch(&schema, &[10, 20, 30, 40])?)?;
+    persist(
+        temp.path(),
+        id,
+        "2026",
+        &test_batch(&schema, &[10, 20, 30, 40])?,
+    )?;
     // First delete speaks in the original batch's coordinates (removes 20)...
     delete_rows(temp.path(), id, &mut [1])?;
     // ...the second in the post-first-delete batch's coordinates:

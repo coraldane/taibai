@@ -188,7 +188,9 @@ fn purge_table(engine: &Engine, db: &str, table: &str) -> Result<u64> {
     // snapshots (and their keys in key sets): without invalidation, a probe
     // for a value the purge just deleted reports "exists" and re-inserting
     // it fails with a phantom duplicate key until the next rebuild.
-    engine.index_manager().invalidate_primary_key_index(db, table);
+    engine
+        .index_manager()
+        .invalidate_primary_key_index(db, table);
     let unique_index_names = previous_meta
         .unique_indexes
         .iter()
@@ -283,7 +285,6 @@ fn now_micros() -> i64 {
         .unwrap_or_default()
         .as_micros() as i64
 }
-
 
 /// Bounded retry for segment file removal: transient Windows sharing
 /// violations from in-flight readers clear within milliseconds.

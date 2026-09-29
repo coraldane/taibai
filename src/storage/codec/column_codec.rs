@@ -1300,12 +1300,7 @@ fn build_run_column(
             covered, expected
         )));
     }
-    Ok(ColumnArray::rle(
-        runs,
-        col_def.data_type,
-        bitmap,
-        row_count,
-    ))
+    Ok(ColumnArray::rle(runs, col_def.data_type, bitmap, row_count))
 }
 
 pub(crate) fn decode_i64_rle_payload(payload: &[u8], expected_rows: usize) -> Result<Vec<i64>> {

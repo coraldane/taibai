@@ -372,10 +372,7 @@ fn range_frame_preceding_end_bound_is_inclusive() {
         .execute(&mut session, "CREATE TABLE tr (v INT64)")
         .expect("create");
     engine
-        .execute(
-            &mut session,
-            "INSERT INTO tr (v) VALUES (1), (2), (3)",
-        )
+        .execute(&mut session, "INSERT INTO tr (v) VALUES (1), (2), (3)")
         .expect("insert");
 
     // SQL standard / PostgreSQL: RANGE BETWEEN UNBOUNDED PRECEDING AND 1

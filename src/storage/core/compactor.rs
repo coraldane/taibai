@@ -217,7 +217,11 @@ impl Compactor {
             .txn_mutations()
             .is_some_and(|registry| registry.table_has_pins(db, table))
         {
-            tracing::debug!(db, table, "table pinned by an open transaction, skipping compaction");
+            tracing::debug!(
+                db,
+                table,
+                "table pinned by an open transaction, skipping compaction"
+            );
             return Ok(CompactStats::default());
         }
 
@@ -631,8 +635,8 @@ impl Compactor {
             source_row_group_count = sources.len();
 
             let estimated_width = estimated_row_width_bytes(schema);
-            let in_memory_budget_rows = (clustered_merge_budget_bytes() / estimated_width)
-                .max(output_row_group_rows * 4);
+            let in_memory_budget_rows =
+                (clustered_merge_budget_bytes() / estimated_width).max(output_row_group_rows * 4);
             if global_row_base > in_memory_budget_rows {
                 // Partition exceeds the in-memory budget: spill sorted runs
                 // to temp files and k-way merge them into the output, keeping
@@ -1212,15 +1216,14 @@ impl Compactor {
             }
         };
         let flush_run = |cache: &mut RowGroupCache,
-                             run_paths: &mut Vec<PathBuf>,
-                             run_seq: &mut usize,
-                             refs: &mut Vec<RowRef>|
+                         run_paths: &mut Vec<PathBuf>,
+                         run_seq: &mut usize,
+                         refs: &mut Vec<RowRef>|
          -> Result<()> {
             if refs.is_empty() {
                 return Ok(());
             }
-            let batch =
-                self.gather_cached_chunk(schema, &source_row_groups, refs, cache)?;
+            let batch = self.gather_cached_chunk(schema, &source_row_groups, refs, cache)?;
             let mut indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
             sort_clustered_row_indices(&mut indices, &batch, sort_key_indices);
             let sorted = gather_global_chunk(schema, &batch, &indices)?;
@@ -1249,7 +1252,8 @@ impl Compactor {
             for prior in 0..source.row_group_idx {
                 segment_row_base += reader.row_group_rows(prior) as u64;
             }
-            let ttl_col = ttl.and_then(|(idx, _)| reader.read_column(source.row_group_idx, idx).ok());
+            let ttl_col =
+                ttl.and_then(|(idx, _)| reader.read_column(source.row_group_idx, idx).ok());
             for row_idx in 0..row_count {
                 let row_id = segment_row_base + row_idx as u64;
                 if reader.is_row_deleted(row_id) {
@@ -1304,8 +1308,12 @@ impl Compactor {
                 for group in current_runs.chunks(CLUSTERED_MERGE_MAX_RUNS) {
                     let merged_path = merge_wave_path(final_path, wave, next_seq);
                     next_seq += 1;
-                    let mut writer =
-                        SegmentWriter::create(&merged_path, schema.clone(), output_row_group_rows, 0)?;
+                    let mut writer = SegmentWriter::create(
+                        &merged_path,
+                        schema.clone(),
+                        output_row_group_rows,
+                        0,
+                    )?;
                     self.merge_runs_into_writer(
                         group,
                         schema,
@@ -1434,7 +1442,10 @@ impl Compactor {
         use std::collections::BinaryHeap;
         let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
 
-        let materialize_keys = |cache: &mut RowGroupCache, source_idx: usize, row_idx: usize| -> Result<Vec<crate::types::scalar::ScalarValue>> {
+        let materialize_keys = |cache: &mut RowGroupCache,
+                                source_idx: usize,
+                                row_idx: usize|
+         -> Result<Vec<crate::types::scalar::ScalarValue>> {
             let source = &source_row_groups[source_idx];
             let batch = cache.get(source, &self.segment_mgr)?;
             Ok(sort_key_indices
@@ -1507,7 +1518,8 @@ impl Compactor {
             }));
 
             if chunk.len() >= output_row_group_rows {
-                let batch = self.gather_cached_chunk(schema, &source_row_groups, &chunk, &mut cache)?;
+                let batch =
+                    self.gather_cached_chunk(schema, &source_row_groups, &chunk, &mut cache)?;
                 writer.write_batch_parallel(&batch)?;
                 chunk.clear();
             }

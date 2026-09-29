@@ -234,8 +234,8 @@ impl ReplicationEvent {
                 let db = decoder.read_str("db")?;
                 let table = decoder.read_str("table")?;
                 let partition = decoder.read_str("partition")?;
-                let memtable_id = Uuid::from_slice(decoder.take(16, "memtable id")?)
-                    .map_err(|error| {
+                let memtable_id =
+                    Uuid::from_slice(decoder.take(16, "memtable id")?).map_err(|error| {
                         TaibaiError::Storage(format!("invalid memtable id: {error}"))
                     })?;
                 let first_lsn = decoder.read_u64()?;
@@ -260,11 +260,9 @@ impl ReplicationEvent {
                 let count = decoder.read_u32()? as usize;
                 let mut memtable_ids = Vec::with_capacity(count.min(4096));
                 for _ in 0..count {
-                    memtable_ids.push(
-                        Uuid::from_slice(decoder.take(16, "memtable id")?).map_err(|error| {
-                            TaibaiError::Storage(format!("invalid memtable id: {error}"))
-                        })?,
-                    );
+                    memtable_ids.push(Uuid::from_slice(decoder.take(16, "memtable id")?).map_err(
+                        |error| TaibaiError::Storage(format!("invalid memtable id: {error}")),
+                    )?);
                 }
                 Ok(Self::SegmentUpdate {
                     db,
@@ -305,7 +303,11 @@ impl ReplicationEvent {
                 let db = decoder.read_str("db")?;
                 let table = decoder.read_str("table")?;
                 let segments = decode_str_vec(&mut decoder)?;
-                Ok(Self::SegmentsRemoved { db, table, segments })
+                Ok(Self::SegmentsRemoved {
+                    db,
+                    table,
+                    segments,
+                })
             }
             TAG_CATALOG_SNAPSHOT => {
                 let db = decoder.read_str("db")?;
@@ -392,7 +394,6 @@ fn decode_str_vec(decoder: &mut Decoder<'_>) -> Result<Vec<String>> {
     decoder.read_str_vec("names")
 }
 
-
 // ---------------------------------------------------------------------------
 // RepLog: sequence assignment, ring buffer, session fan-out
 // ---------------------------------------------------------------------------
@@ -473,20 +474,24 @@ impl RepLog {
     /// without a provable retirement still fails loudly (bootstrap drift).
     pub fn segment_retired(&self, db: &str, table: &str, segment: &str) -> bool {
         let state = self.state.lock().unwrap();
-        state.ring.iter().rev().any(|(_, event)| match event.as_ref() {
-            ReplicationEvent::SegmentsReplaced {
-                db: d,
-                table: t,
-                retired,
-                ..
-            } => d == db && t == table && retired.iter().any(|name| name == segment),
-            ReplicationEvent::SegmentsRemoved {
-                db: d,
-                table: t,
-                segments,
-            } => d == db && t == table && segments.iter().any(|name| name == segment),
-            _ => false,
-        })
+        state
+            .ring
+            .iter()
+            .rev()
+            .any(|(_, event)| match event.as_ref() {
+                ReplicationEvent::SegmentsReplaced {
+                    db: d,
+                    table: t,
+                    retired,
+                    ..
+                } => d == db && t == table && retired.iter().any(|name| name == segment),
+                ReplicationEvent::SegmentsRemoved {
+                    db: d,
+                    table: t,
+                    segments,
+                } => d == db && t == table && segments.iter().any(|name| name == segment),
+                _ => false,
+            })
     }
 
     /// Test-only injection of the seq file location.
@@ -515,7 +520,10 @@ impl RepLog {
         // the full timeout per event. The bounded per-session queue absorbs
         // normal jitter; only a genuinely wedged consumer trips the drop.
         state.sessions.retain(|sink| {
-            match sink.send_timeout((seq, Arc::clone(&event)), std::time::Duration::from_millis(500)) {
+            match sink.send_timeout(
+                (seq, Arc::clone(&event)),
+                std::time::Duration::from_millis(500),
+            ) {
                 Ok(()) => true,
                 Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
                     tracing::warn!("replication session fell behind and was dropped");
@@ -551,12 +559,11 @@ impl RepLog {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = path.with_extension("seq.tmp");
-        let write = std::fs::File::create(&tmp)
-            .and_then(|mut file| {
-                use std::io::Write;
-                file.write_all(seq.to_string().as_bytes())?;
-                file.sync_all()
-            });
+        let write = std::fs::File::create(&tmp).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(seq.to_string().as_bytes())?;
+            file.sync_all()
+        });
         match write {
             Ok(()) => {
                 if let Err(error) = std::fs::rename(&tmp, path) {
@@ -605,7 +612,11 @@ impl RepLog {
     /// (re-bootstrap required).
     pub fn events_after(&self, after_seq: u64) -> Result<Vec<(u64, Arc<ReplicationEvent>)>> {
         let state = self.state.lock().unwrap();
-        let oldest = state.ring.front().map(|(seq, _)| *seq).unwrap_or(state.next_seq);
+        let oldest = state
+            .ring
+            .front()
+            .map(|(seq, _)| *seq)
+            .unwrap_or(state.next_seq);
         if after_seq + 1 < oldest {
             return Err(TaibaiError::Storage(format!(
                 "standby at seq {after_seq} is behind the replication ring (oldest {}); \
@@ -625,7 +636,11 @@ impl RepLog {
     /// next_seq)` for the resume decision.
     pub fn register_session(&self, sink: &SessionSink) -> (u64, u64) {
         let mut state = self.state.lock().unwrap();
-        let oldest = state.ring.front().map(|(seq, _)| *seq).unwrap_or(state.next_seq);
+        let oldest = state
+            .ring
+            .front()
+            .map(|(seq, _)| *seq)
+            .unwrap_or(state.next_seq);
         state.sessions.push(sink.clone());
         (oldest.saturating_sub(1), state.next_seq - 1)
     }
@@ -684,10 +699,7 @@ impl AppliedSeqState {
         let persisted = self.persisted.load(Ordering::Acquire);
         // First advance always persists: a standby that died before its
         // baseline must not replay the whole bootstrap again.
-        if !force
-            && persisted > 0
-            && target.saturating_sub(persisted) < self.every
-        {
+        if !force && persisted > 0 && target.saturating_sub(persisted) < self.every {
             return Ok(());
         }
         drop(pending);

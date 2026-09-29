@@ -206,7 +206,10 @@ async fn pubsub_overhead_diagnostic() {
             .await
             .expect("create");
         let mut hub_sub = connect(&server.addr).await;
-        hub_sub.subscribe("main.bench_hub").await.expect("subscribe");
+        hub_sub
+            .subscribe("main.bench_hub")
+            .await
+            .expect("subscribe");
         let stop = Arc::new(AtomicBool::new(false));
         let received = Arc::new(AtomicU64::new(0));
         {
@@ -268,7 +271,10 @@ async fn pubsub_overhead_diagnostic() {
             let received = Arc::clone(&received);
             tokio::spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
-                    match v2_sub.recv_sub_event_timeout(Duration::from_millis(50)).await {
+                    match v2_sub
+                        .recv_sub_event_timeout(Duration::from_millis(50))
+                        .await
+                    {
                         Ok(Some(SubEvent::Data(frame))) => {
                             received.fetch_add(1, Ordering::Relaxed);
                             if v2_sub

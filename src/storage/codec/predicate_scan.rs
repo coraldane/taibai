@@ -469,13 +469,13 @@ fn count_eq_adaptive(
         }
         crate::storage::codec::encoding::EncodingType::DeltaRle => {
             let values = crate::storage::codec::column_codec::decode_i64_delta_rle_payload(
-                payload,
-                row_count,
+                payload, row_count,
             )?;
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::BitPacked => {
-            let values = crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload)?;
+            let values =
+                crate::storage::codec::column_codec::decode_i64_bitpacked_payload(payload)?;
             count_eq_numeric_from_i64(&values, row_count, col_def, bitmap, value)
         }
         crate::storage::codec::encoding::EncodingType::Dictionary
@@ -726,8 +726,14 @@ use crate::storage::partition::pruning::RangeOp;
 /// compare in (no decimal rescaling anywhere in the pipeline).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RunPredicate {
-    Int { op: RangeOp, value: i128 },
-    Float { op: RangeOp, value: f64 },
+    Int {
+        op: RangeOp,
+        value: i128,
+    },
+    Float {
+        op: RangeOp,
+        value: f64,
+    },
     /// The predicate value cannot order against a raw i64 run value (NULL or
     /// a non-numeric scalar): it matches no row, mirroring the row kernels'
     /// `vec![false; n]` fallback.
@@ -940,10 +946,7 @@ mod run_fold_tests {
     }
 
     fn int_pred(op: RangeOp, value: i128) -> RunPredicate {
-        RunPredicate::Int {
-            op,
-            value,
-        }
+        RunPredicate::Int { op, value }
     }
 
     #[test]
@@ -1002,7 +1005,10 @@ mod run_fold_tests {
             payload.extend_from_slice(&value.to_le_bytes());
             payload.extend_from_slice(&len.to_le_bytes());
         }
-        assert_eq!(decode_i64_rle_payload(&payload, values.len()).unwrap(), values);
+        assert_eq!(
+            decode_i64_rle_payload(&payload, values.len()).unwrap(),
+            values
+        );
         let raw = raw_column(
             &payload,
             crate::storage::codec::encoding::EncodingType::Rle.to_u8(),

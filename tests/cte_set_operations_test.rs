@@ -254,12 +254,7 @@ fn set_op_precedence_matches_postgresql() {
     );
     assert_eq!(
         rows2,
-        vec![
-            vec![i64(1)],
-            vec![i64(2)],
-            vec![i64(3)],
-            vec![i64(4)]
-        ]
+        vec![vec![i64(1)], vec![i64(2)], vec![i64(3)], vec![i64(4)]]
     );
 
     // UNION and EXCEPT are left-associative: `a UNION b EXCEPT c`

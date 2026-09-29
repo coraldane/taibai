@@ -96,11 +96,7 @@ fn inner_join_residual_like_between_in_conditions_match_rows() {
     let right_schema = Schema::new(vec![ColumnDef::new("right_id", DataType::Int64)]);
     let mut ids = ColumnArray::empty(DataType::Int64);
     let mut names = ColumnArray::empty(DataType::VarChar);
-    for (id, name) in [
-        (1i64, "apple"),
-        (2, "banana"),
-        (7, "apricot"),
-    ] {
+    for (id, name) in [(1i64, "apple"), (2, "banana"), (7, "apricot")] {
         ids.push(&ScalarValue::Int64(Some(id))).unwrap();
         names
             .push(&ScalarValue::VarChar(Some(name.to_string())))
@@ -154,7 +150,11 @@ fn inner_join_residual_like_between_in_conditions_match_rows() {
     let output = join.next_batch().unwrap().expect("exactly one match");
     // (1, "apple") passes LIKE + BETWEEN + IN; (2, "banana") fails all three;
     // (7, "apricot") passes LIKE and IN but fails BETWEEN.
-    assert_eq!(output.num_rows(), 1, "only row id=1 satisfies all residuals");
+    assert_eq!(
+        output.num_rows(),
+        1,
+        "only row id=1 satisfies all residuals"
+    );
     assert_eq!(output.scalar(0, 0), Some(ScalarValue::Int64(Some(1))));
     assert!(join.next_batch().unwrap().is_none());
 }

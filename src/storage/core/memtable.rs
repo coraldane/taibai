@@ -475,7 +475,10 @@ impl MemTable {
             partition_key,
             schema,
             batch: RwLock::new(None),
-            backing: RwLock::new(MemTableBacking::Spilled { tail_path: tail_path.clone(), rows }),
+            backing: RwLock::new(MemTableBacking::Spilled {
+                tail_path: tail_path.clone(),
+                rows,
+            }),
             tail_path: Mutex::new(Some(tail_path)),
             state: AtomicU8::new(MemTableState::Pending as u8),
             row_count: AtomicU64::new(rows),

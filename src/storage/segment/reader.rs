@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use crate::common::error::{Result, TaibaiError};
-use crate::storage::codec::column_codec::{
-    decode_column_selected, decode_column_with_runs,
-};
+use crate::storage::codec::column_codec::{decode_column_selected, decode_column_with_runs};
 use crate::storage::index::bloomfilter::BloomFilter;
 use crate::storage::partition::pruning::{RowGroupPredicate, ScanStats, ZoneMap};
 use crate::storage::segment::delete_bitmap;
@@ -238,10 +236,7 @@ impl SegmentReader {
     /// tombstones of the owning transaction). Only fresh per-scan instances
     /// receive this — the cached readers are shared across sessions.
     pub fn set_txn_delete_overlay(&mut self, bitmap: std::sync::Arc<Vec<u8>>) {
-        let deleted_count = bitmap
-            .iter()
-            .map(|byte| byte.count_ones() as u64)
-            .sum();
+        let deleted_count = bitmap.iter().map(|byte| byte.count_ones() as u64).sum();
         self.txn_delete_overlay = Some(TxnDeleteOverlay {
             bitmap,
             deleted_count,
@@ -366,9 +361,8 @@ impl SegmentReader {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            TaibaiError::Storage("segment footer rewrite failed".to_string())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| TaibaiError::Storage("segment footer rewrite failed".to_string())))
     }
 
     /// Complete or discard an interrupted delete-footer rewrite. Returns
@@ -563,7 +557,8 @@ impl SegmentReader {
         if rg.offset as usize > data.len() || rg_end > data.len() {
             return Err(TaibaiError::Storage(format!(
                 "segment row group range {}..{} exceeds data length {}",
-                rg.offset, rg_end,
+                rg.offset,
+                rg_end,
                 data.len()
             )));
         }
@@ -632,7 +627,8 @@ impl SegmentReader {
         if rg.offset as usize > data.len() || rg_end > data.len() {
             return Err(TaibaiError::Storage(format!(
                 "segment row group range {}..{} exceeds data length {}",
-                rg.offset, rg_end,
+                rg.offset,
+                rg_end,
                 data.len()
             )));
         }
@@ -814,7 +810,12 @@ impl SegmentReader {
         projection: &[usize],
         allow_dictionary: bool,
     ) -> Result<crate::types::batch::RecordBatch> {
-        self.read_row_group_with_projection_passthrough(row_group, projection, allow_dictionary, false)
+        self.read_row_group_with_projection_passthrough(
+            row_group,
+            projection,
+            allow_dictionary,
+            false,
+        )
     }
 
     pub fn read_row_group_with_projection_passthrough(
@@ -1126,15 +1127,11 @@ fn read_delete_journal(journal: &Path) -> Result<Option<(u64, Vec<u8>)>> {
         return Ok(None);
     }
     let data_end = u64::from_le_bytes(body[0..8].try_into().expect("u64 slice"));
-    let footer_len =
-        u32::from_le_bytes(body[8..12].try_into().expect("u32 slice")) as usize;
+    let footer_len = u32::from_le_bytes(body[8..12].try_into().expect("u32 slice")) as usize;
     if body.len() < 12 + footer_len {
         return Ok(None);
     }
-    Ok(Some((
-        data_end,
-        body[12..12 + footer_len].to_vec(),
-    )))
+    Ok(Some((data_end, body[12..12 + footer_len].to_vec())))
 }
 
 /// Whether a footer-write failure is worth retrying: transient sharing

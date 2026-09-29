@@ -22,7 +22,7 @@ pub(crate) const VALUE_SET_MAX_DISTINCT: usize = 1024;
 // Extension-block magics live in `footer_ext`, the single source of
 // truth for every optional footer block.
 pub(crate) use super::footer_ext::{
-    COL_SUM_EXTENSION_MAGIC, COLUMN_CRC_EXTENSION_MAGIC, FOOTER_CRC_EXTENSION_MAGIC,
+    COLUMN_CRC_EXTENSION_MAGIC, COL_SUM_EXTENSION_MAGIC, FOOTER_CRC_EXTENSION_MAGIC,
     VALUE_SET_EXTENSION_MAGIC,
 };
 
@@ -580,7 +580,8 @@ fn accumulate_column_sum(slot: &mut i64, col: &ColumnArray, offset: usize, count
     }
 }
 
-fn merge_column_metadata(group: &mut BuildingRowGroup, col_idx: usize, metadata: ColumnMetadata) {    merge_zone_bound(&mut group.zone_mins[col_idx], metadata.min_value, true);
+fn merge_column_metadata(group: &mut BuildingRowGroup, col_idx: usize, metadata: ColumnMetadata) {
+    merge_zone_bound(&mut group.zone_mins[col_idx], metadata.min_value, true);
     merge_zone_bound(&mut group.zone_maxs[col_idx], metadata.max_value, false);
     group.null_counts[col_idx] += metadata.null_count;
 

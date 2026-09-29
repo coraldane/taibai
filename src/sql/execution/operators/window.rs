@@ -542,7 +542,6 @@ fn peer_end(
     end
 }
 
-
 /// True for frames equivalent to "unbounded start through the current row"
 /// (the SQL default when no frame clause is given): a running prefix
 /// aggregate per partition answers them exactly.
@@ -625,9 +624,8 @@ fn compute_running_aggregate(
                                     as i64,
                             );
                         } else if let Some(i) = value.integer_i128() {
-                            sum_i = sum_i.saturating_add(
-                                i.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-                            );
+                            sum_i = sum_i
+                                .saturating_add(i.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
                         } else {
                             has_float = true;
                             sum_f += value.numeric_f64().unwrap_or(0.0);
@@ -654,7 +652,15 @@ fn compute_running_aggregate(
                 }
             }
             let current = running_value(
-                func, any, count, sum_i, sum_decimal, sum_f, has_float, &best, result_type,
+                func,
+                any,
+                count,
+                sum_i,
+                sum_decimal,
+                sum_f,
+                has_float,
+                &best,
+                result_type,
             );
             for &row in &order[pos..peer_end] {
                 values[row as usize] = current.clone();
@@ -747,8 +753,7 @@ fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue], arg_type: DataType) ->
                 if matches!(value, ScalarValue::Float32(_) | ScalarValue::Float64(_)) {
                     has_float = true;
                     float_sum += value.numeric_f64().unwrap_or(0.0);
-                } else if arg_type == DataType::Decimal
-                    && matches!(value, ScalarValue::Decimal(_))
+                } else if arg_type == DataType::Decimal && matches!(value, ScalarValue::Decimal(_))
                 {
                     // Decimal sums stay in the raw scaled domain so the
                     // result column (also Decimal) accepts them; the old
@@ -757,10 +762,12 @@ fn aggregate_frame(func: &AggFunc, frame: &[ScalarValue], arg_type: DataType) ->
                         value
                             .integer_i128()
                             .unwrap_or(0)
-                            .clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+                            .clamp(i64::MIN as i128, i64::MAX as i128)
+                            as i64,
                     );
                 } else if let Some(i) = value.integer_i128() {
-                    int_sum = int_sum.saturating_add(i.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
+                    int_sum =
+                        int_sum.saturating_add(i.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
                 } else if let Some(f) = value.numeric_f64() {
                     float_sum += f;
                 }

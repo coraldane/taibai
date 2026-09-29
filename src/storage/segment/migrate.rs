@@ -182,7 +182,10 @@ mod tests {
     use crate::types::scalar::ScalarValue;
 
     fn write_segment(path: &Path) {
-        let schema = Schema::new(vec![ColumnDef::new("id", crate::protocol::types::DataType::Int64)]);
+        let schema = Schema::new(vec![ColumnDef::new(
+            "id",
+            crate::protocol::types::DataType::Int64,
+        )]);
         let mut writer = SegmentWriter::create(path, schema, 8192, 1).expect("create");
         let schema = Schema::new(vec![ColumnDef::new(
             "id",
@@ -190,7 +193,11 @@ mod tests {
         )]);
         let mut batch = crate::types::batch::RecordBatch::new(schema.clone());
         for value in 0..100i64 {
-            batch.column_mut(0).unwrap().push(&ScalarValue::Int64(Some(value))).expect("push");
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(value)))
+                .expect("push");
         }
         writer.write_batch(&batch).expect("append");
         writer.seal().expect("seal");

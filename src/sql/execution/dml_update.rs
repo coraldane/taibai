@@ -26,7 +26,13 @@ pub fn exec_update(
 ) -> Result<ExecResult> {
     if reader_txn_id > 0 {
         return super::txn_dml::exec_update_in_txn(
-            engine, db, table, assignments, where_clause, reader_txn_id, username,
+            engine,
+            db,
+            table,
+            assignments,
+            where_clause,
+            reader_txn_id,
+            username,
         );
     }
     // An open transaction's deferred mutations pin memtable row positions and
@@ -92,7 +98,10 @@ pub fn exec_update(
                 column: assignment.column.clone(),
                 value: {
                     super::dml_delete::require_subquery_select_permissions_for_expr(
-                        engine, username, db, &assignment.value,
+                        engine,
+                        username,
+                        db,
+                        &assignment.value,
                     )?;
                     super::dml_delete::resolve_expr_in_subqueries_pub(
                         engine,
@@ -286,19 +295,19 @@ pub fn exec_update(
                             .collect();
                         match RecordBatch::try_new(new_batch.schema.clone(), columns) {
                             Ok(updated) => {
-                            let bytes = updated.estimated_size_bytes();
-                            if super::helpers::change_event_budget_allows(
-                                event_buffer_bytes,
-                                bytes,
-                                &mut event_budget_warned,
-                                "update",
-                                db,
-                                table,
-                            ) {
-                                event_buffer_bytes += bytes;
-                                updated_row_batches.push(updated);
+                                let bytes = updated.estimated_size_bytes();
+                                if super::helpers::change_event_budget_allows(
+                                    event_buffer_bytes,
+                                    bytes,
+                                    &mut event_budget_warned,
+                                    "update",
+                                    db,
+                                    table,
+                                ) {
+                                    event_buffer_bytes += bytes;
+                                    updated_row_batches.push(updated);
+                                }
                             }
-                        }
                             Err(error) => tracing::warn!(
                                 db,
                                 table,
@@ -470,9 +479,7 @@ pub fn exec_update(
             }
         }
         for (old_seg, tmp_path, final_path) in staged_segments {
-            if let Err(error) =
-                mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg])
-            {
+            if let Err(error) = mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg]) {
                 // The replacement failed: drop the orphaned temp segment
                 // instead of leaking it (startup cleanup only knows the
                 // compaction temp patterns).

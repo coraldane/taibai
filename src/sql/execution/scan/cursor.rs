@@ -248,7 +248,11 @@ impl ScanCursor {
                 let _cpu = crate::common::work_limiter::acquire_cpu();
                 let _io = crate::common::work_limiter::acquire_io();
                 Some(strategy::read_row_group_with_strategy(
-                    &spec, &plan, &table_schema, &reader, rg_idx,
+                    &spec,
+                    &plan,
+                    &table_schema,
+                    &reader,
+                    rg_idx,
                 ))
             })
             .collect();
@@ -353,7 +357,10 @@ impl ScanCursor {
                 // a normal end-of-stream: catch it and fail the query instead.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     for (segment, precomputed) in segments.iter().zip(per_segment_candidates) {
-                        let reader = match runtime.segment_mgr().open_scan_reader(segment, spec.reader_txn_id) {
+                        let reader = match runtime
+                            .segment_mgr()
+                            .open_scan_reader(segment, spec.reader_txn_id)
+                        {
                             Ok(r) => r,
                             Err(e) => {
                                 if segment.exists() {
@@ -476,7 +483,11 @@ impl ScanCursor {
             self.current_reader = None;
             return Ok(());
         }
-        let reader = match self.runtime.segment_mgr().open_scan_reader(segment, self.spec.reader_txn_id) {
+        let reader = match self
+            .runtime
+            .segment_mgr()
+            .open_scan_reader(segment, self.spec.reader_txn_id)
+        {
             Ok(r) => r,
             Err(error) => {
                 // Same contract as the executor's inline path: a concurrent

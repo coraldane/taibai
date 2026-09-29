@@ -159,8 +159,7 @@ pub fn build_pipeline_with_subqueries(
                 .cloned()
                 .unwrap_or_default();
             Ok(Box::new(
-                ScanExec::new_shared(batches, scan.projection)
-                    .with_table_schema(scan.schema),
+                ScanExec::new_shared(batches, scan.projection).with_table_schema(scan.schema),
             ))
         }
         LogicalPlan::Filter(filter) => {
