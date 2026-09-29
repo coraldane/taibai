@@ -2002,7 +2002,8 @@ fn apply_distinct(batch: RecordBatch) -> RecordBatch {
         .iter()
         .map(|column| column.take(&kept_rows))
         .collect();
-    RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
+    RecordBatch::try_new(batch.schema.clone(), columns)
+        .expect("apply_distinct: masked columns match the batch schema")
 }
 
 /// Apply HAVING filter to aggregated results.

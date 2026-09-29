@@ -94,26 +94,26 @@ fn try_exec_fast_insert_sql_inner(
     }
 
     let catalogs = engine.catalogs().read().unwrap();
-    let catalog = match catalogs.get(db) {
-        Some(catalog) => catalog,
+    let table_meta = match catalogs
+        .get(db)
+        .and_then(|catalog| catalog.get_table_shared(table))
+        .cloned()
+    {
+        Some(meta) => meta,
         None => {
-            return FastInsertOutcome::Executed(Err(TaibaiError::Sql(format!(
-                "database '{}' does not exist",
-                db
-            ))))
-        }
-    };
-    let table_meta = match catalog.get_table(table) {
-        Some(meta) => meta.clone(),
-        None => {
-            return FastInsertOutcome::Executed(Err(TaibaiError::Sql(format!(
-                "table '{}.{}' does not exist",
-                db, table
-            ))))
+            let missing = if catalogs.get(db).is_none() {
+                format!("database '{}' does not exist", db)
+            } else {
+                format!("table '{}.{}' does not exist", db, table)
+            };
+            return FastInsertOutcome::Executed(Err(TaibaiError::Sql(missing)));
         }
     };
     drop(catalogs);
 
+    // Arc-shared metadata: the standard path uses `get_table_shared`; cloning
+    // the whole TableMeta per statement showed up on high-frequency
+    // single-row INSERTs. One schema build remains (Schema owns its columns).
     let schema = Schema::new(table_meta.columns.clone());
     let columns = match parse_insert_column_list(sql, bytes, &mut pos) {
         Some(columns) => columns,

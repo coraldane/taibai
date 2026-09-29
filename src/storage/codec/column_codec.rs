@@ -464,7 +464,10 @@ pub(crate) fn encode_i64_delta_rle_payload(values: &[i64]) -> Vec<u8> {
     out
 }
 
-pub(crate) fn decode_i64_delta_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
+pub(crate) fn decode_i64_delta_rle_payload(
+    payload: &[u8],
+    expected_rows: usize,
+) -> Result<Vec<i64>> {
     let mut cursor = Cursor::new(payload);
     let run_count = read_u32_le(&mut cursor)? as usize;
     let mut values = Vec::new();
@@ -472,8 +475,16 @@ pub(crate) fn decode_i64_delta_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
     for _ in 0..run_count {
         let delta = zigzag_decode(read_varint(&mut cursor)?);
         prev = prev.wrapping_add(delta);
-        let len = read_varint(&mut cursor)?;
-        values.extend(std::iter::repeat_n(prev, len as usize));
+        let len = read_varint(&mut cursor)? as usize;
+        // Same pre-expansion bound as the plain RLE decoder.
+        if values.len().saturating_add(len) > expected_rows {
+            return Err(TaibaiError::Storage(format!(
+                "delta-RLE run expansion reaches {} values, exceeding the row group's {}",
+                values.len().saturating_add(len),
+                expected_rows
+            )));
+        }
+        values.extend(std::iter::repeat_n(prev, len));
     }
     Ok(values)
 }
@@ -1195,7 +1206,7 @@ pub(crate) fn decode_adaptive_column_with_runs(
                 let runs = parse_i64_runs_plain_rle(payload)?;
                 return build_run_column(runs, row_count, col_def, bitmap);
             }
-            let values = decode_i64_rle_payload(payload)?;
+            let values = decode_i64_rle_payload(payload, row_count)?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::DeltaRle => {
@@ -1203,7 +1214,7 @@ pub(crate) fn decode_adaptive_column_with_runs(
                 let runs = parse_i64_runs_delta_rle(payload)?;
                 return build_run_column(runs, row_count, col_def, bitmap);
             }
-            let values = decode_i64_delta_rle_payload(payload)?;
+            let values = decode_i64_delta_rle_payload(payload, row_count)?;
             build_numeric_column_from_i64(values, row_count, col_def, bitmap)
         }
         EncodingType::Delta => {
@@ -1297,7 +1308,7 @@ fn build_run_column(
     ))
 }
 
-pub(crate) fn decode_i64_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
+pub(crate) fn decode_i64_rle_payload(payload: &[u8], expected_rows: usize) -> Result<Vec<i64>> {
     let mut cursor = Cursor::new(payload);
     let run_count = read_u32_le(&mut cursor)? as usize;
     let mut values = Vec::new();
@@ -1306,6 +1317,15 @@ pub(crate) fn decode_i64_rle_payload(payload: &[u8]) -> Result<Vec<i64>> {
         cursor.read_exact(&mut value_buf)?;
         let value = i64::from_le_bytes(value_buf);
         let len = read_u32_le(&mut cursor)? as usize;
+        // Validate BEFORE expanding: a corrupt run length used to drive a
+        // repeat_n allocation of up to 4 billion values.
+        if values.len().saturating_add(len) > expected_rows {
+            return Err(TaibaiError::Storage(format!(
+                "RLE run expansion reaches {} values, exceeding the row group's {}",
+                values.len().saturating_add(len),
+                expected_rows
+            )));
+        }
         values.extend(std::iter::repeat_n(value, len));
     }
     Ok(values)

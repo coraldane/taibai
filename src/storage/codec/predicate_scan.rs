@@ -940,7 +940,7 @@ mod run_fold_tests {
         let values = sample_values();
         let payload = encode_i64_delta_rle_payload(&values);
         assert_eq!(
-            decode_i64_delta_rle_payload(&payload).unwrap(),
+            decode_i64_delta_rle_payload(&payload, values.len()).unwrap(),
             values,
             "fixture must round-trip"
         );
@@ -991,7 +991,7 @@ mod run_fold_tests {
             payload.extend_from_slice(&value.to_le_bytes());
             payload.extend_from_slice(&len.to_le_bytes());
         }
-        assert_eq!(decode_i64_rle_payload(&payload).unwrap(), values);
+        assert_eq!(decode_i64_rle_payload(&payload, values.len()).unwrap(), values);
         let raw = raw_column(
             &payload,
             crate::storage::codec::encoding::EncodingType::Rle.to_u8(),

@@ -893,9 +893,17 @@ impl BatchWriter {
         self.memtable_mgr.rename_table(db, old_table, new_table)
     }
 
-    pub(crate) fn persist_memtable_tail(
+    /// Persist an explicit batch as the memtable's durable tail — same guards
+    /// as [`Self::persist_memtable_tail`], but the caller supplies the
+    /// content. UPDATE/DELETE use this to make the post-statement batch
+    /// durable BEFORE the in-memory swap: the statement's segment rewrites
+    /// are already committed at that point, and a crash between the tail
+    /// write and the swap must not let recovery restore the pre-statement
+    /// tail next to them (resurrecting old rows).
+    pub(crate) fn persist_memtable_tail_batch(
         &self,
         memtable: &crate::storage::core::memtable::MemTable,
+        batch: &RecordBatch,
     ) -> Result<()> {
         if memtable.state() != MemTableState::Pending {
             return Ok(());
@@ -905,16 +913,11 @@ impl BatchWriter {
         {
             return Ok(());
         }
-        let table_dir = self.segment_mgr.table_dir(memtable.db(), memtable.table());
-        // Arc-share instead of copying; persist only reads the batch.
-        let Some(batch) = memtable.read_snapshot_arc() else {
-            return Ok(());
-        };
         crate::storage::core::durable_tail::persist(
-            &table_dir,
+            &self.segment_mgr.table_dir(memtable.db(), memtable.table()),
             memtable.id(),
             memtable.partition_key(),
-            &batch,
+            batch,
         )
     }
 

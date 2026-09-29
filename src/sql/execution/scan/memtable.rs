@@ -280,20 +280,39 @@ pub fn scan_memtables(
                     return None;
                 }
 
-                let source = match &txn_positions {
+                // Exactly one materialization per path: the txn-filtered
+                // batch is owned when present; the no-predicate path moves it
+                // (or clones the source once). The old code deep-cloned the
+                // source up front and cloned it again below.
+                let txn_filtered = match &txn_positions {
                     Some(positions) => {
                         match crate::storage::core::txn_mutations::filter_batch_excluding_positions(
                             source, positions,
                         ) {
-                            Ok(filtered) => filtered,
+                            Ok(filtered) => Some(filtered),
                             Err(e) => return Some(Err(e)),
                         }
                     }
-                    None => source.clone(),
+                    None => None,
                 };
-                let source = &source;
-
-                let filtered = if spec.has_predicates() {
+                let filtered = if let Some(txn_filtered) = txn_filtered {
+                    if spec.has_predicates() {
+                        match super::row_filter::apply_predicates(
+                            &txn_filtered,
+                            &spec.eq_predicates,
+                            &spec.range_predicates,
+                            &spec.in_predicates,
+                            spec.remaining_predicate.as_ref(),
+                        ) {
+                            Ok(filtered) => filtered,
+                            // Propagate: a failed predicate used to drop the
+                            // whole memtable batch from the result.
+                            Err(e) => return Some(Err(e)),
+                        }
+                    } else {
+                        txn_filtered
+                    }
+                } else if spec.has_predicates() {
                     match super::row_filter::apply_predicates(
                         source,
                         &spec.eq_predicates,
@@ -302,8 +321,6 @@ pub fn scan_memtables(
                         spec.remaining_predicate.as_ref(),
                     ) {
                         Ok(filtered) => filtered,
-                        // Propagate: a failed predicate used to drop the
-                        // whole memtable batch from the result.
                         Err(e) => return Some(Err(e)),
                     }
                 } else {

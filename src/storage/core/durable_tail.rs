@@ -187,6 +187,10 @@ fn tail_commit_timeouts() -> (Duration, Duration) {
     )
 }
 
+/// Upper bound on in-flight commit commands (frames are batch-sized; 8192 is
+/// thousands of statements of slack before backpressure engages).
+const TAIL_COMMIT_QUEUE_CAPACITY: usize = 8192;
+
 pub(crate) struct TailCommitTicket {
     completion: Arc<CommitCompletion>,
 }
@@ -235,7 +239,13 @@ pub(crate) struct TailCommitter {
 
 impl TailCommitter {
     pub(crate) fn start(async_fsync: bool) -> Arc<Self> {
-        let (sender, receiver) = crossbeam_channel::unbounded();
+        // Bounded: every queued command holds a batch-sized compressed WAL
+        // frame, and the old unbounded channel grew without limit when the
+        // disk could not keep up (the backlog warning did not slow anyone
+        // down). A full queue now applies backpressure at `submit` for the
+        // configured tail-commit timeout, then fails that statement's
+        // durability wait instead of buffering without bound.
+        let (sender, receiver) = crossbeam_channel::bounded(TAIL_COMMIT_QUEUE_CAPACITY);
         let queued = Arc::new(AtomicUsize::new(0));
         let loop_queued = Arc::clone(&queued);
         let handle = std::thread::Builder::new()
@@ -258,19 +268,26 @@ impl TailCommitter {
     ) -> TailCommitTicket {
         let completion = CommitCompletion::new();
         self.queued.fetch_add(1, Ordering::Relaxed);
-        if self
-            .sender
-            .send(CommitCommand::Append(AppendCommand {
-                table_dir,
-                id,
-                partition_key,
-                prepared,
-                completion: Arc::clone(&completion),
-            }))
-            .is_err()
-        {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
-            completion.finish(Err("durable tail commit thread stopped".into()));
+        let command = CommitCommand::Append(AppendCommand {
+            table_dir,
+            id,
+            partition_key,
+            prepared,
+            completion: Arc::clone(&completion),
+        });
+        let (timeout, _warn) = tail_commit_timeouts();
+        match self.sender.send_timeout(command, timeout) {
+            Ok(()) => {}
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                completion.finish(Err(
+                    "durable tail commit backlog exceeded the queue and the fsync wait timed out; the write was not acknowledged".into(),
+                ));
+            }
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+                completion.finish(Err("durable tail commit thread stopped".into()));
+            }
         }
         TailCommitTicket { completion }
     }
@@ -786,8 +803,29 @@ pub fn persist(table_dir: &Path, id: Uuid, partition_key: &str, batch: &RecordBa
 
     write_new_synced(&tmp_path, &payload)?;
     fs::rename(&tmp_path, &final_path)?;
+    // The rename must be durable BEFORE the older generation is removed,
+    // otherwise a crash on a filesystem that has not yet persisted the
+    // rename's directory entry leaves no tail at all — every acknowledged
+    // row of this memtable would vanish on recovery. Failure to fsync a
+    // directory (not supported everywhere) degrades to the previous
+    // behavior rather than failing the write.
+    sync_dir_best_effort(&tail_dir);
     remove_other_generations(&tail_dir, id, &final_path)?;
     Ok(())
+}
+
+/// Best-effort `fsync` of a directory entry so a completed rename survives a
+/// crash before the old generation is removed. Unix needs this for
+/// durability; Windows either no-ops or refuses, which we tolerate.
+fn sync_dir_best_effort(dir: &Path) {
+    let result = fs::File::open(dir).and_then(|handle| handle.sync_all());
+    if let Err(error) = result {
+        tracing::debug!(
+            dir = %dir.display(),
+            error = %error,
+            "directory fsync unsupported; rename durability relies on the filesystem journal"
+        );
+    }
 }
 
 /// Durably append only the newly inserted rows to an existing memtable tail.
@@ -824,6 +862,7 @@ pub fn append(table_dir: &Path, id: Uuid, partition_key: &str, delta: &RecordBat
     let final_path = tail_dir.join(format!("{stem}.tail"));
     write_new_synced(&tmp_path, &encode_tail_log(partition_key, delta)?)?;
     fs::rename(&tmp_path, &final_path)?;
+    sync_dir_best_effort(&tail_dir);
     Ok(())
 }
 
@@ -837,6 +876,9 @@ pub fn clear(table_dir: &Path, id: Uuid) -> Result<()> {
     let sequence = next_sequence();
     let marker = tail_dir.join(format!("{}.{}.clear", id.simple(), sequence));
     write_new_synced(&marker, &TAIL_MAGIC.to_le_bytes())?;
+    // Make the marker's directory entry durable before the tails it
+    // tombstones are removed (same ordering rule as `persist`).
+    sync_dir_best_effort(&tail_dir);
     remove_other_generations(&tail_dir, id, &marker)?;
     Ok(())
 }

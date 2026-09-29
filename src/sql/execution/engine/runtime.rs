@@ -388,9 +388,33 @@ impl Engine {
             // rewrites, memtable tail rewrites) before the visibility flip
             // inside commit_txn exposes the transaction's new rows.
             super::txn_dml::materialize_txn_mutations_at_commit(self, txn_id)?;
-            self.batch_writer().commit_txn(txn_id)?;
+            if let Err(first_error) = self.batch_writer().commit_txn(txn_id) {
+                // By the time commit_txn reports an error, the visibility flip
+                // has usually already happened (the failure comes from the
+                // durable-tail fsync wait). Retry once, then fail with an
+                // explicit "fate ambiguous" error — the old behavior returned
+                // a bare error, inviting a ROLLBACK that cannot actually undo
+                // the applied changes.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Err(retry_error) = self.batch_writer().commit_txn(txn_id) {
+                    tracing::error!(
+                        txn_id,
+                        first_error = %first_error,
+                        retry_error = %retry_error,
+                        "COMMIT durable-tail wait failed twice; transaction fate ambiguous"
+                    );
+                    return Err(TaibaiError::Storage(format!(
+                        "COMMIT applied but the durable-tail wait failed twice ({retry_error}); \
+                         the transaction's changes are visible and ROLLBACK cannot undo them — \
+                         verify the data with SELECT"
+                    )));
+                }
+            }
         }
 
+        // The published index entries are authoritative now; drop the
+        // rollback record.
+        self.index_manager().forget_txn_published_entries(txn_id);
         session.commit_txn();
         Ok(())
     }

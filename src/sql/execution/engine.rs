@@ -271,6 +271,29 @@ fn rebuild_compacted_location_indexes(
     }
 }
 
+fn adjust_row_count_for_ttl_drops(
+    catalogs: &RwLock<HashMap<String, DatabaseCatalog>>,
+    data_dir: &Path,
+    db: &str,
+    table: &str,
+    rows_dropped_ttl: u64,
+) {
+    if rows_dropped_ttl == 0 {
+        return;
+    }
+    // TTL-expired rows physically removed by compaction were never
+    // subtracted by a DELETE; without this the catalog row_count drifts
+    // upward forever.
+    let mut catalogs = catalogs.write().unwrap();
+    if let Some(catalog) = catalogs.get_mut(db) {
+        if let Some(meta) = catalog.get_table_mut(table) {
+            meta.row_count = (meta.row_count - rows_dropped_ttl as i64).max(0);
+            let meta_dir = data_dir.join("meta");
+            let _ = catalog.save(&meta_dir);
+        }
+    }
+}
+
 fn start_auto_compaction_thread(
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
@@ -339,6 +362,13 @@ fn start_auto_compaction_thread(
                             };
                         match compact_result {
                             Ok(stats) => {
+                                adjust_row_count_for_ttl_drops(
+                                    &catalogs,
+                                    &data_dir,
+                                    &db,
+                                    &table,
+                                    stats.rows_dropped_ttl,
+                                );
                                 if stats.rows_dropped > 0 || stats.segments_written > 0 {
                                     rebuild_compacted_location_indexes(
                                         &index_manager,
@@ -376,6 +406,13 @@ fn start_auto_compaction_thread(
                     {
                         match compactor.compact_table_for_fragmentation(&db, &table, &table_meta) {
                             Ok(stats) => {
+                                adjust_row_count_for_ttl_drops(
+                                    &catalogs,
+                                    &data_dir,
+                                    &db,
+                                    &table,
+                                    stats.rows_dropped_ttl,
+                                );
                                 if stats.segments_written > 0 {
                                     rebuild_compacted_location_indexes(
                                         &index_manager,

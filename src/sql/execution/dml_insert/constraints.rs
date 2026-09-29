@@ -225,7 +225,9 @@ fn load_existing_unique_keys(
         }
     }
     for memtable in engine.memtable_manager().get_by_table(db, table) {
-        if let Some(batch) = memtable.read() {
+        // Arc-shared snapshot: `read()` deep-clones the whole batch (up to
+        // 500k rows × all columns) just to probe a few key columns.
+        if let Some(batch) = memtable.read_snapshot_arc() {
             check_existing_unique_batch_with_indices(table, index_name, &batch, indices, new_keys)?;
         }
     }

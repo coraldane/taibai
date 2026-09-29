@@ -967,3 +967,94 @@ fn comments_and_quoted_identifiers_parse_end_to_end() -> Result<()> {
     assert_eq!(first_i64(r, 0, 0), 1);
     Ok(())
 }
+
+#[test]
+fn rollback_releases_published_primary_keys_for_reinsert() -> Result<()> {
+    // The INSERT publishes its PK/unique keys into the index at statement
+    // time, even inside an explicit transaction. ROLLBACK must retract them,
+    // or the re-insert of the same key hits a phantom duplicate until the
+    // next snapshot refresh.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (id INT64 PRIMARY KEY, v VARCHAR)")?;
+    engine.execute(&mut session, "BEGIN")?;
+    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 'a')")?;
+    engine.execute(&mut session, "ROLLBACK")?;
+    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 'b')")?;
+
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t")?, 0, 0),
+        1
+    );
+    assert_eq!(
+        first_text(engine.execute(&mut session, "SELECT v FROM t WHERE id = 1")?, 0, 0),
+        "b"
+    );
+    Ok(())
+}
+
+#[test]
+fn transaction_updates_same_memtable_row_twice_without_duplicating() -> Result<()> {
+    // Deferred-DELETE memtable positions recorded by the first UPDATE must
+    // not match again in the second: the committed memtable batch never
+    // changes between statements, so a re-match appended a second copy of
+    // the new row image at COMMIT (one row became two).
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
+    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (5, 0)")?;
+    engine.execute(&mut session, "BEGIN")?;
+    engine.execute(&mut session, "UPDATE t SET v = 1 WHERE id = 5")?;
+    engine.execute(&mut session, "UPDATE t SET v = 2 WHERE id = 5")?;
+    engine.execute(&mut session, "COMMIT")?;
+
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 5")?, 0, 0),
+        1,
+        "the row must exist exactly once after two in-transaction UPDATEs"
+    );
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT v FROM t WHERE id = 5")?, 0, 0),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn update_set_unknown_column_reports_error_instead_of_silent_noop() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
+    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10)")?;
+
+    let result = engine.execute(&mut session, "UPDATE t SET nosuchcol = 1 WHERE id = 1");
+    assert!(result.is_err(), "unknown SET column must be an error");
+
+    Ok(())
+}
+
+#[test]
+fn composite_pk_update_validates_against_the_full_key() -> Result<()> {
+    // PK(id, ts) with only `id` assigned: the uniqueness probe used to be
+    // built from the assigned subset alone, so (1,1) and (1,2) — two legal
+    // rows sharing id — were rejected as duplicates.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, ts INT64, PRIMARY KEY (id, ts))")?;
+    engine.execute(&mut session, "INSERT INTO t (id, ts) VALUES (1, 1), (1, 2)")?;
+    engine.execute(&mut session, "UPDATE t SET id = 9 WHERE ts = 1")?;
+
+    assert_eq!(
+        first_i64(engine.execute(&mut session, "SELECT COUNT(*) FROM t WHERE id = 9")?, 0, 0),
+        1
+    );
+    Ok(())
+}

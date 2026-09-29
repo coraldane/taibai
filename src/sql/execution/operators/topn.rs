@@ -174,6 +174,30 @@ impl Accumulator {
             .map(|(expr, _)| eval_expr_column(expr, batch))
             .collect::<Result<Vec<_>>>()?;
         for row in 0..batch.num_rows() {
+            // Decide acceptance against the heap's worst entry BEFORE
+            // materializing the key vector: with a full heap the overwhelming
+            // majority of rows fail the test, and the old code cloned every
+            // candidate's sort keys just to throw them away.
+            let accept = if self.heap.len() < self.capacity {
+                true
+            } else {
+                let worst = self.heap.peek().expect("full heap has a worst entry");
+                let mut ordering = Ordering::Equal;
+                for (index, descending) in self.descending.iter().enumerate() {
+                    let o = compare_scalars_null_last(&key_columns[index][row], &worst.keys[index]);
+                    let o = if *descending { o.reverse() } else { o };
+                    if !o.is_eq() {
+                        ordering = o;
+                        break;
+                    }
+                }
+                // An exact key tie loses to the incumbent: the incoming slot
+                // number is always greater (matches HeapEntry::cmp's tie-break).
+                ordering == Ordering::Less
+            };
+            if !accept {
+                continue;
+            }
             let keys = key_columns
                 .iter()
                 .map(|column| column[row].clone())
@@ -183,23 +207,15 @@ impl Accumulator {
                 slot: self.slots,
                 descending: Arc::clone(&self.descending),
             };
-            let accept = if self.heap.len() < self.capacity {
-                true
-            } else {
-                let worst = self.heap.peek().expect("full heap has a worst entry");
-                entry.cmp(worst) == Ordering::Less
-            };
-            if accept {
-                if self.heap.len() >= self.capacity {
-                    let worst = self.heap.pop().expect("full heap pops the worst entry");
-                    self.live[worst.slot] = false;
-                    self.dead += 1;
-                }
-                self.append_row(batch, row)?;
-                self.heap.push(entry);
-                if self.dead >= self.capacity.max(64) {
-                    self.compact()?;
-                }
+            if self.heap.len() >= self.capacity {
+                let worst = self.heap.pop().expect("full heap pops the worst entry");
+                self.live[worst.slot] = false;
+                self.dead += 1;
+            }
+            self.append_row(batch, row)?;
+            self.heap.push(entry);
+            if self.dead >= self.capacity.max(64) {
+                self.compact()?;
             }
         }
         Ok(())

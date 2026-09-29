@@ -1511,7 +1511,102 @@ fn eval_join_expr(
                 .collect::<Result<Vec<_>>>()?;
             SHARED_JOIN_REGISTRY.with(|registry| registry.execute(name, &arg_values))
         }
-        _ => Ok(ScalarValue::Int64(None)),
+        LogicalExpr::In {
+            expr,
+            values,
+            negated,
+        } => {
+            let left = eval_join_expr(expr, left_row, right_row, left_ncols)?;
+            if left.is_null() {
+                return Ok(ScalarValue::Bool(None));
+            }
+            let mut found = false;
+            for value in values {
+                if matches!(
+                    eval_join_binary_scalar(&left, &BinOp::Eq, value),
+                    ScalarValue::Bool(Some(true))
+                ) {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(ScalarValue::Bool(Some(found != *negated)))
+        }
+        LogicalExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let value = eval_join_expr(expr, left_row, right_row, left_ncols)?;
+            if value.is_null() {
+                return Ok(ScalarValue::Bool(None));
+            }
+            let low = eval_join_expr(low, left_row, right_row, left_ncols)?;
+            let high = eval_join_expr(high, left_row, right_row, left_ncols)?;
+            let ge = matches!(
+                eval_join_binary_scalar(&value, &BinOp::Gte, &low),
+                ScalarValue::Bool(Some(true))
+            );
+            let le = matches!(
+                eval_join_binary_scalar(&value, &BinOp::Lte, &high),
+                ScalarValue::Bool(Some(true))
+            );
+            Ok(ScalarValue::Bool(Some((ge && le) != *negated)))
+        }
+        LogicalExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let value = eval_join_expr(expr, left_row, right_row, left_ncols)?;
+            if value.is_null() {
+                return Ok(ScalarValue::Bool(None));
+            }
+            let matched = crate::sql::execution::helpers::scalar_like_matches(&value, pattern);
+            Ok(ScalarValue::Bool(Some(matched != *negated)))
+        }
+        LogicalExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            let operand_value = match operand {
+                Some(op) => Some(eval_join_expr(op, left_row, right_row, left_ncols)?),
+                None => None,
+            };
+            for (when, then) in when_clauses {
+                let matched = match &operand_value {
+                    Some(op) => {
+                        let when_value =
+                            eval_join_expr(when, left_row, right_row, left_ncols)?;
+                        matches!(
+                            eval_join_binary_scalar(op, &BinOp::Eq, &when_value),
+                            ScalarValue::Bool(Some(true))
+                        )
+                    }
+                    None => scalar_truthy(&eval_join_expr(
+                        when,
+                        left_row,
+                        right_row,
+                        left_ncols,
+                    )?),
+                };
+                if matched {
+                    return eval_join_expr(then, left_row, right_row, left_ncols);
+                }
+            }
+            match else_clause {
+                Some(else_expr) => eval_join_expr(else_expr, left_row, right_row, left_ncols),
+                None => Ok(ScalarValue::Int64(None)),
+            }
+        }
+        // Subquery/aggregate forms cannot be evaluated row-wise here. The old
+        // fall-through returned NULL, which the caller treats as "no match" —
+        // silently dropping every row of the join. Fail loudly instead.
+        _ => Err(TaibaiError::Sql(
+            "unsupported expression in join residual condition; move it into WHERE or rewrite the join condition".into(),
+        )),
     }
 }
 

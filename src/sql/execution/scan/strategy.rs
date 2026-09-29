@@ -442,12 +442,9 @@ pub fn read_plain_row_group(
     )?;
 
     if !reader.delete_bitmap().is_empty() {
-        let rg_start_row: u64 = reader
-            .footer_row_groups_info()
-            .iter()
-            .take(rg_idx)
-            .map(|r| r.row_count)
-            .sum();
+        // O(1) prefix sum; the old clone-the-whole-footer sum was quadratic
+        // in the row-group count for bitmap segments.
+        let rg_start_row: u64 = reader.row_group_start_row(rg_idx);
         batch = crate::storage::segment::delete_bitmap::filter_batch(
             &batch,
             rg_start_row,
@@ -532,12 +529,8 @@ fn apply_delete_bitmap(
     if reader.delete_bitmap().is_empty() {
         return Ok(batch);
     }
-    let rg_start_row: u64 = reader
-        .footer_row_groups_info()
-        .iter()
-        .take(rg_idx)
-        .map(|r| r.row_count)
-        .sum();
+    // O(1) prefix sum instead of cloning the whole footer per row group.
+    let rg_start_row: u64 = reader.row_group_start_row(rg_idx);
     crate::storage::segment::delete_bitmap::filter_batch(
         &batch,
         rg_start_row,

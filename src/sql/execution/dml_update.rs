@@ -5,6 +5,7 @@ use crate::types::batch::RecordBatch;
 use crate::types::batch::Schema;
 use crate::types::scalar::ScalarValue;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::engine::{Engine, ExecResult};
@@ -27,6 +28,16 @@ pub fn exec_update(
         return super::txn_dml::exec_update_in_txn(
             engine, db, table, assignments, where_clause, reader_txn_id, username,
         );
+    }
+    // An open transaction's deferred mutations pin memtable row positions and
+    // segment row ids; rewriting either underneath the pin makes its COMMIT
+    // delete/update the wrong rows. Auto-commit UPDATE refuses instead of
+    // racing the pin.
+    if engine.txn_mutations().table_has_pins(db, table) {
+        return Err(TaibaiError::ResourceBusy(format!(
+            "table '{}.{}' is pinned by an open transaction; retry after it commits or rolls back",
+            db, table
+        )));
     }
     let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
@@ -129,12 +140,14 @@ pub fn exec_update(
             if let Some(new_batch) = new_batch {
                 updated_count += affected;
                 if publish_updates {
-                    let columns = batch
+                    // Change events carry the post-update row images: take
+                    // from `new_batch`, not the pre-update snapshot.
+                    let columns = new_batch
                         .columns
                         .iter()
                         .map(|col| col.take(&matched_rows))
                         .collect();
-                    match RecordBatch::try_new(batch.schema.clone(), columns) {
+                    match RecordBatch::try_new(new_batch.schema.clone(), columns) {
                         Ok(updated) => updated_row_batches.push(updated),
                         Err(error) => tracing::warn!(
                             db,
@@ -373,9 +386,15 @@ pub fn exec_update(
             )?;
         }
 
-        for (old_seg, batches) in rewritten_segments {
+        // Two-phase rewrite: write every replacement segment to its temp
+        // file first, and only then perform the (metadata-only) swaps. A
+        // failure in phase one aborts the statement with the old segments
+        // fully intact; before this split, the loop replaced segment N while
+        // segment N+1 was still unwritten, so an error left the statement
+        // half-applied ("some rows updated" despite the reported failure).
+        let mut staged_segments: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
+        for (old_seg, batches) in &rewritten_segments {
             let Some(schema) = batches.first().map(|batch| batch.schema.clone()) else {
-                mgr.remove_segment_file(&old_seg)?;
                 continue;
             };
             let partition_key = old_seg.file_name().and_then(|name| {
@@ -385,18 +404,32 @@ pub fn exec_update(
                 mgr.next_replacement_segment_path(&table_dir, partition_key.as_deref())?;
             let tmp_path =
                 crate::storage::segment::store::replacement_tmp_path(&final_path, "update_tmp");
-            let write_result = mgr.write_new_segment_batches(
+            if let Err(error) = mgr.write_new_segment_batches(
                 &tmp_path,
                 schema,
                 mgr.row_group_target_rows(),
-                &batches,
+                batches,
                 mgr.table_compression_level(db, table),
-            );
-            if let Err(error) = write_result {
+            ) {
+                // Drop every temp file written so far and abort cleanly.
+                for (_, tmp, final_path) in &staged_segments {
+                    let _ = std::fs::remove_file(tmp);
+                    let _ = crate::storage::segment::meta::remove_sidecar_meta(tmp);
+                    let _ = std::fs::remove_file(final_path);
+                }
                 let _ = std::fs::remove_file(&tmp_path);
                 let _ = crate::storage::segment::meta::remove_sidecar_meta(&tmp_path);
                 return Err(error);
             }
+            staged_segments.push((old_seg.clone(), tmp_path, final_path));
+        }
+        // Empty rewritten segments (no surviving rows): removed outright.
+        for (old_seg, batches) in &rewritten_segments {
+            if batches.is_empty() {
+                mgr.remove_segment_file(old_seg)?;
+            }
+        }
+        for (old_seg, tmp_path, final_path) in staged_segments {
             if let Err(error) =
                 mgr.replace_segments_with_tmp(&tmp_path, &final_path, &[old_seg])
             {
@@ -411,13 +444,17 @@ pub fn exec_update(
 
         let mut tail_persist_failed = false;
         for (memtable, batch) in memtable_updates {
-            if !memtable.replace_pending_batch(batch) {
-                return Err(TaibaiError::Internal(format!(
-                    "memtable for '{}.{}' left pending state during UPDATE",
-                    db, table
-                )));
-            }
-            if let Err(error) = engine.batch_writer().persist_memtable_tail(&memtable) {
+            // Durable tail BEFORE the in-memory swap: the segment rewrites
+            // above already committed the new values, so a crash between the
+            // two steps must not let recovery restore the pre-update tail
+            // next to them. This loop runs under the table/partition
+            // mutation lock, so no flush can invalidate `batch` in between.
+            // A tail write failure still swaps in memory and falls back to
+            // the flush below (same degradation as before).
+            if let Err(error) = engine
+                .batch_writer()
+                .persist_memtable_tail_batch(&memtable, &batch)
+            {
                 tail_persist_failed = true;
                 tracing::warn!(
                     db,
@@ -425,6 +462,12 @@ pub fn exec_update(
                     error = %error,
                     "UPDATE durable tail write failed; flushing target table"
                 );
+            }
+            if !memtable.replace_pending_batch(batch) {
+                return Err(TaibaiError::Internal(format!(
+                    "memtable for '{}.{}' left pending state during UPDATE",
+                    db, table
+                )));
             }
         }
         if tail_persist_failed {
@@ -538,13 +581,28 @@ fn indexes_touched_by_assignments(
         })
         .cloned()
         .collect();
-    let pk_columns: Vec<String> = table_schema
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(idx, column)| column.primary_key && assigned_columns.contains(idx))
-        .map(|(_, column)| column.name.clone())
-        .collect();
+    let pk_columns: Vec<String> = {
+        // The primary key is one composite constraint: once any of its columns
+        // is rewritten, the NEW (c1, c2, ...) combinations must be checked for
+        // uniqueness against the full key. Filtering to the assigned subset
+        // used to reject legal updates — PK(id, ts) with `SET id = 1` flagged
+        // (1, 1) vs (1, 2) as duplicates.
+        let any_pk_assigned = table_schema
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(idx, column)| column.primary_key && assigned_columns.contains(&idx));
+        if !any_pk_assigned {
+            Vec::new()
+        } else {
+            table_schema
+                .columns
+                .iter()
+                .filter(|column| column.primary_key)
+                .map(|column| column.name.clone())
+                .collect()
+        }
+    };
     if !pk_columns.is_empty() {
         indexes.push(crate::storage::catalog::schema::UniqueIndexMeta {
             name: "PRIMARY".to_string(),
@@ -608,12 +666,26 @@ pub(crate) fn rebuild_update_column(
         // ScalarValue round-trip.
         None => Ok(column.take(kept)),
         Some(value) => {
+            // Split the survivors into maximal constant runs: long unmatched
+            // runs go through `gather_into` (memcpy for ascending runs, bulk
+            // bitmaps), and only the matched rows pay a per-row push. The old
+            // loop routed EVERY row through a scalar() + push() round-trip,
+            // cloning a String per VarChar cell of a million-row group to
+            // change one row.
             let mut out = ColumnArray::empty(column.data_type());
-            for (kept_idx, &src_row) in kept.iter().enumerate() {
-                if kept_matched[kept_idx] {
-                    out.push(value)?;
+            let mut idx = 0usize;
+            while idx < kept.len() {
+                let matched = kept_matched[idx];
+                let start = idx;
+                while idx < kept.len() && kept_matched[idx] == matched {
+                    idx += 1;
+                }
+                if matched {
+                    for _ in start..idx {
+                        out.push(value)?;
+                    }
                 } else {
-                    out.push(&column.scalar(src_row as usize))?;
+                    column.gather_into(&kept[start..idx], &mut out)?;
                 }
             }
             Ok(out)
@@ -641,6 +713,13 @@ pub(crate) fn precompute_assigned_values(
                     eval_expr_to_scalar(&assign.value, &table_schema.columns[col_idx].data_type)?;
                 assigned.insert(col_idx, value);
             }
+        } else {
+            // A silent skip used to report rows_affected while changing
+            // nothing (`UPDATE t SET nosuchcol = 1 WHERE ...`).
+            return Err(TaibaiError::Sql(format!(
+                "unknown column '{}' in SET clause",
+                assign.column
+            )));
         }
     }
     Ok(assigned)

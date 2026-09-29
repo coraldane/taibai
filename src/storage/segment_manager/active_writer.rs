@@ -396,16 +396,23 @@ impl ActiveSegmentWriter {
 
         let remaining = total_buffered - rows_to_flush;
         if remaining > 0 {
-            let mut remainder = RecordBatch::new(buffered.schema.clone());
-            for col_idx in 0..num_cols {
-                let col = buffered.column(col_idx).unwrap();
-                let dst = remainder.column_mut(col_idx).unwrap();
-                for row_idx in rows_to_flush..total_buffered {
-                    let val = col.scalar(row_idx);
-                    dst.push(&val)?;
-                }
-            }
-            self.buffered_batch = Some(remainder);
+            // One slice per column instead of a scalar() + push() round-trip
+            // per cell: an append larger than the row-group target flushed
+            // this loop once per group, so the old rebuild was O(N²/R) cell
+            // copies for a single big append (a 500k-row memtable flush paid
+            // ~15M scalar clones).
+            let columns = (0..num_cols)
+                .map(|col_idx| {
+                    buffered
+                        .column(col_idx)
+                        .expect("buffered column exists")
+                        .slice_fast(rows_to_flush, total_buffered)
+                })
+                .collect();
+            self.buffered_batch = Some(RecordBatch::try_new(
+                buffered.schema.clone(),
+                columns,
+            )?);
             self.buffered_rows = remaining;
         }
 

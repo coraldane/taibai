@@ -248,7 +248,29 @@ fn apply_range_mask(
 }
 
 fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut [bool]) {
-    if let Some(col) = batch.column(pred.column_index) {
+    let Some(col) = batch.column(pred.column_index) else {
+        for m in mask.iter_mut() {
+            *m = false;
+        }
+        return;
+    };
+    // The hashed probe needs a plain typed column: `from_column` ignores the
+    // null bitmap and would flatten Selected/Rle/Dictionary per row, and
+    // Blob/Vector values have no hashable form. Tiny lists also keep the
+    // linear probe (no set construction). Anything bigger — a hash join
+    // runtime filter injects up to 1024 values — probes a hash set built
+    // once per batch: O(rows + values) instead of O(rows × values) scalar
+    // comparisons.
+    let hashable = pred.values.len() > 4
+        && !matches!(
+            col,
+            ColumnArray::Selected { .. }
+                | ColumnArray::Rle { .. }
+                | ColumnArray::Dictionary { .. }
+                | ColumnArray::Blob { .. }
+                | ColumnArray::Vector { .. }
+        );
+    if !hashable {
         for (i, m) in mask.iter_mut().enumerate() {
             if !*m {
                 continue;
@@ -259,10 +281,22 @@ fn apply_in_mask(batch: &RecordBatch, pred: &InPredicate, mask: &mut [bool]) {
             });
             *m = found;
         }
-    } else {
-        for m in mask.iter_mut() {
-            *m = false;
-        }
+        return;
+    }
+    let values: std::collections::HashSet<
+        crate::sql::execution::join_hashtable::ScalarValueHashable,
+    > = pred
+        .values
+        .iter()
+        .filter(|value| !value.is_null())
+        .map(crate::sql::execution::join_hashtable::ScalarValueHashable::from_scalar)
+        .collect();
+    for (i, m) in mask.iter_mut().enumerate() {
+        // A NULL row never satisfies IN, and `from_column` would read the
+        // data slot regardless of the bitmap.
+        *m = *m
+            && !col.bitmap().is_null(i)
+            && values.contains(&crate::sql::execution::join_hashtable::ScalarValueHashable::from_column(col, i));
     }
 }
 
@@ -966,12 +1000,8 @@ fn selected_live_rows(
         return (start..end).collect();
     }
 
-    let rg_start_row: u64 = reader
-        .footer_row_groups_info()
-        .iter()
-        .take(rg_idx)
-        .map(|r| r.row_count)
-        .sum();
+    // O(1) prefix sum instead of cloning the whole footer per row group.
+    let rg_start_row: u64 = reader.row_group_start_row(rg_idx);
     (start..end)
         .filter(|row| !reader.is_row_deleted(rg_start_row + *row as u64))
         .collect()

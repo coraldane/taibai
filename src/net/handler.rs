@@ -65,6 +65,11 @@ impl Drop for Handler {
                 );
             }
         }
+        // A client that vanishes mid-transaction must not leave its
+        // transactional memtables and mutation pins behind forever: pins
+        // block compaction/flush for the whole table, and transactional
+        // memtables are only removable via commit/rollback.
+        self.rollback_open_txn_on_disconnect();
     }
 }
 
@@ -88,6 +93,9 @@ impl Handler {
     }
 
     pub fn flush_on_disconnect(&mut self) {
+        // Same rationale as the Drop safety net below; the normal path gets
+        // the tidy, ordered rollback before any bulk-import flush work.
+        self.rollback_open_txn_on_disconnect();
         if let Some(conn) = self.pubsub_conn.take() {
             self.engine.pubsub().drop_connection(&conn);
         }
@@ -127,6 +135,49 @@ impl Handler {
                     }
                 }
             }
+        }
+    }
+
+    /// Rolls back any open transaction, tolerating (and logging) failures so
+    /// it is safe from both the normal disconnect path and `Drop` — including
+    /// `Drop` during unwind, where a second panic would abort the process.
+    fn rollback_open_txn_on_disconnect(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if !session.in_txn() {
+            return;
+        }
+        let txn_id = session.active_txn_id();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let discarded_dml = crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(
+                &self.engine,
+                txn_id,
+            );
+            let rolled_back = self.engine.batch_writer().rollback_txn(txn_id)?;
+            self.engine
+                .index_manager()
+                .discard_txn_published_entries_at_rollback(txn_id);
+            Ok::<u64, TaibaiError>(rolled_back + discarded_dml)
+        }));
+        match outcome {
+            Ok(Ok(rows)) => {
+                session.rollback_txn();
+                tracing::info!(
+                    txn_id,
+                    rows_rolled_back = rows,
+                    "open transaction rolled back on disconnect"
+                );
+            }
+            Ok(Err(error)) => tracing::warn!(
+                txn_id,
+                error = %error,
+                "failed to roll back open transaction on disconnect"
+            ),
+            Err(_) => tracing::warn!(
+                txn_id,
+                "panicked while rolling back open transaction on disconnect"
+            ),
         }
     }
 
@@ -1244,9 +1295,19 @@ impl Handler {
             return Ok(vec![build_error("no active transaction")]);
         }
         let txn_id = session.active_txn_id();
+        // Same cleanup order as the SQL-text path (engine/core.rs): deferred
+        // DML plans first, then the batch-writer rollback, then the unique/PK
+        // index entries the transaction published at statement time.
+        let discarded_dml = crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(
+            &self.engine,
+            txn_id,
+        );
         let rolled_back = self.engine.batch_writer().rollback_txn(txn_id)?;
+        self.engine
+            .index_manager()
+            .discard_txn_published_entries_at_rollback(txn_id);
         session.rollback_txn();
-        Ok(vec![build_ok(rolled_back)])
+        Ok(vec![build_ok(rolled_back + discarded_dml)])
     }
 
     fn handle_cursor_open(&mut self, payload: &[u8]) -> Result<Vec<Message>> {

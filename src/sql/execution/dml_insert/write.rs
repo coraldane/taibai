@@ -15,6 +15,16 @@ pub fn exec_replace(
         ));
     }
 
+    // Same pin-exclusion as auto-commit DELETE/UPDATE: REPLACE physically
+    // removes conflicting memtable rows (shifting positions), which would
+    // make an open transaction's COMMIT delete the wrong rows.
+    if engine.txn_mutations().table_has_pins(db, table) {
+        return Err(TaibaiError::ResourceBusy(format!(
+            "table '{}.{}' is pinned by an open transaction; retry after it commits or rolls back",
+            db, table
+        )));
+    }
+
     let _unique_guard = constraint_insert_lock(db, table).lock().unwrap();
     let materialized =
         materialize_insert_values(engine, db, table, columns, values, timezone_offset_hours)?;
@@ -617,6 +627,27 @@ fn exec_materialized_insert_batch(
     log_insert_profile("write", row_count as usize, write_start.elapsed());
 
     let catalog_start = Instant::now();
+    // Snapshot the published keys before the append consumes the entries, so
+    // an explicit-transaction ROLLBACK can retract exactly these keys. The
+    // record is taken before the append attempt: a half-failed publish (some
+    // indexes appended, one errored) must still be retractable.
+    if txn_id > 0 {
+        for (index_name, entries) in &unique_index_entries {
+            let keys = entries.iter().map(|entry| entry.key.clone()).collect();
+            engine
+                .index_manager()
+                .record_txn_published_keys(txn_id, db, table, index_name, keys);
+        }
+        if !primary_keys.is_empty() {
+            engine.index_manager().record_txn_published_keys(
+                txn_id,
+                db,
+                table,
+                crate::storage::index::index_manager::PRIMARY_LOCATION_INDEX_NAME,
+                primary_keys.clone(),
+            );
+        }
+    }
     if publish_unique_index_entries {
         append_unique_index_entries_after_insert(engine, db, table, unique_index_entries)?;
     }

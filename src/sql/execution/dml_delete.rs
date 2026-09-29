@@ -149,8 +149,31 @@ pub(crate) fn plan_delete_memtable_rows(
                 continue;
             }
         }
-        let Some(batch) = memtable.read_snapshot_arc() else {
+        let Some(original) = memtable.read_snapshot_arc() else {
             continue;
+        };
+        if original.num_rows() == 0 {
+            continue;
+        }
+        // Rows this transaction already tombstoned in an earlier statement
+        // must not match again: the committed batch is unchanged between
+        // statements (only positions are recorded), so a re-match would
+        // double-count and duplicate the deferred delete events.
+        let prior_positions = engine
+            .txn_mutations()
+            .memtable_positions(reader_txn_id, memtable.id());
+        let (batch, live_positions) = match prior_positions {
+            Some(positions) if !positions.is_empty() => {
+                let keep: Vec<u32> = (0..original.num_rows() as u32)
+                    .filter(|row| !positions.contains(row))
+                    .collect();
+                let filtered =
+                    crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+                        &original, &positions,
+                    )?;
+                (Arc::new(filtered), Some(keep))
+            }
+            _ => (Arc::clone(&original), None),
         };
         if batch.num_rows() == 0 {
             continue;
@@ -162,18 +185,30 @@ pub(crate) fn plan_delete_memtable_rows(
             Some(expr) => eval_where_clause_batch(expr, &batch, table_schema)?,
             None => vec![true; batch.num_rows()],
         };
-        let removed = mask.iter().filter(|matches| **matches).count();
+        // Lift the matches back to absolute positions in the original batch
+        // so plans, tombstone registrations and delete events all speak the
+        // same coordinate system.
+        let mut absolute_mask = vec![false; original.num_rows()];
+        for (filtered_idx, &matches) in mask.iter().enumerate() {
+            if matches {
+                let absolute = live_positions
+                    .as_ref()
+                    .map_or(filtered_idx as u32, |map| map[filtered_idx]);
+                absolute_mask[absolute as usize] = true;
+            }
+        }
+        let removed = absolute_mask.iter().filter(|matches| **matches).count();
         if removed > 0 {
-            let keep = mask.iter().map(|matches| !matches).collect::<Vec<_>>();
-            let filtered = filter_batch_keep(&batch, &keep, batch.num_rows() - removed)?;
-            let removed_positions = mask
+            let keep = absolute_mask.iter().map(|matches| !matches).collect::<Vec<_>>();
+            let filtered = filter_batch_keep(&original, &keep, original.num_rows() - removed)?;
+            let removed_positions = absolute_mask
                 .iter()
                 .enumerate()
                 .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
                 .collect::<Vec<_>>();
             plans.push(ReplaceMemtableConflictPlan {
                 memtable,
-                original: batch,
+                original,
                 filtered: Arc::new(filtered),
                 removed_positions,
             });
@@ -219,6 +254,11 @@ pub(crate) fn apply_replace_memtable_conflicts(
         // ROLLBACK needs to undo.
         let tail_result = if plan.memtable.is_transactional() {
             Ok(())
+        } else if plan.filtered.num_rows() == 0 {
+            // Nothing survived the delete: a clear tombstone (fail-closed)
+            // replaces the memtable's tail instead of persisting an empty
+            // snapshot generation.
+            crate::storage::core::durable_tail::clear(&table_dir, plan.memtable.id())
         } else {
             crate::storage::core::durable_tail::persist(
                 &table_dir,
@@ -984,6 +1024,17 @@ pub fn exec_delete(
         );
     }
 
+    // An open transaction's deferred mutations pin memtable row positions and
+    // segment row ids. An auto-commit DELETE physically removes memtable rows
+    // (shifting positions) and rewrites segment footers, so its COMMIT would
+    // delete the wrong rows. Refuse instead of racing the pin.
+    if engine.txn_mutations().table_has_pins(db, table) {
+        return Err(TaibaiError::ResourceBusy(format!(
+            "table '{}.{}' is pinned by an open transaction; retry after it commits or rolls back",
+            db, table
+        )));
+    }
+
     // Resolve subqueries through the permission-gated wrapper (a bare
     // resolve_in_subqueries here would let WHERE IN (SELECT ...) read tables
     // the user cannot SELECT).
@@ -1274,6 +1325,21 @@ pub fn exec_delete(
             engine
                 .index_manager()
                 .invalidate_table_unique_index_snapshots(db, table, &unique_index_names);
+            if total_deleted > 0 {
+                // The successfully rewritten segments and the memtable removal
+                // are durable even though the statement reports an error; the
+                // catalog must reflect them or row_count drifts upward forever
+                // (the success-path decrement below is skipped on Err).
+                engine.invalidate_hot_store(db, table);
+                let mut catalogs = engine.catalogs().write().unwrap();
+                if let Some(catalog) = catalogs.get_mut(db) {
+                    if let Some(meta) = catalog.get_table_mut(table) {
+                        meta.row_count = (meta.row_count - total_deleted as i64).max(0);
+                        let meta_dir = engine.data_dir().join("meta");
+                        let _ = catalog.save(&meta_dir);
+                    }
+                }
+            }
             return Err(error);
         }
 

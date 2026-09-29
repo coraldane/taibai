@@ -11,7 +11,7 @@ members = [
 
 [package]
 name = "taibai"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 autotests = false
 description = "An experimental Rust columnar database server for analytical workloads"

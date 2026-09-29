@@ -36,6 +36,12 @@ pub struct CompactStats {
     pub segments_written: usize,
     pub rows_written: u64,
     pub rows_dropped: u64,
+    /// Rows physically removed by the TTL filter during the rewrite. These
+    /// were never subtracted from the catalog `row_count` (unlike
+    /// `rows_dropped`, which is dominated by DELETE-tombstoned rows the
+    /// DELETE statement already subtracted), so the caller adjusts
+    /// `row_count` by exactly this value.
+    pub rows_dropped_ttl: u64,
 }
 
 /// Identity of a compaction input file at the moment the unlocked heavy
@@ -87,6 +93,7 @@ enum PreparedCompaction {
         identities: Vec<SegmentFileIdentity>,
         segments_read: usize,
         rows_dropped: u64,
+        rows_dropped_ttl: u64,
     },
     /// Replacement segment written to a non-discoverable tmp path; commit
     /// re-validates the inputs and atomically swaps it in.
@@ -98,6 +105,7 @@ enum PreparedCompaction {
         segments_read: usize,
         rows_to_write: usize,
         rows_dropped: u64,
+        rows_dropped_ttl: u64,
     },
 }
 
@@ -304,6 +312,7 @@ impl Compactor {
             stats.segments_written += part_stats.segments_written;
             stats.rows_written += part_stats.rows_written;
             stats.rows_dropped += part_stats.rows_dropped;
+            stats.rows_dropped_ttl += part_stats.rows_dropped_ttl;
         }
 
         tracing::info!(
@@ -544,6 +553,7 @@ impl Compactor {
         let mut sorted_indices = Vec::new();
         let source_row_group_count;
         let mut deleted_rows = 0u64;
+        let mut ttl_dropped = 0u64;
 
         if sort_key_indices.is_empty() {
             let now = std::time::SystemTime::now()
@@ -574,6 +584,7 @@ impl Compactor {
                             );
                             if !visible {
                                 deleted_rows += 1;
+                                ttl_dropped += 1;
                                 continue;
                             }
                         }
@@ -631,7 +642,7 @@ impl Compactor {
                     .segment_mgr
                     .next_replacement_segment_path(table_dir, partition_key)?;
                 let tmp_path = store::replacement_tmp_path(&final_path, "compact_tmp");
-                let (rows_written, dropped) = self.prepare_clustered_external(
+                let (rows_written, dropped, dropped_ttl) = self.prepare_clustered_external(
                     db,
                     table,
                     partition_label,
@@ -652,6 +663,7 @@ impl Compactor {
                         identities,
                         segments_read,
                         rows_dropped: dropped,
+                        rows_dropped_ttl: dropped_ttl,
                     });
                 }
                 tracing::info!(
@@ -672,6 +684,7 @@ impl Compactor {
                     segments_read,
                     rows_to_write: rows_written,
                     rows_dropped: dropped,
+                    rows_dropped_ttl: dropped_ttl,
                 });
             }
             if global_row_base > u32::MAX as usize {
@@ -734,7 +747,9 @@ impl Compactor {
                                 if ts.saturating_add(duration) > now
                         )
                     });
-                    deleted_rows += (before - sorted_indices.len()) as u64;
+                    let ttl_removed = (before - sorted_indices.len()) as u64;
+                    deleted_rows += ttl_removed;
+                    ttl_dropped += ttl_removed;
                 }
             }
 
@@ -776,6 +791,7 @@ impl Compactor {
                 identities,
                 segments_read,
                 rows_dropped: deleted_rows,
+                rows_dropped_ttl: ttl_dropped,
             });
         }
 
@@ -834,6 +850,7 @@ impl Compactor {
             segments_read,
             rows_to_write,
             rows_dropped: deleted_rows,
+            rows_dropped_ttl: ttl_dropped,
         })
     }
 
@@ -859,6 +876,7 @@ impl Compactor {
                 identities,
                 segments_read,
                 rows_dropped,
+                rows_dropped_ttl,
             } => {
                 if !compaction_inputs_unchanged(&self.segment_mgr, &segment_files, &identities) {
                     tracing::info!(
@@ -875,6 +893,11 @@ impl Compactor {
                 for old_seg in &segment_files {
                     self.segment_mgr.remove_segment_file(old_seg)?;
                 }
+                // Persisted unique-index snapshots still point at the removed
+                // segments. Bump the content epoch so every probe refreshes
+                // (or falls back) instead of trusting locations that no longer
+                // exist — including after a crash before the caller's rebuild.
+                self.segment_mgr.note_memtable_flush(db, table);
                 tracing::info!(
                     db,
                     table,
@@ -887,6 +910,7 @@ impl Compactor {
                 Ok(CompactStats {
                     segments_read,
                     rows_dropped,
+                    rows_dropped_ttl,
                     ..CompactStats::default()
                 })
             }
@@ -898,6 +922,7 @@ impl Compactor {
                 segments_read,
                 rows_to_write,
                 rows_dropped,
+                rows_dropped_ttl,
             } => {
                 if !compaction_inputs_unchanged(&self.segment_mgr, &segment_files, &identities) {
                     let _ = std::fs::remove_file(&tmp_path);
@@ -934,6 +959,12 @@ impl Compactor {
                     &final_path,
                     &segment_files,
                 )?;
+                // Same epoch bump as the AllDropped arm: the replacement no
+                // longer contains the rows the persisted unique-index
+                // snapshots point at, and their recorded watermarks are
+                // meaningless against the merged segment. The epoch bump
+                // forces every probe to refresh until the caller rebuilds.
+                self.segment_mgr.note_memtable_flush(db, table);
 
                 tracing::info!(
                     db,
@@ -952,6 +983,7 @@ impl Compactor {
                     segments_written: 1,
                     rows_written: rows_to_write as u64,
                     rows_dropped,
+                    rows_dropped_ttl,
                 })
             }
         }
@@ -1090,7 +1122,7 @@ impl Compactor {
         ttl: Option<(usize, i64)>,
         output_row_group_rows: usize,
         compression_level: i32,
-    ) -> Result<(usize, u64)> {
+    ) -> Result<(usize, u64, u64)> {
         let estimated_width = estimated_row_width_bytes(schema);
         // Bound the run to the budget (no row-group-multiplier floor: wide
         // rows must not lift the run past it). A small floor keeps the run
@@ -1125,6 +1157,7 @@ impl Compactor {
         let mut run_paths: Vec<PathBuf> = Vec::new();
         let mut run_seq = 0usize;
         let mut dropped = 0u64;
+        let mut dropped_ttl = 0u64;
 
         let run_cleanup = |paths: &[PathBuf]| {
             for path in paths {
@@ -1185,6 +1218,7 @@ impl Compactor {
                     );
                     if !visible {
                         dropped += 1;
+                        dropped_ttl += 1;
                         continue;
                     }
                 }
@@ -1203,7 +1237,7 @@ impl Compactor {
         }
 
         if run_paths.is_empty() {
-            return Ok((0, dropped));
+            return Ok((0, dropped, dropped_ttl));
         }
 
         // ---- Pass B: k-way merge (waves when runs exceed the fan-in) ----
@@ -1272,7 +1306,7 @@ impl Compactor {
             rows_written = written,
             "clustered external merge completed"
         );
-        Ok((written, dropped))
+        Ok((written, dropped, dropped_ttl))
     }
 
     /// K-way merge of sorted run files into `writer`, gathering rows through
@@ -1685,7 +1719,18 @@ fn sort_clustered_row_indices(
         } else if let Some(value) = data.get(row_idx as usize) {
             groups.entry(value).or_default().push(row_idx);
         } else {
-            continue;
+            // A row index out of range for the leading column means the
+            // column and the surviving-row set disagree (some other bug's
+            // symptom). The old `continue` silently dropped the row from
+            // the compaction output — quieter than a panic and far more
+            // dangerous. Keep the row (sorted with the null group) and say
+            // so loudly.
+            tracing::error!(
+                row_idx,
+                len = data.len(),
+                "cluster sort: leading-key row index out of range; keeping row in null group"
+            );
+            null_group.push(row_idx);
         }
     }
 

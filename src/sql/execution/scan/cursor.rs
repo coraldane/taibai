@@ -48,7 +48,7 @@ pub struct ScanCursor {
     current_candidates: Vec<usize>,
     candidate_pos: usize,
     remaining_limit: Option<usize>,
-    memtable_batches: Vec<RecordBatch>,
+    memtable_batches: std::collections::VecDeque<RecordBatch>,
     memtable_pos: usize,
     /// Decoded row groups awaiting emission, in candidate order. Filled a
     /// window at a time by a parallel decode fan-out so cursor-served scans
@@ -98,7 +98,7 @@ impl ScanCursor {
             current_candidates: Vec::new(),
             candidate_pos: 0,
             remaining_limit,
-            memtable_batches: Vec::new(),
+            memtable_batches: std::collections::VecDeque::new(),
             memtable_pos: 0,
             prefetch: VecDeque::new(),
             decode_rx: None,
@@ -170,7 +170,7 @@ impl ScanCursor {
         while self.segment_pos < self.segments.len() {
             crate::common::query_cancel::check()?;
             if self.current_reader.is_none() {
-                self.open_current_segment();
+                self.open_current_segment()?;
                 if self.current_reader.is_none() {
                     self.segment_pos += 1;
                     continue;
@@ -197,10 +197,11 @@ impl ScanCursor {
             self.segment_pos += 1;
         }
 
-        while self.memtable_pos < self.memtable_batches.len() {
-            crate::common::query_cancel::check()?;
-            let batch = self.memtable_batches[self.memtable_pos].clone();
+        // Consume the memtable leg by value: the old index+clone walk
+        // deep-copied every already-materialized batch a second time.
+        while let Some(batch) = self.memtable_batches.pop_front() {
             self.memtable_pos += 1;
+            crate::common::query_cancel::check()?;
             let batch = strategy::apply_ttl_filter_and_projection(
                 batch,
                 &self.table_meta,
@@ -427,10 +428,11 @@ impl ScanCursor {
     }
 
     fn drain_memtable_leg(&mut self) -> Result<Option<RecordBatch>> {
-        while self.memtable_pos < self.memtable_batches.len() {
-            crate::common::query_cancel::check()?;
-            let batch = self.memtable_batches[self.memtable_pos].clone();
+        // Consume by value (see next_batch); batches were materialized once
+        // during initialize.
+        while let Some(batch) = self.memtable_batches.pop_front() {
             self.memtable_pos += 1;
+            crate::common::query_cancel::check()?;
             let batch = strategy::apply_ttl_filter_and_projection(
                 batch,
                 &self.table_meta,
@@ -444,7 +446,7 @@ impl ScanCursor {
         Ok(None)
     }
 
-    fn open_current_segment(&mut self) {
+    fn open_current_segment(&mut self) -> Result<()> {
         let segment = &self.segments[self.segment_pos];
         let meta_candidates = self
             .runtime
@@ -472,13 +474,24 @@ impl ScanCursor {
             .is_some_and(|candidates| candidates.is_empty())
         {
             self.current_reader = None;
-            return;
+            return Ok(());
         }
         let reader = match self.runtime.segment_mgr().open_scan_reader(segment, self.spec.reader_txn_id) {
             Ok(r) => r,
-            Err(_) => {
+            Err(error) => {
+                // Same contract as the executor's inline path: a concurrent
+                // compaction may legitimately remove a segment mid-scan, but
+                // anything else (IO error, corrupt footer) must fail the
+                // query instead of silently dropping the segment's rows.
                 self.current_reader = None;
-                return;
+                if segment.exists() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    segment = %segment.display(),
+                    "cursor scan: segment vanished mid-scan; skipping"
+                );
+                return Ok(());
             }
         };
         let candidates = meta_candidates.unwrap_or_else(|| {
@@ -489,9 +502,22 @@ impl ScanCursor {
         self.current_candidates = candidates;
         self.candidate_pos = 0;
         self.current_reader = Some(reader);
+        Ok(())
     }
 
     fn initialize(&mut self) -> Result<()> {
+        // The segment discovery and the memtable scan below must observe the
+        // table atomically: a memtable flush running between the two steps
+        // would move rows into a segment that is not in the discovered list
+        // while retiring the memtable that still held them — the rows would
+        // vanish from this scan. Same contract as ScanExecutor::execute.
+        let segment_mgr = self.runtime.segment_mgr().clone();
+        let db = self.db.clone();
+        let table = self.spec.table_name.clone();
+        segment_mgr.with_table_flush_read_lock(&db, &table, || self.initialize_unlocked())
+    }
+
+    fn initialize_unlocked(&mut self) -> Result<()> {
         let mut hot_spec = self.spec.clone();
         hot_spec.projection = Some(self.plan.projection_cols.clone());
         if let Some(batch) = memtable::scan_resident_hot_store(
@@ -502,7 +528,7 @@ impl ScanCursor {
             &hot_spec,
         ) {
             self.segments.clear();
-            self.memtable_batches = vec![batch];
+            self.memtable_batches = std::collections::VecDeque::from(vec![batch]);
             self.initialized = true;
             return Ok(());
         }
@@ -561,11 +587,12 @@ impl ScanCursor {
             &self.db,
             &self.spec.table_name,
             &memtable_spec,
-        )?;
+        )?
+        .into();
         // The mirror batch rides the memtable drain path, which applies the
         // TTL filter, projection and limit identically.
         if let Some(batch) = hybrid_mirror_batch {
-            self.memtable_batches.push(batch);
+            self.memtable_batches.push_back(batch);
         }
 
         if self.try_spawn_background_decoder()? {

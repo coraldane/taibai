@@ -907,6 +907,12 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 let discarded_dml =
                     super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
                 let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
+                // Retract the unique/PK index entries INSERT statements
+                // published at statement time; otherwise the next INSERT of
+                // the same key sees a phantom duplicate until the next
+                // snapshot refresh.
+                self.index_manager()
+                    .discard_txn_published_entries_at_rollback(txn_id);
                 tracing::debug!(
                     txn_id,
                     rows_rolled_back = rolled_back + discarded_dml,

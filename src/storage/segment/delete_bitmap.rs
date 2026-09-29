@@ -31,11 +31,11 @@ pub fn filter_batch(
     delete_bitmap: &[u8],
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
-    let mut keep = Vec::with_capacity(num_rows);
+    let mut keep: Vec<u32> = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
         let row_id = first_row_id + i as u64;
         if !is_deleted(delete_bitmap, row_id) {
-            keep.push(i);
+            keep.push(i as u32);
         }
     }
 
@@ -43,14 +43,12 @@ pub fn filter_batch(
         return Ok(batch.clone());
     }
 
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for c in 0..batch.num_columns() {
-        let src = batch.column(c).unwrap();
-        let mut new_col = crate::types::array::ColumnArray::empty(src.data_type());
-        for &i in &keep {
-            new_col.push(&src.scalar(i))?;
-        }
-        columns.push(new_col);
-    }
+    // One bulk gather per column (memcpy runs for fixed-width types) instead
+    // of a scalar() + push() round-trip per surviving cell: this runs for
+    // every candidate row group of every segment that carries a delete
+    // bitmap, so the per-cell rebuild dominated post-DELETE scans.
+    let columns = (0..batch.num_columns())
+        .map(|c| batch.column(c).expect("column exists").take(&keep))
+        .collect();
     RecordBatch::try_new(batch.schema.clone(), columns)
 }

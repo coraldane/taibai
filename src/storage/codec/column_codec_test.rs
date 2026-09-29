@@ -712,7 +712,7 @@ fn bitpacked_decimal_tick_prices_roundtrip_via_stored_choice() {
 fn delta_rle_roundtrip(values: &[i64]) {
     let payload = crate::storage::codec::column_codec::encode_i64_delta_rle_payload(values);
     let decoded =
-        crate::storage::codec::column_codec::decode_i64_delta_rle_payload(&payload).unwrap();
+        crate::storage::codec::column_codec::decode_i64_delta_rle_payload(&payload, values.len()).unwrap();
     assert_eq!(decoded, values);
 }
 

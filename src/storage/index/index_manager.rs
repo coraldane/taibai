@@ -29,6 +29,12 @@ pub struct IndexManager {
     segment_mgr: Arc<SegmentManager>,
     data_dir: PathBuf,
     unique_index_compaction: Mutex<UniqueIndexCompactionSchedule>,
+    /// Unique/PK keys that explicit-transaction INSERT statements published
+    /// at statement time. Entries become visible to constraint probes before
+    /// COMMIT, so ROLLBACK must retract exactly these keys — otherwise the
+    /// next INSERT of the same key sees a phantom duplicate until the next
+    /// snapshot refresh. COMMIT only drops the record.
+    txn_published: Mutex<HashMap<u64, HashMap<(String, String), Vec<(String, Vec<Vec<ScalarValue>>)>>>>,
 }
 
 #[derive(Default)]
@@ -49,6 +55,94 @@ impl IndexManager {
             segment_mgr,
             data_dir,
             unique_index_compaction: Mutex::new(UniqueIndexCompactionSchedule::default()),
+            txn_published: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records the unique-index/PK keys a transactional INSERT just published,
+    /// so ROLLBACK can retract them (see `discard_txn_published_entries_at_rollback`).
+    pub fn record_txn_published_keys(
+        &self,
+        txn_id: u64,
+        db: &str,
+        table: &str,
+        index_name: &str,
+        keys: Vec<Vec<ScalarValue>>,
+    ) {
+        if txn_id == 0 || keys.is_empty() {
+            return;
+        }
+        let mut guard = self.txn_published.lock().unwrap();
+        let per_table = guard.entry(txn_id).or_default();
+        let per_index = per_table
+            .entry((db.to_string(), table.to_string()))
+            .or_default();
+        if let Some(existing) = per_index
+            .iter_mut()
+            .find(|(name, _)| name == index_name)
+        {
+            existing.1.extend(keys);
+        } else {
+            per_index.push((index_name.to_string(), keys));
+        }
+    }
+
+    /// COMMIT path: the published entries are now authoritative, drop the
+    /// rollback record.
+    pub fn forget_txn_published_entries(&self, txn_id: u64) {
+        if txn_id == 0 {
+            return;
+        }
+        self.txn_published.lock().unwrap().remove(&txn_id);
+    }
+
+    /// Removes keys from the in-memory primary-key existence cache. Returns
+    /// false when the cache is absent or a key cannot be encoded, so callers
+    /// can fall back to dropping the whole cache.
+    pub fn remove_primary_keys(&self, db: &str, table: &str, keys: &[Vec<ScalarValue>]) -> bool {
+        let cache_key = format!("{}\0{}", db, table);
+        let mut indexes = self.primary_key_indexes.write().unwrap();
+        let Some(current) = indexes.get_mut(&cache_key) else {
+            return false;
+        };
+        for key in keys {
+            let Ok(encoded) = encode_unique_key(key) else {
+                return false;
+            };
+            current.remove(&encoded);
+        }
+        true
+    }
+
+    /// ROLLBACK path: retract the index entries this transaction published at
+    /// statement time. Key removal is precise and persisted (delta removal
+    /// records); when a snapshot cannot be maintained it is invalidated so
+    /// probes fall back to a full scan until the next rebuild — slow, never
+    /// wrong.
+    pub fn discard_txn_published_entries_at_rollback(&self, txn_id: u64) {
+        if txn_id == 0 {
+            return;
+        }
+        let Some(per_table) = self.txn_published.lock().unwrap().remove(&txn_id) else {
+            return;
+        };
+        for ((db, table), per_index) in per_table {
+            for (index_name, keys) in per_index {
+                let is_primary = index_name == PRIMARY_LOCATION_INDEX_NAME;
+                if is_primary && !self.remove_primary_keys(&db, &table, &keys) {
+                    self.invalidate_primary_key_cache(&db, &table);
+                }
+                match self.remove_unique_index_keys(&db, &table, &index_name, &keys) {
+                    Ok(true) => {}
+                    _ => {
+                        if is_primary {
+                            self.invalidate_primary_key_index(&db, &table);
+                        } else {
+                            self.invalidate_unique_index_snapshot(&db, &table, &index_name);
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -289,6 +289,22 @@ impl TxnMutationRegistry {
         })
     }
 
+    /// True when a transaction *other* than `txn_id` pins the table. DML
+    /// outside the pinning transaction (auto-commit statements, other open
+    /// transactions) must not run while pins exist: an auto-commit DELETE
+    /// physically removes memtable rows and shifts positions, so a later
+    /// COMMIT of the pinned transaction would delete the wrong rows.
+    pub fn table_pinned_by_other(&self, txn_id: u64, db: &str, table: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.iter().any(|(&holder, txn)| {
+            holder != txn_id
+                && txn
+                    .tables
+                    .iter()
+                    .any(|entry| entry.db == db && entry.table == table && entry.is_pinned())
+        })
+    }
+
     /// True when a background flush must skip this memtable: a transaction
     /// still needs its batch positions stable for the deferred removal.
     pub fn is_memtable_pinned(&self, memtable_id: Uuid) -> bool {

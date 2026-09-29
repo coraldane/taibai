@@ -190,12 +190,9 @@ fn count_with_predicates(
             };
             let bitmap_active = !reader.delete_bitmap().is_empty();
             if bitmap_active {
-                let rg_start_row: u64 = reader
-                    .footer_row_groups_info()
-                    .iter()
-                    .take(*rg_idx)
-                    .map(|r| r.row_count)
-                    .sum();
+                // O(1) prefix sum; the old clone-the-whole-footer sum was
+                // quadratic in the row-group count for bitmap segments.
+                let rg_start_row: u64 = reader.row_group_start_row(*rg_idx);
                 batch = delete_bitmap::filter_batch(&batch, rg_start_row, reader.delete_bitmap())?;
             }
 
@@ -232,9 +229,9 @@ pub fn build_count_star_result(count: u64) -> super::super::engine::ExecResult {
     let mut batch = RecordBatch::new(schema.clone());
     batch
         .column_mut(0)
-        .unwrap()
+        .expect("count(*) schema has exactly one column")
         .push(&ScalarValue::Int64(Some(count as i64)))
-        .unwrap();
+        .expect("Int64 push into a fresh column cannot fail");
     super::super::engine::ExecResult::Query {
         schema,
         batches: vec![batch],

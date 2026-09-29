@@ -481,16 +481,17 @@ impl SegmentManager {
         partition_key: &str,
         min_seal_size: u64,
     ) -> Result<Option<(PathBuf, Schema, u64)>> {
-        let _pattern = format!("p{}_*", partition_key);
+        let prefix = format!("p{}_", partition_key);
         let segments: Vec<PathBuf> = if let Ok(entries) = std::fs::read_dir(table_dir) {
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     let file_name = e.file_name();
                     let name = file_name.to_string_lossy();
-                    name.starts_with(&format!("p{}", partition_key))
-                        && name.ends_with(".dat")
-                        && name.contains('_')
+                    // The `_` separator is load-bearing: without it partition
+                    // "1" matches partition "10"'s segment (p1 vs p10) and
+                    // recovers a file another writer owns.
+                    name.starts_with(&prefix) && name.ends_with(".dat")
                 })
                 .map(|e| e.path())
                 .collect()
@@ -538,7 +539,11 @@ impl SegmentManager {
         let reader = SegmentReader::open_owned(seg_path)?;
         let data_end = reader.data_end();
 
-        let row_groups = reader.footer_row_groups_info();
+        // Recovery rehydrates the writer's row-group metadata once per
+        // recovered segment — the deep clone is fine here (not per row-group
+        // read); use the borrowed accessor and clone only what the writer
+        // takes ownership of.
+        let row_groups = reader.footer_row_groups().to_vec();
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)

@@ -59,7 +59,7 @@ pub enum ScalarValueHashable {
 }
 
 impl ScalarValueHashable {
-    fn from_column(column: &ColumnArray, row: usize) -> Self {
+    pub fn from_column(column: &ColumnArray, row: usize) -> Self {
         match column {
             ColumnArray::Selected { .. } | ColumnArray::Rle { .. } => {
                 Self::from_column(column.flattened(), row)
@@ -155,6 +155,10 @@ pub struct JoinHashTable {
     pub matched: Vec<bool>,
     /// Total row count across all build batches.
     total_rows: usize,
+    /// Prefix sum of build-batch row counts. `row_offset` is called per
+    /// matched row during LEFT/RIGHT/FULL probes; the old re-summing made
+    /// marking O(matched × batches).
+    batch_offsets: Vec<usize>,
 }
 
 impl JoinHashTable {
@@ -165,6 +169,7 @@ impl JoinHashTable {
             key_columns,
             matched: Vec::new(),
             total_rows: 0,
+            batch_offsets: vec![0],
         }
     }
 
@@ -186,6 +191,8 @@ impl JoinHashTable {
         }
 
         self.build_data.push(batch);
+        let last = self.batch_offsets.last().copied().unwrap_or(0);
+        self.batch_offsets.push(last + num_rows);
     }
 
     /// Finalize the build phase: initialize matched tracking.
@@ -260,11 +267,13 @@ impl JoinHashTable {
     }
 
     fn row_offset(&self, batch_idx: usize, row_idx: usize) -> usize {
-        let mut offset = 0;
-        for i in 0..batch_idx {
-            offset += self.build_data[i].num_rows();
-        }
-        offset + row_idx
+        // `batch_offsets` holds the prefix sum (len = batches + 1); the old
+        // re-sum over build batches ran once per matched row.
+        self.batch_offsets
+            .get(batch_idx)
+            .copied()
+            .unwrap_or(0)
+            + row_idx
     }
 }
 

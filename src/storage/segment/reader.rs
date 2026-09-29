@@ -329,13 +329,16 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// Truncate to `data_end` and append the new footer, retrying briefly:
-    /// on Windows, `set_len` fails while a reader holds the segment mmapped
-    /// (ERROR_USER_MAPPED_FILE). The write is idempotent, so retrying the
-    /// whole body after a partial attempt is safe.
+    /// Truncate to `data_end` and append the new footer, retrying with
+    /// backoff: on Windows, `set_len` fails while a reader holds the segment
+    /// mmapped (ERROR_USER_MAPPED_FILE). The write is idempotent, so
+    /// retrying the whole body after a partial attempt is safe. A long
+    /// analytical scan easily holds its mmap for many seconds, so the window
+    /// grows to ~10s (fixed 200ms steps); a delete failing here used to
+    /// leave the statement partially applied.
     fn apply_footer_bytes_with_retry(path: &Path, data_end: u64, footer: &[u8]) -> Result<()> {
-        const ATTEMPTS: usize = 20;
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+        const ATTEMPTS: usize = 50;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
         let mut last_err = None;
         for attempt in 0..ATTEMPTS {
             let result = (|| -> Result<()> {
@@ -551,7 +554,20 @@ impl SegmentReader {
         }
 
         let data = self.data.as_slice();
-        let all_data = &data[rg.offset as usize..rg.offset as usize + total_size];
+        // Footer offsets come from disk: a corrupted footer must surface as
+        // an error, not as an out-of-bounds panic (same contract as
+        // read_column_raw).
+        let rg_end = (rg.offset as usize)
+            .checked_add(total_size)
+            .ok_or_else(|| TaibaiError::Storage("segment row group offset overflow".to_string()))?;
+        if rg.offset as usize > data.len() || rg_end > data.len() {
+            return Err(TaibaiError::Storage(format!(
+                "segment row group range {}..{} exceeds data length {}",
+                rg.offset, rg_end,
+                data.len()
+            )));
+        }
+        let all_data = &data[rg.offset as usize..rg_end];
 
         let col_offsets: Vec<usize> = rg
             .column_compressed_sizes
@@ -607,7 +623,20 @@ impl SegmentReader {
         }
 
         let data = self.data.as_slice();
-        let all_data = &data[rg.offset as usize..rg.offset as usize + total_size];
+        // Footer offsets come from disk: a corrupted footer must surface as
+        // an error, not as an out-of-bounds panic (same contract as
+        // read_column_raw).
+        let rg_end = (rg.offset as usize)
+            .checked_add(total_size)
+            .ok_or_else(|| TaibaiError::Storage("segment row group offset overflow".to_string()))?;
+        if rg.offset as usize > data.len() || rg_end > data.len() {
+            return Err(TaibaiError::Storage(format!(
+                "segment row group range {}..{} exceeds data length {}",
+                rg.offset, rg_end,
+                data.len()
+            )));
+        }
+        let all_data = &data[rg.offset as usize..rg_end];
 
         let col_offsets: Vec<usize> = rg
             .column_compressed_sizes
@@ -1013,9 +1042,14 @@ fn split_batch(
 ) -> crate::types::batch::RecordBatch {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for i in 0..batch.num_columns() {
-        columns.push(split_column(batch.column(i).unwrap(), start, end));
+        columns.push(split_column(
+            batch.column(i).expect("column exists"),
+            start,
+            end,
+        ));
     }
-    crate::types::batch::RecordBatch::try_new(batch.schema.clone(), columns).unwrap()
+    crate::types::batch::RecordBatch::try_new(batch.schema.clone(), columns)
+        .expect("split_batch: sliced columns match the batch schema")
 }
 
 fn split_column(col: &ColumnArray, start: usize, end: usize) -> ColumnArray {

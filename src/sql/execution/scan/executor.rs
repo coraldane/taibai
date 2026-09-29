@@ -1099,7 +1099,10 @@ impl<'a> ScanExecutor<'a> {
                     cols.push(*col);
                 }
             }
-            let row_groups = reader.footer_row_groups_info();
+            // Borrowed footer access: the deep-cloning variant materialized
+            // every row group's metadata (bloom filters + value sets) just to
+            // read one entry's column sizes.
+            let row_groups = reader.footer_row_groups();
             if let Some(rg) = row_groups.get(rg_idx) {
                 for col_idx in cols {
                     if let Some(bytes) = rg.column_compressed_sizes.get(col_idx) {

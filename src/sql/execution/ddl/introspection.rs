@@ -684,6 +684,19 @@ pub fn exec_optimize_table(
         compactor.optimize_table(db, table, &table_meta)?
     };
 
+    // TTL-expired rows physically removed by the rewrite were never
+    // subtracted from the catalog by a DELETE; correct row_count first.
+    if stats.rows_dropped_ttl > 0 {
+        let mut catalogs = engine.catalogs().write().unwrap();
+        if let Some(catalog) = catalogs.get_mut(db) {
+            if let Some(meta) = catalog.get_table_mut(table) {
+                meta.row_count = (meta.row_count - stats.rows_dropped_ttl as i64).max(0);
+                let meta_dir = engine.data_dir().join("meta");
+                let _ = catalog.save(&meta_dir);
+            }
+        }
+    }
+
     // The rewrite moved rows to new segment locations, so rebuild the
     // location-index snapshots eagerly instead of invalidating them for a
     // lazy rebuild on the next probe. Skip when compaction was a no-op.

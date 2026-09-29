@@ -378,6 +378,12 @@ pub(crate) fn exec_update_in_txn(
         // Transactional memtables (this transaction's own INSERTs) update in
         // place — no durable state, ROLLBACK-safe. Committed memtables defer
         // via tombstone positions + new rows, exactly like segments.
+        // Memtable rows this transaction already tombstoned in earlier
+        // statements must not match again: the committed memtable's batch is
+        // never mutated between statements (only positions are recorded), so
+        // without this filter a second UPDATE of the same row would append a
+        // second copy of its new image at COMMIT.
+        let txn_mutations = engine.txn_mutations();
         for memtable in engine
             .memtable_manager()
             .get_visible_to(db, table, reader_txn_id)
@@ -387,8 +393,22 @@ pub(crate) fn exec_update_in_txn(
                     continue;
                 }
             }
-            let Some(batch) = memtable.read_snapshot_arc() else {
+            let Some(raw_batch) = memtable.read_snapshot_arc() else {
                 continue;
+            };
+            let prior_positions = txn_mutations.memtable_positions(reader_txn_id, memtable.id());
+            let (batch, live_positions) = match prior_positions {
+                Some(positions) if !positions.is_empty() => {
+                    let keep: Vec<u32> = (0..raw_batch.num_rows() as u32)
+                        .filter(|row| !positions.contains(row))
+                        .collect();
+                    let filtered =
+                        crate::storage::core::txn_mutations::filter_batch_excluding_positions(
+                            &raw_batch, &positions,
+                        )?;
+                    (Arc::new(filtered), Some(keep))
+                }
+                _ => (Arc::clone(&raw_batch), None),
             };
             let (new_batch, affected, matched_rows) =
                 super::dml_update::update_memtable_batch(
@@ -410,13 +430,22 @@ pub(crate) fn exec_update_in_txn(
                 }
                 continue;
             }
-            engine.txn_mutations().register_memtable_tombstones(
+            // Map the filtered-batch positions back to absolute positions in
+            // the committed memtable batch for the deferred removal.
+            let absolute_rows: Vec<u32> = match &live_positions {
+                Some(map) => matched_rows
+                    .iter()
+                    .map(|&pos| map[pos as usize])
+                    .collect(),
+                None => matched_rows.clone(),
+            };
+            txn_mutations.register_memtable_tombstones(
                 reader_txn_id,
                 db,
                 table,
                 partitions.as_deref(),
                 Arc::clone(&memtable),
-                matched_rows.iter().copied(),
+                absolute_rows.iter().copied(),
             );
             let columns = new_batch
                 .columns
@@ -686,19 +715,24 @@ fn materialize_memtable(
         ));
     };
     let filtered = filter_batch_excluding_positions(&snapshot, positions)?;
-    if !memtable.replace_pending_batch(Arc::new(filtered.clone())) {
-        return Err(TaibaiError::Internal(
-            "deferred-DELETE memtable left pending state before COMMIT (a flush raced the transaction)"
-                .to_string(),
-        ));
-    }
+    // Durable tail BEFORE the in-memory swap: this runs under the table's
+    // mutation lock, so a crash between the two steps restores the filtered
+    // tail (deletes preserved) instead of resurrecting the deleted rows next
+    // to a possibly already-rewritten tail.
     let table_dir = engine.data_dir().join(memtable.db()).join(memtable.table());
     crate::storage::core::durable_tail::persist(
         &table_dir,
         memtable.id(),
         memtable.partition_key(),
         &filtered,
-    )
+    )?;
+    if !memtable.replace_pending_batch(Arc::new(filtered.clone())) {
+        return Err(TaibaiError::Internal(
+            "deferred-DELETE memtable left pending state before COMMIT (a flush raced the transaction)"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Drop the transaction's deferred mutations without touching durable state
