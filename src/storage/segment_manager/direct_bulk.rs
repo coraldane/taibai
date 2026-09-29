@@ -9,6 +9,27 @@ fn log_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
     }
 }
 
+/// Bulk appends this slow deserve a permanent WARN (not only behind the
+/// insert-profile flag): the usual cause is a synchronous segment seal inside
+/// the table-wide active-segments lock (or partition-lock contention), which
+/// stalls every concurrent writer of the table and shows up client-side as
+/// request timeouts / "outcome unknown".
+const SLOW_BULK_APPEND_WARN: std::time::Duration = std::time::Duration::from_secs(10);
+const SLOW_SEAL_WARN: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn warn_slow_seal(db: &str, table: &str, partition: &str, size_bytes: u64, elapsed: std::time::Duration) {
+    if elapsed >= SLOW_SEAL_WARN {
+        tracing::warn!(
+            db,
+            table,
+            partition,
+            size_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow segment seal inside the table active-segments lock; concurrent writers of this table were stalled"
+        );
+    }
+}
+
 impl SegmentManager {
     pub fn bulk_insert_payload(&self, db: &str, payload: &[u8]) -> Result<u64> {
         let req = parse_direct_bulk_payload(payload)?;
@@ -62,7 +83,15 @@ impl SegmentManager {
             )?;
 
             if seg.current_size >= self.max_segment_size() {
+                let seal_start = std::time::Instant::now();
                 seg.seal(&|path| self.invalidate_reader(path))?;
+                warn_slow_seal(
+                    db,
+                    req.table_name,
+                    "",
+                    seg.current_size,
+                    seal_start.elapsed(),
+                );
                 active_guard.remove("");
             } else {
                 seg.flush_meta(&|path| self.invalidate_reader(path))?;
@@ -186,7 +215,8 @@ impl SegmentManager {
             .map(String::as_str)
             .collect::<Vec<_>>();
 
-        self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
+        let total_start = std::time::Instant::now();
+        let result = self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
             ensure_state_not_retired(&state, db, req.table_name)?;
 
             let mut written = 0u64;
@@ -208,7 +238,15 @@ impl SegmentManager {
                     zone_map_columns.as_deref(),
                 )?;
                 if seg.current_size >= self.max_segment_size() {
+                    let seal_start = std::time::Instant::now();
                     seg.seal(&|path| self.invalidate_reader(path))?;
+                    warn_slow_seal(
+                        db,
+                        req.table_name,
+                        &group.partition_key,
+                        seg.current_size,
+                        seal_start.elapsed(),
+                    );
                     active_guard.remove(&group.partition_key);
                 } else if flush_immediately {
                     seg.flush_meta(&|path| self.invalidate_reader(path))?;
@@ -220,7 +258,18 @@ impl SegmentManager {
             }
             log_profile("append", written as usize, append_start.elapsed());
             Ok(written)
-        })
+        });
+        let elapsed = total_start.elapsed();
+        if elapsed >= SLOW_BULK_APPEND_WARN {
+            tracing::warn!(
+                db,
+                table = req.table_name,
+                rows = req.row_count,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow direct bulk append: synchronous segment seal inside the table-wide active-segments lock or partition-lock contention stalls concurrent writers (client sees request timeouts)"
+            );
+        }
+        result
     }
 
     fn direct_bulk_key_column_indices(

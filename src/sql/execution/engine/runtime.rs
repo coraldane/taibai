@@ -519,6 +519,11 @@ impl Engine {
     }
 
     pub fn flush_table_buffers(&self, db: &str, table: &str) -> Result<u64> {
+        // The end-of-bulk-import flush can write gigabytes per table; when it
+        // takes this long, every bulk commit of the last session (and the
+        // client behind it) waited just as long — worth a permanent WARN.
+        const SLOW_TABLE_FLUSH_WARN: std::time::Duration = std::time::Duration::from_secs(30);
+        let start = std::time::Instant::now();
         self.batch_writer.flush_table(db, table)?;
 
         let rows = self.segment_mgr.flush_table_active(db, table)?;
@@ -534,6 +539,17 @@ impl Engine {
             let mut state = self.catalog_save_state.lock().unwrap();
             state.pending_insert_rows = 0;
             state.last_save_at = Instant::now();
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= SLOW_TABLE_FLUSH_WARN {
+            tracing::warn!(
+                db,
+                table,
+                rows,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow table buffer flush; the requesting bulk client waited for the whole duration"
+            );
         }
 
         Ok(rows)
