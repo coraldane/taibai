@@ -156,6 +156,7 @@ where
         usize::MAX
     };
     let idle_timeout_secs = config.server.connection_idle_timeout_secs;
+    let bulk_idle_timeout_secs = config.server.bulk_import_idle_timeout_secs;
     let request_queue_timeout_ms = config.server.request_queue_timeout_ms;
     let notification_capacity = config.pubsub.notification_channel_capacity.max(1);
     let mut framed = Framed::new(
@@ -191,13 +192,27 @@ where
             // and restarts the idle window, so a pure subscriber that pushes
             // data but sends no frames is not disconnected mid-stream.
             let wait = next_frame_or_push(&mut framed, &mut push_rx);
-            let incoming = if idle_timeout_secs == 0 {
+            // A bulk-import client legitimately stays silent for long
+            // stretches (decoding input files, filling batches) and depends
+            // on keepalive PINGs; a PING interval racing the regular idle
+            // timeout would kill a live import mid-file. Widen (or drop,
+            // when set to 0) the idle window while the bulk session is open.
+            let effective_idle_timeout_secs =
+                if handler.as_ref().is_some_and(|h| h.is_bulk_import_mode()) {
+                    bulk_idle_timeout_secs
+                } else {
+                    idle_timeout_secs
+                };
+            let incoming = if effective_idle_timeout_secs == 0 {
                 wait.await
             } else {
-                match timeout(Duration::from_secs(idle_timeout_secs), wait).await {
+                match timeout(Duration::from_secs(effective_idle_timeout_secs), wait).await {
                     Ok(incoming) => incoming,
                     Err(_) => {
-                        tracing::warn!(idle_timeout_secs, "closing idle connection");
+                        tracing::warn!(
+                            idle_timeout_secs = effective_idle_timeout_secs,
+                            "closing idle connection"
+                        );
                         break 'connection Ok(());
                     }
                 }

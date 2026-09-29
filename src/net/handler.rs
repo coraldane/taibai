@@ -92,6 +92,14 @@ impl Handler {
         self.push_channel = Some(push_tx);
     }
 
+    /// Whether this connection currently holds an open bulk-import session.
+    /// The connection loop widens the idle window while this is true: bulk
+    /// import clients go silent for long stretches and must not be idle-
+    /// disconnected mid-import.
+    pub(crate) fn is_bulk_import_mode(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.bulk_import_mode)
+    }
+
     pub fn flush_on_disconnect(&mut self) {
         // Same rationale as the Drop safety net below; the normal path gets
         // the tidy, ordered rollback before any bulk-import flush work.

@@ -55,6 +55,7 @@ server:
 |------|------|------|
 | `request_queue_timeout_ms` | 30000 | 重请求等待执行槽位的最长时间，超时返回过载错误而不是静默排队 |
 | `connection_idle_timeout_secs` | — | 连接无任何协议帧的最长时间，超时断开（0 关闭） |
+| `bulk_import_idle_timeout_secs` | 3600 | bulk 导入会话存续期间的空闲断连超时：导入客户端会长时间静默（解码输入文件、攒批），仅靠 keepalive PING 续命，间隔与常规空闲打平时会误杀进行中的导入（0 = bulk 会话完全不受空闲断连） |
 | `max_concurrent_requests` | 8 | CPU/磁盘重请求的最大并发数 |
 
 过载与超时错误会返回给客户端，应用侧应将其视为可重试信号。

@@ -597,6 +597,14 @@ pub struct ServerSettings {
     /// Set to 0 to disable the idle timeout.
     #[serde(default = "default_connection_idle_timeout_secs")]
     pub connection_idle_timeout_secs: u64,
+    /// Idle timeout applied while the connection holds an open bulk-import
+    /// session. Bulk import clients legitimately stay silent for long
+    /// stretches (decoding input files, filling batches) and rely on
+    /// keepalive PINGs; a keepalive interval that races the regular idle
+    /// timeout kills live imports mid-file. Set to 0 to exempt bulk sessions
+    /// from idle disconnects entirely.
+    #[serde(default = "default_bulk_import_idle_timeout_secs")]
+    pub bulk_import_idle_timeout_secs: u64,
     /// Maximum time allowed for an incoming TLS handshake. Set to 0 to disable.
     #[serde(default = "default_tls_handshake_timeout_secs")]
     pub tls_handshake_timeout_secs: u64,
@@ -614,6 +622,10 @@ pub struct ServerSettings {
 
 fn default_statement_timeout_secs() -> u64 {
     0
+}
+
+fn default_bulk_import_idle_timeout_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -960,6 +972,7 @@ fn default_server_settings() -> ServerSettings {
         max_connections: default_max_connections(),
         max_concurrent_requests: default_max_concurrent_requests(),
         connection_idle_timeout_secs: default_connection_idle_timeout_secs(),
+        bulk_import_idle_timeout_secs: default_bulk_import_idle_timeout_secs(),
         tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
         request_queue_timeout_ms: default_request_queue_timeout_ms(),
         statement_timeout_secs: default_statement_timeout_secs(),

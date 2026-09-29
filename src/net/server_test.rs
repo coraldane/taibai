@@ -26,7 +26,6 @@ fn spawn_test_connection_with_limiter(
     engine: Arc<Engine>,
     request_limiter: Arc<Semaphore>,
 ) -> (Framed<DuplexStream, MessageCodec>, JoinHandle<Result<()>>) {
-    let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);
     let config = Arc::new(ServerConfig {
         compression: crate::common::config::CompressionSettings {
             enabled: false,
@@ -34,6 +33,22 @@ fn spawn_test_connection_with_limiter(
         },
         ..ServerConfig::default()
     });
+    spawn_test_connection_with_limiter_and_config(engine, request_limiter, config)
+}
+
+fn spawn_test_connection_with_config(
+    engine: Arc<Engine>,
+    config: Arc<ServerConfig>,
+) -> (Framed<DuplexStream, MessageCodec>, JoinHandle<Result<()>>) {
+    spawn_test_connection_with_limiter_and_config(engine, Arc::new(Semaphore::new(4)), config)
+}
+
+fn spawn_test_connection_with_limiter_and_config(
+    engine: Arc<Engine>,
+    request_limiter: Arc<Semaphore>,
+    config: Arc<ServerConfig>,
+) -> (Framed<DuplexStream, MessageCodec>, JoinHandle<Result<()>>) {
+    let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);
     let server = tokio::spawn(handle_framed(
         server_stream,
         config,
@@ -171,6 +186,65 @@ async fn disconnect_while_waiting_for_request_capacity_closes_connection() {
     timeout(Duration::from_secs(2), server)
         .await
         .expect("disconnected connection must not wait for request capacity")
+        .unwrap()
+        .unwrap();
+}
+
+/// bulk 导入会话存续期间，连接不受常规空闲超时约束（走
+/// `bulk_import_idle_timeout_secs`，0 = 完全豁免）；会话结束后恢复
+/// 常规空闲断连。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_import_sessions_survive_the_regular_idle_timeout() {
+    let (_dir, engine) = test_engine();
+    let mut config = ServerConfig::default();
+    config.server.connection_idle_timeout_secs = 1;
+    config.server.bulk_import_idle_timeout_secs = 0;
+    let config = Arc::new(config);
+
+    // 基线：常规连接空闲 1 秒即被断开。
+    let (mut plain, plain_server) =
+        spawn_test_connection_with_config(Arc::clone(&engine), Arc::clone(&config));
+    login(&mut plain, "root").await;
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    timeout(Duration::from_secs(2), plain_server)
+        .await
+        .expect("regular idle connection should be closed")
+        .unwrap()
+        .unwrap();
+
+    // bulk 会话连接：空闲超过常规窗口仍存活（PING 有 PONG）；
+    // STOP BULK 结束会话后，常规空闲窗口重新生效。
+    let (mut bulk, bulk_server) = spawn_test_connection_with_config(engine, config);
+    login(&mut bulk, "root").await;
+    bulk.send(query("START BULK IMPORT")).await.unwrap();
+    let started = timeout(Duration::from_secs(2), bulk.next())
+        .await
+        .expect("bulk import should start")
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.msg_type, MSG_TYPE_OK);
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    bulk.send(Message::empty(MSG_TYPE_PING)).await.unwrap();
+    let pong = timeout(Duration::from_secs(2), bulk.next())
+        .await
+        .expect("bulk session must outlive the regular idle timeout")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pong.msg_type, MSG_TYPE_PONG);
+
+    bulk.send(query("STOP BULK IMPORT")).await.unwrap();
+    let stopped = timeout(Duration::from_secs(2), bulk.next())
+        .await
+        .expect("bulk import should stop")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.msg_type, MSG_TYPE_OK);
+
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    timeout(Duration::from_secs(2), bulk_server)
+        .await
+        .expect("idle timeout should apply again after the bulk session ends")
         .unwrap()
         .unwrap();
 }
