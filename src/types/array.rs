@@ -92,6 +92,25 @@ impl Utf8Buffer {
         }
     }
 
+    /// Bulk-append `other[start..end]`: one data memcpy plus an offsets pass
+    /// with a base adjustment — no per-value iteration.
+    pub fn extend_from_bulk(&mut self, other: &Self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        let src_base = other.offsets[start] as usize;
+        let src_end = other.offsets[end] as usize;
+        let old_data_len = self.data.len();
+        self.offsets.reserve(end - start);
+        self.data.extend_from_slice(&other.data[src_base..src_end]);
+        let adjust = (old_data_len - src_base) as u32;
+        self.offsets.extend(
+            other.offsets[start + 1..=end]
+                .iter()
+                .map(|o| o.wrapping_add(adjust)),
+        );
+    }
+
     /// Used only by compaction's position gatherer. Query execution builds
     /// buffers append-only and never pays this relocation cost.
     pub fn set(&mut self, index: usize, value: &str) {
@@ -1752,6 +1771,124 @@ impl ColumnArray {
                 Ok(())
             }
             _ => unreachable!("column type checked before extend"),
+        }
+    }
+
+    /// Append `other[start..end]` without materializing a slice: fixed-width
+    /// columns bulk-copy their data window and rebuild the bitmap range,
+    /// VarChar bulk-copies arena + offsets. View/Rle/Dictionary sources fall
+    /// back to `slice_fast` + `extend`. The hot store's append loop pays this
+    /// once per batch per column, so the per-row `slice_fast` paths (bitmap
+    /// pushes and per-value string clones) only run for view sources.
+    pub fn extend_range(&mut self, other: &ColumnArray, start: usize, end: usize) -> Result<()> {
+        self.flatten_in_place();
+        let owned_other;
+        let other = match other {
+            ColumnArray::Selected { .. } => {
+                owned_other = other.flattened().clone();
+                &owned_other
+            }
+            other => other,
+        };
+        if end <= start {
+            return Ok(());
+        }
+        if self.data_type() != other.data_type() {
+            return Err(TaibaiError::Internal(format!(
+                "cannot extend {} with {}",
+                self.data_type().display_name(),
+                other.data_type().display_name(),
+            )));
+        }
+
+        macro_rules! extend_range_column {
+            ($variant:ident) => {{
+                match (self, other) {
+                    (
+                        ColumnArray::$variant { data, bitmap },
+                        ColumnArray::$variant {
+                            data: src_data,
+                            bitmap: src_bitmap,
+                        },
+                    ) => {
+                        // Typed vecs index in ELEMENTS — no width math.
+                        data.extend_from_slice(&src_data[start..end]);
+                        for i in start..end {
+                            if src_bitmap.is_null(i) {
+                                bitmap.push_null();
+                            } else {
+                                bitmap.push_valid();
+                            }
+                        }
+                        return Ok(());
+                    }
+                    _ => unreachable!("column type checked before extend_range"),
+                }
+            }};
+        }
+
+        match (&mut *self, &*other) {
+            (ColumnArray::Bool { .. }, ColumnArray::Bool { .. }) => {
+                extend_range_column!(Bool)
+            }
+            (ColumnArray::Int8 { .. }, ColumnArray::Int8 { .. }) => extend_range_column!(Int8),
+            (ColumnArray::Int16 { .. }, ColumnArray::Int16 { .. }) => {
+                extend_range_column!(Int16)
+            }
+            (ColumnArray::Int32 { .. }, ColumnArray::Int32 { .. }) => {
+                extend_range_column!(Int32)
+            }
+            (ColumnArray::Int64 { .. }, ColumnArray::Int64 { .. }) => {
+                extend_range_column!(Int64)
+            }
+            (ColumnArray::UInt8 { .. }, ColumnArray::UInt8 { .. }) => extend_range_column!(UInt8),
+            (ColumnArray::UInt16 { .. }, ColumnArray::UInt16 { .. }) => {
+                extend_range_column!(UInt16)
+            }
+            (ColumnArray::UInt32 { .. }, ColumnArray::UInt32 { .. }) => {
+                extend_range_column!(UInt32)
+            }
+            (ColumnArray::UInt64 { .. }, ColumnArray::UInt64 { .. }) => {
+                extend_range_column!(UInt64)
+            }
+            (ColumnArray::Float32 { .. }, ColumnArray::Float32 { .. }) => {
+                extend_range_column!(Float32)
+            }
+            (ColumnArray::Float64 { .. }, ColumnArray::Float64 { .. }) => {
+                extend_range_column!(Float64)
+            }
+            (ColumnArray::Decimal { .. }, ColumnArray::Decimal { .. }) => {
+                extend_range_column!(Decimal)
+            }
+            (ColumnArray::Date { .. }, ColumnArray::Date { .. }) => extend_range_column!(Date),
+            (ColumnArray::Time { .. }, ColumnArray::Time { .. }) => extend_range_column!(Time),
+            (ColumnArray::Timestamp { .. }, ColumnArray::Timestamp { .. }) => {
+                extend_range_column!(Timestamp)
+            }
+            (ColumnArray::Interval { .. }, ColumnArray::Interval { .. }) => {
+                extend_range_column!(Interval)
+            }
+            (
+                ColumnArray::VarChar { data, bitmap },
+                ColumnArray::VarChar {
+                    data: src_data,
+                    bitmap: src_bitmap,
+                },
+            ) => {
+                data.extend_from_bulk(src_data, start, end);
+                for i in start..end {
+                    if src_bitmap.is_null(i) {
+                        bitmap.push_null();
+                    } else {
+                        bitmap.push_valid();
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                let sliced = other.slice_fast(start, end);
+                self.extend(&sliced)
+            }
         }
     }
 

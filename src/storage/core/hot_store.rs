@@ -63,7 +63,7 @@ fn watermark_cut(min_offset: u64, base: u64) -> u32 {
 
 /// The postings at or above the watermark cut (rows still held in memory).
 #[inline]
-fn resident_postings<'a>(postings: &'a [u32], cut: u32) -> &'a [u32] {
+fn resident_postings(postings: &[u32], cut: u32) -> &[u32] {
     &postings[postings.partition_point(|&o| o < cut)..]
 }
 
@@ -83,7 +83,7 @@ struct PoolCacheSlot {
     _pad: u32,
 }
 
-const POOL_CACHE_SLOTS: usize = 1024;
+const POOL_CACHE_SLOTS: usize = 4096;
 
 /// Interning pool for variable-length key values. A distinct string is stored
 /// once and addressed by a `u32` id, so that building the inverted index never
@@ -297,9 +297,14 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
         ColumnArray::Timestamp { data, .. } => num_keys!(data, |v: i64| ValueKey::Int(v)),
         ColumnArray::Interval { data, .. } => num_keys!(data, |v: i64| ValueKey::Int(v)),
         ColumnArray::VarChar { data, .. } => {
-            // Symbol-grouped ingestion repeats each key on consecutive rows;
-            // a byte compare against the previous row skips the whole intern
-            // for those runs.
+            // Two dedup layers: a byte compare against the previous row skips
+            // consecutive runs (symbol-grouped ingestion), and a batch-local
+            // map catches interleaved symbols — beyond ~1000 distinct values
+            // the pool's direct-mapped cache thrashes and every row used to
+            // pay a full string hash + probe. The pool now interns each
+            // distinct string once per batch.
+            let mut seen: HashMap<&str, ValueKey, FastBuild> =
+                HashMap::with_capacity_and_hasher(256, FastBuild::default());
             let mut prev_valid = false;
             for i in 0..n {
                 if bm.is_null(i) {
@@ -308,7 +313,16 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
                 } else if prev_valid && data[i] == data[i - 1] {
                     out.push(*out.last().expect("previous row pushed a key"));
                 } else {
-                    out.push(ValueKey::Str(pool.intern(&data[i])));
+                    let s: &str = &data[i];
+                    let key = match seen.get(s) {
+                        Some(key) => *key,
+                        None => {
+                            let key = ValueKey::Str(pool.intern(s));
+                            seen.insert(s, key);
+                            key
+                        }
+                    };
+                    out.push(key);
                     prev_valid = true;
                 }
             }
@@ -321,6 +335,267 @@ fn collect_keys(col: &ColumnArray, pool: &mut StringPool) -> Result<Vec<ValueKey
         }
     }
     Ok(out)
+}
+
+/// Row accessor that yields the inverted-index `ValueKey` for a column without
+/// materializing a `Vec<ValueKey>`: the append path groups keys straight from
+/// the column range in one pass. Variable-width values dedup through a
+/// batch-local map, so the pool interns each distinct string once per slice
+/// (the pool's own 1024-slot direct-mapped cache thrashes beyond ~1000
+/// distinct symbols).
+enum KeySource<'a> {
+    Bool {
+        data: &'a [u8],
+        bm: &'a NullBitmap,
+    },
+    Int8 {
+        data: &'a [i8],
+        bm: &'a NullBitmap,
+    },
+    Int16 {
+        data: &'a [i16],
+        bm: &'a NullBitmap,
+    },
+    Int32 {
+        data: &'a [i32],
+        bm: &'a NullBitmap,
+    },
+    Int64 {
+        data: &'a [i64],
+        bm: &'a NullBitmap,
+    },
+    UInt8 {
+        data: &'a [u8],
+        bm: &'a NullBitmap,
+    },
+    UInt16 {
+        data: &'a [u16],
+        bm: &'a NullBitmap,
+    },
+    UInt32 {
+        data: &'a [u32],
+        bm: &'a NullBitmap,
+    },
+    UInt64 {
+        data: &'a [u64],
+        bm: &'a NullBitmap,
+    },
+    Float32 {
+        data: &'a [f32],
+        bm: &'a NullBitmap,
+    },
+    Float64 {
+        data: &'a [f64],
+        bm: &'a NullBitmap,
+    },
+    Decimal {
+        data: &'a [i64],
+        bm: &'a NullBitmap,
+    },
+    Date {
+        data: &'a [i32],
+        bm: &'a NullBitmap,
+    },
+    Time {
+        data: &'a [i64],
+        bm: &'a NullBitmap,
+    },
+    Timestamp {
+        data: &'a [i64],
+        bm: &'a NullBitmap,
+    },
+    Interval {
+        data: &'a [i64],
+        bm: &'a NullBitmap,
+    },
+    VarChar {
+        data: &'a Utf8Buffer,
+        bm: &'a NullBitmap,
+        dedup: HashMap<&'a str, ValueKey, FastBuild>,
+    },
+}
+
+/// Materialize view-like key columns (dictionary/RLE) once so grouping reads
+/// owned arrays.
+fn materialized_key_column<'a>(
+    owned: &'a mut Option<ColumnArray>,
+    col: &'a ColumnArray,
+) -> &'a ColumnArray {
+    match col {
+        ColumnArray::Dictionary { .. } => {
+            *owned = Some(col.materialize_varchar());
+            owned.as_ref().expect("just inserted")
+        }
+        ColumnArray::Rle { .. } => {
+            *owned = Some(col.flattened().clone());
+            owned.as_ref().expect("just inserted")
+        }
+        other => other,
+    }
+}
+
+impl<'a> KeySource<'a> {
+    fn new(col: &'a ColumnArray) -> Result<Self> {
+        Ok(match col {
+            ColumnArray::Bool { data, bitmap } => Self::Bool { data, bm: bitmap },
+            ColumnArray::Int8 { data, bitmap } => Self::Int8 { data, bm: bitmap },
+            ColumnArray::Int16 { data, bitmap } => Self::Int16 { data, bm: bitmap },
+            ColumnArray::Int32 { data, bitmap } => Self::Int32 { data, bm: bitmap },
+            ColumnArray::Int64 { data, bitmap } => Self::Int64 { data, bm: bitmap },
+            ColumnArray::UInt8 { data, bitmap } => Self::UInt8 { data, bm: bitmap },
+            ColumnArray::UInt16 { data, bitmap } => Self::UInt16 { data, bm: bitmap },
+            ColumnArray::UInt32 { data, bitmap } => Self::UInt32 { data, bm: bitmap },
+            ColumnArray::UInt64 { data, bitmap } => Self::UInt64 { data, bm: bitmap },
+            ColumnArray::Float32 { data, bitmap } => Self::Float32 { data, bm: bitmap },
+            ColumnArray::Float64 { data, bitmap } => Self::Float64 { data, bm: bitmap },
+            ColumnArray::Decimal { data, bitmap } => Self::Decimal { data, bm: bitmap },
+            ColumnArray::Date { data, bitmap } => Self::Date { data, bm: bitmap },
+            ColumnArray::Time { data, bitmap } => Self::Time { data, bm: bitmap },
+            ColumnArray::Timestamp { data, bitmap } => Self::Timestamp { data, bm: bitmap },
+            ColumnArray::Interval { data, bitmap } => Self::Interval { data, bm: bitmap },
+            ColumnArray::VarChar { data, bitmap } => Self::VarChar {
+                data,
+                bm: bitmap,
+                dedup: HashMap::with_capacity_and_hasher(256, FastBuild::default()),
+            },
+            other => {
+                return Err(TaibaiError::Internal(format!(
+                    "hot store: column type {} is not supported as a cluster-key column",
+                    other.data_type().display_name()
+                )));
+            }
+        })
+    }
+
+    #[inline]
+    fn key_at(&mut self, i: usize, pool: &mut StringPool) -> ValueKey {
+        match self {
+            Self::Bool { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Bool(data[i] != 0)
+                }
+            }
+            Self::Int8 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i] as i64)
+                }
+            }
+            Self::Int16 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i] as i64)
+                }
+            }
+            Self::Int32 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i] as i64)
+                }
+            }
+            Self::Int64 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i])
+                }
+            }
+            Self::UInt8 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i] as i64)
+                }
+            }
+            Self::UInt16 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i] as i64)
+                }
+            }
+            Self::UInt32 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i] as i64)
+                }
+            }
+            Self::UInt64 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::UInt(data[i])
+                }
+            }
+            Self::Float32 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Float((data[i] as f64).to_bits())
+                }
+            }
+            Self::Float64 { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Float(data[i].to_bits())
+                }
+            }
+            Self::Decimal { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i])
+                }
+            }
+            Self::Date { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i] as i64)
+                }
+            }
+            Self::Time { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i])
+                }
+            }
+            Self::Timestamp { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i])
+                }
+            }
+            Self::Interval { data, bm } => {
+                if bm.is_null(i) {
+                    ValueKey::Null
+                } else {
+                    ValueKey::Int(data[i])
+                }
+            }
+            Self::VarChar { data, bm, dedup } => {
+                if bm.is_null(i) {
+                    return ValueKey::Null;
+                }
+                let s: &'a str = &data[i];
+                if let Some(key) = dedup.get(s) {
+                    return *key;
+                }
+                let key = ValueKey::Str(pool.intern(s));
+                dedup.insert(s, key);
+                key
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +911,10 @@ impl OpenChunk {
 
     /// Freeze a copy of this chunk's current content into an immutable chunk.
     /// The open chunk keeps its data so readers already holding the lock (or
-    /// about to acquire it) still observe every published row.
+    /// about to acquire it) still observe every published row. Columns are
+    /// shared by `Arc` clone — the immutable chunk and the (soon replaced)
+    /// open chunk reference the same buffers, so sealing is a refcount bump
+    /// instead of a full-column copy.
     fn freeze_at(&self, base: u64) -> Chunk {
         let memory_bytes = self
             .columns
@@ -647,11 +925,7 @@ impl OpenChunk {
         Chunk {
             base,
             rows: self.rows as u32,
-            columns: self
-                .columns
-                .iter()
-                .map(|c| std::sync::Arc::new((**c).clone()))
-                .collect(),
+            columns: self.columns.clone(),
             index: GroupIndex {
                 key: self.index.key.clone(),
                 key_partition: self.index.key_partition.clone(),
@@ -938,28 +1212,53 @@ impl HotStore {
 
         let _writer = self.writer.lock().unwrap();
 
-        // Derive index keys for the new rows (interning strings without
-        // cloning). Done once per batch; the per-slice copy below slices into
-        // this buffer.
-        let (keys, partition_keys) = {
-            let mut pool = self.string_pool.write().unwrap();
+        // Grouping sources: keys are derived straight from each column range
+        // in one fused pass per slice — no intermediate Vec<ValueKey> and no
+        // second traversal. View-like key columns (dictionary/RLE) are
+        // materialized once up front.
+        let mut owned_key_col: Option<ColumnArray> = None;
+        let mut owned_partition_col: Option<ColumnArray> = None;
+        {
+            // Validate the key columns are groupable before mutating state.
             let key_col = batch.column(self.key_column_index).ok_or_else(|| {
                 TaibaiError::Internal("hot store: missing key column in batch".into())
             })?;
-            let keys = collect_keys(key_col, &mut pool)?;
-            let partition_keys = match self.partition_column_index {
-                Some(partition_idx) => {
-                    let partition_col = batch.column(partition_idx).ok_or_else(|| {
-                        TaibaiError::Internal("hot store: missing partition column in batch".into())
-                    })?;
-                    Some(collect_keys(partition_col, &mut pool)?)
-                }
-                None => None,
-            };
-            (keys, partition_keys)
+            KeySource::new(materialized_key_column(&mut owned_key_col, key_col))?;
+            if let Some(partition_idx) = self.partition_column_index {
+                let partition_col = batch.column(partition_idx).ok_or_else(|| {
+                    TaibaiError::Internal("hot store: missing partition column in batch".into())
+                })?;
+                KeySource::new(materialized_key_column(
+                    &mut owned_partition_col,
+                    partition_col,
+                ))?;
+            }
+        }
+        let key_col_src = materialized_key_column(
+            &mut owned_key_col,
+            batch.column(self.key_column_index).ok_or_else(|| {
+                TaibaiError::Internal("hot store: missing key column in batch".into())
+            })?,
+        );
+        let mut key_src = KeySource::new(key_col_src)?;
+        let mut part_src = match self.partition_column_index {
+            Some(idx) => Some(KeySource::new(materialized_key_column(
+                &mut owned_partition_col,
+                batch.column(idx).ok_or_else(|| {
+                    TaibaiError::Internal("hot store: missing partition column in batch".into())
+                })?,
+            ))?),
+            None => None,
         };
 
         let num_cols = self.schema.num_columns();
+        // Batch-local grouping scratch: one small cache-hot map probe per row,
+        // then one chunk-index entry + contiguous extend per distinct key.
+        // Reused across slices so the capacity survives the whole batch.
+        let mut key_scratch: HashMap<ValueKey, Vec<u32>, FastBuild> =
+            HashMap::with_capacity_and_hasher(256, FastBuild::default());
+        let mut pkey_scratch: HashMap<(ValueKey, ValueKey), Vec<u32>, FastBuild> =
+            HashMap::with_capacity_and_hasher(256, FastBuild::default());
         let mut consumed = 0usize;
         while consumed < added {
             let open_arc = self.state.read().unwrap().open.clone();
@@ -977,29 +1276,62 @@ impl HotStore {
                 if start == 0 && end == added {
                     dst.extend(src)?;
                 } else {
-                    let sliced = src.slice_fast(start, end);
-                    dst.extend(&sliced)?;
+                    dst.extend_range(src, start, end)?;
                 }
             }
             let local_base = open.rows as u32;
-            for (j, key) in keys[start..end].iter().enumerate() {
-                open.index
-                    .key
-                    .entry(*key)
-                    .or_default()
-                    .push(local_base + j as u32);
-            }
-            if let (Some(kp), Some(pkeys)) =
-                (open.index.key_partition.as_mut(), partition_keys.as_ref())
             {
-                for (j, (key, pkey)) in keys[start..end]
-                    .iter()
-                    .zip(pkeys[start..end].iter())
-                    .enumerate()
-                {
-                    kp.entry((*key, *pkey))
+                let mut pool = self.string_pool.write().unwrap();
+                // Clear the per-key vectors but keep their buffers: reusing
+                // them avoids ~one Vec allocation per distinct key per batch
+                // (the group shapes are stable across batches of a table).
+                if key_scratch.len() > 8192 {
+                    key_scratch.clear();
+                } else {
+                    for offsets in key_scratch.values_mut() {
+                        offsets.clear();
+                    }
+                }
+                match part_src.as_mut() {
+                    Some(psrc) => {
+                        if pkey_scratch.len() > 8192 {
+                            pkey_scratch.clear();
+                        } else {
+                            for offsets in pkey_scratch.values_mut() {
+                                offsets.clear();
+                            }
+                        }
+                        for i in start..end {
+                            let k = key_src.key_at(i, &mut pool);
+                            let pk = psrc.key_at(i, &mut pool);
+                            let offset = local_base + (i - start) as u32;
+                            key_scratch.entry(k).or_default().push(offset);
+                            pkey_scratch.entry((k, pk)).or_default().push(offset);
+                        }
+                    }
+                    None => {
+                        for i in start..end {
+                            let k = key_src.key_at(i, &mut pool);
+                            key_scratch
+                                .entry(k)
+                                .or_default()
+                                .push(local_base + (i - start) as u32);
+                        }
+                    }
+                }
+                for (key, offsets) in key_scratch.iter() {
+                    open.index
+                        .key
+                        .entry(*key)
                         .or_default()
-                        .push(local_base + j as u32);
+                        .extend_from_slice(offsets);
+                }
+                if let Some(kp) = open.index.key_partition.as_mut() {
+                    for ((key, pkey), offsets) in pkey_scratch.iter() {
+                        kp.entry((*key, *pkey))
+                            .or_default()
+                            .extend_from_slice(offsets);
+                    }
                 }
             }
             open.rows += take;

@@ -196,3 +196,31 @@ python E:/workspace/bench/duckdb_bench.py load|query|appender
 - 端到端 4.0-4.4s vs DuckDB 2.96s(337 万行/s):客户端单 socket 写(~800MB/s 回环)与串行 per-connection 处理是剩余约束。已验证无效的方向:双连接(客户端单 consumer 交替写,无收益且不稳)、500k 大批次(段对齐破坏批次结构,反而变慢)、线上 zstd-1(回环上解压成本超过传输收益;真实网络场景仍值得做,服务端入口已支持 0x28B52FFD magic 检测解压)。
 - 下一步优先级:① 双 consumer 各持一个连接(重叠 socket 写与服务端处理);② 线上压缩采用定长前缀精确分配解压缓冲;③ bulk 编码 v2(连续 varchar 缓冲 + offsets,协议文档已定义,服务端解析待实现)。
 - 全量回归 617+ 用例通过;新增 `direct_bulk_multi_session_test`(多轮导入 SUM/AVG 精确)与 partition_cluster 的 NULL/乱序用例共同钉住本轮改动。
+
+## 12. 热存 append 优化实测与瓶颈定性(2026-09-29)
+
+> 目标:append 接近 kdb+(3.3 亿行/s,无逐行索引维护)。基线(§3.4):append 1600-1700 万行/s、点查 1.23µs、gather 2380 万行/s。
+
+### 12.1 落地的改动
+
+| 项 | 内容 |
+|---|---|
+| append 索引分批 | 每行一次 chunk-HashMap entry → 批内小表分组 + 每 distinct key 一次 entry + 连续 extend(postings 升序不变);VarChar 批内字符串去重(interleaved symbol 流从每行 intern 降为每 distinct 一次) |
+| 融合单遍分组 | 新增 `KeySource` 行访问器,键直接从列范围派生进分组表,去掉中间 `Vec<ValueKey>` 与二次遍历;Dictionary/RLE 键列物化一次 |
+| `ColumnArray::extend_range` | 跨 chunk 边界的切片追加不再走逐行 `slice_fast`;定宽列按元素整段 memcpy,VarChar arena+offsets 批量拷贝(新增 `Utf8Buffer::extend_from_bulk`) |
+| seal 免列拷贝 | `freeze_at` 的列改为 `Arc` 共享(引用计数移交),每 64K 行省一次全列 memcpy;索引 clone 维持原状 |
+| pool 缓存扩容 | intern 直接映射缓存 1024 → 4096 槽(高基数 symbol 下减少冲突) |
+
+结果:append 1420-1590 万行/s(与基线同量级);**点查 1.23 → 0.83-0.87µs(-30%),gather 2380 → 3100-3300 万行/s(+35%)**。
+
+### 12.2 瓶颈定性(相位计时 + 消融实测)
+
+append 的逐行成本 ~60-70ns,分解:**键派生(位图判空 + arena 取值 + 字符串哈希 + dedup 探测 + scratch 入表)≈ 44-50ns**,列拷贝 ≈ 10ns,索引应用 ≈ 5.5ns,seal 摊销 ≈ 少量。键派生的 44ns 由 2-3 次**依赖性随机内存访问**(dedup 哈希表探测、scratch 哈希表探测、postings 随机写)构成——在本机内存延迟与安全软件开销下已贴近下限,数据结构微优化(融合/去重/缓冲复用/缓存扩容)均已实测到顶。
+
+**结论:逐行哈希式倒排索引维护的算法下限就是当前速度;要接近 kdb+ 必须改变架构,三条路线:**
+
+1. **seal 时并行建索引**:append 退化为纯列拷贝(~10ns/行 ≈ 8000 万-1 亿行/s);索引在 seal 时用 rayon 并行分组构建(每 64K 行一次,几 ms,8 线程摊薄后 ≈ 6-8ns/行)。代价:open chunk 在建好前点查退化为线性扫(≤64K 行,~0.1-0.3ms),或引入"indexed-prefix + 未索引尾"双段查询。
+2. **上游字典化**:INSERT 管线直接产出 intern id(复用 bulk 编码的符号池),逐行成本从"字符串哈希+探测"降为"数组下标"(~2-4ns/行)。改动面在 SQL VALUES/二进制协议一侧。
+3. **行域分片并行 append**:8-16 分片各建局部分组再有序合并,预计 2500 万-3500 万行/s(受合并与内存带宽限制,收益低于 1/2)。
+
+推荐顺序:2(与 bulk 字典化协同)→ 1(kdb+ 语义最接近)。本轮全部改动以 hot_store 14 项单测、fast_path 18 项、hybrid mirror 5 项与全量 617+ 用例验证,并顺带修复 `extend_range` 的定宽列元素/字节偏移错误(跨 chunk 边界定宽列追加 panic,单测抓住)。
