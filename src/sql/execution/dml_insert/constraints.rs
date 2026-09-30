@@ -105,7 +105,7 @@ pub fn validate_unique_key_uniqueness(
             }
         }
     }
-    load_existing_unique_keys(engine, db, table, indices, index_name, &keys)
+    load_existing_unique_keys(engine, db, table, schema, indices, index_name, &keys)
 }
 
 /// Collect one entry per live row for the given key columns. Rows sharing a
@@ -199,65 +199,54 @@ pub(crate) fn collect_unique_index_entries_from(
 /// being validated: only a collision with a key the current batch is writing
 /// is an error. This mirrors the snapshot-based path (`unique_key_exists`),
 /// which never fails on unrelated pre-existing duplicates.
+///
+/// The fallback collects the whole key set once and then INSTALLS it as the
+/// index snapshot, so a single lost/invalid snapshot costs one full-table
+/// scan instead of one per subsequent INSERT (the primary-key fallback in
+/// `validate_primary_key_uniqueness` already did this via
+/// `install_primary_key_index`).
 fn load_existing_unique_keys(
     engine: &Engine,
     db: &str,
     table: &str,
+    schema: &Schema,
     indices: &[usize],
     index_name: &str,
     new_keys: &HashSet<Vec<ScalarValue>>,
 ) -> Result<()> {
-    let table_dir = engine.data_dir().join(db).join(table);
-    if table_dir.exists() {
-        for seg_path in SegmentManager::discover_segments(&table_dir)? {
-            let reader = engine.segment_mgr().open_reader_cached(&seg_path)?;
-            for rg_idx in 0..reader.num_row_groups() {
-                let mut batch = reader.read_row_group_with_projection(rg_idx, indices)?;
-                if !reader.delete_bitmap().is_empty() {
-                    batch = crate::storage::segment::delete_bitmap::filter_batch(
-                        &batch,
-                        reader.row_group_start_row(rg_idx),
-                        reader.delete_bitmap(),
-                    )?;
-                }
-                check_existing_unique_batch(table, index_name, &batch, new_keys)?;
-            }
-        }
+    let entries = collect_unique_index_entries(
+        engine,
+        db,
+        table,
+        indices,
+        "unique key validation fallback",
+    )?;
+    if let Some(entry) = entries.iter().find(|entry| new_keys.contains(&entry.key)) {
+        return Err(duplicate_unique_key_error(table, index_name, &entry.key));
     }
-    for memtable in engine.memtable_manager().get_by_table(db, table) {
-        // Arc-shared snapshot: `read()` deep-clones the whole batch (up to
-        // 500k rows × all columns) just to probe a few key columns.
-        if let Some(batch) = memtable.read_snapshot_arc() {
-            check_existing_unique_batch_with_indices(table, index_name, &batch, indices, new_keys)?;
-        }
-    }
-    Ok(())
-}
-
-fn check_existing_unique_batch(
-    table: &str,
-    index_name: &str,
-    batch: &RecordBatch,
-    new_keys: &HashSet<Vec<ScalarValue>>,
-) -> Result<()> {
-    let projected_indices: Vec<usize> = (0..batch.num_columns()).collect();
-    check_existing_unique_batch_with_indices(table, index_name, batch, &projected_indices, new_keys)
-}
-
-fn check_existing_unique_batch_with_indices(
-    table: &str,
-    index_name: &str,
-    batch: &RecordBatch,
-    indices: &[usize],
-    new_keys: &HashSet<Vec<ScalarValue>>,
-) -> Result<()> {
-    for row_idx in 0..batch.num_rows() {
-        let Some(key) = unique_key_for_row(batch, row_idx, indices, &batch.schema) else {
-            continue;
-        };
-        if new_keys.contains(&key) {
-            return Err(duplicate_unique_key_error(table, index_name, &key));
-        }
+    // Install the scanned snapshot so future statements probe it instead of
+    // rescanning the table. Failure only leaves the slow path in place — the
+    // statement itself is unaffected.
+    let columns = indices
+        .iter()
+        .map(|&idx| schema.columns[idx].name.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = engine.index_manager().persist_unique_index_entries(
+        db,
+        table,
+        index_name,
+        &columns,
+        entries,
+        Some(engine.segment_mgr().memtable_flush_epoch(db, table)),
+        None,
+    ) {
+        tracing::warn!(
+            db,
+            table,
+            index = %index_name,
+            error = %error,
+            "failed to install unique-index snapshot after fallback scan"
+        );
     }
     Ok(())
 }

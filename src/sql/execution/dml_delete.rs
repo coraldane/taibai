@@ -903,7 +903,14 @@ pub(crate) struct DeleteIndexMaintenance {
     /// Key-column positions inside a full-schema batch, per index.
     schema_key_positions: Vec<Vec<usize>>,
     keys: Vec<HashSet<Vec<ScalarValue>>>,
-    locations: Vec<UniqueRowLocation>,
+    /// Interned segment paths: one String per segment touched by the
+    /// statement, referenced by id from `locations`. Recording one String
+    /// clone per deleted row allocated the same path up to 65k times per
+    /// statement.
+    segment_paths: Vec<String>,
+    /// (segment id into `segment_paths`, absolute row id) of every recorded
+    /// row.
+    locations: Vec<(u32, u64)>,
     maintained: bool,
     rows_seen: usize,
 }
@@ -940,10 +947,21 @@ impl DeleteIndexMaintenance {
             indexes,
             schema_key_positions,
             keys,
+            segment_paths: Vec::new(),
             locations: Vec::new(),
             maintained: true,
             rows_seen: 0,
         }
+    }
+
+    /// Return the id of `path` in the statement's segment table, interning it
+    /// on first sight.
+    fn intern_segment(&mut self, path: &str) -> u32 {
+        if let Some(pos) = self.segment_paths.iter().position(|existing| existing == path) {
+            return pos as u32;
+        }
+        self.segment_paths.push(path.to_string());
+        (self.segment_paths.len() - 1) as u32
     }
 
     fn has_indexes(&self) -> bool {
@@ -1038,7 +1056,7 @@ impl DeleteIndexMaintenance {
 
     fn record_segment_row(
         &mut self,
-        segment_path: &str,
+        segment_id: u32,
         row_id: u64,
         batch: &RecordBatch,
         row_idx: usize,
@@ -1047,10 +1065,7 @@ impl DeleteIndexMaintenance {
         if !self.admit_row() {
             return;
         }
-        self.locations.push(UniqueRowLocation {
-            segment_path: segment_path.to_string(),
-            row_id,
-        });
+        self.locations.push((segment_id, row_id));
         for (index_offset, key_positions) in projected_positions.iter().enumerate() {
             let mut key = Vec::with_capacity(key_positions.len());
             let mut valid = true;
@@ -1079,6 +1094,14 @@ impl DeleteIndexMaintenance {
         if !self.maintained {
             return false;
         }
+        let locations: Vec<UniqueRowLocation> = self
+            .locations
+            .iter()
+            .map(|(segment_id, row_id)| UniqueRowLocation {
+                segment_path: self.segment_paths[*segment_id as usize].clone(),
+                row_id: *row_id,
+            })
+            .collect();
         for (index_offset, (index_name, _)) in self.indexes.iter().enumerate() {
             let snapshot_missing = || {
                 matches!(
@@ -1092,7 +1115,7 @@ impl DeleteIndexMaintenance {
                 db,
                 table,
                 index_name,
-                self.locations.clone(),
+                locations.clone(),
             ) {
                 Ok(true) => {}
                 Ok(false) if snapshot_missing() => {}
@@ -1260,9 +1283,9 @@ pub fn exec_delete(
                         continue;
                     }
                 }
-                let segment_path_string = index_maintenance
+                let segment_id = index_maintenance
                     .still_maintaining()
-                    .then(|| seg_path.to_string_lossy().to_string());
+                    .then(|| index_maintenance.intern_segment(&seg_path.to_string_lossy()));
                 let prev_deleted = reader.deleted_row_count();
                 let maintaining = index_maintenance.still_maintaining();
                 let outcome = match_segment_for_delete(
@@ -1284,10 +1307,10 @@ pub fn exec_delete(
                                 matched.iter().map(|(idx, _)| *idx).collect();
                             deleted_events.push(batch, &deleted_rows);
                         }
-                        if let Some(segment_path) = segment_path_string.as_deref() {
+                        if let Some(segment_id) = segment_id {
                             for (idx, absolute) in matched {
                                 index_maintenance.record_segment_row(
-                                    segment_path,
+                                    segment_id,
                                     *absolute,
                                     batch,
                                     *idx as usize,

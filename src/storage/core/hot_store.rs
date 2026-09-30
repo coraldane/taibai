@@ -92,9 +92,15 @@ const POOL_CACHE_SLOTS: usize = 4096;
 /// This mirrors q's enumerated `` `sym$ `` symbols: the index compares interned
 /// ids, never string bytes. A direct-mapped hash cache sits in front of the
 /// map so repeated symbols within a batch skip the full lookup entirely.
+///
+/// Released ids are tombstoned (`reverse[i] = None`) rather than removed:
+/// ids are positions in `reverse`, and postings in surviving chunk indexes
+/// embed them. Tombstoned ids are gone from `forward`, so a later intern of
+/// the same string allocates a fresh id — safe because no live postings
+/// reference a released one.
 pub struct StringPool {
     forward: HashMap<String, u32, FastBuild>,
-    reverse: Vec<String>,
+    reverse: Vec<Option<String>>,
     cache: Vec<PoolCacheSlot>,
 }
 
@@ -119,7 +125,13 @@ impl StringPool {
         let hash = FastHasher::hash_str(s);
         let idx = (hash as usize) & (POOL_CACHE_SLOTS - 1);
         let slot = self.cache[idx];
-        if slot.hash == hash && self.reverse[slot.id as usize] == s {
+        if slot.hash == hash
+            && self
+                .reverse
+                .get(slot.id as usize)
+                .and_then(|entry| entry.as_deref())
+                == Some(s)
+        {
             Some((idx, slot))
         } else {
             None
@@ -136,7 +148,7 @@ impl StringPool {
             Some(&id) => id,
             None => {
                 let id = self.reverse.len() as u32;
-                self.reverse.push(s.to_string());
+                self.reverse.push(Some(s.to_string()));
                 self.forward.insert(s.to_string(), id);
                 id
             }
@@ -153,6 +165,25 @@ impl StringPool {
         match self.cached(s) {
             Some((_idx, slot)) => Some(slot.id),
             None => self.forward.get(s).copied(),
+        }
+    }
+
+    /// Drop every id outside `live`: removes its string from `forward` and
+    /// tombstones its `reverse` slot. Called after a prefix compaction so the
+    /// pool tracks the rows actually resident instead of growing without
+    /// bound on high-cardinality string keys. The direct-mapped cache is
+    /// cleared wholesale — its (hash, id) slots may name released ids.
+    pub fn retain_ids(&mut self, live: &HashSet<u32>) {
+        for (id, slot) in self.reverse.iter_mut().enumerate() {
+            if slot.is_some() && !live.contains(&(id as u32)) {
+                if let Some(s) = slot.take() {
+                    self.forward.remove(s.as_str());
+                }
+            }
+        }
+        for slot in self.cache.iter_mut() {
+            slot.hash = 0;
+            slot.id = 0;
         }
     }
 
@@ -1933,6 +1964,17 @@ impl HotStore {
         });
 
         self.row_count.fetch_sub(n, Ordering::AcqRel);
+        // Reclaim interned strings the surviving chunks no longer reference:
+        // without this the pool grows with every distinct key ever appended,
+        // even after its rows were reclaimed under backpressure.
+        {
+            let new_state = self.state.read().unwrap().clone();
+            let live = {
+                let open = new_state.open.read().unwrap();
+                collect_live_pool_ids(&new_state, &open)
+            };
+            self.string_pool.write().unwrap().retain_ids(&live);
+        }
         self.recompute_memory_bytes();
         n
     }
@@ -1981,6 +2023,34 @@ fn sealed_then_open<'a>(
         .iter()
         .map(|c| c.as_ref() as &dyn ChunkView)
         .chain(std::iter::once(open as &dyn ChunkView))
+}
+
+/// Intern ids still referenced by any surviving chunk's group indexes (the
+/// key index plus both components of the composite key/partition index).
+fn collect_live_pool_ids(st: &StoreState, open: &OpenChunk) -> HashSet<u32> {
+    fn collect(index: &GroupIndex, live: &mut HashSet<u32>) {
+        for key in index.key.keys() {
+            if let ValueKey::Str(id) = key {
+                live.insert(*id);
+            }
+        }
+        if let Some(kp) = &index.key_partition {
+            for (key, partition) in kp.keys() {
+                if let ValueKey::Str(id) = key {
+                    live.insert(*id);
+                }
+                if let ValueKey::Str(id) = partition {
+                    live.insert(*id);
+                }
+            }
+        }
+    }
+    let mut live = HashSet::new();
+    for chunk in &st.sealed {
+        collect(&chunk.index, &mut live);
+    }
+    collect(&open.index, &mut live);
+    live
 }
 
 /// Walk all chunks in append order (sealed, then open) and hand each chunk's

@@ -144,7 +144,26 @@ impl TxnMutationRegistry {
             .iter()
             .position(|entry| entry.db == db && entry.table == table)
         {
-            return &mut txn.tables[index];
+            let entry = &mut txn.tables[index];
+            // The recorded scope drives the COMMIT mutation-lock breadth, so a
+            // later statement must widen it to cover its own tombstones: a
+            // table-wide statement (`None`) makes the COMMIT take the whole
+            // table lock, and two different narrow partitions union their
+            // keys. Keeping the first statement's narrow scope would let
+            // COMMIT rewrite another partition's segments while that
+            // partition's flush runs concurrently.
+            match (&mut entry.partitions, partitions) {
+                (_, None) => entry.partitions = None,
+                (None, Some(_)) => {}
+                (Some(existing), Some(new_parts)) => {
+                    for part in new_parts {
+                        if !existing.iter().any(|key| key == part) {
+                            existing.push(part.clone());
+                        }
+                    }
+                }
+            }
+            return entry;
         }
         let mut entry = TableTxnMutations::new(db, table, None);
         if let Some(parts) = partitions {

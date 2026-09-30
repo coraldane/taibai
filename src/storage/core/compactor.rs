@@ -1294,14 +1294,21 @@ impl Compactor {
 
         let mut source_row_groups: Vec<SourceRowGroup> = Vec::new();
         let mut rows_per_source: Vec<usize> = Vec::new();
+        // Segment-local start row of each source row group, computed during
+        // the same discovery pass (recomputing it per source below made the
+        // row-ref loop quadratic in a segment's row-group count).
+        let mut row_base_per_source: Vec<u64> = Vec::new();
         for seg_path in segment_files {
             let reader = self.segment_mgr.open_reader(seg_path)?;
+            let mut segment_row_base = 0u64;
             for rg_idx in 0..reader.num_row_groups() {
                 source_row_groups.push(SourceRowGroup {
                     segment_path: seg_path.clone(),
                     row_group_idx: rg_idx,
                 });
                 rows_per_source.push(reader.row_group_rows(rg_idx) as usize);
+                row_base_per_source.push(segment_row_base);
+                segment_row_base += reader.row_group_rows(rg_idx) as u64;
             }
         }
 
@@ -1352,10 +1359,7 @@ impl Compactor {
         for (source_idx, source) in source_row_groups.iter().enumerate() {
             let row_count = rows_per_source[source_idx];
             let reader = self.segment_mgr.open_reader(&source.segment_path)?;
-            let mut segment_row_base = 0u64;
-            for prior in 0..source.row_group_idx {
-                segment_row_base += reader.row_group_rows(prior) as u64;
-            }
+            let segment_row_base = row_base_per_source[source_idx];
             let ttl_col =
                 ttl.and_then(|(idx, _)| reader.read_column(source.row_group_idx, idx).ok());
             for row_idx in 0..row_count {

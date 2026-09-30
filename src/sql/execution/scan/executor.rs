@@ -1016,9 +1016,18 @@ fn reverse_batch(batch: &RecordBatch) -> Result<RecordBatch> {
 }
 
 fn reverse_column(col: &ColumnArray) -> Result<ColumnArray> {
-    let mut out = ColumnArray::with_capacity(col.data_type(), col.len());
-    for row_idx in (0..col.len()).rev() {
-        out.push(&col.scalar(row_idx))?;
-    }
-    Ok(out)
+    // One bulk gather instead of a per-row scalar() + push() round-trip,
+    // which cloned every VarChar cell of the row group being reversed.
+    // View shapes (Selected/Rle/Dictionary) have no arm in gather_into, so
+    // they are flattened once first.
+    let flattened;
+    let col = match col {
+        ColumnArray::Selected { .. } | ColumnArray::Rle { .. } | ColumnArray::Dictionary { .. } => {
+            flattened = col.flattened();
+            &flattened
+        }
+        other => other,
+    };
+    let rows: Vec<u32> = (0..col.len() as u32).rev().collect();
+    Ok(col.take(&rows))
 }

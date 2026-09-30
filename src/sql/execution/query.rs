@@ -1081,19 +1081,51 @@ pub(crate) fn execute_scalar_subquery(
     db: &str,
     subquery: &Statement,
 ) -> Result<ScalarValue> {
-    let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
-        return Err(TaibaiError::Sql("scalar subquery must be a SELECT".into()));
-    };
+    // Stream the subquery and stop as soon as a second row proves it is not
+    // scalar. The materialized path computed the entire result just to look
+    // at its first row (and to prove there was no second), paying full
+    // subquery-scan cost on every scalar subquery over a large table.
+    const MORE_THAN_ONE: &str = "__taibai_scalar_subquery_more_than_one_row";
+    fn is_more_than_one(error: &TaibaiError) -> bool {
+        matches!(error, TaibaiError::Internal(msg) if msg == MORE_THAN_ONE)
+    }
     let mut first: Option<ScalarValue> = None;
     let mut rows = 0usize;
-    for batch in batches {
+    let streamed = match exec_select_streaming(engine, db, subquery, |batch| {
         if batch.num_columns() == 0 {
-            continue;
+            return Ok(());
         }
         for row_idx in 0..batch.num_rows() {
             rows += 1;
             if first.is_none() {
                 first = Some(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
+            }
+            if rows > 1 {
+                return Err(TaibaiError::Internal(MORE_THAN_ONE.into()));
+            }
+        }
+        Ok(())
+    }) {
+        Ok(streamed) => streamed,
+        Err(error) if is_more_than_one(&error) => None,
+        Err(error) => return Err(error),
+    };
+    if streamed.is_none() && rows <= 1 {
+        // The streaming pipeline declined (subqueries/derived tables inside
+        // the subquery, or an unsupported plan shape): fall back to the
+        // materialized execution.
+        let ExecResult::Query { batches, .. } = exec_select(engine, db, subquery)? else {
+            return Err(TaibaiError::Sql("scalar subquery must be a SELECT".into()));
+        };
+        for batch in batches {
+            if batch.num_columns() == 0 {
+                continue;
+            }
+            for row_idx in 0..batch.num_rows() {
+                rows += 1;
+                if first.is_none() {
+                    first = Some(batch.scalar(row_idx, 0).unwrap_or(ScalarValue::Int64(None)));
+                }
             }
         }
     }

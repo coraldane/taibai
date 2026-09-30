@@ -1072,11 +1072,6 @@ fn decode_delete_positions(bytes: &[u8]) -> Result<Vec<u32>> {
         .collect())
 }
 
-/// Durably record row deletions for a memtable without rewriting its tail.
-///
-/// The sidecar generation (`<id>.<seq>.del`) applies to the tail below it:
-/// recovery loads the tail, then removes the recorded positions oldest
-/// sidecar first. Appends to the tail only extend it, so positions recorded
 /// Why a generation walk stopped without finding a live tail.
 enum Suppression {
     /// A clear tombstone: the tail was explicitly dropped.
@@ -1149,6 +1144,11 @@ fn resolve_live_tail(
     LiveTail::Absent
 }
 
+/// Durably record row deletions for a memtable without rewriting its tail.
+///
+/// The sidecar generation (`<id>.<seq>.del`) applies to the tail below it:
+/// recovery loads the tail, then removes the recorded positions oldest
+/// sidecar first. Appends to the tail only extend it, so positions recorded
 /// against an earlier prefix stay valid. Returns `false` when the memtable
 /// has no live tail (caller falls back to a full `persist`).
 pub fn delete_rows(table_dir: &Path, id: Uuid, positions: &[u32]) -> Result<bool> {

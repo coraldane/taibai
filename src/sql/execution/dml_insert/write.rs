@@ -405,11 +405,15 @@ fn materialize_insert_values(
         for row in values {
             for (col_idx, provided) in provided_by_col.iter().enumerate() {
                 let val_idx = provided.unwrap();
+                let column = &schema.columns[col_idx];
                 push_literal_fast(
                     batch.column_mut(col_idx).unwrap(),
                     &row[val_idx],
-                    schema.columns[col_idx].scale,
+                    column.scale,
                     timezone_offset_hours,
+                    &column.name,
+                    column.primary_key,
+                    column.nullable,
                 )?;
             }
         }
@@ -1408,12 +1412,11 @@ fn can_direct_materialize(
     if values.iter().flatten().any(is_default_value_expr) {
         return false;
     }
+    // PK / NOT NULL columns take this path too: `push_literal_fast` rejects
+    // NULL literals for them, which is the only extra validation the slow
+    // materialize path performed here.
     schema.columns.iter().enumerate().all(|(idx, col)| {
-        provided_by_col[idx].is_some()
-            && !is_missing_auto_inc[idx]
-            && col.default_value.is_none()
-            && col.nullable
-            && !col.primary_key
+        provided_by_col[idx].is_some() && !is_missing_auto_inc[idx] && col.default_value.is_none()
     })
 }
 
@@ -1425,22 +1428,50 @@ fn is_default_value_expr(expr: &Expr) -> bool {
     )
 }
 
+/// Same NULL rule the general materialize path enforces via `validate_nullable`:
+/// a PK or NOT NULL column rejects an explicit NULL.
+fn validate_literal_nullness(
+    column_name: &str,
+    primary_key: bool,
+    nullable: bool,
+    scalar: &ScalarValue,
+) -> Result<()> {
+    if (primary_key || !nullable) && scalar.is_null() {
+        return Err(TaibaiError::Sql(format!(
+            "column '{}' cannot be NULL",
+            column_name
+        )));
+    }
+    Ok(())
+}
+
 fn push_literal_fast(
     col: &mut ColumnArray,
     expr: &Expr,
     scale: i32,
     timezone_offset_hours: i32,
+    column_name: &str,
+    primary_key: bool,
+    nullable: bool,
 ) -> Result<()> {
     let Expr::Literal(value) = expr else {
-        return col.push(&eval_expr_to_scalar_with_scale_timezone(
+        let scalar = eval_expr_to_scalar_with_scale_timezone(
             expr,
             &col.data_type(),
             scale,
             timezone_offset_hours,
-        )?);
+        )?;
+        validate_literal_nullness(column_name, primary_key, nullable, &scalar)?;
+        return col.push(&scalar);
     };
 
     if value.is_null() {
+        if primary_key || !nullable {
+            return Err(TaibaiError::Sql(format!(
+                "column '{}' cannot be NULL",
+                column_name
+            )));
+        }
         return col.push(&ScalarValue::null_for_type(col.data_type()));
     }
 
