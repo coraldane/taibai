@@ -177,6 +177,10 @@ impl SegmentManager {
         table_meta: &crate::storage::catalog::schema::TableMeta,
         flush_immediately: bool,
     ) -> Result<u64> {
+        // Timed from the very top: column compression (prepare_direct_bulk_groups)
+        // runs before any lock and can dominate the request at high table
+        // COMPRESSION_LEVEL — zstd 19 is single-digit MB/s per core.
+        let total_start = std::time::Instant::now();
         let table_dir = self.data_dir.join(db).join(req.table_name);
         std::fs::create_dir_all(&table_dir)?;
         self.set_table_compression_level(db, req.table_name, table_meta.compression_level);
@@ -215,7 +219,6 @@ impl SegmentManager {
             .map(String::as_str)
             .collect::<Vec<_>>();
 
-        let total_start = std::time::Instant::now();
         let result = self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
             ensure_state_not_retired(&state, db, req.table_name)?;
 
@@ -265,8 +268,9 @@ impl SegmentManager {
                 db,
                 table = req.table_name,
                 rows = req.row_count,
+                compression_level,
                 elapsed_ms = elapsed.as_millis() as u64,
-                "slow direct bulk append: synchronous segment seal inside the table-wide active-segments lock or partition-lock contention stalls concurrent writers (client sees request timeouts)"
+                "slow direct bulk append: high table COMPRESSION_LEVEL makes column compression dominate (zstd 19 is single-digit MB/s per core); synchronous segment seal inside the table-wide active-segments lock is the other usual cause (client sees request timeouts)"
             );
         }
         result
