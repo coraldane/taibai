@@ -309,7 +309,7 @@ fn optimize_heavy_phase_keeps_target_partition_writable() -> Result<()> {
     // a partition compaction must run OUTSIDE the partition mutation lock,
     // so INSERTs into the very partition being compacted proceed. Before
     // the split they queued behind the whole rewrite and timed out after
-    // mutation_lock_timeout_ms.
+    // mutation_lock_timeout_secs.
     let result = (|| -> Result<()> {
         crate::storage::core::compactor::Compactor::set_heavy_phase_delay_for_tests(2_000);
 

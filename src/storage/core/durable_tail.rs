@@ -187,8 +187,8 @@ impl CommitCompletion {
 fn tail_commit_timeouts() -> (Duration, Duration) {
     let timeouts = crate::common::config::storage_timeouts();
     (
-        Duration::from_millis(timeouts.tail_commit_timeout_ms.max(1)),
-        Duration::from_millis(timeouts.tail_commit_warn_ms.max(1)),
+        Duration::from_secs(timeouts.tail_commit_timeout_secs.max(1)),
+        Duration::from_secs(timeouts.tail_commit_warn_secs.max(1)),
     )
 }
 

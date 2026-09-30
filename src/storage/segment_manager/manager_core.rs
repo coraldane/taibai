@@ -1033,7 +1033,7 @@ impl SegmentManager {
         let (partition_keys, partition_locks) = sorted_partition_locks(&registry);
         drop(registry);
         let timeouts = crate::common::config::storage_timeouts();
-        let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
+        let timeout = Duration::from_secs(timeouts.mutation_lock_timeout_secs.max(1));
         let mut partition_guards = Vec::with_capacity(partition_locks.len());
         for (partition, lock) in partition_keys.iter().zip(&partition_locks) {
             partition_guards.push(acquire_partition_lock_for_wide_gate(
@@ -1079,7 +1079,7 @@ impl SegmentManager {
         }
         drop(registries);
         let timeouts = crate::common::config::storage_timeouts();
-        let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
+        let timeout = Duration::from_secs(timeouts.mutation_lock_timeout_secs.max(1));
         let mut partition_guard_sets = Vec::with_capacity(states.len());
         for (table_idx, key) in keys.iter().enumerate() {
             let mut guards = Vec::new();
@@ -1503,8 +1503,8 @@ fn acquire_mutation_lock<'a>(
     key: &str,
 ) -> Result<std::sync::MutexGuard<'a, ()>> {
     let timeouts = crate::common::config::storage_timeouts();
-    let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
-    let warn_after = Duration::from_millis(timeouts.mutation_lock_warn_ms.max(1));
+    let timeout = Duration::from_secs(timeouts.mutation_lock_timeout_secs.max(1));
+    let warn_after = Duration::from_secs(timeouts.mutation_lock_warn_secs.max(1));
     let start = Instant::now();
     let mut backoff = Duration::from_millis(1);
     loop {
@@ -1605,8 +1605,8 @@ fn acquire_partition_mutation_lock<'a>(
     partition_key: &str,
 ) -> Result<std::sync::MutexGuard<'a, ()>> {
     let timeouts = crate::common::config::storage_timeouts();
-    let timeout = Duration::from_millis(timeouts.mutation_lock_timeout_ms.max(1));
-    let warn_after = Duration::from_millis(timeouts.mutation_lock_warn_ms.max(1));
+    let timeout = Duration::from_secs(timeouts.mutation_lock_timeout_secs.max(1));
+    let warn_after = Duration::from_secs(timeouts.mutation_lock_warn_secs.max(1));
     let start = Instant::now();
     let mut backoff = Duration::from_millis(1);
     loop {
