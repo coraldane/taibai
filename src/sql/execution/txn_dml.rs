@@ -571,16 +571,13 @@ pub(crate) fn exec_update_in_txn(
                 }
                 // The updated image of exactly the matched rows.
                 let kept_matched = vec![true; matched.len()];
-                let mut columns = Vec::with_capacity(batch.num_columns());
-                for (col_idx, column) in batch.columns.iter().enumerate() {
-                    columns.push(super::dml_update::rebuild_update_column(
-                        column,
-                        assigned.get(&col_idx),
-                        &matched,
-                        &kept_matched,
-                    )?);
-                }
-                updated_images.push(RecordBatch::try_new(batch.schema.clone(), columns)?);
+                let image = super::dml_update::rebuild_update_batch(
+                    &batch,
+                    &assigned,
+                    &matched,
+                    &kept_matched,
+                )?;
+                updated_images.push(image);
             }
 
             if newly_deleted.is_empty() {

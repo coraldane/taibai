@@ -202,16 +202,7 @@ pub fn exec_update(
                     kept.push(row_idx as u32);
                     kept_matched.push(*matches);
                 }
-                let mut new_columns = Vec::with_capacity(batch.num_columns());
-                for (col_idx, column) in batch.columns.iter().enumerate() {
-                    new_columns.push(rebuild_update_column(
-                        column,
-                        assigned.get(&col_idx),
-                        &kept,
-                        &kept_matched,
-                    )?);
-                }
-                let new_batch = RecordBatch::try_new(batch.schema.clone(), new_columns)?;
+                let new_batch = rebuild_update_batch(&batch, &assigned, &kept, &kept_matched)?;
                 updated_count += kept_matched.iter().filter(|m| **m).count() as u64;
                 if rg_publish {
                     let matched: Vec<u32> = kept_matched
@@ -602,6 +593,29 @@ pub(crate) fn update_memtable_batch(
         affected,
         matched_rows,
     ))
+}
+
+/// Rebuild a whole batch for the surviving rows of an UPDATE: untouched rows
+/// keep their value, matched survivors receive the (constant) assigned value
+/// in their assigned columns. The single image constructor shared by the
+/// rewritten-row-group (auto-commit) and deferred-image (transactional)
+/// segment paths.
+pub(crate) fn rebuild_update_batch(
+    batch: &RecordBatch,
+    assigned: &std::collections::HashMap<usize, ScalarValue>,
+    kept: &[u32],
+    kept_matched: &[bool],
+) -> Result<RecordBatch> {
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+    for (col_idx, column) in batch.columns.iter().enumerate() {
+        new_columns.push(rebuild_update_column(
+            column,
+            assigned.get(&col_idx),
+            kept,
+            kept_matched,
+        )?);
+    }
+    RecordBatch::try_new(batch.schema.clone(), new_columns)
 }
 
 /// Rebuild one column for the surviving rows of an UPDATE: untouched rows
