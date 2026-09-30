@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
+use crate::common::error::{Result, TaibaiError};
 use crate::storage::segment_manager::active_writer::ActiveSegmentWriter;
 
 pub(super) struct TableSegmentState {
@@ -27,6 +30,14 @@ pub(super) struct TableSegmentState {
     /// until it clears, so the registry write guard only needs to be held
     /// briefly for the partition snapshot.
     pub(super) partition_gate: AtomicBool,
+    /// Segments removed from `active_segments` whose seal (footer + fsync)
+    /// still runs outside every lock. Registered atomically with the removal
+    /// while the partition mutex is held, so a wide gate that has collected
+    /// all partition mutexes can wait for the registry to drain and then see
+    /// a fully quiesced table. Readers/discovery must skip these paths until
+    /// the seal publishes the footer.
+    pub(super) sealing_segments: Mutex<Vec<(String, PathBuf)>>,
+    pub(super) sealing_condvar: Condvar,
     pub(super) flush_visibility: RwLock<()>,
     pub(super) retired: AtomicBool,
 }
@@ -48,6 +59,8 @@ impl TableSegmentState {
             mutation_lock: Mutex::new(()),
             partition_locks: RwLock::new(HashMap::new()),
             partition_gate: AtomicBool::new(false),
+            sealing_segments: Mutex::new(Vec::new()),
+            sealing_condvar: Condvar::new(),
             flush_visibility: RwLock::new(()),
             retired: AtomicBool::new(false),
         }
@@ -63,5 +76,69 @@ impl TableSegmentState {
     pub(super) fn set_compression_level_override(&self, level: Option<i32>) {
         self.compression_level_override
             .store(level.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Record that `path` is being sealed outside the locks. Must be called
+    /// while the partition mutex is still held, together with removing the
+    /// segment from `active_segments`.
+    pub(super) fn register_sealing_segment(&self, partition: &str, path: PathBuf) {
+        self.sealing_segments
+            .lock()
+            .unwrap()
+            .push((partition.to_string(), path));
+    }
+
+    /// Mark the seal of `path` as finished and wake any wide gate waiting for
+    /// the registry to drain. Idempotent.
+    pub(super) fn finish_sealing_segment(&self, path: &Path) {
+        let mut sealing = self.sealing_segments.lock().unwrap();
+        sealing.retain(|(_, sealing_path)| sealing_path != path);
+        drop(sealing);
+        self.sealing_condvar.notify_all();
+    }
+
+    /// Block until no seal is in flight, bounded by `timeout` so a stalled
+    /// disk surfaces as a timeout error instead of an indefinite hang.
+    pub(super) fn wait_sealing_segments_drained(&self, timeout: Duration) -> Result<()> {
+        let mut sealing = self.sealing_segments.lock().unwrap();
+        if sealing.is_empty() {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(std::time::Instant::now);
+        while !sealing.is_empty() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(TaibaiError::ResourceBusy(format!(
+                    "in-flight segment seals did not finish within {} ms; the sealing disk I/O is stalled or slow",
+                    timeout.as_millis()
+                )));
+            }
+            let (guard, _) = self
+                .sealing_condvar
+                .wait_timeout(sealing, deadline - now)
+                .unwrap();
+            sealing = guard;
+        }
+        Ok(())
+    }
+
+    /// Paths currently being sealed outside the locks; discovery and
+    /// mutable-reader lookups must treat them as not yet published.
+    pub(super) fn sealing_paths(&self) -> HashSet<PathBuf> {
+        self.sealing_segments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
+    /// Cheap non-blocking probe used by the try-lock wide-gate variants: a
+    /// table with an in-flight seal falls back to the blocking path, which
+    /// drains the registry and keeps the gate's quiescence guarantee.
+    pub(super) fn has_sealing_segments(&self) -> bool {
+        !self.sealing_segments.lock().unwrap().is_empty()
     }
 }

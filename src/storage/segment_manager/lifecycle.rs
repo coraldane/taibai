@@ -150,29 +150,64 @@ impl SegmentManager {
         Ok(written)
     }
 
+    /// Seal extracted writers outside every lock and report the sealed row
+    /// count. Used by the flush/seal lifecycle entry points so their footer
+    /// fsyncs no longer stall the table's other partitions.
+    fn seal_pending_writers_outside_locks(
+        &self,
+        pending_seals: Vec<PendingSeal>,
+        log_stage: Option<&str>,
+    ) -> Result<u64> {
+        let mut sealed_rows = 0u64;
+        for mut pending in pending_seals {
+            let partition = pending.partition.clone();
+            let size_bytes = pending.writer.current_size;
+            let rows = pending.writer.total_rows;
+            let result = pending.writer.seal(&|path| self.invalidate_reader(path));
+            if let Err(error) = &result {
+                tracing::error!(
+                    partition_key = %partition,
+                    error = %error,
+                    "segment seal failed outside the locks"
+                );
+            } else {
+                self.emit_segment_update_final_path(&pending.writer.path);
+                if let Some(stage) = log_stage {
+                    tracing::info!(
+                        path = %pending.writer.path.display(),
+                        size_mb = size_bytes / (1024 * 1024),
+                        rows,
+                        partition_key = %partition,
+                        "{stage}"
+                    );
+                }
+                sealed_rows += rows;
+            }
+            drop(pending.token);
+            result?;
+        }
+        Ok(sealed_rows)
+    }
+
     pub fn flush_table_active(&self, db: &str, table: &str) -> Result<u64> {
         let key = table_key(db, table);
         let mut total = 0u64;
         let state = self.tables.read().unwrap().get(&key).cloned();
         if let Some(state) = state {
+            let pending_seals = {
+                let mut active_guard = state.active_segments.lock().unwrap();
+                let keys_to_seal: Vec<String> = active_guard
+                    .iter()
+                    .filter(|(_, seg)| {
+                        seg.total_rows > 0 && seg.current_size >= self.min_segment_seal_size()
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                extract_pending_seals(&state, &mut active_guard, &keys_to_seal)
+            };
+            total += self.seal_pending_writers_outside_locks(pending_seals, None)?;
+
             let mut active_guard = state.active_segments.lock().unwrap();
-            let keys_to_seal: Vec<String> = active_guard
-                .iter()
-                .filter(|(_, seg)| {
-                    seg.total_rows > 0 && seg.current_size >= self.min_segment_seal_size()
-                })
-                .map(|(k, _)| k.clone())
-                .collect();
-
-            for key in keys_to_seal {
-                if let Some(seg) = active_guard.get_mut(&key) {
-                    seg.seal(&|path| self.invalidate_reader(path))?;
-                    self.emit_segment_update_final_path(&seg.path);
-                    total += seg.total_rows;
-                }
-                active_guard.remove(&key);
-            }
-
             for (_, seg) in active_guard.iter_mut() {
                 if seg.total_rows > 0 || seg.buffered_rows > 0 {
                     seg.flush_buffer(&|path| self.invalidate_reader(path))?;
@@ -189,32 +224,23 @@ impl SegmentManager {
     /// segments to become immutable so they are visible to the compactor.
     pub fn seal_table_active(&self, db: &str, table: &str) -> Result<u64> {
         let key = table_key(db, table);
-        let mut total = 0u64;
         let state = self.tables.read().unwrap().get(&key).cloned();
-        if let Some(state) = state {
+        let Some(state) = state else {
+            return Ok(0);
+        };
+        let pending_seals = {
             let mut active_guard = state.active_segments.lock().unwrap();
             let keys_to_seal = active_guard
                 .iter()
                 .filter(|(_, segment)| segment.total_rows > 0 || segment.buffered_rows > 0)
                 .map(|(partition_key, _)| partition_key.clone())
                 .collect::<Vec<_>>();
-
-            for partition_key in keys_to_seal {
-                if let Some(segment) = active_guard.get_mut(&partition_key) {
-                    segment.seal(&|path| self.invalidate_reader(path))?;
-                    self.emit_segment_update_final_path(&segment.path);
-                    total += segment.total_rows;
-                    tracing::info!(
-                        path = %segment.path.display(),
-                        rows = segment.total_rows,
-                        partition_key,
-                        "sealing active segment for close-of-day optimization"
-                    );
-                }
-                active_guard.remove(&partition_key);
-            }
-        }
-        Ok(total)
+            extract_pending_seals(&state, &mut active_guard, &keys_to_seal)
+        };
+        self.seal_pending_writers_outside_locks(
+            pending_seals,
+            Some("sealing active segment for close-of-day optimization"),
+        )
     }
 
     pub fn flush_partition_active(
@@ -227,18 +253,23 @@ impl SegmentManager {
         let mut total = 0u64;
         let state = self.tables.read().unwrap().get(&key).cloned();
         if let Some(state) = state {
-            let mut active_guard = state.active_segments.lock().unwrap();
-            let should_seal = active_guard.get(partition_key).is_some_and(|segment| {
-                segment.total_rows > 0 && segment.current_size >= self.min_segment_seal_size()
-            });
+            let (pending_seal, should_seal) = {
+                let mut active_guard = state.active_segments.lock().unwrap();
+                let should_seal = active_guard.get(partition_key).is_some_and(|segment| {
+                    segment.total_rows > 0 && segment.current_size >= self.min_segment_seal_size()
+                });
+                let pending_seal = if should_seal {
+                    extract_pending_seals(&state, &mut active_guard, &[partition_key.to_string()])
+                } else {
+                    Vec::new()
+                };
+                (pending_seal, should_seal)
+            };
             if should_seal {
-                if let Some(segment) = active_guard.get_mut(partition_key) {
-                    segment.seal(&|path| self.invalidate_reader(path))?;
-                    self.emit_segment_update_final_path(&segment.path);
-                    total = total.saturating_add(segment.total_rows);
-                }
-                active_guard.remove(partition_key);
-            } else if let Some(segment) = active_guard.get_mut(partition_key) {
+                return self.seal_pending_writers_outside_locks(pending_seal, None);
+            }
+            let mut active_guard = state.active_segments.lock().unwrap();
+            if let Some(segment) = active_guard.get_mut(partition_key) {
                 if segment.total_rows > 0 || segment.buffered_rows > 0 {
                     segment.flush_buffer(&|path| self.invalidate_reader(path))?;
                     segment.flush_meta(&|path| self.invalidate_reader(path))?;
@@ -254,26 +285,20 @@ impl SegmentManager {
     /// pending memtables may still depend on it.
     pub(crate) fn seal_table_active_under_table_lock(&self, db: &str, table: &str) -> Result<u64> {
         let key = table_key(db, table);
-        let mut total = 0u64;
         let state = self.tables.read().unwrap().get(&key).cloned();
-        if let Some(state) = state {
+        let Some(state) = state else {
+            return Ok(0);
+        };
+        let pending_seals = {
             let mut active_guard = state.active_segments.lock().unwrap();
             let keys_to_seal = active_guard
                 .iter()
                 .filter(|(_, segment)| segment.total_rows > 0 || segment.buffered_rows > 0)
                 .map(|(partition_key, _)| partition_key.clone())
                 .collect::<Vec<_>>();
-
-            for partition_key in keys_to_seal {
-                if let Some(segment) = active_guard.get_mut(&partition_key) {
-                    segment.seal(&|path| self.invalidate_reader(path))?;
-                    self.emit_segment_update_final_path(&segment.path);
-                    total += segment.total_rows;
-                }
-                active_guard.remove(&partition_key);
-            }
-        }
-        Ok(total)
+            extract_pending_seals(&state, &mut active_guard, &keys_to_seal)
+        };
+        self.seal_pending_writers_outside_locks(pending_seals, None)
     }
 
     pub(crate) fn seal_partition_active_under_table_lock(
@@ -287,50 +312,40 @@ impl SegmentManager {
         let Some(state) = state else {
             return Ok(0);
         };
-        let mut active_guard = state.active_segments.lock().unwrap();
-        let Some(segment) = active_guard.get_mut(partition_key) else {
-            return Ok(0);
+        let pending_seal = {
+            let mut active_guard = state.active_segments.lock().unwrap();
+            let Some(segment) = active_guard.get(partition_key) else {
+                return Ok(0);
+            };
+            if segment.total_rows == 0 && segment.buffered_rows == 0 {
+                return Ok(0);
+            }
+            extract_pending_seals(&state, &mut active_guard, &[partition_key.to_string()])
         };
-        if segment.total_rows == 0 && segment.buffered_rows == 0 {
-            return Ok(0);
-        }
-        segment.seal(&|path| self.invalidate_reader(path))?;
-        self.emit_segment_update_final_path(&segment.path);
-        let rows = segment.total_rows;
-        active_guard.remove(partition_key);
-        Ok(rows)
+        self.seal_pending_writers_outside_locks(pending_seal, None)
     }
 
     pub fn flush_all_active(&self) -> Result<u64> {
-
         let mut total = 0u64;
         let states = self.table_states_snapshot();
         for state in states {
+            let pending_seals = {
+                let mut active_guard = state.active_segments.lock().unwrap();
+                let keys_to_seal: Vec<String> = active_guard
+                    .iter()
+                    .filter(|(_, seg)| {
+                        seg.total_rows > 0 && seg.current_size >= self.min_segment_seal_size()
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                extract_pending_seals(&state, &mut active_guard, &keys_to_seal)
+            };
+            total += self.seal_pending_writers_outside_locks(
+                pending_seals,
+                Some("sealing segment on flush (meets minimum size threshold)"),
+            )?;
+
             let mut active_guard = state.active_segments.lock().unwrap();
-            let keys_to_seal: Vec<String> = active_guard
-                .iter()
-                .filter(|(_, seg)| {
-                    seg.total_rows > 0 && seg.current_size >= self.min_segment_seal_size()
-                })
-                .map(|(k, _)| k.clone())
-                .collect();
-
-            for key in keys_to_seal {
-                if let Some(seg) = active_guard.get_mut(&key) {
-                    seg.seal(&|path| self.invalidate_reader(path))?;
-                    self.emit_segment_update_final_path(&seg.path);
-                    tracing::info!(
-                        path = %seg.path.display(),
-                        size_mb = seg.current_size / (1024 * 1024),
-                        rows = seg.total_rows,
-                        partition_key = key,
-                        "sealing segment on flush (meets minimum size threshold)"
-                    );
-                    total += seg.total_rows;
-                }
-                active_guard.remove(&key);
-            }
-
             for (_, seg) in active_guard.iter_mut() {
                 if seg.total_rows > 0 || seg.buffered_rows > 0 {
                     seg.flush_buffer(&|path| self.invalidate_reader(path))?;
@@ -389,7 +404,24 @@ impl SegmentManager {
         tracing::debug!(txn_id, "transaction rolled back in storage layer");
         Ok(())
     }
+}
 
+/// Extract the named writers from the active map under its lock, registering
+/// each in the sealing registry so wide gates, readers and segment discovery
+/// treat them as mid-seal until the lock-free seal finishes.
+fn extract_pending_seals(
+    state: &Arc<TableSegmentState>,
+    active_guard: &mut std::sync::MutexGuard<'_, HashMap<String, ActiveSegmentWriter>>,
+    keys: &[String],
+) -> Vec<PendingSeal> {
+    let mut pending = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Some(seg) = active_guard.remove(key) {
+            state.register_sealing_segment(key, seg.path.clone());
+            pending.push(PendingSeal::new(Arc::clone(state), key, seg));
+        }
+    }
+    pending
 }
 
 /// Gather the selected rows of a batch (columnar take, no per-cell boxing).

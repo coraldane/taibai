@@ -630,27 +630,28 @@ impl SegmentManager {
     ) -> Result<Vec<PathBuf>> {
         let segments = Self::discover_segments(table_dir)?;
         let key = table_key(db, table);
-        let active_paths = {
+        let (active_paths, sealing_paths) = {
             let tables = self.tables.read().unwrap();
             tables
                 .get(&key)
                 .map(|state| {
                     let active_guard = state.active_segments.lock().unwrap();
-                    active_guard
+                    let active = active_guard
                         .values()
                         .map(|segment| segment.path.clone())
-                        .collect::<HashSet<_>>()
+                        .collect::<HashSet<_>>();
+                    (active, state.sealing_paths())
                 })
                 .unwrap_or_default()
         };
 
-        if active_paths.is_empty() {
+        if active_paths.is_empty() && sealing_paths.is_empty() {
             return Ok(segments);
         }
 
         Ok(segments
             .into_iter()
-            .filter(|path| !active_paths.contains(path))
+            .filter(|path| !active_paths.contains(path) && !sealing_paths.contains(path))
             .collect())
     }
 
@@ -676,10 +677,17 @@ impl SegmentManager {
     pub fn find_unsealed_segment(
         table_dir: &Path,
         min_seal_size: u64,
+        exclude: &HashSet<PathBuf>,
     ) -> Result<Option<(PathBuf, Schema, u64)>> {
         let segments = Self::discover_segments(table_dir)?;
 
         for seg_path in segments.iter().rev() {
+            // A path excluded here is mid-seal outside the locks: its footer
+            // is about to be finalized by its own seal, so it must never be
+            // resumed for append or reported as an append target.
+            if exclude.contains(seg_path) {
+                continue;
+            }
             let file_len = match std::fs::metadata(seg_path) {
                 Ok(m) => m.len(),
                 Err(_) => continue,
@@ -1102,6 +1110,7 @@ impl SegmentManager {
                 lock, key, partition, timeout,
             )?);
         }
+        state.wait_sealing_segments_drained(timeout)?;
         f()
     }
 
@@ -1153,6 +1162,9 @@ impl SegmentManager {
                 }
             }
             partition_guard_sets.push(guards);
+        }
+        for state in &states {
+            state.wait_sealing_segments_drained(timeout)?;
         }
         f()
     }
@@ -1270,6 +1282,9 @@ impl SegmentManager {
                 None => return Ok(None),
             }
         }
+        if state.has_sealing_segments() {
+            return Ok(None);
+        }
         ensure_state_not_retired(&state, db, table)?;
         let result = f().map(Some);
         drop(partition_guards);
@@ -1326,6 +1341,9 @@ impl SegmentManager {
             }
             partition_guard_sets.push(guards);
         }
+        if states.iter().any(|state| state.has_sealing_segments()) {
+            return Ok(None);
+        }
         f().map(Some)
     }
 
@@ -1333,6 +1351,20 @@ impl SegmentManager {
         let Some(state) = self.state_for_segment_path(path) else {
             return SegmentReader::open_owned(path);
         };
+
+        // A segment removed from the active map is sealed outside every lock:
+        // its footer is published by the seal, so a reader that lands in that
+        // window waits for the seal instead of failing on a torn footer. The
+        // old in-lock seal blocked here on the active-segments mutex; the
+        // bounded wait preserves that serialization without stalling writers.
+        if state.sealing_paths().contains(path) {
+            let timeout = Duration::from_secs(
+                crate::common::config::storage_timeouts()
+                    .mutation_lock_timeout_secs
+                    .max(1),
+            );
+            state.wait_sealing_segments_drained(timeout)?;
+        }
 
         let mut active_guard = state.active_segments.lock().unwrap();
         for segment in active_guard.values_mut() {

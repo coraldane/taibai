@@ -51,7 +51,12 @@ gate 复位由 drop 守卫（`PartitionGateReset` / `DatabaseGatesReset`）完�
 分区锁的临界区必须是**内存级或元数据级**操作。任何慢 I/O（decode/sort/segment 重写/fsync）要么移出分区锁，要么像 memtable flush 一样拆成"锁内 freeze、锁外 I/O"两阶段。已落地的两阶段拆分：
 
 - **memtable flush**：锁内只翻转 `Flushing` 并共享 batch（`freeze_memtable_under_partition_lock`），segment 写入在 flush I/O gate 下进行；
-- **compaction**：heavy 阶段（解码全部行组、TTL 清理、聚簇排序、写替换 tmp 文件）**不持分区锁**运行，CPU/IO permit 也在取锁**之前**获取（持分区锁睡在 permit 队列上会白白冻结该分区的写入）。提交阶段在分区锁内完成：先以输入文件身份（长度+行数+删除数）校验 heavy 期间无人改动输入，再原子 rename 替换；输入有变则丢弃本次产物，留待下轮收敛。
+- **compaction**：heavy 阶段（解码全部行组、TTL 清理、聚簇排序、写替换 tmp 文件）**不持分区锁**运行，CPU/IO permit 也在取锁**之前**获取（持分区锁睡在 permit 队列上会白白冻结该分区的写入）。提交阶段在分区锁内完成：先以输入文件身份（长度+行数+删除数）校验 heavy 期间无人改动输入，再原子 rename 替换；输入有变则丢弃本次产物，留待下轮收敛；
+- **segment seal（段封口）**：活动段写满后的 footer 落盘 + fsync **不再持有任何锁**。写路径在锁内只完成"从 `active_segments` 摘除 + 向 sealing 注册表登记"，随后释放分区锁与表级 active 锁，seal 在锁外执行（`PendingSeal` / `SealingToken`，Drop 兜底清理登记，错误与 panic 路径不会泄漏登记项）。此前 seal 与 fsync 在表级 `active_segments` 互斥锁内执行，多分区并行导入时一次慢 seal（磁盘抖动下可达数十秒）会停顿**全表**所有分区的写入，并让等待的分区锁队列超过 `mutation_lock_timeout_secs`，最终以 `ResourceBusy` 断连收场。配套协议：
+  - 宽锁在收齐全部分区锁后等待 sealing 注册表**排空**（`wait_sealing_segments_drained`，复用 `mutation_lock_timeout_secs` 上限）才进入临界区，保证宽锁持有者仍看到完全静止的表；
+  - try 变体（`try_with_table_mutation_lock` / `try_with_database_mutation_locks`）在 sealing 非空时直接让位返回 `None`，由调用方走阻塞路径；
+  - 读者（`open_mutable_reader_owned`）命中 mid-seal 路径时先有界等待排空再重开，替代旧实现里阻塞在 active 锁上的串行化；
+  - `discover_inactive_segments` 与 `find_unsealed_segment(_partition)` 过滤 sealing 路径：compaction 不会纳入半成品段，恢复/续写扫描不会把正在封口的文件当作可续写段（防双写者）；同分区的下一个写者会直接滚动到新 seq 的新段，与旧段的锁外封口并行。
 
 ### 分区子集锁
 
@@ -124,6 +129,16 @@ TTL 回收回归位于 `tests/ttl_purge_test.rs`：
 |------|----------|
 | `ttl_purge_drains_expired_partition_memtables_before_deleting_files` | 过期分区尚驻留 memtable 的行在分区锁内被 drain 并连同 flush 产物一起删除，后续 flush 不再复活该分区 |
 
+seal 出锁回归位于 `src/storage/segment_manager/seal_outside_lock_test.rs`（挂载为 `segment_manager::seal_outside_lock_tests`）：
+
+| 测试 | 锁定行为 |
+|------|----------|
+| `wide_gate_waits_for_in_flight_seal` | 宽锁等待在途 seal 排空后才进入临界区 |
+| `try_gate_declines_during_in_flight_seal` | sealing 非空时 try 宽锁让位（返回 `None`），排空后放行 |
+| `find_unsealed_skips_paths_mid_seal` | mid-seal 路径不会被恢复为可续写段（防双写者） |
+| `bulk_write_to_other_partition_proceeds_during_seal` | 分区 A 封口期间，分区 B 的写入不被阻塞 |
+| `interleaved_partition_batches_with_forced_seals_stay_readable` | 微型段上限强制每次写入封口，双分区交错写入后全部行完整可读 |
+
 既有 `lock_tests::blocked_table_state_does_not_block_global_registry` 继续覆盖全局注册表不被阻塞表拖垮的行为。
 
 ## 代码索引
@@ -134,5 +149,6 @@ TTL 回收回归位于 `tests/ttl_purge_test.rs`：
 | 宽锁 gate 协议、分区锁 API | `src/storage/segment_manager/manager_core.rs`（`with_table_mutation_lock` / `with_partition_mutation_lock` / `with_partition_set_mutation_lock` / `with_state_table_mutation_lock`） |
 | 有界等待、慢锁 WARN、超时 | 同上（`acquire_mutation_lock` / `acquire_partition_mutation_lock`） |
 | 写路径迁移 | `src/storage/core/batch_writer.rs`、`src/storage/segment_manager/buffered_write.rs`、`src/storage/segment_manager/direct_bulk.rs` |
+| seal 出锁与 sealing 注册表 | `src/storage/segment_manager/state.rs`（`sealing_segments` / `wait_sealing_segments_drained`）、`direct_bulk.rs` / `buffered_write.rs`（`PendingSeal` / `SealingToken`）、`manager_core.rs`（宽锁排空、try 让位、读者等待、发现过滤） |
 | 宽锁调用点收窄 | `src/storage/core/compactor.rs`（`compact_table` / `optimize_partition`）、`src/sql/execution/dml_delete.rs`、`src/sql/execution/dml_update.rs`、`src/sql/execution/ttl_purge.rs`、`src/sql/execution/engine.rs`（健康统计） |
 | 并发回归 | `src/storage/partition_lock_test.rs`、`src/sql/execution/engine_test/lifecycle.rs` |
