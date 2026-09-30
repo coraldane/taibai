@@ -566,3 +566,84 @@ mod tests {
         assert!(!registry.table_has_pins("db", "t"));
     }
 }
+
+    /// A later table-wide statement must widen the COMMIT lock scope: a
+    /// narrow-partition DELETE followed by a table-wide DELETE would
+    /// otherwise leave the recorded scope narrow while tombstones cover
+    /// other partitions, letting COMMIT rewrite those segments against a
+    /// concurrent flush.
+    #[test]
+    fn table_scope_widens_to_none_on_table_wide_statement() {
+        let registry = TxnMutationRegistry::new();
+        registry
+            .register_segment_tombstones(
+                1,
+                "db",
+                "t",
+                Some(&["a".to_string()]),
+                Path::new("s1"),
+                &[],
+                [0],
+            )
+            .unwrap();
+        // Table-wide statement (partitions = None).
+        registry
+            .register_segment_tombstones(1, "db", "t", None, Path::new("s2"), &[], [0])
+            .unwrap();
+        // Scope is private; verify via take: the merged entry drives the
+        // COMMIT lock breadth in materialize_tables.
+        let mutations = registry.take(1).unwrap();
+        let entry = &mutations.tables[0];
+        assert!(
+            entry.partitions.is_none(),
+            "table-wide statement must widen the recorded scope to None"
+        );
+    }
+
+    /// Two different narrow partitions union their keys; a repeat of the
+    /// same partition does not duplicate the entry.
+    #[test]
+    fn narrow_scopes_union_across_statements() {
+        let registry = TxnMutationRegistry::new();
+        registry
+            .register_segment_tombstones(
+                1,
+                "db",
+                "t",
+                Some(&["a".to_string()]),
+                Path::new("s1"),
+                &[],
+                [0],
+            )
+            .unwrap();
+        registry
+            .register_segment_tombstones(
+                1,
+                "db",
+                "t",
+                Some(&["b".to_string()]),
+                Path::new("s2"),
+                &[],
+                [0],
+            )
+            .unwrap();
+        registry
+            .register_segment_tombstones(
+                1,
+                "db",
+                "t",
+                Some(&["a".to_string()]),
+                Path::new("s1"),
+                &[],
+                [1],
+            )
+            .unwrap();
+        let mutations = registry.take(1).unwrap();
+        let entry = &mutations.tables[0];
+        assert_eq!(
+            entry.partitions.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..]),
+            "narrow scopes must union without duplicates"
+        );
+        assert_eq!(entry.segments.len(), 2);
+    }

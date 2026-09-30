@@ -1087,3 +1087,48 @@ fn sum_returns_null_for_empty_input_via_metadata_path() {
         vec![vec![ScalarValue::Int64(None)]]
     );
 }
+
+/// Scalar subqueries must reject more than one row, accept exactly one, and
+/// yield NULL on zero rows. The streaming early-exit path (stops at the
+/// second row instead of materializing the whole subquery) must preserve all
+/// three outcomes.
+#[test]
+fn scalar_subquery_row_count_contract() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE t_nums (n INT64)")
+        .expect("create table");
+    for n in [1i64, 2, 3] {
+        engine
+            .execute(&mut session, &format!("INSERT INTO t_nums VALUES ({n})"))
+            .expect("insert");
+    }
+
+    // Exactly one row: usable as a scalar.
+    let rows = query(
+        &engine,
+        &mut session,
+        "SELECT * FROM t_nums WHERE n = (SELECT n FROM t_nums WHERE n = 2)",
+    );
+    assert_eq!(rows, vec![vec![i64(2)]], "single-row scalar subquery");
+
+    // Zero rows: NULL comparison matches nothing, not an error.
+    let rows = query(
+        &engine,
+        &mut session,
+        "SELECT * FROM t_nums WHERE n = (SELECT n FROM t_nums WHERE n = 99)",
+    );
+    assert!(rows.is_empty(), "zero-row scalar subquery matches nothing");
+
+    // More than one row: an error — the streaming path must detect it at the
+    // second row, not after materializing the full subquery.
+    let error = query_err(
+        &engine,
+        &mut session,
+        "SELECT * FROM t_nums WHERE n = (SELECT n FROM t_nums)",
+    );
+    assert!(
+        error.contains("more than one row"),
+        "multi-row scalar subquery must fail, got: {error}"
+    );
+}

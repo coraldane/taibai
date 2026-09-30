@@ -881,3 +881,56 @@ fn replace_is_rejected_inside_transaction_without_deleting_old_row() {
         other => panic!("expected query result, got {:?}", other),
     }
 }
+
+/// A lost/invalid unique-index snapshot must cost exactly one fallback
+/// full-table scan: the validating INSERT installs the scanned snapshot, so
+/// the NEXT insert probes it instead of rescanning the table again.
+#[test]
+fn fallback_unique_validation_installs_snapshot_for_following_inserts() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(
+            &mut session,
+            "CREATE TABLE snap_users (id INT64 PRIMARY KEY, code INT64, UNIQUE KEY uk_code (code))",
+        )
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO snap_users VALUES (1, 10)")
+        .expect("base insert");
+    // Drop the snapshot that the base insert published.
+    engine
+        .index_manager()
+        .invalidate_unique_index_snapshot("main", "snap_users", "uk_code");
+    assert_eq!(
+        engine
+            .index_manager()
+            .unique_index_columns("main", "snap_users", "uk_code")
+            .expect("columns lookup"),
+        None,
+        "snapshot must be gone after invalidation"
+    );
+
+    // This INSERT takes the fallback full-scan path — and must install the
+    // snapshot it just scanned.
+    engine
+        .execute(&mut session, "INSERT INTO snap_users VALUES (2, 20)")
+        .expect("fallback insert");
+    assert_eq!(
+        engine
+            .index_manager()
+            .unique_index_columns("main", "snap_users", "uk_code")
+            .expect("columns lookup")
+            .expect("snapshot must be installed by the fallback scan"),
+        vec!["code".to_string()],
+        "installed snapshot must cover the index key columns"
+    );
+
+    // Correctness of the installed snapshot: duplicate keys still rejected,
+    // distinct keys accepted.
+    assert!(engine
+        .execute(&mut session, "INSERT INTO snap_users VALUES (3, 20)")
+        .is_err());
+    engine
+        .execute(&mut session, "INSERT INTO snap_users VALUES (4, 40)")
+        .expect("distinct key after snapshot install");
+}
