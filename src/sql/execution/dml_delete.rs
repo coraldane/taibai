@@ -18,10 +18,7 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{
-    build_row_group_predicate, collect_expr_column_indices, eval_expr_to_scalar,
-    eval_where_clause_batch,
-};
+use super::helpers::{eval_expr_to_scalar, eval_where_clause_batch};
 use super::scan::cluster_prune;
 use super::scan::row_filter::ClusterKeyBounds;
 use crate::sql::parser::ast::{BinOp, Expr};
@@ -1011,21 +1008,17 @@ pub fn exec_delete(
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    let (table_schema, table_meta) = {
-        let catalogs = engine.catalogs().read().unwrap();
-        let catalog = catalogs
-            .get(db)
-            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-        let meta = catalog
-            .get_table(table)
-            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-            .clone();
-        (Schema::new(meta.columns.clone()), meta)
-    };
-
     if reader_txn_id > 0 {
         return super::txn_dml::exec_delete_in_txn(engine, db, table, where_clause, reader_txn_id);
     }
+
+    let ctx = super::txn_dml::DmlStatementContext::plan(engine, db, table, where_clause)?;
+    let resolved_where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let target_partition_key = ctx.narrowed_partition();
+    let predicate = ctx.predicate.as_ref();
+    let predicate_projection = &ctx.predicate_projection;
 
     super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
 
@@ -1041,26 +1034,12 @@ pub fn exec_delete(
         .lock()
         .unwrap();
 
-    // Resolve WHERE subqueries into literals: the predicate evaluator would
-    // otherwise treat unexpanded subqueries as "match every row" and rewrite
-    // the whole table. Subquery table permissions are enforced statement-wide
-    // by the engine's permission gate before dispatch.
-    let resolved_where_clause =
-        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
-
-    let target_partition_key =
-        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
     let mut total_deleted: u64 = 0;
     // Segments whose delete footer was successfully rewritten by this
     // statement (0 for memtable-only deletes).
     let mut footers_rewritten: u64 = 0;
-    let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
-    let predicate_projection = resolved_where_clause
-        .as_ref()
-        .map(|expr| collect_expr_column_indices(expr, &table_schema))
-        .unwrap_or_default();
 
     engine
         .batch_writer()

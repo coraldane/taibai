@@ -105,13 +105,73 @@ pub(crate) fn refuse_txn_dml_on_pinned_table(
     Ok(())
 }
 
-/// Mutation-lock scope for the deferred plans: the partition the statements
-/// were narrowed to, or `None` for a table-wide lock at COMMIT.
-fn partition_scope(target: &Option<String>) -> Option<Vec<String>> {
-    target
-        .as_deref()
-        .filter(|key| !key.is_empty())
-        .map(|key| vec![key.to_string()])
+/// Everything the four DML statement paths (auto-commit/transaction ×
+/// DELETE/UPDATE) derive identically from the statement before touching any
+/// data: the table metadata snapshot, the subquery-resolved WHERE clause,
+/// the compiled row-group predicate, and the narrowed partition. Planning
+/// phases consume this context; the materialization strategy (immediate for
+/// auto-commit, deferred to COMMIT for transactions) is the caller's choice.
+/// Constructed once per statement via [`DmlStatementContext::plan`], so the
+/// next preamble step is added here — not re-copied into four paths.
+pub(crate) struct DmlStatementContext {
+    pub table_schema: Schema,
+    pub table_meta: TableMeta,
+    pub resolved_where: Option<Expr>,
+    ///  when the WHERE clause compiles to no row-group predicate
+    /// (statement matches everything).
+    pub predicate: Option<crate::storage::segment::RowGroupPredicate>,
+    /// Column indices the WHERE clause references (for projected reads).
+    pub predicate_projection: Vec<usize>,
+    /// The `partition = const` key the WHERE clause narrows to, if any.
+    pub target_partition_key: Option<String>,
+}
+
+impl DmlStatementContext {
+    pub(crate) fn plan(
+        engine: &Engine,
+        db: &str,
+        table: &str,
+        where_clause: &Option<Expr>,
+    ) -> Result<Self> {
+        let (table_schema, table_meta) = load_table(engine, db, table)?;
+        // Subquery table permissions are enforced statement-wide by the
+        // engine's permission gate before dispatch; resolution here turns
+        // the subqueries into literals so the predicate evaluator (whose
+        // legacy fallback treated them as "match every row") never sees one.
+        let resolved_where = super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
+        let predicate = build_row_group_predicate(&resolved_where, &table_schema);
+        let predicate_projection = resolved_where
+            .as_ref()
+            .map(|expr| collect_expr_column_indices(expr, &table_schema))
+            .unwrap_or_default();
+        let target_partition_key =
+            delete_partition_eq_key(&resolved_where, &table_schema, &table_meta);
+        Ok(Self {
+            table_schema,
+            table_meta,
+            resolved_where,
+            predicate,
+            predicate_projection,
+            target_partition_key,
+        })
+    }
+
+    /// Mutation-lock scope derived from the narrowed partition: the single
+    /// partition, or `None` for a table-wide lock.
+    pub(crate) fn partition_scope(&self) -> Option<Vec<String>> {
+        self.target_partition_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .map(|key| vec![key.to_string()])
+    }
+
+    /// The narrowed partition as a `&str` filter argument (`None` when the
+    /// statement spans the whole table).
+    pub(crate) fn narrowed_partition(&self) -> Option<&str> {
+        self.target_partition_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+    }
 }
 
 fn run_under_mutation_locks<T>(
@@ -145,18 +205,20 @@ pub(crate) fn exec_delete_in_txn(
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    let (table_schema, table_meta) = load_table(engine, db, table)?;
-    ensure_txn_dml_supported(&table_meta)?;
-
-    let resolved_where_clause =
-        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
-    let target_partition_key =
-        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
-    let partitions = partition_scope(&target_partition_key);
+    let ctx = DmlStatementContext::plan(engine, db, table, where_clause)?;
+    ensure_txn_dml_supported(&ctx.table_meta)?;
+    let partitions = ctx.partition_scope();
+    let resolved_where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let target_partition_key = ctx
+        .target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty());
+    let predicate = ctx.predicate.as_ref();
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
-    let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
 
     let delete_body = || -> Result<u64> {
         // Write-write conflict control: the check runs inside the mutation
@@ -172,11 +234,9 @@ pub(crate) fn exec_delete_in_txn(
             engine,
             db,
             table,
-            &resolved_where_clause,
-            &table_schema,
-            target_partition_key
-                .as_deref()
-                .filter(|key| !key.is_empty()),
+            resolved_where_clause,
+            table_schema,
+            target_partition_key,
             reader_txn_id,
         )?;
         let (own_plans, committed_plans): (Vec<_>, Vec<_>) = memtable_plans
@@ -364,23 +424,21 @@ pub(crate) fn exec_update_in_txn(
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    let (table_schema, table_meta) = load_table(engine, db, table)?;
-    ensure_txn_dml_supported(&table_meta)?;
-    if table_meta.is_partitioned()
+    let ctx = DmlStatementContext::plan(engine, db, table, where_clause)?;
+    ensure_txn_dml_supported(&ctx.table_meta)?;
+    if ctx.table_meta.is_partitioned()
         && assignments.iter().any(|assignment| {
             assignment
                 .column
-                .eq_ignore_ascii_case(&table_meta.partition_key)
+                .eq_ignore_ascii_case(&ctx.table_meta.partition_key)
         })
     {
         return Err(TaibaiError::Sql(format!(
             "updating partition key '{}' is not supported; use DELETE followed by INSERT",
-            table_meta.partition_key
+            ctx.table_meta.partition_key
         )));
     }
 
-    let resolved_where_clause =
-        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
     let resolved_assignments: Vec<Assignment> = assignments
         .iter()
         .map(|assignment| {
@@ -396,20 +454,16 @@ pub(crate) fn exec_update_in_txn(
         .collect::<Result<_>>()?;
     let assignments = resolved_assignments.as_slice();
 
-    let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
-    let predicate_projection = resolved_where_clause
-        .as_ref()
-        .map(|expr| collect_expr_column_indices(expr, &table_schema))
-        .unwrap_or_default();
-    let target_partition_key =
-        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
-    let partitions = partition_scope(&target_partition_key);
+    let resolved_where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let predicate = ctx.predicate.as_ref();
+    let predicate_projection = &ctx.predicate_projection;
+    let partitions = ctx.partition_scope();
+    let narrowed_partition = ctx.narrowed_partition();
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
-    let narrowed_partition = target_partition_key
-        .as_deref()
-        .filter(|key| !key.is_empty());
 
     let update_body = || -> Result<u64> {
         // Write-write conflict control, same gate as delete_body.
@@ -521,7 +575,7 @@ pub(crate) fn exec_update_in_txn(
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !super::helpers::segment_may_match(&reader, predicate.as_ref()) {
+            if !super::helpers::segment_may_match(&reader, predicate) {
                 continue;
             }
             let prior_ids = engine
