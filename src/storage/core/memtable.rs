@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 use uuid::Uuid;
@@ -59,6 +59,10 @@ pub struct MemTable {
     /// tail, so REPLACE conflict key indexes can refresh incrementally on a
     /// stable version and rebuild on a bump.
     content_version: AtomicU64,
+    /// Set when this memtable's durable-tail commit failed: the tail file
+    /// (if any was created) may be torn, so the next flush must take the
+    /// segment protocol instead of trusting the tail's presence on disk.
+    needs_segment_flush: AtomicBool,
 }
 
 impl MemTable {
@@ -78,6 +82,7 @@ impl MemTable {
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
             content_version: AtomicU64::new(0),
+            needs_segment_flush: AtomicBool::new(false),
         }
     }
 
@@ -103,6 +108,7 @@ impl MemTable {
             txn_id: AtomicU64::new(txn_id),
             visibility: RwLock::new(TxnVisibility::Uncommitted(txn_id)),
             content_version: AtomicU64::new(0),
+            needs_segment_flush: AtomicBool::new(false),
         }
     }
 
@@ -163,6 +169,16 @@ impl MemTable {
                 }
             }
         }
+    }
+
+    /// Whether this memtable's tail commit failed and its next flush must
+    /// take the segment protocol (see `needs_segment_flush`).
+    pub fn needs_segment_flush(&self) -> bool {
+        self.needs_segment_flush.load(Ordering::Acquire)
+    }
+
+    pub fn set_needs_segment_flush(&self, value: bool) {
+        self.needs_segment_flush.store(value, Ordering::Release);
     }
 
     pub fn txn_id(&self) -> u64 {
@@ -454,6 +470,7 @@ impl MemTable {
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
             content_version: AtomicU64::new(0),
+            needs_segment_flush: AtomicBool::new(false),
         }
     }
 
@@ -486,6 +503,7 @@ impl MemTable {
             txn_id: AtomicU64::new(0),
             visibility: RwLock::new(TxnVisibility::Committed),
             content_version: AtomicU64::new(0),
+            needs_segment_flush: AtomicBool::new(false),
         }
     }
 
