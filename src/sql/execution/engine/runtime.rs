@@ -158,7 +158,6 @@ impl Engine {
         }
     }
 
-
     /// Distinct partition keys of a batch (empty for non-partitioned tables
     /// or when no key can be derived). Typed, memoized key derivation
     /// straight from column storage; the scalar-based
@@ -182,9 +181,7 @@ impl Engine {
             return Vec::new();
         };
         use crate::storage::catalog::schema::PartitionType;
-        use crate::storage::partition::partition_function::{
-            PartitionKeyKind, PartitionKeysAt,
-        };
+        use crate::storage::partition::partition_function::{PartitionKeyKind, PartitionKeysAt};
         let partition_column = batch.column(partition_col_idx);
         // Derive the kind through `partition_strategy()` so every scheme
         // (Hash/Mod included) gets per-partition mirror accounting, matching
@@ -335,7 +332,7 @@ impl Engine {
             self.hot_store_mgr.clear_resident_coverage(db, table);
             self.batch_writer
                 .memtable_manager()
-                .mark_hot_unfed_all_partitions(db, table);
+                .retract_hot_mirror_coverage(db, table);
             tracing::warn!(
                 db,
                 table,
@@ -376,10 +373,12 @@ impl Engine {
     /// on-disk JSON (the snapshot was written by the applier).
     pub fn reload_catalog(&self, db: &str) -> Result<()> {
         let meta_dir = self.data_dir.join("meta");
-        let catalog = crate::storage::catalog::schema::DatabaseCatalog::load_or_create(
-            &meta_dir, db,
-        )?;
-        self.catalogs.write().unwrap().insert(db.to_string(), catalog);
+        let catalog =
+            crate::storage::catalog::schema::DatabaseCatalog::load_or_create(&meta_dir, db)?;
+        self.catalogs
+            .write()
+            .unwrap()
+            .insert(db.to_string(), catalog);
         Ok(())
     }
 
@@ -457,8 +456,7 @@ impl Engine {
         // Deferred DML plans are dropped first: no durable state was
         // written at statement time, so discarding them restores the
         // pre-statement state.
-        let discarded_dml =
-            super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
+        let discarded_dml = super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
         let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
         // Retract the unique/PK index entries INSERT statements published at
         // statement time; otherwise the next INSERT of the same key sees a
@@ -530,10 +528,7 @@ impl Engine {
         let mut total = 0u64;
         for (db, table) in tables {
             total = total.saturating_add(self.flush_table_buffers(&db, &table)?);
-            self.bulk_dirty_tables
-                .lock()
-                .unwrap()
-                .remove(&(db, table));
+            self.bulk_dirty_tables.lock().unwrap().remove(&(db, table));
         }
         if !self.is_bulk_mode() {
             self.index_manager.resume_unique_index_compaction();
@@ -746,8 +741,9 @@ impl Engine {
         // archived maximum can only come from post-close writes, which the
         // insert path mirrors; any later bypass re-closes the gate through
         // `hot_partition_mirrored`.
-        let covers_from = match SegmentManager::discover_segments(&self.segment_mgr.table_dir(db, table))
-        {
+        let covers_from = match SegmentManager::discover_segments(
+            &self.segment_mgr.table_dir(db, table),
+        ) {
             // An empty table legitimately yields i64::MIN (nothing archived,
             // every future row is post-close). A discovery FAILURE must not:
             // the mirror is empty here, so claiming full coverage would hide
@@ -1010,14 +1006,11 @@ impl Engine {
                             // and fully loaded. A partition with any archived
                             // (pre-cutoff) segment stays cold, matching a
                             // server that never restarted.
-                            if partition_segments
-                                .iter()
-                                .all(|seg| {
-                                    eligible.contains(seg)
-                                        && loaded_segments.contains(seg)
-                                        && !failed_segments.contains(seg)
-                                })
-                            {
+                            if partition_segments.iter().all(|seg| {
+                                eligible.contains(seg)
+                                    && loaded_segments.contains(seg)
+                                    && !failed_segments.contains(seg)
+                            }) {
                                 store.mark_partition_resident(partition_key);
                             }
                         }

@@ -91,7 +91,6 @@ fn prepare_direct_bulk_constraint_entries(
 
     let mut entries_by_index = Vec::with_capacity(unique_constraints.len());
     for (index_name, indices) in unique_constraints {
-
         let mut seen = HashSet::with_capacity(req.row_count);
         let mut entries = Vec::with_capacity(req.row_count);
         for row_idx in 0..req.row_count {
@@ -160,6 +159,59 @@ fn prepare_direct_bulk_constraint_entries(
     }
 
     Ok((primary_keys, entries_by_index))
+}
+
+/// Coverage ownership for one bulk write. [`Engine::begin_hot_bulk_write`]
+/// snapshots and clears the resident coverage; the guard carries the
+/// pre-write snapshot through the write and the feed, and every exit is
+/// explicit:
+/// - [`HotBulkCoverageGuard::restore_pre_write`] — the write did not commit
+///   (or committed zero rows); put the pre-write coverage back.
+/// - [`HotBulkCoverageGuard::settle`] — a successor step took over the final
+///   state (the restore-or-mark decision after a successful feed).
+///
+/// Dropping without either clears the coverage: the fail-closed default. A
+/// path that leaves without a decision must not leave the store claiming a
+/// coverage it cannot prove (the ghost-row posture). This replaces the
+/// snapshot/clear/restore-or-clear sequence that used to be hand-written at
+/// every bulk entry and feed tail.
+struct HotBulkCoverageGuard<'e> {
+    engine: &'e Engine,
+    db: String,
+    table: String,
+    snapshot: Option<crate::storage::core::hot_store::ResidentCoverageSnapshot>,
+    settled: bool,
+}
+
+impl HotBulkCoverageGuard<'_> {
+    /// Whether a pre-write coverage existed to defend (the table has a hot
+    /// key column). When false, every operation is a no-op.
+    fn active(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    fn restore_pre_write(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            self.engine
+                .hot_store_mgr
+                .restore_resident_coverage(&self.db, &self.table, snapshot);
+        }
+        self.settled = true;
+    }
+
+    fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for HotBulkCoverageGuard<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.engine
+                .hot_store_mgr
+                .clear_resident_coverage(&self.db, &self.table);
+        }
+    }
 }
 
 impl Engine {
@@ -301,10 +353,9 @@ impl Engine {
         self.segment_mgr
             .set_table_compression_level(db, table, table_meta.compression_level);
         self.validate_batch_unique_constraints(db, table, &batch)?;
-        let resident_coverage_before_bulk = self.begin_hot_bulk_write(db, table, table_meta);
-        let had_segments_before =
-            resident_coverage_before_bulk.is_some()
-                && !Self::table_has_any_segment(&self.segment_mgr.table_dir(db, table));
+        let mut coverage = self.begin_hot_bulk_write(db, table, table_meta);
+        let had_segments_before = coverage.active()
+            && !Self::table_has_any_segment(&self.segment_mgr.table_dir(db, table));
         // Load-bearing copy: the segment writers consume the batch by value
         // (append_batch_owned moves columns into row-group buffers), and the
         // hot mirror must only be fed AFTER the write commits — feeding first
@@ -312,7 +363,7 @@ impl Engine {
         // depend on exists, and a failed write would strand them. The regular
         // INSERT path can feed first because its rows land in memtables under
         // the same statement, not in segment files.
-        let hot_batch = if resident_coverage_before_bulk.is_some() {
+        let hot_batch = if coverage.active() {
             Some(batch.clone())
         } else {
             None
@@ -329,10 +380,7 @@ impl Engine {
         } {
             Ok(result) => result,
             Err(e) => {
-                if let Some(snapshot) = resident_coverage_before_bulk {
-                    self.hot_store_mgr
-                        .restore_resident_coverage(db, table, snapshot);
-                }
+                coverage.restore_pre_write();
                 return Err(e);
             }
         };
@@ -346,15 +394,14 @@ impl Engine {
                     table,
                     table_meta,
                     batch,
-                    resident_coverage_before_bulk,
+                    &mut coverage,
                     had_segments_before,
                 );
-            } else {
-                self.hot_store_mgr.clear_resident_coverage(db, table);
             }
-        } else if let Some(snapshot) = resident_coverage_before_bulk {
-            self.hot_store_mgr
-                .restore_resident_coverage(db, table, snapshot);
+            // No hot batch (no key column): the guard's drop keeps the
+            // coverage cleared, as the explicit clear here used to.
+        } else {
+            coverage.restore_pre_write();
         }
         Ok(result)
     }
@@ -396,8 +443,12 @@ impl Engine {
         // collide with it.
         let decompressed;
         let payload: &[u8] = if payload.len() >= 4 && payload[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
-            decompressed = zstd::bulk::decompress(payload, max_bulk_decompressed_len(payload.len()))
-                .map_err(|e| TaibaiError::Protocol(format!("bulk payload zstd decompress failed: {}", e)))?;
+            decompressed =
+                zstd::bulk::decompress(payload, max_bulk_decompressed_len(payload.len())).map_err(
+                    |e| {
+                        TaibaiError::Protocol(format!("bulk payload zstd decompress failed: {}", e))
+                    },
+                )?;
             &decompressed
         } else {
             payload
@@ -504,12 +555,12 @@ impl Engine {
             }
         }
 
-        let resident_coverage_before_bulk = if hot_payload_should_feed {
-            self.begin_hot_bulk_write(
+        let mut coverage = if hot_payload_should_feed {
+            Some(self.begin_hot_bulk_write(
                 db,
                 &table_name,
                 table_meta_for_hot.as_ref().expect("checked hot table meta"),
-            )
+            ))
         } else {
             None
         };
@@ -524,9 +575,8 @@ impl Engine {
         ) {
             Ok(result) => result,
             Err(e) => {
-                if let Some(snapshot) = resident_coverage_before_bulk {
-                    self.hot_store_mgr
-                        .restore_resident_coverage(db, &table_name, snapshot);
+                if let Some(coverage) = coverage.as_mut() {
+                    coverage.restore_pre_write();
                 }
                 return Err(e);
             }
@@ -536,24 +586,30 @@ impl Engine {
             self.mark_bulk_dirty_table(db, &table_name);
         }
         let hot_feed_start = std::time::Instant::now();
-        log_direct_bulk_profile("should_feed", if hot_payload_should_feed { 1 } else { 0 }, hot_feed_start.elapsed());
+        log_direct_bulk_profile(
+            "should_feed",
+            if hot_payload_should_feed { 1 } else { 0 },
+            hot_feed_start.elapsed(),
+        );
         if result > 0 && hot_payload_should_feed {
             if let Some(table_meta) = table_meta_for_hot.as_ref() {
-                self.feed_hot_store_after_direct_bulk(
-                    db,
-                    &table_name,
-                    table_meta,
-                    &req,
-                    resident_coverage_before_bulk,
-                    had_segments_before,
-                );
+                if let Some(coverage) = coverage.as_mut() {
+                    self.feed_hot_store_after_direct_bulk(
+                        db,
+                        &table_name,
+                        table_meta,
+                        &req,
+                        coverage,
+                        had_segments_before,
+                    );
+                }
             }
         } else if result > 0 {
             let else_start = std::time::Instant::now();
-            self.hot_store_mgr.clear_resident_coverage(db, &table_name);
-            // Bulk-mode writes skip the hot-store feed entirely and their
-            // partitions are not derived here; retire the fast path for the
-            // table until the store is rebuilt (restart warmup / invalidate).
+            // The guard's drop clears the coverage. Bulk-mode writes skip the
+            // hot-store feed entirely and their partitions are not derived
+            // here; retire the fast path for the table until the store is
+            // rebuilt (restart warmup / invalidate).
             if table_meta_for_hot.as_ref().is_some_and(|meta| {
                 crate::storage::core::hot_store::resolve_key_column(meta).is_some()
             }) {
@@ -563,6 +619,7 @@ impl Engine {
             }
             log_direct_bulk_profile("else_branch", result as usize, else_start.elapsed());
         }
+        drop(coverage);
 
         if result > 0 {
             let index_start = std::time::Instant::now();
@@ -608,14 +665,25 @@ impl Engine {
         db: &str,
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
-    ) -> Option<crate::storage::core::hot_store::ResidentCoverageSnapshot> {
-        crate::storage::core::hot_store::resolve_key_column(table_meta)?;
-        let snapshot = self
-            .hot_store_mgr
-            .resident_coverage_snapshot(db, table)
-            .unwrap_or_default();
-        self.hot_store_mgr.clear_resident_coverage(db, table);
-        Some(snapshot)
+    ) -> HotBulkCoverageGuard<'_> {
+        let snapshot = if crate::storage::core::hot_store::resolve_key_column(table_meta).is_some()
+        {
+            let snapshot = self
+                .hot_store_mgr
+                .resident_coverage_snapshot(db, table)
+                .unwrap_or_default();
+            self.hot_store_mgr.clear_resident_coverage(db, table);
+            Some(snapshot)
+        } else {
+            None
+        };
+        HotBulkCoverageGuard {
+            engine: self,
+            db: db.to_string(),
+            table: table.to_string(),
+            snapshot,
+            settled: false,
+        }
     }
 
     /// After a successful hot-store feed: when the written rows are the
@@ -629,9 +697,7 @@ impl Engine {
         &self,
         db: &str,
         table: &str,
-        resident_coverage_before_bulk: Option<
-            crate::storage::core::hot_store::ResidentCoverageSnapshot,
-        >,
+        coverage: &mut HotBulkCoverageGuard<'_>,
         had_segments_before: bool,
     ) {
         if !had_segments_before
@@ -643,12 +709,31 @@ impl Engine {
             let store = self.hot_store_mgr.get(db, table);
             if store.is_some_and(|s| s.row_count() > 0) {
                 self.apply_hot_resident_mark(db, table, HotResidentMark::FullTable);
+                coverage.settle();
                 return;
             }
         }
-        if let Some(snapshot) = resident_coverage_before_bulk {
-            self.hot_store_mgr
-                .restore_resident_coverage(db, table, snapshot);
+        coverage.restore_pre_write();
+    }
+
+    /// Feed one batch into the hot store, reclaiming resident memory once on
+    /// backpressure before retrying. The single feed step shared by every
+    /// bulk feed tail.
+    fn feed_hot_store_with_reclaim(
+        &self,
+        db: &str,
+        table: &str,
+        table_meta: &crate::storage::catalog::schema::TableMeta,
+        batch: &RecordBatch,
+        feed: &HotFeedGuard<'_>,
+    ) -> crate::common::error::Result<()> {
+        match self.feed_hot_store(db, table, table_meta, batch, feed) {
+            Ok(()) => Ok(()),
+            Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
+                self.reclaim_hot_store_pressure(db, table);
+                self.feed_hot_store(db, table, table_meta, batch, feed)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -658,33 +743,18 @@ impl Engine {
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
         batch: &RecordBatch,
-        resident_coverage_before_bulk: Option<
-            crate::storage::core::hot_store::ResidentCoverageSnapshot,
-        >,
+        coverage: &mut HotBulkCoverageGuard<'_>,
         had_segments_before: bool,
     ) {
         let feed = self.begin_hot_feed(db, table);
-        let feed_result = match self.feed_hot_store(db, table, table_meta, batch, &feed) {
-            Ok(()) => Ok(()),
-            Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
-                self.reclaim_hot_store_pressure(db, table);
-                self.feed_hot_store(db, table, table_meta, batch, &feed)
-            }
-            Err(e) => Err(e),
-        };
-
-        match feed_result {
+        match self.feed_hot_store_with_reclaim(db, table, table_meta, batch, &feed) {
             Ok(()) => {
-                Self::restore_or_mark_full_resident(
-                    self,
-                    db,
-                    table,
-                    resident_coverage_before_bulk,
-                    had_segments_before,
-                );
+                Self::restore_or_mark_full_resident(self, db, table, coverage, had_segments_before);
             }
             Err(e) => {
-                self.hot_store_mgr.clear_resident_coverage(db, table);
+                // The rows are persisted but not mirrored; the coverage
+                // guard's drop clears the fast path, and the unmirrored-row
+                // accounting keeps it down for these rows.
                 self.note_mirror_batch(db, table, table_meta, batch, false);
                 tracing::warn!(
                     db,
@@ -702,9 +772,7 @@ impl Engine {
         table: &str,
         table_meta: &crate::storage::catalog::schema::TableMeta,
         req: &crate::storage::bulk_payload::DirectBulkRequest<'_>,
-        resident_coverage_before_bulk: Option<
-            crate::storage::core::hot_store::ResidentCoverageSnapshot,
-        >,
+        coverage: &mut HotBulkCoverageGuard<'_>,
         had_segments_before: bool,
     ) {
         // The request was parsed once before the write; only the batch
@@ -714,48 +782,29 @@ impl Engine {
             let schema = Schema::new(table_meta.columns.clone());
             crate::storage::segment_manager::direct_bulk_request_to_batch(req, &schema)
         })();
-        let mut feed_batch: Option<RecordBatch> = None;
+        log_direct_bulk_profile("hot_feed_parse", 0, hot_parse_start.elapsed());
+        let mut parsed_batch: Option<RecordBatch> = None;
         let feed = self.begin_hot_feed(db, table);
-        let feed_result = match parse_result {
+        let outcome = match parse_result {
             Ok(batch) => {
-            log_direct_bulk_profile("hot_feed_parse", 0, hot_parse_start.elapsed());
-                let fed = match self.feed_hot_store(db, table, table_meta, &batch, &feed) {
-                    Ok(()) => Ok(()),
-                    Err(crate::common::error::TaibaiError::ResourceBusy(_)) => {
-                        self.reclaim_hot_store_pressure(db, table);
-                        self.feed_hot_store(db, table, table_meta, &batch, &feed)
-                    }
-                    Err(e) => Err(e),
-                };
-                match fed {
-                    Ok(()) => {
-                        feed_batch = Some(batch);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        feed_batch = Some(batch);
-                        Err(e)
-                    }
-                }
+                let result = self.feed_hot_store_with_reclaim(db, table, table_meta, &batch, &feed);
+                parsed_batch = Some(batch);
+                result
             }
             Err(e) => Err(e),
         };
 
-        match feed_result {
+        match outcome {
             Ok(()) => {
-                Self::restore_or_mark_full_resident(
-                    self,
-                    db,
-                    table,
-                    resident_coverage_before_bulk,
-                    had_segments_before,
-                );
+                Self::restore_or_mark_full_resident(self, db, table, coverage, had_segments_before);
             }
             Err(e) => {
-                self.hot_store_mgr.clear_resident_coverage(db, table);
                 // The payload rows are already persisted but not mirrored;
-                // mark what we can so the resident fast path stands down.
-                match feed_batch.as_ref() {
+                // the coverage guard's drop clears, and the accounting below
+                // stands the fast path down for what we can name. A parse
+                // failure names no rows, so only the table-level marker goes
+                // up.
+                match parsed_batch.as_ref() {
                     Some(batch) => self.note_mirror_batch(db, table, table_meta, batch, false),
                     None => self
                         .batch_writer

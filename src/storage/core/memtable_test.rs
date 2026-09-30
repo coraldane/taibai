@@ -246,3 +246,33 @@ fn spill_rejects_empty_or_flushed_memtables() {
     memtable.set_state(MemTableState::Flushing);
     assert!(!memtable.spill_to_tail(temp.path().join("none.tail")));
 }
+
+/// After a hot-store prefix reclamation the table's mirror coverage must be
+/// retracted table-wide: both claim paths stand down until the store is
+/// invalidated. (The previous encoding flipped accounted counters from 0 to
+/// 1, but counters only ever hold values >= 1, so the retraction never
+/// fired.)
+#[test]
+fn retract_hot_mirror_coverage_stands_down_both_claims() {
+    let manager = MemTableManager::new(10_000, 60, 2, 3600);
+    assert!(manager.hot_partition_mirrored("main", "t", ""));
+    assert!(manager.hot_table_fully_mirrored("main", "t"));
+
+    manager.retract_hot_mirror_coverage("main", "t");
+    assert!(
+        !manager.hot_partition_mirrored("main", "t", ""),
+        "retraction must disable the partition claim"
+    );
+    assert!(
+        !manager.hot_table_fully_mirrored("main", "t"),
+        "retraction must disable the watermark shortcut claim"
+    );
+    // Unrelated tables are untouched.
+    assert!(manager.hot_partition_mirrored("main", "other", ""));
+
+    // Invalidation (table rebuild / UPDATE / DELETE) clears the marker and
+    // the fast path can be re-established.
+    manager.clear_hot_unfed("main", "t");
+    assert!(manager.hot_partition_mirrored("main", "t", ""));
+    assert!(manager.hot_table_fully_mirrored("main", "t"));
+}

@@ -692,9 +692,9 @@ impl MemTableManager {
             .or_insert(0) += rows;
     }
 
-    /// Zero means every segment row of the partition is provably mirrored in
-    /// the hot store, so a resident-partition scan may answer from the store
-    /// alone. See [`HotUnfedScope`] for the table-level bypass marker.
+    /// Unmirrored-row count for one partition. Test/introspection view of
+    /// the accounting; the production claim paths go through
+    /// [`Self::hot_partition_mirrored`] / [`Self::hot_table_fully_mirrored`].
     pub fn hot_unfed_rows(&self, db: &str, table: &str, partition: &str) -> u64 {
         let unfed = self.hot_unfed_rows.lock().unwrap();
         unfed
@@ -754,15 +754,20 @@ impl MemTableManager {
             .any(|(k_db, k_table, _)| k_db == db && k_table == table)
     }
 
-    /// Flip every accounted partition of the table to unmirrored (hot-store
-    /// prefix reclamation: rows below the new front are gone from the store).
-    pub fn mark_hot_unfed_all_partitions(&self, db: &str, table: &str) {
+    /// Retract the table's mirror coverage after a hot-store prefix
+    /// reclamation: rows below the new front are gone from the store, so no
+    /// partition's residency is provable anymore. Raised as the sticky
+    /// table-level marker — the same encoding a bulk bypass uses — so both
+    /// claim paths (`hot_partition_mirrored`, `hot_table_fully_mirrored`)
+    /// stand down until the store is invalidated and rebuilt. (The previous
+    /// encoding tried to flip accounted partition counters from 0 to 1, but
+    /// counters only ever hold values >= 1, so the flip never fired and the
+    /// retraction was a no-op.)
+    pub fn retract_hot_mirror_coverage(&self, db: &str, table: &str) {
         let mut unfed = self.hot_unfed_rows.lock().unwrap();
-        for (key, value) in unfed.iter_mut() {
-            if key.0 == db && key.1 == table && *value == 0 {
-                *value = 1;
-            }
-        }
+        *unfed
+            .entry((db.to_string(), table.to_string(), HotUnfedScope::Table))
+            .or_insert(0) += 1;
     }
 
     pub fn clear_hot_unfed(&self, db: &str, table: &str) {
