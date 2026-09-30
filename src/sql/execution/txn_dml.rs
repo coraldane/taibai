@@ -29,9 +29,7 @@ use super::dml_delete::{
     prune_segments_by_cluster_key, prune_segments_by_partition,
 };
 use super::engine::{Engine, ExecResult};
-use super::helpers::{
-    build_row_group_predicate, collect_expr_column_indices, eval_where_clause_batch,
-};
+use super::helpers::{build_row_group_predicate, collect_expr_column_indices};
 use crate::sql::parser::ast::{Assignment, Expr};
 
 /// Reject tables whose indexes or acceleration paths have no deferred-DML
@@ -316,83 +314,51 @@ pub(crate) fn exec_delete_in_txn(
             let prior_ids = engine
                 .txn_mutations()
                 .segment_row_ids(reader_txn_id, &seg_path);
-            let bitmap_bytes = total_rows.div_ceil(8) as usize;
-            let mut new_bitmap = vec![0u8; bitmap_bytes];
-            let footer_bitmap = reader.delete_bitmap().to_vec();
-            let copy_len = footer_bitmap.len().min(bitmap_bytes);
-            new_bitmap[..copy_len].copy_from_slice(&footer_bitmap[..copy_len]);
-            for row_id in &prior_ids {
-                delete_bitmap::mark_deleted(&mut new_bitmap, *row_id);
-            }
+            // WHERE-less deletes publish no events here (nothing was read to
+            // publish), so batches are only needed when a WHERE clause is
+            // evaluated.
+            let outcome = super::dml_delete::match_segment_for_delete(
+                &reader,
+                predicate,
+                resolved_where_clause.as_ref(),
+                &prior_ids,
+                resolved_where_clause.is_some(),
+                |reader, rg_idx| reader.read_row_group(rg_idx),
+                |batch, matched| {
+                    if !publish_deletes {
+                        return Ok(());
+                    }
+                    let deleted_in_rg: Vec<u32> = matched.iter().map(|(idx, _)| *idx).collect();
+                    match batch.take_rows(&deleted_in_rg) {
+                        Ok(deleted) => engine.txn_mutations().defer_delete_event(
+                            reader_txn_id,
+                            db,
+                            table,
+                            deleted,
+                        )?,
+                        Err(error) => tracing::warn!(
+                            db,
+                            table,
+                            error = %error,
+                            "failed to build deferred delete-event batch"
+                        ),
+                    }
+                    Ok(())
+                },
+            )?;
 
-            let mut newly_deleted: Vec<u64> = Vec::new();
-            let mut row_id: u64 = 0;
-            for rg_idx in 0..reader.num_row_groups() {
-                let rg_rows = reader.row_group_rows(rg_idx);
-                if delete_bitmap::row_range_all_deleted(&new_bitmap, row_id, rg_rows) {
-                    row_id += rg_rows;
-                    continue;
-                }
-                if let Some(ref pred) = predicate {
-                    if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
-                        row_id += rg_rows;
-                        continue;
-                    }
-                }
-                match resolved_where_clause.as_ref() {
-                    None => {
-                        for i in 0..rg_rows {
-                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
-                                newly_deleted.push(row_id + i);
-                            }
-                        }
-                        row_id += rg_rows;
-                    }
-                    Some(where_expr) => {
-                        let batch = reader.read_row_group(rg_idx)?;
-                        let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
-                        let mut deleted_in_rg: Vec<u32> = Vec::new();
-                        for (i, matches) in mask.into_iter().enumerate() {
-                            if matches
-                                && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
-                            {
-                                newly_deleted.push(row_id + i as u64);
-                                deleted_in_rg.push(i as u32);
-                            }
-                        }
-                        if publish_deletes && !deleted_in_rg.is_empty() {
-                            match batch.take_rows(&deleted_in_rg) {
-                                Ok(deleted) => engine.txn_mutations().defer_delete_event(
-                                    reader_txn_id,
-                                    db,
-                                    table,
-                                    deleted,
-                                )?,
-                                Err(error) => tracing::warn!(
-                                    db,
-                                    table,
-                                    error = %error,
-                                    "failed to build deferred delete-event batch"
-                                ),
-                            }
-                        }
-                        row_id += batch.num_rows() as u64;
-                    }
-                }
-            }
-
-            if newly_deleted.is_empty() {
+            if outcome.matched_ids.is_empty() {
                 continue;
             }
-            statement_deleted += newly_deleted.len() as u64;
+            statement_deleted += outcome.matched_ids.len() as u64;
             engine.txn_mutations().register_segment_tombstones(
                 reader_txn_id,
                 db,
                 table,
                 partitions.as_deref(),
                 &seg_path,
-                &footer_bitmap,
-                newly_deleted,
+                &outcome.footer_bitmap,
+                outcome.matched_ids,
             )?;
         }
 
