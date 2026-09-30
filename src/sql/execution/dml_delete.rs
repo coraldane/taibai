@@ -123,6 +123,62 @@ pub(crate) fn plan_replace_memtable_conflicts(
 /// Scan the table's committed, non-transactional pending memtables for rows
 /// matching the DELETE predicate. Reuses the REPLACE two-phase plan/apply
 /// machinery so the physical removal and durable-tail rewrite are identical.
+/// The single walk over a table's visible memtables shared by the DELETE
+/// planner, auto-commit UPDATE, and transactional UPDATE: memtables visible
+/// to the statement's transaction, optionally narrowed to one partition,
+/// each yielded with
+/// - its original snapshot (positions in plans, tombstone registrations and
+///   events are absolute against this batch), and
+/// - the registry's transaction-tombstone view of it (`live_positions`
+///   maps view coordinates back to original ones; an identity view when
+///   nothing is tombstoned — including every auto-commit statement).
+///
+/// The walk-and-view they used to re-derive per caller is
+/// `TxnMutationRegistry::memtable_batch_visible_to_txn`; new memtable-side
+/// consumers must iterate through here so the visibility rules stay in one
+/// place.
+pub(crate) fn for_each_visible_memtable(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    reader_txn_id: u64,
+    narrowed_partition: Option<&str>,
+    mut consume: impl FnMut(
+        Arc<crate::storage::core::memtable::MemTable>,
+        Arc<RecordBatch>,
+        Arc<RecordBatch>,
+        Option<Vec<u32>>,
+    ) -> Result<()>,
+) -> Result<()> {
+    // Visible-to-this-transaction memtables: committed rows plus this
+    // transaction's own uncommitted INSERTs (so a DELETE/UPDATE inside a
+    // transaction reaches rows the same transaction just wrote). Rows of
+    // other still-open transactions stay untouched.
+    for memtable in engine
+        .memtable_manager()
+        .get_visible_to(db, table, reader_txn_id)
+    {
+        if let Some(key) = narrowed_partition {
+            if memtable.partition_key() != key {
+                continue;
+            }
+        }
+        let Some(original) = memtable.read_snapshot_arc() else {
+            continue;
+        };
+        if original.num_rows() == 0 {
+            continue;
+        }
+        let (view, live_positions) = engine.txn_mutations().memtable_batch_visible_to_txn(
+            reader_txn_id,
+            &memtable,
+            &original,
+        )?;
+        consume(memtable, original, view, live_positions)?;
+    }
+    Ok(())
+}
+
 /// The caller holds the table mutation lock.
 pub(crate) fn plan_delete_memtable_rows(
     engine: &Engine,
@@ -134,77 +190,57 @@ pub(crate) fn plan_delete_memtable_rows(
     reader_txn_id: u64,
 ) -> Result<Vec<ReplaceMemtableConflictPlan>> {
     let mut plans = Vec::new();
-    // Visible-to-this-transaction memtables: committed rows plus this
-    // transaction's own uncommitted INSERTs, so a DELETE inside a
-    // transaction removes rows the same transaction just wrote (they used
-    // to survive the DELETE and reappear after COMMIT). Rows of other
-    // still-open transactions stay untouched.
-    for memtable in engine
-        .memtable_manager()
-        .get_visible_to(db, table, reader_txn_id)
-    {
-        if let Some(key) = target_partition_key {
-            if memtable.partition_key() != key {
-                continue;
+    for_each_visible_memtable(
+        engine,
+        db,
+        table,
+        reader_txn_id,
+        target_partition_key,
+        |memtable, original, view, live_positions| {
+            if view.num_rows() == 0 {
+                return Ok(());
             }
-        }
-        let Some(original) = memtable.read_snapshot_arc() else {
-            continue;
-        };
-        if original.num_rows() == 0 {
-            continue;
-        }
-        // Rows this transaction already tombstoned in an earlier statement
-        // must not match again: read through the registry's filtered view so
-        // a re-match cannot double-count and duplicate the deferred delete
-        // events.
-        let (batch, live_positions) = engine.txn_mutations().memtable_batch_visible_to_txn(
-            reader_txn_id,
-            &memtable,
-            &original,
-        )?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        // Propagate evaluation errors: swallowing them here used to make the
-        // memtable look "no match", deleting segment rows while leaving the
-        // memtable rows alive.
-        let mask = match where_clause.as_ref() {
-            Some(expr) => eval_where_clause_batch(expr, &batch, table_schema)?,
-            None => vec![true; batch.num_rows()],
-        };
-        // Lift the matches back to absolute positions in the original batch
-        // so plans, tombstone registrations and delete events all speak the
-        // same coordinate system.
-        let mut absolute_mask = vec![false; original.num_rows()];
-        for (filtered_idx, &matches) in mask.iter().enumerate() {
-            if matches {
-                let absolute = live_positions
-                    .as_ref()
-                    .map_or(filtered_idx as u32, |map| map[filtered_idx]);
-                absolute_mask[absolute as usize] = true;
+            // Propagate evaluation errors: swallowing them here used to make the
+            // memtable look "no match", deleting segment rows while leaving the
+            // memtable rows alive.
+            let mask = match where_clause.as_ref() {
+                Some(expr) => eval_where_clause_batch(expr, &view, table_schema)?,
+                None => vec![true; view.num_rows()],
+            };
+            // Lift the matches back to absolute positions in the original batch
+            // so plans, tombstone registrations and delete events all speak the
+            // same coordinate system.
+            let mut absolute_mask = vec![false; original.num_rows()];
+            for (filtered_idx, &matches) in mask.iter().enumerate() {
+                if matches {
+                    let absolute = live_positions
+                        .as_ref()
+                        .map_or(filtered_idx as u32, |map| map[filtered_idx]);
+                    absolute_mask[absolute as usize] = true;
+                }
             }
-        }
-        let removed = absolute_mask.iter().filter(|matches| **matches).count();
-        if removed > 0 {
-            let keep = absolute_mask
-                .iter()
-                .map(|matches| !matches)
-                .collect::<Vec<_>>();
-            let filtered = filter_batch_keep(&original, &keep, original.num_rows() - removed)?;
-            let removed_positions = absolute_mask
-                .iter()
-                .enumerate()
-                .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
-                .collect::<Vec<_>>();
-            plans.push(ReplaceMemtableConflictPlan {
-                memtable,
-                original,
-                filtered: Arc::new(filtered),
-                removed_positions,
-            });
-        }
-    }
+            let removed = absolute_mask.iter().filter(|matches| **matches).count();
+            if removed > 0 {
+                let keep = absolute_mask
+                    .iter()
+                    .map(|matches| !matches)
+                    .collect::<Vec<_>>();
+                let filtered = filter_batch_keep(&original, &keep, original.num_rows() - removed)?;
+                let removed_positions = absolute_mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
+                    .collect::<Vec<_>>();
+                plans.push(ReplaceMemtableConflictPlan {
+                    memtable,
+                    original,
+                    filtered: Arc::new(filtered),
+                    removed_positions,
+                });
+            }
+            Ok(())
+        },
+    )?;
     Ok(plans)
 }
 

@@ -476,79 +476,64 @@ pub(crate) fn exec_update_in_txn(
 
         // Transactional memtables (this transaction's own INSERTs) update in
         // place — no durable state, ROLLBACK-safe. Committed memtables defer
-        // via tombstone positions + new rows, exactly like segments.
-        // Memtable rows this transaction already tombstoned in earlier
-        // statements must not match again: the committed memtable's batch is
-        // never mutated between statements (only positions are recorded), so
-        // without this filter a second UPDATE of the same row would append a
-        // second copy of its new image at COMMIT.
+        // via tombstone positions + new rows, exactly like segments. The
+        // shared walk applies the transaction-tombstone view (same contract
+        // as the DELETE planner), so a second UPDATE of the same row cannot
+        // append a second copy of its new image at COMMIT.
         let txn_mutations = engine.txn_mutations();
-        for memtable in engine
-            .memtable_manager()
-            .get_visible_to(db, table, reader_txn_id)
-        {
-            if let Some(key) = narrowed_partition {
-                if memtable.partition_key() != key {
-                    continue;
+        super::dml_delete::for_each_visible_memtable(
+            engine,
+            db,
+            table,
+            reader_txn_id,
+            narrowed_partition,
+            |memtable, _original, batch, live_positions| {
+                let (new_batch, affected, matched_rows) = super::dml_update::update_memtable_batch(
+                    assignments,
+                    &resolved_where_clause,
+                    &table_schema,
+                    &batch,
+                )?;
+                let Some(new_batch) = new_batch else {
+                    return Ok(());
+                };
+                statement_updated += affected;
+                if memtable.is_transactional() {
+                    if !memtable.replace_pending_batch(Arc::new(new_batch)) {
+                        return Err(TaibaiError::Internal(
+                            "transactional memtable left pending state during in-transaction UPDATE"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(());
                 }
-            }
-            let Some(raw_batch) = memtable.read_snapshot_arc() else {
-                continue;
-            };
-            // Rows this transaction already tombstoned in earlier statements
-            // must not match again: read through the registry's filtered
-            // view (same contract as the DELETE planner) so a second UPDATE
-            // of the same row cannot append a second copy of its new image
-            // at COMMIT.
-            let (batch, live_positions) = txn_mutations.memtable_batch_visible_to_txn(
-                reader_txn_id,
-                &memtable,
-                &raw_batch,
-            )?;
-            let (new_batch, affected, matched_rows) = super::dml_update::update_memtable_batch(
-                assignments,
-                &resolved_where_clause,
-                &table_schema,
-                &batch,
-            )?;
-            let Some(new_batch) = new_batch else {
-                continue;
-            };
-            statement_updated += affected;
-            if memtable.is_transactional() {
-                if !memtable.replace_pending_batch(Arc::new(new_batch)) {
-                    return Err(TaibaiError::Internal(
-                        "transactional memtable left pending state during in-transaction UPDATE"
-                            .to_string(),
-                    ));
-                }
-                continue;
-            }
-            // Map the filtered-batch positions back to absolute positions in
-            // the committed memtable batch for the deferred removal.
-            let absolute_rows: Vec<u32> = match &live_positions {
-                Some(map) => matched_rows.iter().map(|&pos| map[pos as usize]).collect(),
-                None => matched_rows.clone(),
-            };
-            txn_mutations.register_memtable_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                Arc::clone(&memtable),
-                absolute_rows.iter().copied(),
-            )?;
-            let updated_rows = new_batch.take_rows(&matched_rows)?;
-            if publish_updates {
-                engine.txn_mutations().defer_update_event(
+                // Map the filtered-batch positions back to absolute positions in
+                // the committed memtable batch for the deferred removal.
+                let absolute_rows: Vec<u32> = match &live_positions {
+                    Some(map) => matched_rows.iter().map(|&pos| map[pos as usize]).collect(),
+                    None => matched_rows.clone(),
+                };
+                txn_mutations.register_memtable_tombstones(
                     reader_txn_id,
                     db,
                     table,
-                    updated_rows.clone(),
+                    partitions.as_deref(),
+                    Arc::clone(&memtable),
+                    absolute_rows.iter().copied(),
                 )?;
-            }
-            new_rows.push((memtable.partition_key().to_string(), updated_rows));
-        }
+                let updated_rows = new_batch.take_rows(&matched_rows)?;
+                if publish_updates {
+                    engine.txn_mutations().defer_update_event(
+                        reader_txn_id,
+                        db,
+                        table,
+                        updated_rows.clone(),
+                    )?;
+                }
+                new_rows.push((memtable.partition_key().to_string(), updated_rows));
+                Ok(())
+            },
+        )?;
 
         // Segment rows: tombstone ids + new row images; no rewrite, no seal,
         // so everything here is reversible until COMMIT.

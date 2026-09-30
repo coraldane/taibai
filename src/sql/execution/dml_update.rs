@@ -107,30 +107,27 @@ pub fn exec_update(
             Arc<RecordBatch>,
         )> = Vec::new();
         let narrowed_partition = target_partition_key;
-        for memtable in engine
-            .memtable_manager()
-            .get_visible_to(db, table, reader_txn_id)
-        {
-            if let Some(key) = narrowed_partition {
-                if memtable.partition_key() != key {
-                    continue;
+        super::dml_delete::for_each_visible_memtable(
+            engine,
+            db,
+            table,
+            reader_txn_id,
+            narrowed_partition,
+            |memtable, _original, batch, _live_positions| {
+                let (new_batch, affected, matched_rows) =
+                    update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
+                if let Some(new_batch) = new_batch {
+                    updated_count += affected;
+                    if publish_updates {
+                        // Change events carry the post-update row images: take
+                        // from `new_batch`, not the pre-update snapshot.
+                        updated_events.push(&new_batch, &matched_rows);
+                    }
+                    memtable_updates.push((memtable, Arc::new(new_batch)));
                 }
-            }
-            let Some(batch) = memtable.read_snapshot_arc() else {
-                continue;
-            };
-            let (new_batch, affected, matched_rows) =
-                update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
-            if let Some(new_batch) = new_batch {
-                updated_count += affected;
-                if publish_updates {
-                    // Change events carry the post-update row images: take
-                    // from `new_batch`, not the pre-update snapshot.
-                    updated_events.push(&new_batch, &matched_rows);
-                }
-                memtable_updates.push((memtable, Arc::new(new_batch)));
-            }
-        }
+                Ok(())
+            },
+        )?;
 
         // A background memtable flush may have produced an active segment.
         // Seal only this table's active writers before replacing segment files;
