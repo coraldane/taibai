@@ -69,3 +69,43 @@ fn test_extend() {
     assert_eq!(col1.len(), 3);
     assert_eq!(col1.scalar(2), ScalarValue::Int64(Some(3)));
 }
+
+#[test]
+fn test_extend_from_run_form_source() {
+    use crate::types::bitmap::NullBitmap;
+
+    // Rle/DeltaRle run-form sources used to hit an unreachable!() in extend:
+    // the data_type gate passes (a view's data_type is its underlying type),
+    // so any caller holding a run-form column panicked the session instead of
+    // extending. extend must materialize the view and append its values.
+    let runs_col = ColumnArray::rle(
+        vec![(7, 3), (9, 2)],
+        DataType::Int64,
+        NullBitmap::new_valid(5),
+        5,
+    );
+    assert_eq!(runs_col.data_type(), DataType::Int64);
+
+    let mut dst = ColumnArray::empty(DataType::Int64);
+    dst.push(&ScalarValue::Int64(Some(1))).unwrap();
+    dst.extend(&runs_col).unwrap();
+    assert_eq!(dst.len(), 6);
+    assert_eq!(dst.scalar(0), ScalarValue::Int64(Some(1)));
+    assert_eq!(dst.scalar(1), ScalarValue::Int64(Some(7)));
+    assert_eq!(dst.scalar(3), ScalarValue::Int64(Some(7)));
+    assert_eq!(dst.scalar(4), ScalarValue::Int64(Some(9)));
+    assert_eq!(dst.scalar(5), ScalarValue::Int64(Some(9)));
+
+    // append_owned routes variable-width moves separately but falls back to
+    // extend for everything else — same contract for run-form sources.
+    let runs_col2 = ColumnArray::rle(
+        vec![(4, 2)],
+        DataType::Int64,
+        NullBitmap::new_valid(2),
+        2,
+    );
+    let mut dst2 = ColumnArray::empty(DataType::Int64);
+    dst2.append_owned(runs_col2).unwrap();
+    assert_eq!(dst2.len(), 2);
+    assert_eq!(dst2.scalar(1), ScalarValue::Int64(Some(4)));
+}

@@ -237,6 +237,18 @@ pub fn eval_where_clause_batch(
             values,
             negated,
         } => {
+            // Hash-set fast path: a column operand over all-literal
+            // candidates (the shape subquery resolution produces) probes a
+            // set instead of scanning every candidate per row — a DELETE ...
+            // WHERE id IN (large subquery) used to pay O(rows x values)
+            // scalar comparisons on every rescanned batch.
+            if values.len() > 4 {
+                if let Some(mask) =
+                    eval_in_column_literal_hashed(expr, values, *negated, batch, schema)
+                {
+                    return mask;
+                }
+            }
             // Three-valued IN: a NULL operand makes the row UNKNOWN (excluded
             // for both IN and NOT IN); NOT IN over a list containing NULL
             // matches nothing.
@@ -307,6 +319,89 @@ pub fn eval_where_clause_batch(
         Expr::Like { .. } => row_wise(),
         _ => row_wise(),
     }
+}
+
+/// Hash-set fast path for `column IN (all literals)` over a literal-rich
+/// candidate list — the shape subquery resolution produces for
+/// `WHERE id IN (SELECT ...)`. The row loop probes the set instead of
+/// scanning every candidate per row (O(rows x values) scalar comparisons on
+/// every rescanned batch used to dominate large DELETE/UPDATE ... IN).
+/// Candidates that do not round-trip through the column's type losslessly
+/// (coercions the strict `scalar_values_equal` would reject) stay in a small
+/// residual list compared per row, so the equality semantics are unchanged.
+/// BLOB/VECTOR/INTERVAL columns keep the generic path: their hashable forms
+/// collapse or asymmetrize across `from_scalar`/`from_column`. Returns `None`
+/// when the shape does not apply (non-column operand, any non-literal
+/// candidate) and the caller keeps its generic loop.
+fn eval_in_column_literal_hashed(
+    expr: &Expr,
+    values: &[Expr],
+    negated: bool,
+    batch: &RecordBatch,
+    schema: &Schema,
+) -> Option<Result<Vec<bool>>> {
+    use crate::sql::execution::join_hashtable::ScalarValueHashable;
+    use crate::types::array::ColumnArray;
+    use std::collections::HashSet;
+
+    let Expr::Column(col_name) = expr else {
+        return None;
+    };
+    let col_idx = schema.index_of(col_name.as_str())?;
+    let col = batch.column(col_idx)?;
+    let dtype = schema.columns[col_idx].data_type;
+    if matches!(dtype, DataType::Blob | DataType::Vector | DataType::Interval) {
+        return None;
+    }
+
+    let mut saw_null = false;
+    let mut set = HashSet::with_capacity(values.len());
+    let mut residual: Vec<ScalarValue> = Vec::new();
+    for value in values {
+        let Expr::Literal(v) = value else {
+            return None;
+        };
+        if v.is_null() {
+            saw_null = true;
+            continue;
+        }
+        match coerce_scalar_for_dtype(v, dtype) {
+            Ok(coerced) if scalar_values_equal(v, &coerced) => {
+                set.insert(ScalarValueHashable::from_scalar(&coerced));
+            }
+            _ => residual.push(v.clone()),
+        }
+    }
+
+    // from_column flattens view forms per row; flatten once up front.
+    let flattened;
+    let col = match col {
+        ColumnArray::Selected { .. }
+        | ColumnArray::Rle { .. }
+        | ColumnArray::Dictionary { .. } => {
+            flattened = col.flattened();
+            &flattened
+        }
+        other => other,
+    };
+
+    let mut mask = Vec::with_capacity(batch.num_rows());
+    for row_idx in 0..batch.num_rows() {
+        if col.bitmap().is_null(row_idx) {
+            // NULL operand: UNKNOWN for both IN and NOT IN — excluded.
+            mask.push(false);
+            continue;
+        }
+        let found = set.contains(&ScalarValueHashable::from_column(col, row_idx))
+            || residual
+                .iter()
+                .any(|candidate| scalar_values_equal(&col.scalar(row_idx), candidate));
+        // IN keeps only hits; NOT IN keeps misses, and nothing at all when
+        // the list contained NULL (three-valued UNKNOWN).
+        let keep = if negated { !found && !saw_null } else { found };
+        mask.push(keep);
+    }
+    Some(Ok(mask))
 }
 
 /// Three-valued (SQL NULL-aware) predicate evaluation used by DML paths.

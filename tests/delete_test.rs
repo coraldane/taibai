@@ -614,3 +614,65 @@ fn delete_with_alias_still_prunes_the_target_partition() {
     assert_eq!(count_star(remaining), 1);
     engine.segment_mgr().shutdown();
 }
+
+/// The hashed IN fast path (column operand over >4 literal candidates, the
+/// shape `WHERE id IN (SELECT ...)` produces after subquery resolution) must
+/// keep the generic loop's exact semantics: strict matching, NULL column
+/// values excluded, NOT IN over a NULL candidate matches nothing, and
+/// Int32-vs-Int64 numeric equality still matches.
+#[test]
+fn delete_in_large_literal_list_semantics() {
+    let (_temp_dir, engine, mut session) = create_engine();
+    engine
+        .execute(&mut session, "CREATE TABLE in_t (id INT32, tag VARCHAR)")
+        .expect("create table");
+    for i in 0..40 {
+        let tag = if i % 2 == 0 { "even" } else { "odd" };
+        engine
+            .execute(
+                &mut session,
+                &format!("INSERT INTO in_t VALUES ({i}, '{tag}')"),
+            )
+            .expect("seed");
+    }
+
+    // >4 literal candidates via a subquery (resolver expands to literals).
+    engine
+        .execute(&mut session, "DELETE FROM in_t WHERE id IN (SELECT id FROM in_t WHERE id < 5)")
+        .expect("delete via large IN");
+    let count = |engine: &Engine, session: &mut Session, sql: &str| -> i64 {
+        match engine.execute(session, sql).expect("count") {
+            ExecResult::Query { batches, .. } => batches
+                .iter()
+                .map(|b| b.scalar(0, 0).unwrap())
+                .map(|v| match v {
+                    taibai::types::scalar::ScalarValue::Int64(Some(n)) => n,
+                    other => panic!("unexpected count {other:?}"),
+                })
+                .sum(),
+            other => panic!("expected query, got {other:?}"),
+        }
+    };
+    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"), 35);
+
+    // NOT IN over a list containing NULL: matches nothing.
+    engine
+        .execute(&mut session, "DELETE FROM in_t WHERE id NOT IN (1, 2, 3, 4, 5, NULL)")
+        .expect("not-in null delete");
+    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"), 35);
+
+    // IN over a list containing NULL still matches the non-null hits.
+    engine
+        .execute(&mut session, "DELETE FROM in_t WHERE id IN (5, 6, 7, 8, 9, NULL)")
+        .expect("in null delete");
+    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"), 30);
+
+    // Cross-width numeric equality: Int32 column vs Int64 literals.
+    engine
+        .execute(
+            &mut session,
+            "DELETE FROM in_t WHERE id IN (10, 11, 12, 13, 14, 15, 16)",
+        )
+        .expect("cross-width delete");
+    assert_eq!(count(&engine, &mut session, "SELECT COUNT(*) FROM in_t"), 23);
+}

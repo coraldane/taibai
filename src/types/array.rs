@@ -1628,7 +1628,7 @@ impl ColumnArray {
             }};
         }
 
-        match (self, other) {
+        match (&mut *self, other) {
             (
                 ColumnArray::Bool { data, bitmap },
                 ColumnArray::Bool {
@@ -1774,7 +1774,16 @@ impl ColumnArray {
                 bitmap.extend(other_bitmap);
                 Ok(())
             }
-            _ => unreachable!("column type checked before extend"),
+            _ => {
+                // Rle/Dictionary sources are view forms of an underlying
+                // typed column (the data_type check above passed on that
+                // underlying type, so this terminates): materialize once and
+                // retry into the typed arm. This used to be an
+                // unreachable!() — one new caller with a run-form column in
+                // hand would have panicked a session instead of extending.
+                let flattened = other.flattened();
+                self.extend(&flattened)
+            }
         }
     }
 
