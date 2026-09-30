@@ -135,7 +135,7 @@ SQL 层包含手写 lexer/parser、AST、binder、planner、optimizer 和执行�
 - 支持删除标记和逻辑删除。
 - 唯一索引按需加载并以 base + delta 增量维护，direct bulk 批量导入只追加增量，不随历史数据量线性变慢。
 - 支持 `OPTIMIZE TABLE` 触发 segment 合并、排序和清理；compaction 的重写阶段在分区锁外运行，压缩期间目标分区仍可写入。
-- 写入互斥按 (库, 表, 分区) 粒度加锁，分区间的写入、flush 与 compaction 互不阻塞；全表操作取表级宽锁，等待受 `mutation_lock_timeout_ms` 有界限制。
+- 写入互斥按 (库, 表, 分区) 粒度加锁，分区间的写入、flush 与 compaction 互不阻塞；全表操作取表级宽锁，等待受 `mutation_lock_timeout_secs` 有界限制。
 - 常驻热存（`ALTER TABLE ... SET HOT`）：当日分区的点查走内存倒排索引；重启预热只加载日结之后写入的段（`storage.hot_warmup_enabled` 控制），批量写覆盖全表后自动标记全表常驻。
 - Reader cache、buffer pool、列编码和快速扫描相关模块用于提升读取性能。
 

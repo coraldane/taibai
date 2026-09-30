@@ -214,9 +214,9 @@ pub fn exec_replace(
             })?;
 
     let lock_elapsed = lock_start.elapsed();
-    let lock_warn_after = std::time::Duration::from_millis(
+    let lock_warn_after = std::time::Duration::from_secs(
         crate::common::config::storage_timeouts()
-            .mutation_lock_warn_ms
+            .mutation_lock_warn_secs
             .max(1),
     );
     if lock_elapsed >= lock_warn_after {

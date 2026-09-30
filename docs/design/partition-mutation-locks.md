@@ -25,7 +25,7 @@ WARN taibai::storage::segment_manager: table mutation lock acquisition was slow 
 
 **不同分区的上述操作互不阻塞**；表级慢操作（compaction、历史分区 flush）不再拖住当前分区的实时写入。
 
-分区锁的获取复用表级锁的超时语义：等待 ≥ `storage.mutation_lock_warn_ms`（默认 1s）打 WARN，≥ `storage.mutation_lock_timeout_ms`（默认 60s）返回 `ResourceBusy`，锁排队同样在日志可见。
+分区锁的获取复用表级锁的超时语义：等待 ≥ `storage.mutation_lock_warn_secs`（默认 1s）打 WARN，≥ `storage.mutation_lock_timeout_secs`（默认 60s）返回 `ResourceBusy`，锁排队同样在日志可见。
 
 ### 表级宽锁（gate 协议）
 
@@ -34,7 +34,7 @@ WARN taibai::storage::segment_manager: table mutation lock acquisition was slow 
 1. 获取表 `mutation_lock`（排除其他宽锁持有者）；
 2. 置原子标志 `partition_gate = true`；
 3. 短暂持有 `partition_locks` **写闸**，对已登记分区按分区名**排序**快照出锁的 `Arc` 列表，随即释放写闸；
-4. 依序以**有界等待**锁定全部快照锁（`acquire_partition_lock_for_wide_gate`，复用 `storage.mutation_lock_timeout_ms` 超时语义）：超时返回 `ResourceBusy` 并释放已收集的分区锁与 gate，绝不无限制阻塞；
+4. 依序以**有界等待**锁定全部快照锁（`acquire_partition_lock_for_wide_gate`，复用 `storage.mutation_lock_timeout_secs` 超时语义）：超时返回 `ResourceBusy` 并释放已收集的分区锁与 gate，绝不无限制阻塞；
 5. 执行临界区 `f`；
 6. 释放分区锁、`partition_gate = false`。
 
@@ -44,7 +44,7 @@ gate 复位由 drop 守卫（`PartitionGateReset` / `DatabaseGatesReset`）完�
 
 - **宽锁等待者不会饿死**：gate 置位后新到达的分区写者全部自旋等待；
 - **写闸不长时间持有**：注册表读路径（新分区创建）不会被宽锁收集中卡死，新分区的写者通过 gate 标志自冻结；
-- **无死锁、宽锁收集有界**：分区锁只在快照后按全局排序获取，且收集等待复用 `mutation_lock_timeout_ms` 上限——一个被长持的分区锁（如慢速 bulk 追加）最多让宽锁等待者超时报错，而不是把 gate 顶住同样久、拖垮全表所有分区的写入。宽锁持有者在临界区内不反向等待分区写者持有的其他资源。
+- **无死锁、宽锁收集有界**：分区锁只在快照后按全局排序获取，且收集等待复用 `mutation_lock_timeout_secs` 上限——一个被长持的分区锁（如慢速 bulk 追加）最多让宽锁等待者超时报错，而不是把 gate 顶住同样久、拖垮全表所有分区的写入。宽锁持有者在临界区内不反向等待分区写者持有的其他资源。
 
 ### 分区锁内禁止慢操作
 
@@ -87,7 +87,7 @@ gate 复位由 drop 守卫（`PartitionGateReset` / `DatabaseGatesReset`）完�
 
 ## 已知代价
 
-- 表级一致操作（REPLACE、未命中分区裁剪的 DELETE / UPDATE、DDL、唯一索引快照重建）持有宽锁期间，该表**所有**分区写入停顿——这是全表一致语义的既定代价；命中分区裁剪的 DELETE / UPDATE、compaction 与 ANALYZE 已收窄，不再停顿全表。宽锁收集的等待以 `mutation_lock_timeout_ms` 为上限，单个慢分区不会再把 gate（连同全表写入）顶住无限期；
+- 表级一致操作（REPLACE、未命中分区裁剪的 DELETE / UPDATE、DDL、唯一索引快照重建）持有宽锁期间，该表**所有**分区写入停顿——这是全表一致语义的既定代价；命中分区裁剪的 DELETE / UPDATE、compaction 与 ANALYZE 已收窄，不再停顿全表。宽锁收集的等待以 `mutation_lock_timeout_secs` 为上限，单个慢分区不会再把 gate（连同全表写入）顶住无限期；
 - 分区数极多的表上，宽锁收集需逐一锁定全部分区锁，代价与分区数线性相关；compaction 的全量快照阶段（毫秒级）也有同样量级的登记成本；`partition_locks` 注册表只增不减，随分区数缓慢增长；
 - 同分区并发写者仍然互斥，分区键设计差（如全部写入落入同一分区）无法从该模型获益；
 - compaction heavy 阶段不持分区锁后，同一分区的两个并发 compaction 轮次可能都完成重写，提交阶段的输入身份校验会让后到者丢弃产物（正确性不受影响，浪费一轮重写）。

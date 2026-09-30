@@ -7,7 +7,7 @@ server:
   # 因此独立于通用 max_message_size
   max_bulk_message_size: 134217728
   # 重请求等待执行槽位的最长时间，超时返回 overload 错误而不是静默排队
-  request_queue_timeout_ms: 30000
+  request_queue_timeout_secs: 30
 
 storage:
   # 数据目录；生产部署应改为独立的持久化目录
@@ -23,14 +23,14 @@ storage:
   row_group_target_rows: 65536
   # reader 与 segment 元数据缓存的 segment 数量
   reader_cache_capacity: 1024
-  # 等待表级 mutation lock 的最长时间，超时返回锁超时错误而不是永久阻塞
-  mutation_lock_timeout_ms: 60000
+  # 等待表级 mutation lock 的最长时间（秒），超时返回锁超时错误而不是永久阻塞
+  mutation_lock_timeout_secs: 60
   # 加锁等待超过该阈值时输出 warn 日志，暴露锁排队
-  mutation_lock_warn_ms: 1000
+  mutation_lock_warn_secs: 1
   # 等待 durable tail group commit（fsync）确认的最长时间
-  tail_commit_timeout_ms: 120000
+  tail_commit_timeout_secs: 120
   # fsync 或 commit 确认超过该阈值时输出 warn 日志，暴露慢盘
-  tail_commit_warn_ms: 2000
+  tail_commit_warn_secs: 2
   # ACK 分级：false=ACK_ON_FSYNC（默认，fsync 落盘后应答，崩溃零丢失）；
   # true=ACK_ON_WAL（写入 page cache 即应答，延迟最低，但机器掉电可能丢失
   # 最近一批已应答数据）。测试/导入环境可用 true 换取吞吐，生产保持 false

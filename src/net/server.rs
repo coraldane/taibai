@@ -157,7 +157,7 @@ where
     };
     let idle_timeout_secs = config.server.connection_idle_timeout_secs;
     let bulk_idle_timeout_secs = config.server.bulk_import_idle_timeout_secs;
-    let request_queue_timeout_ms = config.server.request_queue_timeout_ms;
+    let request_queue_timeout_secs = config.server.request_queue_timeout_secs;
     let notification_capacity = config.pubsub.notification_channel_capacity.max(1);
     let mut framed = Framed::new(
         stream,
@@ -238,7 +238,7 @@ where
             Arc::clone(&request_limiter),
             Arc::clone(&context),
             stream_sender,
-            request_queue_timeout_ms,
+            request_queue_timeout_secs,
         );
         // `JoinHandle` is `Unpin`, so `&mut worker` can be polled directly in
         // the select below; the handle is also movable into the disconnect
@@ -526,7 +526,7 @@ fn run_handler(
     request_limiter: Arc<Semaphore>,
     context: Arc<crate::common::query_cancel::QueryContext>,
     stream_sender: tokio::sync::mpsc::Sender<Message>,
-    queue_timeout_ms: u64,
+    queue_timeout_secs: u64,
 ) -> tokio::task::JoinHandle<(Option<Handler>, Result<Vec<Message>>)> {
     // Registered on the connection task before the worker spawns; the guard
     // lives across the queue wait and the execution.
@@ -543,7 +543,7 @@ fn run_handler(
         // Wait for a request slot while watching the cancellation context, so
         // a disconnect (or KILL) during a full queue does not stall cleanup
         // for the whole queue timeout.
-        let deadline = Instant::now() + Duration::from_millis(queue_timeout_ms.max(1));
+        let deadline = Instant::now() + Duration::from_secs(queue_timeout_secs.max(1));
         let permit = loop {
             if let Err(error) = context.check() {
                 return (Some(handler), Ok(vec![build_error(&error.to_string())]));
@@ -552,7 +552,7 @@ fn run_handler(
             if remaining.is_zero() {
                 tracing::warn!(
                     msg_type = msg.msg_type,
-                    queue_timeout_ms,
+                    queue_timeout_secs,
                     "request queue wait timeout; rejecting request with overload error"
                 );
                 return (

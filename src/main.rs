@@ -189,10 +189,10 @@ where
         config.storage.reader_cache_capacity,
     );
     common::config::set_storage_timeouts(common::config::StorageTimeouts {
-        mutation_lock_timeout_ms: config.storage.mutation_lock_timeout_ms,
-        mutation_lock_warn_ms: config.storage.mutation_lock_warn_ms,
-        tail_commit_timeout_ms: config.storage.tail_commit_timeout_ms,
-        tail_commit_warn_ms: config.storage.tail_commit_warn_ms,
+        mutation_lock_timeout_secs: config.storage.mutation_lock_timeout_secs,
+        mutation_lock_warn_secs: config.storage.mutation_lock_warn_secs,
+        tail_commit_timeout_secs: config.storage.tail_commit_timeout_secs,
+        tail_commit_warn_secs: config.storage.tail_commit_warn_secs,
     });
 
     let mut pubsub_settings = config.pubsub.clone();

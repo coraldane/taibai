@@ -612,7 +612,13 @@ impl Handler {
             session.had_writes = true;
         }
 
-        match self.engine.exec_bulk_insert_payload_as(
+        // Covers the whole engine call chain (payload decode → constraint
+        // checks → column compression → locks → seal). The segment-manager
+        // WARN only sees its own stage; anything slow that hides above it
+        // (e.g. zstd at a high table COMPRESSION_LEVEL) surfaces here.
+        const SLOW_BULK_INSERT_REQUEST_WARN: Duration = Duration::from_secs(10);
+        let started = Instant::now();
+        let outcome = self.engine.exec_bulk_insert_payload_as(
             &db,
             payload,
             self.session
@@ -620,7 +626,17 @@ impl Handler {
                 .map(|s| s.bulk_import_mode)
                 .unwrap_or(false),
             self.session.as_ref().map(|s| s.username.as_str()),
-        ) {
+        );
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_BULK_INSERT_REQUEST_WARN {
+            tracing::warn!(
+                db = %db,
+                payload_len = payload.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow bulk insert request: check the table COMPRESSION_LEVEL (zstd 19 is single-digit MB/s per core) and the segment-manager seal WARN"
+            );
+        }
+        match outcome {
             Ok(row_count) => Ok(vec![build_ok(row_count)]),
             Err(e) => {
                 tracing::warn!(error = %e, "bulk insert error");
