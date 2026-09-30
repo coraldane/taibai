@@ -1115,7 +1115,7 @@ fn resolve_live_tail(
         match generation.kind {
             GenerationKind::Tail => {
                 if validate_tails && !tail_file_has_header(&generation.path) {
-                    discard_unusable_tail(&generation.path);
+                    discard_unusable_tail(&generation.path, "header shorter than the log header");
                     continue;
                 }
                 return LiveTail::Found(generation.path.clone());
@@ -1130,10 +1130,13 @@ fn resolve_live_tail(
                 // A torn or corrupt intent marker proves nothing about the
                 // tail: treat it as unsatisfied so the preceding tail stays
                 // authoritative.
-                let satisfied = fs::read(&generation.path)
-                    .ok()
-                    .and_then(|bytes| flush_intent_satisfied(table_dir, &bytes).ok())
-                    .unwrap_or(false);
+                let satisfied = match fs::read(&generation.path) {
+                    Ok(bytes) => flush_intent_satisfied(table_dir, &bytes).unwrap_or(false),
+                    Err(error) => {
+                        report_intent_unreadable(&generation.path, &error.to_string());
+                        false
+                    }
+                };
                 if satisfied {
                     return LiveTail::Suppressed(Suppression::Flush(generation.path.clone()));
                 }
@@ -1485,6 +1488,11 @@ pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredT
         }
         let bytes = fs::read(&path)?;
         if bytes.len() < TAIL_LOG_HEADER_LEN as usize {
+            report_tail_discarded(
+                &path,
+                "file shorter than the log header",
+                bytes.len() as u64,
+            );
             continue;
         }
         let rows = match scan_tail_log_rows(&bytes) {
@@ -1497,6 +1505,11 @@ pub fn recover_index(table_dir: &Path, schema: &Schema) -> Result<Vec<RecoveredT
                 // recovery.
                 let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
                 if bytes.len() < 8usize.saturating_add(partition_len) {
+                    report_tail_discarded(
+                        &path,
+                        "torn inside the variable-length header",
+                        bytes.len() as u64,
+                    );
                     continue;
                 }
                 return Err(TaibaiError::Storage(
@@ -1972,14 +1985,33 @@ fn decode_flush_target(bytes: &[u8]) -> Result<(String, Option<u64>)> {
 /// A recorded flush intent proves its tail is durable once the named segment
 /// is readable and holds at least the recorded row-count watermark.
 fn flush_intent_satisfied(table_dir: &Path, bytes: &[u8]) -> Result<bool> {
-    let (segment_name, expected_rows) = decode_flush_target(bytes)?;
+    let (segment_name, expected_rows) = match decode_flush_target(bytes) {
+        Ok(target) => target,
+        // A torn marker proves nothing about the tail: unsatisfied, and the
+        // preceding tail stays authoritative. Counted so the debris stays
+        // visible in aggregate.
+        Err(error) => {
+            INTENTS_UNREADABLE.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                error = %error,
+                "flush intent marker undecodable; treated as unsatisfied"
+            );
+            return Ok(false);
+        }
+    };
     let segment_path = table_dir.join(segment_name);
     if !segment_path.is_file() {
         return Ok(false);
     }
     let reader = match SegmentReader::open(&segment_path) {
         Ok(reader) => reader,
-        Err(_) => return Ok(false),
+        // The segment exists but is damaged: the intent legitimately stays
+        // unsatisfied (the tail stays authoritative), but a damaged segment
+        // is worth more than a debug line — surfaces at warn, counted.
+        Err(error) => {
+            report_segment_unreadable(&segment_path, &error);
+            return Ok(false);
+        }
     };
     Ok(match expected_rows {
         Some(expected) => reader.row_count() >= expected,
@@ -2021,6 +2053,87 @@ fn next_sequence() -> u64 {
 /// full header extent are validated against the file size.
 const TAIL_LOG_HEADER_LEN: u64 = 8;
 
+// ---------------------------------------------------------------------------
+// Damage observability
+// ---------------------------------------------------------------------------
+//
+// Recovery discards damaged durability artifacts by design: a tail torn
+// before its first fsync holds no committed rows, a torn flush-intent marker
+// proves nothing. The policies are correct — but they used to be silent, so
+// data loss after a crash was undiscoverable. Every discard now bumps a
+// counter and emits a structured event; `tail_damage_snapshot()` aggregates
+// for tests and health reporting.
+
+static TAILS_DISCARDED: AtomicU64 = AtomicU64::new(0);
+static TAIL_BYTES_DISCARDED: AtomicU64 = AtomicU64::new(0);
+static INTENTS_UNREADABLE: AtomicU64 = AtomicU64::new(0);
+static SEGMENTS_UNREADABLE: AtomicU64 = AtomicU64::new(0);
+static ROWCOUNT_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Point-in-time aggregate of durability damage seen since process start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TailDamageSnapshot {
+    /// Tail files removed because they could not hold a committed frame
+    /// (torn header / truncated body before first fsync).
+    pub tails_discarded: u64,
+    /// Their combined size in bytes.
+    pub tail_bytes_discarded: u64,
+    /// Flush-intent markers whose bytes were unreadable (torn marker).
+    pub intents_unreadable: u64,
+    /// Named flush-target segments that exist but failed to open (damaged
+    /// segment — the intent stays unsatisfied, the tail stays authoritative).
+    pub segments_unreadable: u64,
+    /// Spilled memtables whose decoded row count disagreed with the recorded
+    /// one (the decoded content is authoritative and kept).
+    pub rowcount_mismatches: u64,
+}
+
+/// Aggregate of every durability damage event since process start.
+pub fn tail_damage_snapshot() -> TailDamageSnapshot {
+    TailDamageSnapshot {
+        tails_discarded: TAILS_DISCARDED.load(Ordering::Relaxed),
+        tail_bytes_discarded: TAIL_BYTES_DISCARDED.load(Ordering::Relaxed),
+        intents_unreadable: INTENTS_UNREADABLE.load(Ordering::Relaxed),
+        segments_unreadable: SEGMENTS_UNREADABLE.load(Ordering::Relaxed),
+        rowcount_mismatches: ROWCOUNT_MISMATCHES.load(Ordering::Relaxed),
+    }
+}
+
+fn report_tail_discarded(path: &Path, reason: &str, bytes: u64) {
+    TAILS_DISCARDED.fetch_add(1, Ordering::Relaxed);
+    TAIL_BYTES_DISCARDED.fetch_add(bytes, Ordering::Relaxed);
+    tracing::warn!(
+        tail = %path.display(),
+        bytes,
+        reason,
+        "recovery discarded a tail file that could not hold a committed frame (torn before first fsync); its rows were never visible"
+    );
+}
+
+fn report_intent_unreadable(path: &Path, reason: &str) {
+    INTENTS_UNREADABLE.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        intent = %path.display(),
+        reason,
+        "flush intent marker unreadable after crash; treated as unsatisfied and the tail stays authoritative"
+    );
+}
+
+fn report_segment_unreadable(path: &Path, error: &TaibaiError) {
+    SEGMENTS_UNREADABLE.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        segment = %path.display(),
+        error = %error,
+        "flush intent names a segment that failed to open; the intent stays unsatisfied and the tail stays authoritative — the segment may be damaged"
+    );
+}
+
+/// Counter hook for the spilled-memtable row-count correction in
+/// `MemTable::ensure_resident` (which logs its own error with the details).
+pub(crate) fn note_rowcount_mismatch() {
+    ROWCOUNT_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+}
+
 fn tail_file_has_header(path: &Path) -> bool {
     use std::io::Read;
     let mut file = match fs::File::open(path) {
@@ -2041,8 +2154,10 @@ fn tail_file_has_header(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn discard_unusable_tail(path: &Path) {
+fn discard_unusable_tail(path: &Path, reason: &str) {
+    let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     let _ = fs::remove_file(path);
+    report_tail_discarded(path, reason, bytes);
 }
 
 fn parse_generation(path: &Path) -> Option<(Uuid, Generation)> {
@@ -2110,10 +2225,12 @@ fn newest_live_tail_path(tail_dir: &Path, id: Uuid) -> Result<Option<PathBuf>> {
     // Appending insert deltas below a delete sidecar is safe: appends only
     // extend the batch, so recorded positions keep referring to the same
     // prefix — hence deletions are not collected here.
-    Ok(match resolve_live_tail(table_dir, &generations, true, true, None) {
-        LiveTail::Found(path) => Some(path),
-        _ => None,
-    })
+    Ok(
+        match resolve_live_tail(table_dir, &generations, true, true, None) {
+            LiveTail::Found(path) => Some(path),
+            _ => None,
+        },
+    )
 }
 
 fn remove_other_generations(tail_dir: &Path, id: Uuid, keep_path: &Path) -> Result<()> {

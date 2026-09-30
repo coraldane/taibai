@@ -857,3 +857,53 @@ fn recover_index_folds_pending_sidecars_into_a_plain_tail() -> Result<()> {
     );
     Ok(())
 }
+
+/// A tail torn before its first fsync (shorter than the log header) is
+/// discarded by recovery — correctly, since it can hold no committed frame —
+/// and the discard is observable: the file is gone and the damage snapshot
+/// counts it. The recovery used to be silent, so crash-time loss was
+/// undiscoverable.
+#[test]
+fn torn_tail_is_discarded_and_counted() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = Schema::new(vec![ColumnDef::new("id", DataType::Int64)]);
+    let id = Uuid::new_v4();
+
+    // A healthy tail first: it must survive.
+    persist(temp.path(), id, "2026", &test_batch(&schema, &[1])?)?;
+
+    // A torn sibling tail for a different memtable: magic + key length
+    // present, key bytes (and everything else) missing.
+    let torn_id = Uuid::new_v4();
+    let torn_path = temp
+        .path()
+        .join("memtable_tail")
+        .join(format!("{}.0.tail", torn_id.simple()));
+    std::fs::create_dir_all(temp.path().join("memtable_tail"))?;
+    // Same magic a real tail starts with: copy the first bytes from the
+    // healthy tail written above.
+    let live_dir = temp.path().join("memtable_tail");
+    let healthy = live_dir
+        .read_dir()?
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("tail"))
+        .expect("healthy tail exists");
+    let mut bytes = std::fs::read(&healthy)?[..4].to_vec();
+    bytes.extend_from_slice(&64u32.to_le_bytes()); // partition key length...
+                                                   // ...and nothing after: the header extent is torn.
+    std::fs::write(&torn_path, &bytes)?;
+    let before = tail_damage_snapshot();
+
+    let recovered = recover(temp.path(), &schema)?;
+    assert_eq!(recovered.len(), 1, "healthy tail must survive");
+    assert!(!torn_path.exists(), "torn tail must be discarded");
+
+    let after = tail_damage_snapshot();
+    assert_eq!(
+        after.tails_discarded,
+        before.tails_discarded + 1,
+        "the discard must be counted"
+    );
+    assert!(after.tail_bytes_discarded > before.tail_bytes_discarded);
+    Ok(())
+}

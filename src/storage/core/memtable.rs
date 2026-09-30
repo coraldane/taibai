@@ -418,6 +418,10 @@ impl MemTable {
         })?;
         let decoded_rows = batch.num_rows() as u64;
         if decoded_rows != expected_rows {
+            // The decoded content is authoritative and kept; the recorded
+            // count is rewritten to match. Counted so the aggregate is
+            // observable via `tail_damage_snapshot()`.
+            crate::storage::core::durable_tail::note_rowcount_mismatch();
             tracing::error!(
                 expected_rows,
                 decoded_rows,
