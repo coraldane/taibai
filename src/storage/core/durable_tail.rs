@@ -1593,6 +1593,71 @@ pub fn tail_log_rows(path: &Path) -> Result<Option<u64>> {
     Ok(scan_tail_log_rows(&fs::read(path)?))
 }
 
+/// LSN of the last complete frame in a current-format tail log, again by
+/// walking frame headers only (LSNs are allocated in append order, so the
+/// last frame carries the maximum). `Ok(None)` for an invalid/corrupt file or
+/// a V2 (LSN-less) log.
+///
+/// The replication applier uses this to make replay idempotent: its applied
+/// watermark persists only AFTER a tail append is fsynced, so a standby crash
+/// in that window replays the event — and without this check the same frames
+/// would be appended a second time, doubling the tail's rows.
+pub fn tail_last_lsn(path: &Path) -> Result<Option<u64>> {
+    // A tail removed concurrently (compaction/flush) reads as "no lsn" —
+    // the applier treats that as not-yet-applied and re-appends.
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let format = match bytes.len() {
+        len if len < 8 => return Ok(None),
+        _ => match TailFormat::from_magic(u32::from_le_bytes(
+            bytes[0..4].try_into().unwrap(),
+        )) {
+            Some(format) => format,
+            None => return Ok(None),
+        },
+    };
+    if !format.has_commit_metadata() {
+        // V2 frames carry no LSN: nothing to dedup on.
+        return Ok(None);
+    }
+    let partition_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let mut offset = 8usize.saturating_add(partition_len);
+    if offset > bytes.len() {
+        return Ok(None);
+    }
+    let mut last_lsn = None;
+    let frame_min_len = format.frame_header_len + 4;
+    while offset < bytes.len() {
+        // Mirror decode_tail_log / scan_tail_log_rows: a crash-truncated
+        // final frame ends the valid prefix instead of failing the scan.
+        if bytes.len().saturating_sub(offset) < frame_min_len {
+            break;
+        }
+        let payload_len =
+            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
+        let payload_start = offset + format.frame_header_len;
+        let payload_end = payload_start.saturating_add(payload_len);
+        let frame_end = payload_end.saturating_add(4);
+        if frame_end > bytes.len() {
+            break;
+        }
+        let mut hasher = Hasher::new();
+        hasher.update(&bytes[offset..payload_end]);
+        let stored_crc = u32::from_le_bytes(bytes[payload_end..frame_end].try_into().unwrap());
+        if stored_crc != hasher.finalize() {
+            return Ok(None);
+        }
+        last_lsn = Some(u64::from_le_bytes(
+            bytes[offset + 16..offset + 24].try_into().unwrap(),
+        ));
+        offset = frame_end;
+    }
+    Ok(last_lsn)
+}
+
 pub(crate) fn decode_tail_file(path: &Path, schema: &Schema) -> Result<(String, RecordBatch)> {
     decode_tail(&fs::read(path)?, schema)
 }

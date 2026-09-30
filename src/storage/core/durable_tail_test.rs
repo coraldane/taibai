@@ -907,3 +907,89 @@ fn torn_tail_is_discarded_and_counted() -> Result<()> {
     assert!(after.tail_bytes_discarded > before.tail_bytes_discarded);
     Ok(())
 }
+
+/// The replication applier dedups replayed tail appends by the last frame's
+/// LSN: tail_last_lsn must return the max complete-frame LSN, ignore a torn
+/// final frame, and report None for a missing or corrupt file.
+#[test]
+fn tail_last_lsn_tracks_frames_and_tolerates_torn_tail() {
+    use crate::types::batch::{ColumnDef, RecordBatch, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("main").join("t");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let id = uuid::Uuid::new_v4();
+
+    let schema = Schema::new(vec![ColumnDef::new("n", DataType::Int64)]);
+    let make_batch = |values: &[i64]| {
+        let mut col = crate::types::array::ColumnArray::empty(DataType::Int64);
+        for v in values {
+            col.push(&crate::types::scalar::ScalarValue::Int64(Some(*v)))
+                .unwrap();
+        }
+        RecordBatch::try_new(schema.clone(), vec![col]).unwrap()
+    };
+
+    let tail_path = |table_dir: &std::path::Path, id: uuid::Uuid| {
+        crate::storage::core::durable_tail::live_tail_path(table_dir, id)
+            .unwrap()
+            .expect("tail exists")
+    };
+
+    // Missing tail: no LSN.
+    assert_eq!(
+        crate::storage::core::durable_tail::tail_last_lsn(&table_dir.join("nope")).unwrap(),
+        None
+    );
+
+    append_raw_frames(
+        &table_dir,
+        id,
+        "p2026",
+        &encode_tail_frame(&make_batch(&[1, 2])).unwrap(),
+    )
+    .unwrap();
+    let path = tail_path(&table_dir, id);
+    let lsn_after_first =
+        crate::storage::core::durable_tail::tail_last_lsn(&path).unwrap().expect("v3 lsn");
+    assert!(lsn_after_first > 0);
+
+    append_raw_frames(
+        &table_dir,
+        id,
+        "p2026",
+        &encode_tail_frame(&make_batch(&[3])).unwrap(),
+    )
+    .unwrap();
+    let lsn_after_second =
+        crate::storage::core::durable_tail::tail_last_lsn(&path).unwrap().expect("v3 lsn");
+    assert!(
+        lsn_after_second > lsn_after_first,
+        "lsn is append-ordered: {lsn_after_second} > {lsn_after_first}"
+    );
+    let rows =
+        crate::storage::core::durable_tail::tail_log_rows(&path).unwrap().unwrap();
+    assert_eq!(rows, 3);
+
+    // A torn final frame (truncated mid-frame) must not crash the scan or
+    // invent an LSN from partial bytes: the last COMPLETE frame wins.
+    let full = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &full[..full.len() - 3]).unwrap();
+    let lsn_torn = crate::storage::core::durable_tail::tail_last_lsn(&path).unwrap();
+    assert_eq!(
+        lsn_torn,
+        Some(lsn_after_first),
+        "torn final frame is ignored; first frame's lsn remains"
+    );
+
+    // A corrupt (CRC-breaking) file reports None instead of a bogus LSN.
+    let mut corrupt = full.clone();
+    let mid = corrupt.len() - 6;
+    corrupt[mid] ^= 0xFF;
+    std::fs::write(&path, &corrupt).unwrap();
+    assert_eq!(
+        crate::storage::core::durable_tail::tail_last_lsn(&path).unwrap(),
+        None,
+        "crc mismatch must not yield an lsn"
+    );
+}

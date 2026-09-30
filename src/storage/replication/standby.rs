@@ -281,17 +281,51 @@ async fn apply(
             table,
             partition,
             memtable_id,
+            first_lsn,
+            last_lsn,
             frames,
-            ..
         } => {
             let table_dir = engine.data_dir().join(&db).join(&table);
-            append_raw_frames(&table_dir, memtable_id, &partition, &frames)?;
+            // Replay dedup: the applied watermark persists only AFTER the
+            // tail append is fsynced, so a standby crash in that window
+            // replays this event from the persisted (stale) seq. Re-appending
+            // blindly would double the tail's rows. Skip when the tail
+            // already covers the event's LSN range; fail loudly on a partial
+            // overlap (cannot be patched safely).
+            let replayed = match crate::storage::core::durable_tail::live_tail_path(
+                &table_dir,
+                memtable_id,
+            )? {
+                Some(path) => {
+                    match crate::storage::core::durable_tail::tail_last_lsn(&path)? {
+                        Some(tail_lsn) if tail_lsn >= last_lsn => true,
+                        Some(tail_lsn) if tail_lsn >= first_lsn => {
+                            return Err(TaibaiError::Storage(format!(
+                                "replication replay for memtable {memtable_id} partially applied \
+                                 (tail ends at lsn {tail_lsn}, event spans {first_lsn}..{last_lsn}); \
+                                 the tail needs manual inspection"
+                            )));
+                        }
+                        _ => false,
+                    }
+                }
+                None => false,
+            };
+            if !replayed {
+                append_raw_frames(&table_dir, memtable_id, &partition, &frames)?;
+            }
             // The spilled row count must reflect the WHOLE tail file (delta
             // frames from several events accumulate in one file).
             let live_path =
                 crate::storage::core::durable_tail::live_tail_path(&table_dir, memtable_id)?;
             let rows = match &live_path {
                 Some(path) => {
+                    if replayed {
+                        // The per-path cache assumed append-only progression
+                        // from events this session applied; a replay invalidates
+                        // it, so re-read the file once.
+                        tail_rows_cache.remove(&path.to_string_lossy().into_owned());
+                    }
                     if tail_rows_cache.len() > 1024 {
                         // Conservative bound on paths from tails that were
                         // replaced by compaction; the next event re-seeds.
