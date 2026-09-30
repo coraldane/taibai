@@ -179,6 +179,13 @@ where
         .set_push_channel(push_tx);
     let mut pending_messages: VecDeque<Message> = VecDeque::new();
     let mut pending_bytes = 0usize;
+    // Requests the connection has accepted (dispatched to a worker) whose
+    // responses have not been delivered yet. The idle close must treat such
+    // requests — and frames still sitting in `pending_messages` — as
+    // connection activity: a client blocked waiting for a slow response
+    // (bulk writes queue on table locks for a long time) legitimately sends
+    // nothing, and must not lose its connection on top of that.
+    let mut requests_in_flight: usize = 0;
 
     let outcome = 'connection: loop {
         // Fetch the next request frame, giving the pending queue priority so
@@ -209,6 +216,22 @@ where
                 match timeout(Duration::from_secs(effective_idle_timeout_secs), wait).await {
                     Ok(incoming) => incoming,
                     Err(_) => {
+                        // In-flight or queued requests count as activity:
+                        // restart the idle window instead of closing. With
+                        // the current one-worker-at-a-time dispatch this is
+                        // defense in depth (the fetch wait is only reached
+                        // once the previous request's responses went out and
+                        // the pending queue is empty), but it keeps the idle
+                        // close correct by construction if dispatch ever
+                        // overlaps response delivery.
+                        if requests_in_flight > 0 || !pending_messages.is_empty() {
+                            tracing::debug!(
+                                requests_in_flight,
+                                queued_frames = pending_messages.len(),
+                                "idle timeout deferred: connection still has in-flight or queued requests"
+                            );
+                            continue;
+                        }
                         tracing::warn!(
                             idle_timeout_secs = effective_idle_timeout_secs,
                             "closing idle connection"
@@ -229,6 +252,7 @@ where
         };
 
         tracing::debug!(msg_type = msg.msg_type, "message received");
+        requests_in_flight += 1;
 
         let context = build_query_context(&config, Arc::new(AtomicBool::new(false)));
         let (stream_sender, mut stream_receiver) = tokio::sync::mpsc::channel(1);
@@ -391,6 +415,7 @@ where
                 break 'connection Err(e);
             }
         }
+        requests_in_flight = requests_in_flight.saturating_sub(1);
     };
 
     if let Some(handler) = handler.take() {
