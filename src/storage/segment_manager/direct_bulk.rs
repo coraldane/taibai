@@ -17,7 +17,13 @@ fn log_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
 const SLOW_BULK_APPEND_WARN: std::time::Duration = std::time::Duration::from_secs(10);
 const SLOW_SEAL_WARN: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn warn_slow_seal(db: &str, table: &str, partition: &str, size_bytes: u64, elapsed: std::time::Duration) {
+fn warn_slow_seal(
+    db: &str,
+    table: &str,
+    partition: &str,
+    size_bytes: u64,
+    elapsed: std::time::Duration,
+) {
     if elapsed >= SLOW_SEAL_WARN {
         tracing::warn!(
             db,
@@ -61,7 +67,8 @@ impl SegmentManager {
 
         {
             let partition_lock = partition_mutation_lock_arc(&state, "");
-            let _partition_guard = acquire_partition_mutation_lock(&state, &partition_lock, &key, "")?;
+            let _partition_guard =
+                acquire_partition_mutation_lock(&state, &partition_lock, &key, "")?;
             ensure_state_not_retired(&state, db, req.table_name)?;
 
             let mut active_guard = state.active_segments.lock().unwrap();
@@ -98,7 +105,7 @@ impl SegmentManager {
             }
         }
 
-        self.note_direct_segment_append(db, req.table_name);
+        self.note_segments_changed(db, req.table_name);
         Ok(req.row_count as u64)
     }
 
@@ -157,9 +164,7 @@ impl SegmentManager {
                     idx, col_def.name, payload_col.name
                 )));
             }
-            if (col_def.primary_key || !col_def.nullable)
-                && payload_col.has_nulls(req.row_count)
-            {
+            if (col_def.primary_key || !col_def.nullable) && payload_col.has_nulls(req.row_count) {
                 return Err(TaibaiError::Protocol(format!(
                     "bulk column '{}' does not allow NULL values",
                     col_def.name
@@ -180,10 +185,9 @@ impl SegmentManager {
         let table_dir = self.data_dir.join(db).join(req.table_name);
         std::fs::create_dir_all(&table_dir)?;
         self.set_table_compression_level(db, req.table_name, table_meta.compression_level);
-        let compression_level =
-            crate::storage::segment_manager::config::resolve_compression_level(
-                table_meta.compression_level,
-            );
+        let compression_level = crate::storage::segment_manager::config::resolve_compression_level(
+            table_meta.compression_level,
+        );
         let partition_start = std::time::Instant::now();
         let partition_groups = self.direct_bulk_partition_groups(req, table_meta)?;
         log_profile("partition", req.row_count, partition_start.elapsed());
@@ -216,49 +220,50 @@ impl SegmentManager {
             .collect::<Vec<_>>();
 
         let total_start = std::time::Instant::now();
-        let result = self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
-            ensure_state_not_retired(&state, db, req.table_name)?;
+        let result =
+            self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
+                ensure_state_not_retired(&state, db, req.table_name)?;
 
-            let mut written = 0u64;
-            let append_start = std::time::Instant::now();
-            for group in prepared_groups {
-                let mut active_guard = state.active_segments.lock().unwrap();
-                self.get_or_create_active_segment_for_partition_locked(
-                    &table_dir,
-                    schema,
-                    &group.partition_key,
-                    &mut active_guard,
-                )?;
-                let seg = active_guard.get_mut(&group.partition_key).unwrap();
-                seg.append_direct_row_group(
-                    &group.columns,
-                    &group.compressed_columns,
-                    group.row_count as u64,
-                    build_value_sets,
-                    zone_map_columns.as_deref(),
-                )?;
-                if seg.current_size >= self.max_segment_size() {
-                    let seal_start = std::time::Instant::now();
-                    seg.seal(&|path| self.invalidate_reader(path))?;
-                    warn_slow_seal(
-                        db,
-                        req.table_name,
+                let mut written = 0u64;
+                let append_start = std::time::Instant::now();
+                for group in prepared_groups {
+                    let mut active_guard = state.active_segments.lock().unwrap();
+                    self.get_or_create_active_segment_for_partition_locked(
+                        &table_dir,
+                        schema,
                         &group.partition_key,
-                        seg.current_size,
-                        seal_start.elapsed(),
-                    );
-                    active_guard.remove(&group.partition_key);
-                } else if flush_immediately {
-                    seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                        &mut active_guard,
+                    )?;
+                    let seg = active_guard.get_mut(&group.partition_key).unwrap();
+                    seg.append_direct_row_group(
+                        &group.columns,
+                        &group.compressed_columns,
+                        group.row_count as u64,
+                        build_value_sets,
+                        zone_map_columns.as_deref(),
+                    )?;
+                    if seg.current_size >= self.max_segment_size() {
+                        let seal_start = std::time::Instant::now();
+                        seg.seal(&|path| self.invalidate_reader(path))?;
+                        warn_slow_seal(
+                            db,
+                            req.table_name,
+                            &group.partition_key,
+                            seg.current_size,
+                            seal_start.elapsed(),
+                        );
+                        active_guard.remove(&group.partition_key);
+                    } else if flush_immediately {
+                        seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                    }
+                    written += group.row_count as u64;
                 }
-                written += group.row_count as u64;
-            }
-            if written > 0 {
-                self.note_direct_segment_append(db, req.table_name);
-            }
-            log_profile("append", written as usize, append_start.elapsed());
-            Ok(written)
-        });
+                if written > 0 {
+                    self.note_segments_changed(db, req.table_name);
+                }
+                log_profile("append", written as usize, append_start.elapsed());
+                Ok(written)
+            });
         let elapsed = total_start.elapsed();
         if elapsed >= SLOW_BULK_APPEND_WARN {
             tracing::warn!(
@@ -584,7 +589,10 @@ fn slice_null_bitmap(nulls: &[u8], start: usize, len: usize) -> Vec<u8> {
 /// segment codec representation (bitmap followed by non-null values only).
 fn encode_direct_bulk_column(col: &DirectBulkColumn<'_>) -> Result<Vec<u8>> {
     let bitmap_len = u32::try_from(col.nulls.len()).map_err(|_| {
-        TaibaiError::Protocol(format!("bulk column '{}' null bitmap is too large", col.name))
+        TaibaiError::Protocol(format!(
+            "bulk column '{}' null bitmap is too large",
+            col.name
+        ))
     })?;
     let mut encoded = Vec::with_capacity(4 + col.nulls.len() + col.data.len());
     encoded.extend_from_slice(&bitmap_len.to_le_bytes());

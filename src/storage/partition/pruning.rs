@@ -18,6 +18,17 @@ impl ZoneMap {
         }
     }
 
+    /// Whether this map carries computed statistics. Writers that skip zone
+    /// map computation (bulk direct writes outside the key columns) emit
+    /// [`ZoneMap::null`]-shaped defaults: a NULL min and a zero null_count.
+    /// A computed map always has a non-NULL min or a non-zero null_count —
+    /// a computed all-null group records null_count == row_count > 0. A
+    /// computed zero-row group is indistinguishable from an uncomputed one;
+    /// folding either from data is a no-op, so the ambiguity is harmless.
+    pub fn is_computed(&self) -> bool {
+        !self.min_value.is_null() || self.null_count > 0
+    }
+
     pub fn contains(&self, value: &ScalarValue) -> bool {
         if self.min_value.is_null() || value.is_null() {
             return true;

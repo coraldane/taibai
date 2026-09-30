@@ -24,7 +24,9 @@ use rayon::prelude::*;
 
 use crate::common::error::{Result, TaibaiError};
 use crate::protocol::types::DataType;
-use crate::sql::execution::operators::aggregate::aggregate_result_column_def;
+use crate::sql::execution::operators::aggregate::{
+    aggregate_result_column_def, null_scalar_of_type,
+};
 use crate::sql::execution::scan::memtable as scan_memtable;
 use crate::sql::execution::scan::partition;
 use crate::sql::execution::scan::row_filter;
@@ -178,8 +180,13 @@ pub fn compute_simple_aggregate(
             && !sums_answerable_from_footer
             && !spec.has_predicates()
             && meta_deleted == 0
-            && meta.is_some()
-        {
+            && meta.as_ref().is_some_and(|m| {
+                aggregates_foldable_from_metadata(
+                    &accumulators,
+                    &aggregate_columns,
+                    &m.segment_zone_maps,
+                )
+            }) {
             segment_sum_cache_lookup(
                 segment_path.to_string_lossy().as_ref(),
                 meta_rows,
@@ -199,7 +206,7 @@ pub fn compute_simple_aggregate(
                     continue;
                 }
                 if let Some(v) = cached.get(sum_idx) {
-                    accumulator.fold_cached_sum(v);
+                    accumulator.fold_cached_sum(v)?;
                 }
                 sum_idx += 1;
             }
@@ -216,7 +223,15 @@ pub fn compute_simple_aggregate(
             && !sums_answerable_from_footer
             && sum_cache.is_none()
             && reader.deleted_row_count() == 0;
-        if !spec.has_predicates() && reader.deleted_row_count() == 0 && !needs_data_fold {
+        if !spec.has_predicates()
+            && reader.deleted_row_count() == 0
+            && !needs_data_fold
+            && aggregates_foldable_from_metadata(
+                &accumulators,
+                &aggregate_columns,
+                reader.segment_zone_maps(),
+            )
+        {
             fold_metadata(
                 &mut accumulators,
                 reader.segment_zone_maps(),
@@ -317,26 +332,15 @@ pub fn compute_simple_aggregate(
             let rg_sums_available = sums_answerable_from_footer
                 && !row_group_meta.zone_maps.is_empty()
                 && row_group_meta.col_sums.len() == row_group_meta.zone_maps.len();
-            // A SUM/AVG argument column whose zone map was never computed
-            // (bulk direct writes populate key columns only) has a NULL
-            // min_value indistinguishable from a genuinely all-null row
-            // group, so fold_metadata would skip the sum and finalize NULL.
-            // Such row groups must fold from data.
-            let sum_avg_columns_visible = aggregates
-                .iter()
-                .zip(&aggregate_columns)
-                .filter(|(a, _)| matches!(a.func, AggFunc::Sum | AggFunc::Avg))
-                .all(|(_, column)| match column {
-                    Some(col) => row_group_meta.zone_maps.get(*col).is_some_and(|zone_map| {
-                        !zone_map.min_value.is_null()
-                            || zone_map.null_count >= row_group_meta.row_count
-                    }),
-                    None => true,
-                });
             if predicate_match == crate::storage::partition::pruning::PredicateMatch::All
                 && reader.delete_bitmap().is_empty()
                 && !streaming_sum
-                && ((!has_sum && !has_avg) || (rg_sums_available && sum_avg_columns_visible))
+                && aggregates_foldable_from_metadata(
+                    &accumulators,
+                    &aggregate_columns,
+                    &row_group_meta.zone_maps,
+                )
+                && (!has_sum && !has_avg || rg_sums_available)
             {
                 meta_folds.push((
                     &row_group_meta.zone_maps,
@@ -532,6 +536,10 @@ pub fn compute_simple_aggregate(
                 .filter(|(a, _)| a.func == crate::sql::planner::AggFunc::Sum)
                 .map(|(a, (i0, f0))| SumCacheValue {
                     i: match (a.sum_i, *i0) {
+                        // Delta of two exact i64 partials; the difference can
+                        // only exceed i64 when one side already wrapped inside
+                        // the documented vectorized col_sum_i64 fold, in which
+                        // case the cache entry is garbage either way.
                         (Some(v), Some(base)) => Some(v.wrapping_sub(base)),
                         (v, None) => v,
                         (None, Some(_)) => None,
@@ -628,6 +636,28 @@ fn fold_metadata(
         accumulator.fold_metadata(zone_maps, row_count, col_sums)?;
     }
     Ok(())
+}
+
+/// Whether every aggregate can fold from these zone maps: each argument
+/// column's map must carry computed statistics. Bulk direct writes compute
+/// zone maps for the partition/cluster key columns only and fill the rest
+/// with defaults whose NULL min / zero null_count are indistinguishable
+/// from a genuinely all-null row group — folding those from metadata would
+/// miscount NULLs for COUNT(col) and return NULL for MIN/MAX (the same
+/// defect once fixed for SUM/AVG). Such segments must fold from data.
+/// COUNT(*) has no argument column and is always foldable.
+fn aggregates_foldable_from_metadata(
+    accumulators: &[AggAccum],
+    aggregate_columns: &[Option<usize>],
+    zone_maps: &[crate::storage::partition::pruning::ZoneMap],
+) -> bool {
+    accumulators
+        .iter()
+        .zip(aggregate_columns)
+        .all(|(_, column)| match column {
+            Some(col) => zone_maps.get(*col).is_some_and(ZoneMap::is_computed),
+            None => true,
+        })
 }
 
 fn fold_batch(
@@ -904,12 +934,7 @@ impl AggAccum {
             }
             AggFunc::Sum if has_values => {
                 if let Some(&sum) = col_sums.get(column) {
-                    self.sum_i = Some(
-                        self.sum_i
-                            .unwrap_or(0)
-                            .checked_add(sum)
-                            .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
-                    );
+                    self.add_i64(sum)?;
                 }
             }
             AggFunc::Avg if has_values => {
@@ -920,6 +945,23 @@ impl AggAccum {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// The single integer-SUM accumulation point for this accumulator: every
+    /// path (footer col_sums, data folds, cached partials) adds through it so
+    /// overflow reports "SUM overflow" instead of silently wrapping — the
+    /// same contract as the generic aggregate operator. The row-group
+    /// partials fed in here can themselves have wrapped inside the
+    /// documented vectorized `col_sum_i64` fold; this boundary catches
+    /// cross-group / cross-segment accumulation overflow.
+    fn add_i64(&mut self, part: i64) -> Result<()> {
+        self.sum_i = Some(
+            self.sum_i
+                .unwrap_or(0)
+                .checked_add(part)
+                .ok_or_else(|| TaibaiError::Sql("SUM overflow".to_string()))?,
+        );
         Ok(())
     }
 
@@ -953,7 +995,7 @@ impl AggAccum {
                 }
                 _ => {
                     if let Some(part) = values.col_sum_i64() {
-                        self.sum_i = Some(self.sum_i.unwrap_or(0).wrapping_add(part));
+                        self.add_i64(part)?;
                     }
                 }
             },
@@ -975,7 +1017,7 @@ impl AggAccum {
     /// Fold a cached per-segment partial sum into this accumulator. A `None`
     /// delta means the segment contributed nothing (e.g. all-NULL rows) and
     /// must not materialize a zero from an empty accumulator.
-    fn fold_cached_sum(&mut self, cached: &SumCacheValue) {
+    fn fold_cached_sum(&mut self, cached: &SumCacheValue) -> Result<()> {
         match self.col_type {
             DataType::Float32 | DataType::Float64 => {
                 if let Some(v) = cached.f {
@@ -984,10 +1026,11 @@ impl AggAccum {
             }
             _ => {
                 if let Some(v) = cached.i {
-                    self.sum_i = Some(self.sum_i.unwrap_or(0).wrapping_add(v));
+                    self.add_i64(v)?;
                 }
             }
         }
+        Ok(())
     }
 
     fn merge_min(&mut self, value: ScalarValue) {
@@ -1047,27 +1090,6 @@ impl AggAccum {
                 }
             }
         }
-    }
-}
-
-fn null_scalar_of_type(dt: DataType) -> ScalarValue {
-    match dt {
-        DataType::Int64 => ScalarValue::Int64(None),
-        DataType::Int32 => ScalarValue::Int32(None),
-        DataType::Int16 => ScalarValue::Int16(None),
-        DataType::Int8 => ScalarValue::Int8(None),
-        DataType::UInt64 => ScalarValue::UInt64(None),
-        DataType::UInt32 => ScalarValue::UInt32(None),
-        DataType::UInt16 => ScalarValue::UInt16(None),
-        DataType::UInt8 => ScalarValue::UInt8(None),
-        DataType::Float64 => ScalarValue::Float64(None),
-        DataType::Float32 => ScalarValue::Float32(None),
-        DataType::Decimal => ScalarValue::Decimal(None),
-        DataType::Date => ScalarValue::Date(None),
-        DataType::Timestamp => ScalarValue::Timestamp(None),
-        DataType::VarChar => ScalarValue::VarChar(None),
-        DataType::Bool => ScalarValue::Bool(None),
-        _ => ScalarValue::Int64(None),
     }
 }
 
@@ -1325,4 +1347,60 @@ pub fn compute_distinct_column(
             .push(value)?;
     }
     Ok(Some(batch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::batch::ColumnDef;
+
+    fn sum_schema() -> Schema {
+        Schema::new(vec![ColumnDef::new("v", DataType::Int64)])
+    }
+
+    fn batch_of(values: &[i64]) -> RecordBatch {
+        let schema = sum_schema();
+        let mut batch = RecordBatch::new(schema);
+        for value in values {
+            batch
+                .column_mut(0)
+                .unwrap()
+                .push(&ScalarValue::Int64(Some(*value)))
+                .unwrap();
+        }
+        batch
+    }
+
+    /// The data-fold path must report overflow exactly like the footer
+    /// col_sums path and the generic aggregate operator: cross-group
+    /// accumulation that exceeds i64 is an error, not a wrapped value.
+    #[test]
+    fn data_fold_sum_overflow_errors_instead_of_wrapping() {
+        let schema = sum_schema();
+        let mut accumulator = AggAccum::new(AggFunc::Sum, Some(0), &schema);
+        accumulator
+            .fold_batch(&batch_of(&[i64::MAX - 1]), Some(0))
+            .expect("first partial fits");
+        let error = accumulator
+            .fold_batch(&batch_of(&[i64::MAX - 1]), Some(0))
+            .expect_err("cross-group overflow must error");
+        assert!(error.to_string().contains("SUM overflow"), "got: {error}");
+    }
+
+    /// Cached per-segment partials flow through the same accumulation point.
+    #[test]
+    fn cached_partial_sum_overflow_errors_instead_of_wrapping() {
+        let schema = sum_schema();
+        let mut accumulator = AggAccum::new(AggFunc::Sum, Some(0), &schema);
+        accumulator
+            .fold_batch(&batch_of(&[i64::MAX - 1]), Some(0))
+            .expect("first partial fits");
+        let error = accumulator
+            .fold_cached_sum(&SumCacheValue {
+                i: Some(i64::MAX - 1),
+                f: None,
+            })
+            .expect_err("cached-partial overflow must error");
+        assert!(error.to_string().contains("SUM overflow"), "got: {error}");
+    }
 }

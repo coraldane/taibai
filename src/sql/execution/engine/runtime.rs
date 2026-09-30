@@ -439,6 +439,38 @@ impl Engine {
         Ok(())
     }
 
+    /// Roll back the session's open transaction: drop deferred DML plans,
+    /// roll the batch writer back, retract the unique/PK index entries the
+    /// transaction published at statement time, and clear the session's
+    /// transaction state. This is the single rollback protocol — the SQL
+    /// ROLLBACK statement, the wire ROLLBACK message, and the disconnect
+    /// path all go through it, so the cleanup steps cannot drift apart.
+    ///
+    /// On failure the session's transaction state is left intact so the
+    /// caller can retry or report; callers that cannot propagate (disconnect)
+    /// log instead.
+    pub fn rollback_session_txn(&self, session: &mut Session) -> Result<u64> {
+        if !session.in_txn() {
+            return Err(TaibaiError::Sql("no active transaction".into()));
+        }
+        let txn_id = session.active_txn_id();
+        // Deferred DML plans are dropped first: no durable state was
+        // written at statement time, so discarding them restores the
+        // pre-statement state.
+        let discarded_dml =
+            super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
+        let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
+        // Retract the unique/PK index entries INSERT statements published at
+        // statement time; otherwise the next INSERT of the same key sees a
+        // phantom duplicate until the next snapshot refresh.
+        self.index_manager()
+            .discard_txn_published_entries_at_rollback(txn_id);
+        let rows = rolled_back + discarded_dml;
+        tracing::debug!(txn_id, rows_rolled_back = rows, "transaction rolled back");
+        session.rollback_txn();
+        Ok(rows)
+    }
+
     pub fn get_table_meta(
         &self,
         db: &str,

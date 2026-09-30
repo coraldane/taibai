@@ -1178,10 +1178,7 @@ fn chained_intersect_parses_and_folds_left() -> Result<()> {
     let mut session = session();
 
     engine.execute(&mut session, "CREATE TABLE t (v INT64)")?;
-    engine.execute(
-        &mut session,
-        "INSERT INTO t (v) VALUES (1), (2), (3), (4)",
-    )?;
+    engine.execute(&mut session, "INSERT INTO t (v) VALUES (1), (2), (3), (4)")?;
 
     // `a INTERSECT b INTERSECT c` used to fold only the first pair and
     // then fail on the leftover INTERSECT token.
@@ -1263,7 +1260,13 @@ fn fast_insert_path_matches_standard_path() -> Result<()> {
             let ts = if rng.next() % 4 == 0 {
                 "NULL".to_string()
             } else {
-                format!("'2026-{:02}-{:02} {:02}:{:02}:00'", 1 + rng.next() % 12, 1 + rng.next() % 28, rng.next() % 24, rng.next() % 60)
+                format!(
+                    "'2026-{:02}-{:02} {:02}:{:02}:00'",
+                    1 + rng.next() % 12,
+                    1 + rng.next() % 28,
+                    rng.next() % 24,
+                    rng.next() % 60
+                )
             };
             values.push(format!(
                 "({}, {}, {}, {}, {}, {}, {})",
@@ -1326,5 +1329,30 @@ fn fast_insert_path_matches_standard_path() -> Result<()> {
         via_fast, via_standard,
         "fast INSERT path diverged from the standard path"
     );
+    Ok(())
+}
+
+/// A transactional UPDATE must invalidate the hot mirror at COMMIT, exactly
+/// like auto-commit UPDATE does: the mirror is append-only, so rows it still
+/// holds become stale once the deferred update images replace them. HOT
+/// tables are currently rejected from transactional DML, but the invariant
+/// must not depend on that gate staying closed.
+#[test]
+fn txn_update_commit_invalidates_hot_mirror() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path(), "main")?;
+    let mut session = session();
+    engine.execute(&mut session, "CREATE TABLE t (id INT64, v INT64)")?;
+    engine.execute(&mut session, "INSERT INTO t (id, v) VALUES (1, 10)")?;
+    let epoch_before = engine.hot_store_manager().feed_epoch("main", "t");
+    engine.execute(&mut session, "BEGIN")?;
+    engine.execute(&mut session, "UPDATE t SET v = 99 WHERE id = 1")?;
+    engine.execute(&mut session, "COMMIT")?;
+    assert_ne!(
+        engine.hot_store_manager().feed_epoch("main", "t"),
+        epoch_before,
+        "COMMIT of a transactional UPDATE must invalidate the hot mirror"
+    );
+    engine.segment_mgr().shutdown();
     Ok(())
 }

@@ -22,7 +22,6 @@ pub fn exec_update(
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
-    username: &str,
 ) -> Result<ExecResult> {
     if reader_txn_id > 0 {
         return super::txn_dml::exec_update_in_txn(
@@ -32,19 +31,9 @@ pub fn exec_update(
             assignments,
             where_clause,
             reader_txn_id,
-            username,
         );
     }
-    // An open transaction's deferred mutations pin memtable row positions and
-    // segment row ids; rewriting either underneath the pin makes its COMMIT
-    // delete/update the wrong rows. Auto-commit UPDATE refuses instead of
-    // racing the pin.
-    if engine.txn_mutations().table_has_pins(db, table) {
-        return Err(TaibaiError::ResourceBusy(format!(
-            "table '{}.{}' is pinned by an open transaction; retry after it commits or rolls back",
-            db, table
-        )));
-    }
+    super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
     // Join the INSERT/REPLACE writer protocol. UPDATE is the mutator the
     // existing guards missed: INSERT probes unique keys under this striped
     // lock, but an UPDATE that introduces a key under only the table mutation
@@ -88,27 +77,21 @@ pub fn exec_update(
     // Resolve subqueries in the WHERE clause and in assignment values up
     // front, exactly like DELETE does. Without this, `UPDATE ... WHERE id IN
     // (SELECT ...)` used to fall into the predicate evaluator's legacy
-    // "match everything" fallback and rewrite the whole table.
+    // "match everything" fallback and rewrite the whole table. Subquery table
+    // permissions are enforced statement-wide by the engine's permission gate
+    // before dispatch.
     let resolved_where_clause =
-        super::dml_delete::resolve_where_in_subqueries(engine, db, where_clause, username)?;
+        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
     let resolved_assignments: Vec<Assignment> = assignments
         .iter()
         .map(|assignment| {
             Ok(Assignment {
                 column: assignment.column.clone(),
-                value: {
-                    super::dml_delete::require_subquery_select_permissions_for_expr(
-                        engine,
-                        username,
-                        db,
-                        &assignment.value,
-                    )?;
-                    super::query::resolve_expr_in_subqueries_clone(
-                        engine,
-                        db,
-                        &assignment.value,
-                    )?
-                },
+                value: super::query::resolve_expr_in_subqueries_clone(
+                    engine,
+                    db,
+                    &assignment.value,
+                )?,
             })
         })
         .collect::<Result<_>>()?;
@@ -135,9 +118,7 @@ pub fn exec_update(
         // Updated rows are published as change events (post-update values
         // for memtable rows, which are entirely in memory).
         let publish_updates = engine.pubsub().has_subscribers();
-        let mut updated_row_batches: Vec<RecordBatch> = Vec::new();
-        let mut event_buffer_bytes = 0usize;
-        let mut event_budget_warned = false;
+        let mut updated_events = super::helpers::ChangeEventBuffer::new("update", db, table);
         let mut updated_count = 0u64;
         let mut memtable_updates: Vec<(
             Arc<crate::storage::core::memtable::MemTable>,
@@ -165,33 +146,7 @@ pub fn exec_update(
                 if publish_updates {
                     // Change events carry the post-update row images: take
                     // from `new_batch`, not the pre-update snapshot.
-                    let columns = new_batch
-                        .columns
-                        .iter()
-                        .map(|col| col.take(&matched_rows))
-                        .collect();
-                    match RecordBatch::try_new(new_batch.schema.clone(), columns) {
-                        Ok(updated) => {
-                            let bytes = updated.estimated_size_bytes();
-                            if super::helpers::change_event_budget_allows(
-                                event_buffer_bytes,
-                                bytes,
-                                &mut event_budget_warned,
-                                "update",
-                                db,
-                                table,
-                            ) {
-                                event_buffer_bytes += bytes;
-                                updated_row_batches.push(updated);
-                            }
-                        }
-                        Err(error) => tracing::warn!(
-                            db,
-                            table,
-                            error = %error,
-                            "failed to build update-event batch for memtable rows"
-                        ),
-                    }
+                    updated_events.push(&new_batch, &matched_rows);
                 }
                 memtable_updates.push((memtable, Arc::new(new_batch)));
             }
@@ -223,7 +178,7 @@ pub fn exec_update(
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !segment_may_match(&reader, predicate.as_ref()) {
+            if !super::helpers::segment_may_match(&reader, predicate.as_ref()) {
                 continue;
             }
 
@@ -287,35 +242,7 @@ pub fn exec_update(
                         .enumerate()
                         .filter_map(|(idx, m)| m.then_some(idx as u32))
                         .collect();
-                    if !matched.is_empty() {
-                        let columns = new_batch
-                            .columns
-                            .iter()
-                            .map(|col| col.take(&matched))
-                            .collect();
-                        match RecordBatch::try_new(new_batch.schema.clone(), columns) {
-                            Ok(updated) => {
-                                let bytes = updated.estimated_size_bytes();
-                                if super::helpers::change_event_budget_allows(
-                                    event_buffer_bytes,
-                                    bytes,
-                                    &mut event_budget_warned,
-                                    "update",
-                                    db,
-                                    table,
-                                ) {
-                                    event_buffer_bytes += bytes;
-                                    updated_row_batches.push(updated);
-                                }
-                            }
-                            Err(error) => tracing::warn!(
-                                db,
-                                table,
-                                error = %error,
-                                "failed to build update-event batch"
-                            ),
-                        }
-                    }
+                    updated_events.push(&new_batch, &matched);
                 }
                 row_group_updates.push((rg_idx, Some(new_batch)));
             }
@@ -547,7 +474,7 @@ pub fn exec_update(
         // and memtables may carry different schemas after ALTER TABLE ADD
         // COLUMN (metadata-only), so merging by column index would panic.
         if publish_updates && updated_count > 0 {
-            for batch in updated_row_batches {
+            for batch in updated_events.batches {
                 engine
                     .pubsub()
                     .publish_change(crate::pubsub::ChangeKind::Update, db, table, batch);
@@ -802,18 +729,4 @@ pub(crate) fn build_update_mask(
         }
     }
     Ok(mask)
-}
-
-pub(crate) fn segment_may_match(
-    reader: &crate::storage::segment::SegmentReader,
-    predicate: Option<&crate::storage::segment::RowGroupPredicate>,
-) -> bool {
-    let Some(predicate) = predicate else {
-        return true;
-    };
-    let segment_zone_maps = reader.segment_zone_maps();
-    if !segment_zone_maps.is_empty() {
-        return predicate.matches_row_group(segment_zone_maps);
-    }
-    (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
 }

@@ -442,3 +442,103 @@ fn decimal_division_order_by_uses_fractional_numeric_value() {
     assert_eq!(rows[0][1], ScalarValue::Float64(Some(0.1)));
     assert_eq!(rows[1][1], ScalarValue::Float64(Some(0.01)));
 }
+
+/// WHERE predicates and SET/INSERT assignments must accept the same bool
+/// literals: both go through the single shared coercion ladder. This pins the
+/// pre-unification divergence where `SET flag = 'yes'` stored a value that
+/// `WHERE flag = 'yes'` could never find (the scan predicate compile had no
+/// Bool coercion at all). Unknown spellings are assignment errors but
+/// row-filter non-matches — SQL UNKNOWN semantics.
+#[test]
+fn where_and_assignment_accept_the_same_bool_literals() {
+    let (_temp_dir, engine, mut session) = create_engine();
+
+    engine
+        .execute(&mut session, "CREATE TABLE t (id INT64, flag BOOL)")
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1, false), (2, true)")
+        .expect("insert rows");
+
+    // 'yes' must behave identically as an assignment and as a filter.
+    engine
+        .execute(&mut session, "UPDATE t SET flag = 'yes' WHERE id = 1")
+        .expect("'yes' is a valid bool literal in SET");
+    let (_, rows) = collect_rows(
+        engine
+            .execute(&mut session, "SELECT id FROM t WHERE flag = 'yes'")
+            .expect("'yes' is a valid bool literal in WHERE"),
+    );
+    // Both rows now hold true: id=2 was inserted as true and id=1 was just
+    // assigned 'yes'.
+    assert_eq!(
+        rows,
+        vec![
+            vec![ScalarValue::Int64(Some(1))],
+            vec![ScalarValue::Int64(Some(2))]
+        ]
+    );
+    engine
+        .execute(&mut session, "UPDATE t SET flag = 'no' WHERE id = 1")
+        .expect("'no' is a valid bool literal in SET");
+    let (_, rows) = collect_rows(
+        engine
+            .execute(&mut session, "SELECT id FROM t WHERE flag = 'no'")
+            .expect("'no' is a valid bool literal in WHERE"),
+    );
+    // id=1 was assigned 'no' (false); id=2 stays true.
+    assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(1))]]);
+
+    // Unknown spellings: SET errors (an assignment must produce a value),
+    // WHERE silently matches nothing (SQL UNKNOWN).
+    let assign_error = engine
+        .execute(&mut session, "UPDATE t SET flag = 'maybe' WHERE id = 1")
+        .expect_err("'maybe' must be rejected in SET")
+        .to_string();
+    assert!(
+        assign_error.contains("invalid bool 'maybe'"),
+        "{assign_error}"
+    );
+    let (_, rows) = collect_rows(
+        engine
+            .execute(&mut session, "SELECT id FROM t WHERE flag = 'maybe'")
+            .expect("unknown bool spelling filters to nothing, no error"),
+    );
+    assert!(rows.is_empty());
+}
+
+/// Integer narrowing rejections come from the shared integer ladder in the
+/// assignment evaluator; a literal that cannot narrow to the column type
+/// filters to nothing instead of erroring.
+#[test]
+fn where_and_assignment_share_integer_coercion() {
+    let (_temp_dir, engine, mut session) = create_engine();
+
+    engine
+        .execute(&mut session, "CREATE TABLE t (id INT64, small INT32)")
+        .expect("create table");
+    engine
+        .execute(&mut session, "INSERT INTO t VALUES (1, 5)")
+        .expect("insert row");
+
+    let error = engine
+        .execute(&mut session, "UPDATE t SET small = 3000000000 WHERE id = 1")
+        .expect_err("INT32 overflow must be rejected in SET")
+        .to_string();
+    assert!(error.contains("overflows INT32"), "{error}");
+
+    // Same literal as a filter: no error, no match (cannot narrow).
+    let (_, rows) = collect_rows(
+        engine
+            .execute(&mut session, "SELECT id FROM t WHERE small = 3000000000")
+            .expect("non-narrowable literal filters to nothing, no error"),
+    );
+    assert!(rows.is_empty());
+    // The in-range literal still matches.
+    let (_, rows) = collect_rows(
+        engine
+            .execute(&mut session, "SELECT id FROM t WHERE small = 5")
+            .expect("in-range literal matches"),
+    );
+    assert_eq!(rows, vec![vec![ScalarValue::Int64(Some(1))]]);
+}

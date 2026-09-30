@@ -26,7 +26,7 @@ use crate::types::batch::{RecordBatch, Schema};
 
 use super::dml_delete::{
     apply_replace_memtable_conflicts, delete_partition_eq_key, plan_delete_memtable_rows,
-    prune_segments_by_cluster_key, prune_segments_by_partition, resolve_where_in_subqueries,
+    prune_segments_by_cluster_key, prune_segments_by_partition,
 };
 use super::engine::{Engine, ExecResult};
 use super::helpers::{
@@ -58,6 +58,49 @@ pub(crate) fn ensure_txn_dml_supported(table_meta: &TableMeta) -> Result<()> {
     }
     if table_meta.ttl.is_some() {
         return reject("TTL table");
+    }
+    Ok(())
+}
+
+/// Write-write conflict gate for auto-commit DML: an open transaction's
+/// deferred mutations pin memtable row positions and segment row ids.
+/// Auto-commit DELETE/UPDATE physically remove memtable rows and rewrite
+/// segment footers, so a transaction's COMMIT would delete/update the wrong
+/// rows underneath the pin — refuse instead of racing it.
+pub(crate) fn refuse_auto_commit_dml_while_pinned(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+) -> Result<()> {
+    if engine.txn_mutations().table_has_pins(db, table) {
+        return Err(TaibaiError::ResourceBusy(format!(
+            "table '{}.{}' is pinned by an open transaction; retry after it commits or rolls back",
+            db, table
+        )));
+    }
+    Ok(())
+}
+
+/// Write-write conflict gate for deferred DML: the first open transaction to
+/// mutate a table pins it, and another transaction's DML on the same table
+/// must wait until the pin is released. Called inside the mutation-lock
+/// critical section so the check and the tombstone registration are atomic
+/// against a competing transaction's own registration.
+pub(crate) fn refuse_txn_dml_on_pinned_table(
+    engine: &Engine,
+    reader_txn_id: u64,
+    db: &str,
+    table: &str,
+) -> Result<()> {
+    if engine
+        .txn_mutations()
+        .table_pinned_by_other(reader_txn_id, db, table)
+    {
+        return Err(TaibaiError::ResourceBusy(format!(
+            "table '{}.{}' is being modified by another open transaction; \
+             retry after it commits or rolls back",
+            db, table
+        )));
     }
     Ok(())
 }
@@ -101,12 +144,12 @@ pub(crate) fn exec_delete_in_txn(
     table: &str,
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
-    username: &str,
 ) -> Result<ExecResult> {
     let (table_schema, table_meta) = load_table(engine, db, table)?;
     ensure_txn_dml_supported(&table_meta)?;
 
-    let resolved_where_clause = resolve_where_in_subqueries(engine, db, where_clause, username)?;
+    let resolved_where_clause =
+        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
     let target_partition_key =
         delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
     let partitions = partition_scope(&target_partition_key);
@@ -116,23 +159,10 @@ pub(crate) fn exec_delete_in_txn(
     let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
 
     let delete_body = || -> Result<u64> {
-        // Write-write conflict control: the first open transaction to mutate
-        // a table pins it; another transaction's DML on the same table is
-        // refused instead of planning against the same rows and double-
-        // applying at COMMIT (two new images of one row, or an image past a
-        // tombstone). The check runs inside the mutation lock — the same
-        // critical section the tombstone registration below uses — so two
-        // transactions cannot interleave check and register.
-        if engine
-            .txn_mutations()
-            .table_pinned_by_other(reader_txn_id, db, table)
-        {
-            return Err(TaibaiError::ResourceBusy(format!(
-                "table '{}.{}' is being modified by another open transaction; \
-                 retry after it commits or rolls back",
-                db, table
-            )));
-        }
+        // Write-write conflict control: the check runs inside the mutation
+        // lock — the same critical section the tombstone registration below
+        // uses — so two transactions cannot interleave check and register.
+        refuse_txn_dml_on_pinned_table(engine, reader_txn_id, db, table)?;
         let mut statement_deleted: u64 = 0;
 
         // Rows the transaction itself inserted live in transactional
@@ -169,13 +199,7 @@ pub(crate) fn exec_delete_in_txn(
                 plan.removed_positions.iter().copied(),
             )?;
             if engine.pubsub().has_subscribers() {
-                let columns = plan
-                    .original
-                    .columns
-                    .iter()
-                    .map(|col| col.take(&plan.removed_positions))
-                    .collect();
-                match RecordBatch::try_new(plan.original.schema.clone(), columns) {
+                match plan.original.take_rows(&plan.removed_positions) {
                     Ok(deleted) => {
                         engine.txn_mutations().defer_delete_event(
                             reader_txn_id,
@@ -225,7 +249,7 @@ pub(crate) fn exec_delete_in_txn(
                 continue;
             }
             if let Some(ref pred) = predicate {
-                if !super::dml_delete::segment_may_match(&reader, pred) {
+                if !super::helpers::segment_may_match(&reader, Some(pred)) {
                     continue;
                 }
             }
@@ -277,12 +301,7 @@ pub(crate) fn exec_delete_in_txn(
                             }
                         }
                         if publish_deletes && !deleted_in_rg.is_empty() {
-                            let columns = batch
-                                .columns
-                                .iter()
-                                .map(|col| col.take(&deleted_in_rg))
-                                .collect();
-                            match RecordBatch::try_new(batch.schema.clone(), columns) {
+                            match batch.take_rows(&deleted_in_rg) {
                                 Ok(deleted) => engine.txn_mutations().defer_delete_event(
                                     reader_txn_id,
                                     db,
@@ -344,7 +363,6 @@ pub(crate) fn exec_update_in_txn(
     assignments: &[Assignment],
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
-    username: &str,
 ) -> Result<ExecResult> {
     let (table_schema, table_meta) = load_table(engine, db, table)?;
     ensure_txn_dml_supported(&table_meta)?;
@@ -362,25 +380,17 @@ pub(crate) fn exec_update_in_txn(
     }
 
     let resolved_where_clause =
-        super::dml_delete::resolve_where_in_subqueries(engine, db, where_clause, username)?;
+        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
     let resolved_assignments: Vec<Assignment> = assignments
         .iter()
         .map(|assignment| {
             Ok(Assignment {
                 column: assignment.column.clone(),
-                value: {
-                    super::dml_delete::require_subquery_select_permissions_for_expr(
-                        engine,
-                        username,
-                        db,
-                        &assignment.value,
-                    )?;
-                    super::query::resolve_expr_in_subqueries_clone(
-                        engine,
-                        db,
-                        &assignment.value,
-                    )?
-                },
+                value: super::query::resolve_expr_in_subqueries_clone(
+                    engine,
+                    db,
+                    &assignment.value,
+                )?,
             })
         })
         .collect::<Result<_>>()?;
@@ -402,19 +412,8 @@ pub(crate) fn exec_update_in_txn(
         .filter(|key| !key.is_empty());
 
     let update_body = || -> Result<u64> {
-        // Write-write conflict control, mirroring delete_body: refuse when
-        // another open transaction already mutates this table. Check and
-        // tombstone registration share the mutation lock critical section.
-        if engine
-            .txn_mutations()
-            .table_pinned_by_other(reader_txn_id, db, table)
-        {
-            return Err(TaibaiError::ResourceBusy(format!(
-                "table '{}.{}' is being modified by another open transaction; \
-                 retry after it commits or rolls back",
-                db, table
-            )));
-        }
+        // Write-write conflict control, same gate as delete_body.
+        refuse_txn_dml_on_pinned_table(engine, reader_txn_id, db, table)?;
         let publish_updates = engine.pubsub().has_subscribers();
         let mut statement_updated: u64 = 0;
         // New row images per target partition, appended to the transaction's
@@ -442,20 +441,16 @@ pub(crate) fn exec_update_in_txn(
             let Some(raw_batch) = memtable.read_snapshot_arc() else {
                 continue;
             };
-            let prior_positions = txn_mutations.memtable_positions(reader_txn_id, memtable.id());
-            let (batch, live_positions) = match prior_positions {
-                Some(positions) if !positions.is_empty() => {
-                    let keep: Vec<u32> = (0..raw_batch.num_rows() as u32)
-                        .filter(|row| !positions.contains(row))
-                        .collect();
-                    let filtered =
-                        crate::storage::core::txn_mutations::filter_batch_excluding_positions(
-                            &raw_batch, &positions,
-                        )?;
-                    (Arc::new(filtered), Some(keep))
-                }
-                _ => (Arc::clone(&raw_batch), None),
-            };
+            // Rows this transaction already tombstoned in earlier statements
+            // must not match again: read through the registry's filtered
+            // view (same contract as the DELETE planner) so a second UPDATE
+            // of the same row cannot append a second copy of its new image
+            // at COMMIT.
+            let (batch, live_positions) = txn_mutations.memtable_batch_visible_to_txn(
+                reader_txn_id,
+                &memtable,
+                &raw_batch,
+            )?;
             let (new_batch, affected, matched_rows) = super::dml_update::update_memtable_batch(
                 assignments,
                 &resolved_where_clause,
@@ -489,12 +484,7 @@ pub(crate) fn exec_update_in_txn(
                 Arc::clone(&memtable),
                 absolute_rows.iter().copied(),
             )?;
-            let columns = new_batch
-                .columns
-                .iter()
-                .map(|col| col.take(&matched_rows))
-                .collect();
-            let updated_rows = RecordBatch::try_new(new_batch.schema.clone(), columns)?;
+            let updated_rows = new_batch.take_rows(&matched_rows)?;
             if publish_updates {
                 engine.txn_mutations().defer_update_event(
                     reader_txn_id,
@@ -531,7 +521,7 @@ pub(crate) fn exec_update_in_txn(
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !super::dml_update::segment_may_match(&reader, predicate.as_ref()) {
+            if !super::helpers::segment_may_match(&reader, predicate.as_ref()) {
                 continue;
             }
             let prior_ids = engine
@@ -720,9 +710,19 @@ fn materialize_tables(engine: &Engine, mutations: &TxnMutations) -> Result<()> {
                     batch.clone(),
                 );
             }
-            // 4. Counters and caches, as auto-commit DML would.
+            // 4. Counters and caches, as auto-commit DML would. Invalidate
+            // the hot mirror for every mutated table, exactly like
+            // auto-commit DELETE/UPDATE which invalidate unconditionally:
+            // the mirror is append-only, so tombstoned rows (delete or
+            // update) leave it stale. Deferred update images are not a
+            // reliable trigger — they are only buffered when pubsub has
+            // subscribers. The two paths share this invariant by code, not
+            // by table eligibility — `ensure_txn_dml_supported` currently
+            // rejects HOT tables, but relying on that gate here would
+            // silently reintroduce stale point queries the day deferred DML
+            // supports them.
+            engine.invalidate_hot_store(db, table);
             if table_mutations.deleted_rows > 0 {
-                engine.invalidate_hot_store(db, table);
                 let mut catalogs = engine.catalogs().write().unwrap();
                 if let Some(catalog) = catalogs.get_mut(db) {
                     if let Some(meta) = catalog.get_table_mut(table) {

@@ -1720,7 +1720,7 @@ pub fn format_aggregate_name(agg: &AggregateExpr, schema: &Schema) -> String {
     format!("{}({}{})", func_name, distinct_str, arg_name)
 }
 
-fn null_scalar_of_type(dt: DataType) -> ScalarValue {
+pub(crate) fn null_scalar_of_type(dt: DataType) -> ScalarValue {
     match dt {
         DataType::Int64 => ScalarValue::Int64(None),
         DataType::Int32 => ScalarValue::Int32(None),

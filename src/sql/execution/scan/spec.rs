@@ -666,38 +666,34 @@ fn coerce_scalar(
         return Some(ScalarValue::null_for_type(*target_type));
     }
     match (target_type, value) {
-        (DataType::Int32, ScalarValue::Int64(Some(v))) => {
-            i32::try_from(*v).ok().map(|v| ScalarValue::Int32(Some(v)))
+        // Bool, integer, and float coercions delegate to the single ladder
+        // in `execution::helpers` that SET/INSERT and the DML predicate
+        // masks share, so `WHERE flag = 'yes'` accepts exactly the literals
+        // `SET flag = 'yes'` accepts. The Option contract is preserved:
+        // a rejected (or unknown) combination returns None and the
+        // predicate stays in the generic row-level filter instead of
+        // erroring or feeding an index probe a mistyped value.
+        (DataType::Bool, ScalarValue::VarChar(Some(_)))
+        | (DataType::Bool, ScalarValue::Int64(Some(_)))
+        | (DataType::Bool, ScalarValue::Int32(Some(_))) => {
+            crate::sql::execution::helpers::coerce_scalar_for_dtype(value, DataType::Bool).ok()
         }
-        (DataType::Int16, ScalarValue::Int64(Some(v))) => {
-            i16::try_from(*v).ok().map(|v| ScalarValue::Int16(Some(v)))
-        }
-        (DataType::Int8, ScalarValue::Int64(Some(v))) => {
-            i8::try_from(*v).ok().map(|v| ScalarValue::Int8(Some(v)))
-        }
-        (DataType::UInt32, ScalarValue::Int64(Some(v))) => {
-            u32::try_from(*v).ok().map(|v| ScalarValue::UInt32(Some(v)))
-        }
-        (DataType::UInt16, ScalarValue::Int64(Some(v))) => {
-            u16::try_from(*v).ok().map(|v| ScalarValue::UInt16(Some(v)))
-        }
-        (DataType::UInt8, ScalarValue::Int64(Some(v))) => {
-            u8::try_from(*v).ok().map(|v| ScalarValue::UInt8(Some(v)))
-        }
-        (DataType::Float32, ScalarValue::Float64(Some(v))) => {
-            Some(ScalarValue::Float32(Some(*v as f32)))
-        }
+        (
+            target @ (DataType::Int64
+            | DataType::Int32
+            | DataType::Int16
+            | DataType::Int8
+            | DataType::UInt64
+            | DataType::UInt32
+            | DataType::UInt16
+            | DataType::UInt8),
+            value,
+        ) => crate::sql::execution::helpers::coerce_integer_scalar(value, *target).ok(),
         // Integer literals against float/unsigned-64 columns: without these
         // arms the literal kept its Int64 tag, the bloom/set-index hash
         // mismatched, and row groups containing matches were pruned away.
-        (DataType::Float64, ScalarValue::Int64(Some(v))) => {
-            Some(ScalarValue::Float64(Some(*v as f64)))
-        }
-        (DataType::Float32, ScalarValue::Int64(Some(v))) => {
-            Some(ScalarValue::Float32(Some(*v as f32)))
-        }
-        (DataType::UInt64, ScalarValue::Int64(Some(v))) => {
-            u64::try_from(*v).ok().map(|v| ScalarValue::UInt64(Some(v)))
+        (DataType::Float64, _) | (DataType::Float32, _) => {
+            crate::sql::execution::helpers::coerce_scalar_for_dtype(value, *target_type).ok()
         }
         (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
             let m = 10_i64.checked_pow(scale as u32)?;

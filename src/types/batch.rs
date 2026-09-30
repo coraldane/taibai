@@ -212,6 +212,15 @@ impl RecordBatch {
         Ok(Self { schema, columns })
     }
 
+    /// Materialize the selected rows (by absolute row positions) into a new
+    /// batch carrying this batch's schema. The single constructor for
+    /// change-event row images (deleted rows, post-update images) and the
+    /// deferred-DML row batches, so every path produces identical batches.
+    pub fn take_rows(&self, indices: &[u32]) -> Result<RecordBatch> {
+        let columns = self.columns.iter().map(|col| col.take(indices)).collect();
+        RecordBatch::try_new(self.schema.clone(), columns)
+    }
+
     /// Returns the number of rows (assumes all columns have the same length).
     pub fn num_rows(&self) -> usize {
         self.columns.first().map(|c| c.len()).unwrap_or(0)

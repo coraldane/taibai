@@ -708,11 +708,7 @@ impl MemTableManager {
     pub fn hot_partition_mirrored(&self, db: &str, table: &str, partition: &str) -> bool {
         let unfed = self.hot_unfed_rows.lock().unwrap();
         if unfed
-            .get(&(
-                db.to_string(),
-                table.to_string(),
-                HotUnfedScope::Table,
-            ))
+            .get(&(db.to_string(), table.to_string(), HotUnfedScope::Table))
             .copied()
             .unwrap_or(0)
             > 0
@@ -867,12 +863,11 @@ impl MemTableManager {
         }
 
         let mut writable = self.writable.write().unwrap();
-        // Evict entries whose memtable is gone (flushed / removed / rolled
-        // back): the map had no removal path, so every flushed (db, table,
-        // partition, txn_id) combination left a dead entry forever — a slow
-        // leak under high-cardinality partitions and short transactions.
-        // Sweeping here (insertion path) keeps the map at roughly the live set.
-        writable.retain(|_, weak| weak.upgrade().is_some());
+        // Dead entries for this key cannot linger: every retirement point
+        // (`remove_flushed`, `clear_table`, `clear_partition`,
+        // `rename_table`, `rollback_txn`) removes the writable entries of
+        // the memtables it retires, and a retired key's entry is only ever
+        // re-created by the insert below.
         if let Some(memtable) = writable.get(&key).and_then(Weak::upgrade) {
             if memtable.state() == MemTableState::Pending
                 && memtable.txn_id() == txn_id
@@ -1132,19 +1127,58 @@ impl MemTableManager {
             .collect()
     }
 
+    /// Drop the writable entries of retired memtables. Retirement points
+    /// call this with the keys of the memtables they removed, so the map
+    /// never accumulates dead entries and the insertion path never needs a
+    /// full-map sweep.
+    fn remove_writable_keys(&self, keys: &[WritableTableKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut writable = self.writable.write().unwrap();
+        for key in keys {
+            // Only drop the entry if it still points at a dead memtable: a
+            // live replacement for the same key (re-created after retirement)
+            // must survive.
+            if writable.get(key).and_then(Weak::upgrade).is_none() {
+                writable.remove(key);
+            }
+        }
+    }
+
     pub fn remove_flushed(&self) {
         let mut memtables = self.memtables.write().unwrap();
-        memtables.retain(|mt| mt.state() != MemTableState::Flushed);
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
+        memtables.retain(|mt| {
+            if mt.state() != MemTableState::Flushed {
+                return true;
+            }
+            retired_keys.push((
+                mt.db().to_string(),
+                mt.table().to_string(),
+                mt.partition_key().to_string(),
+                mt.txn_id(),
+            ));
+            false
+        });
         drop(memtables);
+        self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
     }
 
     pub fn clear_table(&self, db: &str, table: &str) -> u64 {
         let mut memtables = self.memtables.write().unwrap();
         let mut cleared = 0u64;
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
         memtables.retain(|mt| {
             if mt.db() == db && mt.table() == table {
                 cleared += mt.row_count();
+                retired_keys.push((
+                    mt.db().to_string(),
+                    mt.table().to_string(),
+                    mt.partition_key().to_string(),
+                    mt.txn_id(),
+                ));
                 mt.set_state(MemTableState::Flushed);
                 mt.clear_batch();
                 false
@@ -1153,6 +1187,7 @@ impl MemTableManager {
             }
         });
         drop(memtables);
+        self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
         cleared
     }
@@ -1160,9 +1195,16 @@ impl MemTableManager {
     pub fn clear_partition(&self, db: &str, table: &str, partition_key: &str) -> u64 {
         let mut memtables = self.memtables.write().unwrap();
         let mut cleared = 0u64;
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
         memtables.retain(|mt| {
             if mt.db() == db && mt.table() == table && mt.partition_key() == partition_key {
                 cleared += mt.row_count();
+                retired_keys.push((
+                    mt.db().to_string(),
+                    mt.table().to_string(),
+                    mt.partition_key().to_string(),
+                    mt.txn_id(),
+                ));
                 mt.set_state(MemTableState::Flushed);
                 mt.clear_batch();
                 false
@@ -1171,12 +1213,14 @@ impl MemTableManager {
             }
         });
         drop(memtables);
+        self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
         cleared
     }
 
     pub fn rename_table(&self, db: &str, old_table: &str, new_table: &str) -> u64 {
         let mut memtables = self.memtables.write().unwrap();
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
         let mut replacements = Vec::new();
         let mut renamed_rows = 0u64;
         memtables.retain(|mt| {
@@ -1184,6 +1228,12 @@ impl MemTableManager {
                 return true;
             }
 
+            retired_keys.push((
+                mt.db().to_string(),
+                mt.table().to_string(),
+                mt.partition_key().to_string(),
+                mt.txn_id(),
+            ));
             let old_state = mt.state();
             mt.set_state(MemTableState::Flushed);
             let Some(batch) = mt.take_batch() else {
@@ -1221,6 +1271,7 @@ impl MemTableManager {
         });
         memtables.extend(replacements);
         drop(memtables);
+        self.remove_writable_keys(&retired_keys);
         self.prune_replace_key_indexes();
         renamed_rows
     }
@@ -1229,8 +1280,15 @@ impl MemTableManager {
         let mut memtables = self.memtables.write().unwrap();
         let mut rolled_back = 0u64;
         let mut removed_any = false;
+        let mut retired_keys: Vec<WritableTableKey> = Vec::new();
         memtables.retain(|mt| {
             if mt.txn_id() == txn_id {
+                retired_keys.push((
+                    mt.db().to_string(),
+                    mt.table().to_string(),
+                    mt.partition_key().to_string(),
+                    mt.txn_id(),
+                ));
                 mt.mark_aborted();
                 rolled_back += mt.row_count();
                 removed_any = true;
@@ -1241,6 +1299,7 @@ impl MemTableManager {
         });
         drop(memtables);
         if removed_any {
+            self.remove_writable_keys(&retired_keys);
             self.prune_replace_key_indexes();
         }
         rolled_back

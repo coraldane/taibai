@@ -914,7 +914,6 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     assignments,
                     where_clause,
                     session.active_txn_id(),
-                    &session.username,
                 );
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
@@ -937,7 +936,6 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     &table.name,
                     where_clause,
                     session.active_txn_id(),
-                    &session.username,
                 );
                 if result.is_ok() && session.in_txn() {
                     session.mark_txn_write();
@@ -1019,31 +1017,8 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 Ok(ExecResult::Ok { rows_affected: 0 })
             }
             Statement::Rollback => {
-                if !session.in_txn() {
-                    return Err(TaibaiError::Sql("no active transaction".into()));
-                }
-                let txn_id = session.active_txn_id();
-                // Deferred DML plans are dropped first: no durable state was
-                // written at statement time, so discarding them restores the
-                // pre-statement state.
-                let discarded_dml =
-                    super::txn_dml::discard_txn_mutations_at_rollback(self, txn_id);
-                let rolled_back = self.batch_writer().rollback_txn(txn_id)?;
-                // Retract the unique/PK index entries INSERT statements
-                // published at statement time; otherwise the next INSERT of
-                // the same key sees a phantom duplicate until the next
-                // snapshot refresh.
-                self.index_manager()
-                    .discard_txn_published_entries_at_rollback(txn_id);
-                tracing::debug!(
-                    txn_id,
-                    rows_rolled_back = rolled_back + discarded_dml,
-                    "transaction rolled back"
-                );
-                session.rollback_txn();
-                Ok(ExecResult::Ok {
-                    rows_affected: rolled_back + discarded_dml,
-                })
+                let rows = self.rollback_session_txn(session)?;
+                Ok(ExecResult::Ok { rows_affected: rows })
             }
             Statement::ShowStats => super::ddl::exec_show_stats(self, &session.database),
             Statement::ShowPerformanceBaselines => {
@@ -1151,12 +1126,15 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
             Statement::DropDatabase { name, .. } => {
                 self.require_database_permission(session, PermissionType::Drop, name)
             }
-            Statement::Insert { table, .. } => self.require_table_permission(
-                session,
-                PermissionType::Insert,
-                table.effective_database(&session.database),
-                &table.name,
-            ),
+            Statement::Insert { table, .. } => {
+                self.require_table_permission(
+                    session,
+                    PermissionType::Insert,
+                    table.effective_database(&session.database),
+                    &table.name,
+                )?;
+                self.require_read_table_permissions(session, stmt)
+            }
             Statement::Replace { table, .. } => {
                 self.require_table_permission(
                     session,
@@ -1169,7 +1147,8 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                     PermissionType::Delete,
                     table.effective_database(&session.database),
                     &table.name,
-                )
+                )?;
+                self.require_read_table_permissions(session, stmt)
             }
             Statement::ReplaceSelect { table, query, .. } => {
                 self.require_table_permission(
@@ -1195,36 +1174,29 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
                 )?;
                 self.ensure_permissions(session, query)
             }
-            Statement::Update { table, .. } => self.require_table_permission(
-                session,
-                PermissionType::Update,
-                table.effective_database(&session.database),
-                &table.name,
-            ),
-            Statement::Delete { table, .. } => self.require_table_permission(
-                session,
-                PermissionType::Delete,
-                table.effective_database(&session.database),
-                &table.name,
-            ),
-            Statement::Select { from, .. } => {
-                if let Some(from_clause) = from {
-                    for table_ref in
-                        super::query::extract_table_refs(from_clause, &session.database)
-                    {
-                        self.require_table_permission(
-                            session,
-                            PermissionType::Select,
-                            &table_ref.database,
-                            &table_ref.table,
-                        )?;
-                    }
-                }
-                Ok(())
+            Statement::Update { table, .. } => {
+                self.require_table_permission(
+                    session,
+                    PermissionType::Update,
+                    table.effective_database(&session.database),
+                    &table.name,
+                )?;
+                self.require_read_table_permissions(session, stmt)
             }
+            Statement::Delete { table, .. } => {
+                self.require_table_permission(
+                    session,
+                    PermissionType::Delete,
+                    table.effective_database(&session.database),
+                    &table.name,
+                )?;
+                self.require_read_table_permissions(session, stmt)
+            }
+            Statement::Select { .. } => self.require_read_table_permissions(session, stmt),
             Statement::Union { left, right, .. } => {
                 self.ensure_permissions(session, left)?;
-                self.ensure_permissions(session, right)
+                self.ensure_permissions(session, right)?;
+                self.require_read_table_permissions(session, stmt)
             }
             Statement::ShowTables { database } => self.require_database_permission(
                 session,
@@ -1330,6 +1302,24 @@ fn execute_stmt(&self, session: &mut Session, stmt: &Statement) -> Result<ExecRe
         db: &str,
     ) -> Result<()> {
         self.require_permission(session, permission, PermissionObjectType::Database, db)
+    }
+
+    /// Require SELECT on every table a statement reads beyond its primary
+    /// write/FROM grant surface: subqueries in WHERE / SET / select items,
+    /// derived tables, and join ON conditions. Runs on the full statement so
+    /// no read path — SELECT, DML, prepared, streaming — can bypass it.
+    fn require_read_table_permissions(&self, session: &Session, stmt: &Statement) -> Result<()> {
+        let mut tables = Vec::new();
+        super::query::collect_read_tables(stmt, &session.database, &mut tables);
+        for reference in tables {
+            self.require_table_permission(
+                session,
+                PermissionType::Select,
+                &reference.database,
+                &reference.table,
+            )?;
+        }
+        Ok(())
     }
 
     fn require_global_admin(&self, session: &Session) -> Result<()> {

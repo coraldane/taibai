@@ -808,50 +808,17 @@ pub fn coerce_scalar_for_dtype(value: &ScalarValue, dtype: DataType) -> Result<S
             "false" | "0" | "no" => Ok(ScalarValue::Bool(Some(false))),
             _ => Err(TaibaiError::Sql(format!("invalid bool '{}'", v))),
         },
-        (DataType::Int64, value) => value
-            .integer_i128()
-            .and_then(|v| i64::try_from(v).ok())
-            .map(|v| ScalarValue::Int64(Some(v)))
-            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to INT64", value))),
-        (DataType::Int32, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int32(Some(
-            i32::try_from(*v)
-                .map_err(|_| TaibaiError::Sql(format!("value '{}' overflows INT32", v)))?,
-        ))),
-        (DataType::Int32, value) => value
-            .integer_i128()
-            .and_then(|v| i32::try_from(v).ok())
-            .map(|v| ScalarValue::Int32(Some(v)))
-            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to INT32", value))),
-        (DataType::Int16, value) => value
-            .integer_i128()
-            .and_then(|v| i16::try_from(v).ok())
-            .map(|v| ScalarValue::Int16(Some(v)))
-            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to INT16", value))),
-        (DataType::Int8, value) => value
-            .integer_i128()
-            .and_then(|v| i8::try_from(v).ok())
-            .map(|v| ScalarValue::Int8(Some(v)))
-            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to INT8", value))),
-        (DataType::UInt64, value) => value
-            .integer_i128()
-            .and_then(|v| u64::try_from(v).ok())
-            .map(|v| ScalarValue::UInt64(Some(v)))
-            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to UINT64", value))),
-        (DataType::UInt32, value) => value
-            .integer_i128()
-            .and_then(|v| u32::try_from(v).ok())
-            .map(|v| ScalarValue::UInt32(Some(v)))
-            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to UINT32", value))),
-        (DataType::UInt16, value) => value
-            .integer_i128()
-            .and_then(|v| u16::try_from(v).ok())
-            .map(|v| ScalarValue::UInt16(Some(v)))
-            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to UINT16", value))),
-        (DataType::UInt8, value) => value
-            .integer_i128()
-            .and_then(|v| u8::try_from(v).ok())
-            .map(|v| ScalarValue::UInt8(Some(v)))
-            .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to UINT8", value))),
+        (
+            target @ (DataType::Int64
+            | DataType::Int32
+            | DataType::Int16
+            | DataType::Int8
+            | DataType::UInt64
+            | DataType::UInt32
+            | DataType::UInt16
+            | DataType::UInt8),
+            value,
+        ) => coerce_integer_scalar(value, target),
         (DataType::Float64, value) => value
             .numeric_f64()
             .map(|v| ScalarValue::Float64(Some(v)))
@@ -865,6 +832,48 @@ pub fn coerce_scalar_for_dtype(value: &ScalarValue, dtype: DataType) -> Result<S
             .map(|v| ScalarValue::VarChar(Some(v)))
             .ok_or_else(|| TaibaiError::Sql(format!("cannot cast {:?} to VARCHAR", value))),
         _ => Ok(value.clone()),
+    }
+}
+
+/// The single integer coercion ladder, shared by the predicate fast path and
+/// the constant-expression evaluator (`eval_expr_to_scalar*`): widening is
+/// exact via i128, narrowing and negative-UINT rejections carry explicit
+/// errors. Both call sites must stay on this ladder so `WHERE flag = 'yes'`
+/// and `SET flag = 'yes'` — and every integer conversion — behave
+/// identically no matter which path evaluates them.
+pub(crate) fn coerce_integer_scalar(value: &ScalarValue, target: DataType) -> Result<ScalarValue> {
+    let Some(raw) = value.integer_i128() else {
+        return Err(TaibaiError::Sql(format!(
+            "cannot cast {:?} to {}",
+            value,
+            target.display_name()
+        )));
+    };
+    macro_rules! narrowed {
+        ($t:ty, $variant:ident, $name:expr) => {
+            match <$t>::try_from(raw) {
+                Ok(v) => Ok(ScalarValue::$variant(Some(v))),
+                Err(_) if raw < 0 => Err(TaibaiError::Sql(format!(
+                    "negative value '{}' for {}",
+                    raw, $name
+                ))),
+                Err(_) => Err(TaibaiError::Sql(format!(
+                    "value '{}' overflows {}",
+                    raw, $name
+                ))),
+            }
+        };
+    }
+    match target {
+        DataType::Int64 => narrowed!(i64, Int64, "INT64"),
+        DataType::Int32 => narrowed!(i32, Int32, "INT32"),
+        DataType::Int16 => narrowed!(i16, Int16, "INT16"),
+        DataType::Int8 => narrowed!(i8, Int8, "INT8"),
+        DataType::UInt64 => narrowed!(u64, UInt64, "UINT64"),
+        DataType::UInt32 => narrowed!(u32, UInt32, "UINT32"),
+        DataType::UInt16 => narrowed!(u16, UInt16, "UINT16"),
+        DataType::UInt8 => narrowed!(u8, UInt8, "UINT8"),
+        _ => unreachable!("coerce_integer_scalar called with non-integer target"),
     }
 }
 
@@ -981,81 +990,11 @@ pub fn eval_expr_to_scalar_with_scale_timezone(
         Expr::Literal(v) if v.is_null() => Ok(ScalarValue::null_for_type(*dt)),
         Expr::Literal(v) => match (dt, v) {
             (target, value) if *target == value.data_type() => Ok(value.clone()),
-            (DataType::Bool, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Bool(Some(*v != 0))),
-            (DataType::Bool, ScalarValue::VarChar(Some(v))) => {
-                match v.to_ascii_lowercase().as_str() {
-                    "true" | "1" => Ok(ScalarValue::Bool(Some(true))),
-                    "false" | "0" => Ok(ScalarValue::Bool(Some(false))),
-                    _ => Err(TaibaiError::Sql(format!("invalid bool '{}'", v))),
-                }
-            }
-            (DataType::Int64, ScalarValue::Int32(Some(v))) => {
-                Ok(ScalarValue::Int64(Some(*v as i64)))
-            }
-            (DataType::Int32, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int32(Some(
-                i32::try_from(*v)
-                    .map_err(|_| TaibaiError::Sql(format!("value '{}' overflows INT32", v)))?,
-            ))),
-            (DataType::Int16, ScalarValue::Int64(Some(v))) => Ok(ScalarValue::Int16(Some(
-                i16::try_from(*v)
-                    .map_err(|_| TaibaiError::Sql(format!("value '{}' overflows INT16", v)))?,
-            ))),
-            (DataType::Int8, ScalarValue::Int64(Some(v))) => {
-                Ok(ScalarValue::Int8(Some(i8::try_from(*v).map_err(|_| {
-                    TaibaiError::Sql(format!("value '{}' overflows INT8", v))
-                })?)))
-            }
-            (DataType::UInt64, ScalarValue::Int64(Some(v))) => {
-                if *v < 0 {
-                    return Err(TaibaiError::Sql(format!(
-                        "negative value '{}' for UINT64",
-                        v
-                    )));
-                }
-                Ok(ScalarValue::UInt64(Some(*v as u64)))
-            }
-            (DataType::UInt32, ScalarValue::Int64(Some(v))) => {
-                if *v < 0 {
-                    return Err(TaibaiError::Sql(format!(
-                        "negative value '{}' for UINT32",
-                        v
-                    )));
-                }
-                Ok(ScalarValue::UInt32(Some(u32::try_from(*v).map_err(
-                    |_| TaibaiError::Sql(format!("value '{}' overflows UINT32", v)),
-                )?)))
-            }
-            (DataType::UInt16, ScalarValue::Int64(Some(v))) => {
-                if *v < 0 {
-                    return Err(TaibaiError::Sql(format!(
-                        "negative value '{}' for UINT16",
-                        v
-                    )));
-                }
-                Ok(ScalarValue::UInt16(Some(u16::try_from(*v).map_err(
-                    |_| TaibaiError::Sql(format!("value '{}' overflows UINT16", v)),
-                )?)))
-            }
-            (DataType::UInt8, ScalarValue::Int64(Some(v))) => {
-                if *v < 0 {
-                    return Err(TaibaiError::Sql(format!(
-                        "negative value '{}' for UINT8",
-                        v
-                    )));
-                }
-                Ok(ScalarValue::UInt8(Some(u8::try_from(*v).map_err(
-                    |_| TaibaiError::Sql(format!("value '{}' overflows UINT8", v)),
-                )?)))
-            }
-            (DataType::Float64, ScalarValue::Int64(Some(v))) => {
-                Ok(ScalarValue::Float64(Some(*v as f64)))
-            }
-            (DataType::Float32, ScalarValue::Float64(Some(v))) => {
-                Ok(ScalarValue::Float32(Some(*v as f32)))
-            }
-            (DataType::Float32, ScalarValue::Int64(Some(v))) => {
-                Ok(ScalarValue::Float32(Some(*v as f32)))
-            }
+            // Bool-from-string/int and every integer/float conversion are
+            // intentionally NOT re-implemented here: the fallback below
+            // delegates to `coerce_scalar_for_dtype`, the single ladder both
+            // evaluators share (`WHERE flag = 'yes'` and
+            // `SET flag = 'yes'` must accept the same literals).
             (DataType::Decimal, ScalarValue::Float64(Some(v))) => {
                 let multiplier = decimal_multiplier(scale)?;
                 Ok(ScalarValue::Decimal(Some(
@@ -1367,6 +1306,86 @@ pub fn change_event_budget_allows(
         );
     }
     false
+}
+
+/// Buffered change-event row images for one auto-commit DML statement:
+/// materializes selected rows out of source batches via
+/// [`RecordBatch::take_rows`], enforces the pubsub buffer budget, and
+/// accumulates the batches the statement publishes once its durable work
+/// has committed. This is the single collection path for DELETE/UPDATE
+/// events; the transactional paths defer instead (charging the transaction
+/// budget) and publish through the same pubsub chokepoint at COMMIT.
+pub(crate) struct ChangeEventBuffer {
+    what: &'static str,
+    db: String,
+    table: String,
+    buffered_bytes: usize,
+    warned: bool,
+    pub batches: Vec<RecordBatch>,
+}
+
+impl ChangeEventBuffer {
+    pub(crate) fn new(what: &'static str, db: &str, table: &str) -> Self {
+        Self {
+            what,
+            db: db.to_string(),
+            table: table.to_string(),
+            buffered_bytes: 0,
+            warned: false,
+            batches: Vec::new(),
+        }
+    }
+
+    /// Materialize `positions` out of `source` into the buffer (no-op past
+    /// the budget; build failures are logged and skipped — a failed event
+    /// batch must not fail the statement that already made the change).
+    pub(crate) fn push(&mut self, source: &RecordBatch, positions: &[u32]) {
+        if positions.is_empty() {
+            return;
+        }
+        match source.take_rows(positions) {
+            Ok(batch) => {
+                let bytes = batch.estimated_size_bytes();
+                if change_event_budget_allows(
+                    self.buffered_bytes,
+                    bytes,
+                    &mut self.warned,
+                    self.what,
+                    &self.db,
+                    &self.table,
+                ) {
+                    self.buffered_bytes += bytes;
+                    self.batches.push(batch);
+                }
+            }
+            Err(error) => tracing::warn!(
+                db = %self.db,
+                table = %self.table,
+                what = self.what,
+                error = %error,
+                "failed to build change-event batch"
+            ),
+        }
+    }
+}
+
+/// Segment-level zone-map probe: does any row group of this segment possibly
+/// match the predicate? Uses the segment-level zone maps when present, else
+/// scans per-row-group maps. `None` means no predicate — everything matches.
+/// The single copy shared by the DELETE, UPDATE, and transactional DML
+/// planners (they used to carry drifting per-module duplicates).
+pub(crate) fn segment_may_match(
+    reader: &crate::storage::segment::SegmentReader,
+    predicate: Option<&crate::storage::segment::RowGroupPredicate>,
+) -> bool {
+    let Some(predicate) = predicate else {
+        return true;
+    };
+    let segment_zone_maps = reader.segment_zone_maps();
+    if !segment_zone_maps.is_empty() {
+        return predicate.matches_row_group(segment_zone_maps);
+    }
+    (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
 }
 
 #[cfg(test)]

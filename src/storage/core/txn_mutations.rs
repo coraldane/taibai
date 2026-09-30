@@ -333,6 +333,32 @@ impl TxnMutationRegistry {
             .map(|entry| Arc::clone(&entry.positions))
     }
 
+    /// The memtable batch as this transaction sees it: earlier statements'
+    /// tombstoned rows are filtered out, and the returned position map
+    /// translates filtered-batch coordinates back to absolute positions in
+    /// the memtable's batch. The committed batch is never mutated between
+    /// statements (only tombstone positions are recorded), so every
+    /// deferred-DML consumer — DELETE planning, UPDATE planning, change
+    /// events — must read through this view or a re-match would
+    /// double-count the already-doomed rows.
+    pub fn memtable_batch_visible_to_txn(
+        &self,
+        txn_id: u64,
+        memtable: &MemTable,
+        original: &Arc<RecordBatch>,
+    ) -> crate::common::error::Result<(Arc<RecordBatch>, Option<Vec<u32>>)> {
+        match self.memtable_positions(txn_id, memtable.id()) {
+            Some(positions) if !positions.is_empty() => {
+                let keep: Vec<u32> = (0..original.num_rows() as u32)
+                    .filter(|row| !positions.contains(row))
+                    .collect();
+                let filtered = filter_batch_excluding_positions(original, &positions)?;
+                Ok((Arc::new(filtered), Some(keep)))
+            }
+            _ => Ok((Arc::clone(original), None)),
+        }
+    }
+
     /// True when any live transaction holds deferred mutations (pins) on the
     /// table: compaction and TTL must leave its segments alone.
     pub fn table_has_pins(&self, db: &str, table: &str) -> bool {

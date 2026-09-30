@@ -12,7 +12,7 @@ use crate::storage::partition::{
     parse_partition_key, partition_function::compute_partition_key_from_scalar,
 };
 use crate::storage::segment::delete_bitmap;
-use crate::storage::segment::{RangeOp, SegmentReader};
+use crate::storage::segment::RangeOp;
 use crate::storage::segment_manager::SegmentManager;
 use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
@@ -158,25 +158,14 @@ pub(crate) fn plan_delete_memtable_rows(
             continue;
         }
         // Rows this transaction already tombstoned in an earlier statement
-        // must not match again: the committed batch is unchanged between
-        // statements (only positions are recorded), so a re-match would
-        // double-count and duplicate the deferred delete events.
-        let prior_positions = engine
-            .txn_mutations()
-            .memtable_positions(reader_txn_id, memtable.id());
-        let (batch, live_positions) = match prior_positions {
-            Some(positions) if !positions.is_empty() => {
-                let keep: Vec<u32> = (0..original.num_rows() as u32)
-                    .filter(|row| !positions.contains(row))
-                    .collect();
-                let filtered =
-                    crate::storage::core::txn_mutations::filter_batch_excluding_positions(
-                        &original, &positions,
-                    )?;
-                (Arc::new(filtered), Some(keep))
-            }
-            _ => (Arc::clone(&original), None),
-        };
+        // must not match again: read through the registry's filtered view so
+        // a re-match cannot double-count and duplicate the deferred delete
+        // events.
+        let (batch, live_positions) = engine.txn_mutations().memtable_batch_visible_to_txn(
+            reader_txn_id,
+            &memtable,
+            &original,
+        )?;
         if batch.num_rows() == 0 {
             continue;
         }
@@ -1021,7 +1010,6 @@ pub fn exec_delete(
     table: &str,
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
-    username: &str,
 ) -> Result<ExecResult> {
     let (table_schema, table_meta) = {
         let catalogs = engine.catalogs().read().unwrap();
@@ -1036,26 +1024,10 @@ pub fn exec_delete(
     };
 
     if reader_txn_id > 0 {
-        return super::txn_dml::exec_delete_in_txn(
-            engine,
-            db,
-            table,
-            where_clause,
-            reader_txn_id,
-            username,
-        );
+        return super::txn_dml::exec_delete_in_txn(engine, db, table, where_clause, reader_txn_id);
     }
 
-    // An open transaction's deferred mutations pin memtable row positions and
-    // segment row ids. An auto-commit DELETE physically removes memtable rows
-    // (shifting positions) and rewrites segment footers, so its COMMIT would
-    // delete the wrong rows. Refuse instead of racing the pin.
-    if engine.txn_mutations().table_has_pins(db, table) {
-        return Err(TaibaiError::ResourceBusy(format!(
-            "table '{}.{}' is pinned by an open transaction; retry after it commits or rolls back",
-            db, table
-        )));
-    }
+    super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
 
     // Join the INSERT/REPLACE writer protocol: the probe→publish window on
     // the INSERT side is guarded by this striped lock, so row-rewriting
@@ -1069,10 +1041,12 @@ pub fn exec_delete(
         .lock()
         .unwrap();
 
-    // Resolve subqueries through the permission-gated wrapper (a bare
-    // resolve_in_subqueries here would let WHERE IN (SELECT ...) read tables
-    // the user cannot SELECT).
-    let resolved_where_clause = resolve_where_in_subqueries(engine, db, where_clause, username)?;
+    // Resolve WHERE subqueries into literals: the predicate evaluator would
+    // otherwise treat unexpanded subqueries as "match every row" and rewrite
+    // the whole table. Subquery table permissions are enforced statement-wide
+    // by the engine's permission gate before dispatch.
+    let resolved_where_clause =
+        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
 
     let target_partition_key =
         delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
@@ -1100,9 +1074,7 @@ pub fn exec_delete(
 
     let mut delete_body = || -> Result<bool> {
         // Deleted-row batches for the change feed (segments + memtables).
-        let mut deleted_row_batches: Vec<RecordBatch> = Vec::new();
-        let mut event_buffer_bytes = 0usize;
-        let mut event_budget_warned = false;
+        let mut deleted_events = super::helpers::ChangeEventBuffer::new("delete", db, table);
         // Memtable-resident rows are removed in place (no forced flush),
         // mirroring the REPLACE conflict path; durable tails are rewritten
         // so crash recovery cannot resurrect deleted rows.
@@ -1123,37 +1095,7 @@ pub fn exec_delete(
             // before the plans are consumed.
             if engine.pubsub().has_subscribers() {
                 for plan in &memtable_plans {
-                    if plan.removed_positions.is_empty() {
-                        continue;
-                    }
-                    let columns = plan
-                        .original
-                        .columns
-                        .iter()
-                        .map(|col| col.take(&plan.removed_positions))
-                        .collect();
-                    match RecordBatch::try_new(plan.original.schema.clone(), columns) {
-                        Ok(deleted) => {
-                            let bytes = deleted.estimated_size_bytes();
-                            if super::helpers::change_event_budget_allows(
-                                event_buffer_bytes,
-                                bytes,
-                                &mut event_budget_warned,
-                                "delete",
-                                db,
-                                table,
-                            ) {
-                                event_buffer_bytes += bytes;
-                                deleted_row_batches.push(deleted);
-                            }
-                        }
-                        Err(error) => tracing::warn!(
-                            db,
-                            table,
-                            error = %error,
-                            "failed to build delete-event batch for memtable rows"
-                        ),
-                    }
+                    deleted_events.push(&plan.original, &plan.removed_positions);
                 }
             }
             let undo = apply_replace_memtable_conflicts(engine, db, table, memtable_plans)?;
@@ -1204,7 +1146,7 @@ pub fn exec_delete(
                     continue;
                 }
                 if let Some(ref pred) = predicate {
-                    if !segment_may_match(&reader, pred) {
+                    if !super::helpers::segment_may_match(&reader, Some(pred)) {
                         continue;
                     }
                 }
@@ -1263,34 +1205,8 @@ pub fn exec_delete(
                                 }
                             }
                         }
-                        if publish_deletes && !deleted_rows.is_empty() {
-                            let columns = batch
-                                .columns
-                                .iter()
-                                .map(|col| col.take(&deleted_rows))
-                                .collect();
-                            match RecordBatch::try_new(batch.schema.clone(), columns) {
-                                Ok(deleted) => {
-                                    let bytes = deleted.estimated_size_bytes();
-                                    if super::helpers::change_event_budget_allows(
-                                        event_buffer_bytes,
-                                        bytes,
-                                        &mut event_budget_warned,
-                                        "delete",
-                                        db,
-                                        table,
-                                    ) {
-                                        event_buffer_bytes += bytes;
-                                        deleted_row_batches.push(deleted);
-                                    }
-                                }
-                                Err(error) => tracing::warn!(
-                                    db,
-                                    table,
-                                    error = %error,
-                                    "failed to build delete-event batch"
-                                ),
-                            }
+                        if publish_deletes {
+                            deleted_events.push(&batch, &deleted_rows);
                         }
                         row_id += batch.num_rows() as u64;
                     } else if let Some(segment_path) = segment_path_string.as_deref() {
@@ -1321,35 +1237,7 @@ pub fn exec_delete(
                                 deleted_rows.push(i as u32);
                             }
                         }
-                        if !deleted_rows.is_empty() {
-                            let columns = batch
-                                .columns
-                                .iter()
-                                .map(|col| col.take(&deleted_rows))
-                                .collect();
-                            match RecordBatch::try_new(batch.schema.clone(), columns) {
-                                Ok(deleted) => {
-                                    let bytes = deleted.estimated_size_bytes();
-                                    if super::helpers::change_event_budget_allows(
-                                        event_buffer_bytes,
-                                        bytes,
-                                        &mut event_budget_warned,
-                                        "delete",
-                                        db,
-                                        table,
-                                    ) {
-                                        event_buffer_bytes += bytes;
-                                        deleted_row_batches.push(deleted);
-                                    }
-                                }
-                                Err(error) => tracing::warn!(
-                                    db,
-                                    table,
-                                    error = %error,
-                                    "failed to build delete-event batch"
-                                ),
-                            }
-                        }
+                        deleted_events.push(&batch, &deleted_rows);
                         row_id += rg_rows;
                     } else {
                         for i in 0..rg_rows {
@@ -1432,7 +1320,7 @@ pub fn exec_delete(
         // (ALTER TABLE ADD COLUMN is metadata-only), and merging them by
         // column index would panic or mix columns.
         if publish_deletes && total_deleted > 0 {
-            for batch in deleted_row_batches {
+            for batch in deleted_events.batches {
                 engine
                     .pubsub()
                     .publish_change(crate::pubsub::ChangeKind::Delete, db, table, batch);
@@ -1453,17 +1341,10 @@ pub fn exec_delete(
     };
 
     if total_deleted > 0 {
-        if footers_rewritten > 0 {
-            // Footer rewrites changed row locations on disk, but only flush
-            // and compaction used to bump the content epoch — the persisted
-            // unique-index snapshots kept looking fresh, so a crash between
-            // a footer rewrite and the tombstone append left deleted keys
-            // "present" until the next unrelated flush, and legal re-inserts
-            // of those keys were rejected as duplicates. Bump the epoch like
-            // compaction does (memtable-only deletes never touch footers and
-            // keep skipping the bump — see the no-forced-flush invariant).
-            mgr.note_memtable_flush(db, table);
-        }
+        // Footer rewrites bump the content epoch inside the
+        // `rewrite_delete_footer` primitive itself, so the transactional
+        // COMMIT path (which rewrites the same footers) gets identical
+        // freshness without remembering to call anything.
         if !indexes_maintained {
             tracing::warn!(
                 db,
@@ -1501,176 +1382,6 @@ pub fn exec_delete(
     Ok(ExecResult::Ok {
         rows_affected: total_deleted,
     })
-}
-
-/// Resolve subqueries in a DML WHERE clause into literals. Shared with the
-/// UPDATE path, whose legacy evaluator otherwise treated unexpanded
-/// subqueries as "match every row".
-/// DML WHERE-clause subqueries execute below the statement-level permission
-/// check, so they must carry their own SELECT permission gate: without it a
-/// user with only DELETE on `t` could read any table via
-/// `DELETE FROM t WHERE id IN (SELECT secret FROM private)`.
-fn require_subquery_select_permissions(
-    engine: &Engine,
-    username: &str,
-    default_db: &str,
-    stmt: &crate::sql::parser::ast::Statement,
-) -> Result<()> {
-    use crate::storage::catalog::auth::{PermissionObjectType, PermissionType};
-    let mut tables = Vec::new();
-    collect_statement_tables(stmt, default_db, &mut tables);
-    for (db, table) in tables {
-        if !engine.auth_manager().check_permission(
-            username,
-            PermissionType::Select,
-            PermissionObjectType::Table,
-            &format!("{}.{}", db, table),
-        ) {
-            return Err(TaibaiError::Sql(format!(
-                "access denied for user '{}' to {:?} on {:?} '{}.{}' (subquery)",
-                username,
-                PermissionType::Select,
-                PermissionObjectType::Table,
-                db,
-                table
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn collect_statement_tables(
-    stmt: &crate::sql::parser::ast::Statement,
-    default_db: &str,
-    out: &mut Vec<(String, String)>,
-) {
-    use crate::sql::parser::ast::Statement;
-    match stmt {
-        Statement::Select { from, .. } => {
-            if let Some(from) = from {
-                for reference in super::query::extract_table_refs(from, default_db) {
-                    out.push((reference.database.clone(), reference.table.clone()));
-                }
-            }
-        }
-        Statement::Union { left, right, .. } => {
-            collect_statement_tables(left, default_db, out);
-            collect_statement_tables(right, default_db, out);
-        }
-        _ => {}
-    }
-}
-
-pub(super) fn resolve_where_in_subqueries(
-    engine: &Engine,
-    db: &str,
-    where_clause: &Option<Expr>,
-    username: &str,
-) -> Result<Option<Expr>> {
-    if let Some(expr) = where_clause.as_ref() {
-        require_subquery_select_permissions_for_expr(engine, username, db, expr)?;
-    }
-    resolve_in_subqueries(engine, db, where_clause)
-}
-
-/// Walk an expression tree, permission-checking every subquery statement
-/// found inside (SELECT/EXISTS/scalar).
-pub(super) fn require_subquery_select_permissions_for_expr(
-    engine: &Engine,
-    username: &str,
-    default_db: &str,
-    expr: &Expr,
-) -> Result<()> {
-    match expr {
-        Expr::Subquery(stmt) => {
-            require_subquery_select_permissions(engine, username, default_db, stmt)
-        }
-        Expr::Exists(inner) => {
-            if let Expr::Subquery(stmt) = inner.as_ref() {
-                require_subquery_select_permissions(engine, username, default_db, stmt)
-            } else {
-                require_subquery_select_permissions_for_expr(engine, username, default_db, inner)
-            }
-        }
-        Expr::UnaryNot(inner)
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner)
-        | Expr::UnaryMinus(inner) => {
-            require_subquery_select_permissions_for_expr(engine, username, default_db, inner)
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            require_subquery_select_permissions_for_expr(engine, username, default_db, left)?;
-            require_subquery_select_permissions_for_expr(engine, username, default_db, right)
-        }
-        Expr::In { expr, values, .. } => {
-            require_subquery_select_permissions_for_expr(engine, username, default_db, expr)?;
-            for value in values {
-                require_subquery_select_permissions_for_expr(engine, username, default_db, value)?;
-            }
-            Ok(())
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            require_subquery_select_permissions_for_expr(engine, username, default_db, expr)?;
-            require_subquery_select_permissions_for_expr(engine, username, default_db, low)?;
-            require_subquery_select_permissions_for_expr(engine, username, default_db, high)
-        }
-        Expr::Like { expr, pattern, .. } => {
-            require_subquery_select_permissions_for_expr(engine, username, default_db, expr)?;
-            require_subquery_select_permissions_for_expr(engine, username, default_db, pattern)
-        }
-        Expr::Function { args, .. } => {
-            for arg in args {
-                require_subquery_select_permissions_for_expr(engine, username, default_db, arg)?;
-            }
-            Ok(())
-        }
-        Expr::Case {
-            operand,
-            when_clauses,
-            else_clause,
-        } => {
-            if let Some(operand) = operand {
-                require_subquery_select_permissions_for_expr(
-                    engine, username, default_db, operand,
-                )?;
-            }
-            for (when, then) in when_clauses {
-                require_subquery_select_permissions_for_expr(engine, username, default_db, when)?;
-                require_subquery_select_permissions_for_expr(engine, username, default_db, then)?;
-            }
-            if let Some(else_expr) = else_clause {
-                require_subquery_select_permissions_for_expr(
-                    engine, username, default_db, else_expr,
-                )?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn resolve_in_subqueries(
-    engine: &Engine,
-    db: &str,
-    where_clause: &Option<Expr>,
-) -> Result<Option<Expr>> {
-    where_clause
-        .as_ref()
-        .map(|expr| super::query::resolve_expr_in_subqueries_clone(engine, db, expr))
-        .transpose()
-}
-
-pub(crate) fn segment_may_match(
-    reader: &SegmentReader,
-    predicate: &crate::storage::segment::RowGroupPredicate,
-) -> bool {
-    let segment_zone_maps = reader.segment_zone_maps();
-    if !segment_zone_maps.is_empty() {
-        return predicate.matches_row_group(segment_zone_maps);
-    }
-    (0..reader.num_row_groups()).any(|rg_idx| predicate.matches_row_group(reader.zone_maps(rg_idx)))
 }
 
 pub(crate) fn prune_segments_by_partition(

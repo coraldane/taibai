@@ -109,7 +109,7 @@ fn flush_epoch_mismatch_refreshes_snapshot_incrementally() -> Result<()> {
     // A memtable flush after the snapshot was built bumps the epoch. With
     // no segment rows beyond the watermarks, the refresh is a no-op scan
     // and the probe succeeds without a full rebuild.
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
     assert_eq!(
         manager.unique_key_locations(
             "db",
@@ -568,7 +568,7 @@ fn refresh_collapses_duplicate_memtable_placeholders_at_compaction() -> Result<(
     // compaction threshold once it has been indexed into the delta.
     let tail: Vec<i64> = (4..54).collect();
     write_value_segment(&table_dir.join("seg_00001.dat"), &tail)?;
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
     // The first refresh appends the tail to the delta without rewriting base.
     assert!(manager
         .unique_key_locations(
@@ -580,7 +580,7 @@ fn refresh_collapses_duplicate_memtable_placeholders_at_compaction() -> Result<(
         .is_some());
     // The next refresh past the threshold compacts the delta back into the
     // base snapshot, collapsing duplicate memtable placeholders per key.
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
     assert!(manager
         .unique_key_locations(
             "db",
@@ -666,7 +666,7 @@ fn stale_epoch_refresh_keeps_physical_rows_with_delete_bitmap() -> Result<()> {
     crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 2);
     crate::storage::segment::delete_bitmap::mark_deleted(&mut bitmap, 3);
     segment_mgr.rewrite_delete_footer(&seg0_path, &bitmap, 2)?;
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
 
     let locations = manager.unique_key_locations(
         "db",
@@ -733,7 +733,7 @@ fn stale_epoch_refresh_scans_only_new_segment_rows() -> Result<()> {
     // the epoch; the next probe must pick up their locations via an
     // incremental refresh.
     write_value_segment(&table_dir.join("seg_00001.dat"), &[4, 5])?;
-    segment_mgr.note_memtable_flush("db", "ticks");
+    segment_mgr.note_segments_changed("db", "ticks");
 
     let seg1 = table_dir
         .join("seg_00001.dat")

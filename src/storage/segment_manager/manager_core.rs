@@ -128,13 +128,15 @@ impl SegmentManager {
         let Some(segment) = path.file_name().and_then(|name| name.to_str()) else {
             return;
         };
-        log.enqueue(crate::storage::replication::ReplicationEvent::DeleteFooterRewrite {
-            db,
-            table,
-            segment: segment.to_string(),
-            bitmap: bitmap.to_vec(),
-            deleted_count,
-        });
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::DeleteFooterRewrite {
+                db,
+                table,
+                segment: segment.to_string(),
+                bitmap: bitmap.to_vec(),
+                deleted_count,
+            },
+        );
     }
 
     /// Emit a `SegmentsReplaced` after a compaction/UPDATE replacement commit
@@ -155,12 +157,14 @@ impl SegmentManager {
             .filter_map(|old| old.file_name().and_then(|name| name.to_str()))
             .map(str::to_string)
             .collect();
-        log.enqueue(crate::storage::replication::ReplicationEvent::SegmentsReplaced {
-            db,
-            table,
-            new_segments: vec![new_name.to_string()],
-            retired,
-        });
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::SegmentsReplaced {
+                db,
+                table,
+                new_segments: vec![new_name.to_string()],
+                retired,
+            },
+        );
     }
 
     /// Emit a `SegmentsRemoved` for a TTL/DROP purge batch (db/table derived
@@ -182,11 +186,13 @@ impl SegmentManager {
         else {
             return;
         };
-        log.enqueue(crate::storage::replication::ReplicationEvent::SegmentsRemoved {
-            db: db.to_string(),
-            table: table.to_string(),
-            segments: segments.to_vec(),
-        });
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::SegmentsRemoved {
+                db: db.to_string(),
+                table: table.to_string(),
+                segments: segments.to_vec(),
+            },
+        );
     }
 
     /// Current active segment file name for `(db, table, partition)`.
@@ -218,21 +224,29 @@ impl SegmentManager {
             return;
         };
         let (segment, kind) = match new_segment {
-            Some(name) => (name.to_string(), crate::storage::replication::SegmentUpdateKind::Final),
+            Some(name) => (
+                name.to_string(),
+                crate::storage::replication::SegmentUpdateKind::Final,
+            ),
             None => {
                 let Some(segment) = self.active_segment_name_for(db, table, partition_key) else {
                     return;
                 };
-                (segment, crate::storage::replication::SegmentUpdateKind::Prefix)
+                (
+                    segment,
+                    crate::storage::replication::SegmentUpdateKind::Prefix,
+                )
             }
         };
-        log.enqueue(crate::storage::replication::ReplicationEvent::SegmentUpdate {
-            db: db.to_string(),
-            table: table.to_string(),
-            segment,
-            kind,
-            memtable_ids,
-        });
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::SegmentUpdate {
+                db: db.to_string(),
+                table: table.to_string(),
+                segment,
+                kind,
+                memtable_ids,
+            },
+        );
     }
 
     /// Emit a `Final` update for a just-sealed active segment, deriving
@@ -257,13 +271,15 @@ impl SegmentManager {
         ) else {
             return;
         };
-        log.enqueue(crate::storage::replication::ReplicationEvent::SegmentUpdate {
-            db: db.to_string(),
-            table: table.to_string(),
-            segment: name.to_string(),
-            kind: crate::storage::replication::SegmentUpdateKind::Final,
-            memtable_ids: Vec::new(),
-        });
+        log.enqueue(
+            crate::storage::replication::ReplicationEvent::SegmentUpdate {
+                db: db.to_string(),
+                table: table.to_string(),
+                segment: name.to_string(),
+                kind: crate::storage::replication::SegmentUpdateKind::Final,
+                memtable_ids: Vec::new(),
+            },
+        );
     }
 
     /// Wire the pub/sub hub once at engine startup. Deferred bulk/RELAXED
@@ -393,11 +409,14 @@ impl SegmentManager {
     }
 
     fn flush_epoch_file_path(&self, db: &str, table: &str) -> PathBuf {
-        self.data_dir.join("meta").join("flush_epochs").join(format!(
-            "{}--{}.epoch",
-            sanitize_component(db),
-            sanitize_component(table)
-        ))
+        self.data_dir
+            .join("meta")
+            .join("flush_epochs")
+            .join(format!(
+                "{}--{}.epoch",
+                sanitize_component(db),
+                sanitize_component(table)
+            ))
     }
 
     /// Current memtable-flush epoch for a table. Lazily restored from the
@@ -412,19 +431,13 @@ impl SegmentManager {
         epoch
     }
 
-    /// Bump the segment-content epoch: rows were appended directly to
-    /// segments outside the memtable flush pipeline (bulk/direct writes).
-    /// Unique index snapshots stamped with the previous epoch are
-    /// potentially incomplete and must be refreshed before probing.
-    pub fn note_direct_segment_append(&self, db: &str, table: &str) {
-        self.note_memtable_flush(db, table)
-    }
-
     /// Bump the segment-content epoch: rows reached segments for this table
-    /// (memtable flush or direct append). Unique index snapshots stamped with
-    /// the previous epoch are potentially incomplete and must be refreshed
-    /// before probing.
-    pub fn note_memtable_flush(&self, db: &str, table: &str) {
+    /// outside a primitive that already bumps (`replace_segments_with_tmp`
+    /// and `rewrite_delete_footer` bump on their own; direct appends, flush
+    /// installs, and removal-only paths do not). Unique index snapshots
+    /// stamped with the previous epoch are potentially incomplete and must
+    /// be refreshed before probing.
+    pub fn note_segments_changed(&self, db: &str, table: &str) {
         let key = table_key(db, table);
         let path = self.flush_epoch_file_path(db, table);
         let mut epochs = self.flush_epochs.write().unwrap();
@@ -452,6 +465,49 @@ impl SegmentManager {
             }
         }
         epochs.insert(key, next);
+    }
+
+    /// Bump the content epoch for the table owning `path`, derived from the
+    /// `<data_dir>/<db>/<table>/` layout. Used by the segment-change
+    /// primitives so every content change bumps exactly where it lands; a
+    /// path outside a table dir (scratch files) logs and skips.
+    fn bump_flush_epoch_for_segment(&self, path: &Path) {
+        let Some(table_dir) = path.parent() else {
+            return;
+        };
+        let (db, table) = match self.db_table_for_segment_path(table_dir) {
+            Ok(names) => names,
+            Err(error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %error,
+                    "cannot resolve table for content-epoch bump"
+                );
+                return;
+            }
+        };
+        self.note_segments_changed(&db, &table);
+    }
+
+    fn db_table_for_segment_path(&self, table_dir: &Path) -> Result<(String, String)> {
+        let relative = table_dir.strip_prefix(&self.data_dir).map_err(|_| {
+            TaibaiError::Storage(format!(
+                "table dir '{}' is outside data dir '{}'",
+                table_dir.display(),
+                self.data_dir.display()
+            ))
+        })?;
+        let mut components = relative.components();
+        let db = components
+            .next()
+            .ok_or_else(|| TaibaiError::Storage("table dir is missing database name".into()))?;
+        let table = components
+            .next()
+            .ok_or_else(|| TaibaiError::Storage("table dir is missing table name".into()))?;
+        Ok((
+            db.as_os_str().to_string_lossy().into_owned(),
+            table.as_os_str().to_string_lossy().into_owned(),
+        ))
     }
 
     /// Run `f` while holding the table's flush-visibility read lock. Scan and
@@ -528,9 +584,7 @@ impl SegmentManager {
         let override_level = tables
             .get(&key)
             .and_then(|state| state.compression_level_override());
-        Ok(crate::storage::segment_manager::config::resolve_compression_level(
-            override_level,
-        ))
+        Ok(crate::storage::segment_manager::config::resolve_compression_level(override_level))
     }
 
     fn table_state_key_from_dir(&self, table_dir: &Path) -> Result<String> {
@@ -866,7 +920,6 @@ impl SegmentManager {
         Ok(())
     }
 
-
     pub fn replace_segments_with_tmp(
         &self,
         tmp_path: &Path,
@@ -925,6 +978,10 @@ impl SegmentManager {
 
         remove_sidecar_meta(tmp_path)?;
         let _ = self.open_reader_cached(final_path);
+        // The replacement changed this table's on-disk content: bump the
+        // epoch here so no caller can forget (persisted unique-index
+        // snapshots pointing at the old segments must refresh).
+        self.bump_flush_epoch_for_segment(final_path);
         self.emit_segments_replaced(final_path, old_segments);
         Ok(())
     }
@@ -937,6 +994,11 @@ impl SegmentManager {
     ) -> Result<()> {
         let result = self.rewrite_delete_footer_inner(path, bitmap, deleted_count);
         if result.is_ok() {
+            // Deleted rows changed this segment's visible content: bump the
+            // epoch here so no caller can forget (a crash between the
+            // rewrite and any later tombstone append left deleted keys
+            // "present" in stale unique-index snapshots).
+            self.bump_flush_epoch_for_segment(path);
             self.emit_delete_footer_rewrite(path, bitmap, deleted_count);
         }
         result
@@ -1192,11 +1254,10 @@ impl SegmentManager {
     ) -> Result<Option<T>> {
         let key = table_key(db, table);
         let state = self.get_or_create_state(&key);
-        let _mutation_guard =
-            match try_lock_or_none(&state.mutation_lock, "table mutation lock") {
-                Some(guard) => guard,
-                None => return Ok(None),
-            };
+        let _mutation_guard = match try_lock_or_none(&state.mutation_lock, "table mutation lock") {
+            Some(guard) => guard,
+            None => return Ok(None),
+        };
         let registry = match state.partition_locks.try_write() {
             Ok(registry) => registry,
             Err(_) => return Ok(None),
@@ -1240,11 +1301,11 @@ impl SegmentManager {
         let mut registries = Vec::with_capacity(states.len());
         let mut partition_arc_sets = Vec::with_capacity(states.len());
         for (_key, state) in keys.iter().zip(states.iter()) {
-            let mutation_guard =
-                match try_lock_or_none(&state.mutation_lock, "table mutation lock") {
-                    Some(guard) => guard,
-                    None => return Ok(None),
-                };
+            let mutation_guard = match try_lock_or_none(&state.mutation_lock, "table mutation lock")
+            {
+                Some(guard) => guard,
+                None => return Ok(None),
+            };
             let registry = match state.partition_locks.try_write() {
                 Ok(registry) => registry,
                 Err(_) => return Ok(None),
@@ -1471,7 +1532,10 @@ impl Drop for DatabaseGatesReset {
 /// before running `f` (the gate flag freezes new partitions instead),
 /// while the try variants keep it held through `f`.
 fn sorted_partition_locks(
-    registry: &std::sync::RwLockWriteGuard<'_, std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>>,
+    registry: &std::sync::RwLockWriteGuard<
+        '_,
+        std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>,
+    >,
 ) -> (Vec<String>, Vec<Arc<std::sync::Mutex<()>>>) {
     let mut partition_keys: Vec<String> = registry.keys().cloned().collect();
     partition_keys.sort();
@@ -1558,7 +1622,10 @@ fn acquire_partition_lock_for_wide_gate<'a>(
             Ok(guard) => return Ok(guard),
             Err(std::sync::TryLockError::WouldBlock) => {}
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                panic!("partition mutation lock poisoned on {} partition {}: {}", key, partition_key, poisoned)
+                panic!(
+                    "partition mutation lock poisoned on {} partition {}: {}",
+                    key, partition_key, poisoned
+                )
             }
         }
         if start.elapsed() >= timeout {
@@ -1656,115 +1723,144 @@ fn acquire_partition_mutation_lock<'a>(
 const REPLACE_JOURNAL_MAGIC: &[u8; 8] = b"TBREPJ01";
 
 pub(crate) fn replace_journal_path(final_path: &Path) -> PathBuf {
-let mut name = final_path.as_os_str().to_os_string();
-name.push(".replace");
-PathBuf::from(name)
+    let mut name = final_path.as_os_str().to_os_string();
+    name.push(".replace");
+    PathBuf::from(name)
 }
 
 pub(crate) fn write_replace_journal(journal: &Path, old_segments: &[PathBuf]) -> Result<()> {
-let mut body = Vec::new();
-body.extend_from_slice(&(old_segments.len() as u32).to_le_bytes());
-for old in old_segments {
-    let text = old.to_string_lossy();
-    body.extend_from_slice(&(text.len() as u32).to_le_bytes());
-    body.extend_from_slice(text.as_bytes());
-}
-let mut hasher = crc32fast::Hasher::new();
-hasher.update(&body);
-let crc = hasher.finalize();
+    let mut body = Vec::new();
+    body.extend_from_slice(&(old_segments.len() as u32).to_le_bytes());
+    for old in old_segments {
+        let text = old.to_string_lossy();
+        body.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        body.extend_from_slice(text.as_bytes());
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&body);
+    let crc = hasher.finalize();
 
-let tmp = {
-    let mut name = journal.as_os_str().to_os_string();
-    name.push(".tmp");
-    PathBuf::from(name)
-};
-let mut file = std::fs::OpenOptions::new()
-    .write(true)
-    .create(true)
-    .truncate(true)
-    .open(&tmp)?;
-use std::io::Write as _;
-file.write_all(REPLACE_JOURNAL_MAGIC)?;
-file.write_all(&body)?;
-file.write_all(&crc.to_le_bytes())?;
-file.sync_all()?;
-drop(file);
-std::fs::rename(&tmp, journal)?;
-Ok(())
+    let tmp = {
+        let mut name = journal.as_os_str().to_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    use std::io::Write as _;
+    file.write_all(REPLACE_JOURNAL_MAGIC)?;
+    file.write_all(&body)?;
+    file.write_all(&crc.to_le_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, journal)?;
+    Ok(())
 }
 
 /// Finish or discard interrupted segment replacements at startup. With the
 /// final segment present the rename had committed, so the retirement of the
 /// listed old segments is completed; without it the rename never happened.
 pub(crate) fn recover_replace_journals(table_dir: &Path) {
-let Ok(entries) = std::fs::read_dir(table_dir) else {
-    return;
-};
-for entry in entries.flatten() {
-    let path = entry.path();
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        continue;
+    let Ok(entries) = std::fs::read_dir(table_dir) else {
+        return;
     };
-    let Some(final_name) = name.strip_suffix(".replace") else {
-        continue;
-    };
-    let final_path = table_dir.join(final_name);
-    let Some(olds) = read_replace_journal(&path) else {
-        let _ = std::fs::remove_file(&path);
-        continue;
-    };
-    if final_path.exists() {
-        for old in &olds {
-            if old != &final_path && old.exists() {
-                tracing::warn!(
-                    old_segment = %old.display(),
-                    "startup recovery: retiring old segment left by interrupted replacement"
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(final_name) = name.strip_suffix(".replace") else {
+            continue;
+        };
+        let final_path = table_dir.join(final_name);
+        let Some(olds) = read_replace_journal(&path) else {
+            if final_path.exists() {
+                // The journal is written BEFORE the rename, so a journal whose
+                // final segment exists means the replacement committed — but an
+                // unreadable journal (torn write / CRC mismatch) leaves the old
+                // segments it listed unretirable. Deleting the journal here
+                // would turn a crash-window double-count into a permanent,
+                // silent one: preserve it for inspection and keep alarming at
+                // every startup instead.
+                let corrupt = path.with_extension("replace.corrupt");
+                let preserved = std::fs::rename(&path, &corrupt).is_ok();
+                if !preserved {
+                    let _ = std::fs::remove_file(&path);
+                }
+                tracing::error!(
+                    journal = %path.display(),
+                    preserved_as = %corrupt.display(),
+                    preserved,
+                    final_segment = %final_path.display(),
+                    "replace journal is unreadable but the replacement had committed; the old \
+                     segments it listed cannot be retired automatically and scans may double-count \
+                     their rows until they are removed manually"
                 );
-                let _ = std::fs::remove_file(old);
-                let _ = remove_sidecar_meta(old);
+            } else {
+                // No final segment: the rename never committed, so discarding
+                // the journal loses nothing.
+                tracing::debug!(
+                    journal = %path.display(),
+                    "discarding journal of a replacement whose rename never committed"
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        };
+        if final_path.exists() {
+            for old in &olds {
+                if old != &final_path && old.exists() {
+                    tracing::warn!(
+                        old_segment = %old.display(),
+                        "startup recovery: retiring old segment left by interrupted replacement"
+                    );
+                    let _ = std::fs::remove_file(old);
+                    let _ = remove_sidecar_meta(old);
+                }
             }
         }
+        let _ = std::fs::remove_file(&path);
     }
-    let _ = std::fs::remove_file(&path);
-}
 }
 
 fn read_replace_journal(journal: &Path) -> Option<Vec<PathBuf>> {
-let bytes = std::fs::read(journal).ok()?;
-if bytes.len() < 8 + 4 + 4 || !bytes.starts_with(REPLACE_JOURNAL_MAGIC) {
-    return None;
-}
-let body = &bytes[8..bytes.len() - 4];
-let crc = u32::from_le_bytes(
-    bytes[bytes.len() - 4..]
-        .try_into()
-        .expect("crc slice has fixed length"),
-);
-let mut hasher = crc32fast::Hasher::new();
-hasher.update(body);
-if hasher.finalize() != crc {
-    return None;
-}
-let count = u32::from_le_bytes(body[0..4].try_into().expect("u32 slice")) as usize;
-let mut olds = Vec::with_capacity(count.min(4096));
-let mut pos = 4usize;
-for _ in 0..count {
-    if pos + 4 > body.len() {
+    let bytes = std::fs::read(journal).ok()?;
+    if bytes.len() < 8 + 4 + 4 || !bytes.starts_with(REPLACE_JOURNAL_MAGIC) {
         return None;
     }
-    let len = u32::from_le_bytes(body[pos..pos + 4].try_into().expect("u32 slice")) as usize;
-    pos += 4;
-    if pos + len > body.len() {
+    let body = &bytes[8..bytes.len() - 4];
+    let crc = u32::from_le_bytes(
+        bytes[bytes.len() - 4..]
+            .try_into()
+            .expect("crc slice has fixed length"),
+    );
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(body);
+    if hasher.finalize() != crc {
         return None;
     }
-    olds.push(PathBuf::from(
-        String::from_utf8_lossy(&body[pos..pos + len]).into_owned(),
-    ));
-    pos += len;
+    let count = u32::from_le_bytes(body[0..4].try_into().expect("u32 slice")) as usize;
+    let mut olds = Vec::with_capacity(count.min(4096));
+    let mut pos = 4usize;
+    for _ in 0..count {
+        if pos + 4 > body.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(body[pos..pos + 4].try_into().expect("u32 slice")) as usize;
+        pos += 4;
+        if pos + len > body.len() {
+            return None;
+        }
+        olds.push(PathBuf::from(
+            String::from_utf8_lossy(&body[pos..pos + len]).into_owned(),
+        ));
+        pos += len;
+    }
+    Some(olds)
 }
-Some(olds)
-}
-
 
 /// Test-only re-exports of the replacement journal internals.
 #[cfg(test)]

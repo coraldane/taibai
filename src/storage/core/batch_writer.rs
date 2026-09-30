@@ -108,6 +108,42 @@ impl Default for BatchWriterConfig {
     }
 }
 
+/// Failure cleanup for a frozen flush group. Held across the fallible steps
+/// of a flush, it accumulates the begun tail intents and, on drop — any `?`,
+/// early return, or panic — cancels the intents and returns still-`Flushing`
+/// members to `Pending`. Success paths either [`FlushGroupGuard::take_intents`]
+/// (handing them to `finish_flush_batch`) or have already `mark_flushed` the
+/// members, which makes the restore a no-op. This replaces the hand-written
+/// cancel+restore pair that every failure exit used to need: one forgotten
+/// copy left a memtable stuck in `Flushing` — unflushable and unrestorable —
+/// until recovery.
+struct FlushGroupGuard {
+    memtables: Vec<Arc<crate::storage::core::memtable::MemTable>>,
+    intents: Vec<crate::storage::core::durable_tail::FlushIntent>,
+}
+
+impl FlushGroupGuard {
+    fn new<'m>(
+        memtables: impl IntoIterator<Item = &'m Arc<crate::storage::core::memtable::MemTable>>,
+    ) -> Self {
+        Self {
+            memtables: memtables.into_iter().cloned().collect(),
+            intents: Vec::new(),
+        }
+    }
+
+    fn take_intents(&mut self) -> Vec<crate::storage::core::durable_tail::FlushIntent> {
+        std::mem::take(&mut self.intents)
+    }
+}
+
+impl Drop for FlushGroupGuard {
+    fn drop(&mut self) {
+        BatchWriter::cancel_flush_intents(self.intents.drain(..));
+        BatchWriter::restore_flushing_to_pending(self.memtables.iter());
+    }
+}
+
 pub struct BatchWriter {
     config: BatchWriterConfig,
     memtable_mgr: Arc<MemTableManager>,
@@ -1357,6 +1393,9 @@ impl BatchWriter {
         let partition_key = mt.partition_key().to_string();
         let txn_id = mt.txn_id();
         let table_dir = segment_mgr.table_dir(&db, &table);
+        // Every fallible step below (including the barrier) restores the
+        // frozen memtable on the way out.
+        let _guard = FlushGroupGuard::new(std::iter::once(mt));
         let barrier_start = std::time::Instant::now();
         tail_committer.barrier(&table_dir)?;
         let barrier_ms = barrier_start.elapsed().as_millis() as u64;
@@ -1393,7 +1432,6 @@ impl BatchWriter {
         let wrote = match flush_result {
             Ok(wrote) => wrote,
             Err(e) => {
-                Self::restore_flushing_to_pending(std::iter::once(mt));
                 return Err(e);
             }
         };
@@ -1483,7 +1521,7 @@ impl BatchWriter {
             Self::flush_frozen_memtable_group(segment_mgr, &frozen, tail_committer)
         })();
         if result.is_ok() && had_rows {
-            segment_mgr.note_memtable_flush(&db, &table);
+            segment_mgr.note_segments_changed(&db, &table);
         }
         result
     }
@@ -1533,6 +1571,10 @@ impl BatchWriter {
         let partition_key = frozen[0].0.partition_key().to_string();
         let txn_id = frozen[0].0.txn_id();
         let table_dir = segment_mgr.table_dir(&db, &table);
+        // Every fallible step below (barrier, tail probing, merging, the
+        // protocol-specific flushes) restores the frozen members on the way
+        // out.
+        let _guard = FlushGroupGuard::new(frozen.iter().map(|(mt, _)| mt));
         tail_committer.barrier(&table_dir)?;
 
         let ids = frozen.iter().map(|(mt, _)| mt.id()).collect::<Vec<_>>();
@@ -1588,7 +1630,6 @@ impl BatchWriter {
         let wrote = match flush_result {
             Ok(wrote) => wrote,
             Err(e) => {
-                Self::restore_flushing_to_pending(frozen.iter().map(|(mt, _)| mt));
                 return Err(e);
             }
         };
@@ -1696,6 +1737,7 @@ impl BatchWriter {
         txn_id: u64,
         table_dir: &std::path::Path,
     ) -> Result<()> {
+        let mut guard = FlushGroupGuard::new(locked.iter().map(|(mt, _)| mt));
         let watermark = segment_mgr.durable_active_segment_watermark_under_table_lock(
             db,
             table,
@@ -1716,7 +1758,6 @@ impl BatchWriter {
             );
         };
         let base_rows = expected_total_rows - merged.num_rows() as u64;
-        let mut intents = Vec::with_capacity(locked.len());
         let mut cumulative = 0u64;
         for (mt, batch) in locked {
             cumulative += batch.num_rows() as u64;
@@ -1726,10 +1767,8 @@ impl BatchWriter {
                 &segment_file_name,
                 base_rows + cumulative,
             ) {
-                Ok(intent) => intents.push(intent),
+                Ok(intent) => guard.intents.push(intent),
                 Err(error) => {
-                    Self::cancel_flush_intents(intents);
-                    Self::restore_flushing_to_pending(locked.iter().map(|(mt, _)| mt));
                     return Err(error);
                 }
             }
@@ -1750,20 +1789,17 @@ impl BatchWriter {
         let wrote = match flush_result {
             Ok(wrote) => wrote,
             Err(error) => {
-                Self::cancel_flush_intents(intents);
-                Self::restore_flushing_to_pending(locked.iter().map(|(mt, _)| mt));
                 return Err(error);
             }
         };
         if !wrote {
             // A concurrent winner already carried these rows; drop the
-            // copies and the intents.
+            // copies and the intents (the guard's drop cancels them).
             Self::mark_flushed(locked.iter().map(|(mt, _)| mt));
-            Self::cancel_flush_intents(intents);
             return Ok(());
         }
         if let Err(error) =
-            crate::storage::core::durable_tail::finish_flush_batch(table_dir, intents)
+            crate::storage::core::durable_tail::finish_flush_batch(table_dir, guard.take_intents())
         {
             tracing::warn!(
                 db,
@@ -1821,7 +1857,7 @@ impl BatchWriter {
                 TaibaiError::Storage("durable tail segment path has no file name".into())
             })?
             .to_string();
-        let mut intents = Vec::with_capacity(locked.len());
+        let mut guard = FlushGroupGuard::new(locked.iter().map(|(mt, _)| mt));
         let mut cumulative = 0u64;
         for (mt, batch) in locked {
             cumulative += batch.num_rows() as u64;
@@ -1831,10 +1867,8 @@ impl BatchWriter {
                 &segment_file_name,
                 cumulative,
             ) {
-                Ok(intent) => intents.push(intent),
+                Ok(intent) => guard.intents.push(intent),
                 Err(error) => {
-                    Self::cancel_flush_intents(intents);
-                    Self::restore_flushing_to_pending(locked.iter().map(|(mt, _)| mt));
                     return Err(error);
                 }
             }
@@ -1851,8 +1885,6 @@ impl BatchWriter {
         if let Err(error) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
             let _ = remove_sidecar_meta(&tmp_path);
-            Self::cancel_flush_intents(intents);
-            Self::restore_flushing_to_pending(locked.iter().map(|(mt, _)| mt));
             return Err(error);
         }
 
@@ -1867,12 +1899,10 @@ impl BatchWriter {
         if let Err(error) = transition_result {
             let _ = std::fs::remove_file(&tmp_path);
             let _ = remove_sidecar_meta(&tmp_path);
-            Self::cancel_flush_intents(intents);
-            Self::restore_flushing_to_pending(locked.iter().map(|(mt, _)| mt));
             return Err(error);
         }
         if let Err(error) =
-            crate::storage::core::durable_tail::finish_flush_batch(table_dir, intents)
+            crate::storage::core::durable_tail::finish_flush_batch(table_dir, guard.take_intents())
         {
             tracing::warn!(
                 db,

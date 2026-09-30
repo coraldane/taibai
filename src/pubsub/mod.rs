@@ -304,13 +304,21 @@ impl PubSubHub {
     /// channel is full the event is dropped and counted, matching NATS
     /// at-most-once semantics. Sequence continuity lets subscribers detect
     /// the gap and re-sync with a query.
+    ///
+    /// Insert-specific: the event is mirrored into the reliable-subscription
+    /// retention log (before the subscriber check) so a reconnecting V2
+    /// subscriber replays committed inserts. Delete/Update events go through
+    /// [`Self::publish_change`] and are not retained — those paths keep no
+    /// pre-statement row images to mirror; re-sync runs a query instead.
     pub fn publish(&self, db: &str, table: &str, batch: RecordBatch) {
         self.publish_shared(db, table, Arc::new(batch));
     }
 
     /// Publish a non-insert change event (deleted rows / post-update rows).
     /// Payload layout matches insert notifications; only the message type
-    /// differs so existing subscribers can distinguish the kind.
+    /// differs so existing subscribers can distinguish the kind. Unlike
+    /// [`Self::publish`], no retention-log mirror: see there for why the
+    /// asymmetry is intentional, not an oversight to unify away.
     pub fn publish_change(&self, kind: ChangeKind, db: &str, table: &str, batch: RecordBatch) {
         if !self.has_subscribers() || batch.num_rows() == 0 {
             return;

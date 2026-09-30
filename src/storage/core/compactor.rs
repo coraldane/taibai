@@ -170,7 +170,11 @@ fn compaction_inputs_unchanged(
 /// rewrite strategy must physically drop exactly the same rows to keep
 /// compaction output in sync with query visibility.
 #[inline]
-fn ttl_row_visible(value: &crate::types::scalar::ScalarValue, duration_us: i64, now_us: i64) -> bool {
+fn ttl_row_visible(
+    value: &crate::types::scalar::ScalarValue,
+    duration_us: i64,
+    now_us: i64,
+) -> bool {
     matches!(
         value,
         crate::types::scalar::ScalarValue::Timestamp(Some(ts))
@@ -1024,7 +1028,9 @@ impl Compactor {
                 // segments. Bump the content epoch so every probe refreshes
                 // (or falls back) instead of trusting locations that no longer
                 // exist — including after a crash before the caller's rebuild.
-                self.segment_mgr.note_memtable_flush(db, table);
+                // (Removal-only: no replace primitive runs here, so the bump
+                // cannot be sunk into one.)
+                self.segment_mgr.note_segments_changed(db, table);
                 tracing::info!(
                     db,
                     table,
@@ -1108,12 +1114,11 @@ impl Compactor {
                     &final_path,
                     &segment_files,
                 )?;
-                // Same epoch bump as the AllDropped arm: the replacement no
-                // longer contains the rows the persisted unique-index
-                // snapshots point at, and their recorded watermarks are
-                // meaningless against the merged segment. The epoch bump
-                // forces every probe to refresh until the caller rebuilds.
-                self.segment_mgr.note_memtable_flush(db, table);
+                // The replacement no longer contains the rows the persisted
+                // unique-index snapshots point at, and their recorded
+                // watermarks are meaningless against the merged segment.
+                // `replace_segments_with_tmp` bumps the content epoch itself,
+                // so every probe refreshes until the caller rebuilds.
 
                 tracing::info!(
                     db,

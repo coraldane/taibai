@@ -158,25 +158,14 @@ impl Handler {
         }
         let txn_id = session.active_txn_id();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let discarded_dml = crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(
-                &self.engine,
-                txn_id,
-            );
-            let rolled_back = self.engine.batch_writer().rollback_txn(txn_id)?;
-            self.engine
-                .index_manager()
-                .discard_txn_published_entries_at_rollback(txn_id);
-            Ok::<u64, TaibaiError>(rolled_back + discarded_dml)
+            self.engine.rollback_session_txn(session)
         }));
         match outcome {
-            Ok(Ok(rows)) => {
-                session.rollback_txn();
-                tracing::info!(
-                    txn_id,
-                    rows_rolled_back = rows,
-                    "open transaction rolled back on disconnect"
-                );
-            }
+            Ok(Ok(rows)) => tracing::info!(
+                txn_id,
+                rows_rolled_back = rows,
+                "open transaction rolled back on disconnect"
+            ),
             Ok(Err(error)) => tracing::warn!(
                 txn_id,
                 error = %error,
@@ -1266,18 +1255,8 @@ impl Handler {
         if !session.in_txn() {
             return Ok(vec![build_error("no active transaction")]);
         }
-        let txn_id = session.active_txn_id();
-        // Same cleanup order as the SQL-text path (engine/core.rs): deferred
-        // DML plans first, then the batch-writer rollback, then the unique/PK
-        // index entries the transaction published at statement time.
-        let discarded_dml =
-            crate::sql::execution::txn_dml::discard_txn_mutations_at_rollback(&self.engine, txn_id);
-        let rolled_back = self.engine.batch_writer().rollback_txn(txn_id)?;
-        self.engine
-            .index_manager()
-            .discard_txn_published_entries_at_rollback(txn_id);
-        session.rollback_txn();
-        Ok(vec![build_ok(rolled_back + discarded_dml)])
+        let rows = self.engine.rollback_session_txn(session)?;
+        Ok(vec![build_ok(rows)])
     }
 
     fn handle_cursor_open(&mut self, payload: &[u8]) -> Result<Vec<Message>> {
@@ -1312,10 +1291,12 @@ impl Handler {
         object_type: PermissionObjectType,
         object: &str,
     ) -> std::result::Result<(), Vec<Message>> {
-        if engine
-            .auth_manager()
-            .check_permission(username, PermissionType::Subscribe, object_type, object)
-        {
+        if engine.auth_manager().check_permission(
+            username,
+            PermissionType::Subscribe,
+            object_type,
+            object,
+        ) {
             Ok(())
         } else {
             tracing::warn!(

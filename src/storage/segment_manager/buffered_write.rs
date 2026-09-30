@@ -1,19 +1,9 @@
 impl SegmentManager {
-    pub fn bulk_insert_batch(
-        &self,
-        db: &str,
-        table: &str,
-        batch: RecordBatch,
-    ) -> Result<u64> {
+    pub fn bulk_insert_batch(&self, db: &str, table: &str, batch: RecordBatch) -> Result<u64> {
         self.bulk_insert_batch_with_partition_owned_inner(db, table, "", batch, true, false)
     }
 
-    pub fn bulk_insert_batch_ref(
-        &self,
-        db: &str,
-        table: &str,
-        batch: &RecordBatch,
-    ) -> Result<u64> {
+    pub fn bulk_insert_batch_ref(&self, db: &str, table: &str, batch: &RecordBatch) -> Result<u64> {
         self.bulk_insert_batch_with_partition_inner(db, table, "", batch, true, false)
     }
 
@@ -64,7 +54,7 @@ impl SegmentManager {
             flush_immediately,
             pubsub_deferred,
         )?;
-        self.note_direct_segment_append(db, table);
+        self.note_segments_changed(db, table);
         Ok(row_count)
     }
 
@@ -99,7 +89,7 @@ impl SegmentManager {
             pubsub_deferred,
         )?;
 
-        self.note_direct_segment_append(db, table);
+        self.note_segments_changed(db, table);
         Ok(row_count)
     }
 
@@ -192,9 +182,7 @@ impl SegmentManager {
         path.file_name()
             .and_then(|name| name.to_str())
             .map(str::to_string)
-            .ok_or_else(|| {
-                TaibaiError::Storage("active segment path has no file name".into())
-            })
+            .ok_or_else(|| TaibaiError::Storage("active segment path has no file name".into()))
     }
 
     #[allow(clippy::too_many_arguments)]

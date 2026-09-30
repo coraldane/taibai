@@ -576,7 +576,17 @@ fn scattered_inserts_materialize_only_at_row_group_target() {
     let segments =
         SegmentManager::discover_segments(&table_dir).expect("discover materialized segments");
     assert_eq!(segments.len(), 1);
-    let tails = durable_tail::recover(&table_dir, &schema).expect("recover partial durable tail");
+    // The scattered row's durable-tail frame is written by the background
+    // flush, not synchronously by the INSERT — poll for it instead of
+    // racing the flush (this read used to flake under load).
+    let tails = loop {
+        let tails =
+            durable_tail::recover(&table_dir, &schema).expect("recover partial durable tail");
+        if !tails.is_empty() || std::time::Instant::now() >= deadline {
+            break tails;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(tails.len(), 1);
     assert_eq!(tails[0].batch.num_rows(), 1);
     assert_eq!(
