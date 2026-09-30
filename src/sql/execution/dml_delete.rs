@@ -18,10 +18,7 @@ use crate::types::batch::{RecordBatch, Schema};
 use crate::types::scalar::ScalarValue;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{
-    build_row_group_predicate, collect_expr_column_indices, eval_expr_to_scalar,
-    eval_where_clause_batch,
-};
+use super::helpers::{eval_expr_to_scalar, eval_where_clause_batch};
 use super::scan::cluster_prune;
 use super::scan::row_filter::ClusterKeyBounds;
 use crate::sql::parser::ast::{BinOp, Expr};
@@ -126,6 +123,157 @@ pub(crate) fn plan_replace_memtable_conflicts(
 /// Scan the table's committed, non-transactional pending memtables for rows
 /// matching the DELETE predicate. Reuses the REPLACE two-phase plan/apply
 /// machinery so the physical removal and durable-tail rewrite are identical.
+/// The single walk over a table's visible memtables shared by the DELETE
+/// planner, auto-commit UPDATE, and transactional UPDATE: memtables visible
+/// to the statement's transaction, optionally narrowed to one partition,
+/// each yielded with
+/// - its original snapshot (positions in plans, tombstone registrations and
+///   events are absolute against this batch), and
+/// - the registry's transaction-tombstone view of it (`live_positions`
+///   maps view coordinates back to original ones; an identity view when
+///   nothing is tombstoned — including every auto-commit statement).
+///
+/// The walk-and-view they used to re-derive per caller is
+/// `TxnMutationRegistry::memtable_batch_visible_to_txn`; new memtable-side
+/// consumers must iterate through here so the visibility rules stay in one
+/// place.
+
+/// One segment's DELETE match result (auto-commit and deferred transactional
+/// paths share the walk).
+pub(crate) struct SegmentDeleteMatch {
+    /// The segment's tombstone bitmap as it was before this statement —
+    /// deferred-DML registration needs the pre-statement state.
+    pub footer_bitmap: Vec<u8>,
+    /// The working bitmap: footer tombstones + `seed_tombstones` + every
+    /// newly matched row marked.
+    pub new_bitmap: Vec<u8>,
+    /// Absolute row ids newly matched by this statement, in row order.
+    pub matched_ids: Vec<u64>,
+}
+
+/// The shared per-segment DELETE match walk: seed the working bitmap from
+/// the segment's footer tombstones plus `seed_tombstones` (tombstones
+/// recorded by earlier statements of the same transaction), then walk row
+/// groups — skipping fully-deleted ranges and zone-map-pruned groups —
+/// marking every row the WHERE clause selects.
+///
+/// `need_batches` reads each candidate row group even without a WHERE
+/// clause so batch-granularity consumers can run; the auto-commit path sets
+/// it for change events and index maintenance, the transactional path leaves
+/// it off for WHERE-less deletes (which today publish no events — nothing
+/// was read to publish). `read_row_group` picks full vs projected reads;
+/// `on_row_group` observes each candidate group's matches as
+/// (in-group index, absolute row id) pairs against the read batch.
+pub(crate) fn match_segment_for_delete(
+    reader: &crate::storage::segment::SegmentReader,
+    predicate: Option<&crate::storage::segment::RowGroupPredicate>,
+    where_clause: Option<&Expr>,
+    seed_tombstones: &[u64],
+    need_batches: bool,
+    read_row_group: impl Fn(&crate::storage::segment::SegmentReader, usize) -> Result<RecordBatch>,
+    mut on_row_group: impl FnMut(&RecordBatch, &[(u32, u64)]) -> Result<()>,
+) -> Result<SegmentDeleteMatch> {
+    let total_rows = reader.row_count();
+    let bitmap_bytes = total_rows.div_ceil(8) as usize;
+    let footer_bitmap = reader.delete_bitmap().to_vec();
+    let mut new_bitmap = vec![0u8; bitmap_bytes];
+    let copy_len = footer_bitmap.len().min(bitmap_bytes);
+    new_bitmap[..copy_len].copy_from_slice(&footer_bitmap[..copy_len]);
+    for row_id in seed_tombstones {
+        delete_bitmap::mark_deleted(&mut new_bitmap, *row_id);
+    }
+
+    let mut matched_ids = Vec::new();
+    let mut row_id: u64 = 0;
+    for rg_idx in 0..reader.num_row_groups() {
+        let rg_rows = reader.row_group_rows(rg_idx);
+        if delete_bitmap::row_range_all_deleted(&new_bitmap, row_id, rg_rows) {
+            row_id += rg_rows;
+            continue;
+        }
+        if let Some(pred) = predicate {
+            if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
+                row_id += rg_rows;
+                continue;
+            }
+        }
+        if !where_clause.is_some() && !need_batches {
+            // Delete-everything-in-the-group fast path: no batch is read, so
+            // there is nothing for batch-granularity consumers to observe.
+            for i in 0..rg_rows {
+                if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
+                    matched_ids.push(row_id + i);
+                }
+            }
+            row_id += rg_rows;
+            continue;
+        }
+        let batch = read_row_group(reader, rg_idx)?;
+        let mask = match where_clause {
+            Some(where_expr) => eval_where_clause_batch(where_expr, &batch, &batch.schema)?,
+            None => vec![true; batch.num_rows()],
+        };
+        let mut matched: Vec<(u32, u64)> = Vec::new();
+        for (i, matches) in mask.into_iter().enumerate() {
+            if matches && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64) {
+                matched.push((i as u32, row_id + i as u64));
+            }
+        }
+        if !matched.is_empty() {
+            on_row_group(&batch, &matched)?;
+            matched_ids.extend(matched.iter().map(|(_, absolute)| *absolute));
+        }
+        row_id += batch.num_rows() as u64;
+    }
+    Ok(SegmentDeleteMatch {
+        footer_bitmap,
+        new_bitmap,
+        matched_ids,
+    })
+}
+
+pub(crate) fn for_each_visible_memtable(
+    engine: &Engine,
+    db: &str,
+    table: &str,
+    reader_txn_id: u64,
+    narrowed_partition: Option<&str>,
+    mut consume: impl FnMut(
+        Arc<crate::storage::core::memtable::MemTable>,
+        Arc<RecordBatch>,
+        Arc<RecordBatch>,
+        Option<Vec<u32>>,
+    ) -> Result<()>,
+) -> Result<()> {
+    // Visible-to-this-transaction memtables: committed rows plus this
+    // transaction's own uncommitted INSERTs (so a DELETE/UPDATE inside a
+    // transaction reaches rows the same transaction just wrote). Rows of
+    // other still-open transactions stay untouched.
+    for memtable in engine
+        .memtable_manager()
+        .get_visible_to(db, table, reader_txn_id)
+    {
+        if let Some(key) = narrowed_partition {
+            if memtable.partition_key() != key {
+                continue;
+            }
+        }
+        let Some(original) = memtable.read_snapshot_arc() else {
+            continue;
+        };
+        if original.num_rows() == 0 {
+            continue;
+        }
+        let (view, live_positions) = engine.txn_mutations().memtable_batch_visible_to_txn(
+            reader_txn_id,
+            &memtable,
+            &original,
+        )?;
+        consume(memtable, original, view, live_positions)?;
+    }
+    Ok(())
+}
+
 /// The caller holds the table mutation lock.
 pub(crate) fn plan_delete_memtable_rows(
     engine: &Engine,
@@ -137,77 +285,57 @@ pub(crate) fn plan_delete_memtable_rows(
     reader_txn_id: u64,
 ) -> Result<Vec<ReplaceMemtableConflictPlan>> {
     let mut plans = Vec::new();
-    // Visible-to-this-transaction memtables: committed rows plus this
-    // transaction's own uncommitted INSERTs, so a DELETE inside a
-    // transaction removes rows the same transaction just wrote (they used
-    // to survive the DELETE and reappear after COMMIT). Rows of other
-    // still-open transactions stay untouched.
-    for memtable in engine
-        .memtable_manager()
-        .get_visible_to(db, table, reader_txn_id)
-    {
-        if let Some(key) = target_partition_key {
-            if memtable.partition_key() != key {
-                continue;
+    for_each_visible_memtable(
+        engine,
+        db,
+        table,
+        reader_txn_id,
+        target_partition_key,
+        |memtable, original, view, live_positions| {
+            if view.num_rows() == 0 {
+                return Ok(());
             }
-        }
-        let Some(original) = memtable.read_snapshot_arc() else {
-            continue;
-        };
-        if original.num_rows() == 0 {
-            continue;
-        }
-        // Rows this transaction already tombstoned in an earlier statement
-        // must not match again: read through the registry's filtered view so
-        // a re-match cannot double-count and duplicate the deferred delete
-        // events.
-        let (batch, live_positions) = engine.txn_mutations().memtable_batch_visible_to_txn(
-            reader_txn_id,
-            &memtable,
-            &original,
-        )?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        // Propagate evaluation errors: swallowing them here used to make the
-        // memtable look "no match", deleting segment rows while leaving the
-        // memtable rows alive.
-        let mask = match where_clause.as_ref() {
-            Some(expr) => eval_where_clause_batch(expr, &batch, table_schema)?,
-            None => vec![true; batch.num_rows()],
-        };
-        // Lift the matches back to absolute positions in the original batch
-        // so plans, tombstone registrations and delete events all speak the
-        // same coordinate system.
-        let mut absolute_mask = vec![false; original.num_rows()];
-        for (filtered_idx, &matches) in mask.iter().enumerate() {
-            if matches {
-                let absolute = live_positions
-                    .as_ref()
-                    .map_or(filtered_idx as u32, |map| map[filtered_idx]);
-                absolute_mask[absolute as usize] = true;
+            // Propagate evaluation errors: swallowing them here used to make the
+            // memtable look "no match", deleting segment rows while leaving the
+            // memtable rows alive.
+            let mask = match where_clause.as_ref() {
+                Some(expr) => eval_where_clause_batch(expr, &view, table_schema)?,
+                None => vec![true; view.num_rows()],
+            };
+            // Lift the matches back to absolute positions in the original batch
+            // so plans, tombstone registrations and delete events all speak the
+            // same coordinate system.
+            let mut absolute_mask = vec![false; original.num_rows()];
+            for (filtered_idx, &matches) in mask.iter().enumerate() {
+                if matches {
+                    let absolute = live_positions
+                        .as_ref()
+                        .map_or(filtered_idx as u32, |map| map[filtered_idx]);
+                    absolute_mask[absolute as usize] = true;
+                }
             }
-        }
-        let removed = absolute_mask.iter().filter(|matches| **matches).count();
-        if removed > 0 {
-            let keep = absolute_mask
-                .iter()
-                .map(|matches| !matches)
-                .collect::<Vec<_>>();
-            let filtered = filter_batch_keep(&original, &keep, original.num_rows() - removed)?;
-            let removed_positions = absolute_mask
-                .iter()
-                .enumerate()
-                .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
-                .collect::<Vec<_>>();
-            plans.push(ReplaceMemtableConflictPlan {
-                memtable,
-                original,
-                filtered: Arc::new(filtered),
-                removed_positions,
-            });
-        }
-    }
+            let removed = absolute_mask.iter().filter(|matches| **matches).count();
+            if removed > 0 {
+                let keep = absolute_mask
+                    .iter()
+                    .map(|matches| !matches)
+                    .collect::<Vec<_>>();
+                let filtered = filter_batch_keep(&original, &keep, original.num_rows() - removed)?;
+                let removed_positions = absolute_mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row_idx, matches)| matches.then_some(row_idx as u32))
+                    .collect::<Vec<_>>();
+                plans.push(ReplaceMemtableConflictPlan {
+                    memtable,
+                    original,
+                    filtered: Arc::new(filtered),
+                    removed_positions,
+                });
+            }
+            Ok(())
+        },
+    )?;
     Ok(plans)
 }
 
@@ -1011,21 +1139,17 @@ pub fn exec_delete(
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    let (table_schema, table_meta) = {
-        let catalogs = engine.catalogs().read().unwrap();
-        let catalog = catalogs
-            .get(db)
-            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-        let meta = catalog
-            .get_table(table)
-            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-            .clone();
-        (Schema::new(meta.columns.clone()), meta)
-    };
-
     if reader_txn_id > 0 {
         return super::txn_dml::exec_delete_in_txn(engine, db, table, where_clause, reader_txn_id);
     }
+
+    let ctx = super::txn_dml::DmlStatementContext::plan(engine, db, table, where_clause)?;
+    let resolved_where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let target_partition_key = ctx.narrowed_partition();
+    let predicate = ctx.predicate.as_ref();
+    let predicate_projection = &ctx.predicate_projection;
 
     super::txn_dml::refuse_auto_commit_dml_while_pinned(engine, db, table)?;
 
@@ -1041,26 +1165,12 @@ pub fn exec_delete(
         .lock()
         .unwrap();
 
-    // Resolve WHERE subqueries into literals: the predicate evaluator would
-    // otherwise treat unexpanded subqueries as "match every row" and rewrite
-    // the whole table. Subquery table permissions are enforced statement-wide
-    // by the engine's permission gate before dispatch.
-    let resolved_where_clause =
-        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
-
-    let target_partition_key =
-        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
     let mut total_deleted: u64 = 0;
     // Segments whose delete footer was successfully rewritten by this
     // statement (0 for memtable-only deletes).
     let mut footers_rewritten: u64 = 0;
-    let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
-    let predicate_projection = resolved_where_clause
-        .as_ref()
-        .map(|expr| collect_expr_column_indices(expr, &table_schema))
-        .unwrap_or_default();
 
     engine
         .batch_writer()
@@ -1153,105 +1263,44 @@ pub fn exec_delete(
                 let segment_path_string = index_maintenance
                     .still_maintaining()
                     .then(|| seg_path.to_string_lossy().to_string());
-                let prev_bitmap = reader.delete_bitmap().to_vec();
                 let prev_deleted = reader.deleted_row_count();
-                let bitmap_bytes = total_rows.div_ceil(8) as usize;
-                let mut new_bitmap = vec![0u8; bitmap_bytes];
-                if !prev_bitmap.is_empty() {
-                    let copy_len = prev_bitmap.len().min(bitmap_bytes);
-                    new_bitmap[..copy_len].copy_from_slice(&prev_bitmap[..copy_len]);
-                }
-
-                let mut newly_deleted: u64 = 0;
-                let mut row_id: u64 = 0;
-                for rg_idx in 0..reader.num_row_groups() {
-                    let rg_rows = reader.row_group_rows(rg_idx);
-                    if delete_bitmap::row_range_all_deleted(&new_bitmap, row_id, rg_rows) {
-                        row_id += rg_rows;
-                        continue;
-                    }
-
-                    if let Some(ref pred) = predicate {
-                        if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
-                            row_id += rg_rows;
-                            continue;
-                        }
-                    }
-
-                    if let Some(ref where_expr) = resolved_where_clause {
-                        let batch = if key_projection.is_empty() {
-                            reader.read_row_group(rg_idx)?
+                let maintaining = index_maintenance.still_maintaining();
+                let outcome = match_segment_for_delete(
+                    &reader,
+                    predicate,
+                    resolved_where_clause.as_ref(),
+                    &[],
+                    publish_deletes || maintaining,
+                    |reader, rg_idx| {
+                        if key_projection.is_empty() {
+                            reader.read_row_group(rg_idx)
                         } else {
-                            reader.read_row_group_with_projection(rg_idx, &key_projection)?
-                        };
-                        let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
-                        let mut deleted_rows = Vec::new();
-                        for (i, matches) in mask.into_iter().enumerate() {
-                            if matches
-                                && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
-                            {
-                                newly_deleted += 1;
-                                if publish_deletes {
-                                    deleted_rows.push(i as u32);
-                                }
-                                if let Some(segment_path) = segment_path_string.as_deref() {
-                                    index_maintenance.record_segment_row(
-                                        segment_path,
-                                        row_id + i as u64,
-                                        &batch,
-                                        i,
-                                        &projected_key_positions,
-                                    );
-                                }
-                            }
+                            reader.read_row_group_with_projection(rg_idx, &key_projection)
                         }
+                    },
+                    |batch, matched| {
                         if publish_deletes {
-                            deleted_events.push(&batch, &deleted_rows);
+                            let deleted_rows: Vec<u32> =
+                                matched.iter().map(|(idx, _)| *idx).collect();
+                            deleted_events.push(batch, &deleted_rows);
                         }
-                        row_id += batch.num_rows() as u64;
-                    } else if let Some(segment_path) = segment_path_string.as_deref() {
-                        let batch = if key_projection.is_empty() {
-                            reader.read_row_group(rg_idx)?
-                        } else {
-                            reader.read_row_group_with_projection(rg_idx, &key_projection)?
-                        };
-                        for i in 0..batch.num_rows() {
-                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64) {
-                                newly_deleted += 1;
+                        if let Some(segment_path) = segment_path_string.as_deref() {
+                            for (idx, absolute) in matched {
                                 index_maintenance.record_segment_row(
                                     segment_path,
-                                    row_id + i as u64,
-                                    &batch,
-                                    i,
+                                    *absolute,
+                                    batch,
+                                    *idx as usize,
                                     &projected_key_positions,
                                 );
                             }
                         }
-                        row_id += rg_rows;
-                    } else if publish_deletes {
-                        let batch = reader.read_row_group(rg_idx)?;
-                        let mut deleted_rows = Vec::new();
-                        for i in 0..batch.num_rows() {
-                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64) {
-                                newly_deleted += 1;
-                                deleted_rows.push(i as u32);
-                            }
-                        }
-                        deleted_events.push(&batch, &deleted_rows);
-                        row_id += rg_rows;
-                    } else {
-                        for i in 0..rg_rows {
-                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
-                                newly_deleted += 1;
-                            }
-                        }
-                        row_id += rg_rows;
-                    }
-                }
-
-                let new_deleted_count = prev_deleted + newly_deleted;
-                total_deleted += newly_deleted;
-                (new_bitmap, new_deleted_count, prev_deleted)
+                        Ok(())
+                    },
+                )?;
+                let new_deleted_count = prev_deleted + outcome.matched_ids.len() as u64;
+                total_deleted += outcome.matched_ids.len() as u64;
+                (outcome.new_bitmap, new_deleted_count, prev_deleted)
             };
 
             if new_deleted_count == prev_deleted {

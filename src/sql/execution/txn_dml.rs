@@ -29,9 +29,7 @@ use super::dml_delete::{
     prune_segments_by_cluster_key, prune_segments_by_partition,
 };
 use super::engine::{Engine, ExecResult};
-use super::helpers::{
-    build_row_group_predicate, collect_expr_column_indices, eval_where_clause_batch,
-};
+use super::helpers::{build_row_group_predicate, collect_expr_column_indices};
 use crate::sql::parser::ast::{Assignment, Expr};
 
 /// Reject tables whose indexes or acceleration paths have no deferred-DML
@@ -105,13 +103,73 @@ pub(crate) fn refuse_txn_dml_on_pinned_table(
     Ok(())
 }
 
-/// Mutation-lock scope for the deferred plans: the partition the statements
-/// were narrowed to, or `None` for a table-wide lock at COMMIT.
-fn partition_scope(target: &Option<String>) -> Option<Vec<String>> {
-    target
-        .as_deref()
-        .filter(|key| !key.is_empty())
-        .map(|key| vec![key.to_string()])
+/// Everything the four DML statement paths (auto-commit/transaction ×
+/// DELETE/UPDATE) derive identically from the statement before touching any
+/// data: the table metadata snapshot, the subquery-resolved WHERE clause,
+/// the compiled row-group predicate, and the narrowed partition. Planning
+/// phases consume this context; the materialization strategy (immediate for
+/// auto-commit, deferred to COMMIT for transactions) is the caller's choice.
+/// Constructed once per statement via [`DmlStatementContext::plan`], so the
+/// next preamble step is added here — not re-copied into four paths.
+pub(crate) struct DmlStatementContext {
+    pub table_schema: Schema,
+    pub table_meta: TableMeta,
+    pub resolved_where: Option<Expr>,
+    ///  when the WHERE clause compiles to no row-group predicate
+    /// (statement matches everything).
+    pub predicate: Option<crate::storage::segment::RowGroupPredicate>,
+    /// Column indices the WHERE clause references (for projected reads).
+    pub predicate_projection: Vec<usize>,
+    /// The `partition = const` key the WHERE clause narrows to, if any.
+    pub target_partition_key: Option<String>,
+}
+
+impl DmlStatementContext {
+    pub(crate) fn plan(
+        engine: &Engine,
+        db: &str,
+        table: &str,
+        where_clause: &Option<Expr>,
+    ) -> Result<Self> {
+        let (table_schema, table_meta) = load_table(engine, db, table)?;
+        // Subquery table permissions are enforced statement-wide by the
+        // engine's permission gate before dispatch; resolution here turns
+        // the subqueries into literals so the predicate evaluator (whose
+        // legacy fallback treated them as "match every row") never sees one.
+        let resolved_where = super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
+        let predicate = build_row_group_predicate(&resolved_where, &table_schema);
+        let predicate_projection = resolved_where
+            .as_ref()
+            .map(|expr| collect_expr_column_indices(expr, &table_schema))
+            .unwrap_or_default();
+        let target_partition_key =
+            delete_partition_eq_key(&resolved_where, &table_schema, &table_meta);
+        Ok(Self {
+            table_schema,
+            table_meta,
+            resolved_where,
+            predicate,
+            predicate_projection,
+            target_partition_key,
+        })
+    }
+
+    /// Mutation-lock scope derived from the narrowed partition: the single
+    /// partition, or `None` for a table-wide lock.
+    pub(crate) fn partition_scope(&self) -> Option<Vec<String>> {
+        self.target_partition_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .map(|key| vec![key.to_string()])
+    }
+
+    /// The narrowed partition as a `&str` filter argument (`None` when the
+    /// statement spans the whole table).
+    pub(crate) fn narrowed_partition(&self) -> Option<&str> {
+        self.target_partition_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+    }
 }
 
 fn run_under_mutation_locks<T>(
@@ -145,18 +203,20 @@ pub(crate) fn exec_delete_in_txn(
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    let (table_schema, table_meta) = load_table(engine, db, table)?;
-    ensure_txn_dml_supported(&table_meta)?;
-
-    let resolved_where_clause =
-        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
-    let target_partition_key =
-        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
-    let partitions = partition_scope(&target_partition_key);
+    let ctx = DmlStatementContext::plan(engine, db, table, where_clause)?;
+    ensure_txn_dml_supported(&ctx.table_meta)?;
+    let partitions = ctx.partition_scope();
+    let resolved_where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let target_partition_key = ctx
+        .target_partition_key
+        .as_deref()
+        .filter(|key| !key.is_empty());
+    let predicate = ctx.predicate.as_ref();
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
-    let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
 
     let delete_body = || -> Result<u64> {
         // Write-write conflict control: the check runs inside the mutation
@@ -172,11 +232,9 @@ pub(crate) fn exec_delete_in_txn(
             engine,
             db,
             table,
-            &resolved_where_clause,
-            &table_schema,
-            target_partition_key
-                .as_deref()
-                .filter(|key| !key.is_empty()),
+            resolved_where_clause,
+            table_schema,
+            target_partition_key,
             reader_txn_id,
         )?;
         let (own_plans, committed_plans): (Vec<_>, Vec<_>) = memtable_plans
@@ -256,83 +314,51 @@ pub(crate) fn exec_delete_in_txn(
             let prior_ids = engine
                 .txn_mutations()
                 .segment_row_ids(reader_txn_id, &seg_path);
-            let bitmap_bytes = total_rows.div_ceil(8) as usize;
-            let mut new_bitmap = vec![0u8; bitmap_bytes];
-            let footer_bitmap = reader.delete_bitmap().to_vec();
-            let copy_len = footer_bitmap.len().min(bitmap_bytes);
-            new_bitmap[..copy_len].copy_from_slice(&footer_bitmap[..copy_len]);
-            for row_id in &prior_ids {
-                delete_bitmap::mark_deleted(&mut new_bitmap, *row_id);
-            }
+            // WHERE-less deletes publish no events here (nothing was read to
+            // publish), so batches are only needed when a WHERE clause is
+            // evaluated.
+            let outcome = super::dml_delete::match_segment_for_delete(
+                &reader,
+                predicate,
+                resolved_where_clause.as_ref(),
+                &prior_ids,
+                resolved_where_clause.is_some(),
+                |reader, rg_idx| reader.read_row_group(rg_idx),
+                |batch, matched| {
+                    if !publish_deletes {
+                        return Ok(());
+                    }
+                    let deleted_in_rg: Vec<u32> = matched.iter().map(|(idx, _)| *idx).collect();
+                    match batch.take_rows(&deleted_in_rg) {
+                        Ok(deleted) => engine.txn_mutations().defer_delete_event(
+                            reader_txn_id,
+                            db,
+                            table,
+                            deleted,
+                        )?,
+                        Err(error) => tracing::warn!(
+                            db,
+                            table,
+                            error = %error,
+                            "failed to build deferred delete-event batch"
+                        ),
+                    }
+                    Ok(())
+                },
+            )?;
 
-            let mut newly_deleted: Vec<u64> = Vec::new();
-            let mut row_id: u64 = 0;
-            for rg_idx in 0..reader.num_row_groups() {
-                let rg_rows = reader.row_group_rows(rg_idx);
-                if delete_bitmap::row_range_all_deleted(&new_bitmap, row_id, rg_rows) {
-                    row_id += rg_rows;
-                    continue;
-                }
-                if let Some(ref pred) = predicate {
-                    if !pred.matches_row_group(reader.zone_maps(rg_idx)) {
-                        row_id += rg_rows;
-                        continue;
-                    }
-                }
-                match resolved_where_clause.as_ref() {
-                    None => {
-                        for i in 0..rg_rows {
-                            if delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i) {
-                                newly_deleted.push(row_id + i);
-                            }
-                        }
-                        row_id += rg_rows;
-                    }
-                    Some(where_expr) => {
-                        let batch = reader.read_row_group(rg_idx)?;
-                        let mask = eval_where_clause_batch(where_expr, &batch, &batch.schema)?;
-                        let mut deleted_in_rg: Vec<u32> = Vec::new();
-                        for (i, matches) in mask.into_iter().enumerate() {
-                            if matches
-                                && delete_bitmap::mark_deleted(&mut new_bitmap, row_id + i as u64)
-                            {
-                                newly_deleted.push(row_id + i as u64);
-                                deleted_in_rg.push(i as u32);
-                            }
-                        }
-                        if publish_deletes && !deleted_in_rg.is_empty() {
-                            match batch.take_rows(&deleted_in_rg) {
-                                Ok(deleted) => engine.txn_mutations().defer_delete_event(
-                                    reader_txn_id,
-                                    db,
-                                    table,
-                                    deleted,
-                                )?,
-                                Err(error) => tracing::warn!(
-                                    db,
-                                    table,
-                                    error = %error,
-                                    "failed to build deferred delete-event batch"
-                                ),
-                            }
-                        }
-                        row_id += batch.num_rows() as u64;
-                    }
-                }
-            }
-
-            if newly_deleted.is_empty() {
+            if outcome.matched_ids.is_empty() {
                 continue;
             }
-            statement_deleted += newly_deleted.len() as u64;
+            statement_deleted += outcome.matched_ids.len() as u64;
             engine.txn_mutations().register_segment_tombstones(
                 reader_txn_id,
                 db,
                 table,
                 partitions.as_deref(),
                 &seg_path,
-                &footer_bitmap,
-                newly_deleted,
+                &outcome.footer_bitmap,
+                outcome.matched_ids,
             )?;
         }
 
@@ -364,23 +390,21 @@ pub(crate) fn exec_update_in_txn(
     where_clause: &Option<Expr>,
     reader_txn_id: u64,
 ) -> Result<ExecResult> {
-    let (table_schema, table_meta) = load_table(engine, db, table)?;
-    ensure_txn_dml_supported(&table_meta)?;
-    if table_meta.is_partitioned()
+    let ctx = DmlStatementContext::plan(engine, db, table, where_clause)?;
+    ensure_txn_dml_supported(&ctx.table_meta)?;
+    if ctx.table_meta.is_partitioned()
         && assignments.iter().any(|assignment| {
             assignment
                 .column
-                .eq_ignore_ascii_case(&table_meta.partition_key)
+                .eq_ignore_ascii_case(&ctx.table_meta.partition_key)
         })
     {
         return Err(TaibaiError::Sql(format!(
             "updating partition key '{}' is not supported; use DELETE followed by INSERT",
-            table_meta.partition_key
+            ctx.table_meta.partition_key
         )));
     }
 
-    let resolved_where_clause =
-        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
     let resolved_assignments: Vec<Assignment> = assignments
         .iter()
         .map(|assignment| {
@@ -396,20 +420,16 @@ pub(crate) fn exec_update_in_txn(
         .collect::<Result<_>>()?;
     let assignments = resolved_assignments.as_slice();
 
-    let predicate = build_row_group_predicate(&resolved_where_clause, &table_schema);
-    let predicate_projection = resolved_where_clause
-        .as_ref()
-        .map(|expr| collect_expr_column_indices(expr, &table_schema))
-        .unwrap_or_default();
-    let target_partition_key =
-        delete_partition_eq_key(&resolved_where_clause, &table_schema, &table_meta);
-    let partitions = partition_scope(&target_partition_key);
+    let resolved_where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let predicate = ctx.predicate.as_ref();
+    let predicate_projection = &ctx.predicate_projection;
+    let partitions = ctx.partition_scope();
+    let narrowed_partition = ctx.narrowed_partition();
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
-    let narrowed_partition = target_partition_key
-        .as_deref()
-        .filter(|key| !key.is_empty());
 
     let update_body = || -> Result<u64> {
         // Write-write conflict control, same gate as delete_body.
@@ -422,79 +442,64 @@ pub(crate) fn exec_update_in_txn(
 
         // Transactional memtables (this transaction's own INSERTs) update in
         // place — no durable state, ROLLBACK-safe. Committed memtables defer
-        // via tombstone positions + new rows, exactly like segments.
-        // Memtable rows this transaction already tombstoned in earlier
-        // statements must not match again: the committed memtable's batch is
-        // never mutated between statements (only positions are recorded), so
-        // without this filter a second UPDATE of the same row would append a
-        // second copy of its new image at COMMIT.
+        // via tombstone positions + new rows, exactly like segments. The
+        // shared walk applies the transaction-tombstone view (same contract
+        // as the DELETE planner), so a second UPDATE of the same row cannot
+        // append a second copy of its new image at COMMIT.
         let txn_mutations = engine.txn_mutations();
-        for memtable in engine
-            .memtable_manager()
-            .get_visible_to(db, table, reader_txn_id)
-        {
-            if let Some(key) = narrowed_partition {
-                if memtable.partition_key() != key {
-                    continue;
+        super::dml_delete::for_each_visible_memtable(
+            engine,
+            db,
+            table,
+            reader_txn_id,
+            narrowed_partition,
+            |memtable, _original, batch, live_positions| {
+                let (new_batch, affected, matched_rows) = super::dml_update::update_memtable_batch(
+                    assignments,
+                    &resolved_where_clause,
+                    &table_schema,
+                    &batch,
+                )?;
+                let Some(new_batch) = new_batch else {
+                    return Ok(());
+                };
+                statement_updated += affected;
+                if memtable.is_transactional() {
+                    if !memtable.replace_pending_batch(Arc::new(new_batch)) {
+                        return Err(TaibaiError::Internal(
+                            "transactional memtable left pending state during in-transaction UPDATE"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(());
                 }
-            }
-            let Some(raw_batch) = memtable.read_snapshot_arc() else {
-                continue;
-            };
-            // Rows this transaction already tombstoned in earlier statements
-            // must not match again: read through the registry's filtered
-            // view (same contract as the DELETE planner) so a second UPDATE
-            // of the same row cannot append a second copy of its new image
-            // at COMMIT.
-            let (batch, live_positions) = txn_mutations.memtable_batch_visible_to_txn(
-                reader_txn_id,
-                &memtable,
-                &raw_batch,
-            )?;
-            let (new_batch, affected, matched_rows) = super::dml_update::update_memtable_batch(
-                assignments,
-                &resolved_where_clause,
-                &table_schema,
-                &batch,
-            )?;
-            let Some(new_batch) = new_batch else {
-                continue;
-            };
-            statement_updated += affected;
-            if memtable.is_transactional() {
-                if !memtable.replace_pending_batch(Arc::new(new_batch)) {
-                    return Err(TaibaiError::Internal(
-                        "transactional memtable left pending state during in-transaction UPDATE"
-                            .to_string(),
-                    ));
-                }
-                continue;
-            }
-            // Map the filtered-batch positions back to absolute positions in
-            // the committed memtable batch for the deferred removal.
-            let absolute_rows: Vec<u32> = match &live_positions {
-                Some(map) => matched_rows.iter().map(|&pos| map[pos as usize]).collect(),
-                None => matched_rows.clone(),
-            };
-            txn_mutations.register_memtable_tombstones(
-                reader_txn_id,
-                db,
-                table,
-                partitions.as_deref(),
-                Arc::clone(&memtable),
-                absolute_rows.iter().copied(),
-            )?;
-            let updated_rows = new_batch.take_rows(&matched_rows)?;
-            if publish_updates {
-                engine.txn_mutations().defer_update_event(
+                // Map the filtered-batch positions back to absolute positions in
+                // the committed memtable batch for the deferred removal.
+                let absolute_rows: Vec<u32> = match &live_positions {
+                    Some(map) => matched_rows.iter().map(|&pos| map[pos as usize]).collect(),
+                    None => matched_rows.clone(),
+                };
+                txn_mutations.register_memtable_tombstones(
                     reader_txn_id,
                     db,
                     table,
-                    updated_rows.clone(),
+                    partitions.as_deref(),
+                    Arc::clone(&memtable),
+                    absolute_rows.iter().copied(),
                 )?;
-            }
-            new_rows.push((memtable.partition_key().to_string(), updated_rows));
-        }
+                let updated_rows = new_batch.take_rows(&matched_rows)?;
+                if publish_updates {
+                    engine.txn_mutations().defer_update_event(
+                        reader_txn_id,
+                        db,
+                        table,
+                        updated_rows.clone(),
+                    )?;
+                }
+                new_rows.push((memtable.partition_key().to_string(), updated_rows));
+                Ok(())
+            },
+        )?;
 
         // Segment rows: tombstone ids + new row images; no rewrite, no seal,
         // so everything here is reversible until COMMIT.
@@ -521,7 +526,7 @@ pub(crate) fn exec_update_in_txn(
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !super::helpers::segment_may_match(&reader, predicate.as_ref()) {
+            if !super::helpers::segment_may_match(&reader, predicate) {
                 continue;
             }
             let prior_ids = engine
@@ -566,16 +571,13 @@ pub(crate) fn exec_update_in_txn(
                 }
                 // The updated image of exactly the matched rows.
                 let kept_matched = vec![true; matched.len()];
-                let mut columns = Vec::with_capacity(batch.num_columns());
-                for (col_idx, column) in batch.columns.iter().enumerate() {
-                    columns.push(super::dml_update::rebuild_update_column(
-                        column,
-                        assigned.get(&col_idx),
-                        &matched,
-                        &kept_matched,
-                    )?);
-                }
-                updated_images.push(RecordBatch::try_new(batch.schema.clone(), columns)?);
+                let image = super::dml_update::rebuild_update_batch(
+                    &batch,
+                    &assigned,
+                    &matched,
+                    &kept_matched,
+                )?;
+                updated_images.push(image);
             }
 
             if newly_deleted.is_empty() {

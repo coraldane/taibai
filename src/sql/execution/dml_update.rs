@@ -9,10 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::engine::{Engine, ExecResult};
-use super::helpers::{
-    build_row_group_predicate, collect_expr_column_indices, eval_expr_to_scalar,
-    eval_where_clause_batch,
-};
+use super::helpers::{eval_expr_to_scalar, eval_where_clause_batch};
 use crate::sql::parser::ast::{Assignment, Expr};
 
 pub fn exec_update(
@@ -46,17 +43,16 @@ pub fn exec_update(
         .lock()
         .unwrap();
 
-    let (table_schema, table_meta) = {
-        let catalogs = engine.catalogs().read().unwrap();
-        let catalog = catalogs
-            .get(db)
-            .ok_or_else(|| TaibaiError::Sql(format!("database '{}' does not exist", db)))?;
-        let meta = catalog
-            .get_table(table)
-            .ok_or_else(|| TaibaiError::Sql(format!("table '{}.{}' does not exist", db, table)))?
-            .clone();
-        (Schema::new(meta.columns.clone()), meta)
-    };
+    let ctx = super::txn_dml::DmlStatementContext::plan(engine, db, table, where_clause)?;
+    // Shadow the raw parameter: every consumer below — the memtable batch
+    // updates, the segment masks — must see the subquery-resolved clause,
+    // never the statement's original AST.
+    let where_clause = &ctx.resolved_where;
+    let table_schema = &ctx.table_schema;
+    let table_meta = &ctx.table_meta;
+    let predicate = ctx.predicate.as_ref();
+    let predicate_projection = &ctx.predicate_projection;
+    let target_partition_key = ctx.narrowed_partition();
 
     let table_dir = engine.data_dir().join(db).join(table);
     let mgr = engine.segment_mgr();
@@ -74,14 +70,9 @@ pub fn exec_update(
         )));
     }
 
-    // Resolve subqueries in the WHERE clause and in assignment values up
-    // front, exactly like DELETE does. Without this, `UPDATE ... WHERE id IN
-    // (SELECT ...)` used to fall into the predicate evaluator's legacy
-    // "match everything" fallback and rewrite the whole table. Subquery table
-    // permissions are enforced statement-wide by the engine's permission gate
-    // before dispatch.
-    let resolved_where_clause =
-        super::query::resolve_where_in_subqueries(engine, db, where_clause)?;
+    // Resolve subqueries in the assignment values up front, exactly like the
+    // WHERE clause inside `DmlStatementContext::plan` — without it, a SET
+    // subquery would reach the evaluator as an opaque expression.
     let resolved_assignments: Vec<Assignment> = assignments
         .iter()
         .map(|assignment| {
@@ -96,15 +87,6 @@ pub fn exec_update(
         })
         .collect::<Result<_>>()?;
     let assignments = resolved_assignments.as_slice();
-    let where_clause = &resolved_where_clause;
-
-    let predicate = build_row_group_predicate(where_clause, &table_schema);
-    let predicate_projection = where_clause
-        .as_ref()
-        .map(|expr| collect_expr_column_indices(expr, &table_schema))
-        .unwrap_or_default();
-    let target_partition_key =
-        super::dml_delete::delete_partition_eq_key(where_clause, &table_schema, &table_meta);
 
     engine
         .batch_writer()
@@ -124,33 +106,28 @@ pub fn exec_update(
             Arc<crate::storage::core::memtable::MemTable>,
             Arc<RecordBatch>,
         )> = Vec::new();
-        let narrowed_partition = target_partition_key
-            .as_deref()
-            .filter(|key| !key.is_empty());
-        for memtable in engine
-            .memtable_manager()
-            .get_visible_to(db, table, reader_txn_id)
-        {
-            if let Some(key) = narrowed_partition {
-                if memtable.partition_key() != key {
-                    continue;
+        let narrowed_partition = target_partition_key;
+        super::dml_delete::for_each_visible_memtable(
+            engine,
+            db,
+            table,
+            reader_txn_id,
+            narrowed_partition,
+            |memtable, _original, batch, _live_positions| {
+                let (new_batch, affected, matched_rows) =
+                    update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
+                if let Some(new_batch) = new_batch {
+                    updated_count += affected;
+                    if publish_updates {
+                        // Change events carry the post-update row images: take
+                        // from `new_batch`, not the pre-update snapshot.
+                        updated_events.push(&new_batch, &matched_rows);
+                    }
+                    memtable_updates.push((memtable, Arc::new(new_batch)));
                 }
-            }
-            let Some(batch) = memtable.read_snapshot_arc() else {
-                continue;
-            };
-            let (new_batch, affected, matched_rows) =
-                update_memtable_batch(assignments, where_clause, &table_schema, &batch)?;
-            if let Some(new_batch) = new_batch {
-                updated_count += affected;
-                if publish_updates {
-                    // Change events carry the post-update row images: take
-                    // from `new_batch`, not the pre-update snapshot.
-                    updated_events.push(&new_batch, &matched_rows);
-                }
-                memtable_updates.push((memtable, Arc::new(new_batch)));
-            }
-        }
+                Ok(())
+            },
+        )?;
 
         // A background memtable flush may have produced an active segment.
         // Seal only this table's active writers before replacing segment files;
@@ -178,7 +155,7 @@ pub fn exec_update(
 
         for seg_path in segment_files {
             let reader = mgr.open_reader(&seg_path)?;
-            if !super::helpers::segment_may_match(&reader, predicate.as_ref()) {
+            if !super::helpers::segment_may_match(&reader, predicate) {
                 continue;
             }
 
@@ -225,16 +202,7 @@ pub fn exec_update(
                     kept.push(row_idx as u32);
                     kept_matched.push(*matches);
                 }
-                let mut new_columns = Vec::with_capacity(batch.num_columns());
-                for (col_idx, column) in batch.columns.iter().enumerate() {
-                    new_columns.push(rebuild_update_column(
-                        column,
-                        assigned.get(&col_idx),
-                        &kept,
-                        &kept_matched,
-                    )?);
-                }
-                let new_batch = RecordBatch::try_new(batch.schema.clone(), new_columns)?;
+                let new_batch = rebuild_update_batch(&batch, &assigned, &kept, &kept_matched)?;
                 updated_count += kept_matched.iter().filter(|m| **m).count() as u64;
                 if rg_publish {
                     let matched: Vec<u32> = kept_matched
@@ -625,6 +593,29 @@ pub(crate) fn update_memtable_batch(
         affected,
         matched_rows,
     ))
+}
+
+/// Rebuild a whole batch for the surviving rows of an UPDATE: untouched rows
+/// keep their value, matched survivors receive the (constant) assigned value
+/// in their assigned columns. The single image constructor shared by the
+/// rewritten-row-group (auto-commit) and deferred-image (transactional)
+/// segment paths.
+pub(crate) fn rebuild_update_batch(
+    batch: &RecordBatch,
+    assigned: &std::collections::HashMap<usize, ScalarValue>,
+    kept: &[u32],
+    kept_matched: &[bool],
+) -> Result<RecordBatch> {
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+    for (col_idx, column) in batch.columns.iter().enumerate() {
+        new_columns.push(rebuild_update_column(
+            column,
+            assigned.get(&col_idx),
+            kept,
+            kept_matched,
+        )?);
+    }
+    RecordBatch::try_new(batch.schema.clone(), new_columns)
 }
 
 /// Rebuild one column for the surviving rows of an UPDATE: untouched rows
