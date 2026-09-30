@@ -178,3 +178,7 @@ mod partition_lock_tests;
 #[cfg(test)]
 #[path = "compression_level_test.rs"]
 mod compression_level_tests;
+
+#[cfg(test)]
+#[path = "segment_manager/seal_outside_lock_test.rs"]
+mod seal_outside_lock_tests;

@@ -10,10 +10,9 @@ fn log_profile(stage: &str, rows: usize, elapsed: std::time::Duration) {
 }
 
 /// Bulk appends this slow deserve a permanent WARN (not only behind the
-/// insert-profile flag): the usual cause is a synchronous segment seal inside
-/// the table-wide active-segments lock (or partition-lock contention), which
-/// stalls every concurrent writer of the table and shows up client-side as
-/// request timeouts / "outcome unknown".
+/// insert-profile flag): the usual cause is high table COMPRESSION_LEVEL
+/// (zstd 19 is single-digit MB/s per core) or a saturated disk; segment
+/// seals run outside the locks, so they no longer stall concurrent writers.
 const SLOW_BULK_APPEND_WARN: std::time::Duration = std::time::Duration::from_secs(10);
 const SLOW_SEAL_WARN: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -31,8 +30,43 @@ fn warn_slow_seal(
             partition,
             size_bytes,
             elapsed_ms = elapsed.as_millis() as u64,
-            "slow segment seal inside the table active-segments lock; concurrent writers of this table were stalled"
+            "slow segment seal; it runs outside the table locks so writers keep going, but the disk/fsync behind it is slow"
         );
+    }
+}
+
+/// RAII finish of a seal registration; Drop is the safety net for error and
+/// panic paths so a leaked entry can never wedge the wide-gate drain.
+struct SealingToken {
+    state: Arc<TableSegmentState>,
+    path: PathBuf,
+}
+
+impl Drop for SealingToken {
+    fn drop(&mut self) {
+        self.state.finish_sealing_segment(&self.path);
+    }
+}
+
+/// A segment removed from the active map whose seal (footer + fsync) still
+/// has to run — always executed after the partition and active-segments
+/// locks have been released.
+struct PendingSeal {
+    token: SealingToken,
+    writer: ActiveSegmentWriter,
+    partition: String,
+}
+
+impl PendingSeal {
+    fn new(state: Arc<TableSegmentState>, partition: &str, writer: ActiveSegmentWriter) -> Self {
+        Self {
+            token: SealingToken {
+                state,
+                path: writer.path.clone(),
+            },
+            partition: partition.to_string(),
+            writer,
+        }
     }
 }
 
@@ -65,6 +99,7 @@ impl SegmentManager {
         let compressed_columns =
             self.compress_direct_bulk_columns(&req.columns, bulk_compression_level())?;
 
+        let mut pending_seal = None;
         {
             let partition_lock = partition_mutation_lock_arc(&state, "");
             let _partition_guard =
@@ -77,32 +112,50 @@ impl SegmentManager {
                 &schema,
                 "",
                 &mut active_guard,
+                &state.sealing_paths(),
             )?;
 
-            let seg = active_guard.get_mut("").unwrap();
+            let seal_full = {
+                let seg = active_guard.get_mut("").unwrap();
+                seg.append_direct_row_group(
+                    &req.columns,
+                    &compressed_columns,
+                    req.row_count as u64,
+                    true,
+                    None,
+                )?;
+                seg.current_size >= self.max_segment_size()
+            };
 
-            seg.append_direct_row_group(
-                &req.columns,
-                &compressed_columns,
-                req.row_count as u64,
-                true,
-                None,
-            )?;
-
-            if seg.current_size >= self.max_segment_size() {
-                let seal_start = std::time::Instant::now();
-                seg.seal(&|path| self.invalidate_reader(path))?;
-                warn_slow_seal(
-                    db,
-                    req.table_name,
-                    "",
-                    seg.current_size,
-                    seal_start.elapsed(),
-                );
-                active_guard.remove("");
+            if seal_full {
+                if let Some(seg) = active_guard.remove("") {
+                    state.register_sealing_segment("", seg.path.clone());
+                    pending_seal = Some(PendingSeal::new(Arc::clone(&state), "", seg));
+                }
             } else {
-                seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                active_guard
+                    .get_mut("")
+                    .unwrap()
+                    .flush_meta(&|path| self.invalidate_reader(path))?;
             }
+        }
+
+        if let Some(mut pending) = pending_seal {
+            let seal_start = std::time::Instant::now();
+            let result = pending.writer.seal(&|path| self.invalidate_reader(path));
+            let size = pending.writer.current_size;
+            if let Err(error) = &result {
+                tracing::error!(
+                    db,
+                    table = req.table_name,
+                    error = %error,
+                    "segment seal failed outside the locks"
+                );
+            } else {
+                warn_slow_seal(db, req.table_name, &pending.partition, size, seal_start.elapsed());
+            }
+            drop(pending.token);
+            result?;
         }
 
         self.note_segments_changed(db, req.table_name);
@@ -226,16 +279,19 @@ impl SegmentManager {
         let result = self.with_partition_set_mutation_lock(db, req.table_name, &partition_refs, || {
             ensure_state_not_retired(&state, db, req.table_name)?;
 
-                let mut written = 0u64;
-                let append_start = std::time::Instant::now();
-                for group in prepared_groups {
-                    let mut active_guard = state.active_segments.lock().unwrap();
-                    self.get_or_create_active_segment_for_partition_locked(
-                        &table_dir,
-                        schema,
-                        &group.partition_key,
-                        &mut active_guard,
-                    )?;
+            let mut written = 0u64;
+            let mut pending_seals: Vec<PendingSeal> = Vec::new();
+            let append_start = std::time::Instant::now();
+            for group in prepared_groups {
+                let mut active_guard = state.active_segments.lock().unwrap();
+                self.get_or_create_active_segment_for_partition_locked(
+                    &table_dir,
+                    schema,
+                    &group.partition_key,
+                    &mut active_guard,
+                    &state.sealing_paths(),
+                )?;
+                let seal_full = {
                     let seg = active_guard.get_mut(&group.partition_key).unwrap();
                     seg.append_direct_row_group(
                         &group.columns,
@@ -244,28 +300,65 @@ impl SegmentManager {
                         build_value_sets,
                         zone_map_columns.as_deref(),
                     )?;
-                    if seg.current_size >= self.max_segment_size() {
-                        let seal_start = std::time::Instant::now();
-                        seg.seal(&|path| self.invalidate_reader(path))?;
-                        warn_slow_seal(
-                            db,
-                            req.table_name,
+                    seg.current_size >= self.max_segment_size()
+                };
+                if seal_full {
+                    if let Some(seg) = active_guard.remove(&group.partition_key) {
+                        state.register_sealing_segment(&group.partition_key, seg.path.clone());
+                        pending_seals.push(PendingSeal::new(
+                            Arc::clone(&state),
                             &group.partition_key,
-                            seg.current_size,
-                            seal_start.elapsed(),
-                        );
-                        active_guard.remove(&group.partition_key);
-                    } else if flush_immediately {
-                        seg.flush_meta(&|path| self.invalidate_reader(path))?;
+                            seg,
+                        ));
                     }
-                    written += group.row_count as u64;
+                } else if flush_immediately {
+                    active_guard
+                        .get_mut(&group.partition_key)
+                        .unwrap()
+                        .flush_meta(&|path| self.invalidate_reader(path))?;
                 }
-                if written > 0 {
-                    self.note_segments_changed(db, req.table_name);
+                written += group.row_count as u64;
+            }
+            if written > 0 {
+                self.note_segments_changed(db, req.table_name);
+            }
+            log_profile("append", written as usize, append_start.elapsed());
+            Ok((written, pending_seals))
+        });
+        let (written, pending_seals) = match result {
+            Ok(pair) => pair,
+            Err(error) => return Err(error),
+        };
+        let mut sealed_any = false;
+        let mut first_seal_error: Option<TaibaiError> = None;
+        for mut pending in pending_seals {
+            let partition = pending.partition.clone();
+            let seal_start = std::time::Instant::now();
+            let result = pending.writer.seal(&|path| self.invalidate_reader(path));
+            let size = pending.writer.current_size;
+            drop(pending.token);
+            match result {
+                Ok(()) => {
+                    sealed_any = true;
+                    warn_slow_seal(db, req.table_name, &partition, size, seal_start.elapsed());
                 }
-                log_profile("append", written as usize, append_start.elapsed());
-                Ok(written)
-            });
+                Err(error) => {
+                    tracing::error!(
+                        db,
+                        table = req.table_name,
+                        partition = %partition,
+                        error = %error,
+                        "segment seal failed outside the locks"
+                    );
+                    if first_seal_error.is_none() {
+                        first_seal_error = Some(error);
+                    }
+                }
+            }
+        }
+        if sealed_any {
+            self.note_segments_changed(db, req.table_name);
+        }
         let elapsed = total_start.elapsed();
         if elapsed >= SLOW_BULK_APPEND_WARN {
             tracing::warn!(
@@ -274,10 +367,13 @@ impl SegmentManager {
                 rows = req.row_count,
                 compression_level,
                 elapsed_ms = elapsed.as_millis() as u64,
-                "slow direct bulk append: high table COMPRESSION_LEVEL makes column compression dominate (zstd 19 is single-digit MB/s per core); synchronous segment seal inside the table-wide active-segments lock is the other usual cause (client sees request timeouts)"
+                "slow direct bulk append: high table COMPRESSION_LEVEL makes column compression dominate (zstd 19 is single-digit MB/s per core); a saturated disk is the other usual cause (segment seals run outside the locks)"
             );
         }
-        result
+        if let Some(error) = first_seal_error {
+            return Err(error);
+        }
+        Ok(written)
     }
 
     fn direct_bulk_key_column_indices(
